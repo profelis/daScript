@@ -22,7 +22,7 @@ int fibI(int n)
 
 int main(int unused)
 {
-    print("fibR: ");
+    print("fib recursive: ");
     int ctime = GetSystemTime();
     int fr = fibR(31);
     int time = GetSystemTime()-ctime;
@@ -31,7 +31,7 @@ int main(int unused)
     print (time);
     print("\n");
     
-    print("\nfibI: ");
+    print("\nfib loop: ");
     ctime = GetSystemTime();
     int fi = fibI(6511134);
     time = GetSystemTime()-ctime;
