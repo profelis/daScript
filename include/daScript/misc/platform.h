@@ -69,4 +69,8 @@ inline void das_aligned_free16(void *ptr) {return delete[] (vec4f*)ptr; }
 
 #include <thread>
 
+#if __APPLE__
+#define DAS_THREAD_LOCAL    thread_local
+#else
 #define DAS_THREAD_LOCAL    _declspec(thread)
+#endif
