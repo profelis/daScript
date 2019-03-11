@@ -229,8 +229,8 @@ namespace das {
         }
         virtual void WalkFunction ( Func * fn ) override {
             if (fn->index) {
-                if (context) {
-                    auto simFn = context->getFunction(fn->index - 1);
+                if (__context__) {
+                    auto simFn = __context__->getFunction(fn->index - 1);
                     ss << simFn->name;
                 }
                 else {

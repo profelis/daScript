@@ -18,7 +18,8 @@ bool unit_test ( const string & fn ) {
         } else {
             // tout << *program << "\n";
             Context ctx;
-            if ( !program->simulate(ctx, tout) ) {
+            context_guard guard(ctx);
+            if ( !program->simulate(tout) ) {
                 tout << "failed to simulate\n";
                 for ( auto & err : program->errors ) {
                     tout << reportError(err.at, err.what, err.cerr );

@@ -2337,9 +2337,9 @@ namespace das {
         for ( pass = 0; pass < maxPasses; ++pass ) {
             failToCompile = false;
             errors.clear();
-            InferTypes context(shared_from_this());
-            visit(context);
-            for ( auto efn : context.extraFunctions ) {
+            InferTypes ift(shared_from_this());
+            visit(ift);
+            for ( auto efn : ift.extraFunctions ) {
                 addFunction(efn);
             }
             if ( log ) {
@@ -2349,7 +2349,7 @@ namespace das {
                     logs << reportError(err.at, err.what, err.cerr);
                 }
             }
-            if ( context.finished() )
+            if ( ift.finished() )
                 break;
         }
         if (pass == maxPasses) {

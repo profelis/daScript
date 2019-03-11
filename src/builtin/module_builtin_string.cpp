@@ -9,15 +9,15 @@
 
 namespace das
 {
-    inline bool builtin_string_endswith ( const char * str, const char * cmp, Context * context ) {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
-        const uint32_t cmpLen = stringLengthSafe ( *context, cmp );
+    inline bool builtin_string_endswith ( const char * str, const char * cmp ) {
+        const uint32_t strLen = stringLengthSafe ( str );
+        const uint32_t cmpLen = stringLengthSafe ( cmp );
         return (cmpLen > strLen) ? false : memcmp(&str[strLen - cmpLen], cmp, cmpLen) == 0;
     }
 
-    inline bool builtin_string_startswith ( const char * str, const char * cmp, Context * context ) {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
-        const uint32_t cmpLen = stringLengthSafe ( *context, cmp );
+    inline bool builtin_string_startswith ( const char * str, const char * cmp ) {
+        const uint32_t strLen = stringLengthSafe ( str );
+        const uint32_t cmpLen = stringLengthSafe ( cmp );
         return (cmpLen > strLen) ? false : memcmp(str, cmp, cmpLen) == 0;
     }
 
@@ -39,30 +39,30 @@ namespace das
         return t + 1;
     }
 
-    inline char* builtin_string_strip ( const char *str, Context * context )
+    inline char* builtin_string_strip ( const char *str )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return nullptr;
         const char *start = strip_l(str);
         const char *end = strip_r(str, strLen);
-        return end > start ? context->heap.allocateString(start, uint32_t(end-start)) : nullptr;
+        return end > start ? __context__->heap.allocateString(start, uint32_t(end-start)) : nullptr;
     }
-    inline char* builtin_string_strip_left ( const char *str, Context * context )
+    inline char* builtin_string_strip_left ( const char *str )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return nullptr;
         const char *start = strip_l(str);
-        return start-str < strLen ? context->heap.allocateString(start, strLen-uint32_t(start-str)) : nullptr;
+        return start-str < strLen ? __context__->heap.allocateString(start, strLen-uint32_t(start-str)) : nullptr;
     }
-    inline char* builtin_string_strip_right ( const char *str, Context * context )
+    inline char* builtin_string_strip_right ( const char *str )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return nullptr;
         const char *end = strip_r(str, strLen);
-        return end != str ? context->heap.allocateString(str, uint32_t(end-str)) : nullptr;
+        return end != str ? __context__->heap.allocateString(str, uint32_t(end-str)) : nullptr;
     }
 
     static inline int clamp_int(int v, int minv, int maxv)
@@ -70,9 +70,9 @@ namespace das
         return (v < minv) ? minv : (v > maxv) ? maxv : v;
     }
 
-    inline int builtin_string_find1 ( const char *str, const char *substr, int start, Context * context )
+    inline int builtin_string_find1 ( const char *str, const char *substr, int start )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return -1;
         const char *ret = strstr(&str[clamp_int(start, 0, strLen)], substr);
@@ -85,95 +85,95 @@ namespace das
         const char *ret = strstr(str, substr);
         return ret ? int(ret-str) : -1;
     }
-    inline int builtin_string_length ( const char *str, Context * context )
+    inline int builtin_string_length ( const char *str )
     {
-        return stringLengthSafe ( *context, str );
+        return stringLengthSafe ( str );
     }
 
-    inline char* builtin_string_slice1 ( const char *str, int start, int end, Context * context )
+    inline char* builtin_string_slice1 ( const char *str, int start, int end )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return nullptr;
         start = clamp_int((start < 0) ? (strLen + start) : start, 0, strLen);
         end = clamp_int((end < 0) ? (strLen + end) : end, 0, strLen);
-        return end > start ? context->heap.allocateString(str + start, uint32_t(end-start)) : nullptr;
+        return end > start ? __context__->heap.allocateString(str + start, uint32_t(end-start)) : nullptr;
     }
-    inline char* builtin_string_slice2 ( const char *str, int start, Context * context )
+    inline char* builtin_string_slice2 ( const char *str, int start )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return nullptr;
         start = clamp_int((start < 0) ? (strLen + start) : start, 0, strLen);
-        return strLen > uint32_t(start) ? context->heap.allocateString(str + start, uint32_t(strLen-start)) : nullptr;
+        return strLen > uint32_t(start) ? __context__->heap.allocateString(str + start, uint32_t(strLen-start)) : nullptr;
     }
 
-    inline char* builtin_string_reverse ( const char *str, Context * context )
+    inline char* builtin_string_reverse ( const char *str )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return nullptr;
-        char * ret = context->heap.allocateString(str, strLen);
+        char * ret = __context__->heap.allocateString(str, strLen);
         str += strLen-1;
         for (char *d = ret, *end = ret + strLen; d != end; --str, ++d)
           *d = *str;
         return ret;
     }
 
-    inline char* builtin_string_tolower ( const char *str, Context * context )
+    inline char* builtin_string_tolower ( const char *str )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return nullptr;
-        char * ret = context->heap.allocateString(str, strLen);
+        char * ret = __context__->heap.allocateString(str, strLen);
         for (char *d = ret, *end = ret + strLen; d != end; ++str, ++d)
           *d = (char)tolower(*str);
         return ret;
     }
 
-    inline char* builtin_string_toupper ( const char *str, Context * context )
+    inline char* builtin_string_toupper ( const char *str )
     {
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (!strLen)
             return nullptr;
-        char * ret = context->heap.allocateString(str, strLen);
+        char * ret = __context__->heap.allocateString(str, strLen);
         for (char *d = ret, *end = ret + strLen; d != end; ++str, ++d)
           *d = (char)toupper(*str);
         return ret;
     }
 
-    inline unsigned string_to_uint ( const char *str, Context * context )
+    inline unsigned string_to_uint ( const char *str )
     {
         char *endptr;
         unsigned long int ret = strtoul(str, &endptr, 10);
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (endptr != str + strLen || strLen == 0)
         {
-            context->throw_error("string-to-uint conversion failed. String is not an uint number");
+            __context__->throw_error("string-to-uint conversion failed. String is not an uint number");
             return 0;
         }
         return ret;
     }
-    inline int string_to_int ( const char *str, Context * context )
+    inline int string_to_int ( const char *str )
     {
         char *endptr;
         long int ret = strtol(str, &endptr, 10);
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (endptr != str + strLen || strLen == 0)
         {
-            context->throw_error("string-to-int conversion failed. String is not an integer number");
+            __context__->throw_error("string-to-int conversion failed. String is not an integer number");
             return 0;
         }
         return ret;
     }
-    inline float string_to_float ( const char *str, Context * context )
+    inline float string_to_float ( const char *str )
     {
         char *endptr;
         float ret = strtof(str, &endptr);
-        const uint32_t strLen = stringLengthSafe ( *context, str );
+        const uint32_t strLen = stringLengthSafe ( str );
         if (endptr != str + strLen || strLen == 0)
         {
-            context->throw_error("string-to-float conversion failed. String is not an float number");
+            __context__->throw_error("string-to-float conversion failed. String is not an float number");
             return 0.f;
         }
         return ret;
@@ -181,18 +181,18 @@ namespace das
     inline float fast_to_float ( const char *str ){return str ? (float)atof(str) : 0.f;}
     inline int fast_to_int ( const char *str ){return str ? atoi(str) : 0;}
 
-    inline char * to_das_string(const string & str, Context * ctx) {
-        return ctx->heap.allocateName(str);
+    inline char * to_das_string(const string & str) {
+        return __context__->heap.allocateName(str);
     }
 
     inline void set_das_string(string & str, const char * bs) {
         str = bs ? bs : "";
     }
 
-    inline void peek_das_string(const string & str, Block * block, Context * context) {
+    inline void peek_das_string(const string & str, Block * block) {
         vec4f args[1];
         args[0] = cast<const char *>::from(str.c_str());
-        context->invoke(*block, args, nullptr);
+        __context__->invoke(*block, args, nullptr);
     }
 
     void Module_BuiltIn::addString(ModuleLibrary & lib) {

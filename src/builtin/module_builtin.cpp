@@ -27,10 +27,10 @@ namespace das
         static __forceinline int32_t to_enum ( vec4f val ) {
             return cast<int32_t>::to(val);
         }
-        static __forceinline bool Equ     ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool Equ     ( vec4f a, vec4f b ) {
             return to_enum(a) == to_enum(b);
         }
-        static __forceinline bool NotEqu  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool NotEqu  ( vec4f a, vec4f b ) {
             return to_enum(a) != to_enum(b);
         }
     };
@@ -47,10 +47,10 @@ namespace das
         static __forceinline int32_t to_func ( vec4f val ) {
             return cast<Func>::to(val).index;
         }
-        static __forceinline bool Equ     ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool Equ     ( vec4f a, vec4f b ) {
             return to_func(a) == to_func(b);
         }
-        static __forceinline bool NotEqu  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool NotEqu  ( vec4f a, vec4f b ) {
             return to_func(a) != to_func(b);
         }
     };
@@ -64,9 +64,9 @@ namespace das
         virtual SimNode * visit ( SimVisitor & vis ) override {
             return visitOp2(vis, "EqFunPtr");
         }
-        __forceinline bool compute ( Context & context ) {
-            auto lv = cast<Func>::to(l->eval(context));
-            auto rv = r->evalPtr(context);
+        __forceinline bool compute (  ) {
+            auto lv = cast<Func>::to(l->eval());
+            auto rv = r->evalPtr();
             return !rv && lv.index==0;      // they only equal if both null
         }
     };
@@ -77,9 +77,9 @@ namespace das
         virtual SimNode * visit ( SimVisitor & vis ) override {
             return visitOp2(vis, "NEqFunPtr");
         }
-        __forceinline bool compute ( Context & context ) {
-            auto lv = cast<Func>::to(l->eval(context));
-            auto rv = r->evalPtr(context);
+        __forceinline bool compute (  ) {
+            auto lv = cast<Func>::to(l->eval());
+            auto rv = r->evalPtr();
             return rv || lv.index;
         }
     };
@@ -90,9 +90,9 @@ namespace das
         virtual SimNode * visit ( SimVisitor & vis ) override {
             return visitOp2(vis, "EqLambdaPtr");
         }
-        __forceinline bool compute ( Context & context ) {
-            auto lv = cast<Lambda>::to(l->eval(context));
-            auto rv = r->evalPtr(context);
+        __forceinline bool compute ( ) {
+            auto lv = cast<Lambda>::to(l->eval());
+            auto rv = r->evalPtr();
             return !rv && !lv.capture;      // they only equal if both null
         }
     };
@@ -103,9 +103,9 @@ namespace das
         virtual SimNode * visit ( SimVisitor & vis ) override {
             return visitOp2(vis, "NEqLambdaPtr");
         }
-        __forceinline bool compute ( Context & context ) {
-            auto lv = cast<Lambda>::to(l->eval(context));
-            auto rv = r->evalPtr(context);
+        __forceinline bool compute ( ) {
+            auto lv = cast<Lambda>::to(l->eval());
+            auto rv = r->evalPtr();
             return rv || lv.capture;
         }
     };

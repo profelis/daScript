@@ -231,24 +231,24 @@ namespace das {
     bool Program::optimizationRefFolding() {
         bool any = false, anything = false;
         do {
-            RefFolding context;
-            visit(context);
-            any = context.didAnything();
+            RefFolding rf;
+            visit(rf);
+            any = rf.didAnything();
             anything |= any;
         } while ( any );
         return anything;
     }
 
     bool Program::optimizationBlockFolding() {
-        BlockFolding context;
-        visit(context);
-        return context.didAnything();
+        BlockFolding bf;
+        visit(bf);
+        return bf.didAnything();
     }
 
     bool Program::optimizationCondFolding() {
-        CondFolding context;
-        visit(context);
-        return context.didAnything();
+        CondFolding cf;
+        visit(cf);
+        return cf.didAnything();
     }
 
 }

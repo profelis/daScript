@@ -1,7 +1,6 @@
 #include "daScript/daScript.h"
 #include "../common/fileAccess.h"
 
-#include <thread>
 #include <atomic>
 
 using namespace std;

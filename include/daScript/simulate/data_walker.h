@@ -20,7 +20,6 @@ namespace das {
 
     struct DataWalker {
     // we doing what?
-        class Context * context = nullptr;
         bool reading = false;
         bool cancel = false;
     // helpers

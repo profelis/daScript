@@ -5,8 +5,8 @@
 
 namespace das {
     // save ( obj, block<(bytesAt:string)> )
-    vec4f _builtin_binary_save ( Context & context, SimNode_CallBase * call, vec4f * args );
+    vec4f _builtin_binary_save ( SimNode_CallBase * call, vec4f * args );
 
     // load ( obj, bytesAt:uint32 )
-    vec4f _builtin_binary_load ( Context & context, SimNode_CallBase * call, vec4f * args );
+    vec4f _builtin_binary_load ( SimNode_CallBase * call, vec4f * args );
 }

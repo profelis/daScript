@@ -69,18 +69,21 @@ bool unit_test ( const string & fn ) {
             return false;
         } else {
             Context ctxBase;
-            if ( !program->simulate(ctxBase, tout) ) {
+            ctxBase.bind();
+            if ( !program->simulate(tout) ) {
+                ctxBase.unbind();
                 tout << "failed to simulate\n";
                 for ( auto & err : program->errors ) {
                     tout << reportError(err.at, err.what, err.cerr );
                 }
                 return false;
             }
+            ctxBase.unbind();
             // note: copy of the context is here for testing purposes only
             //          that way we test context-copying functionality every time
             Context ctx(ctxBase);
+            context_guard guard(ctx);
             if ( auto fnTest = ctx.findFunction("test") ) {
-                ctx.restart();
                 bool result = cast<bool>::to(ctx.eval(fnTest, nullptr));
                 if ( auto ex = ctx.getException() ) {
                     tout << "exception: " << ex << "\n";
@@ -115,7 +118,9 @@ bool exception_test ( const string & fn ) {
             return false;
         } else {
             Context ctx;
-            if ( !program->simulate(ctx, tout) ) {
+            context_guard guard(ctx);
+            if ( !program->simulate(tout) ) {
+                ctx.unbind();
                 tout << "failed to simulate\n";
                 for ( auto & err : program->errors ) {
                     tout << reportError(err.at, err.what, err.cerr );

@@ -66,20 +66,20 @@ namespace das
         }
     };
 
-    __forceinline uint32_t hash_function ( Context &, const void * x, size_t size ) {
+    __forceinline uint32_t hash_function ( const void * x, size_t size ) {
         return hash_block32((uint8_t *)x, uint32_t(size));
     }
 
-    __forceinline uint32_t stringLength ( Context & ctx, const char * str ) {//should be non-null
-        if ( ctx.heap.isFastHeapPtr(str) ) {
+    __forceinline uint32_t stringLength ( const char * str ) {//should be non-null
+        if ( __context__->heap.isFastHeapPtr(str) ) {
             auto header = (StringHeader *) ( str - sizeof(StringHeader) );
             return header->length;
         } else {
             return uint32_t(strlen(str));
         }
     }
-    __forceinline uint32_t stringLengthSafe ( Context & ctx, const char * str ) {//accepts nullptr
-        if ( ctx.heap.isFastHeapPtr(str) ) {
+    __forceinline uint32_t stringLengthSafe ( const char * str ) {//accepts nullptr
+        if ( __context__->heap.isFastHeapPtr(str) ) {
             auto header = (StringHeader *) ( str - sizeof(StringHeader) );
             return header->length;
         } else {
@@ -88,7 +88,7 @@ namespace das
     }
 
     template <typename TT>
-    __forceinline uint32_t hash_function ( Context &, const TT x ) {
+    __forceinline uint32_t hash_function ( const TT x ) {
         uint32_t res = hash_block32((const uint8_t *)&x, sizeof(x));
         if (res <= HASH_KILLED32) {
             return 16777619;
@@ -97,8 +97,8 @@ namespace das
     }
 
     template <>
-    __forceinline uint32_t hash_function ( Context & ctx, char * str ) {
-        if ( ctx.heap.isFastHeapPtr(str) ) {
+    __forceinline uint32_t hash_function ( char * str ) {
+        if ( __context__->heap.isFastHeapPtr(str) ) {
             auto header = (StringHeader *) ( str - sizeof(StringHeader) );
             auto hh = header->hash;
             if ( !hh ) {
@@ -110,8 +110,8 @@ namespace das
         }
     }
 
-    uint32_t hash_value ( Context & ctx, void * pX, TypeInfo * info );
-    uint32_t hash_value ( Context & ctx, vec4f value, TypeInfo * info );
+    uint32_t hash_value ( void * pX, TypeInfo * info );
+    uint32_t hash_value ( vec4f value, TypeInfo * info );
     uint32_t hash_value ( TypeInfo * info );
     uint32_t hash_value ( StructInfo * info );
     uint32_t hash_value ( EnumInfo * info );

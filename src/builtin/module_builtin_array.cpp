@@ -17,20 +17,20 @@ namespace das {
         return arr->capacity;
     }
 
-    void builtin_array_resize ( Array * pArray, int newSize, int stride, Context * context ) {
-        array_resize ( *context, *pArray, newSize, stride, true );
+    void builtin_array_resize ( Array * pArray, int newSize, int stride ) {
+        array_resize ( *pArray, newSize, stride, true );
     }
 
-    void builtin_array_reserve ( Array * pArray, int newSize, int stride, Context * context ) {
-        array_reserve( *context, *pArray, newSize, stride );
+    void builtin_array_reserve ( Array * pArray, int newSize, int stride ) {
+        array_reserve( *pArray, newSize, stride );
     }
 
-    int builtin_array_push ( Array * pArray, int index, int stride, Context * context ) {
+    int builtin_array_push ( Array * pArray, int index, int stride ) {
         uint32_t idx = pArray->size;
-        array_resize(*context, *pArray, idx + 1, stride, false);
+        array_resize(*pArray, idx + 1, stride, false);
         if ( index >=0 ) {
             if ( uint32_t(index) >= pArray->size ) {
-                context->throw_error("insert index out of range");
+                __context__->throw_error("insert index out of range");
                 return 0;
             }
             memmove ( pArray->data+(index+1)*stride, pArray->data+index*stride, (idx-index)*stride );
@@ -39,17 +39,17 @@ namespace das {
         return idx;
     }
 
-    void builtin_array_erase ( Array * pArray, int index, int stride, Context * context ) {
+    void builtin_array_erase ( Array * pArray, int index, int stride ) {
         if ( uint32_t(index) >= pArray->size ) {
-            context->throw_error("erase index out of range");
+            __context__->throw_error("erase index out of range");
             return;
         }
         memmove ( pArray->data+index*stride, pArray->data+(index+1)*stride, (pArray->size-index-1)*stride );
-        array_resize(*context, *pArray, pArray->size-1, stride, false);
+        array_resize(*pArray, pArray->size-1, stride, false);
     }
 
-    void builtin_array_clear ( Array * pArray, Context * context ) {
-        array_clear(*context, *pArray);
+    void builtin_array_clear ( Array * pArray ) {
+        array_clear(*pArray);
     }
 
     void Module_BuiltIn::addArrayTypes(ModuleLibrary & lib) {

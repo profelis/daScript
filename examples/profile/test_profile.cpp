@@ -21,27 +21,27 @@ void updateTest ( ObjectArray & objects ) {
     }
 }
 
-void update10000 ( ObjectArray & objects, Context * context ) {
-    auto updateFn = context->findFunction("update");
+void update10000 ( ObjectArray & objects ) {
+    auto updateFn = __context__->findFunction("update");
     if (!updateFn) {
-        context->throw_error("update not exported");
+        __context__->throw_error("update not exported");
         return;
     }
     for ( auto & obj : objects ) {
         vec4f args[1] = { cast<Object &>::from(obj) };
-        context->eval(updateFn,  args);
+        __context__->eval(updateFn,  args);
     }
 }
 
-void update10000ks ( ObjectArray & objects, Context * context ) {
-    auto ksUpdateFn = context->findFunction("ks_update");
+void update10000ks ( ObjectArray & objects ) {
+    auto ksUpdateFn = __context__->findFunction("ks_update");
     if (!ksUpdateFn) {
-        context->throw_error("ks_update not exported");
+        __context__->throw_error("ks_update not exported");
         return;
     }
     for ( auto & obj : objects ) {
         vec4f args[2] = { cast<float3 &>::from(obj.pos), cast<float3>::from(obj.vel) };
-        context->eval(ksUpdateFn,  args);
+        __context__->eval(ksUpdateFn,  args);
     }
 }
 
@@ -174,10 +174,10 @@ struct EsFunctionAnnotation : FunctionAnnotation {
     }
 };
 
-bool EsRunPass ( Context & context, EsPassAttributeTable & table, const vector<EsComponent> & components, uint32_t totalComponents ) {
-    auto functionPtr = context.getFunction(table.functionIndex);
+bool EsRunPass ( EsPassAttributeTable & table, const vector<EsComponent> & components, uint32_t totalComponents ) {
+    auto functionPtr = __context__->getFunction(table.functionIndex);
     vec4f * _args = (vec4f *)(alloca(table.attributes.size() * sizeof(vec4f)));
-    context.callEx(functionPtr, _args, nullptr, 0, [&](SimNode * code){
+    __context__->callEx(functionPtr, _args, nullptr, 0, [&](SimNode * code){
         uint32_t nAttr = (uint32_t) table.attributes.size();
         vec4f * args = _args;
         char **        data    = (char **) alloca(nAttr * sizeof(char *));
@@ -212,9 +212,9 @@ bool EsRunPass ( Context & context, EsPassAttributeTable & table, const vector<E
                     data[a] += stride[a];
                 }
             }
-            code->eval(context);
-            context.stopFlags &= ~(EvalFlags::stopForReturn | EvalFlags::stopForBreak);
-            if ( context.getException() ) {
+            code->eval();
+            __context__->stopFlags &= ~(EvalFlags::stopForReturn | EvalFlags::stopForBreak);
+            if ( __context__->getException() ) {
                 // TODO: report exception here??
                 return;
             }
@@ -223,15 +223,15 @@ bool EsRunPass ( Context & context, EsPassAttributeTable & table, const vector<E
     return true;
 }
 
-uint32_t EsRunBlock ( Context & context, Block block, const vector<EsComponent> & components, uint32_t totalComponents ) {
+uint32_t EsRunBlock ( Block block, const vector<EsComponent> & components, uint32_t totalComponents ) {
     auto * closure = (SimNode_ClosureBlock *) block.body;
     EsAttributeTable * table = (EsAttributeTable *) closure->annotationData;
     if ( !table ) {
-        context.throw_error("EsRunBlock - query missing annotation data");
+        __context__->throw_error("EsRunBlock - query missing annotation data");
     }
     uint32_t nAttr = (uint32_t) table->attributes.size();
     vec4f * _args = (vec4f *)(alloca(table->attributes.size() * sizeof(vec4f)));
-    context.invokeEx(block, _args, nullptr, [&](SimNode * code){
+    __context__->invokeEx(block, _args, nullptr, [&](SimNode * code){
         vec4f * args = _args;
         char **        data    = (char **) alloca(nAttr * sizeof(char *));
         uint32_t *    stride    = (uint32_t *) alloca(nAttr * sizeof(uint32_t));
@@ -265,9 +265,9 @@ uint32_t EsRunBlock ( Context & context, Block block, const vector<EsComponent> 
                     data[a] += stride[a];
                 }
             }
-            code->eval(context);
-            context.stopFlags &= ~(EvalFlags::stopForReturn | EvalFlags::stopForBreak);
-            if ( context.getException() ) {
+            code->eval();
+            __context__->stopFlags &= ~(EvalFlags::stopForReturn | EvalFlags::stopForBreak);
+            if ( __context__->getException() ) {
                 // TODO: report exception here??
                 return;
             }
@@ -312,20 +312,20 @@ void verifyEsComponents() {
     }
 }
 
-void testEsUpdate ( char * pass, Context * ctx ) {
+void testEsUpdate ( char * pass ) {
     if ( !EsGroupData::THAT ) {
-        ctx->throw_error_ex("missing pass data for the pass %s", pass);
+        __context__->throw_error_ex("missing pass data for the pass %s", pass);
         return;
     }
     for ( auto & tab : EsGroupData::THAT->g_esPassTable ) {
         if ( tab->pass==pass ) {
-            EsRunPass(*ctx, *tab, g_components, g_total);
+            EsRunPass(*tab, g_components, g_total);
         }
     }
 }
 
-uint32_t queryEs (Block * block, Context * context) {
-    return EsRunBlock(*context, *block, g_components, g_total);
+uint32_t queryEs (Block * block)  {
+    return EsRunBlock(*block, g_components, g_total);
 }
 #if DAS_USE_EASTL
 #include <EASTL/unordered_map.h>
@@ -431,7 +431,7 @@ __noinline void testParticlesI(int count) {
     particlesI(objects, count);
 }
 
-__noinline void testTryCatch(Context * context) {
+__noinline void testTryCatch() {
     #if _CPPUNWIND || __cpp_exceptions
     int arr[1000];
     int cnt = 0;
@@ -447,7 +447,7 @@ __noinline void testTryCatch(Context * context) {
             }
         }
         if (fail != 1000) {
-            context->throw_error("test optimized out");
+            __context__->throw_error("test optimized out");
             return;
         }
     }
@@ -517,11 +517,9 @@ void advancev(int nbodies, struct planet * __restrict bodies, float dt)
             v_st(&b2->vx, b2v);
         }
     } while(++b != be);
-
-    for (struct planet *__restrict b = bodies; b != be; ++b)
-    {
-        vec4f bx = v_ld(&b->x), bv = v_ld(&b->vx);
-        v_st(&b->x, v_madd(vdt, bv, bx));
+    for (struct planet *__restrict bb = bodies; bb != be; ++bb) {
+        vec4f bx = v_ld(&bb->x), bv = v_ld(&bb->vx);
+        v_st(&bb->x, v_madd(vdt, bv, bx));
     }
 }
 

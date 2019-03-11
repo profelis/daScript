@@ -12,68 +12,70 @@ extern void os_debug_break();
 
 namespace das
 {
+    DAS_THREAD_LOCAL Context * __restrict __context__;
+
     // this is here to occasionally investigate untyped evaluation paths
     #define WARN_SLOW_CAST(TYPE)
     // #define WARN_SLOW_CAST(TYPE)    DAS_ASSERTF(0, "internal perofrmance issue, casting eval to eval##TYPE" );
 
-    bool SimNode::evalBool ( Context & context ) {
+    bool SimNode::evalBool ( ) {
         WARN_SLOW_CAST(Bool);
-        return cast<bool>::to(eval(context));
+        return cast<bool>::to(eval());
     }
 
-    float SimNode::evalFloat ( Context & context ) {
+    float SimNode::evalFloat ( ) {
         WARN_SLOW_CAST(Float);
-        return cast<float>::to(eval(context));
+        return cast<float>::to(eval());
     }
 
-    double SimNode::evalDouble(Context & context) {
+    double SimNode::evalDouble() {
         WARN_SLOW_CAST(Double);
-        return cast<double>::to(eval(context));
+        return cast<double>::to(eval());
     }
 
-    int32_t SimNode::evalInt ( Context & context ) {
+    int32_t SimNode::evalInt ( ) {
         WARN_SLOW_CAST(Int);
-        return cast<int32_t>::to(eval(context));
+        return cast<int32_t>::to(eval());
     }
 
-    uint32_t SimNode::evalUInt ( Context & context ) {
+    uint32_t SimNode::evalUInt ( ) {
         WARN_SLOW_CAST(UInt);
-        return cast<uint32_t>::to(eval(context));
+        return cast<uint32_t>::to(eval());
     }
 
-    int64_t SimNode::evalInt64 ( Context & context ) {
+    int64_t SimNode::evalInt64 ( ) {
         WARN_SLOW_CAST(Int64);
-        return cast<int64_t>::to(eval(context));
+        return cast<int64_t>::to(eval());
     }
 
-    uint64_t SimNode::evalUInt64 ( Context & context ) {
+    uint64_t SimNode::evalUInt64 ( ) {
         WARN_SLOW_CAST(UInt64);
-        return cast<uint64_t>::to(eval(context));
+        return cast<uint64_t>::to(eval());
     }
 
-    char * SimNode::evalPtr ( Context & context ) {
+    char * SimNode::evalPtr ( ) {
         WARN_SLOW_CAST(Ptr);
-        return cast<char *>::to(eval(context));
+        return cast<char *>::to(eval());
     }
 
-    vec4f SimNode_DeleteStructPtr::eval ( Context & context ) {
-        auto pStruct = (char **) subexpr->evalPtr(context);
+    vec4f SimNode_DeleteStructPtr::eval ( ) {
+        auto pStruct = (char **) subexpr->evalPtr();
         pStruct = pStruct + total - 1;
         for ( uint32_t i=0; i!=total; ++i, pStruct-- ) {
             if ( *pStruct ) {
-                context.heap.free(*pStruct, structSize);
+                __context__->heap.free(*pStruct, structSize);
                 *pStruct = nullptr;
             }
         }
         return v_zero();
     }
 
-    vec4f SimNode_Swizzle::eval ( Context & context ) {
+    vec4f SimNode_Swizzle::eval ( ) {
         union {
             vec4f   res;
             float   val[4];
         } R, S;
-        S.res = value->eval(context);
+        S.res = value->eval();
         R.val[0] = S.val[fields[0]];
         R.val[1] = S.val[fields[1]];
         R.val[2] = S.val[fields[2]];
@@ -83,38 +85,38 @@ namespace das
 
     // SimNode_MakeBlock
 
-    vec4f SimNode_MakeBlock::eval ( Context & context )  {
-        Block * block = (Block *) ( context.stack.sp() + stackTop );
-        block->stackOffset = context.stack.spi();
-        block->argumentsOffset = argStackTop ? (context.stack.spi() + argStackTop) : 0;
+    vec4f SimNode_MakeBlock::eval ( )  {
+        Block * block = (Block *) ( __context__->stack.sp() + stackTop );
+        block->stackOffset = __context__->stack.spi();
+        block->argumentsOffset = argStackTop ? (__context__->stack.spi() + argStackTop) : 0;
         block->body = subexpr;
-        block->functionArguments = context.abiArguments();
+        block->functionArguments = __context__->abiArguments();
         return cast<Block *>::from(block);
     }
 
     // SimNode_Debug
 
-    vec4f SimNode_Debug::eval ( Context & context ) {
-        vec4f res = subexpr->eval(context);
+    vec4f SimNode_Debug::eval ( ) {
+        vec4f res = subexpr->eval();
         TextWriter ssw;
         if ( message ) ssw << message << " ";
         ssw << debug_type(typeInfo) << " = " << debug_value(res, typeInfo, PrintFlags::debugger)
             << " at " << debugInfo.describe() << "\n";
-        context.to_out(ssw.str().c_str());
+        __context__->to_out(ssw.str().c_str());
         return res;
     }
 
     // SimNode_Assert
 
-    vec4f SimNode_Assert::eval ( Context & context ) {
-        if ( !subexpr->evalBool(context) ) {
+    vec4f SimNode_Assert::eval ( ) {
+        if ( !subexpr->evalBool() ) {
             string error_message = "assert failed";
             if ( message )
                 error_message = error_message + ", " + message;
             string error = reportError(debugInfo, error_message );
-            error = context.getStackWalk(false) + error;
-            context.to_err(error.c_str());
-            context.throw_error_at(debugInfo,"assert failed");
+            error = __context__->getStackWalk(false) + error;
+            __context__->to_err(error.c_str());
+            __context__->throw_error_at(debugInfo,"assert failed");
         }
         return v_zero();
     }
@@ -126,36 +128,36 @@ namespace das
 #pragma warning(disable:4611)
 #endif
 
-    vec4f SimNode_TryCatch::eval ( Context & context ) {
-        auto aa = context.abiArg; auto acm = context.abiCMRES;
+    vec4f SimNode_TryCatch::eval ( ) {
+        auto aa = __context__->abiArg; auto acm = __context__->abiCMRES;
         char * EP, * SP;
-        context.stack.watermark(EP,SP);
+        __context__->stack.watermark(EP,SP);
         #if DAS_ENABLE_EXCEPTIONS
             try {
                 try_block->eval(context);
             } catch ( const dasException & ) {
-                context.abiArg = aa;
-                context.abiCMRES = acm;
-                context.stack.pop(EP,SP);
-                context.stopFlags &= ~(EvalFlags::stopForThrow | EvalFlags::stopForReturn | EvalFlags::stopForBreak);
+                __context__->abiArg = aa;
+                __context__->abiCMRES = acm;
+                __context__->stack.pop(EP,SP);
+                __context__->stopFlags &= ~(EvalFlags::stopForThrow | EvalFlags::stopForReturn | EvalFlags::stopForBreak);
                 catch_block->eval(context);
             }
         #else
             jmp_buf ev;
-            jmp_buf * JB = context.throwBuf;
-            context.throwBuf = &ev;
+            jmp_buf * JB = __context__->throwBuf;
+            __context__->throwBuf = &ev;
             if ( !setjmp(ev) ) {
-                try_block->eval(context);
+                try_block->eval();
             } else {
-                context.throwBuf = JB;
-                context.abiArg = aa;
-                context.abiCMRES = acm;
-                context.stack.pop(EP,SP);
-                context.stopFlags &= ~(EvalFlags::stopForReturn | EvalFlags::stopForBreak);
-                context.exception = nullptr;
-                catch_block->eval(context);
+                __context__->throwBuf = JB;
+                __context__->abiArg = aa;
+                __context__->abiCMRES = acm;
+                __context__->stack.pop(EP,SP);
+                __context__->stopFlags &= ~(EvalFlags::stopForReturn | EvalFlags::stopForBreak);
+                __context__->exception = nullptr;
+                catch_block->eval();
             }
-            context.throwBuf = JB;
+            __context__->throwBuf = JB;
         #endif
         return v_zero();
     }
@@ -166,18 +168,18 @@ namespace das
 
     // SimNode_CopyRefValue
 
-    vec4f SimNode_CopyRefValue::eval ( Context & context ) {
-        auto pl = l->evalPtr(context);
-        auto pr = r->evalPtr(context);
+    vec4f SimNode_CopyRefValue::eval ( ) {
+        auto pl = l->evalPtr();
+        auto pr = r->evalPtr();
         memcpy ( pl, pr, size );
         return v_zero();
     }
 
     // SimNode_MoveRefValue
 
-    vec4f SimNode_MoveRefValue::eval ( Context & context ) {
-        auto pl = l->evalPtr(context);
-        auto pr = r->evalPtr(context);
+    vec4f SimNode_MoveRefValue::eval ( ) {
+        auto pl = l->evalPtr();
+        auto pr = r->evalPtr();
         memcpy ( pl, pr, size );
         memset ( pr, 0, size );
         return v_zero();
@@ -185,159 +187,159 @@ namespace das
 
     // SimNode_Block
 
-    vec4f SimNode_Block::eval ( Context & context ) {
-        for ( uint32_t i = 0; i!=total && !context.stopFlags; ) {
-            list[i++]->eval(context);
+    vec4f SimNode_Block::eval ( ) {
+        for ( uint32_t i = 0; i!=total && !__context__->stopFlags; ) {
+            list[i++]->eval();
         }
-        evalFinal(context);
+        evalFinal();
         return v_zero();
     }
 
-    vec4f SimNode_ClosureBlock::eval ( Context & context ) {
-        for ( uint32_t i = 0; i!=total && !context.stopFlags; ) {
-            list[i++]->eval(context);
+    vec4f SimNode_ClosureBlock::eval ( ) {
+        for ( uint32_t i = 0; i!=total && !__context__->stopFlags; ) {
+            list[i++]->eval();
         }
-        evalFinal(context);
-        if ( context.stopFlags & EvalFlags::stopForReturn ) {
-            context.stopFlags &= ~EvalFlags::stopForReturn;
-            return context.abiResult();
+        evalFinal();
+        if ( __context__->stopFlags & EvalFlags::stopForReturn ) {
+            __context__->stopFlags &= ~EvalFlags::stopForReturn;
+            return __context__->abiResult();
         } else {
-            if ( needResult ) context.throw_error_at(debugInfo,"end of block without return");
+            if ( needResult ) __context__->throw_error_at(debugInfo,"end of block without return");
             return v_zero();
         }
     }
 
     // SimNode_Let
 
-    vec4f SimNode_Let::eval ( Context & context ) {
-        for ( uint32_t i = 0; i!=total && !context.stopFlags; ) {
-            list[i++]->eval(context);
+    vec4f SimNode_Let::eval ( ) {
+        for ( uint32_t i = 0; i!=total && !__context__->stopFlags; ) {
+            list[i++]->eval();
         }
-        return subexpr ? subexpr->eval(context) : v_zero();
+        return subexpr ? subexpr->eval() : v_zero();
     }
 
     // SimNode_While
 
-    vec4f SimNode_While::eval ( Context & context ) {
+    vec4f SimNode_While::eval (  ) {
         SimNode ** __restrict tail = list + total;
-        while ( cond->evalBool(context) && !context.stopFlags ) {
+        while ( cond->evalBool() && !__context__->stopFlags ) {
             for (SimNode ** __restrict body = list; body!=tail; ++body) {
-                (*body)->eval(context);
-                if (context.stopFlags) goto loopend;
+                (*body)->eval();
+                if (__context__->stopFlags) goto loopend;
             }
         }
     loopend:;
-        evalFinal(context);
-        context.stopFlags &= ~EvalFlags::stopForBreak;
+        evalFinal();
+        __context__->stopFlags &= ~EvalFlags::stopForBreak;
         return v_zero();
     }
 
     // Return
 
-    vec4f SimNode_Return::eval ( Context & context ) {
-        if ( subexpr ) context.abiResult() = subexpr->eval(context);
-        context.stopFlags |= EvalFlags::stopForReturn;
+    vec4f SimNode_Return::eval (  ) {
+        if ( subexpr ) __context__->abiResult() = subexpr->eval();
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnConst::eval ( Context & context ) {
-        context.abiResult() = value;
-        context.stopFlags |= EvalFlags::stopForReturn;
+    vec4f SimNode_ReturnConst::eval ( ) {
+        __context__->abiResult() = value;
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnRefAndEval::eval ( Context & context ) {
-        auto pl = context.abiCopyOrMoveResult();
+    vec4f SimNode_ReturnRefAndEval::eval ( ) {
+        auto pl = __context__->abiCopyOrMoveResult();
         DAS_ASSERT(pl);
-        auto pR = ((char **)(context.stack.sp() + stackTop));
+        auto pR = ((char **)(__context__->stack.sp() + stackTop));
         *pR = pl;
-        subexpr->evalPtr(context);;
-        context.abiResult() = cast<char *>::from(pl);
-        context.stopFlags |= EvalFlags::stopForReturn;
+        subexpr->evalPtr();
+        __context__->abiResult() = cast<char *>::from(pl);
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnAndCopy::eval ( Context & context ) {
-        auto pr = subexpr->evalPtr(context);
-        auto pl = context.abiCopyOrMoveResult();
+    vec4f SimNode_ReturnAndCopy::eval ( ) {
+        auto pr = subexpr->evalPtr();
+        auto pl = __context__->abiCopyOrMoveResult();
         DAS_ASSERT(pl);
         memcpy ( pl, pr, size);
-        context.abiResult() = cast<char *>::from(pl);
-        context.stopFlags |= EvalFlags::stopForReturn;
+        __context__->abiResult() = cast<char *>::from(pl);
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnAndMove::eval ( Context & context ) {
-        auto pr = subexpr->evalPtr(context);
-        auto pl = context.abiCopyOrMoveResult();
+    vec4f SimNode_ReturnAndMove::eval ( ) {
+        auto pr = subexpr->evalPtr();
+        auto pl = __context__->abiCopyOrMoveResult();
         DAS_ASSERT(pl);
         memcpy ( pl, pr, size);
         memset ( pr, 0, size);
-        context.abiResult() = cast<char *>::from(pl);
-        context.stopFlags |= EvalFlags::stopForReturn;
+        __context__->abiResult() = cast<char *>::from(pl);
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnReference::eval ( Context & context ) {
-        char * ref = subexpr->evalPtr(context);
-        if ( context.stack.bottom()<=ref && ref<context.stack.sp()) {
-            context.throw_error_at(debugInfo,"reference bellow current function stack frame");
+    vec4f SimNode_ReturnReference::eval ( ) {
+        char * ref = subexpr->evalPtr();
+        if ( __context__->stack.bottom()<=ref && ref<__context__->stack.sp()) {
+            __context__->throw_error_at(debugInfo,"reference bellow current function stack frame");
             return v_zero();
         }
 #if DAS_ENABLE_STACK_WALK
-        auto pp = (Prologue *) context.stack.sp();
-        auto top = context.stack.sp() + pp->info->stackSize;
-        if ( context.stack.sp()<=ref && ref<top ) {
-            context.throw_error_at(debugInfo,"reference to current function stack frame");
+        auto pp = (Prologue *) __context__->stack.sp();
+        auto top = __context__->stack.sp() + pp->info->stackSize;
+        if ( __context__->stack.sp()<=ref && ref<top ) {
+            __context__->throw_error_at(debugInfo,"reference to current function stack frame");
             return v_zero();
         }
 #endif
-        context.abiResult() = cast<char *>::from(ref);
-        context.stopFlags |= EvalFlags::stopForReturn;
+        __context__->abiResult() = cast<char *>::from(ref);
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnRefAndEvalFromBlock::eval ( Context & context ) {
-        auto ba = (BlockArguments *) ( context.stack.sp() + argStackTop );
+    vec4f SimNode_ReturnRefAndEvalFromBlock::eval ( ) {
+        auto ba = (BlockArguments *) ( __context__->stack.sp() + argStackTop );
         auto pl = ba->copyOrMoveResult;
         DAS_ASSERT(pl);
-        auto pR = ((char **)(context.stack.sp() + stackTop));
+        auto pR = ((char **)(__context__->stack.sp() + stackTop));
         *pR = pl;
-        subexpr->evalPtr(context);;
-        context.abiResult() = cast<char *>::from(pl);
-        context.stopFlags |= EvalFlags::stopForReturn;
+        subexpr->evalPtr();
+        __context__->abiResult() = cast<char *>::from(pl);
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnAndCopyFromBlock::eval ( Context & context ) {
-        auto pr = subexpr->evalPtr(context);
-        auto ba = (BlockArguments *) ( context.stack.sp() + argStackTop );
+    vec4f SimNode_ReturnAndCopyFromBlock::eval ( ) {
+        auto pr = subexpr->evalPtr();
+        auto ba = (BlockArguments *) ( __context__->stack.sp() + argStackTop );
         auto pl = ba->copyOrMoveResult;
         memcpy ( pl, pr, size);
-        context.abiResult() = cast<char *>::from(pl);
-        context.stopFlags |= EvalFlags::stopForReturn;
+        __context__->abiResult() = cast<char *>::from(pl);
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnAndMoveFromBlock::eval ( Context & context ) {
-        auto pr = subexpr->evalPtr(context);
-        auto ba = (BlockArguments *) ( context.stack.sp() + argStackTop );
+    vec4f SimNode_ReturnAndMoveFromBlock::eval ( ) {
+        auto pr = subexpr->evalPtr();
+        auto ba = (BlockArguments *) ( __context__->stack.sp() + argStackTop );
         auto pl = ba->copyOrMoveResult;
         memcpy ( pl, pr, size);
         memset ( pr, 0, size);
-        context.abiResult() = cast<char *>::from(pl);
-        context.stopFlags |= EvalFlags::stopForReturn;
+        __context__->abiResult() = cast<char *>::from(pl);
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
-    vec4f SimNode_ReturnReferenceFromBlock::eval ( Context & context ) {
-        char * ref = subexpr->evalPtr(context);
-        if ( context.stack.bottom()<=ref && ref<context.stack.ap() ) {
-            context.throw_error_at(debugInfo,"reference bellow current call chain stack frame");
+    vec4f SimNode_ReturnReferenceFromBlock::eval ( ) {
+        char * ref = subexpr->evalPtr();
+        if ( __context__->stack.bottom()<=ref && ref<__context__->stack.ap() ) {
+            __context__->throw_error_at(debugInfo,"reference bellow current call chain stack frame");
             return v_zero();
         }
-        context.abiResult() = cast<char *>::from(ref);
-        context.stopFlags |= EvalFlags::stopForReturn;
+        __context__->abiResult() = cast<char *>::from(ref);
+        __context__->stopFlags |= EvalFlags::stopForReturn;
         return v_zero();
     }
 
@@ -365,6 +367,7 @@ namespace das
         functions = ctx.functions;
         totalFunctions = ctx.totalFunctions;
         // now, make it good to go
+        context_guard guard(*this);
         restart();
         runInitScript();
         restart();
@@ -385,7 +388,7 @@ namespace das
         for ( int i=0; i!=totalVariables && !stopFlags; ++i ) {
             auto & pv = globalVariables[i];
             if ( pv.init ) {
-                pv.init->eval(*this);
+                pv.init->eval();
             } else {
                 memset ( globals + pv.offset, 0, pv.size );
             }
@@ -533,7 +536,7 @@ namespace das
         jmp_buf * JB = throwBuf;
         throwBuf = &ev;
         if ( !setjmp(ev) ) {
-            return node->eval(*this);
+            return node->eval();
         } else {
             abiArg = aa;
             abiCMRES = acm;

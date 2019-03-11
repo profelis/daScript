@@ -16,72 +16,72 @@ namespace das
             return v_make_vec4f(x, y, z, w);
         }
         // basic
-        static __forceinline bool Equ     ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool Equ     ( vec4f a, vec4f b ) {
             return (v_signmask(v_cmp_eq(a,b)) & mask) == mask;
         }
-        static __forceinline bool NotEqu  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool NotEqu  ( vec4f a, vec4f b ) {
             return (v_signmask(v_cmp_eq(a, b)) & mask) != mask;
         }
         // numeric
-        static __forceinline vec4f Unp ( vec4f x, Context & ) {
+        static __forceinline vec4f Unp ( vec4f x ) {
             return x;
         }
-        static __forceinline vec4f Unm ( vec4f x, Context & ) {
+        static __forceinline vec4f Unm ( vec4f x ) {
             return v_neg(x);
         }
-        static __forceinline vec4f Add ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Add ( vec4f a, vec4f b ) {
             return v_add(a,b);
         }
-        static __forceinline vec4f Sub ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Sub ( vec4f a, vec4f b ) {
             return v_sub(a,b);
         }
-        static __forceinline vec4f Div ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Div ( vec4f a, vec4f b ) {
             return v_div(a,b);
         }
-        static __forceinline vec4f Mod ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Mod ( vec4f a, vec4f b ) {
             return v_mod(a,b);
         }
-        static __forceinline vec4f Mul ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Mul ( vec4f a, vec4f b ) {
             return v_mul(a,b);
         }
-        static __forceinline void SetAdd  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetAdd  ( char * a, vec4f b ) {
             TT * pa = (TT *) a;
             *pa = cast<TT>::to ( v_add(cast<TT>::from(*pa), b));
         }
-        static __forceinline void SetSub  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetSub  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to ( v_sub(cast<TT>::from(*pa), b));
         }
-        static __forceinline void SetDiv  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetDiv  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to ( v_div(cast<TT>::from(*pa), b));
         }
-        static __forceinline void SetMul  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMul  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to ( v_mul(cast<TT>::from(*pa), b));
         }
-        static __forceinline void SetMod  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMod  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to ( v_mod(cast<TT>::from(*pa), b));
         }
         // vector-scalar
-        static __forceinline vec4f DivVecScal ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f DivVecScal ( vec4f a, vec4f b ) {
             return v_div(a,v_splat_x(b));
         }
-        static __forceinline vec4f MulVecScal ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f MulVecScal ( vec4f a, vec4f b ) {
             return v_mul(a,v_splat_x(b));
         }
-        static __forceinline vec4f DivScalVec ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f DivScalVec ( vec4f a, vec4f b ) {
             return v_div(v_splat_x(a),b);
         }
-        static __forceinline vec4f MulScalVec ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f MulScalVec ( vec4f a, vec4f b ) {
             return v_mul(v_splat_x(a),b);
         }
-        static __forceinline void SetDivScal  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetDivScal  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to ( v_div(cast<TT>::from(*pa), v_splat_x(b)));
         }
-        static __forceinline void SetMulScal  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMulScal  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to ( v_mul(cast<TT>::from(*pa), v_splat_x(b)));
         }
@@ -94,112 +94,112 @@ namespace das
             return v_cast_vec4f(v_make_vec4i(x, y, z, w));
         }
         // basic
-        static __forceinline bool Equ     ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool Equ     ( vec4f a, vec4f b ) {
             return (v_signmask(v_cast_vec4f(v_cmp_eqi(v_cast_vec4i(a),v_cast_vec4i(b)))) & mask) == mask;
         }
-        static __forceinline bool NotEqu  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool NotEqu  ( vec4f a, vec4f b ) {
             return (v_signmask(v_cast_vec4f(v_cmp_eqi(v_cast_vec4i(a), v_cast_vec4i(b)))) & mask) != mask;
         }
         // numeric
-        static __forceinline vec4f Unp ( vec4f x, Context & ) {
+        static __forceinline vec4f Unp ( vec4f x ) {
             return x;
         }
-        static __forceinline vec4f Unm ( vec4f x, Context & ) {
+        static __forceinline vec4f Unm ( vec4f x ) {
             return v_cast_vec4f(v_negi(v_cast_vec4i(x)));
         }
-        static __forceinline vec4f Add ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Add ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_addi(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f Sub ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Sub ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_subi(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f Div ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Div ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_divi(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f Mod ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Mod ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_modi(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f Mul ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Mul ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_muli(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f BinAnd ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f BinAnd ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_andi(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f BinOr ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f BinOr ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_ori(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f BinXor ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f BinXor ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_xori(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f BinShl ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f BinShl ( vec4f a, vec4f b ) {
             int32_t shift = v_extract_xi(v_cast_vec4i(b));
             return v_cast_vec4f(v_sll(v_cast_vec4i(a),shift));
         }
-        static __forceinline vec4f BinShr ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f BinShr ( vec4f a, vec4f b ) {
             int32_t shift = v_extract_xi(v_cast_vec4i(b));
             return v_cast_vec4f(v_sra(v_cast_vec4i(a),shift));
         }
-        static __forceinline void SetAdd  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetAdd  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_addi(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetSub  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetSub  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_subi(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetDiv  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetDiv  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_divi(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetMul  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMul  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_muli(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetMod  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMod  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_modi(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetBinAnd  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetBinAnd  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_andi(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetBinOr  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetBinOr  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_ori(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetBinXor  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetBinXor  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_xori(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetBinShl  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetBinShl  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             int32_t shift = v_extract_xi(v_cast_vec4i(b));
             *pa = cast<TT>::to (v_cast_vec4f(v_sll(v_cast_vec4i(cast<TT>::from(*pa)), shift)));
         }
-        static __forceinline void SetBinShr  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetBinShr  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             int32_t shift = v_extract_xi(v_cast_vec4i(b));
             *pa = cast<TT>::to (v_cast_vec4f(v_sra(v_cast_vec4i(cast<TT>::from(*pa)), shift)));
         }
         // vector-scalar
-        static __forceinline vec4f DivVecScal ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f DivVecScal ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_divi(v_cast_vec4i(a),v_splat_xi(v_cast_vec4i(b))));
         }
-        static __forceinline vec4f MulVecScal ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f MulVecScal ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_muli(v_cast_vec4i(a),v_splat_xi(v_cast_vec4i(b))));
         }
-        static __forceinline vec4f DivScalVec ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f DivScalVec ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_divi(v_splat_xi(v_cast_vec4i(a)),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f MulScalVec ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f MulScalVec ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_muli(v_splat_xi(v_cast_vec4i(a)),v_cast_vec4i(b)));
         }
-        static __forceinline void SetDivScal ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetDivScal ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_divi(v_cast_vec4i(cast<TT>::from(*pa)),
                                                             v_splat_xi(v_cast_vec4i(b)))));
         }
-        static __forceinline void SetMulScal ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMulScal ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_muli(v_cast_vec4i(cast<TT>::from(*pa)),
                                                             v_splat_xi(v_cast_vec4i(b)))));
@@ -209,55 +209,55 @@ namespace das
     template <typename TT, int mask>
     struct SimPolicy_uVec : SimPolicy_iVec<TT,mask> {
         // swapping some numeric operations
-        static __forceinline vec4f Div ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Div ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_divu(v_cast_vec4i(a), v_cast_vec4i(b)));
         }
-        static __forceinline vec4f Mul ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Mul ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_mulu(v_cast_vec4i(a), v_cast_vec4i(b)));
         }
-        static __forceinline vec4f Mod ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Mod ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_modu(v_cast_vec4i(a),v_cast_vec4i(b)));
         }
-        static __forceinline vec4f BinShr ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f BinShr ( vec4f a, vec4f b ) {
             int32_t shift = v_extract_xi(v_cast_vec4i(b));
             return v_cast_vec4f(v_srl(v_cast_vec4i(a),shift));
         }
-        static __forceinline void SetDiv  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetDiv  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_divu(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetMul  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMul  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_mulu(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetMod  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMod  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_modu(v_cast_vec4i(cast<TT>::from(*pa)), v_cast_vec4i(b))));
         }
-        static __forceinline void SetBinShr  ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetBinShr  ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             int32_t shift = v_extract_xi(v_cast_vec4i(b));
             *pa = cast<TT>::to (v_cast_vec4f(v_srl(v_cast_vec4i(cast<TT>::from(*pa)), shift)));
         }
         // vector-scalar
-        static __forceinline vec4f DivVecScal ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f DivVecScal ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_divu(v_cast_vec4i(a),v_splat_xi(v_cast_vec4i(b))));
         }
-        static __forceinline vec4f MulVecScal ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f MulVecScal ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_mulu(v_cast_vec4i(a),v_splat_xi(v_cast_vec4i(b))));
         }
-        static __forceinline vec4f DivScalVec ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f DivScalVec ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_divu(v_splat_xi(v_cast_vec4i(a)), v_cast_vec4i(b)));
         }
-        static __forceinline vec4f MulScalVec ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f MulScalVec ( vec4f a, vec4f b ) {
             return v_cast_vec4f(v_mulu(v_splat_xi(v_cast_vec4i(a)), v_cast_vec4i(b)));
         }
-        static __forceinline void SetDivScal ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetDivScal ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_divu(v_cast_vec4i(cast<TT>::from(*pa)),
                                                             v_splat_xi(v_cast_vec4i(b)))));
         }
-        static __forceinline void SetMulScal ( char * a, vec4f b, Context & ) {
+        static __forceinline void SetMulScal ( char * a, vec4f b ) {
             TT * pa = (TT *)a;
             *pa = cast<TT>::to (v_cast_vec4f(v_mulu(v_cast_vec4i(cast<TT>::from(*pa)),
                                                             v_splat_xi(v_cast_vec4i(b)))));
@@ -330,9 +330,9 @@ namespace das
             V_SUB(arguments[0]);
             V_END();
         }
-        virtual vec4f eval(Context & context) override {
+        virtual vec4f eval() override {
             vec4f argValues[2];
-            evalArgs(context, argValues);
+            evalArgs(argValues);
             auto X = cast<TT>::to(argValues[0]);
             return Policy::setXYZW(X, X, X, X);
         }
@@ -348,9 +348,9 @@ namespace das
             V_SUB(arguments[1]);
             V_END();
         }
-        virtual vec4f eval(Context & context) override {
+        virtual vec4f eval() override {
             vec4f argValues[2];
-            evalArgs(context, argValues);
+            evalArgs(argValues);
             return Policy::setXYZW(cast<TT>::to(argValues[0]),
                                    cast<TT>::to(argValues[1]),
                                    0,
@@ -369,9 +369,9 @@ namespace das
             V_SUB(arguments[2]);
             V_END();
         }
-        virtual vec4f eval(Context & context) override {
+        virtual vec4f eval() override {
             vec4f argValues[3];
-            evalArgs(context, argValues);
+            evalArgs(argValues);
             return Policy::setXYZW(cast<TT>::to(argValues[0]),
                                    cast<TT>::to(argValues[1]),
                                    cast<TT>::to(argValues[2]),
@@ -391,9 +391,9 @@ namespace das
             V_SUB(arguments[3]);
             V_END();
         }
-        virtual vec4f eval(Context & context) override {
+        virtual vec4f eval() override {
             vec4f argValues[4];
-            evalArgs(context, argValues);
+            evalArgs(argValues);
             return Policy::setXYZW(cast<TT>::to(argValues[0]),
                                    cast<TT>::to(argValues[1]),
                                    cast<TT>::to(argValues[2]),
@@ -459,8 +459,8 @@ addFunction ( make_shared<BuiltInFn<SimNode_VecCtor<uint64_t,SimPolicy<VTYPE>,4>
             V_SUB(arguments[0]);
             V_END();
         }
-        virtual vec4f eval(Context & context) override {
-            vec4f i4 = arguments[0]->eval(context);
+        virtual vec4f eval() override {
+            vec4f i4 = arguments[0]->eval();
             return v_cvt_vec4f(v_cast_vec4i(i4));
         }
     };
@@ -473,8 +473,8 @@ addFunction ( make_shared<BuiltInFn<SimNode_VecCtor<uint64_t,SimPolicy<VTYPE>,4>
             V_SUB(arguments[0]);
             V_END();
         }
-        virtual vec4f eval(Context & context) override {
-            vec4f i4 = arguments[0]->eval(context);
+        virtual vec4f eval() override {
+            vec4f i4 = arguments[0]->eval();
             return v_cvt_vec4f(v_cast_vec4i(i4));   // todo: replace wrong cast
         }
     };

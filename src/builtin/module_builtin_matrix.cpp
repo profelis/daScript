@@ -81,112 +81,108 @@ namespace das {
             pt->ref = true;
             return pt;
         }
-        virtual SimNode * simulateCopy ( Context & context, const LineInfo & at, SimNode * l, SimNode * r ) const override {
-            return context.code->makeNode<SimNode_CopyValue<ThisMatrix>>(at, l, r);
+        virtual SimNode * simulateCopy ( const LineInfo & at, SimNode * l, SimNode * r ) const override {
+            return __context__->code->makeNode<SimNode_CopyValue<ThisMatrix>>(at, l, r);
         }
-        virtual SimNode * simulateGetField ( const string & na, Context & context,
-                                            const LineInfo & at, const ExpressionPtr & value ) const override {
+        virtual SimNode * simulateGetField ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
             int field = GetField(na);
             if ( field!=-1 ) {
                 if ( !value->type->isPointer() ) {
-                    auto tnode = value->trySimulate(context, field*sizeof(VecT), Type::none);
+                    auto tnode = value->trySimulate(field*sizeof(VecT), Type::none);
                     if ( tnode ) {
                         return tnode;
                     }
                 }
-                return context.code->makeNode<SimNode_FieldDeref>(at,
-                                                                  value->simulate(context),
+                return __context__->code->makeNode<SimNode_FieldDeref>(at,
+                                                                  value->simulate(),
                                                                   uint32_t(field*sizeof(VecT)));
             } else {
                 return nullptr;
             }
         }
-        virtual SimNode * simulateGetFieldR2V ( const string & na, Context & context,
-                                               const LineInfo & at, const ExpressionPtr & value ) const override {
+        virtual SimNode * simulateGetFieldR2V ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
             int field = GetField(na);
             if ( field!=-1 ) {
                 auto bt = TypeDecl::getVectorType(Type::tFloat, ColC);
                 if ( !value->type->isPointer() ) {
-                    auto tnode = value->trySimulate(context, field*sizeof(VecT), bt);
+                    auto tnode = value->trySimulate(field*sizeof(VecT), bt);
                     if ( tnode ) {
                         return tnode;
                     }
                 }
-                return context.code->makeValueNode<SimNode_FieldDerefR2V>(bt,
+                return __context__->code->makeValueNode<SimNode_FieldDerefR2V>(bt,
                                                                           at,
-                                                                          value->simulate(context),
+                                                                          value->simulate(),
                                                                           uint32_t(field*sizeof(VecT)));
             } else {
                 return nullptr;
             }
         }
-        virtual SimNode * simulateGetNew ( Context & context, const LineInfo & at ) const override {
-            return context.code->makeNode<SimNode_New>(at,int32_t(sizeof(ThisMatrix)));
+        virtual SimNode * simulateGetNew ( const LineInfo & at ) const override {
+            return __context__->code->makeNode<SimNode_New>(at,int32_t(sizeof(ThisMatrix)));
         }
-        virtual SimNode * simulateDeletePtr ( Context & context, const LineInfo & at, SimNode * sube, uint32_t count ) const override {
+        virtual SimNode * simulateDeletePtr ( const LineInfo & at, SimNode * sube, uint32_t count ) const override {
             uint32_t ms = uint32_t(sizeof(ThisMatrix));
-            return context.code->makeNode<SimNode_DeleteStructPtr>(at,sube,count,ms);
+            return __context__->code->makeNode<SimNode_DeleteStructPtr>(at,sube,count,ms);
         }
-        virtual SimNode * simulateSafeGetField ( const string & na, Context & context,
-                                                const LineInfo & at, const ExpressionPtr & value ) const override {
+        virtual SimNode * simulateSafeGetField ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
             int field = GetField(na);
             if ( field!=-1 ) {
-                return context.code->makeNode<SimNode_SafeFieldDeref>(at,
-                                                                      value->simulate(context),
+                return __context__->code->makeNode<SimNode_SafeFieldDeref>(at,
+                                                                      value->simulate(),
                                                                       uint32_t(field*sizeof(VecT)));
             } else {
                 return nullptr;
             }
         };
-        virtual SimNode * simulateSafeGetFieldPtr ( const string & na, Context & context,
-                                                   const LineInfo & at, const ExpressionPtr & value ) const override {
+        virtual SimNode * simulateSafeGetFieldPtr ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
             int field = GetField(na);
             if ( field!=-1 ) {
-                return context.code->makeNode<SimNode_SafeFieldDerefPtr>(at,
-                                                                         value->simulate(context),
+                return __context__->code->makeNode<SimNode_SafeFieldDerefPtr>(at,
+                                                                         value->simulate(),
                                                                          uint32_t(field*sizeof(VecT)));
             } else {
                 return nullptr;
             }
         };
-        SimNode * trySimulate ( Context & context, const ExpressionPtr & subexpr, const ExpressionPtr & index,
+        SimNode * trySimulate ( const ExpressionPtr & subexpr, const ExpressionPtr & index,
                                Type r2vType, uint32_t ofs ) const {
             if ( index->rtti_isConstant() ) {
                 // if its constant index, like a[3]..., we try to let node bellow simulate
                 auto idxCE = static_pointer_cast<ExprConst>(index);
                 uint32_t idxC = cast<uint32_t>::to(idxCE->value);
                 if ( idxC >= RowC ) {
-                    context.thisProgram->error("matrix index out of range", subexpr->at, CompilationError::index_out_of_range);
+                    __context__->thisProgram->error("matrix index out of range", subexpr->at, CompilationError::index_out_of_range);
                     return nullptr;
                 }
                 uint32_t stride = sizeof(float)*ColC;
-                auto tnode = subexpr->trySimulate(context, idxC*stride + ofs, r2vType);
+                auto tnode = subexpr->trySimulate(idxC*stride + ofs, r2vType);
                 if ( tnode ) {
                     return tnode;
                 }
             }
             return nullptr;
         }
-        virtual SimNode * simulateGetAt ( Context & context, const LineInfo & at, const TypeDeclPtr &,
+        virtual SimNode * simulateGetAt ( const LineInfo & at, const TypeDeclPtr &,
                                          const ExpressionPtr & rv, const ExpressionPtr & idx, uint32_t ofs ) const override {
-            if ( auto tnode = trySimulate(context, rv, idx, Type::none, ofs) ) {
+            if ( auto tnode = trySimulate(rv, idx, Type::none, ofs) ) {
                 return tnode;
             } else {
-                return context.code->makeNode<SimNode_At>(at,
-                                                          rv->simulate(context),
-                                                          idx->simulate(context),
+                return __context__->code->makeNode<SimNode_At>(at,
+                                                          rv->simulate(),
+                                                          idx->simulate(),
                                                           uint32_t(sizeof(float)*ColC), ofs, RowC);
             }
         }
-        virtual SimNode * simulateGetAtR2V ( Context & context, const LineInfo & at, const TypeDeclPtr &,
+        virtual SimNode * simulateGetAtR2V ( const LineInfo & at, const TypeDeclPtr &,
                                             const ExpressionPtr & rv, const ExpressionPtr & idx, uint32_t ofs ) const override {
             Type r2vType = (Type) ToBasicType<VecT>::type;
-            if ( auto tnode = trySimulate(context, rv, idx, r2vType, ofs) ) {
+            if ( auto tnode = trySimulate(rv, idx, r2vType, ofs) ) {
                 return tnode;
             } else {
-                return context.code->makeNode<SimNode_AtR2V<float>>(at,
-                                                                    rv->simulate(context),
-                                                                    idx->simulate(context),
+                return __context__->code->makeNode<SimNode_AtR2V<float>>(at,
+                                                                    rv->simulate(),
+                                                                    idx->simulate(),
                                                                     uint32_t(sizeof(float)*ColC), ofs, RowC);
             }
         }
@@ -206,8 +202,8 @@ namespace das {
             V_OP(MatrixCtor);
             V_END();
         }
-        virtual vec4f eval(Context & context) override {
-            auto cmres = cmresEval->evalPtr(context);
+        virtual vec4f eval() override {
+            auto cmres = cmresEval->evalPtr();
             memset ( cmres, 0, sizeof(MatT) );
             return cast<void *>::from(cmres);
         }

@@ -34,14 +34,13 @@ namespace das
 
     template <typename KeyType>
     class TableHash {
-        Context *   context = nullptr;
         uint32_t    valueTypeSize = 0;
         constexpr static uint32_t minCapacity = 64u;
         constexpr static uint32_t minLookups = 4u;
     public:
         TableHash () = delete;
         TableHash ( const TableHash & ) = delete;
-        TableHash ( Context * ctx, uint32_t vs ) : context(ctx), valueTypeSize(vs) {}
+        TableHash ( uint32_t vs ) : valueTypeSize(vs) {}
 
         __forceinline uint32_t indexFromHash(uint32_t hash, uint32_t shift ) const {
             return hash >> shift; // i don't know why this is faster, but it is
@@ -141,9 +140,9 @@ namespace das
         repeatIt:;
             Table newTab;
             uint32_t memSize = newCapacity * (valueTypeSize + sizeof(KeyType) + sizeof(uint32_t));
-            newTab.data = (char *) context->heap.allocate(memSize);
+            newTab.data = (char *) __context__->heap.allocate(memSize);
             if ( !newTab.data ) {
-                context->throw_error("can't grow table, out of heap");
+                __context__->throw_error("can't grow table, out of heap");
                 return false;
             }
             newTab.keys = newTab.data + newCapacity * valueTypeSize;
@@ -182,9 +181,9 @@ namespace das
         }
     };
 
-    void table_clear ( Context & context, Table & arr );
-    void table_lock ( Context & context, Table & arr );
-    void table_unlock ( Context & context, Table & arr );
+    void table_clear ( Table & arr );
+    void table_lock ( Table & arr );
+    void table_unlock ( Table & arr );
 
     struct SimNode_Table : SimNode {
         SimNode_Table(const LineInfo & at, SimNode * t, SimNode * k, uint32_t vts)
@@ -221,12 +220,12 @@ namespace das
             V_ARG(offset);
             V_END();
         }
-        __forceinline char * compute ( Context & context ) {
-            Table * tab = (Table *) tabExpr->evalPtr(context);
-            vec4f xkey = keyExpr->eval(context);
+        __forceinline char * compute ( ) {
+            Table * tab = (Table *) tabExpr->evalPtr();
+            vec4f xkey = keyExpr->eval();
             KeyType key = cast<KeyType>::to(xkey);
-            TableHash<KeyType> thh(&context,valueTypeSize);
-            auto hfn = hash_function(context, key);
+            TableHash<KeyType> thh(valueTypeSize);
+            auto hfn = hash_function(key);
             int index = thh.reserve(*tab, key, hfn);    // if index==-1, it was a through, so safe to do
             return tab->data + index * valueTypeSize + offset;
         }
@@ -241,12 +240,12 @@ namespace das
         virtual SimNode * visit ( SimVisitor & vis ) override {
             return visitTable(vis,"TableErase");
         }
-        __forceinline bool compute ( Context & context ) {
-            Table * tab = (Table *) tabExpr->evalPtr(context);
-            vec4f xkey = keyExpr->eval(context);
+        __forceinline bool compute ( ) {
+            Table * tab = (Table *) tabExpr->evalPtr();
+            vec4f xkey = keyExpr->eval();
             KeyType key = cast<KeyType>::to(xkey);
-            auto hfn = hash_function(context, key);
-            TableHash<KeyType> thh(&context,valueTypeSize);
+            auto hfn = hash_function(key);
+            TableHash<KeyType> thh(valueTypeSize);
             return thh.erase(*tab, key, hfn) != -1;
         }
     };
@@ -259,12 +258,12 @@ namespace das
         virtual SimNode * visit ( SimVisitor & vis ) override {
             return visitTable(vis,"TableFind");
         }
-        __forceinline char * compute(Context & context) {
-            Table * tab = (Table *)tabExpr->evalPtr(context);
-            vec4f xkey = keyExpr->eval(context);
+        __forceinline char * compute() {
+            Table * tab = (Table *)tabExpr->evalPtr();
+            vec4f xkey = keyExpr->eval();
             KeyType key = cast<KeyType>::to(xkey);
-            auto hfn = hash_function(context, key);
-            TableHash<KeyType> thh(&context,valueTypeSize);
+            auto hfn = hash_function(key);
+            TableHash<KeyType> thh(valueTypeSize);
             int index = thh.find(*tab, key, hfn);
             return index!=-1 ? tab->data + index * valueTypeSize : nullptr;
         }
@@ -272,9 +271,9 @@ namespace das
 
     struct TableIterator : Iterator {
         size_t nextValid ( Table * tab, size_t index ) const;
-        virtual bool first ( Context & context, IteratorContext & itc ) override;
-        virtual bool next  ( Context & context, IteratorContext & itc ) override;
-        virtual void close ( Context & context, IteratorContext & itc ) override;
+        virtual bool first ( IteratorContext & itc ) override;
+        virtual bool next  ( IteratorContext & itc ) override;
+        virtual void close ( IteratorContext & itc ) override;
         virtual char * getData ( Table * tab ) const = 0;
         SimNode *   source;
         uint32_t    stride;
@@ -299,7 +298,7 @@ namespace das
             V_ARG(subexpr.stride);
             V_END();
         }
-        virtual vec4f eval ( Context & ) override {
+        virtual vec4f eval ( ) override {
             return cast<Iterator *>::from(&subexpr);
         }
         IterType   subexpr;
@@ -309,7 +308,7 @@ namespace das
         SimNode_DeleteTable ( const LineInfo & a, SimNode * s, uint32_t t, uint32_t va )
             : SimNode_Delete(a,s,t), vts_add_kts(va) {}
         virtual SimNode * visit ( SimVisitor & vis ) override;
-        virtual vec4f eval ( Context & context ) override;
+        virtual vec4f eval ( ) override;
         uint32_t vts_add_kts;
     };
 }

@@ -31,8 +31,8 @@ namespace das {
         SimNode_AsBool(const LineInfo & a, SimNode * se) : SimNode(a), subexpr(se) {}
         __forceinline bool compute(Context & context) {
             auto pv = (JsValue *) subexpr->evalPtr(context);
-            if ( !pv ) { context.throw_error_at(debugInfo,"JSON dereferencing null pointer"); return false; }
-            if ( !pv->IsBool() ) { context.throw_error_at(debugInfo,"JSON not a boolean"); return false; }
+            if ( !pv ) { __context__->throw_error_at(debugInfo,"JSON dereferencing null pointer"); return false; }
+            if ( !pv->IsBool() ) { __context__->throw_error_at(debugInfo,"JSON not a boolean"); return false; }
             return pv->GetBool();
         }
         SimNode * subexpr;
@@ -43,8 +43,8 @@ namespace das {
         SimNode_AsInt(const LineInfo & a, SimNode * se) : SimNode(a), subexpr(se) {}
         __forceinline int32_t compute(Context & context) {
             auto pv = (JsValue *) subexpr->evalPtr(context);
-            if ( !pv ) { context.throw_error_at(debugInfo,"JSON dereferencing null pointer"); return 0; }
-            if ( !pv->IsInt() ) { context.throw_error_at(debugInfo,"JSON not a int"); return 0; }
+            if ( !pv ) { __context__->throw_error_at(debugInfo,"JSON dereferencing null pointer"); return 0; }
+            if ( !pv->IsInt() ) { __context__->throw_error_at(debugInfo,"JSON not a int"); return 0; }
             return pv->GetInt();
         }
         SimNode * subexpr;
@@ -55,8 +55,8 @@ namespace das {
         SimNode_AsFloat(const LineInfo & a, SimNode * se) : SimNode(a), subexpr(se) {}
         __forceinline float compute(Context & context) {
             auto pv = (JsValue *) subexpr->evalPtr(context);
-            if ( !pv ) { context.throw_error_at(debugInfo,"JSON dereferencing null pointer"); return 0.0f; }
-            if ( !pv->IsFloat() ) { context.throw_error_at(debugInfo,"JSON not a float"); return 0.0f; }
+            if ( !pv ) { __context__->throw_error_at(debugInfo,"JSON dereferencing null pointer"); return 0.0f; }
+            if ( !pv->IsFloat() ) { __context__->throw_error_at(debugInfo,"JSON not a float"); return 0.0f; }
             return pv->GetFloat();
         }
         SimNode * subexpr;
@@ -67,8 +67,8 @@ namespace das {
         SimNode_AsDouble(const LineInfo & a, SimNode * se) : SimNode(a), subexpr(se) {}
         __forceinline double compute(Context & context) {
             auto pv = (JsValue *) subexpr->evalPtr(context);
-            if ( !pv ) { context.throw_error_at(debugInfo,"JSON dereferencing null pointer"); return 0.0f; }
-            if ( !pv->IsDouble() ) { context.throw_error_at(debugInfo,"JSON not a double"); return 0.0f; }
+            if ( !pv ) { __context__->throw_error_at(debugInfo,"JSON dereferencing null pointer"); return 0.0f; }
+            if ( !pv->IsDouble() ) { __context__->throw_error_at(debugInfo,"JSON not a double"); return 0.0f; }
             return pv->GetDouble();
         }
         SimNode * subexpr;
@@ -79,11 +79,11 @@ namespace das {
         SimNode_AsString(const LineInfo & a, SimNode * se) : SimNode(a), subexpr(se) {}
         __forceinline char * compute(Context & context) {
             auto pv = (JsValue *) subexpr->evalPtr(context);
-            if ( !pv ) { context.throw_error_at(debugInfo,"JSON dereferencing null pointer"); return nullptr; }
-            if ( !pv->IsString() ) { context.throw_error_at(debugInfo,"JSON not a string"); return nullptr; }
+            if ( !pv ) { __context__->throw_error_at(debugInfo,"JSON dereferencing null pointer"); return nullptr; }
+            if ( !pv->IsString() ) { __context__->throw_error_at(debugInfo,"JSON not a string"); return nullptr; }
             auto ps = pv->GetString();
             auto psl = pv->GetStringLength();
-            return context.heap.allocateString(ps,psl);
+            return __context__->heap.allocateString(ps,psl);
         }
         SimNode * subexpr;
     };
@@ -107,16 +107,16 @@ namespace das {
         __forceinline char * compute(Context & context) {
             auto pv = (JsValue *) subexpr->evalPtr(context);
             if ( !pv ) {
-                if ( !SAFE ) context.throw_error_at(debugInfo,"JSON dereferencing null pointer");
+                if ( !SAFE ) __context__->throw_error_at(debugInfo,"JSON dereferencing null pointer");
                 return nullptr;
             }
             if ( !pv->IsObject() ) {
-                if ( !SAFE ) context.throw_error_at(debugInfo,"JSON field is not an object");
+                if ( !SAFE ) __context__->throw_error_at(debugInfo,"JSON field is not an object");
                 return nullptr;
             }
             auto hf = pv->FindMember(index);
             if ( hf == pv->MemberEnd() ) {
-                if ( !SAFE ) context.throw_error_at(debugInfo,"JSON field not found");
+                if ( !SAFE ) __context__->throw_error_at(debugInfo,"JSON field not found");
                 return nullptr;
             }
             JsValue & value = hf->value;
@@ -133,17 +133,17 @@ namespace das {
         __forceinline char * compute(Context & context) {
             auto pv = (JsValue *) subexpr->evalPtr(context);
             if ( !pv ) {
-                context.throw_error_at(debugInfo,"JSON dereferencing null pointer");
+                __context__->throw_error_at(debugInfo,"JSON dereferencing null pointer");
                 return nullptr;
             }
             if ( !pv->IsObject() ) {
-                context.throw_error_at(debugInfo,"JSON field is not an object");
+                __context__->throw_error_at(debugInfo,"JSON field is not an object");
                 return nullptr;
             }
             auto pi = index->evalPtr(context);
             auto hf = pv->FindMember(pi);
             if ( hf == pv->MemberEnd() ) {
-                context.throw_error_at(debugInfo,"JSON field not found");
+                __context__->throw_error_at(debugInfo,"JSON field not found");
                 return nullptr;
             }
             JsValue & value = hf->value;
@@ -159,16 +159,16 @@ namespace das {
         __forceinline char * compute(Context & context) {
             auto pv = (JsValue *) subexpr->evalPtr(context);
             if ( !pv ) {
-                context.throw_error_at(debugInfo,"JSON dereferencing null pointer");
+                __context__->throw_error_at(debugInfo,"JSON dereferencing null pointer");
                 return nullptr;
             }
             if ( !pv->IsArray() ) {
-                context.throw_error_at(debugInfo,"JSON field is not an array");
+                __context__->throw_error_at(debugInfo,"JSON field is not an array");
                 return nullptr;
             }
             auto idx = cast<uint32_t>::to(index->eval(context));
             if ( idx >= pv->Size() ) {
-                context.throw_error_at(debugInfo,"JSON array index out of range");
+                __context__->throw_error_at(debugInfo,"JSON array index out of range");
                 return nullptr;
             }
             JsValue & value = (*pv)[idx];
@@ -258,31 +258,31 @@ namespace das {
         template <bool SAFE>
         SimNode * simulateIsField ( const string & fn, Context & context, const LineInfo & at, SimNode * subexpr ) const {
             if (fn == "is_object") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                 JsValue,decltype(&JsValue::IsObject),&JsValue::IsObject,SAFE>>(at, subexpr);
             } else if (fn == "is_array") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                 JsValue,decltype(&JsValue::IsArray),&JsValue::IsArray,SAFE>>(at, subexpr);
             } else if (fn == "is_string") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                 JsValue,decltype(&JsValue::IsString),&JsValue::IsString,SAFE>>(at, subexpr);
             } else if (fn == "is_null") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                 JsValue,decltype(&JsValue::IsNull),&JsValue::IsNull,SAFE>>(at, subexpr);
             } else if (fn == "is_bool") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                 JsValue,decltype(&JsValue::IsBool),&JsValue::IsBool,SAFE>>(at, subexpr);
             } else if (fn == "is_int") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                 JsValue,decltype(&JsValue::IsInt),&JsValue::IsInt,SAFE>>(at, subexpr);
             } else if (fn == "is_float") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                 JsValue,decltype(&JsValue::IsFloat),&JsValue::IsFloat,SAFE>>(at, subexpr);
             } else if (fn == "is_double") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                     JsValue,decltype(&JsValue::IsDouble),&JsValue::IsDouble,SAFE>>(at, subexpr);
             } else if (fn == "is_number") {
-                return context.code->makeNode<SimNode_Property<
+                return __context__->code->makeNode<SimNode_Property<
                 JsValue,decltype(&JsValue::IsNumber),&JsValue::IsNumber,SAFE>>(at, subexpr);
             } else {
                 return nullptr;
@@ -299,24 +299,24 @@ namespace das {
             }
             // AS XXX
             else if (fn == "as_bool") {
-                return context.code->makeNode<SimNode_AsBool>(at, subexpr);
+                return __context__->code->makeNode<SimNode_AsBool>(at, subexpr);
             } else if (fn == "as_int") {
-                return context.code->makeNode<SimNode_AsInt>(at, subexpr);
+                return __context__->code->makeNode<SimNode_AsInt>(at, subexpr);
             } else if (fn == "as_float") {
-                return context.code->makeNode<SimNode_AsFloat>(at, subexpr);
+                return __context__->code->makeNode<SimNode_AsFloat>(at, subexpr);
             } else if (fn == "as_double") {
-                return context.code->makeNode<SimNode_AsDouble>(at, subexpr);
+                return __context__->code->makeNode<SimNode_AsDouble>(at, subexpr);
             }else if (fn == "as_string") {
-                return context.code->makeNode<SimNode_AsString>(at, subexpr);
+                return __context__->code->makeNode<SimNode_AsString>(at, subexpr);
             }
             // ARRAY SIZE
             else if (fn == "size") {
-                return context.code->makeNode<SimNode_GetJsonArraySize>(at, subexpr);
+                return __context__->code->makeNode<SimNode_GetJsonArraySize>(at, subexpr);
             }
             // FIELD
             else {
-                auto fieldName = context.code->allocateName(fn);
-                return context.code->makeNode<SimNode_GetJsonFieldConst<false>>(at, subexpr, fieldName);
+                auto fieldName = __context__->code->allocateName(fn);
+                return __context__->code->makeNode<SimNode_GetJsonFieldConst<false>>(at, subexpr, fieldName);
             }
         }
 
@@ -343,38 +343,38 @@ namespace das {
             auto subexpr = sube->simulate(context);
             // AS XXX
             if (fn == "as_bool") {
-                return context.code->makeNode<SimNode_SafeAs<
+                return __context__->code->makeNode<SimNode_SafeAs<
                     decltype(&JsValue::IsBool),&JsValue::IsBool>>(at, subexpr);
             } else if (fn == "as_int") {
-                return context.code->makeNode<SimNode_SafeAs<
+                return __context__->code->makeNode<SimNode_SafeAs<
                     decltype(&JsValue::IsInt),&JsValue::IsInt>>(at, subexpr);
             } else if (fn == "as_float") {
-                return context.code->makeNode<SimNode_SafeAs<
+                return __context__->code->makeNode<SimNode_SafeAs<
                     decltype(&JsValue::IsFloat),&JsValue::IsFloat>>(at, subexpr);
             } else if (fn == "as_double") {
-                return context.code->makeNode<SimNode_SafeAs<
+                return __context__->code->makeNode<SimNode_SafeAs<
                     decltype(&JsValue::IsDouble),&JsValue::IsDouble>>(at, subexpr);
             } else if (fn == "as_string") {
-                return context.code->makeNode<SimNode_SafeAs<
+                return __context__->code->makeNode<SimNode_SafeAs<
                     decltype(&JsValue::IsString),&JsValue::IsString>>(at, subexpr);
             }
             // FIELD
             else {
-                auto fieldName = context.code->allocateName(fn);
-                return context.code->makeNode<SimNode_GetJsonFieldConst<true>>(at, subexpr, fieldName);
+                auto fieldName = __context__->code->allocateName(fn);
+                return __context__->code->makeNode<SimNode_GetJsonFieldConst<true>>(at, subexpr, fieldName);
             }
             return nullptr;
         }
 
         virtual SimNode * simulateGetAt ( Context & context, const LineInfo & at, const TypeDeclPtr & td,
                                          const ExpressionPtr & val, const ExpressionPtr & idx, uint32_t ofs ) const override {
-            if ( ofs ) context.thisProgram->error("internal error, offset in JSON node", at);
+            if ( ofs ) __context__->thisProgram->error("internal error, offset in JSON node", at);
             if ( td->isSimpleType(Type::tString) ) {
-                return context.code->makeNode<SimNode_GetJsonField>(at,
+                return __context__->code->makeNode<SimNode_GetJsonField>(at,
                                                                     val->simulate(context),
                                                                     idx->simulate(context));
             } else if ( td->isIndex() ){
-                return context.code->makeNode<SimNode_GetJsonAt>(at,
+                return __context__->code->makeNode<SimNode_GetJsonAt>(at,
                                                                  val->simulate(context),
                                                                  idx->simulate(context));
             } else {
@@ -384,7 +384,7 @@ namespace das {
 
         virtual SimNode * simulateGetAtR2V ( Context & context, const LineInfo & at, const TypeDeclPtr & td,
                                          const ExpressionPtr & val, const ExpressionPtr & idx, uint32_t ofs ) const override {
-            context.thisProgram->error("internal error, simulateGetAtR2V for JSON node", at);
+            __context__->thisProgram->error("internal error, simulateGetAtR2V for JSON node", at);
             return simulateGetAt(context, at, td, val, idx, ofs);
         }
 
@@ -792,7 +792,7 @@ namespace das {
         writer.walk(args[0], info);
         vec4f bargs[1];
         bargs[0] = cast<void *>::from(&document);
-        context.invoke(*block, bargs, nullptr);
+        __context__->invoke(*block, bargs, nullptr);
         return v_zero();
     }
     

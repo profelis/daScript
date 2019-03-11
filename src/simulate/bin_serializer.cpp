@@ -18,13 +18,11 @@ namespace das {
         uint32_t bytesWritten = 0;
         uint32_t bytesGrow = 1024;
     // writer
-        BinDataSerialize ( Context & ctx ) {
+        BinDataSerialize ( ) {
             DEBUG_BIN_DATA("writing\n");
-            context = &ctx;
             reading = false;
         }
-        BinDataSerialize ( Context & ctx, char * b, uint32_t l ) {
-            context = &ctx;
+        BinDataSerialize ( char * b, uint32_t l ) {
             reading = true;
             bytesAt = b;
             bytesAllocated = l;
@@ -42,7 +40,7 @@ namespace das {
         __forceinline void write ( void * data, uint32_t size ) {
             if ( bytesWritten + size > bytesAllocated ) {
                 uint32_t newSize = max ( bytesAllocated + bytesGrow, bytesWritten + size );
-                bytesAt = context->heap.reallocate(bytesAt, bytesAllocated, newSize);
+                bytesAt = __context__->heap.reallocate(bytesAt, bytesAllocated, newSize);
                 bytesAllocated = newSize;
             }
             DEBUG_BIN_DATA("writing %i bytes at %i\n", size, bytesWritten );
@@ -81,7 +79,7 @@ namespace das {
         void close () {
             if ( !reading && bytesAt ) {
                 DEBUG_BIN_DATA("close at %i bytes\n\n", bytesWritten);
-                bytesAt = context->heap.reallocate(bytesAt, bytesAllocated, bytesWritten);
+                bytesAt = __context__->heap.reallocate(bytesAt, bytesAllocated, bytesWritten);
             }
         }
     // data structures
@@ -97,8 +95,8 @@ namespace das {
             if ( reading ) {
                 uint32_t newSize;
                 load(newSize);
-                array_clear(*context, *pa);
-                array_resize(*context, *pa, newSize, getTypeBaseSize(ti), true);
+                array_clear(*pa);
+                array_resize(*pa, newSize, getTypeBaseSize(ti), true);
             } else {
                 save(pa->size);
             }
@@ -118,14 +116,14 @@ namespace das {
             if ( reading ) {
                 uint32_t length;
                 load ( length );
-                auto hh = (StringHeader *) context->heap.allocate(length + 1 + sizeof(StringHeader));
+                auto hh = (StringHeader *) __context__->heap.allocate(length + 1 + sizeof(StringHeader));
                 hh->length = length;
                 hh->hash = 0;
                 data = (char *) (hh + 1);
                 read ( data, length );
                 data[length] = 0;
             } else {
-                uint32_t length = stringLength(*context, data);
+                uint32_t length = stringLength(data);
                 save ( length );
                 write ( data, length );
             }
@@ -200,8 +198,8 @@ namespace das {
     };
 
     // save ( obj, block<(bytesAt)> )
-    vec4f _builtin_binary_save ( Context & context, SimNode_CallBase * call, vec4f * args ) {
-        BinDataSerialize writer(context);
+    vec4f _builtin_binary_save (SimNode_CallBase * call, vec4f * args ) {
+        BinDataSerialize writer;
         // args
         Block * block = cast<Block *>::to(args[1]);
         auto info = call->types[0];
@@ -215,15 +213,15 @@ namespace das {
         StringHeader * hh = (StringHeader *) writer.bytesAt;
         hh->length = writer.bytesWritten;
         bargs[0] = cast<char *>::from(writer.bytesAt + sizeof(StringHeader));
-        context.invoke(*block, bargs, nullptr);
+        __context__->invoke(*block, bargs, nullptr);
         return v_zero();
     }
 
     // load ( obj, bytesAt )
-    vec4f _builtin_binary_load ( Context & context, SimNode_CallBase * call, vec4f * args ) {
+    vec4f _builtin_binary_load ( SimNode_CallBase * call, vec4f * args ) {
         char * ba = cast<char *>::to(args[1]);
         StringHeader * hh = ((StringHeader *)ba) - 1;
-        BinDataSerialize reader(context, ba, hh->length);
+        BinDataSerialize reader(ba, hh->length);
         auto info = call->types[0];
         reader.walk(args[0], info);
         return v_zero();

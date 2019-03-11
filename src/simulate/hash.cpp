@@ -31,10 +31,6 @@ namespace das
             }
             return fnv_bias;
         }
-    // walker
-        HashDataWalker ( Context & ctx ) {
-            context = &ctx;
-        }
     // data types
         virtual void Bool ( bool & t )          { update(t); }
         virtual void Int64 ( int64_t & t )      { update(t); }
@@ -59,14 +55,14 @@ namespace das
         virtual void WalkBlock ( Block * )              { error("HASH, not expecting block"); }
     };
 
-    uint32_t hash_value ( Context & ctx, void * pX, TypeInfo * info ) {
-        HashDataWalker walker(ctx);
+    uint32_t hash_value ( void * pX, TypeInfo * info ) {
+        HashDataWalker walker;
         walker.walk((char*)pX,info);
         return walker.getHash();
     }
 
-    uint32_t hash_value ( Context & ctx, vec4f value, TypeInfo * info ) {
-        HashDataWalker walker(ctx);
+    uint32_t hash_value ( vec4f value, TypeInfo * info ) {
+        HashDataWalker walker;
         walker.walk(value,info);
         return walker.getHash();
     }

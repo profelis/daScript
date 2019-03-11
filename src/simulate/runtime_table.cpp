@@ -4,25 +4,25 @@
 
 namespace das
 {
-    void table_clear ( Context & context, Table & arr ) {
+    void table_clear ( Table & arr ) {
         if ( arr.lock ) {
-            context.throw_error("clearing locked table");
+            __context__->throw_error("clearing locked table");
             return;
         }
         memset(arr.hashes, 0, arr.capacity * sizeof(uint32_t));
         arr.size = 0;
     }
 
-    void table_lock ( Context & context, Table & arr ) {
+    void table_lock ( Table & arr ) {
         arr.lock ++;
         if ( arr.lock==0 ) {
-            context.throw_error("table lock overflow");
+            __context__->throw_error("table lock overflow");
         }
     }
 
-    void table_unlock ( Context & context, Table & arr ) {
+    void table_unlock ( Table & arr ) {
         if ( arr.lock==0 ) {
-            context.throw_error("table lock underflow");
+            __context__->throw_error("table lock underflow");
         }
         arr.lock --;
     }
@@ -36,10 +36,10 @@ namespace das
         return index;
     }
 
-    bool TableIterator::first ( Context & context, IteratorContext & itc ) {
-        vec4f ll = source->eval(context);
+    bool TableIterator::first ( IteratorContext & itc ) {
+        vec4f ll = source->eval();
         auto pTable = cast<Table *>::to(ll);
-        table_lock(context, *pTable);
+        table_lock(*pTable);
         size_t index = nextValid(pTable, 0);
         char * data    = getData(pTable);
         itc.value      = cast<char *>::from(data + index * stride);
@@ -48,7 +48,7 @@ namespace das
         return (bool) pTable->size;
     }
 
-    bool TableIterator::next  ( Context &, IteratorContext & itc ) {
+    bool TableIterator::next  ( IteratorContext & itc ) {
         char * data = cast<char *>::to(itc.value);
         char * tableData = getData(itc.table);
         size_t index = nextValid(itc.table, (data - tableData) / stride + 1 );
@@ -57,9 +57,9 @@ namespace das
         return data != itc.table_end;
     }
 
-    void TableIterator::close ( Context & context, IteratorContext & itc ) {
+    void TableIterator::close ( IteratorContext & itc ) {
         if ( itc.table ) {
-            table_unlock(context, *itc.table);
+            table_unlock(*itc.table);
         }
     }
 
@@ -77,16 +77,16 @@ namespace das
 
     // delete
 
-    vec4f SimNode_DeleteTable::eval ( Context & context ) {
-        auto pTable = (Table *) subexpr->evalPtr(context);
+    vec4f SimNode_DeleteTable::eval ( ) {
+        auto pTable = (Table *) subexpr->evalPtr();
         pTable = pTable + total - 1;
         for ( uint32_t i=0; i!=total; ++i, pTable-- ) {
             if ( pTable->data ) {
                 if ( !pTable->lock ) {
                     uint32_t oldSize = pTable->capacity*(vts_add_kts + sizeof(uint32_t));
-                    context.heap.free(pTable->data, oldSize);
+                    __context__->heap.free(pTable->data, oldSize);
                 } else {
-                    context.throw_error("deleting locked table");
+                    __context__->throw_error("deleting locked table");
                     return v_zero();
                 }
             }

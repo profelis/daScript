@@ -57,18 +57,18 @@ struct IntFieldsAnnotation : StructureTypeAnnotation {
     struct SimNode_IntFieldDeref : SimNode {
         DAS_PTR_NODE;
         SimNode_IntFieldDeref ( const LineInfo & at, SimNode * rv, char * n ) : SimNode(at), value(rv), name(n) {}
-        char * compute ( Context & context ) {
-            vec4f rv = value->eval(context);
+        char * compute ( ) {
+            vec4f rv = value->eval();
             if ( IntFields * prv = cast<IntFields *>::to(rv) ) {
                 auto it = prv->fields.find(name);
                 if ( it != prv->fields.end() ) {
                     return (char *) (&it->second);
                 } else {
-                    context.throw_error_at(debugInfo, "field %s not found", name);
+                    __context__->throw_error_at(debugInfo, "field %s not found", name);
                     return nullptr;
                 }
             } else {
-                context.throw_error_at(debugInfo,"dereferencing null pointer");
+                __context__->throw_error_at(debugInfo,"dereferencing null pointer");
                 return nullptr;
             }
         }
@@ -80,18 +80,18 @@ struct IntFieldsAnnotation : StructureTypeAnnotation {
         DAS_INT_NODE;
         SimNode_IntFieldDerefR2V ( const LineInfo & at, SimNode * rv, char * n )
             : SimNode_IntFieldDeref(at,rv,n) {}
-        __forceinline int32_t compute ( Context & context ) {
-            vec4f rv = value->eval(context);
+        __forceinline int32_t compute ( ) {
+            vec4f rv = value->eval();
             if ( IntFields * prv = cast<IntFields *>::to(rv) ) {
                 auto it = prv->fields.find(name);
                 if ( it != prv->fields.end() ) {
                     return it->second;
                 } else {
-                    context.throw_error_at(debugInfo,"field %s not found",name);
+                    __context__->throw_error_at(debugInfo,"field %s not found",name);
                     return 0;
                 }
             } else {
-                context.throw_error_at(debugInfo,"dereferencing null pointer");
+                __context__->throw_error_at(debugInfo,"dereferencing null pointer");
                 return 0;
             }
         }
@@ -103,8 +103,8 @@ struct IntFieldsAnnotation : StructureTypeAnnotation {
     struct SimNode_SafeIntFieldDeref : SimNode_IntFieldDeref {
         DAS_PTR_NODE;
         SimNode_SafeIntFieldDeref ( const LineInfo & at, SimNode * rv, char * n ) : SimNode_IntFieldDeref(at,rv,n) {}
-        __forceinline char * compute ( Context & context ) {
-            vec4f rv = value->eval(context);
+        __forceinline char * compute ( ) {
+            vec4f rv = value->eval();
             if ( IntFields * prv = cast<IntFields *>::to(rv) ) {
                 auto it = prv->fields.find(name);
                 if ( it != prv->fields.end() ) {
@@ -147,71 +147,68 @@ struct IntFieldsAnnotation : StructureTypeAnnotation {
         auto pF = structureType->findField(na);
         return pF ? make_shared<TypeDecl>(*pF->type) : nullptr;
     }
-    virtual SimNode * simulateGetField ( const string & na, Context & context,
-                                        const LineInfo & at, const ExpressionPtr & rv ) const  override {
-        return context.code->makeNode<SimNode_IntFieldDeref>(at,rv->simulate(context),context.code->allocateName(na));
+    virtual SimNode * simulateGetField ( const string & na, const LineInfo & at, const ExpressionPtr & rv ) const  override {
+        return __context__->code->makeNode<SimNode_IntFieldDeref>(at,rv->simulate(),__context__->code->allocateName(na));
     }
-    virtual SimNode * simulateGetFieldR2V ( const string & na, Context & context,
-                                           const LineInfo & at, const ExpressionPtr & rv ) const  override {
-        return context.code->makeNode<SimNode_IntFieldDerefR2V>(at,rv->simulate(context),context.code->allocateName(na));
-    }    virtual SimNode * simulateSafeGetField ( const string & na, Context & context,
-                                            const LineInfo & at, const ExpressionPtr & rv ) const  override {
-        return context.code->makeNode<SimNode_SafeIntFieldDeref>(at,rv->simulate(context),context.code->allocateName(na));
+    virtual SimNode * simulateGetFieldR2V ( const string & na, const LineInfo & at, const ExpressionPtr & rv ) const  override {
+        return __context__->code->makeNode<SimNode_IntFieldDerefR2V>(at,rv->simulate(),__context__->code->allocateName(na));
+    }    virtual SimNode * simulateSafeGetField ( const string & na, const LineInfo & at, const ExpressionPtr & rv ) const  override {
+        return __context__->code->makeNode<SimNode_SafeIntFieldDeref>(at,rv->simulate(),__context__->code->allocateName(na));
     }
     virtual size_t getSizeOf() const override { return sizeof(IntFields); }
     virtual size_t getAlignOf() const override { return alignof(IntFields); }
 };
 
-void testFields ( Context * ctx ) {
+void testFields ( ) {
     int32_t t = 0;
     IntFields x;
-    auto fx = ctx->findFunction("testFields");
+    auto fx = __context__->findFunction("testFields");
     if (!fx) {
-        ctx->throw_error("function testFields not found");
+        __context__->throw_error("function testFields not found");
         return;
     }
     vec4f args[1] = { cast<IntFields *>::from(&x) };
     x.fields["a"] = 1;
-    t = cast<int32_t>::to ( ctx->eval(fx, args) );
-    assert(!ctx->getException());
+    t = cast<int32_t>::to ( __context__->eval(fx, args) );
+    assert(!__context__->getException());
     assert(t==1);
     x.fields["b"] = 2;
-    t = cast<int32_t>::to ( ctx->eval(fx, args) );
-    assert(!ctx->getException());
+    t = cast<int32_t>::to ( __context__->eval(fx, args) );
+    assert(!__context__->getException());
     assert(t==3);
     x.fields["c"] = 3;
-    t = cast<int32_t>::to ( ctx->eval(fx, args) );
-    assert(!ctx->getException());
+    t = cast<int32_t>::to ( __context__->eval(fx, args) );
+    assert(!__context__->getException());
     assert(t==6);
     x.fields["d"] = 4;
-    t = cast<int32_t>::to ( ctx->eval(fx, args) );
-    assert(!ctx->getException());
+    t = cast<int32_t>::to ( __context__->eval(fx, args) );
+    assert(!__context__->getException());
     assert(t==10);
     x.fields.erase("b");
-    t = cast<int32_t>::to ( ctx->eval(fx, args) );
-    assert(!ctx->getException());
+    t = cast<int32_t>::to ( __context__->eval(fx, args) );
+    assert(!__context__->getException());
     assert(t==8);
 }
 
-inline void test_das_string(Block * block, Context * context) {
+inline void test_das_string(Block * block) {
     string str = "test_das_string";
     vec4f args[1];
     args[0] = cast<void *>::from(&str);
-    context->invoke(*block, args, nullptr);
-    if (str != "out_of_it") context->throw_error("test string mismatch");
+    __context__->invoke(*block, args, nullptr);
+    if (str != "out_of_it") __context__->throw_error("test string mismatch");
 }
 
-vec4f new_and_init ( Context & context, SimNode_CallBase * call, vec4f * ) {
+vec4f new_and_init ( SimNode_CallBase * call, vec4f * ) {
     TypeInfo * typeInfo = call->types[0];
     if ( typeInfo->dim || typeInfo->type!=Type::tStructure ) {
-        context.throw_error("invalid type");
+        __context__->throw_error("invalid type");
         return v_zero();
     }
     auto size = getTypeSize(typeInfo);
-    auto data = context.heap.allocate(size);
+    auto data = __context__->heap.allocate(size);
     if ( typeInfo->structType && typeInfo->structType->initializer!=-1 ) {
-        auto fn = context.getFunction(typeInfo->structType->initializer);
-        context.callWithCopyOnReturn(fn, nullptr, data, 0);
+        auto fn = __context__->getFunction(typeInfo->structType->initializer);
+        __context__->callWithCopyOnReturn(fn, nullptr, data, 0);
     } else {
         memset(data, 0, size);
     }

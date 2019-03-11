@@ -26,21 +26,21 @@ namespace das
 
     struct SimPolicy_String {
         // basic
-        static __forceinline bool Equ     ( vec4f a, vec4f b, Context & )
+        static __forceinline bool Equ     ( vec4f a, vec4f b )
             { return strcmp(to_rts(a), to_rts(b))==0; }
-        static __forceinline bool NotEqu  ( vec4f a, vec4f b, Context & )
+        static __forceinline bool NotEqu  ( vec4f a, vec4f b )
             { return (bool) strcmp(to_rts(a), to_rts(b)); }
         // ordered
-        static __forceinline bool LessEqu ( vec4f a, vec4f b, Context & )
+        static __forceinline bool LessEqu ( vec4f a, vec4f b )
             { return strcmp(to_rts(a), to_rts(b))<=0; }
-        static __forceinline bool GtEqu   ( vec4f a, vec4f b, Context & )
+        static __forceinline bool GtEqu   ( vec4f a, vec4f b )
             { return strcmp(to_rts(a), to_rts(b))>=0; }
-        static __forceinline bool Less    ( vec4f a, vec4f b, Context & )
+        static __forceinline bool Less    ( vec4f a, vec4f b )
             { return strcmp(to_rts(a), to_rts(b))<0; }
-        static __forceinline bool Gt      ( vec4f a, vec4f b, Context & )
+        static __forceinline bool Gt      ( vec4f a, vec4f b )
             { return strcmp(to_rts(a), to_rts(b))>0; }
-        static vec4f Add  ( vec4f a, vec4f b, Context & context );
-        static void SetAdd ( char * a, vec4f b, Context & context );
+        static vec4f Add  ( vec4f a, vec4f b );
+        static void SetAdd ( char * a, vec4f b );
     };
 
     template <> struct SimPolicy<char *> : SimPolicy_String {};

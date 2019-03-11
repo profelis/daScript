@@ -29,8 +29,8 @@ namespace  das {
                 }
             }
         }
-        virtual SimNode * makeSimNode ( Context & context ) override {
-            return context.code->makeNode<SimT>(at);
+        virtual SimNode * makeSimNode ( ) override {
+            return __context__->code->makeNode<SimT>(at);
         }
     };
 

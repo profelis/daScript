@@ -6,7 +6,6 @@ namespace das
         none,
         autoinfer,
         alias,
-        fakeContext,
         anyArgument,
         tVoid,
         tBool,

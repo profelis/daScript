@@ -69,25 +69,25 @@ namespace das
 
     // core functions
 
-    void builtin_throw ( char * text, Context * context ) {
-        context->throw_error(text);
+    void builtin_throw ( char * text ) {
+        __context__->throw_error(text);
     }
 
-    void builtin_print ( char * text, Context * context ) {
-        context->to_out(text);
+    void builtin_print ( char * text ) {
+        __context__->to_out(text);
     }
 
-    vec4f builtin_breakpoint ( Context & context, SimNode_CallBase * call, vec4f * ) {
-        context.breakPoint(call->debugInfo.column, call->debugInfo.line);
+    vec4f builtin_breakpoint ( SimNode_CallBase * call, vec4f * ) {
+        __context__->breakPoint(call->debugInfo.column, call->debugInfo.line);
         return v_zero();
     }
 
-    void builtin_stackwalk ( Context * context) {
-        context->stackWalk();
+    void builtin_stackwalk ( ) {
+        __context__->stackWalk();
     }
 
-    void builtin_terminate ( Context * context ) {
-        context->throw_error("terminate");
+    void builtin_terminate ( ) {
+        __context__->throw_error("terminate");
     }
 
     int builtin_table_size ( const Table * arr ) {
@@ -98,31 +98,31 @@ namespace das
         return arr->capacity;
     }
 
-    void builtin_table_clear ( Table * arr, Context * context ) {
-        table_clear(*context, *arr);
+    void builtin_table_clear ( Table * arr ) {
+        table_clear(*arr);
     }
 
-    vec4f _builtin_hash ( Context & context, SimNode_CallBase * call, vec4f * args ) {
-        auto uhash = hash_value(context, args[0], call->types[0]);
+    vec4f _builtin_hash ( SimNode_CallBase * call, vec4f * args ) {
+        auto uhash = hash_value(args[0], call->types[0]);
         return cast<uint32_t>::from(uhash);
     }
 
-    uint32_t heap_bytes_allocated ( Context * context ) {
-        return context->heap.bytesAllocated();
+    uint32_t heap_bytes_allocated ( ) {
+        return __context__->heap.bytesAllocated();
     }
-    uint32_t heap_high_watermark ( Context * context ) {
-      return (uint32_t) context->heap.buddyHighWatermark();
+    uint32_t heap_high_watermark ( ) {
+      return (uint32_t) __context__->heap.buddyHighWatermark();
     }
-    int32_t heap_depth ( Context * context ) {
-      return (int32_t) context->heap.buddyChunksCount();
-    }
-
-    void builtin_table_lock ( Table * arr, Context * context ) {
-        table_lock(*context, *arr);
+    int32_t heap_depth ( ) {
+      return (int32_t) __context__->heap.buddyChunksCount();
     }
 
-    void builtin_table_unlock ( Table * arr, Context * context ) {
-        table_unlock(*context, *arr);
+    void builtin_table_lock ( Table * arr ) {
+        table_lock(*arr);
+    }
+
+    void builtin_table_unlock ( Table * arr ) {
+        table_unlock(*arr);
     }
 
     void Module_BuiltIn::addRuntime(ModuleLibrary & lib) {

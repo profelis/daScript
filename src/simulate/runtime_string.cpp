@@ -9,40 +9,40 @@ namespace das
 {
     // string operations
 
-    vec4f SimPolicy_String::Add ( vec4f a, vec4f b, Context & context ) {
+    vec4f SimPolicy_String::Add ( vec4f a, vec4f b ) {
         const char *  sA = to_rts(a);
-        auto la = stringLength(context, sA);
+        auto la = stringLength(sA);
         const char *  sB = to_rts(b);
-        auto lb = stringLength(context, sB);
+        auto lb = stringLength(sB);
         uint32_t commonLength = la + lb;
         if ( !commonLength ) {
             return v_zero();
-        } else if ( char * sAB = (char * ) context.heap.allocateString(nullptr, commonLength) ) {
+        } else if ( char * sAB = (char * ) __context__->heap.allocateString(nullptr, commonLength) ) {
             memcpy ( sAB, sA, la );
             memcpy ( sAB+la, sB, lb+1 );
             return cast<char *>::from(sAB);
         } else {
-            context.throw_error("can't add two strings, out of heap");
+            __context__->throw_error("can't add two strings, out of heap");
             return v_zero();
         }
     }
 
-    void SimPolicy_String::SetAdd ( char * a, vec4f b, Context & context ) {
+    void SimPolicy_String::SetAdd ( char * a, vec4f b ) {
         char ** pA = (char **)a;
         const char *  sA = *pA ? *pA : rts_null;
-        auto la = stringLength(context, sA);
+        auto la = stringLength(sA);
         const char *  sB = to_rts(b);
-        auto lb = stringLength(context, sB);
+        auto lb = stringLength(sB);
         uint32_t commonLength = la + lb;
         if ( !commonLength ) {
             // *pA = nullptr; is unnecessary, because its already nullptr
             return;
-        } else if ( char * sAB = (char * ) context.heap.allocateString(nullptr, commonLength) ) {
+        } else if ( char * sAB = (char * ) __context__->heap.allocateString(nullptr, commonLength) ) {
             memcpy ( sAB, sA, la );
             memcpy ( sAB+la, sB, lb+1 );
             *pA = sAB;
         } else {
-            context.throw_error("can't add two strings, out of heap");
+            __context__->throw_error("can't add two strings, out of heap");
         }
     }
 
@@ -142,17 +142,17 @@ namespace das
         return ssw.str();
     }
 
-    vec4f SimNode_StringBuilder::eval ( Context & context ) {
+    vec4f SimNode_StringBuilder::eval ( ) {
         vec4f * argValues = (vec4f *)(alloca(nArguments * sizeof(vec4f)));
-        evalArgs(context, argValues);
-        StringBuilderWriter writer(context.heap);
+        evalArgs(argValues);
+        StringBuilderWriter writer(__context__->heap);
         DebugDataWalker<StringBuilderWriter> walker(writer, PrintFlags::string_builder);
         for ( int i = 0; i!=nArguments; ++i ) {
             walker.walk(argValues[i], types[i]);
         }
         auto pStr = writer.c_str();
         if ( !pStr ) {
-            context.throw_error("can't allocate string builder result, out of heap");
+            __context__->throw_error("can't allocate string builder result, out of heap");
         }
         return cast<char *>::from(pStr);
     }

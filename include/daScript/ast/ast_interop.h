@@ -35,9 +35,6 @@ namespace das
                 auto arg = make_shared<Variable>();
                 arg->name = "arg" + to_string(argi);
                 arg->type = args[argi];
-                if ( arg->type->baseType==Type::fakeContext ) {
-                    arg->init = make_shared<ExprFakeContext>(at);
-                }
                 this->arguments.push_back(arg);
             }
             this->result = makeType<Result>(lib);
@@ -55,9 +52,9 @@ namespace das
                 }
             }
         }
-        virtual SimNode * makeSimNode ( Context & context ) override {
-            const char * fnName = context.code->allocateName(this->name);
-            return context.code->makeNode<SimNodeT>(at, fnName);
+        virtual SimNode * makeSimNode ( ) override {
+            const char * fnName = __context__->code->allocateName(this->name);
+            return __context__->code->makeNode<SimNodeT>(at, fnName);
         }
     };
 
@@ -70,9 +67,6 @@ namespace das
                 auto arg = make_shared<Variable>();
                 arg->name = "arg" + to_string(argi);
                 arg->type = args[argi];
-                if ( arg->type->baseType==Type::fakeContext ) {
-                    arg->init = make_shared<ExprConstPtr>(at);
-                }
                 this->arguments.push_back(arg);
             }
             this->result = makeType<RetT>(lib);
@@ -87,9 +81,9 @@ namespace das
             : InteropFnBase<RetT,Args...>(name,lib) {
             this->callBased = true;
         }
-        virtual SimNode * makeSimNode ( Context & context ) override {
-            const char * fnName = context.code->allocateName(this->name);
-            return context.code->makeNode<SimNode_InteropFuncCall<func>>(BuiltInFunction::at,fnName);
+        virtual SimNode * makeSimNode ( ) override {
+            const char * fnName = __context__->code->allocateName(this->name);
+            return __context__->code->makeNode<SimNode_InteropFuncCall<func>>(BuiltInFunction::at,fnName);
         }
     };
 

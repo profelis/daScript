@@ -7,8 +7,8 @@
 namespace das {
 
     void DataWalker::error ( const char * message ) {
-        if ( context ) {
-            context->throw_error(message);
+        if ( __context__ ) {
+            __context__->throw_error(message);
         }
         cancel = true;
     }

@@ -44,7 +44,7 @@ namespace das
             string      name;
             TypeDeclPtr decl;
             uint32_t    offset;
-            function<SimNode * (FactoryNodeType,Context &,const LineInfo &, const ExpressionPtr &)>   factory;
+            function<SimNode * (FactoryNodeType,const LineInfo &, const ExpressionPtr &)>   factory;
         };
         ManagedStructureAnnotation (const string & n, ModuleLibrary & ml )
             : TypeAnnotation(n), mlib(&ml) { }
@@ -77,39 +77,35 @@ namespace das
                 return nullptr;
             }
         }
-        virtual SimNode * simulateGetField ( const string & na, Context & context,
-                                            const LineInfo & at, const ExpressionPtr & value ) const override {
+        virtual SimNode * simulateGetField ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
             auto it = fields.find(na);
             if ( it!=fields.end() ) {
-                return it->second.factory(FactoryNodeType::getField,context,at,value);
+                return it->second.factory(FactoryNodeType::getField,at,value);
             } else {
                 return nullptr;
             }
         }
-        virtual SimNode * simulateGetFieldR2V ( const string & na, Context & context,
-                                               const LineInfo & at, const ExpressionPtr & value ) const override {
+        virtual SimNode * simulateGetFieldR2V ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
             auto it = fields.find(na);
             if ( it!=fields.end() ) {
                 auto itT = it->second.decl;
-                return it->second.factory(FactoryNodeType::getFieldR2V,context,at,value);
+                return it->second.factory(FactoryNodeType::getFieldR2V,at,value);
             } else {
                 return nullptr;
             }
         }
-        virtual SimNode * simulateSafeGetField ( const string & na, Context & context,
-                                                const LineInfo & at, const ExpressionPtr & value ) const override {
+        virtual SimNode * simulateSafeGetField ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
             auto it = fields.find(na);
             if ( it!=fields.end() ) {
-                return it->second.factory(FactoryNodeType::safeGetField,context,at,value);
+                return it->second.factory(FactoryNodeType::safeGetField,at,value);
             } else {
                 return nullptr;
             }
         };
-        virtual SimNode * simulateSafeGetFieldPtr ( const string & na, Context & context,
-                                                   const LineInfo & at, const ExpressionPtr & value ) const override {
+        virtual SimNode * simulateSafeGetFieldPtr ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
             auto it = fields.find(na);
             if ( it!=fields.end() ) {
-                return it->second.factory(FactoryNodeType::safeGetFieldPtr,context,at,value);
+                return it->second.factory(FactoryNodeType::safeGetFieldPtr,at,value);
             } else {
                 return nullptr;
             }
@@ -124,10 +120,10 @@ namespace das
             using resultType = decltype((((ManagedType *)0)->*PROP)());
             field.decl = makeType<resultType>(*mlib);
             field.offset = -1U;
-            field.factory = [](FactoryNodeType nt,Context & context,const LineInfo & at, const ExpressionPtr & value) -> SimNode * {
+            field.factory = [](FactoryNodeType nt, const LineInfo & at, const ExpressionPtr & value) -> SimNode * {
                 switch ( nt ) {
                     case FactoryNodeType::getField:
-                        return context.code->makeNode<SimNode_Property<ManagedType,FunT,PROP,false>>(at, value->simulate(context));
+                        return __context__->code->makeNode<SimNode_Property<ManagedType,FunT,PROP,false>>(at, value->simulate());
                     case FactoryNodeType::safeGetField:
                     case FactoryNodeType::safeGetFieldPtr:
                     case FactoryNodeType::getFieldR2V:
@@ -148,26 +144,26 @@ namespace das
             field.decl = pT;
             field.offset = offset;
             auto baseType = field.decl->baseType;
-            field.factory = [offset,baseType](FactoryNodeType nt,Context & context,const LineInfo & at, const ExpressionPtr & value) -> SimNode * {
+            field.factory = [offset,baseType](FactoryNodeType nt,const LineInfo & at, const ExpressionPtr & value) -> SimNode * {
                 if ( !value->type->isPointer() ) {
                     if ( nt==FactoryNodeType::getField || nt==FactoryNodeType::getFieldR2V ) {
                         auto r2vType = (nt==FactoryNodeType::getField) ? Type::none : baseType;
-                        auto tnode = value->trySimulate(context, offset, r2vType);
+                        auto tnode = value->trySimulate(offset, r2vType);
                         if ( tnode ) {
                             return tnode;
                         }
                     }
                 }
-                auto simV = value->simulate(context);
+                auto simV = value->simulate();
                 switch ( nt ) {
                     case FactoryNodeType::getField:
-                        return context.code->makeNode<SimNode_FieldDeref>(at,simV,offset);
+                        return __context__->code->makeNode<SimNode_FieldDeref>(at,simV,offset);
                     case FactoryNodeType::getFieldR2V:
-                        return context.code->makeValueNode<SimNode_FieldDerefR2V>(baseType,at,simV,offset);
+                        return __context__->code->makeValueNode<SimNode_FieldDerefR2V>(baseType,at,simV,offset);
                     case FactoryNodeType::safeGetField:
-                        return context.code->makeNode<SimNode_SafeFieldDeref>(at,simV,offset);
+                        return __context__->code->makeNode<SimNode_SafeFieldDeref>(at,simV,offset);
                     case FactoryNodeType::safeGetFieldPtr:
-                        return context.code->makeNode<SimNode_SafeFieldDerefPtr>(at,simV,offset);
+                        return __context__->code->makeNode<SimNode_SafeFieldDerefPtr>(at,simV,offset);
                     default:
                         return nullptr;
                 }
@@ -220,11 +216,11 @@ namespace das
             : ManagedStructureAnnotation<OT,false>(n,ml) { }
         virtual bool canNew() const override { return true; }
         virtual bool canDeletePtr() const override { return true; }
-        virtual SimNode * simulateGetNew ( Context & context, const LineInfo & at ) const override {
-            return context.code->makeNode<SimNode_NewHandle<ManagedType>>(at);
+        virtual SimNode * simulateGetNew ( const LineInfo & at ) const override {
+            return __context__->code->makeNode<SimNode_NewHandle<ManagedType>>(at);
         }
-        virtual SimNode * simulateDeletePtr ( Context & context, const LineInfo & at, SimNode * sube, uint32_t count ) const override {
-            return context.code->makeNode<SimNode_DeleteHandlePtr<ManagedType>>(at,sube,count);
+        virtual SimNode * simulateDeletePtr ( const LineInfo & at, SimNode * sube, uint32_t count ) const override {
+            return __context__->code->makeNode<SimNode_DeleteHandlePtr<ManagedType>>(at,sube,count);
         }
     };
 
@@ -238,8 +234,8 @@ namespace das
             DAS_INT_NODE;
             SimNode_VectorLength ( const LineInfo & at, SimNode * rv )
                 : SimNode(at), value(rv) {}
-            __forceinline int32_t compute ( Context & context ) {
-                auto pValue = (VectorType *) value->evalPtr(context);
+            __forceinline int32_t compute ( ) {
+                auto pValue = (VectorType *) value->evalPtr();
                 return int32_t(pValue->size());
             }
             SimNode * value;
@@ -248,11 +244,11 @@ namespace das
             DAS_PTR_NODE;
             SimNode_AtStdVector ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t ofs )
                 : SimNode_At(at, rv, idx, 0, ofs, 0) {}
-            __forceinline char * compute ( Context & context ) {
-                auto pValue = (VectorType *) value->evalPtr(context);
-                uint32_t idx = cast<uint32_t>::to(index->eval(context));
+            __forceinline char * compute ( ) {
+                auto pValue = (VectorType *) value->evalPtr();
+                uint32_t idx = cast<uint32_t>::to(index->eval());
                 if ( idx >= pValue->size() ) {
-                    context.throw_error_at(debugInfo,"std::vector index out of range");
+                    __context__->throw_error_at(debugInfo,"std::vector index out of range");
                     return nullptr;
                 } else {
                     return ((char *)(pValue->data() + idx)) + offset;
@@ -260,8 +256,8 @@ namespace das
             }
         };
         struct VectorIterator : Iterator {
-            virtual bool first ( Context & context, IteratorContext & itc ) override {
-                vec4f ll = source->eval(context);
+            virtual bool first ( IteratorContext & itc ) override {
+                vec4f ll = source->eval();
                 VectorType * pArray = cast<VectorType *>::to(ll);
                 char * data    = (char *) pArray->data();
                 uint32_t size = (uint32_t) pArray->size();
@@ -270,19 +266,19 @@ namespace das
                 itc.array      = nullptr;
                 return (bool) size;
             }
-            virtual bool next  ( Context &, IteratorContext & itc ) override {
+            virtual bool next  ( IteratorContext & itc ) override {
                 char * data = cast<char *>::to(itc.value) + sizeof(OT);
                 itc.value = cast<char *>::from(data);
                 return data != itc.array_end;
             }
-            virtual void close ( Context &, IteratorContext & ) override {
+            virtual void close ( IteratorContext & ) override {
             }
             SimNode *   source;
         };
         struct SimNode_VectorIterator : SimNode, VectorIterator {
             SimNode_VectorIterator ( const LineInfo & at, SimNode * s )
                 : SimNode(at) { VectorIterator::source = s;}
-            virtual vec4f eval ( Context & ) override {
+            virtual vec4f eval ( ) override {
                 return cast<Iterator *>::from(static_cast<VectorIterator *>(this));
             }
         };
@@ -303,19 +299,18 @@ namespace das
         }
         virtual TypeDeclPtr makeIndexType ( TypeDeclPtr & ) const override { return make_shared<TypeDecl>(*vecType); }
         virtual TypeDeclPtr makeIteratorType () const override { return make_shared<TypeDecl>(*vecType); }
-        virtual SimNode * simulateGetAt ( Context & context, const LineInfo & at, const TypeDeclPtr &,
+        virtual SimNode * simulateGetAt ( const LineInfo & at, const TypeDeclPtr &,
                                          const ExpressionPtr & rv, const ExpressionPtr & idx, uint32_t ofs ) const override {
-            return context.code->makeNode<SimNode_AtStdVector>(at,
-                                                               rv->simulate(context),
-                                                               idx->simulate(context),
+            return __context__->code->makeNode<SimNode_AtStdVector>(at,
+                                                               rv->simulate(),
+                                                               idx->simulate(),
                                                                ofs);
         }
-        virtual SimNode * simulateGetIterator ( Context & context, const LineInfo & at, SimNode * rv ) const override {
-            return context.code->makeNode<SimNode_VectorIterator>(at, rv);
+        virtual SimNode * simulateGetIterator ( const LineInfo & at, SimNode * rv ) const override {
+            return __context__->code->makeNode<SimNode_VectorIterator>(at, rv);
         }
-        virtual SimNode * simulateGetField ( const string & na, Context & context,
-                                            const LineInfo & at, const ExpressionPtr & value ) const override {
-            if ( na=="length" ) return context.code->makeNode<SimNode_VectorLength>(at,value->simulate(context));
+        virtual SimNode * simulateGetField ( const string & na, const LineInfo & at, const ExpressionPtr & value ) const override {
+            if ( na=="length" ) return __context__->code->makeNode<SimNode_VectorLength>(at,value->simulate());
             return nullptr;
         }
         TypeDeclPtr vecType;
@@ -326,22 +321,22 @@ namespace das
         struct SimNode_AtStdVectorR2V : ManagedVectorAnnotation<OT,false>::SimNode_AtStdVector {
             SimNode_AtStdVectorR2V ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t ofs )
                 : ManagedVectorAnnotation<OT,false>::SimNode_AtStdVector(at, rv, idx, ofs) {}
-            virtual vec4f eval ( Context & context ) override {
-                OT * pR = (OT *) ManagedVectorAnnotation<OT,false>::SimNode_AtStdVector::compute(context);
+            virtual vec4f eval ( ) override {
+                OT * pR = (OT *) ManagedVectorAnnotation<OT,false>::SimNode_AtStdVector::compute();
                 return cast<OT>::from(*pR);
             }
 #define EVAL_NODE(TYPE,CTYPE)                                           \
-            virtual CTYPE eval##TYPE ( Context & context ) override {   \
-                return *(CTYPE *)ManagedVectorAnnotation<OT,false>::SimNode_AtStdVector::compute(context);    \
+            virtual CTYPE eval##TYPE ( ) override {   \
+                return *(CTYPE *)ManagedVectorAnnotation<OT,false>::SimNode_AtStdVector::compute();    \
             }
             DAS_EVAL_NODE
 #undef EVAL_NODE
         };
-        virtual SimNode * simulateGetAtR2V ( Context & context, const LineInfo & at, const TypeDeclPtr &,
+        virtual SimNode * simulateGetAtR2V ( const LineInfo & at, const TypeDeclPtr &,
                                             const ExpressionPtr & rv, const ExpressionPtr & idx, uint32_t ofs ) const override {
-            return context.code->makeNode<SimNode_AtStdVectorR2V>(at,
-                                                                  rv->simulate(context),
-                                                                  idx->simulate(context),
+            return __context__->code->makeNode<SimNode_AtStdVectorR2V>(at,
+                                                                  rv->simulate(),
+                                                                  idx->simulate(),
                                                                   ofs);
         }
     };
@@ -354,11 +349,11 @@ namespace das
         virtual bool isLocal() const override { return true; }
         virtual size_t getSizeOf() const override { return sizeof(OT); }
         virtual bool isRefType() const override { return false; }
-        virtual SimNode * simulateCopy ( Context & context, const LineInfo & at, SimNode * l, SimNode * r ) const override {
-            return context.code->makeNode<SimNode_CopyValue<OT>>(at, l, r);
+        virtual SimNode * simulateCopy ( const LineInfo & at, SimNode * l, SimNode * r ) const override {
+            return __context__->code->makeNode<SimNode_CopyValue<OT>>(at, l, r);
         }
-        virtual SimNode * simulateRef2Value ( Context & context, const LineInfo & at, SimNode * l ) const override {
-            return context.code->makeNode<SimNode_Ref2Value<OT>>(at, l);
+        virtual SimNode * simulateRef2Value ( const LineInfo & at, SimNode * l ) const override {
+            return __context__->code->makeNode<SimNode_Ref2Value<OT>>(at, l);
         }
     };
 }

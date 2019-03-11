@@ -111,8 +111,9 @@ namespace das {
         ProgramPtr      program;
     protected:
         vec4f eval ( Expression * expr, bool & failed ) {
+            context_guard guard(ctx);
             ctx.restart();
-            auto node = expr->simulate(ctx);
+            auto node = expr->simulate();
             ctx.restart();
             vec4f result = ctx.evalWithCatch(node);
             if ( ctx.getException() ) {
@@ -419,8 +420,7 @@ namespace das {
         virtual ExpressionPtr visit ( ExprCall * expr ) override {
             bool allNoSideEffects = true;
             for ( auto & arg : expr->arguments ) {
-                if ( arg->type->baseType!=Type::fakeContext )
-                    allNoSideEffects &= arg->noSideEffects;
+                allNoSideEffects &= arg->noSideEffects;
             }
             if ( allNoSideEffects ) {
                 if ( isNop(expr->func->shared_from_this()) ) {
@@ -435,8 +435,7 @@ namespace das {
             if ( expr->func->result->isFoldable() && (expr->func->sideEffectFlags==0) ) {
                 auto allConst = true;
                 for ( auto & arg : expr->arguments ) {
-                    if ( arg->type->baseType!=Type::fakeContext )
-                        allConst &= arg->constexpression;
+                    allConst &= arg->constexpression;
                 }
                 if ( allConst ) {
                     if ( expr->func->builtIn ) {
@@ -569,7 +568,8 @@ namespace das {
             DAS_ASSERTF ( !program->failed(), "internal error while folding (remove unused)?" );
             program->allocateStack(dummy);
             DAS_ASSERTF ( !program->failed(), "internal error while folding (allocate stack)?" );
-            program->simulate(ctx, dummy);
+            context_guard guard(ctx);
+            program->simulate(dummy);
             DAS_ASSERTF ( !program->failed(), "internal error while folding (simulate)?" );
         }
     protected:
@@ -577,14 +577,12 @@ namespace das {
         virtual ExpressionPtr visit ( ExprCall * expr ) override {
             bool allNoSideEffects = true;
             for ( auto & arg : expr->arguments ) {
-                if ( arg->type->baseType!=Type::fakeContext )
-                    allNoSideEffects &= arg->noSideEffects;
+                allNoSideEffects &= arg->noSideEffects;
             }
             if ( expr->func->result->isFoldable() && (expr->func->sideEffectFlags==0) && !expr->func->builtIn ) {
                 auto allConst = true;
                 for ( auto & arg : expr->arguments ) {
-                    if ( arg->type->baseType!=Type::fakeContext )
-                        allConst &= arg->constexpression;
+                    allConst &= arg->constexpression;
                 }
                 if ( allConst ) {
                     DAS_ASSERT ( expr->func->index!=-1 );
@@ -616,9 +614,9 @@ namespace das {
     }
 
     bool Program::verifyAndFoldContracts() {
-        ContractFolding context(shared_from_this());
-        visit(context);
-        return context.didAnything();
+        ContractFolding cf(shared_from_this());
+        visit(cf);
+        return cf.didAnything();
     }
 }
 

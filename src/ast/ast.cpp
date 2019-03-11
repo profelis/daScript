@@ -302,11 +302,11 @@ namespace das {
         return cexpr;
     }
 
-    SimNode * ExprRef2Value::GetR2V ( Context & context, const LineInfo & at, const TypeDeclPtr & type, SimNode * expr ) {
+    SimNode * ExprRef2Value::GetR2V ( const LineInfo & at, const TypeDeclPtr & type, SimNode * expr ) {
         if ( type->isHandle() ) {
-            auto resN = type->annotation->simulateRef2Value(context, at, expr);
+            auto resN = type->annotation->simulateRef2Value(at, expr);
             if ( !resN ) {
-                context.thisProgram->error("integration error, simulateRef2Value returned null",
+                __context__->thisProgram->error("integration error, simulateRef2Value returned null",
                                            at, CompilationError::missing_node );
             }
             return resN;
@@ -314,7 +314,7 @@ namespace das {
             if ( type->isRefType() ) {
                 return expr;
             } else {
-                return context.code->makeValueNode<SimNode_Ref2Value>(type->baseType, at, expr);
+                return __context__->code->makeValueNode<SimNode_Ref2Value>(type->baseType, at, expr);
             }
         }
     }

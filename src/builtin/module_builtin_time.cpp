@@ -43,25 +43,25 @@ namespace das {
         static __forceinline auto to_time ( vec4f a ) {
             return cast<Time>::to(a).time;
         }
-        static __forceinline bool Equ     ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool Equ     ( vec4f a, vec4f b ) {
             return to_time(a) == to_time(b);
         }
-        static __forceinline bool NotEqu  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool NotEqu  ( vec4f a, vec4f b ) {
             return to_time(a) != to_time(b);
         }
-        static __forceinline bool GtEqu  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool GtEqu  ( vec4f a, vec4f b ) {
             return to_time(a) >= to_time(b);
         }
-        static __forceinline bool LessEqu  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool LessEqu  ( vec4f a, vec4f b ) {
             return to_time(a) <= to_time(b);
         }
-        static __forceinline bool Gt  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool Gt  ( vec4f a, vec4f b ) {
             return to_time(a) > to_time(b);
         }
-        static __forceinline bool Less  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline bool Less  ( vec4f a, vec4f b ) {
             return to_time(a) < to_time(b);
         }
-        static __forceinline vec4f Sub  ( vec4f a, vec4f b, Context & ) {
+        static __forceinline vec4f Sub  ( vec4f a, vec4f b ) {
             double dt = difftime(to_time(a), to_time(b));
             return cast<float>::from((float)dt);
         }

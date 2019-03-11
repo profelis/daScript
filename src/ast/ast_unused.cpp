@@ -482,9 +482,9 @@ namespace das {
     bool Program::optimizationUnused(TextWriter & logs) {
         buildAccessFlags(logs);
         // remove itselft
-        RemoveUnusedLocalVariables context;
-        visit(context);
-        return context.didAnything();
+        RemoveUnusedLocalVariables ruf;
+        visit(ruf);
+        return ruf.didAnything();
     }
 }
 
