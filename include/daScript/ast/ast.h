@@ -109,7 +109,12 @@ namespace das
 
     typedef vector<AnnotationArgument> AnnotationArguments;
 
+    struct AnnotationFilter {
+        virtual bool isAnnotationAllowed ( const string & name ) const { return true; }
+    };
+
     struct AnnotationArgumentList : AnnotationArguments {
+        AnnotationFilter *filter;
         const AnnotationArgument * find ( const string & name, Type type ) const;
         bool getBoolOption(const string & name, bool def = false) const;
         int32_t getIntOption(const string & name, int32_t def = false) const;
@@ -1425,7 +1430,7 @@ namespace das
         virtual void afterAlias ( const char * name, const LineInfo & at ) = 0;
     };
 
-    class Program : public ptr_ref_count {
+    class Program : public AnnotationFilter, public ptr_ref_count {
     public:
         Program();
         int getContextStackSize() const;
@@ -1501,6 +1506,7 @@ namespace das
         void makeMacroModule( TextWriter & logs );
         vector<ReaderMacroPtr> getReaderMacro ( const string & markup ) const;
         void serialize ( AstSerializer & ser );
+        virtual bool isAnnotationAllowed ( const string & name ) const override;
     protected:
         // this is no longer the way to link AOT
         //  set CodeOfPolicies::aot instead
@@ -1553,6 +1559,7 @@ namespace das
         das_map<CompilationError,int>   expectErrors;
         AnnotationArgumentList      options;
         CodeOfPolicies              policies;
+        FileAccessPtr               fileAccess;
         vector<tuple<Module *,string,string,bool,LineInfo>> allRequireDecl;
         das_hash_map<uint64_t,TypeDecl *> astTypeInfo;
     };

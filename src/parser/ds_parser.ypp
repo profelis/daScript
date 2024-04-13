@@ -657,12 +657,8 @@ expr_reader
 
 options_declaration
     :   DAS_OPTIONS annotation_argument_list[list] {
-        if ( yyextra->g_Program->options.size() ) {
-            yyextra->g_Program->options.insert ( yyextra->g_Program->options.begin(),
-                $list->begin(), $list->end() );
-        } else {
-            swap ( yyextra->g_Program->options, *$list );
-        }
+        yyextra->g_Program->options.insert ( yyextra->g_Program->options.begin(),
+            $list->begin(), $list->end() );
         auto opt = yyextra->g_Program->options.find("indenting", tInt);
         if (opt)
         {

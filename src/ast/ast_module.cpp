@@ -44,6 +44,7 @@ namespace das {
     // ANNOTATION
 
     const AnnotationArgument * AnnotationArgumentList::find ( const string & name, Type type ) const {
+        if (filter && !filter->isAnnotationAllowed(name)) return nullptr;
         auto it = find_if(begin(), end(), [&](const AnnotationArgument & arg){
             return (arg.name==name) && (type==Type::tVoid || type==arg.type);
         });

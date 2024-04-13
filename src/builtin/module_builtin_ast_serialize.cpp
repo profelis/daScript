@@ -2214,4 +2214,7 @@ namespace das {
         allocateStack(logs);
     }
 
+    bool Program::isAnnotationAllowed ( const string & name ) const { 
+        return fileAccess && fileAccess->canAnnotationBeUsed(name); 
+    }
 }

@@ -2748,6 +2748,8 @@ namespace das {
         thisModule = make_unique<ModuleDas>();
         library.addBuiltInModule();
         library.addModule(thisModule.get());
+
+        options.filter = this;
     }
 
     TypeDecl * Program::makeTypeDeclaration(const LineInfo &at, const string &name) {

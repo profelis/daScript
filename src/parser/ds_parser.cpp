@@ -5527,12 +5527,8 @@ yyreduce:
 
   case 36: /* options_declaration: "options" annotation_argument_list  */
                                                    {
-        if ( yyextra->g_Program->options.size() ) {
-            yyextra->g_Program->options.insert ( yyextra->g_Program->options.begin(),
-                (yyvsp[0].aaList)->begin(), (yyvsp[0].aaList)->end() );
-        } else {
-            swap ( yyextra->g_Program->options, *(yyvsp[0].aaList) );
-        }
+        yyextra->g_Program->options.insert ( yyextra->g_Program->options.begin(),
+            (yyvsp[0].aaList)->begin(), (yyvsp[0].aaList)->end() );
         auto opt = yyextra->g_Program->options.find("indenting", tInt);
         if (opt)
         {

@@ -43,6 +43,7 @@ namespace das {
                 moduleAllowed = context->findFunction("module_allowed");    // note, this one CAN be null
                 moduleUnsafe = context->findFunction("module_allowed_unsafe");    // note, this one CAN be null
                 canModuleBeRequired = context->findFunction("can_module_be_required");    // note, this one CAN be null
+                canAnnBeUsed = context->findFunction("can_annotation_be_used");    // note, this one CAN be null
                 // get it ready
                 context->restart();
                 context->runInitScript();   // note: we assume sane init stack size here
@@ -87,7 +88,7 @@ namespace das {
         args[1] = cast<const char *>::from(fileName.c_str());
         auto res = context->evalWithCatch(moduleUnsafe, args, nullptr);
         auto exc = context->getException(); exc;
-        DAS_ASSERTF(!exc, "exception failed in `module_unsafe`: %s", exc);
+        DAS_ASSERTF(!exc, "exception failed in `module_allowed_unsafe`: %s", exc);
         return cast<bool>::to(res);
     }
 
@@ -99,6 +100,16 @@ namespace das {
         auto res = context->evalWithCatch(canModuleBeRequired, args, nullptr);
         auto exc = context->getException(); exc;
         DAS_ASSERTF(!exc, "exception failed in `can_module_be_required`: %s", exc);
+        return cast<bool>::to(res);
+    }
+
+    bool ModuleFileAccess::canAnnotationBeUsed ( const string & name ) const {
+        if(failed() || !canAnnBeUsed) return FileAccess::canAnnotationBeUsed(name);
+        vec4f args[1];
+        args[0] = cast<const char *>::from(name.c_str());
+        auto res = context->evalWithCatch(canAnnBeUsed, args, nullptr);
+        auto exc = context->getException(); exc;
+        DAS_ASSERTF(!exc, "exception failed in `can_annotation_be_used`: %s", exc);
         return cast<bool>::to(res);
     }
 

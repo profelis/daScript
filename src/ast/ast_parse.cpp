@@ -346,6 +346,7 @@ namespace das {
                               bool isDep,
                               CodeOfPolicies policies ) {
         ProgramPtr program = make_smart<Program>();
+        program->fileAccess = access;
         ReuseCacheGuard rcg;
         auto time0 = ref_time_ticks();
 
