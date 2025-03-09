@@ -114,3 +114,55 @@ jobs:
         cd cmake_temp
         cmake -DCMAKE_BUILD_TYPE:STRING=${{ matrix.cmake_preset }} -G Ninja -DCMAKE_TOOLCHAIN_FILE=../emsdk/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake ../
         ninja
+        
+    - name: "Deploy: Daslang to try-dascript repo"
+      if: github.ref == 'refs/heads/master' && matrix.target == 'darwin' && matrix.architecture == '64' && matrix.cmake_preset == 'Release' && github.event_name != 'pull_request'
+      run: |
+        set -eux
+        # Create temporary directory for cloning target repository
+        mkdir -p /tmp/try-dascript
+        cd /tmp/try-dascript
+        
+        # Clone target repository
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git clone https://x-access-token:${{ secrets.TRY_DASCRIPT_CONTENT }}@github.com/profelis/try-dascript.git .
+        
+        # Define the directory where to place wasm file
+        TARGET_DIR="." # Change to the path relative to target repository root
+        
+        # Copy WASM file from the source project
+        cp $GITHUB_WORKSPACE/web/output/daScript.wasm $TARGET_DIR/
+        cp $GITHUB_WORKSPACE/web/output/daScript.js $TARGET_DIR/
+        
+        # Check if there are any changes to commit
+        if git diff --quiet; then
+          echo "No changes detected. Skipping commit and push."
+          exit 0
+        fi
+        
+        # Create a new branch
+        BRANCH_NAME="update-wasm-$(date +'%Y%m%d-%H%M%S')"
+        git checkout -b $BRANCH_NAME
+        
+        # Add file to index, commit and push
+        git add $TARGET_DIR/daScript.wasm
+        git add $TARGET_DIR/daScript.js
+        git commit -m "Update Daslang from CI build"
+        
+        # Try to push directly, if not possible create a PR
+        if git push origin $BRANCH_NAME; then
+          echo "Successfully pushed changes to target repository"
+        else
+          echo "Creating a pull request instead of direct push"
+          # Push changes to new branch
+          git push origin $BRANCH_NAME
+          
+          # Create PR using GitHub API
+          PR_BODY="{\"title\":\"Update Daslang from CI build\",\"body\":\"Automatically generated PR with updated Daslang\",\"head\":\"$BRANCH_NAME\",\"base\":\"main\"}"
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.TRY_DASCRIPT_CONTENT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "$PR_BODY" \
+            https://api.github.com/repos/profelis/try-dascript/pulls
+        fi
