@@ -348,6 +348,15 @@ typedef MatmulMx4Q8Fn = function<(var yp : float?; wn : uint8 const?; we : uint8
 // In-place repack of one MXFP4 region [d rows x n cols] (raw plane pointers at the region start)
 // into the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
 typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d : int64) : void>
+// Region-list GEMV, ONE dispatch for N same-shape [d x n] projections (the MoE decode fuse: all k
+// routed experts' gates — or ups, or downs — in one fork/join instead of k). `offs` packs PAIRS
+// per region: [2r] = the weight-element offset of region r's rows (into the blob the wp/sp — or
+// wn/we — pointers base), [2r+1] = the activation-element offset (into xqp/xsp; xsp offset =
+// element/32) — so regions may share one activation (gates/ups) or each bring their own (downs).
+// Region r's d outputs land at yp + r*d. Bit-exact: the same per-row dots, only scheduled in one
+// parallel_for.
+typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
 //! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
@@ -363,6 +372,8 @@ struct KernelBackend {
     repack : RepackQ8Q8Fn
     mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
     repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
+    groupn : MatmulQ8Q8GroupNFn = @@q8q8_unset_groupn
+    groupn_mx4 : MatmulMx4GroupNFn = @@mx4q8_unset_groupn
     needs_repack : bool
     priority : int
 }
@@ -373,6 +384,8 @@ var g_mm_q8q8 = @@q8q8_unset_kernel
 var g_mm_q8q8_batch = @@q8q8_unset_batch
 var g_mm_q8q8_group3 = @@q8q8_unset_group3
 var g_mm_mx4q8 = @@mx4q8_unset_kernel
+var g_mm_q8q8_groupn = @@q8q8_unset_groupn
+var g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 
@@ -401,12 +414,18 @@ def private q8q8_unset_batch(var yp : float?; wp : int8 const?; sp : float const
 def private q8q8_unset_group3(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) { no_backend() }
 [unused_argument(yp, wn, we, xqp, xsp, n, d)]
 def private mx4q8_unset_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, n, d)]
+def private q8q8_unset_groupn(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wn, we, offs, nregions, xqp, xsp, n, d)]
+def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
     g_mm_q8q8_batch = be.batch
     g_mm_q8q8_group3 = be.group3
     g_mm_mx4q8 = be.mm_mx4
+    g_mm_q8q8_groupn = be.groupn
+    g_mm_mx4q8_groupn = be.groupn_mx4
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
@@ -580,6 +599,31 @@ def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> 
     unsafe {
         invoke(g_mm_mx4q8, addr(y[0]),
             reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
+//! Region-list Q8·Q8 GEMV: ONE dispatch for `nregions` same-shape [d x n] projections (see the
+//! MatmulQ8Q8GroupNFn doc for the packed `offs` pairs). wq/ws are the WHOLE blob (offsets are
+//! absolute); xq/xs hold the activation row(s) the offs pairs index. Region r -> y[r*d .. r*d+d).
+def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; offs : array<int64>; nregions : int64;
+                       xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_groupn, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
+//! Region-list MXFP4·Q8 GEMV — the native-4-bit twin of matmul_q8q8_groupn (offsets in weight
+//! elements into the whole nibble/scale planes; the kernels derive the /2 and /32 byte positions).
+def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                        xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
     }
 }

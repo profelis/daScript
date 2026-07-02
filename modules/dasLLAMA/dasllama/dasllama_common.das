@@ -1247,6 +1247,13 @@ struct Session {
     moe_w : array<float>        // the selected top-k weights (n_expert_used)
     moe_idx : array<int64>      // the selected top-k expert ids (n_expert_used)
     moe_acc : array<float>      // weighted expert-output accumulator (dim)
+    // decode dispatch-fuse scratch: all k routed experts' projections run as region-list GEMVs
+    moe_offs : array<int64>     // packed (weight, activation) element-offset pairs (2 per region)
+    moe_gu : array<float>       // fused gate outputs (k x n_ff_exp)
+    moe_gu2 : array<float>      // fused up outputs (k x n_ff_exp)
+    moe_dn : array<float>       // fused down outputs (k x dim)
+    moe_dq : array<int8>        // the k activated-hidden rows requantized (k x n_ff_exp)
+    moe_ds : array<float>       // ... and their scales (k x n_ff_exp / 32)
     // the layer's rmsnormed activation quantized ONCE and reused across every expert's gate/up
     // matmul — dedicated buffers because the down-projections quantize s.hb into the shared xq/xs
     moe_xq : array<int8>        // xb's Q8 quants (dim)
@@ -1299,6 +1306,12 @@ def make_run_state(c : Config) : Session {
         s.moe_acc |> resize(c.dim)
         s.moe_xq |> resize(c.dim)
         s.moe_xs |> resize(c.dim / 32l)
+        s.moe_offs |> resize(2l * c.n_expert_used)
+        s.moe_gu |> resize(c.n_expert_used * c.n_ff_exp)
+        s.moe_gu2 |> resize(c.n_expert_used * c.n_ff_exp)
+        s.moe_dn |> resize(c.n_expert_used * c.dim)
+        s.moe_dq |> resize(c.n_expert_used * c.n_ff_exp)
+        s.moe_ds |> resize(c.n_expert_used * c.n_ff_exp / 32l)
     }
     let maxn = max(xdim, ffw)   // the Q8·Q8 path quantizes whichever activation feeds a matmul
     s.xq |> resize(maxn)
@@ -1718,6 +1731,16 @@ def private mm_at_mx4_pre(var y : array<float>; t : Model; woff : int64; xq : ar
     }
 }
 
+// Region-list GEMVs (the MoE decode dispatch fuse): all k routed experts' same-shape projections in
+// ONE fork/join. offs packs (weight, activation) element-offset pairs; region j -> y[j*d .. j*d+d).
+def private mm_at_q8_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, n, d)
+}
+
+def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    matmul_mx4q8_groupn(y, t.mxq, t.mxs, offs, nregions, xq, xs, n, d)
+}
+
 // Route a big-weight matmul through the Q8, Q4, or fp32 kernel depending on the model's quant mode.
 // xq/xs are the run-state activation-quant scratch (used only by the Q8 path).
 def private mm(var y : array<float>; t : Model; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; n, d : int64) {
@@ -2120,45 +2143,95 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     }
     let nfe = c.n_ff_exp
     let ege = dim * nfe
-    for (j in range64(k)) {
-        let e = l * ne + s.moe_idx[j]
-        let base = e * ege
+    if (pre_q8) {
+        // Fused-dispatch form: all k experts' gates in ONE region-list GEMV, then all ups, one
+        // activation + one requant over the k rows, then all downs (per-region activations).
+        // Bit-exact vs the per-expert loop below — the same per-row dots/act/quant, the same
+        // j-ascending weighted reduce — but 3 fork/joins instead of 3k (the mm_moe 86 vs the
+        // dense mms' 104 GB/s was mostly this dispatch overhead).
         let ts_gu = ref_time_ticks()
-        if (t.experts_mx4) {   // native 4-bit expert weights — half the Q8 traffic
-            mm_at_mx4_pre(s.hb, t, t.we1_off + base, s.moe_xq, s.moe_xs, dim, nfe)
-            mm_at_mx4_pre(s.hb2, t, t.we3_off + base, s.moe_xq, s.moe_xs, dim, nfe)
-        } elif (pre_q8) {
-            mm_at_q8_pre(s.hb, t, t.we1_off + base, s.moe_xq, s.moe_xs, dim, nfe)
-            mm_at_q8_pre(s.hb2, t, t.we3_off + base, s.moe_xq, s.moe_xs, dim, nfe)
-        } else {
-            mm(s.hb, t, t.we1_off + base, s.xb, s.xq, s.xs, dim, nfe)
-            mm(s.hb2, t, t.we3_off + base, s.xb, s.xq, s.xs, dim, nfe)
+        for (j in range64(k)) {
+            s.moe_offs[j * 2l] = t.we1_off + (l * ne + s.moe_idx[j]) * ege
+            s.moe_offs[j * 2l + 1l] = 0l   // gates share the single hoisted xb image
         }
-        if (c.moe_exps_bias) {  // gpt-oss: this expert's gate/up biases before the activation
-            add_bias(s.hb, 0l, t.fblob, t.web1_off + e * nfe, nfe)
-            add_bias(s.hb2, 0l, t.fblob, t.web3_off + e * nfe, nfe)
+        if (t.experts_mx4) {   // native 4-bit expert weights — half the Q8 traffic
+            mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+        } else {
+            mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+        }
+        for (j in range64(k)) {
+            s.moe_offs[j * 2l] = t.we3_off + (l * ne + s.moe_idx[j]) * ege
+        }
+        if (t.experts_mx4) {
+            mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+        } else {
+            mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+        }
+        if (c.moe_exps_bias) {  // gpt-oss: each expert's gate/up biases before the activation
+            for (j in range64(k)) {
+                let e = l * ne + s.moe_idx[j]
+                add_bias(s.moe_gu, j * nfe, t.fblob, t.web1_off + e * nfe, nfe)
+                add_bias(s.moe_gu2, j * nfe, t.fblob, t.web3_off + e * nfe, nfe)
+            }
         }
         prof_add("mm_moe", ts_gu)
         let ts_act = ref_time_ticks()
-        gate_batch(s.hb, s.hb2, c.ffn_act, nfe, 1l)
+        gate_batch(s.moe_gu, s.moe_gu2, c.ffn_act, nfe, k)
         prof_add("act", ts_act)
+        requant_rows_q8(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds)   // books mm_requant
         let ts_down = ref_time_ticks()
-        if (t.experts_mx4) {   // quantize hb like mm's q8 path does, then the native down GEMV
-            quantize_q8_0_into(s.hb, nfe, s.xq, s.xs, 0l, 0l)
-            mm_at_mx4_pre(s.xb2, t, t.we2_off + base, s.xq, s.xs, nfe, dim)
-        } else {
-            mm(s.xb2, t, t.we2_off + base, s.hb, s.xq, s.xs, nfe, dim)
+        for (j in range64(k)) {
+            s.moe_offs[j * 2l] = t.we2_off + (l * ne + s.moe_idx[j]) * ege
+            s.moe_offs[j * 2l + 1l] = j * nfe   // each down reads its own requantized row
         }
-        if (c.moe_exps_bias) {  // ... and its down bias, inside the routed weight (ggml_add_id order)
-            add_bias(s.xb2, 0l, t.fblob, t.web2_off + e * dim, dim)
+        if (t.experts_mx4) {
+            mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
+        } else {
+            mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
+        }
+        if (c.moe_exps_bias) {  // ... and each down bias, inside the routed weight (ggml_add_id order)
+            for (j in range64(k)) {
+                add_bias(s.moe_dn, j * dim, t.fblob, t.web2_off + (l * ne + s.moe_idx[j]) * dim, dim)
+            }
         }
         prof_add("mm_moe", ts_down)
         let ts_red = ref_time_ticks()
-        let w = s.moe_w[j]
-        for (i in range64(dim)) {
-            s.moe_acc[i] += w * s.xb2[i]
+        for (j in range64(k)) {   // slot order preserved — the sum is bit-identical
+            let w = s.moe_w[j]
+            for (i in range64(dim)) {
+                s.moe_acc[i] += w * s.moe_dn[j * dim + i]
+            }
         }
         prof_add("moe_reduce", ts_red)
+    } else {
+        // fp32 reference path: the per-expert loop (q4 never routes here — MoE loads are q8/fp32)
+        for (j in range64(k)) {
+            let e = l * ne + s.moe_idx[j]
+            let base = e * ege
+            let ts_gu = ref_time_ticks()
+            mm(s.hb, t, t.we1_off + base, s.xb, s.xq, s.xs, dim, nfe)
+            mm(s.hb2, t, t.we3_off + base, s.xb, s.xq, s.xs, dim, nfe)
+            if (c.moe_exps_bias) {  // gpt-oss: this expert's gate/up biases before the activation
+                add_bias(s.hb, 0l, t.fblob, t.web1_off + e * nfe, nfe)
+                add_bias(s.hb2, 0l, t.fblob, t.web3_off + e * nfe, nfe)
+            }
+            prof_add("mm_moe", ts_gu)
+            let ts_act = ref_time_ticks()
+            gate_batch(s.hb, s.hb2, c.ffn_act, nfe, 1l)
+            prof_add("act", ts_act)
+            let ts_down = ref_time_ticks()
+            mm(s.xb2, t, t.we2_off + base, s.hb, s.xq, s.xs, nfe, dim)
+            if (c.moe_exps_bias) {  // ... and its down bias, inside the routed weight (ggml_add_id order)
+                add_bias(s.xb2, 0l, t.fblob, t.web2_off + e * dim, dim)
+            }
+            prof_add("mm_moe", ts_down)
+            let ts_red = ref_time_ticks()
+            let w = s.moe_w[j]
+            for (i in range64(dim)) {
+                s.moe_acc[i] += w * s.xb2[i]
+            }
+            prof_add("moe_reduce", ts_red)
+        }
     }
     // shared expert, gated by a sigmoid scalar from its per-layer gate vector
     if (c.n_ff_shexp > 0l) {

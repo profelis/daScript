@@ -176,6 +176,121 @@ def private mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 con
     }
 }
 
+// ===== region-list (groupN) kernels — the MoE decode dispatch fuse =====
+// One parallel_for over nregions * d rows (or nregions * d/4 interleaved groups): all k routed
+// experts' gates (or ups, or downs) in ONE fork/join. Per-row math identical to the single-region
+// kernels — bit-exact, only the scheduling changes.
+
+def private q8q8_groupn_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+        unsafe {
+            for (i in range(rb, re)) {
+                let ii = int64(i)
+                let r = ii / d
+                let row = ii % d
+                let woff = offs[r * 2l]
+                let xoff = offs[r * 2l + 1l]
+                myp[ii] = dot_q8q8_sdot4x4(wp + woff + row * n, sp + woff / 32l + row * nb, xqp + xoff, xsp + xoff / 32l, n)
+            }
+        }
+    }
+}
+
+def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    let ng = d / 4l
+    var myp = yp
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), get_total_hw_jobs()) $(gb, ge) {
+        unsafe {
+            for (gi in range(gb, ge)) {
+                let gg = int64(gi)
+                let r = gg / ng
+                let g = gg % ng
+                let woff = offs[r * 2l]
+                let xoff = offs[r * 2l + 1l]
+                let f = dot_q8q8_laneq4(wp + woff + g * 4l * n, sp + woff / 32l + g * 4l * nb, xqp + xoff, xsp + xoff / 32l, n)
+                let yb = r * d + g * 4l
+                myp[yb + 0l] = f.x
+                myp[yb + 1l] = f.y
+                myp[yb + 2l] = f.z
+                myp[yb + 3l] = f.w
+            }
+        }
+    }
+    unsafe {
+        for (r in range64(nregions)) {   // row tails (d % 4): row-major sdot4x4 per region
+            let woff = offs[r * 2l]
+            let xoff = offs[r * 2l + 1l]
+            for (i in range64(ng * 4l, d)) {
+                myp[r * d + i] = dot_q8q8_sdot4x4(wp + woff + i * n, sp + woff / 32l + i * nb, xqp + xoff, xsp + xoff / 32l, n)
+            }
+        }
+    }
+}
+
+def private mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let ii = int64(i)
+                    let r = ii / d
+                    let row = ii % d
+                    let woff = offs[r * 2l]
+                    let xoff = offs[r * 2l + 1l]
+                    myp[ii] = dot_mx4q8(lutp, wn + woff / 2l + row * (n / 2l), we + woff / 32l + row * nb,
+                        xqp + xoff, xsp + xoff / 32l, n)
+                }
+            }
+        }
+    }
+}
+
+def private mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nrow = n / 2l
+    let nbb = n / 32l
+    let ng = d / 4l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), get_total_hw_jobs()) $(gb, ge) {
+            unsafe {
+                for (gi in range(gb, ge)) {
+                    let gg = int64(gi)
+                    let r = gg / ng
+                    let g = gg % ng
+                    let woff = offs[r * 2l]
+                    let xoff = offs[r * 2l + 1l]
+                    let f = dot_mx4q8_laneq4(lutp, wn + woff / 2l + g * 4l * nrow, we + woff / 32l + g * 4l * nbb,
+                        xqp + xoff, xsp + xoff / 32l, n)
+                    let yb = r * d + g * 4l
+                    myp[yb + 0l] = f.x
+                    myp[yb + 1l] = f.y
+                    myp[yb + 2l] = f.z
+                    myp[yb + 3l] = f.w
+                }
+            }
+        }
+        for (r in range64(nregions)) {   // row tails (d % 4): row-major dot per region
+            let woff = offs[r * 2l]
+            let xoff = offs[r * 2l + 1l]
+            for (i in range64(ng * 4l, d)) {
+                myp[r * d + i] = dot_mx4q8(lutp, wn + woff / 2l + i * nrow, we + woff / 32l + i * nbb,
+                    xqp + xoff, xsp + xoff / 32l, n)
+            }
+        }
+    }
+}
+
 // ===== MXFP4 laneq form (interleaved 4-row groups) — mx4 model load only =====
 // The mx repack (repack_mx4_neon) interleaves nibble BYTES 4-rows-per-sub-chunk: block bi of a
 // group is 64 bytes at + bi*64, sub-chunk j (j = 0..3) = [r0 nb(4j..4j+3) | r1 | r2 | r3] — so ONE
@@ -578,13 +693,16 @@ def dasllama_math_aarch64_neon_register() {
         // (tests, benchmarks). priority 10 out-ranks portable (0).
         register_kernel_backend(KernelBackend(name = "arm64-sdot", mm = @@q8q8_kernel_neon_sdot4x4,
             batch = @@q8q8_batch_kernel_neon_sdot4x4, group3 = @@q8q8_group3_kernel_neon_sdot4x4,
-            repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel_neon, needs_repack = false, priority = 10))
+            repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel_neon,
+            groupn = @@q8q8_groupn_kernel_neon_sdot4x4, groupn_mx4 = @@mx4q8_groupn_kernel_neon,
+            needs_repack = false, priority = 10))
         // arm64-laneq: laneq + interleaved repack — the highest priority (20), but needs_repack, so only
         // select_matmul_backend_for_load (at Q8 model load, which then repacks) activates it. Its mx4
         // pair reads/writes the interleaved-group mx layout (repack_mx4_neon above).
         register_kernel_backend(KernelBackend(name = "arm64-laneq", mm = @@q8q8_kernel_neon_laneq,
             batch = @@q8q8_batch_kernel_neon_laneq, group3 = @@q8q8_group3_kernel_neon_laneq,
             repack = @@repack_q8q8_neon, mm_mx4 = @@mx4q8_kernel_neon_laneq, repack_mx4 = @@repack_mx4_neon,
+            groupn = @@q8q8_groupn_kernel_neon_laneq, groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq,
             needs_repack = true, priority = 20))
     }
 }

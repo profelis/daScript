@@ -211,11 +211,52 @@ def private mx4q8_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; 
     }
 }
 
+def private q8q8_groupn_kernel(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+        unsafe {
+            for (i in range(rb, re)) {
+                let ii = int64(i)
+                let r = ii / d
+                let row = ii % d
+                let woff = offs[r * 2l]
+                let xoff = offs[r * 2l + 1l]
+                myp[ii] = dot_q8q8(wp + woff + row * n, sp + woff / 32l + row * nb, xqp + xoff, xsp + xoff / 32l, n)
+            }
+        }
+    }
+}
+
+def private mx4q8_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let ii = int64(i)
+                    let r = ii / d
+                    let row = ii % d
+                    let woff = offs[r * 2l]
+                    let xoff = offs[r * 2l + 1l]
+                    myp[ii] = dot_mx4q8_scalar(lutp, wn + woff / 2l + row * (n / 2l), we + woff / 32l + row * nb,
+                        xqp + xoff, xsp + xoff / 32l, n)
+                }
+            }
+        }
+    }
+}
+
 //! Register the portable Q8·Q8 backend (row-major, no repack). Lowest priority — a platform ISA backend
 //! out-ranks it in the auto-select where available; it stays the fallback everywhere else.
 [init]
 def dasllama_math_default_register() {
     register_kernel_backend(KernelBackend(name = "portable", mm = @@q8q8_kernel, batch = @@q8q8_batch_kernel,
         group3 = @@q8q8_group3_kernel, repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel,
+        groupn = @@q8q8_groupn_kernel, groupn_mx4 = @@mx4q8_groupn_kernel,
         needs_repack = false, priority = 0))
 }
