@@ -1789,39 +1789,52 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let kstart = (is_sliding && pos + 1l > c.sliding_window) ? (pos + 1l - c.sliding_window) : 0l
     let cnt = pos + 1l - kstart
     // attention rmsnorm
+    let ts_norm0 = ref_time_ticks()
     rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
+    prof_add("norm", ts_norm0)
     // q, k, v projections (independent — share s.xb; fused into one parallel dispatch when Q8)
+    let ts_qkv = ref_time_ticks()
     mm_qkv(s, t, l)
     if (c.attn_qkv_bias) {  // Qwen2: + bias before RoPE
         add_bias(s.q, 0l, t.bq, l * qd, qd)
         add_bias(s.k, 0l, t.bk, l * kv_dim, kv_dim)
         add_bias(s.v, 0l, t.bv, l * kv_dim, kv_dim)
     }
+    prof_add("mm_qkv", ts_qkv)
     if (c.qk_norm) {  // Qwen3/gemma4: per-head RMSNorm on q/k before RoPE — q/k are n_heads/n_kv_heads rows of head_size
+        let ts_qknorm = ref_time_ticks()
         rms_batch(s.q, s.q, t, t.rms_q_offs[l], head_size, n_heads)
         rms_batch(s.k, s.k, t, t.rms_k_offs[l], head_size, n_kv_heads)
+        prof_add("norm", ts_qknorm)
     }
     // gemma4: weightless per-head RMSNorm on V (all-ones weight; V is never roped). V-from-K layers
     // (wv_offs < 0) already normed V inside mm_qkv, fused with the K→V copy.
     if (c.v_norm && t.wv_offs[l] >= 0l) {
+        let ts_vnorm = ref_time_ticks()
         rms_batch(s.v, s.v, t, t.rms_ones_off, head_size, n_kv_heads)
+        prof_add("norm", ts_vnorm)
     }
     // RoPE on q (qd) and k (kv_dim) — sliding layers may use their own θ / position scale (Gemma3),
     // and p-RoPE arches (gemma4) apply the rope_freqs factors to GLOBAL layers only
+    let ts_rope = ref_time_ticks()
     let theta = is_sliding ? c.rope_freq_base_swa : c.rope_freq_base
     let fscale = is_sliding ? c.rope_freq_scale_swa : c.rope_freq_scale
     let use_ff = !(c.rope_ff_global_only && is_sliding)
     rope_apply(s.q, pos, head_size, qd, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
     rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+    prof_add("rope", ts_rope)
     // store k, v for this position into the KV cache
+    let ts_kv = ref_time_ticks()
     let kvoff = loff + pos * kv_dim
     copy_floats(unsafe(addr(s.key_cache[kvoff])), unsafe(addr(s.k[0])), kv_dim)
     copy_floats(unsafe(addr(s.value_cache[kvoff])), unsafe(addr(s.v[0])), kv_dim)
+    prof_add("kv_store", ts_kv)
     // multi-head attention, threaded over heads past the decode threshold — each head reads its own
     // q/K/V slices and writes a disjoint att row (h*seq_len) and xb slice, so threading is
     // result-identical to the inline loop (the per-token KV read grows linearly with context; the
     // gate keeps short contexts free of the per-layer-per-token dispatch cost). Fork workers touch
     // raw pointers only; att row width is cnt <= seq_len.
+    let ts_attn = ref_time_ticks()
     let seq_len = c.seq_len
     let attn_softcap = c.attn_logit_softcap
     let attn_par = cnt * head_size * n_heads >= g_decode_attn_par_threshold
@@ -1865,15 +1878,20 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
             }
         }
     }
+    prof_add("attn", ts_attn)
     // output projection (qd -> dim), optional bias + post-attention norm, residual
+    let ts_wo = ref_time_ticks()
     mm(s.xb2, t, t.wo_offs[l], s.xb, s.xq, s.xs, qd, dim)
     if (c.attn_out_bias) {  // gpt-oss: + bias on the projected attention output
         add_bias(s.xb2, 0l, t.bo, l * dim, dim)
     }
+    prof_add("mm_wo", ts_wo)
+    let ts_resid0 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-attention RMSNorm before the residual add
         rms_at(s.xb2, t, t.rms_post_att_off + l * dim, s.xb2, dim)
     }
     add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
+    prof_add("act_resid", ts_resid0)
 }
 
 // ffn-norm → gated FFN (act(W1·x) * (W3·x)) → down-proj(+post-norm) → residual.
@@ -1882,13 +1900,22 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
     let dim = c.dim
     let hidden = c.hidden_dim
     // ffn rmsnorm
+    let ts_norm1 = ref_time_ticks()
     rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
+    prof_add("norm", ts_norm1)
     // gated FFN: hb = act(W1·xb) * (W3·xb) — silu (SwiGLU) or gelu (GeGLU, Gemma2)
+    let ts_ffn = ref_time_ticks()
     mm(s.hb, t, t.w1_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
     mm(s.hb2, t, t.w3_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
+    prof_add("mm_ffn", ts_ffn)
+    let ts_act = ref_time_ticks()
     gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)   // fused act*gate; same kernel as prefill (npos=1 → inline)
+    prof_add("act", ts_act)
     // down projection, optional post-FFN norm, residual
+    let ts_ffn2 = ref_time_ticks()
     mm(s.xb, t, t.w2_off + l * hidden * dim, s.hb, s.xq, s.xs, hidden, dim)
+    prof_add("mm_ffn", ts_ffn2)
+    let ts_resid1 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm before the residual add
         rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
     }
@@ -1896,6 +1923,7 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
     if (c.layer_out_scale) {  // gemma4: scale the whole layer output (after the residual)
         scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
     }
+    prof_add("act_resid", ts_resid1)
 }
 
 // The MoE FFN core shared by decode and (naive per-token) prefill: reads the rmsnormed activation
@@ -1981,11 +2009,13 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     let ne = c.n_expert
     let k = c.n_expert_used
     // router logits (fp32 weights + optional bias), then the shared select
+    let ts_route = ref_time_ticks()
     mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb, dim, ne)
     if (c.moe_router_bias) {
         add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
     }
     moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
+    prof_add("moe_route", ts_route)
     // routed experts: acc = Σ w_j · FFN_e(xb), each expert the standard gated-FFN shape
     for (i in range64(dim)) {
         s.moe_acc[i] = 0.0
@@ -1996,13 +2026,16 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     // xq/xs scratch, which would clobber a hoisted xb image there. Bit-identical (same quants).
     let pre_q8 = t.quant == QuantMode.q8
     if (pre_q8) {
+        let ts_rq = ref_time_ticks()
         quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)
+        prof_add("mm_requant", ts_rq)
     }
     let nfe = c.n_ff_exp
     let ege = dim * nfe
     for (j in range64(k)) {
         let e = l * ne + s.moe_idx[j]
         let base = e * ege
+        let ts_gu = ref_time_ticks()
         if (pre_q8) {
             mm_at_q8_pre(s.hb, t, t.we1_off + base, s.moe_xq, s.moe_xs, dim, nfe)
             mm_at_q8_pre(s.hb2, t, t.we3_off + base, s.moe_xq, s.moe_xs, dim, nfe)
@@ -2014,18 +2047,26 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
             add_bias(s.hb, 0l, t.fblob, t.web1_off + e * nfe, nfe)
             add_bias(s.hb2, 0l, t.fblob, t.web3_off + e * nfe, nfe)
         }
+        prof_add("mm_moe", ts_gu)
+        let ts_act = ref_time_ticks()
         gate_batch(s.hb, s.hb2, c.ffn_act, nfe, 1l)
+        prof_add("act", ts_act)
+        let ts_down = ref_time_ticks()
         mm(s.xb2, t, t.we2_off + base, s.hb, s.xq, s.xs, nfe, dim)
         if (c.moe_exps_bias) {  // ... and its down bias, inside the routed weight (ggml_add_id order)
             add_bias(s.xb2, 0l, t.fblob, t.web2_off + e * dim, dim)
         }
+        prof_add("mm_moe", ts_down)
+        let ts_red = ref_time_ticks()
         let w = s.moe_w[j]
         for (i in range64(dim)) {
             s.moe_acc[i] += w * s.xb2[i]
         }
+        prof_add("moe_reduce", ts_red)
     }
     // shared expert, gated by a sigmoid scalar from its per-layer gate vector
     if (c.n_ff_shexp > 0l) {
+        let ts_sh = ref_time_ticks()
         let g = moe_shexp_gate(t, l, s.xb)
         let nsh = c.n_ff_shexp
         let she = dim * nsh
@@ -2041,6 +2082,7 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
         for (i in range64(dim)) {
             s.moe_acc[i] += g * s.xb2[i]
         }
+        prof_add("mm_shexp", ts_sh)
     }
 }
 
@@ -2049,8 +2091,11 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
 def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
     let c = t.config
     let dim = c.dim
+    let ts_norm = ref_time_ticks()
     rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
+    prof_add("norm", ts_norm)
     moe_ffn_core(t, s, l)
+    let ts_resid = ref_time_ticks()
     if (c.pre_post_norm) {
         rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
     }
@@ -2058,6 +2103,7 @@ def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
     if (c.layer_out_scale) {
         scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
     }
+    prof_add("act_resid", ts_resid)
 }
 
 // Q8_0 row dequant from the linear embedding copy: dst[i] = q[i] * scale[i/32] — the same
@@ -2093,10 +2139,12 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     let dim = c.dim
 
     // token embedding: row `token` into the residual stream
+    let ts_embed = ref_time_ticks()
     embed_row(t, token, unsafe(addr(s.x[0])))
     if (c.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
         scale_inplace(unsafe(addr(s.x[0])), c.embed_scale, dim)
     }
+    prof_add("embed", ts_embed)
 
     // per-layer transformer stack — attention then FFN, each through the arch's registered block
     for (l in range64(c.n_layers)) {
@@ -2105,6 +2153,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     }
 
     // final rmsnorm (into xb to avoid aliasing x as both in/out), then classifier
+    let ts_final = ref_time_ticks()
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
     if (c.shared_weights && !t.cls_q8) {
         // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
@@ -2119,10 +2168,11 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     for (id in t.suppress) {  // gemma4: pin the checkpoint's suppressed token ids to -inf
         s.logits[id] = -1.0e30
     }
+    prof_add("final", ts_final)
 }
 
-// ----- forward_prefill section profiler -----
-// Measurement is UNCONDITIONAL: a handful of ref_time_ticks() + table adds per prefill, negligible
+// ----- forward section profiler (decode AND prefill feed the same buckets) -----
+// Measurement is UNCONDITIONAL: a handful of ref_time_ticks() + table adds per forward, negligible
 // against the matmuls, so it always accumulates. Output is on-demand — reset() to start a window,
 // report() to dump it. (We measure a lot; never gate the measurement, only the printing.)
 // Prefill pass-threading thresholds. Every value was measured on M1 Max against its ~90us job
@@ -2232,31 +2282,31 @@ def get_moe_grouped_prefill() : bool {
     return g_moe_grouped_prefill
 }
 
-var g_prefill_prof_acc : table<string; int64>
+var g_forward_prof_acc : table<string; int64>
 
 //! Start a fresh measurement window (zero the per-section accumulators).
-def prefill_profile_reset() {
-    g_prefill_prof_acc |> clear()
+def forward_profile_reset() {
+    g_forward_prof_acc |> clear()
 }
 
 def private prof_add(name : string; t0 : int64) {
-    let cur = g_prefill_prof_acc?[name] ?? 0l
-    g_prefill_prof_acc[name] = cur + int64(get_time_usec(t0))
+    let cur = g_forward_prof_acc?[name] ?? 0l
+    g_forward_prof_acc[name] = cur + int64(get_time_usec(t0))
 }
 
 //! The accumulated time (us) for one section since the last reset (0 if the section never ran).
-def prefill_profile_get(name : string) : int64 {
-    return g_prefill_prof_acc?[name] ?? 0l
+def forward_profile_get(name : string) : int64 {
+    return g_forward_prof_acc?[name] ?? 0l
 }
 
 //! Print the accumulated per-section times (us) since the last reset.
-def prefill_profile_report() {
+def forward_profile_report() {
     var total = 0l
-    for (v in values(g_prefill_prof_acc)) {
+    for (v in values(g_forward_prof_acc)) {
         total += v
     }
-    to_log(LOG_INFO, "=== forward_prefill profile (us, summed over the window) ===\n")
-    for (k, v in keys(g_prefill_prof_acc), values(g_prefill_prof_acc)) {
+    to_log(LOG_INFO, "=== forward profile (us, summed over the window) ===\n")
+    for (k, v in keys(g_forward_prof_acc), values(g_forward_prof_acc)) {
         to_log(LOG_INFO, "  {k}: {v} ({100l * v / max(total, 1l)}%)\n")
     }
     to_log(LOG_INFO, "  TOTAL: {total}\n")
@@ -2544,7 +2594,7 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
 //! pos 0..npos-1 in sequence. Q4 has no batched kernel, so it falls back to that per-token path.
 // ===== std/dense block kernels (prefill, batched) =====
 // The batched counterparts to attention_std_decode / ffn_dense_decode; the registry binds these for
-// every dense arch. Keep the per-section profiler buckets (prof_add) so prefill_profile_report stays
+// every dense arch. Keep the per-section profiler buckets (prof_add) so forward_profile_report stays
 // intact. Bit-identical to the inlined form.
 
 // attn-norm → batched QKV(+bias) → RoPE → KV-store → prefill attention → out-proj(+post-norm) → residual.
@@ -2900,7 +2950,8 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
     if (t.quant == QuantMode.q8 && g_moe_grouped_prefill) {
         ffn_moe_prefill_grouped(t, s, l, npos)
     } else {
-        let ts_moe = ref_time_ticks()
+        // per-position reference path — moe_ffn_core carries its own section buckets
+        // (moe_route / mm_requant / mm_moe / act / moe_reduce / mm_shexp)
         for (p in range64(npos)) {
             copy_floats(s.xb_b, p * dim, s.xb, 0l, dim)
             moe_ffn_core(t, s, l)
@@ -2911,7 +2962,6 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
                 s.x_b[p * dim + i] += s.moe_acc[i]
             }
         }
-        prof_add("mm_ffn", ts_moe)
     }
     if (c.layer_out_scale) {
         let os = t.fblob[t.out_scale_off + l]
