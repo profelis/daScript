@@ -339,34 +339,45 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
-- **Tied classifier reads the fp32 embedding — the single biggest decode lever on big-vocab
-  models.** `shared_weights` models (Gemma family, Qwen small) route the classifier matmul
-  through the fp32 `token_embd` in fblob: vocab × dim × 4B of traffic per token — on
-  gemma-4-12B (262144 × 3840) that is ~4GB/token, roughly a quarter of its ~5 tok/s decode
-  roofline; llama.cpp matmuls the Q8 embedding directly. Same fix also cuts RESIDENT memory
-  (the fp32 table costs 4GB vs ~1GB at Q8; today only the per-token embedding-row read needs
-  fp32, and that could dequant one row on demand). Changes numerics vs today's fp32 classifier
-  → every tied-model parity fixture needs refreezing in the same PR. (Spotted wave 3.)
-- **V-from-K layers: fuse the K→V copy with the weightless V-norm.** gemma4 global layers copy
-  the K projection into V, then rms_batch it — two passes over npos × kv_dim where one fused
-  pass would do. Small (kv_dim = 512 on those layers) but free. (Spotted wave 3.)
-- **No llama.cpp A/B on gemma-4-12B yet.** Wave 3 verified tokens, not speed — prefill 62 t/s /
-  gen 5 t/s on the M1 are uncalibrated against llama.cpp on the same box. Run the interleaved
-  A/B (kernel-opt method) before drawing any conclusions or optimizing. (Spotted wave 3.)
-  Same for gpt-oss-20b (wave 5): the chat smoke saw prefill 3 t/s / gen 2 t/s — expected to be
-  dominated by the naive per-token MoE prefill + the doubled Q8 expert traffic (both already on
-  this ledger), but A/B before touching anything.
-- **MoE prefill is naive per-token — expert-bucketed grouped GEMM is the batched fix.** Each
-  prefill position routes independently and runs its top-k experts through the single-token
-  matmuls (`ffn_moe_prefill`); llama.cpp batches all positions hitting the same expert into one
-  GEMM (`mul_mat_id`). Bucket positions by selected expert, run one batched GEMM per touched
-  expert, scatter back by weight. Decode is unaffected (one token = no bucketing win).
+- **DONE (perf pass, 2026-07-02): tied classifier matmuls the Q8 disk quants (`Model.cls_q8`).**
+  Tied Q8 loads of a Q8_0 embedding (every tied model we run — probed all 11) transcode
+  `token_embd` twice into qblob — a classifier copy at wcls_off (repacked with the other 2D
+  weights) and a LINEAR copy at emb_q8_off that embedding rows dequant from on demand (the laneq
+  repack interleaves wcls in place, so row reads need their own un-repacked copy; on a no-repack
+  box the two could alias — noted x64 follow-up) — and drop the fp32 table: on gemma-4-12B,
+  classifier traffic 4.03GB → 1.13GB/token and resident 4.03GB → 2.26GB. Rows are bit-identical
+  (same Q8_0 data the fblob decode used; gated by test_parity_tied_cls_q8_rows); the classifier
+  quants are exactly what llama.cpp matmuls. 8 of 9 tied-model fixtures held token-for-token
+  unchanged; gemma2's "Once upon a time" flipped a near-tie under the PINNED classic+libm test
+  kernels only (default kernels still matched the oracle 24/24) → moved to the counting prompt
+  like Qwen2.5/Phi, oracle-refrozen. fp32/q4 loads and non-Q8_0 embeddings keep the exact old
+  path. (Spotted wave 3.)
+- **DONE (perf pass, 2026-07-02): V-from-K layers fuse the K→V copy with the weightless V-norm.**
+  Decode (mm_qkv) and prefill both rmsnorm k→v out-of-place when v_norm is on (bit-identical to
+  copy + in-place norm; the block's v_norm step skips those layers). (Spotted wave 3.)
+- **DONE (perf pass, 2026-07-02): llama.cpp A/Bs run (quiet box, CPU `-ngl 0`, llama-bench
+  pp512/tg64 vs our matched driver, ggml-parity fast-math).** gemma-4-12B: prefill us 75-80 t/s
+  vs llama.cpp 74.4±0.5 (parity to +5%); decode us ~7.3 vs 8.74 (~84% — the remaining decode gap
+  is the next lever). gpt-oss-20b: prefill us ~219 vs 117 (~1.9× FASTER — the grouped MoE GEMM);
+  decode us ~19 vs ~39-42 (~0.47× — exactly the MXFP4→Q8 doubled expert-weight-traffic asymmetry
+  quantified: the native-MXFP4/Q4_0 entry below is now the headline gpt-oss decode lever).
+  (Spotted waves 3/5.)
+- **DONE (perf pass, 2026-07-02): MoE prefill runs expert-bucketed grouped GEMMs — bit-exact.**
+  `ffn_moe_prefill_grouped` routes every position (one batched router GEMM + the shared
+  `moe_select`), CSR-buckets the (position, slot) pairs by expert, runs one batched GEMM chain
+  per touched expert off a single whole-batch requant, and reduces the parked outputs in exactly
+  the decode accumulation order (k slots then shared expert) — so it is bit-identical to the
+  per-position path: the batch GEMM/requant/gate kernels are bit-for-bit their single-token
+  forms per row. Proven on both MoE models (all logits identical after a 300-token prefill,
+  grouped vs reference) and pinned by the qwen2moe fixture running through BOTH paths
+  (`set_moe_grouped_prefill` A/B). Decode unchanged (one token = no bucketing win).
+  Measured (M1 Max, interleaved in-process A/B): Qwen1.5-MoE 512-tok prefill 31 → ~270 t/s
+  (~8.7×); gpt-oss-20b 256-tok prefill 27 → ~186 t/s (~6.8×). (Spotted wave 4.)
+- **DONE (perf pass, 2026-07-02): MoE decode re-quantized the same activation per expert.**
+  `moe_ffn_core` now quantizes xb once per layer into dedicated `moe_xq/moe_xs` (the
+  down-projections quantize s.hb into the shared xq/xs, which would clobber a hoisted image
+  there) and routes every gate/up matmul through `mm_at_q8_pre`. Bit-identical (same quants).
   (Spotted wave 4.)
-- **MoE decode re-quantizes the same activation per expert.** `moe_ffn_core` calls `mm` 2×
-  per routed expert + 2× for the shared expert on the SAME `s.xb`, and each Q8 call re-runs
-  `quantize_q8_0_into` on it — 5 redundant requants of a dim-wide vector per layer per token
-  (only the down-projection inputs differ). Hoist the xb quant once per layer like `mm_qkv`
-  does for the fused QKV path. Small per call, ×24 layers ×(2k+2) matmuls. (Spotted wave 4.)
 - **MXFP4 experts transcode to Q8 — doubling their bytes.** gpt-oss-20b's expert stacks are
   4.25 bit/weight on disk (~10GB) but run as Q8 (~19GB + 2.4GB scales): 2× the resident memory
   AND 2× the decode weight traffic vs a native MXFP4 kernel (per-block E8M0 scale + 16-entry
@@ -378,13 +389,54 @@ what it costs today and what the fix would change.
   batch GEMM, no NEON arm, no repack backend), so a q4 prefill runs at generation speed:
   measured on SmolLM2-135M, q8 prefill 1391 t/s vs q4 prefill 70 t/s ≈ its own 69 t/s decode.
   A q4 batch kernel (or the load-time q4→q8 transcode as the cheap fix) closes it.
-  (Spotted tutorials wave.)
-- **`kv_cache_off` prefix-sums per call — O(n_layers²) int adds per forward.** Each call walks
-  all prior layers (dasllama_common.das kv_cache_off); with per-layer heterogeneous kv geometry
-  that's ~n_layers² ≈ 2-3k integer ops per token on the 12B — noise next to the matmuls, which
-  is why it wasn't chased. The clean fix (per Copilot on #3346): precompute a per-layer KV-ROW
-  prefix array (kv_dim sums, seq_len-independent) once at load and multiply by the LIVE seq_len
-  at call time, so the tests' post-load seq_len cap keeps working. (Spotted post-wave-3 review.)
+  (Spotted tutorials wave.) **LOW PRIORITY (2026-07-02):** the path is cold — every model we
+  test/ship parity for is Q8_0 on disk (plus gpt-oss MXFP4→Q8); no Q4_0 GGUF anywhere in the
+  fixture set. q4 only fires when a user opts into `QuantMode q4` for footprint. Priority rises
+  only if the MXFP4→Q4_0 halfway house above lands (q4 becomes the resident format of a real
+  20B model).
+- **LOW PRIORITY: f32 projection GEMM is untiled — dot-per-token, no token block.**
+  `matmul_batch` (dasllama_math.das) is the exact pre-#3315 shape the Q8 path had: weight-
+  stationary nest with one horizontal-reduce `dot()` per (row, token), zero register reuse
+  across rows/tokens, and no L2 token-blocking (long-prefill X re-streams from DRAM per weight
+  row). The SDOT-era fix transfers verbatim since it's dtype-agnostic: a 4-row × 4-token
+  register tile with float4 `mad` chains and per-tile reduces (the fp32 twin of
+  `dot_q8q8_sdot4x4` — keeps W row-major, no repack, decode GEMV untouched; do NOT reuse the
+  broadcast-A `gemm_f32` form, it needs a transposed W copy) plus an `effective_token_block`
+  at ~¼ the Q8 block (fp32 activations are 4× fatter). Expected kernel win ~2-3.5× (what the
+  attention tile measured), ceiling below Q8 (fmla = 4 MACs/instr vs SDOT 16; 4B/weight vs
+  ~1.06B). LOW because the f32 arm only fires for f32 GGUF tensors — in practice the tiny
+  teaching models; attention's fp32 GEMMs already have the register tile (`gemm_f32_uk_4x16`).
+  (Spotted post-#3354, 2026-07-02.)
+- **DONE (perf pass, 2026-07-02): `kv_cache_off` prefix-summed per call.** `Model.kv_row_prefix`
+  (filled by layout_offsets, seq_len-independent) × the LIVE seq_len at call time — the O(1)
+  Model overload serves both hot call sites; the Config walking form stays as the definitional
+  reference. (Spotted post-wave-3 review, per Copilot on #3346.)
+- **DONE (perf pass, 2026-07-02): decode attention threads over heads — crossover measured,
+  default re-set.** `attention_std_decode` maybe_parallel_fors the head loop (disjoint per-head
+  rows ⇒ bit-exact vs inline, gated by test_forward), behind `g_decode_attn_par_threshold`
+  (profile `runtime.decode_attn_par_threshold`). Quiet-box sweep (M1 Max, inline-vs-threaded
+  interleaved at 32..2048 ctx on Llama-3.2-1B and gemma-4-12B): crossover at ~200-260K work on
+  BOTH; below it threading costs ≤2%, above it wins reach +74% (1B) / +89% (12B) at 2048 ctx —
+  the derived 4M default was ~15× too conservative (the 12B ran inline below ctx 512). Default
+  is now the measured 262144. (Spotted tune audit, 2026-07-02.)
+- **LOW PRIORITY: `sample_` top-k is O(top_k × vocab) scalar selection.** Each of the top_k
+  rounds rescans the whole vocab (dasllama_common.das sample_) — top_k=40 on gemma-4's 262144
+  vocab is ~10M compares per sampled token. Cold today (SamplingParams defaults are greedy /
+  top_k=0, and all parity fixtures are greedy), but it's the sampling path the tutorials teach.
+  Fix = single-pass partial selection (bounded min-heap of size top_k, or threshold-and-count).
+  (Spotted tune audit, 2026-07-02.)
+- **Flash-attention tile shape is a frozen compile-time constant — deferred x64 tuning axis.**
+  `ATTN_FLASH_QT/KV = 64×64` (dasllama_common.das) was chosen on M1 and never swept; tile shape
+  is the classic per-box cache parameter, and x64's small private L2 differs in kind from M1's
+  big shared L2. QT is compile-time-coupled to the `float[64]` running max/sum fixed arrays and
+  the fa_* scratch sizing, so this is a compile-time axis à la `[tuned]` (profile-keyed), not a
+  runtime setter. DEFERRED until an x64 box exists to measure on — do not solve the coupling
+  speculatively. (Spotted tune audit, 2026-07-02.)
+- **DONE (perf pass, 2026-07-02): decode-path micros.** (a) `forward_prefill` no longer sizes
+  `att_b` in flash mode (flash packs into the fa_* tiles instead). (b) Decode `layer_out_scale`
+  and the embedding-row copy now use `scale_inplace`/`copy_floats`. The MoE weighted accumulate
+  deliberately STAYS a plain loop — `axpy`'s fused-FMA kernel would perturb the frozen fixtures
+  for a negligible win. (Spotted tune audit, 2026-07-02.)
 
 ## What collapsed (done — Phase 5)
 

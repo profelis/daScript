@@ -11,6 +11,8 @@ require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
 require dasllama/dasllama_par  // maybe_parallel_for (+ get_total_hw_jobs): thread the prefill attention over heads
+require dasllama/dasllama_tune  // box_profile_path: the runtime half of the per-box profile applies at load_model
+require daslib/json_boost  // read_json / read_json_field for the box profile's "runtime" section
 require math
 require daslib/random  // int4 RNG state + random_float for token sampling
 require daslib/strings_boost  // join() for the arch-registry diagnostic
@@ -143,7 +145,9 @@ struct ArchBlocks {
 //! the big 2D weights live in exactly one of wblob (fp32) / qblob+qscales (Q8) / q4blob+q4scales
 //! (Q4) per `quant`, at the w*_off offsets (parallel layout: the same weight-element offset indexes
 //! all three — Q8 scales at off/32, Q4 bytes at off/2). For shared_weights the classifier reads the
-//! fp32 embedding from fblob, so wcls_off is unused.
+//! fp32 embedding from fblob (wcls_off unused) — EXCEPT tied Q8 loads of a Q8_0 embedding (cls_q8),
+//! which drop the fp32 table entirely: the classifier matmuls the disk quants at wcls_off (exactly
+//! what llama.cpp does) and embedding rows dequant on demand from the linear copy at emb_q8_off.
 struct Model {
     config : Config = Config()
     arch : string = ""              // GGUF general.architecture, resolved at load — drives the chat template
@@ -170,6 +174,10 @@ struct Model {
     out_scale_off : int64
     // token ids whose logits pin to -inf after the classifier (gemma4 suppress_tokens); empty = none
     suppress : array<int64>
+    // per-layer KV-ROW prefix (Σ layer_kv_dim of prior layers), filled by layout_offsets — makes
+    // kv_cache_off O(1). seq_len-INDEPENDENT on purpose: tests cap seq_len after load, so the cache
+    // offset multiplies by the live value at call time, never a baked one
+    kv_row_prefix : array<int64>
     // big 2D weights — exactly one representation populated per `quant`
     wblob : array<float>
     qblob : array<int8>
@@ -206,6 +214,13 @@ struct Model {
     wsh2_off : int64        // ffn_down_shexp: layers x (n_ff_shexp x dim)
     wsh3_off : int64        // ffn_up_shexp:   layers x (dim x n_ff_shexp)
     wcls_off : int64
+    // Tied-classifier Q8 (see the struct doc): the classifier lives in qblob at wcls_off (repacked
+    // with the other 2D weights) and the fp32 embedding table is NOT in fblob — token rows dequant
+    // from the second, LINEAR transcode at emb_q8_off (the repack backend interleaves wcls in place,
+    // so row reads need their own un-repacked copy). Set only by load_gguf for
+    // shared_weights + QuantMode.q8 + Q8_0 token_embd on disk (every tied model we run).
+    cls_q8 : bool = false
+    emb_q8_off : int64
     quant : QuantMode
     rope_freqs : array<float>   // per-pair RoPE scaling (Llama-3.1 NTK-by-parts); empty = none
     // QKV projection biases (Qwen2) — fp32, per layer (q: layers×dim, k/v: layers×kv_dim);
@@ -277,8 +292,12 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     let hidden = c.hidden_dim
     let layers = c.n_layers
     var fo = 0l
-    t.tok_emb_off = fo
-    fo += c.vocab_size * dim
+    if (t.cls_q8) {
+        t.tok_emb_off = -1l   // no fp32 embedding table — rows dequant from emb_q8_off
+    } else {
+        t.tok_emb_off = fo
+        fo += c.vocab_size * dim
+    }
     t.rms_att_off = fo
     fo += layers * dim
     t.rms_ffn_off = fo
@@ -337,6 +356,13 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     }
     t.rms_final_off = fo
     fo += dim
+    t.kv_row_prefix |> clear()
+    t.kv_row_prefix |> reserve(layers)
+    var kvrow = 0l
+    for (l in range64(layers)) {
+        t.kv_row_prefix |> push(kvrow)
+        kvrow += layer_kv_dim(c, l)
+    }
     var wo = 0l
     t.wq_offs |> clear()
     t.wq_offs |> reserve(layers)
@@ -394,7 +420,16 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         wo += layers * dim * hidden
     }
     if (c.shared_weights) {
-        t.wcls_off = 0l
+        if (t.cls_q8) {
+            // tied Q8: the classifier transcode (repacked like every 2D weight) + the linear
+            // embedding copy the row reads dequant from
+            t.wcls_off = wo
+            wo += c.vocab_size * dim
+            t.emb_q8_off = wo
+            wo += c.vocab_size * dim
+        } else {
+            t.wcls_off = 0l   // unused — the classifier reads the fp32 embedding from fblob
+        }
     } else {
         t.wcls_off = wo
         wo += c.vocab_size * dim
@@ -602,7 +637,9 @@ def private repack_q8_weights(var t : Model) {
             repack_q8q8_weight(t.qblob, t.qscales, t.w3_off + l * dim * hidden, dim, hidden)
         }
     }
-    if (!c.shared_weights) {
+    if (!c.shared_weights || t.cls_q8) {
+        // the linear copy at emb_q8_off is deliberately NOT repacked — embedding-row dequant
+        // indexes it directly
         repack_q8q8_weight(t.qblob, t.qscales, t.wcls_off, dim, c.vocab_size)
     }
 }
@@ -851,6 +888,11 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         }
         // a separate output.weight means the classifier is not tied to the embeddings
         t.config.shared_weights = gguf_find_tensor(m, "output.weight") < 0
+        // tied Q8 loads of a Q8_0 embedding matmul the classifier on the DISK quants (llama.cpp's
+        // arithmetic) and drop the fp32 table — see Model.cls_q8. Other disk types keep the exact
+        // fp32 path (a requantized classifier would drift from the oracle for no parity gain).
+        t.cls_q8 = (t.config.shared_weights && mode == QuantMode.q8
+            && gguf_tensor_type(m, "token_embd.weight") == GGML_TYPE_Q8_0)
         // logit soft-caps from metadata when present (gemma2: 50/30, gemma4: final 30 only);
         // configure()'s values stay as the fallback for files without the keys
         if (gguf_has(m, "{arch}.attn_logit_softcapping")) {
@@ -896,8 +938,11 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         } else {
             reserve_resize(t.wblob, sz.wblob_n)
         }
-        // embedding + norms -> fblob (decoded to fp32 from whatever the disk type is)
-        gguf_read_tensor_f32(m, bytes, "token_embd.weight", t.fblob, t.tok_emb_off, vocab * dim)
+        // embedding + norms -> fblob (decoded to fp32 from whatever the disk type is); cls_q8 keeps
+        // the embedding out of fblob — both Q8 copies transcode with the big weights below
+        if (!t.cls_q8) {
+            gguf_read_tensor_f32(m, bytes, "token_embd.weight", t.fblob, t.tok_emb_off, vocab * dim)
+        }
         // gpt-oss names its pre-FFN norm post_attention_norm (same graph role as ffn_norm)
         let ffn_norm_name = t.config.post_attn_is_ffn_norm ? "post_attention_norm" : "ffn_norm"
         for (l in range64(layers)) {
@@ -982,6 +1027,10 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         }
         if (!t.config.shared_weights) {
             load_big(m, bytes, "output.weight", t, t.wcls_off, vocab * dim, scratch)
+        } elif (t.cls_q8) {
+            // tied Q8: classifier copy (repacked below) + the linear copy embedding rows read
+            gguf_transcode_q8_0(m, bytes, "token_embd.weight", t.qblob, t.qscales, t.wcls_off, t.wcls_off / 32l, vocab * dim)
+            gguf_transcode_q8_0(m, bytes, "token_embd.weight", t.qblob, t.qscales, t.emb_q8_off, t.emb_q8_off / 32l, vocab * dim)
         }
         // Qwen2 Q/K/V projection biases — small fp32 tensors, kept dense
         if (t.config.attn_qkv_bias) {
@@ -1081,7 +1130,8 @@ struct Session {
     q : array<float>          // query (dim)
     k : array<float>          // key, this position (kv_dim)
     v : array<float>          // value, this position (kv_dim)
-    att : array<float>        // attention scores for one head (seq_len) — the per-token forward() path
+    att : array<float>        // attention scores, one seq_len row PER HEAD (head h at h*seq_len) —
+                              // the per-token forward() path threads over heads past the decode threshold
     att_b : array<float>      // batched prefill attention scores, one (start_pos+npos)-wide row PER HEAD
                               // so the head loop threads with no shared scratch (sized in forward_prefill)
     logits : array<float>     // output logits (vocab_size)
@@ -1122,6 +1172,26 @@ struct Session {
     moe_w : array<float>        // the selected top-k weights (n_expert_used)
     moe_idx : array<int64>      // the selected top-k expert ids (n_expert_used)
     moe_acc : array<float>      // weighted expert-output accumulator (dim)
+    // the layer's rmsnormed activation quantized ONCE and reused across every expert's gate/up
+    // matmul — dedicated buffers because the down-projections quantize s.hb into the shared xq/xs
+    moe_xq : array<int8>        // xb's Q8 quants (dim)
+    moe_xs : array<float>       // xb's per-block scales (dim / 32)
+    // grouped MoE prefill scratch — sized per prefill by ffn_moe_prefill_grouped; empty for dense
+    // arches, decode, and the per-position reference path
+    moe_rlog : array<float>     // batched router logits (npos x n_expert)
+    moe_idx_b : array<int64>    // per-position selected expert ids (npos x k)
+    moe_w_b : array<float>      // per-position selected weights (npos x k)
+    moe_gl_b : array<float>     // per-position shared-expert sigmoid gates (npos; shexp arches only)
+    moe_cnt : array<int64>      // per-expert bucket cursor, run END after the CSR fill (n_expert)
+    moe_bkt : array<int64>      // (position*k + slot) entries grouped by expert (npos x k)
+    moe_gxq : array<int8>       // one bucket's gathered activation quants (npos x dim)
+    moe_gxs : array<float>      // one bucket's gathered activation scales (npos x dim/32)
+    moe_ghb : array<float>      // bucket gate outputs (npos x max(n_ff_exp, n_ff_shexp))
+    moe_ghb2 : array<float>     // bucket up outputs (same shape)
+    moe_hq : array<int8>        // bucket hidden requant quants (npos x max(n_ff_exp, n_ff_shexp))
+    moe_hs : array<float>       // bucket hidden requant scales (same / 32)
+    moe_gout : array<float>     // bucket (then shared-expert) down-projection output (npos x dim)
+    moe_eout : array<float>     // routed expert outputs parked by (position, slot) (npos x k x dim)
 }
 
 //! Allocate the run state sized to a model.
@@ -1143,13 +1213,15 @@ def make_run_state(c : Config) : Session {
     s.q |> resize(qd)
     s.k |> resize(kvd)
     s.v |> resize(kvd)
-    s.att |> resize(c.seq_len)
+    s.att |> resize(c.n_heads * c.seq_len)   // one row per head — decode attention threads over heads
     s.logits |> resize(c.vocab_size)
     if (c.n_expert > 0l) {   // MoE routing scratch
         s.moe_logits |> resize(c.n_expert)
         s.moe_w |> resize(c.n_expert_used)
         s.moe_idx |> resize(c.n_expert_used)
         s.moe_acc |> resize(c.dim)
+        s.moe_xq |> resize(c.dim)
+        s.moe_xs |> resize(c.dim / 32l)
     }
     let maxn = max(xdim, ffw)   // the Q8·Q8 path quantizes whichever activation feeds a matmul
     s.xq |> resize(maxn)
@@ -1176,9 +1248,67 @@ def eval_(t : Model; var s : Session; tokens : array<int64>) {
     s.n_past += npos
 }
 
+// ===== Per-box runtime profile (box_profile.json "runtime" section) =====
+
+def private apply_i64_knob(rt : JsonValue const?; key : string; blk : block<(v : int64) : void>) {
+    let v = read_json_field(rt, key, -1l)
+    if (v >= 0l) {
+        invoke(blk, v)
+        to_log(LOG_INFO, "dasLLAMA: box profile runtime: {key} = {v}\n")
+    }
+}
+
+//! Apply the per-box runtime knobs from box_profile.json's optional "runtime" section (written by
+//! the tuner harness; see tune_for_this_box.md): token block, L2 budget, threading thresholds,
+//! chunk multipliers, and an optional kernel-backend pin. The kernel-perm keys in the same file
+//! are consumed at COMPILE time by `[tuned]`; this is the runtime half. Missing file or section =
+//! no-op; every applied entry logs. load_model calls this before loading (a backend pin must land
+//! before the backend-for-load select); direct load_gguf users opt in by calling it themselves.
+//! `path` "" = the resolved default (DASLLAMA_BOX_PROFILE env, else <das_root>/box_profile.json).
+def apply_box_profile_runtime(path : string = "") {
+    let ppath = path != "" ? path : box_profile_path()
+    let text = fread(ppath)
+    if (empty(text)) return
+    var err = ""
+    let jv = read_json(text, err)
+    if (jv == null) {
+        to_log(LOG_WARNING, "dasLLAMA: {ppath} is not valid JSON ({err}) — runtime knobs not applied\n")
+        return
+    }
+    let rt = jv?["runtime"]   // null-sentinel when absent — every read below then keeps its default
+    apply_i64_knob(rt, "q8_token_block") $(v) { set_q8_token_block(v) }
+    apply_i64_knob(rt, "q8_l2_budget") $(v) { set_q8_l2_budget(v) }
+    apply_i64_knob(rt, "matmul_par_threshold") $(v) { set_matmul_par_threshold(v) }
+    apply_i64_knob(rt, "attn_par_threshold") $(v) { set_attn_par_threshold(v) }
+    apply_i64_knob(rt, "decode_attn_par_threshold") $(v) { set_decode_attn_par_threshold(v) }
+    apply_i64_knob(rt, "requant_par_threshold") $(v) { set_requant_par_threshold(v) }
+    apply_i64_knob(rt, "norm_par_threshold") $(v) { set_norm_par_threshold(v) }
+    apply_i64_knob(rt, "rope_par_threshold") $(v) { set_rope_par_threshold(v) }
+    apply_i64_knob(rt, "kv_store_par_threshold") $(v) { set_kv_store_par_threshold(v) }
+    apply_i64_knob(rt, "act_par_threshold") $(v) { set_act_par_threshold(v) }
+    // the two int-typed knobs clamp into int range before the cast — int() wraps silently on int64
+    apply_i64_knob(rt, "q8_chunks_per_job") $(v) { set_q8_chunks_per_job(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "q4_chunks_per_job") $(v) { set_q4_chunks_per_job(int(min(v, 2147483647l))) }
+    let be = read_json_field(rt, "backend", "")
+    if (be != "") {
+        pin_kernel_backend(be)   // warns and keeps the current backend if the name is unknown
+        to_log(LOG_INFO, "dasLLAMA: box profile runtime: backend = {active_kernel_backend()} (profile pin '{be}')\n")
+    }
+    // "threads" is advisory — the worker count is fixed at jobque creation, controlled by the
+    // DAS_JOBQUE_THREADS env (see tune_for_this_box.md); a profile can only recommend it. No live
+    // comparison here: get_total_hw_jobs() throws outside a job queue, and load_model may run there.
+    let adv = read_json_field(rt, "threads", -1l)
+    if (adv > 0l) {
+        to_log(LOG_INFO, "dasLLAMA: box profile advises threads = {adv} — ensure DAS_JOBQUE_THREADS={adv}\n")
+    }
+}
+
 //! Load a model AND its tokenizer from a GGUF — the full user-facing entry point. Arch and
 //! tokenizer backend are both auto-selected from GGUF metadata; `mode` picks the weight quant.
+//! Applies box_profile.json's "runtime" knobs first (see apply_box_profile_runtime) — the runtime
+//! half of per-box tuning; the compile-time half ([tuned] kernel perms) is already in the code.
 def load_model_(path : string; mode : QuantMode = QuantMode.fp32) : Model {
+    apply_box_profile_runtime()   // before load: a backend pin must precede the backend-for-load select
     var m <- load_gguf(path, mode)
     m.tok <- load_tokenizer_auto(path)
     return <- m
@@ -1223,6 +1353,14 @@ def private mm_fblob(var y : array<float>; t : Model; woff : int64; x : array<fl
     }
 }
 
+// Batched fp32 matmul against the aux blob: Y [npos x d] token-major from X [npos x n] — the grouped
+// MoE prefill's router. matmul_batch is bit-for-bit npos x matmul, so routing matches decode exactly.
+def private mm_fblob_b(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d, npos : int64) {
+    array_view(t.fblob, woff, n * d) $(w : array<float>#) {
+        matmul_batch(y, w, x, n, d, npos)
+    }
+}
+
 // rmsnorm with the weight as a zero-copy view into the fp32 aux blob at `woff` (len size).
 def private rms_at(var o : array<float> | #; t : Model; woff : int64; x : array<float> | #; size : int64) {
     array_view(t.fblob, woff, size) $(w : array<float>#) {
@@ -1238,7 +1376,7 @@ def private rms_batch(var out : array<float>; src : array<float>; t : Model; wof
         var op = addr(out[0])
         let ip = reinterpret<float const?>(addr(src[0]))
         let wp = reinterpret<float const?>(addr(t.fblob[woff]))
-        maybe_parallel_for(dim * npos >= NORM_PAR_THRESHOLD, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(dim * npos >= g_norm_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let off = int64(p) * dim
@@ -1268,7 +1406,7 @@ def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model
         var qp = addr(q_b[0])
         var kp = addr(k_b[0])
         let ffp = has_ff ? reinterpret<float const?>(addr(t.rope_freqs[0])) : null
-        let rope_par = (qd + kv_dim) * npos >= ROPE_PAR_THRESHOLD
+        let rope_par = (qd + kv_dim) * npos >= g_rope_par_threshold
         maybe_parallel_for(rope_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
@@ -1330,7 +1468,7 @@ def private rope_batch_tab(var q_b : array<float>; var k_b : array<float>; cos_t
         var kp = addr(k_b[0])
         let cp = reinterpret<float const?>(addr(cos_tab[0]))
         let sp = reinterpret<float const?>(addr(sin_tab[0]))
-        let rope_par = (qd + kv_dim) * npos >= ROPE_PAR_THRESHOLD
+        let rope_par = (qd + kv_dim) * npos >= g_rope_par_threshold
         maybe_parallel_for(rope_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
@@ -1354,7 +1492,7 @@ def private rope_batch_tab(var q_b : array<float>; var k_b : array<float>; cos_t
 // loff + (start_pos+p)*kv_dim and the source offset p*kv_dim both advance by kv_dim per position, so
 // the whole k_b -> key_cache store is ONE contiguous block of npos*kv_dim floats (v likewise) — copied
 // with the vectorized copy_floats (bounds-checked array copy doesn't vectorize), threaded over the
-// positions (each worker owns a disjoint cache slice). Self-gates on KV_STORE_PAR_THRESHOLD.
+// positions (each worker owns a disjoint cache slice). Self-gates on g_kv_store_par_threshold.
 def private kv_store_batch(var key_cache : array<float>; var value_cache : array<float>;
                            k_b : array<float>; v_b : array<float>; loff, start_pos, npos, kv_dim : int64) {
     let dstbase = loff + start_pos * kv_dim
@@ -1363,7 +1501,7 @@ def private kv_store_batch(var key_cache : array<float>; var value_cache : array
         var vcp = addr(value_cache[0])
         let kbp = reinterpret<float const?>(addr(k_b[0]))
         let vbp = reinterpret<float const?>(addr(v_b[0]))
-        maybe_parallel_for(kv_dim * npos >= KV_STORE_PAR_THRESHOLD, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(kv_dim * npos >= g_kv_store_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
             let m0 = int64(rb) * kv_dim
             let cnt = (int64(re) - int64(rb)) * kv_dim
             unsafe {
@@ -1378,7 +1516,7 @@ def private kv_store_batch(var key_cache : array<float>; var value_cache : array
 // One memory pass (vs silu-then-mul), and the transcendental is vectorized via exp4 unless g_act_vec is
 // off. Each element is independent (no cross-position reduce), so threading never changes the result;
 // the only non-bit-exactness is exp4's ~2 ulp. Fork workers touch raw base pointers; self-gates on
-// ACT_PAR_THRESHOLD so small prompts (and decode, npos=1) run inline.
+// g_act_par_threshold so small prompts (and decode, npos=1) run inline.
 def private gate_batch(var g : array<float>; u : array<float>; act : FfnAct; hidden, npos : int64) {
     let is_gelu = act == FfnAct.gelu
     let is_oai = act == FfnAct.swiglu_oai
@@ -1386,7 +1524,7 @@ def private gate_batch(var g : array<float>; u : array<float>; act : FfnAct; hid
     unsafe {
         var gp = addr(g[0])
         var up = reinterpret<float const?>(addr(u[0]))
-        maybe_parallel_for(hidden * npos >= ACT_PAR_THRESHOLD, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(hidden * npos >= g_act_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let off = int64(p) * hidden
@@ -1459,17 +1597,36 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
     let koff = t.wk_offs[l]
     let voff = t.wv_offs[l]
     if (voff < 0l) {
-        // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection
+        // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection. With v_norm the
+        // copy fuses into the norm — rmsnorm reads all of k before writing v, and k stays intact for
+        // its own qk_norm + rope — one pass instead of copy-then-norm; the block's v_norm step skips
+        // these layers. Bit-identical arithmetic to copy + in-place norm.
         mm(s.q, t, qoff, s.xb, s.xq, s.xs, dim, qd)
         mm(s.k, t, koff, s.xb, s.xq, s.xs, dim, kv)
-        copy_floats(s.k, 0l, s.v, 0l, kv)
-    } elif (t.quant == QuantMode.q8 && dim * (qd + 2l * kv) >= MATMUL_PAR_THRESHOLD) {
+        if (c.v_norm) {
+            rms_batch(s.v, s.k, t, t.rms_ones_off, layer_head_size(c, l), layer_n_kv_heads(c, l))
+        } else {
+            copy_floats(s.k, 0l, s.v, 0l, kv)
+        }
+    } elif (t.quant == QuantMode.q8 && dim * (qd + 2l * kv) >= g_matmul_par_threshold) {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
         matmul_q8q8_group3(s.q, s.k, s.v, t.qblob, t.qscales, qoff, koff, voff, s.xq, s.xs, dim, qd, kv, kv)
     } else {
         mm(s.q, t, qoff, s.xb, s.xq, s.xs, dim, qd)
         mm(s.k, t, koff, s.xb, s.xq, s.xs, dim, kv)
         mm(s.v, t, voff, s.xb, s.xq, s.xs, dim, kv)
+    }
+}
+
+// Q8 matmul against a PRE-quantized activation (xq/xs already hold x's Q8 image) — the MoE core
+// quantizes the shared rmsnormed activation once per layer and reuses it across every expert's
+// gate/up matmul instead of re-quantizing per call.
+def private mm_at_q8_pre(var y : array<float>; t : Model; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    let total = n * d
+    array_view(t.qblob, woff, total) $(wq : array<int8>#) {
+        array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
+            matmul_q8q8(y, wq, ws, xq, xs, n, d)
+        }
     }
 }
 
@@ -1485,41 +1642,54 @@ def private mm(var y : array<float>; t : Model; woff : int64; x : array<float>; 
     }
 }
 
+// Quantize the npos rows of a batched activation to Q8 (row p at x[p*n..] -> quants xqb[p*n..],
+// scales xsb[p*nb..]) — independent per position, so thread it (it was the largest serial bucket
+// once attention + GEMM threaded). Fork workers touch raw addresses only; the captured destinations
+// bind straight through as `var int8?`/`var float?`. Same per-row quants as the single-row
+// quantize_q8_0_into (both forward to the same ptr core).
+def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>) {
+    let nb = n / 32l
+    let ts_rq = ref_time_ticks()
+    unsafe {
+        let xp = reinterpret<float const?>(addr(x[0]))
+        var qp = addr(xqb[0])
+        var sp = addr(xsb[0])
+        let rq_par = n * npos >= g_requant_par_threshold
+        maybe_parallel_for(rq_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let pp = int64(p)
+                    quantize_q8_0_into_ptr(xp + pp * n, n, qp, sp, pp * n, pp * nb)
+                }
+            }
+        }
+    }
+    prof_add("mm_requant", ts_rq)
+}
+
+// Batched Q8 GEMM against a PRE-quantized activation image (the batch analog of mm_at_q8_pre) —
+// the grouped MoE prefill runs many GEMMs off one requant (the whole-batch image or a gathered
+// expert bucket).
+def private mm_b_q8_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
+    let total = n * d
+    let ts_gemm = ref_time_ticks()
+    array_view(t.qblob, woff, total) $(wq : array<int8>#) {
+        array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
+            matmul_q8q8_batch(y, wq, ws, xqb, xsb, n, d, npos)
+        }
+    }
+    prof_add("mm_gemm", ts_gemm)
+}
+
 // Batched big-weight matmul for prefill: Y [npos x d] from X [npos x n], via the slice-1 GEMM
 // kernels. Q8 quantizes each of the npos activation columns into the batched xqb/xsb scratch first;
 // fp32 goes straight through. Q4 has no batched kernel, so forward_prefill never routes it here.
 def private mm_b(var y : array<float>; t : Model; woff : int64; x : array<float>; var xqb : array<int8>; var xsb : array<float>; n, d, npos : int64) {
-    let total = n * d
     if (t.quant == QuantMode.q8) {
-        let nb = n / 32l
-        let ts_rq = ref_time_ticks()
-        // quantize each of the npos activation columns into xqb/xsb — independent per position, so
-        // thread it (it was the largest serial bucket once attention + GEMM threaded). Fork workers
-        // touch raw addresses only; the captured destinations bind straight through as `var int8?`/`var float?`.
-        unsafe {
-            let xp = reinterpret<float const?>(addr(x[0]))
-            var qp = addr(xqb[0])
-            var sp = addr(xsb[0])
-            let rq_par = n * npos >= REQUANT_PAR_THRESHOLD
-            maybe_parallel_for(rq_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
-                unsafe {
-                    for (p in range(rb, re)) {
-                        let pp = int64(p)
-                        quantize_q8_0_into_ptr(xp + pp * n, n, qp, sp, pp * n, pp * nb)
-                    }
-                }
-            }
-        }
-        prof_add("mm_requant", ts_rq)
-        let ts_gemm = ref_time_ticks()
-        array_view(t.qblob, woff, total) $(wq : array<int8>#) {
-            array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
-                matmul_q8q8_batch(y, wq, ws, xqb, xsb, n, d, npos)
-            }
-        }
-        prof_add("mm_gemm", ts_gemm)
+        requant_rows_q8(x, n, npos, xqb, xsb)
+        mm_b_q8_pre(y, t, woff, xqb, xsb, n, d, npos)
     } else {
-        array_view(t.wblob, woff, total) $(w : array<float>#) {
+        array_view(t.wblob, woff, n * d) $(w : array<float>#) {
             matmul_batch(y, w, x, n, d, npos)
         }
     }
@@ -1572,7 +1742,8 @@ def kv_row_total(c : Config) : int64 {
 }
 
 //! Layer `l`'s base offset into the KV cache. Reads seq_len LIVE (tests cap it after load), so this
-//! is a function of Config, never baked into the Model at load.
+//! is a function of Config, never baked into the Model at load. The definitional walking form; the
+//! hot paths use the O(1) Model overload below (same value via the load-time prefix array).
 def kv_cache_off(c : Config; l : int64) : int64 {
     var row = 0l
     for (i in range64(l)) {
@@ -1580,6 +1751,10 @@ def kv_cache_off(c : Config; l : int64) : int64 {
     }
     return row * c.seq_len
 }
+
+//! O(1) kv_cache_off: the per-layer KV-ROW prefix is filled by layout_offsets at load
+//! (seq_len-independent), multiplied by the LIVE seq_len here so post-load seq_len caps keep working.
+def kv_cache_off(t : Model; l : int64) : int64 => t.kv_row_prefix[l] * t.config.seq_len
 
 //! True when sliding layers rope differently than global layers — different θ / position scale
 //! (Gemma3: 10k/unscaled local vs 1M/linear-8 global) or a different head size (gemma4: 256 vs 512).
@@ -1607,7 +1782,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let qd = n_heads * head_size       // query / attention-output width (== dim except Gemma2/gemma4)
     let kv_mul = n_heads / n_kv_heads
     let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
-    let loff = kv_cache_off(c, l)
+    let loff = kv_cache_off(t, l)
     // Sliding-window (local) vs global attention per the arch's layer pattern (Gemma2 alternates,
     // Gemma3 5:1). The window covers all positions when pos < window, so it's a no-op for short contexts.
     let is_sliding = layer_is_sliding(c, l)
@@ -1626,7 +1801,9 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         rms_batch(s.q, s.q, t, t.rms_q_offs[l], head_size, n_heads)
         rms_batch(s.k, s.k, t, t.rms_k_offs[l], head_size, n_kv_heads)
     }
-    if (c.v_norm) {  // gemma4: weightless per-head RMSNorm on V (all-ones weight; V is never roped)
+    // gemma4: weightless per-head RMSNorm on V (all-ones weight; V is never roped). V-from-K layers
+    // (wv_offs < 0) already normed V inside mm_qkv, fused with the K→V copy.
+    if (c.v_norm && t.wv_offs[l] >= 0l) {
         rms_batch(s.v, s.v, t, t.rms_ones_off, head_size, n_kv_heads)
     }
     // RoPE on q (qd) and k (kv_dim) — sliding layers may use their own θ / position scale (Gemma3),
@@ -1640,30 +1817,52 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let kvoff = loff + pos * kv_dim
     copy_floats(unsafe(addr(s.key_cache[kvoff])), unsafe(addr(s.k[0])), kv_dim)
     copy_floats(unsafe(addr(s.value_cache[kvoff])), unsafe(addr(s.v[0])), kv_dim)
-    // multi-head attention. att[0..cnt) holds the scores for keys kstart..pos (kstart=0 unless
-    // a sliding-window layer past the window), scaled by 1/sqrt(head_size).
-    for (h in range64(n_heads)) {
-        let qoff = h * head_size
-        let kvhoff = (h / kv_mul) * head_size  // GQA: which kv head this query head reads
-        for (j in range64(cnt)) {
-            let koff = loff + (kstart + j) * kv_dim + kvhoff
-            s.att[j] = dot(unsafe(addr(s.q[qoff])), unsafe(addr(s.key_cache[koff])), head_size) * scale
-        }
-        if (c.attn_logit_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-            softcap(s.att, cnt, c.attn_logit_softcap)
-        }
-        if (c.attn_sinks) {  // gpt-oss: this head's sink logit joins the softmax denominator
-            softmax_sink(s.att, cnt, t.fblob[t.sinks_off + l * n_heads + h])
-        } else {
-            softmax(s.att, cnt)
-        }
-        // weighted sum of values into xb[qoff..]
-        for (i in range64(head_size)) {
-            s.xb[qoff + i] = 0.0
-        }
-        for (j in range64(cnt)) {
-            let voff = loff + (kstart + j) * kv_dim + kvhoff
-            axpy(unsafe(addr(s.xb[qoff])), unsafe(addr(s.value_cache[voff])), s.att[j], head_size)
+    // multi-head attention, threaded over heads past the decode threshold — each head reads its own
+    // q/K/V slices and writes a disjoint att row (h*seq_len) and xb slice, so threading is
+    // result-identical to the inline loop (the per-token KV read grows linearly with context; the
+    // gate keeps short contexts free of the per-layer-per-token dispatch cost). Fork workers touch
+    // raw pointers only; att row width is cnt <= seq_len.
+    let seq_len = c.seq_len
+    let attn_softcap = c.attn_logit_softcap
+    let attn_par = cnt * head_size * n_heads >= g_decode_attn_par_threshold
+    let sinksp = (c.attn_sinks
+        ? unsafe(reinterpret<float const?>(unsafe(addr(t.fblob[t.sinks_off + l * n_heads]))))
+        : null)
+    unsafe {
+        let qp = reinterpret<float const?>(addr(s.q[0]))
+        let kcp = reinterpret<float const?>(addr(s.key_cache[0]))
+        let vcp = reinterpret<float const?>(addr(s.value_cache[0]))
+        var xbp = addr(s.xb[0])
+        var attp = addr(s.att[0])
+        maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (h in range(rb, re)) {
+                    let hh = int64(h)
+                    let qoff = hh * head_size
+                    let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
+                    var arow = attp + hh * seq_len          // scores for keys kstart..pos
+                    for (j in range64(cnt)) {
+                        let koff = loff + (kstart + j) * kv_dim + kvhoff
+                        arow[j] = dot(qp + qoff, kcp + koff, head_size) * scale
+                    }
+                    if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
+                        softcap(arow, cnt, attn_softcap)
+                    }
+                    if (sinksp != null) {  // gpt-oss: this head's sink logit joins the softmax denominator
+                        softmax_sink(arow, cnt, sinksp[hh])
+                    } else {
+                        softmax(arow, cnt)
+                    }
+                    // weighted sum of values into xb[qoff..]
+                    for (i in range64(head_size)) {
+                        xbp[qoff + i] = 0.0
+                    }
+                    for (j in range64(cnt)) {
+                        let voff = loff + (kstart + j) * kv_dim + kvhoff
+                        axpy(xbp + qoff, vcp + voff, arow[j], head_size)
+                    }
+                }
+            }
         }
     }
     // output projection (qd -> dim), optional bias + post-attention norm, residual
@@ -1695,10 +1894,7 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
     }
     add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
     if (c.layer_out_scale) {  // gemma4: scale the whole layer output (after the residual)
-        let os = t.fblob[t.out_scale_off + l]
-        for (i in range64(dim)) {
-            s.x[i] *= os
-        }
+        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
     }
 }
 
@@ -1706,34 +1902,31 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
 // in s.xb, leaves the combined routed + shared-expert output in s.moe_acc. Router probs are taken
 // over ALL experts BEFORE top-k selection (llama.cpp build_moe_ffn order); qwen2moe keeps the
 // selected probs un-renormalized (norm_topk_prob renormalizes them for the DeepSeek/Qwen3-MoE shape).
-def private moe_ffn_core(t : Model; var s : Session; l : int64) {
-    let c = t.config
-    let dim = c.dim
+// Gate transform + top-k selection + weight post-processing on one router-logit row, IN PLACE (the
+// top-k knockout consumes the row). The selected ids/weights land at idx[off..]/w[off..] — off is 0
+// for decode, p*k for the grouped prefill router. One body for both, so routing is bit-identical.
+def private moe_select(c : Config; var lg : array<float> | #; var idx : array<int64>; var w : array<float>; off : int64) {
     let ne = c.n_expert
     let k = c.n_expert_used
-    // router logits (fp32 weights + optional bias), then probs — softmax_weight routes on the RAW
-    // biased logits and softmaxes only the selected top-k afterwards (gpt-oss)
-    mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb, dim, ne)
-    if (c.moe_router_bias) {
-        add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
-    }
+    // probs — softmax_weight routes on the RAW biased logits and softmaxes only the selected
+    // top-k afterwards (gpt-oss)
     if (c.moe_gate == MoeGate.sigmoid) {
         for (i in range64(ne)) {
-            s.moe_logits[i] = 1.0 / (1.0 + exp(-s.moe_logits[i]))
+            lg[i] = 1.0 / (1.0 + exp(-lg[i]))
         }
     } elif (c.moe_gate == MoeGate.softmax) {
-        var mx = s.moe_logits[0]
+        var mx = lg[0]
         for (i in range64(ne)) {
-            mx = max(mx, s.moe_logits[i])
+            mx = max(mx, lg[i])
         }
         var sum = 0.0
         for (i in range64(ne)) {
-            let e = exp(s.moe_logits[i] - mx)
-            s.moe_logits[i] = e
+            let e = exp(lg[i] - mx)
+            lg[i] = e
             sum += e
         }
         for (i in range64(ne)) {
-            s.moe_logits[i] /= sum
+            lg[i] /= sum
         }
     }
     // top-k by selection score — the winner is knocked out with -FLT_MAX (softmax_weight selects on
@@ -1742,43 +1935,81 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     for (j in range64(k)) {
         var best = 0l
         for (i in range64(ne)) {
-            if (s.moe_logits[i] > s.moe_logits[best]) {
+            if (lg[i] > lg[best]) {
                 best = i
             }
         }
-        s.moe_idx[j] = best
-        s.moe_w[j] = s.moe_logits[best]
-        s.moe_logits[best] = -FLT_MAX
+        idx[off + j] = best
+        w[off + j] = lg[best]
+        lg[best] = -FLT_MAX
     }
     if (c.moe_gate == MoeGate.softmax_weight) {  // gpt-oss: softmax over just the selected k logits
-        softmax(s.moe_w, k)
+        softmax(unsafe(addr(w[off])), k)
     }
     if (c.norm_topk_prob) {   // renormalize the selected weights to sum 1 (llama.cpp clamps at f16-min)
         var ws = 0.0
         for (j in range64(k)) {
-            ws += s.moe_w[j]
+            ws += w[off + j]
         }
         ws = max(ws, 6.103515625e-5)
         for (j in range64(k)) {
-            s.moe_w[j] /= ws
+            w[off + j] /= ws
         }
     }
     if (c.expert_weights_scale != 0.0 && c.expert_weights_scale != 1.0) {
         for (j in range64(k)) {
-            s.moe_w[j] *= c.expert_weights_scale
+            w[off + j] *= c.expert_weights_scale
         }
     }
+}
+
+// The shared expert's scalar sigmoid gate: σ(gate_vec_l · x). One body for decode and prefill.
+def private moe_shexp_gate(t : Model; l : int64; x : array<float> | #) : float {
+    let dim = t.config.dim
+    var gl = 0.0
+    array_view(t.fblob, t.shexp_gate_off + l * dim, dim) $(gv : array<float>#) {
+        for (i in range64(dim)) {
+            gl += gv[i] * x[i]
+        }
+    }
+    return 1.0 / (1.0 + exp(-gl))
+}
+
+def private moe_ffn_core(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let ne = c.n_expert
+    let k = c.n_expert_used
+    // router logits (fp32 weights + optional bias), then the shared select
+    mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb, dim, ne)
+    if (c.moe_router_bias) {
+        add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
+    }
+    moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
     // routed experts: acc = Σ w_j · FFN_e(xb), each expert the standard gated-FFN shape
     for (i in range64(dim)) {
         s.moe_acc[i] = 0.0
+    }
+    // Q8: quantize the shared rmsnormed activation ONCE — every routed expert's gate/up (and the
+    // shared expert's) reads the same xb, and per-call mm() would re-quantize it 2k+2 times per
+    // layer. Dedicated moe_xq/moe_xs buffers: the down-projections quantize s.hb into the shared
+    // xq/xs scratch, which would clobber a hoisted xb image there. Bit-identical (same quants).
+    let pre_q8 = t.quant == QuantMode.q8
+    if (pre_q8) {
+        quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)
     }
     let nfe = c.n_ff_exp
     let ege = dim * nfe
     for (j in range64(k)) {
         let e = l * ne + s.moe_idx[j]
         let base = e * ege
-        mm(s.hb, t, t.we1_off + base, s.xb, s.xq, s.xs, dim, nfe)
-        mm(s.hb2, t, t.we3_off + base, s.xb, s.xq, s.xs, dim, nfe)
+        if (pre_q8) {
+            mm_at_q8_pre(s.hb, t, t.we1_off + base, s.moe_xq, s.moe_xs, dim, nfe)
+            mm_at_q8_pre(s.hb2, t, t.we3_off + base, s.moe_xq, s.moe_xs, dim, nfe)
+        } else {
+            mm(s.hb, t, t.we1_off + base, s.xb, s.xq, s.xs, dim, nfe)
+            mm(s.hb2, t, t.we3_off + base, s.xb, s.xq, s.xs, dim, nfe)
+        }
         if (c.moe_exps_bias) {  // gpt-oss: this expert's gate/up biases before the activation
             add_bias(s.hb, 0l, t.fblob, t.web1_off + e * nfe, nfe)
             add_bias(s.hb2, 0l, t.fblob, t.web3_off + e * nfe, nfe)
@@ -1795,17 +2026,16 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     }
     // shared expert, gated by a sigmoid scalar from its per-layer gate vector
     if (c.n_ff_shexp > 0l) {
-        var gl = 0.0
-        array_view(t.fblob, t.shexp_gate_off + l * dim, dim) $(gv : array<float>#) {
-            for (i in range64(dim)) {
-                gl += gv[i] * s.xb[i]
-            }
-        }
-        let g = 1.0 / (1.0 + exp(-gl))
+        let g = moe_shexp_gate(t, l, s.xb)
         let nsh = c.n_ff_shexp
         let she = dim * nsh
-        mm(s.hb, t, t.wsh1_off + l * she, s.xb, s.xq, s.xs, dim, nsh)
-        mm(s.hb2, t, t.wsh3_off + l * she, s.xb, s.xq, s.xs, dim, nsh)
+        if (pre_q8) {
+            mm_at_q8_pre(s.hb, t, t.wsh1_off + l * she, s.moe_xq, s.moe_xs, dim, nsh)
+            mm_at_q8_pre(s.hb2, t, t.wsh3_off + l * she, s.moe_xq, s.moe_xs, dim, nsh)
+        } else {
+            mm(s.hb, t, t.wsh1_off + l * she, s.xb, s.xq, s.xs, dim, nsh)
+            mm(s.hb2, t, t.wsh3_off + l * she, s.xb, s.xq, s.xs, dim, nsh)
+        }
         gate_batch(s.hb, s.hb2, c.ffn_act, nsh, 1l)
         mm(s.xb2, t, t.wsh2_off + l * she, s.hb, s.xq, s.xs, nsh, dim)
         for (i in range64(dim)) {
@@ -1826,10 +2056,35 @@ def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
     }
     add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     if (c.layer_out_scale) {
-        let os = t.fblob[t.out_scale_off + l]
-        for (i in range64(dim)) {
-            s.x[i] *= os
+        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
+    }
+}
+
+// Q8_0 row dequant from the linear embedding copy: dst[i] = q[i] * scale[i/32] — the same
+// arithmetic gguf_read_tensor_f32 used to fill fblob, so the values are bit-identical to the
+// fp32 table this replaces.
+def private dequant_q8_row(t : Model; off, n : int64; var dst : float?) {
+    unsafe {
+        let qp = addr(t.qblob[off])
+        let sp = addr(t.qscales[off / 32l])
+        for (b in range64(n / 32l)) {
+            let sc = sp[b]
+            let base = b * 32l
+            for (k in range64(32l)) {
+                dst[base + k] = float(qp[base + k]) * sc
+            }
         }
+    }
+}
+
+// Copy token `token`'s embedding row into dst — from the fp32 fblob table, or (cls_q8 loads, which
+// carry no fp32 table) dequanted on demand from the linear Q8 copy at emb_q8_off.
+def private embed_row(t : Model; token : int64; var dst : float?) {
+    let dim = t.config.dim
+    if (t.cls_q8) {
+        dequant_q8_row(t, t.emb_q8_off + token * dim, dim, dst)
+    } else {
+        copy_floats(dst, unsafe(addr(t.fblob[t.tok_emb_off + token * dim])), dim)
     }
 }
 
@@ -1837,16 +2092,10 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     let c = t.config
     let dim = c.dim
 
-    // token embedding: copy row `token` of the fp32 embedding table into the residual stream
-    array_view(t.fblob, t.tok_emb_off + token * dim, dim) $(row : array<float>#) {
-        for (i in range64(dim)) {
-            s.x[i] = row[i]
-        }
-    }
+    // token embedding: row `token` into the residual stream
+    embed_row(t, token, unsafe(addr(s.x[0])))
     if (c.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
-        for (i in range64(dim)) {
-            s.x[i] *= c.embed_scale
-        }
+        scale_inplace(unsafe(addr(s.x[0])), c.embed_scale, dim)
     }
 
     // per-layer transformer stack — attention then FFN, each through the arch's registered block
@@ -1857,10 +2106,11 @@ def forward(t : Model; var s : Session; token, pos : int64) {
 
     // final rmsnorm (into xb to avoid aliasing x as both in/out), then classifier
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
-    if (c.shared_weights) {
-        // tied weights: the classifier IS the fp32 embedding table
+    if (c.shared_weights && !t.cls_q8) {
+        // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
         mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
     } else {
+        // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
         mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
     }
     if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
@@ -1875,20 +2125,47 @@ def forward(t : Model; var s : Session; token, pos : int64) {
 // Measurement is UNCONDITIONAL: a handful of ref_time_ticks() + table adds per prefill, negligible
 // against the matmuls, so it always accumulates. Output is on-demand — reset() to start a window,
 // report() to dump it. (We measure a lot; never gate the measurement, only the printing.)
+// Prefill pass-threading thresholds. Every value was measured on M1 Max against its ~90us job
+// dispatch; they are runtime knobs because the crossover tracks the box's dispatch latency and
+// core count, not the model. Setters clamp to >= 0 (0 = always thread).
 // Thread the prefill attention over heads once the work proxy (npos × max-cnt × n_heads) clears this;
 // below it the per-job dispatch overhead isn't worth it and we run the head loop inline.
-let ATTN_PAR_THRESHOLD = 100_000l
+var g_attn_par_threshold = 100_000l
 // Thread the per-position activation requant (mm_b) once n × npos clears this.
-let REQUANT_PAR_THRESHOLD = 256_000l
+var g_requant_par_threshold = 256_000l
 // Thread the per-position rmsnorm once dim × npos clears this.
-let NORM_PAR_THRESHOLD = 256_000l
+var g_norm_par_threshold = 256_000l
 // Thread the per-position rope (q_b + k_b) once (qd + kv_dim) × npos clears this.
-let ROPE_PAR_THRESHOLD = 100_000l
+var g_rope_par_threshold = 100_000l
 // Thread the KV-cache store once kv_dim × npos clears this (it's a memory-bound contiguous copy).
-let KV_STORE_PAR_THRESHOLD = 256_000l
+var g_kv_store_par_threshold = 256_000l
 // Thread the per-position FFN activation (silu/gelu) once hidden × npos clears this. Lower than the
 // memory-bound passes — each element pays a transcendental (exp/tanh), so the compute justifies threading sooner.
-let ACT_PAR_THRESHOLD = 100_000l
+var g_act_par_threshold = 100_000l
+
+def set_attn_par_threshold(v : int64) { g_attn_par_threshold = max(v, 0l) }
+def get_attn_par_threshold() : int64 => g_attn_par_threshold
+def set_requant_par_threshold(v : int64) { g_requant_par_threshold = max(v, 0l) }
+def get_requant_par_threshold() : int64 => g_requant_par_threshold
+def set_norm_par_threshold(v : int64) { g_norm_par_threshold = max(v, 0l) }
+def get_norm_par_threshold() : int64 => g_norm_par_threshold
+def set_rope_par_threshold(v : int64) { g_rope_par_threshold = max(v, 0l) }
+def get_rope_par_threshold() : int64 => g_rope_par_threshold
+def set_kv_store_par_threshold(v : int64) { g_kv_store_par_threshold = max(v, 0l) }
+def get_kv_store_par_threshold() : int64 => g_kv_store_par_threshold
+def set_act_par_threshold(v : int64) { g_act_par_threshold = max(v, 0l) }
+def get_act_par_threshold() : int64 => g_act_par_threshold
+
+// Thread the DECODE attention over heads once cnt × head_size × n_heads clears this. Decode
+// attention is the one per-token cost that grows linearly with context (the KV read), so it
+// eventually rivals the weight traffic — the per-layer-per-token dispatch (~90µs on M1) must
+// amortize first. Default MEASURED (M1 Max, quiet box, 2026-07-02): the inline-vs-threaded
+// crossover sits at ~200-260K work on both Llama-3.2-1B (hs 64 × 32 heads) and gemma-4-12B
+// (hs 512 × 16 heads); below it threading costs ≤2%, above it wins grow to +74%/+89% at 2048 ctx.
+// Set huge to disable, 0 to always thread (the A/B).
+var g_decode_attn_par_threshold = 262_144l
+def set_decode_attn_par_threshold(v : int64) { g_decode_attn_par_threshold = max(v, 0l) }
+def get_decode_attn_par_threshold() : int64 => g_decode_attn_par_threshold
 // Query-block width for the blocked prefill attention (each K/V tile is reused across this many queries).
 let ATTN_BLOCK_Q = 8l
 // Tile dims for the flash prefill attention (Q rows × KV cols processed per GEMM tile). The flash
@@ -1937,6 +2214,22 @@ def set_act_vec(on : bool) {
 //! Whether the FFN gate uses the vectorized exp4 kernels.
 def get_act_vec() : bool {
     return g_act_vec
+}
+
+// Grouped MoE prefill: when true (default) bucket positions by selected expert and run one batched
+// GEMM per touched expert; when false fall back to the per-position reference path. A/B toggle for
+// benchmarking (the two paths are bit-identical — see ffn_moe_prefill_grouped).
+var g_moe_grouped_prefill = true
+
+//! Select the MoE prefill path: expert-bucketed grouped GEMMs (default true) vs the per-position
+//! reference path. Bit-identical either way.
+def set_moe_grouped_prefill(on : bool) {
+    g_moe_grouped_prefill = on
+}
+
+//! Whether the MoE prefill uses the grouped expert-bucketed path.
+def get_moe_grouped_prefill() : bool {
+    return g_moe_grouped_prefill
 }
 
 var g_prefill_prof_acc : table<string; int64>
@@ -2102,13 +2395,15 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
                               is_sliding : bool; sliding_window : int64; attn_softcap : float;
                               sinksp : float const?) {   // this layer's per-head sink logits; null = no sinks
     let maxctx = start_pos + npos          // per-head att row width (= max cnt over this call)
-    let attn_par = npos * maxctx * n_heads >= ATTN_PAR_THRESHOLD
+    let attn_par = npos * maxctx * n_heads >= g_attn_par_threshold
     unsafe {
         let qp = reinterpret<float const?>(addr(s.q_b[0]))
         let kcp = reinterpret<float const?>(addr(s.key_cache[0]))
         let vcp = reinterpret<float const?>(addr(s.value_cache[0]))
         var xbp = addr(s.xb_b[0])
-        var attp = addr(s.att_b[0])
+        // att_b is sized only for the blocked/classic modes (flash packs into fa_* instead), so the
+        // base pointer must not index an empty array under flash — null there, never dereferenced.
+        var attp = !empty(s.att_b) ? addr(s.att_b[0]) : null
         if (g_attn_prefill_mode == AttnPrefillMode.flash) {
             // per-head packing scratch bases (sized in forward_prefill for this mode)
             var qpk0 = addr(s.fa_q[0]);  var kpk0 = addr(s.fa_k[0]);  var vpk0 = addr(s.fa_v[0])
@@ -2264,7 +2559,7 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     let kv_mul = n_heads / n_kv_heads
     let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
     let use_rope_tab = g_use_rope_table
-    let loff = kv_cache_off(c, l)
+    let loff = kv_cache_off(t, l)
     // sliding vs global attention per the arch's layer pattern (see attention_std_decode)
     let is_sliding = layer_is_sliding(c, l)
     // attention rmsnorm, per position
@@ -2277,8 +2572,13 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     mm_b(s.k_b, t, t.wk_offs[l], s.xb_b, s.xqb, s.xsb, dim, kv_dim, npos)
     if (t.wv_offs[l] >= 0l) {
         mm_b(s.v_b, t, t.wv_offs[l], s.xb_b, s.xqb, s.xsb, dim, kv_dim, npos)
+    } elif (c.v_norm) {
+        // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection, with the copy
+        // fused into the weightless V-norm (k_b read fully before v_b is written; k_b stays intact
+        // for its own qk_norm + rope). The v_norm step below skips these layers. Bit-identical to
+        // copy + in-place norm; lands in this mm_qkv bucket instead of "norm".
+        rms_batch(s.v_b, s.k_b, t, t.rms_ones_off, head_size, npos * n_kv_heads)
     } else {
-        // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection
         copy_floats(s.k_b, 0l, s.v_b, 0l, npos * kv_dim)
     }
     if (c.attn_qkv_bias) {  // Qwen2: + bias per position before RoPE
@@ -2295,13 +2595,15 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
         rms_batch(s.k_b, s.k_b, t, t.rms_k_offs[l], head_size, npos * n_kv_heads)
         prof_add("norm", ts_qknorm)
     }
-    if (c.v_norm) {  // gemma4: weightless per-head RMSNorm on V (all-ones weight; V is never roped)
+    // gemma4: weightless per-head RMSNorm on V (all-ones weight; V is never roped). V-from-K layers
+    // already normed V above, fused with the K→V copy.
+    if (c.v_norm && t.wv_offs[l] >= 0l) {
         let ts_vnorm = ref_time_ticks()
         rms_batch(s.v_b, s.v_b, t, t.rms_ones_off, head_size, npos * n_kv_heads)
         prof_add("norm", ts_vnorm)
     }
     // RoPE per position (absolute pos = start_pos + p) in place, then the KV-store pass below.
-    // rope_batch* self-gates threading on ROPE_PAR_THRESHOLD, so small prompts run it inline.
+    // rope_batch* self-gates threading on g_rope_par_threshold, so small prompts run it inline.
     // Sliding layers read the swa table / θ when the arch ropes them differently (Gemma3/gemma4);
     // p-RoPE arches (gemma4) apply the rope_freqs factors to GLOBAL layers only.
     let ts_rope = ref_time_ticks()
@@ -2384,27 +2686,233 @@ def private ffn_dense_prefill(t : Model; var s : Session; l : int64; npos : int6
     prof_add("act_resid", ts_resid1)
 }
 
-// MoE FFN, prefill — naive per-token routing: each position routes to its own expert set, so there
-// is no batched GEMM here; positions run serially through the decode scratch with the per-expert
-// matmuls threading internally. The expert-bucketed grouped GEMM is a perf-ledger item.
+// Raw byte move as int64 lanes — the Q8 gather's copy. Integer loads/stores are bit-exact by
+// construction with no FP semantics (a float-lane copy of quant bytes could in principle quiet
+// sNaN bit patterns on some targets). n8 = byte count / 8.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def private copy_int64s(var d : int64?; s : int64 const?; n8 : int64) {
+    unsafe {
+        for (j in range64(n8)) {
+            d[j] = s[j]
+        }
+    }
+}
+
+// Gather one expert bucket's Q8-quantized activation rows (quants + scales) out of the whole-batch
+// image: gather row r comes from position moe_bkt[b0+r]/k. The int8 quant rows move as int64 lanes
+// (dim % 32 == 0 so dim % 8 == 0); the scales are genuine floats and ride the tuned copy_floats.
+def private moe_gather_rows(var s : Session; b0, cnt, dim, k : int64) {
+    let nb = dim / 32l
+    let d8 = dim / 8l
+    unsafe {
+        let xqp = reinterpret<int64 const?>(addr(s.xqb[0]))
+        var gqp = reinterpret<int64?>(addr(s.moe_gxq[0]))
+        let xsp = reinterpret<float const?>(addr(s.xsb[0]))
+        var gsp = addr(s.moe_gxs[0])
+        for (r in range64(cnt)) {
+            let p = s.moe_bkt[b0 + r] / k
+            copy_int64s(gqp + r * d8, xqp + p * d8, d8)
+            copy_floats(gsp + r * nb, xsp + p * nb, nb)
+        }
+    }
+}
+
+// MoE FFN prefill, grouped: route every position, bucket the (position, slot) pairs by expert, and
+// run ONE batched GEMM chain per touched expert instead of npos*k single-token matmuls (llama.cpp's
+// mul_mat_id shape). Bit-exact vs the per-position reference path: the batch GEMM is bit-for-bit
+// N x the single-token kernel, rows quantize identically, and the reduce applies the k weighted
+// outputs (then the shared expert) in exactly the decode accumulation order.
+def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let nb = dim / 32l
+    let ne = c.n_expert
+    let k = c.n_expert_used
+    let nfe = c.n_ff_exp
+    let nsh = c.n_ff_shexp
+    let nfx = max(nfe, nsh)
+    let nk = npos * k
+    s.moe_rlog |> resize(npos * ne)
+    s.moe_idx_b |> resize(nk)
+    s.moe_w_b |> resize(nk)
+    s.moe_cnt |> resize(ne)
+    s.moe_bkt |> resize(nk)
+    s.moe_gxq |> resize(npos * dim)
+    s.moe_gxs |> resize(npos * nb)
+    s.moe_ghb |> resize(npos * nfx)
+    s.moe_ghb2 |> resize(npos * nfx)
+    s.moe_hq |> resize(npos * nfx)
+    s.moe_hs |> resize(npos * nfx / 32l)
+    s.moe_gout |> resize(npos * dim)
+    s.moe_eout |> resize(nk * dim)
+    if (nsh > 0l) {
+        s.moe_gl_b |> resize(npos)
+    }
+
+    // 1. route every position: one batched router GEMM (bit-identical per row to decode's
+    //    mm_fblob), then the shared select per row; the shexp gate dots ride along
+    let ts_route = ref_time_ticks()
+    mm_fblob_b(s.moe_rlog, t, t.router_off + l * ne * dim, s.xb_b, dim, ne, npos)
+    for (p in range64(npos)) {
+        if (c.moe_router_bias) {
+            add_bias(s.moe_rlog, p * ne, t.fblob, t.router_b_off + l * ne, ne)
+        }
+        array_view(s.moe_rlog, p * ne, ne) $(var lg : array<float>#) {
+            moe_select(c, lg, s.moe_idx_b, s.moe_w_b, p * k)
+        }
+        if (nsh > 0l) {
+            array_view(s.xb_b, p * dim, dim) $(var xv : array<float>#) {
+                s.moe_gl_b[p] = moe_shexp_gate(t, l, xv)
+            }
+        }
+    }
+    // bucket the (position, slot) pairs by expert — CSR with the in-place cursor trick: counts
+    // become run starts, the fill advances them, so afterwards moe_cnt[e] is the END of e's run
+    // (and moe_cnt[e-1] its start)
+    for (e in range64(ne)) {
+        s.moe_cnt[e] = 0l
+    }
+    for (r in range64(nk)) {
+        s.moe_cnt[s.moe_idx_b[r]]++
+    }
+    var run = 0l
+    for (e in range64(ne)) {
+        let cn = s.moe_cnt[e]
+        s.moe_cnt[e] = run
+        run += cn
+    }
+    for (r in range64(nk)) {
+        let e = s.moe_idx_b[r]
+        s.moe_bkt[s.moe_cnt[e]] = r
+        s.moe_cnt[e]++
+    }
+    prof_add("moe_route", ts_route)
+
+    // 2. quantize every normed activation row ONCE (same per-row quants as the decode hoist)
+    requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
+
+    // 3. one batched GEMM chain per touched expert over its gathered rows; raw down-projection
+    //    rows park in the (position, slot) grid for the ordered reduce
+    for (e in range64(ne)) {
+        let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
+        let cnt = s.moe_cnt[e] - b0
+        if (cnt == 0l) {
+            continue
+        }
+        let ts_gather = ref_time_ticks()
+        moe_gather_rows(s, b0, cnt, dim, k)
+        prof_add("moe_gather", ts_gather)
+        let eg = l * ne + e
+        let base = eg * dim * nfe
+        mm_b_q8_pre(s.moe_ghb, t, t.we1_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        mm_b_q8_pre(s.moe_ghb2, t, t.we3_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        if (c.moe_exps_bias) {  // gpt-oss: this expert's gate/up biases before the activation
+            for (r in range64(cnt)) {
+                add_bias(s.moe_ghb, r * nfe, t.fblob, t.web1_off + eg * nfe, nfe)
+                add_bias(s.moe_ghb2, r * nfe, t.fblob, t.web3_off + eg * nfe, nfe)
+            }
+        }
+        let ts_act = ref_time_ticks()
+        gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
+        prof_add("act", ts_act)
+        requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
+        mm_b_q8_pre(s.moe_gout, t, t.we2_off + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+        if (c.moe_exps_bias) {  // ... and its down bias, inside the routed weight (ggml_add_id order)
+            for (r in range64(cnt)) {
+                add_bias(s.moe_gout, r * dim, t.fblob, t.web2_off + eg * dim, dim)
+            }
+        }
+        let ts_park = ref_time_ticks()
+        for (r in range64(cnt)) {
+            copy_floats(s.moe_gout, r * dim, s.moe_eout, s.moe_bkt[b0 + r] * dim, dim)
+        }
+        prof_add("moe_park", ts_park)
+    }
+
+    // 4. shared expert for ALL positions — a plain dense batched FFN off the whole-batch image
+    if (nsh > 0l) {
+        let she = dim * nsh
+        mm_b_q8_pre(s.moe_ghb, t, t.wsh1_off + l * she, s.xqb, s.xsb, dim, nsh, npos)
+        mm_b_q8_pre(s.moe_ghb2, t, t.wsh3_off + l * she, s.xqb, s.xsb, dim, nsh, npos)
+        let ts_act2 = ref_time_ticks()
+        gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nsh, npos)
+        prof_add("act", ts_act2)
+        requant_rows_q8(s.moe_ghb, nsh, npos, s.moe_hq, s.moe_hs)
+        mm_b_q8_pre(s.moe_gout, t, t.wsh2_off + l * she, s.moe_hq, s.moe_hs, nsh, dim, npos)
+    }
+
+    // 5. ordered reduce into xb2_b: per position, the k weighted routed outputs in slot order, then
+    //    the shared expert — exactly the decode accumulation order, so the sum is bit-identical.
+    //    Plain mul+add loops (NOT axpy — its fused-FMA kernel would perturb the low bits); rows are
+    //    disjoint so threading never changes the result.
+    let ts_red = ref_time_ticks()
+    unsafe {
+        var ap = addr(s.xb2_b[0])
+        let ep = reinterpret<float const?>(addr(s.moe_eout[0]))
+        let wp = reinterpret<float const?>(addr(s.moe_w_b[0]))
+        let sp = nsh > 0l ? reinterpret<float const?>(addr(s.moe_gout[0])) : null
+        let gp = nsh > 0l ? reinterpret<float const?>(addr(s.moe_gl_b[0])) : null
+        maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let pp = int64(p)
+                    var arow = ap + pp * dim
+                    for (i in range64(dim)) {
+                        arow[i] = 0.0
+                    }
+                    for (j in range64(k)) {
+                        let w = wp[pp * k + j]
+                        let er = ep + (pp * k + j) * dim
+                        for (i in range64(dim)) {
+                            arow[i] += w * er[i]
+                        }
+                    }
+                    if (sp != null) {
+                        let g = gp[pp]
+                        let sr = sp + pp * dim
+                        for (i in range64(dim)) {
+                            arow[i] += g * sr[i]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    prof_add("moe_reduce", ts_red)
+    // post-norm + residual (the layer-output scale tail is shared with the reference path)
+    let ts_resid = ref_time_ticks()
+    if (c.pre_post_norm) {
+        rms_batch(s.xb2_b, s.xb2_b, t, t.rms_post_ffn_off + l * dim, dim, npos)
+    }
+    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
+    prof_add("act_resid", ts_resid)
+}
+
+// MoE FFN, prefill: norm, then either the grouped expert-bucketed path (Q8, default) or the
+// per-position reference path through the decode scratch (fp32 models — q4 never prefills — and
+// the bit-identical A/B switch).
 def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     let dim = c.dim
     let ts_norm = ref_time_ticks()
     rms_batch(s.xb_b, s.x_b, t, t.rms_ffn_off + l * dim, dim, npos)
     prof_add("norm", ts_norm)
-    let ts_moe = ref_time_ticks()
-    for (p in range64(npos)) {
-        copy_floats(s.xb_b, p * dim, s.xb, 0l, dim)
-        moe_ffn_core(t, s, l)
-        if (c.pre_post_norm) {
-            rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
+    if (t.quant == QuantMode.q8 && g_moe_grouped_prefill) {
+        ffn_moe_prefill_grouped(t, s, l, npos)
+    } else {
+        let ts_moe = ref_time_ticks()
+        for (p in range64(npos)) {
+            copy_floats(s.xb_b, p * dim, s.xb, 0l, dim)
+            moe_ffn_core(t, s, l)
+            if (c.pre_post_norm) {
+                rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
+            }
+            for (i in range64(dim)) {   // residual add into this position's x_b row
+                s.x_b[p * dim + i] += s.moe_acc[i]
+            }
         }
-        for (i in range64(dim)) {   // residual add into this position's x_b row
-            s.x_b[p * dim + i] += s.moe_acc[i]
-        }
+        prof_add("mm_ffn", ts_moe)
     }
-    prof_add("mm_ffn", ts_moe)
     if (c.layer_out_scale) {
         let os = t.fblob[t.out_scale_off + l]
         scale_inplace(unsafe(addr(s.x_b[0])), os, npos * dim)
@@ -2438,32 +2946,28 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     s.hb2_b |> resize(npos * hidden)
     s.xqb |> resize(npos * maxn)
     s.xsb |> resize(npos * maxn / 32l)
-    // per-head attention scratch. classic uses one (start_pos+npos)-wide score row per head; blocked
-    // needs ATTN_BLOCK_Q such rows per head (one per query in the block). Size for blocked — classic
-    // indexes the first row of each head's block, so the wider allocation is a harmless superset.
-    s.att_b |> resize(n_heads * ATTN_BLOCK_Q * (start_pos + npos))
+    // per-head attention scratch, per the selected algorithm. classic uses one (start_pos+npos)-wide
+    // score row per head; blocked needs ATTN_BLOCK_Q such rows per head (one per query in the block) —
+    // size for blocked, classic indexes the first row of each head's block, so the wider allocation is
+    // a harmless superset. flash never touches att_b (it packs into the fa_* tiles instead), so it
+    // skips that allocation entirely.
     if (g_attn_prefill_mode == AttnPrefillMode.flash) {  // per-head flash packing scratch (see Session)
         s.fa_q |> resize(n_heads * ATTN_FLASH_QT * head_size)
         s.fa_k |> resize(n_heads * head_size * ATTN_FLASH_KV)
         s.fa_v |> resize(n_heads * ATTN_FLASH_KV * head_size)
         s.fa_kq |> resize(n_heads * ATTN_FLASH_QT * ATTN_FLASH_KV)
         s.fa_vkq |> resize(n_heads * ATTN_FLASH_QT * head_size)
+    } else {
+        s.att_b |> resize(n_heads * ATTN_BLOCK_Q * (start_pos + npos))
     }
 
     // token embeddings -> residual stream x_b [npos x dim]
     let ts_embed = ref_time_ticks()
     for (p in range64(npos)) {
-        let tok = tokens[p]
-        array_view(t.fblob, t.tok_emb_off + tok * dim, dim) $(row : array<float>#) {
-            for (i in range64(dim)) {
-                s.x_b[p * dim + i] = row[i]
-            }
-        }
+        embed_row(t, tokens[p], unsafe(addr(s.x_b[p * dim])))
     }
     if (c.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
-        for (k in range64(npos * dim)) {
-            s.x_b[k] *= c.embed_scale
-        }
+        scale_inplace(unsafe(addr(s.x_b[0])), c.embed_scale, npos * dim)
     }
     prof_add("embed", ts_embed)
 
@@ -2497,7 +3001,7 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     array_view(s.x_b, last * dim, dim) $(var xv : array<float>#) {
         rms_at(s.xb, t, t.rms_final_off, xv, dim)
     }
-    if (c.shared_weights) {
+    if (c.shared_weights && !t.cls_q8) {
         mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
     } else {
         mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)

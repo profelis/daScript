@@ -77,11 +77,55 @@ def private parity_ok(path : string; quant : QuantMode; prompt, want : array<int
     return ok
 }
 
-// gemma-2-2b-it Q8_0, prompt "Once upon a time" (BOS=2). Confident — clean 40/40 vs oracle.
-let GEMMA2_PROMPT <- [2l, 14326l, 3054l, 476l, 1069l]
-let GEMMA2_GEN <- [235269l, 575l, 476l, 2840l, 10545l, 675l, 166962l, 27836l, 578l, 121048l,
-                   17200l, 235269l, 11012l, 476l, 3486l, 4602l, 8602l, 2810l, 1610l, 235265l,
-                   2810l, 1610l, 729l, 3836l]
+// cls_q8 invariant: a tied Q8 load of a Q8_0 embedding drops the fp32 table (the classifier
+// matmuls the disk quants; rows dequant on demand from the linear transcode at emb_q8_off) — and
+// those rows must be bit-identical to the fp32 table a fp32 load decodes from the same disk data.
+// SmolLM2-135M is the smallest tied model.
+[test]
+def test_parity_tied_cls_q8_rows(t : T?) {
+    t |> run("tied Q8 load: cls_q8 embedding rows bit-match the fp32 table") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = "{MODELS_DIR}SmolLM2-135M-Instruct-Q8_0.gguf"
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: {path} not present")
+            return
+        }
+        var t32 <- load_gguf(path, QuantMode.fp32)
+        var t8 <- load_gguf(path, QuantMode.q8)
+        t |> success(!t32.cls_q8, "fp32 load keeps the fblob table")
+        t |> success(t8.cls_q8, "tied Q8_0 load takes the cls_q8 path")
+        let dim = t8.config.dim
+        var bad = 0l
+        for (token in [0l, 1l, 1000l, t8.config.vocab_size - 1l]) {
+            for (i in range64(dim)) {
+                let el = t8.emb_q8_off + token * dim + i
+                let want = t32.fblob[t32.tok_emb_off + token * dim + i]
+                if (float(t8.qblob[el]) * t8.qscales[el / 32l] != want) {
+                    bad++
+                }
+            }
+        }
+        t |> success(bad == 0l, "embedding rows bit-identical ({bad} mismatches)")
+        delete t32
+        delete t8
+    }
+}
+
+// gemma-2-2b-it Q8_0, "1, 2, 3, 4, 5, 6, 7," (BOS=2) — the counting prompt, same as Qwen2.5/Phi:
+// the old "Once upon a time" continuation flipped on a genuine near-tie under the PINNED
+// classic+libm kernels when the tied classifier went Q8 (cls_q8) — the default kernels still
+// matched the oracle 24/24. Re-frozen from simple_ids (harness/parity.sh) 2026-07-02, and the
+// pinned run verified 40/40 against it.
+let GEMMA2_PROMPT <- [2l, 235274l, 235269l, 235248l, 235284l, 235269l, 235248l, 235304l, 235269l, 235248l,
+                      235310l, 235269l, 235248l, 235308l, 235269l, 235248l, 235318l, 235269l, 235248l, 235324l,
+                      235269l]
+let GEMMA2_GEN <- [235248l, 235321l, 235269l, 235248l, 235315l, 235269l, 235248l, 235274l, 235276l, 235269l,
+                   235248l, 235274l, 235274l, 235269l, 235248l, 235274l, 235284l, 235269l, 235248l, 235274l,
+                   235304l, 235269l, 235248l, 235274l, 235310l, 235269l, 235248l, 235274l, 235308l, 235269l,
+                   235248l, 235274l, 235318l, 235269l, 235248l, 235274l, 235324l, 235269l, 235248l, 235274l]
 
 [test]
 def test_parity_gemma2(t : T?) {
@@ -289,6 +333,9 @@ def test_parity_qwen3_4b(t : T?) {
 // Qwen1.5-MoE-A2.7B-Chat Q8 — the routed-experts arch (softmax router -> top-4 of 60 with
 // un-renormalized weights + a sigmoid-gated shared expert; QKV bias, NEOX rope). Same Qwen BPE
 // vocab and counting continuation as the dense Qwen fixtures, so the id arrays are shared.
+// The fixture runs through BOTH MoE prefill paths off one model load: the grouped expert-bucketed
+// GEMMs (default) and the per-position reference path — they are bit-identical by construction,
+// and this gate pins that.
 [test]
 def test_parity_qwen2moe(t : T?) {
     t |> run("qwen2moe forward (Qwen1.5-MoE-A2.7B-Chat Q8, routed experts + shared expert)") @(t : T?) {
@@ -301,22 +348,42 @@ def test_parity_qwen2moe(t : T?) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        t |> success(parity_ok(path, QuantMode.q8, QWEN3_PROMPT, QWEN3_GEN), "qwen2moe token-for-token")
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen2moe token-for-token")
+        set_moe_grouped_prefill(false)
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen2moe reference-prefill token-for-token")
+        set_moe_grouped_prefill(true)
+        delete tr
     }
 }
 
-// gemma-3-1b-it + gemma-3-4b-it Q8, "1, 2, 3, 4, 5, 6, 7," (BOS=2) — the per-layer attention-pattern
-// arch (5-local:1-global SWA + dual RoPE θ; the 4B adds linear-8 position scaling on global layers).
-// Same counting prompt, but the models diverge after "10" (the 1B drops into prose), so each keeps
-// its own continuation. The sliding MASK itself (kstart > 0) engages only past the 512-token window;
-// that was validated separately with a ~900-token counting prompt (40/40) — see the wave-2 notes.
+// gemma-3-1b-it + gemma-3-4b-it Q8 — the per-layer attention-pattern arch (5-local:1-global SWA +
+// dual RoPE θ; the 4B adds linear-8 position scaling on global layers). The 4B counts cleanly from
+// "1..7," (BOS=2); the 1B used to drop into prose after "10" — a prose tail that flipped a genuine
+// near-tie when the box profile's tuned kernel perms went live — so its prompt counts to 23 and the
+// continuation stays numeric for all 40 tokens (kernel-robust; oracle-refrozen 2026-07-02, verified
+// pinned 40/40 both with and without a live box profile). The sliding MASK itself (kstart > 0)
+// engages only past the 512-token window; that was validated separately with a ~900-token counting
+// prompt (40/40) — see the wave-2 notes.
 let GEMMA3_PROMPT <- [2l, 236770l, 236764l, 236743l, 236778l, 236764l, 236743l, 236800l, 236764l, 236743l,
                       236812l, 236764l, 236743l, 236810l, 236764l, 236743l, 236825l, 236764l, 236743l, 236832l,
                       236764l]
-let GEMMA3_1B_GEN <- [236743l, 236828l, 236764l, 236743l, 236819l, 236764l, 236743l, 236770l, 236771l, 236761l,
-                      108l, 2094l, 563l, 496l, 3606l, 7501l, 529l, 4945l, 236761l, 138l,
-                      1509l, 236789l, 236751l, 3187l, 1456l, 618l, 496l, 6250l, 1523l, 573l,
-                      4735l, 1003l, 17047l, 236761l, 108l, 6294l, 611l, 1461l, 786l, 531l]
+let GEMMA3_1B_PROMPT <- [2l, 236770l, 236764l, 236743l, 236778l, 236764l, 236743l, 236800l, 236764l, 236743l,
+                         236812l, 236764l, 236743l, 236810l, 236764l, 236743l, 236825l, 236764l, 236743l, 236832l,
+                         236764l, 236743l, 236828l, 236764l, 236743l, 236819l, 236764l, 236743l, 236770l, 236771l,
+                         236764l, 236743l, 236770l, 236770l, 236764l, 236743l, 236770l, 236778l, 236764l, 236743l,
+                         236770l, 236800l, 236764l, 236743l, 236770l, 236812l, 236764l, 236743l, 236770l, 236810l,
+                         236764l, 236743l, 236770l, 236825l, 236764l, 236743l, 236770l, 236832l, 236764l, 236743l,
+                         236770l, 236828l, 236764l, 236743l, 236770l, 236819l, 236764l, 236743l, 236778l, 236771l,
+                         236764l, 236743l, 236778l, 236770l, 236764l, 236743l, 236778l, 236778l, 236764l, 236743l,
+                         236778l, 236800l, 236764l]
+let GEMMA3_1B_GEN <- [236743l, 236778l, 236812l, 236764l, 236743l, 236778l, 236810l, 236764l, 236743l, 236778l,
+                      236825l, 236764l, 236743l, 236778l, 236832l, 236764l, 236743l, 236778l, 236828l, 236764l,
+                      236743l, 236778l, 236819l, 236764l, 236743l, 236800l, 236771l, 236764l, 236743l, 236800l,
+                      236770l, 236764l, 236743l, 236800l, 236778l, 236764l, 236743l, 236800l, 236800l, 236764l]
 let GEMMA3_4B_GEN <- [236743l, 236828l, 236764l, 236743l, 236819l, 236764l, 236743l, 236770l, 236771l, 236764l,
                       236743l, 236770l, 236770l, 236764l, 236743l, 236770l, 236778l, 236764l, 236743l, 236770l,
                       236800l, 236764l, 236743l, 236770l, 236812l, 236764l, 236743l, 236770l, 236810l, 236764l,
@@ -334,7 +401,7 @@ def test_parity_gemma3_1b(t : T?) {
             t |> success(true, "skipped: {path} not present")
             return
         }
-        t |> success(parity_ok(path, QuantMode.q8, GEMMA3_PROMPT, GEMMA3_1B_GEN), "gemma3-1b token-for-token")
+        t |> success(parity_ok(path, QuantMode.q8, GEMMA3_1B_PROMPT, GEMMA3_1B_GEN), "gemma3-1b token-for-token")
     }
 }
 
