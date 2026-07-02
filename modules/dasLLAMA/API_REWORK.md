@@ -381,12 +381,22 @@ what it costs today and what the fix would change.
   down-projections quantize s.hb into the shared xq/xs, which would clobber a hoisted image
   there) and routes every gate/up matmul through `mm_at_q8_pre`. Bit-identical (same quants).
   (Spotted wave 4.)
-- **MXFP4 experts transcode to Q8 — doubling their bytes.** gpt-oss-20b's expert stacks are
-  4.25 bit/weight on disk (~10GB) but run as Q8 (~19GB + 2.4GB scales): 2× the resident memory
-  AND 2× the decode weight traffic vs a native MXFP4 kernel (per-block E8M0 scale + 16-entry
-  nibble LUT — the int8 side of the SDOT pipeline could eat un-LUTed nibbles with a lane
-  table). Q4_0 storage is the existing halfway house (same 4-bit traffic, one lossy requant,
-  no new kernel) — worth an A/B before writing MXFP4-native matmuls. (Spotted wave 5.)
+- **DONE (MXFP4 arc, 2026-07-02): native-MXFP4 expert stacks + repacked TBL/SDOT kernels + the
+  MoE dispatch fuse.** Was: gpt-oss-20b's 4.25-bit expert stacks ran as Q8 (2× resident, 2×
+  decode traffic). Now: the stacks stay as raw nibble + E8M0 planes (mxq/mxs, exact disk bits —
+  the old dequant→requant amax error is gone), decoded in-register by new aarch64_neon
+  intrinsics (tbl16_lo/tbl16_hi = vqtbl1q_s8 of the doubled-e2m1 LUT; sdot4_w / sdot4_laneq_w
+  take the tbl result as a VALUE) through dot_mx4q8 ([tuned], row-major) and dot_mx4q8_laneq4
+  (interleaved 4-row repack, the block_mxfp4x4 twin). Grouped prefill expands each touched
+  expert to EXACT Q8 (lossless: q = LUT int, scale = e8m0_half), writing the interleaved form
+  directly on a repack backend; short prompts route per-position (npos·k ≥ 8·n_expert guard).
+  On top, the MoE decode dispatch fuse: region-list groupn/groupn_mx4 kernels run all k
+  experts' gates (ups, downs) in ONE fork/join — 288 → ~72 mm dispatches/token, bit-exact.
+  Measured (NOISY box, 4-tok smoke): decode 22.0 → 32 t/s (llama.cpp anchor 39.9), resident
+  26 → 13.2GB, every fixture token-for-token unchanged (no refreeze — the counting fixtures
+  absorbed all kernel-order changes). Official quiet-box A/B (decode_prof two-window +
+  same-window llama-bench) still pending. (Spotted wave 5; the Q4_0 halfway house was skipped —
+  native landed directly.)
 - **q4 has no batched prefill kernel — prefill collapses to decode rate.** The q4 path serves
   everything through the scalar fp32-activation `dot_q4`/`matmul_q4` (no q8-style token-blocked
   batch GEMM, no NEON arm, no repack backend), so a q4 prefill runs at generation speed:
