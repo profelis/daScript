@@ -361,7 +361,10 @@ what it costs today and what the fix would change.
   is the next lever). gpt-oss-20b: prefill us ~219 vs 117 (~1.9× FASTER — the grouped MoE GEMM);
   decode us ~19 vs ~39-42 (~0.47× — exactly the MXFP4→Q8 doubled expert-weight-traffic asymmetry
   quantified: the native-MXFP4/Q4_0 entry below is now the headline gpt-oss decode lever).
-  (Spotted waves 3/5.)
+  POST-JOBQUE (#3361 wake propagation + batch dispatch + worker spin, same-window anchors):
+  12B decode 7.3 → 7.9 t/s vs 8.63 (gap 84% → ~92%); gpt-oss decode 19.2 → 22.0 vs 39.9
+  (0.47× → 0.55×) — the dispatch-latency share of the decode gap is banked; what remains on
+  gpt-oss is the weight-format asymmetry. (Spotted waves 3/5.)
 - **DONE (perf pass, 2026-07-02): MoE prefill runs expert-bucketed grouped GEMMs — bit-exact.**
   `ffn_moe_prefill_grouped` routes every position (one batched router GEMM + the shared
   `moe_select`), CSR-buckets the (position, slot) pairs by expert, runs one batched GEMM chain
