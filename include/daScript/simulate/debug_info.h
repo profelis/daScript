@@ -196,6 +196,7 @@ namespace das
         string  fileName;
         string  importName;
         bool extraDepModule = false;
+        string  requireName;    // the require string that produced this info (e.g. "daslib/fio"); carried so a promoted shared module records its canonical, directory-independent require identity
     };
 
     struct BaseRequireRecord {

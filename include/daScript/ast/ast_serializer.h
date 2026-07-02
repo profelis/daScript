@@ -221,7 +221,7 @@ namespace das {
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
         static constexpr uint32_t getVersion () { 
-            return 93;   // 93: ExprMakeArray::makeArrayOnHeap added
+            return 94;   // 94: Module::promotedRequire (shared-module canonical require identity) added
         }
 
         void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;

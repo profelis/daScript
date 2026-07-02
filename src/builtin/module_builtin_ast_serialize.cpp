@@ -2755,7 +2755,7 @@ namespace das {
             for ( auto & m : modules ) {
                 bool builtin = m->builtIn, promoted = m->promoted;
                 ser << builtin << promoted;
-                ser << m->name << m->fileName;
+                ser << m->name << m->fileName << m->promotedRequire;
 
                 if ( m->builtIn && m->promoted ) {
                     bool isNew = ser.writingReadyModules.count(m) == 0;
@@ -2789,8 +2789,8 @@ namespace das {
         uint64_t size = 0; ser << size;
         for ( uint64_t i = 0; i < size; i++ ) {
             bool builtin = false, promoted = false;
-            string name, fileName;
-            ser << builtin << promoted << name << fileName;
+            string name, fileName, promotedRequire;
+            ser << builtin << promoted << name << fileName << promotedRequire;
             if ( builtin && !promoted ) {
                 // pass
             } else if ( builtin && promoted ) {
@@ -2809,7 +2809,7 @@ namespace das {
                         library.addModule(mod);
                         ser.serializeModule(*mod, /*already_exists*/false);
                         mod->builtIn = false; // suppress assert
-                        mod->promoteToBuiltin(nullptr);
+                        mod->promoteToBuiltin(nullptr, promotedRequire);
                     }
                 } else {
                     Module * m = Module::require(name);

@@ -1131,7 +1131,7 @@ namespace das
     class DAS_API Module {
     public:
         Module ( const string & n = "" );
-        void promoteToBuiltin(const FileAccessPtr & access);
+        void promoteToBuiltin(const FileAccessPtr & access, const string & requireName = string());
         virtual ~Module();
         virtual void addPrerequisits ( ModuleLibrary & ) const {}
         virtual ModuleAotType aotRequire ( TextWriter & ) const { return ModuleAotType::no_aot; }
@@ -1174,7 +1174,7 @@ namespace das
         }
         friend DAS_CC_API bool compileBuiltinModule ( Module * module, const string & name, const unsigned char * const str, unsigned int str_len );
         static Module * require ( const string & name );
-        static Module * requireEx ( const string & name, bool allowPromoted, const string & expectedFileName = string() );
+        static Module * requireEx ( const string & name, bool allowPromoted, const string & requireName = string() );
         static void Initialize();
         static void CollectFileInfo(das::vector<FileInfoPtr> &accesses);
         static void Shutdown( bool dumpHandleLeaks = true );
@@ -1259,6 +1259,7 @@ namespace das
         string                                      cppClassName;       // C++ class name (e.g. "Module_Math"), set by REGISTER_MODULE
         uint64_t                                    nameHash = 0;
         string                                      fileName;           // where the module was found, if not built-in
+        string                                      promotedRequire;    // canonical require string a shared module was promoted with (e.g. "daslib/fio"); identity-matched in requireEx so a cross-directory `require` resolves it, while a mis-qualified one (bare `require fio`) does not
         union {
             struct {
                 bool    builtIn : 1;

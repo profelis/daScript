@@ -290,16 +290,20 @@ namespace das {
         return nullptr;
     }
 
-    Module * Module::requireEx ( const string & name, bool allowPromoted, const string & expectedFileName ) {
+    Module * Module::requireEx ( const string & name, bool allowPromoted, const string & requireName ) {
         if ( !daScriptEnvironment::getBound() ) return nullptr;
         for ( auto m = daScriptEnvironment::getBound()->modules; m != nullptr; m = m->next ) {
             if ( allowPromoted || !m->promoted ) {
                 if ( m->name == name ) {
-                    // We key by module name only.
-                    // If someone required daslib/fio earlier (fio is shared),
-                    // and now we write require fio it will be found, although
-                    // it's an error.
-                    if ( m->promoted && !expectedFileName.empty() && m->fileName != expectedFileName ) {
+                    // A shared module is identity-matched by the canonical require
+                    // string it was promoted with, NOT by a directory-relative file
+                    // path. This lets `require component_macro` resolve the promoted
+                    // module from any directory, while a mis-qualified require -- bare
+                    // `require fio` for a module promoted as `daslib/fio` -- still fails.
+                    // An empty stored identity (older serialized data, extra-dependency
+                    // promotion) falls back to name-only matching.
+                    if ( m->promoted && !requireName.empty() && !m->promotedRequire.empty()
+                            && m->promotedRequire != requireName ) {
                         continue;
                     }
                     return m;
@@ -354,13 +358,14 @@ namespace das {
         isPublic = true;
     }
 
-    void Module::promoteToBuiltin(const FileAccessPtr & access) {
+    void Module::promoteToBuiltin(const FileAccessPtr & access, const string & requireName) {
         DAS_ASSERTF(!builtIn, "failed to promote. already builtin");
         next = daScriptEnvironment::getBound()->modules;
         daScriptEnvironment::getBound()->modules = this;
         builtIn = true;
         promoted = true;
         promotedAccess = access;
+        promotedRequire = requireName;
     }
 
     Module::~Module() {
