@@ -21,8 +21,11 @@ struct Args {
     model : string
 
     @clarg_short = "p"
-    @clarg_doc = "Prefill depth before the decode window (default: 256)"
-    prefill : int = 256
+    @clarg_doc = "Prefill depth before the decode window (default: 8)"
+    prefill : int = 8
+
+    @clarg_doc = "Second, deeper window in the same process — 0 to skip (default: 512)"
+    prefill2 : int = 512
 
     @clarg_short = "n"
     @clarg_doc = "Decode tokens profiled (default: 64)"
@@ -115,7 +118,26 @@ def private print_traffic_table(t : Model; pos : int64) {
     print("  TOTAL:        {mb(total)} MB/token -> at 100 GB/s ~= {102400.0lf / mb(total)} tok/s ceiling\n")
 }
 
-def private run_profile(var t : Model; p, n : int64) {
+// One measured window: greedily decode n tokens from context depth p (the cache is already filled
+// to p), with the profiler reset to cover exactly this loop. Returns the chained last token.
+def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int64) : int64 {
+    var tok = tok0
+    forward_profile_reset()
+    let t0 = ref_time_ticks()
+    for (i in range64(n)) {
+        forward(t, s, tok, p + i)
+        tok = greedy_top(s, t.config.vocab_size)
+    }
+    let us = get_time_usec(t0)
+    let tps = double(n) / (double(us) * 1.0e-6lf)
+    print("decode: {n} tokens from ctx {p} in {us}us = {tps} tok/s\n\n")
+    forward_profile_report()
+    print("\n")
+    print_traffic_table(t, p + n / 2l)
+    return tok
+}
+
+def private run_profile(var t : Model; p, n, p2 : int64) {
     let c = t.config
     var s <- make_run_state(c)
     with_job_que() {
@@ -132,18 +154,15 @@ def private run_profile(var t : Model; p, n : int64) {
         let prompt <- build_prompt(p)
         forward_prefill(t, s, prompt, p, 0l)
         var tok = greedy_top(s, c.vocab_size)
-        forward_profile_reset()
-        let t0 = ref_time_ticks()
-        for (i in range64(n)) {
-            forward(t, s, tok, p + i)
+        tok = profile_window(t, s, p, n, tok)
+        if (p2 > p + n) {   // second window, deeper into the context, off the same load
+            let fill = p2 - (p + n)
+            let more <- build_prompt(fill)
+            forward_prefill(t, s, more, fill, p + n)
             tok = greedy_top(s, c.vocab_size)
+            print("\n")
+            profile_window(t, s, p2, n, tok)
         }
-        let us = get_time_usec(t0)
-        let tps = double(n) / (double(us) * 1.0e-6lf)
-        print("decode: {n} tokens from ctx {p} in {us}us = {tps} tok/s\n\n")
-        forward_profile_report()
-        print("\n")
-        print_traffic_table(t, p + n / 2l)
     }
 }
 
@@ -166,11 +185,12 @@ def main() {
     }
     let p = max(int64(cfg.prefill), 8l)
     let n = max(int64(cfg.ngen), 1l)
+    let p2 = int64(cfg.prefill2)
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)
-    let ctx_cap = max(2048l, p + n + 8l)
+    let ctx_cap = max(2048l, max(p, p2) + n + 8l)
     t.config.seq_len = min(t.config.seq_len, ctx_cap)   // cap the KV allocation
     let c = t.config
     print("config: dim={c.dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size} moe={c.moe}\n")
-    run_profile(t, p, n)
+    run_profile(t, p, n, p2)
 }
