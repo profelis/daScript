@@ -136,7 +136,7 @@ def test_matmul_mx4q8(t : T?) {
             close(t, y[i], want[i], 1e-6, "row {i} (backend {active_kernel_backend()})")
         }
     }
-    t |> run("every registered backend agrees (pin A/B)") @(t : T?) {
+    t |> run("every row-major backend agrees (pin A/B)") @(t : T?) {
         var wn : array<uint8>
         var we : array<uint8>
         var xq : array<int8>
@@ -145,6 +145,9 @@ def test_matmul_mx4q8(t : T?) {
         gemv_case(wn, we, xq, xs, want, 64l, 5l)
         let saved = active_kernel_backend()
         for (name in kernel_backend_names()) {
+            if (kernel_backend_needs_repack(name)) {   // interleaved kernels can't read row-major planes
+                continue
+            }
             pin_kernel_backend(name)
             var y : array<float>
             y |> resize(5)
@@ -158,4 +161,38 @@ def test_matmul_mx4q8(t : T?) {
             select_kernel_backend(saved)
         }
     }
+    t |> run("laneq: repack + interleaved GEMV matches the scalar leaf (incl. tail rows)") @(t : T?) {
+        if (!has_backend("arm64-laneq")) {   // registered on arm64 + JIT only
+            return
+        }
+        // d = 6 = one 4-row group + 2 row-major tail rows
+        var wn : array<uint8>
+        var we : array<uint8>
+        var xq : array<int8>
+        var xs : array<float>
+        var want : array<float>
+        gemv_case(wn, we, xq, xs, want, 64l, 6l)
+        let saved = active_kernel_backend()
+        pin_kernel_backend("arm64-laneq")
+        repack_mx4_weight(wn, we, 0l, 64l, 6l)
+        var y : array<float>
+        y |> resize(6)
+        matmul_mx4q8(y, wn, we, xq, xs, 64l, 6l)
+        for (i in range(6)) {
+            close(t, y[i], want[i], 1e-6, "row {i} (arm64-laneq repacked)")
+        }
+        clear_kernel_backend_pin()
+        if (saved != "") {
+            select_kernel_backend(saved)
+        }
+    }
+}
+
+def private has_backend(name : string) : bool {
+    for (n in kernel_backend_names()) {
+        if (n == name) {
+            return true
+        }
+    }
+    return false
 }

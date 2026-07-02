@@ -146,6 +146,7 @@ let g_aarch64_intrin_lookup <- {
     "aarch64_neon::sdot4" => @@intrinsic_sdot4,
     "aarch64_neon::sdot4_laneq" => @@intrinsic_sdot4_laneq,
     "aarch64_neon::sdot4_w" => @@intrinsic_sdot4_w,
+    "aarch64_neon::sdot4_laneq_w" => @@intrinsic_sdot4_laneq_w,
     "aarch64_neon::tbl16_lo" => @@intrinsic_tbl16,
     "aarch64_neon::tbl16_hi" => @@intrinsic_tbl16
 }
@@ -1520,6 +1521,43 @@ def intrinsic_sdot4_w(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array
     var fnTy = LLVMFunctionType(v4i32, fnArgTypes)
     var callArgs <- [arguments[0], wvec, xvec]
     return LLVMBuildCall2(ctx.builder, fnTy, decl, callArgs, "sdot4_w")
+}
+
+// Emitter for aarch64_neon::sdot4_laneq_w (gated by g_aarch64_intrin_lookup, only reached on
+// aarch64). sdot4_laneq_w(acc:int4; w:int4; x:int8 const?; lane:int):int4 — sdot4_laneq with the
+// interleaved weight operand as a VALUE (a tbl16_lo/tbl16_hi result, bitcast in-register); `x`'s
+// 32-bit group `lane` is splatted exactly as in intrinsic_sdot4_laneq. `lane` must be a
+// compile-time constant in 0..3.
+def intrinsic_sdot4_laneq_w(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    let v16i8 = LLVMVectorType(ctx.types.t_int8, 16u)
+    let v4i32 = ctx.types.LLVMInt4Type()
+    var wvec = LLVMBuildBitCast(ctx.builder, arguments[1], v16i8, "")
+    var xptr = LLVMBuildPointerCast(ctx.builder, arguments[2], LLVMPointerType(v16i8, 0u), "")
+    var xvec = LLVMBuildLoad2(ctx.builder, v16i8, xptr, "")
+    LLVMSetAlignment(xvec, 1u)
+    if (LLVMIsAConstantInt(arguments[3]) == null) {
+        failed_E(_expr, "aarch64_neon::sdot4_laneq_w: lane must be a compile-time constant")
+        return null
+    }
+    let lane = int(LLVMConstIntGetZExtValue(arguments[3]))
+    if (lane < 0 || lane > 3) {
+        failed_E(_expr, "aarch64_neon::sdot4_laneq_w: lane must be in 0..3")
+        return null
+    }
+    var xi32 = LLVMBuildBitCast(ctx.builder, xvec, v4i32, "")
+    var xspl = LLVMBuildShuffleVector(ctx.builder, ctx.types, xi32, xi32, [lane, lane, lane, lane], "xlane")
+    var xbcast = LLVMBuildBitCast(ctx.builder, xspl, v16i8, "")
+    let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.sdot")
+    var declTypes <- [v4i32, v16i8]
+    var decl = LLVMGetIntrinsicDeclaration(g_mod, id, declTypes)
+    if (decl == null) {
+        failed_E(_expr, "missing intrinsic llvm.aarch64.neon.sdot (non-ARM target?)")
+        return null
+    }
+    var fnArgTypes <- [v4i32, v16i8, v16i8]
+    var fnTy = LLVMFunctionType(v4i32, fnArgTypes)
+    var callArgs <- [arguments[0], wvec, xbcast]
+    return LLVMBuildCall2(ctx.builder, fnTy, decl, callArgs, "sdot4_laneq_w")
 }
 
 // v16i8 splat of a small constant (AND mask / shift amount for the nibble ops)

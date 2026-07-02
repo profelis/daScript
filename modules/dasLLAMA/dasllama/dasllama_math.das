@@ -345,9 +345,13 @@ typedef RepackQ8Q8Fn = function<(var wp : int8?; var sp : float?; n : int64; d :
 // 32-block, row stride n/2) + `we` RAW E8M0 scale bytes (1 per block, row stride n/32) — against a
 // pre-quantized Q8 activation. Native half-traffic path for MoE expert stacks (gpt-oss decode).
 typedef MatmulMx4Q8Fn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+// In-place repack of one MXFP4 region [d rows x n cols] (raw plane pointers at the region start)
+// into the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
+typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
-//! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first.
+//! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
+//! (mm_mx4 and repack_mx4 follow the same flag — one layout decision per backend).
 //! priority = higher wins the auto-select (portable 0; arm64 sdot 10 / laneq 20; x64 vnni 20 later).
 //! mm_mx4 = the MXFP4·Q8 GEMV (native 4-bit expert weights); every backend supplies one (the portable
 //! scalar form at minimum) so the mx4 path dispatches exactly like the Q8 one.
@@ -358,6 +362,7 @@ struct KernelBackend {
     group3 : MatmulQ8Q8Group3Fn
     repack : RepackQ8Q8Fn
     mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
+    repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
     needs_repack : bool
     priority : int
 }
@@ -369,6 +374,7 @@ var g_mm_q8q8_batch = @@q8q8_unset_batch
 var g_mm_q8q8_group3 = @@q8q8_unset_group3
 var g_mm_mx4q8 = @@mx4q8_unset_kernel
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
+var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 
 var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
@@ -379,6 +385,10 @@ var g_backend_pin = ""              // A/B: force this backend by name; "" = aut
 //! Default repack: no-op — weights stay row-major for the portable / sdot4x4 kernels.
 [unused_argument(wp, sp, n, d)]
 def repack_q8q8_identity(var wp : int8?; var sp : float?; n, d : int64) {}
+
+//! Default MXFP4 repack: no-op — the planes stay row-major for the portable / row-major kernels.
+[unused_argument(np, ep, n, d)]
+def repack_mx4_identity(var np : uint8?; var ep : uint8?; n, d : int64) {}
 
 def private no_backend() {
     panic("dasLLAMA: no Q8·Q8 kernel backend registered — require dasllama/dasllama_math_default")
@@ -398,6 +408,7 @@ def private activate(be : KernelBackend) {
     g_mm_q8q8_group3 = be.group3
     g_mm_mx4q8 = be.mm_mx4
     g_repack_q8q8 = be.repack
+    g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
     g_active_needs_repack = be.needs_repack
 }
@@ -475,6 +486,26 @@ def repack_q8q8_weight(var qblob : array<int8>; var qscales : array<float>; woff
     unsafe {
         invoke(g_repack_q8q8, addr(qblob[woff]), addr(qscales[woff / 32l]), n, d)
     }
+}
+
+//! Repack one native-MXFP4 weight tensor (region at weight-element offset woff in the mxq/mxs
+//! planes, shape [d rows x n cols]) into the active backend's layout, IN PLACE. No-op unless a
+//! repack backend is enabled. n % 32 == 0.
+def repack_mx4_weight(var mxq : array<uint8>; var mxs : array<uint8>; woff, n, d : int64) {
+    unsafe {
+        invoke(g_repack_mx4, addr(mxq[woff / 2l]), addr(mxs[woff / 32l]), n, d)
+    }
+}
+
+//! Does backend `name` read an interleaved (repacked) weight layout? false for unknown names.
+//! Lets tests / direct callers skip layout-mismatched A/Bs (a repack backend cannot run on
+//! row-major buffers).
+def kernel_backend_needs_repack(name : string) : bool {
+    var r = false
+    g_kernel_backends |> get(name) $(be) {
+        r = be.needs_repack
+    }
+    return r
 }
 
 //! Q8·Q8 matmul: y = W·x with W as int8 quants `wq` [d x n] + scales `ws` [d x n/32] and the

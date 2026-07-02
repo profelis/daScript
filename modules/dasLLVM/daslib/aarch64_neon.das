@@ -119,3 +119,24 @@ def sdot4_laneq(acc : int4; w : int8 const?; x : int8 const?; lane : int) : int4
     }
     return r
 }
+
+//! Lane-indexed signed dot-product with a VALUE weight operand: like `sdot4_laneq`, but `w` is
+//! 16 int8 packed little-endian into an `int4` (the form `tbl16_lo`/`tbl16_hi` return) — so a
+//! LUT-dequantized 4-row interleaved weight vector feeds the indexed SDOT with no memory
+//! round-trip. On an aarch64 JIT target this is one indexed SDOT; elsewhere the scalar body below.
+//! `lane` must be a compile-time constant.
+def sdot4_laneq_w(acc : int4; w : int4; x : int8 const?; lane : int) : int4 {
+    let b = lane * 4
+    var r = acc
+    unsafe {
+        let x0 = int(x[b])
+        let x1 = int(x[b + 1])
+        let x2 = int(x[b + 2])
+        let x3 = int(x[b + 3])
+        r.x += sxb(w.x, 0) * x0 + sxb(w.x, 1) * x1 + sxb(w.x, 2) * x2 + sxb(w.x, 3) * x3
+        r.y += sxb(w.y, 0) * x0 + sxb(w.y, 1) * x1 + sxb(w.y, 2) * x2 + sxb(w.y, 3) * x3
+        r.z += sxb(w.z, 0) * x0 + sxb(w.z, 1) * x1 + sxb(w.z, 2) * x2 + sxb(w.z, 3) * x3
+        r.w += sxb(w.w, 0) * x0 + sxb(w.w, 1) * x1 + sxb(w.w, 2) * x2 + sxb(w.w, 3) * x3
+    }
+    return r
+}

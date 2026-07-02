@@ -669,6 +669,23 @@ def private repack_q8_weights(var t : Model) {
     }
 }
 
+// Repack the native-MXFP4 expert stacks into the active backend's interleaved mx layout, IN PLACE
+// (each expert slice is its own 2D tensor). Mirrors repack_q8_weights' contract: called only after
+// select_matmul_backend_for_load picks a repack backend; the pointer is otherwise identity.
+def private repack_mx4_stacks(var t : Model) {
+    let c = t.config
+    let dim = c.dim
+    let ege = dim * c.n_ff_exp
+    for (l in range64(c.n_layers)) {
+        for (e in range64(c.n_expert)) {
+            let base = (l * c.n_expert + e) * ege
+            repack_mx4_weight(t.mxq, t.mxs, t.we1_off + base, dim, c.n_ff_exp)
+            repack_mx4_weight(t.mxq, t.mxs, t.we2_off + base, c.n_ff_exp, dim)
+            repack_mx4_weight(t.mxq, t.mxs, t.we3_off + base, dim, c.n_ff_exp)
+        }
+    }
+}
+
 //! go straight into `mode`'s storage (pre-quantized tensors transcode block-for-block with no fp32
 //! round-trip; F16/F32 tensors dequant one at a time through a small reused scratch), so a Q8/Q4
 //! load never holds the dense fp32 weights. The embedding + norms stay fp32 in fblob regardless.
@@ -1103,6 +1120,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         // layout. Returns false off-ARM (portable stays, weights stay row-major).
         if (mode == QuantMode.q8 && select_matmul_backend_for_load()) {
             repack_q8_weights(t)
+            if (t.experts_mx4) {
+                repack_mx4_stacks(t)
+            }
         }
     }
     fclose(f)
@@ -2847,7 +2867,11 @@ def private moe_gather_rows(var s : Session; b0, cnt, dim, k : int64) {
 // into EXACT Q8 blocks in the given scratch: q[j] = the doubled-e2m1 LUT value (already an int8),
 // scale = e8m0_half(e) — no requantization error, every value representable. Grouped prefill runs
 // the proven Q8 batch GEMM off this scratch (one expansion per touched expert amortizes over the
-// whole bucket); repacked to the active backend's interleaved layout when it needs one.
+// whole bucket). On a repack backend the mx planes are ALREADY interleaved (repack_mx4_stacks),
+// and the interleaved nibble order maps byte-for-byte onto the interleaved Q8 order — nibble byte
+// `off` (0..63) of block-group bg lands at q8[bg*128 + off] (low nibbles, k-chunk 0..15) and
+// q8[bg*128 + 64 + off] (high, k 16..31), with the scale bytes 1:1 positional in BOTH layouts —
+// so the expansion writes the repacked form directly, no separate repack pass.
 def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<int8>; var ws : array<float>) {
     let total = n * d
     wq |> resize(total)
@@ -2861,24 +2885,56 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
         let ep = addr(t.mxs[woff / 32l])
         var qp = addr(wq[0])
         var sp = addr(ws[0])
-        maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_total_hw_jobs()) $(bb, be) {
+        // scale bytes: 1:1 positional map in both the row-major and the interleaved layout
+        maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_total_hw_jobs()) $(sb, se) {
             unsafe {
-                for (bi0 in range(bb, be)) {
-                    let bi = int64(bi0)
-                    let nb16 = bi * 16l
-                    let qb = bi * 32l
-                    for (j in range64(16l)) {
-                        let b = int(np[nb16 + j])
-                        qp[qb + j] = lutp[b & 15]
-                        qp[qb + j + 16l] = lutp[b >> 4]
-                    }
+                for (bi in range(sb, se)) {
                     sp[bi] = e8m0_half(uint(ep[bi]))
                 }
             }
         }
-    }
-    if (g_active_needs_repack) {
-        repack_q8q8_weight(wq, ws, 0l, n, d)
+        if (g_active_needs_repack) {
+            // interleaved: whole 4-row block-groups first, then the row-major tail rows
+            let ngrp = (d / 4l) * (n / 32l)
+            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_total_hw_jobs()) $(gb, ge) {
+                unsafe {
+                    for (bg0 in range(gb, ge)) {
+                        let bg = int64(bg0)
+                        let nb = bg * 64l
+                        let qb = bg * 128l
+                        for (off in range64(64l)) {
+                            let b = int(np[nb + off])
+                            qp[qb + off] = lutp[b & 15]
+                            qp[qb + 64l + off] = lutp[b >> 4]
+                        }
+                    }
+                }
+            }
+            for (bi in range64(ngrp * 4l, nblk)) {   // row tail (d % 4): row-major from here on
+                let nb16 = bi * 16l
+                let qb = bi * 32l
+                for (j in range64(16l)) {
+                    let b = int(np[nb16 + j])
+                    qp[qb + j] = lutp[b & 15]
+                    qp[qb + j + 16l] = lutp[b >> 4]
+                }
+            }
+        } else {
+            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_total_hw_jobs()) $(bb, be) {
+                unsafe {
+                    for (bi0 in range(bb, be)) {
+                        let bi = int64(bi0)
+                        let nb16 = bi * 16l
+                        let qb = bi * 32l
+                        for (j in range64(16l)) {
+                            let b = int(np[nb16 + j])
+                            qp[qb + j] = lutp[b & 15]
+                            qp[qb + j + 16l] = lutp[b >> 4]
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

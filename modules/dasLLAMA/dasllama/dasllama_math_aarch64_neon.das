@@ -176,6 +176,120 @@ def private mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 con
     }
 }
 
+// ===== MXFP4 laneq form (interleaved 4-row groups) — mx4 model load only =====
+// The mx repack (repack_mx4_neon) interleaves nibble BYTES 4-rows-per-sub-chunk: block bi of a
+// group is 64 bytes at + bi*64, sub-chunk j (j = 0..3) = [r0 nb(4j..4j+3) | r1 | r2 | r3] — so ONE
+// v16i8 load + tbl16_lo/tbl16_hi yields BOTH laneq weight vectors of that sub-chunk (k 4j..4j+3
+// and k 16+4j..19+4j across the 4 rows; a nibble byte x holds elems x low / x+16 high). E8M0
+// scale bytes interleave 4-per-block ([r0e r1e r2e r3e] at + bi*4). Tail rows (d % 4) stay
+// row-major and run the row-major dot_mx4q8. This is the mx4 twin of llama.cpp's block_mxfp4x4
+// repacked GEMV — where its gpt-oss decode number lives.
+
+//! Interleaved MXFP4·Q8 dot over one 4-row group against one token: per 32-block, 4 nibble loads
+//! feed 8 TBL + 8 indexed SDOT (each tbl result is one laneq weight vector, fed as a VALUE via
+//! sdot4_laneq_w) — accumulator lane L is output row L, flushed through the 4 rows' e8m0_half
+//! scales × the token block scale. No horizontal reduce. Not `private`: called from inside the
+//! lifted parallel_for worker lambdas.
+[hint(unsafe_range_check, noalias = lut, noalias = wg, noalias = eg, noalias = xq, noalias = xs)]
+def dot_mx4q8_laneq4(lut : int8 const?; wg : uint8 const?; eg : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        for (bi in range64(nb)) {
+            let wb = bi * 64l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq_w(acc, tbl16_lo(lut, wg + wb), xq + xb, 0)
+            acc = sdot4_laneq_w(acc, tbl16_hi(lut, wg + wb), xq + xb + 16l, 0)
+            acc = sdot4_laneq_w(acc, tbl16_lo(lut, wg + wb + 16l), xq + xb, 1)
+            acc = sdot4_laneq_w(acc, tbl16_hi(lut, wg + wb + 16l), xq + xb + 16l, 1)
+            acc = sdot4_laneq_w(acc, tbl16_lo(lut, wg + wb + 32l), xq + xb, 2)
+            acc = sdot4_laneq_w(acc, tbl16_hi(lut, wg + wb + 32l), xq + xb + 16l, 2)
+            acc = sdot4_laneq_w(acc, tbl16_lo(lut, wg + wb + 48l), xq + xb, 3)
+            acc = sdot4_laneq_w(acc, tbl16_hi(lut, wg + wb + 48l), xq + xb + 16l, 3)
+            let s = float4(e8m0_half(uint(eg[bi * 4l])), e8m0_half(uint(eg[bi * 4l + 1l])),
+                e8m0_half(uint(eg[bi * 4l + 2l])), e8m0_half(uint(eg[bi * 4l + 3l])))
+            let xsb = xs[bi]
+            f += float4(acc) * s * float4(xsb, xsb, xsb, xsb)
+        }
+    }
+    return f
+}
+
+// In-place repack of one MXFP4 region [d x n] into the interleaved-group layout above. Copies both
+// planes to a scratch, then writes the interleaved layout back; tail rows (d % 4) stay row-major.
+// Runs once per expert tensor at load, on the main context.
+def private repack_mx4_neon(var np : uint8?; var ep : uint8?; n, d : int64) {
+    let nrow = n / 2l    // nibble bytes per row
+    let nbb = n / 32l    // blocks per row
+    let ng = d / 4l
+    var tn : array<uint8>
+    var te : array<uint8>
+    tn |> resize(d * nrow)
+    te |> resize(d * nbb)
+    unsafe {
+        var tnp = addr(tn[0])
+        var tep = addr(te[0])
+        for (i in range64(d * nrow)) {
+            tnp[i] = np[i]
+        }
+        for (i in range64(d * nbb)) {
+            tep[i] = ep[i]
+        }
+        for (g in range64(ng)) {
+            let gnb = g * 4l * nrow
+            for (bi in range64(nbb)) {
+                let dst = gnb + bi * 64l
+                for (j in range64(4l)) {
+                    for (r in range64(4l)) {
+                        let src = (g * 4l + r) * nrow + bi * 16l + j * 4l
+                        let dj = dst + j * 16l + r * 4l
+                        np[dj + 0l] = tnp[src + 0l]
+                        np[dj + 1l] = tnp[src + 1l]
+                        np[dj + 2l] = tnp[src + 2l]
+                        np[dj + 3l] = tnp[src + 3l]
+                    }
+                }
+            }
+            let geb = g * 4l * nbb
+            for (bi in range64(nbb)) {
+                for (r in range64(4l)) {
+                    ep[geb + bi * 4l + r] = tep[(g * 4l + r) * nbb + bi]
+                }
+            }
+        }
+    }
+    delete tn
+    delete te
+}
+
+def private mx4q8_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nrow = n / 2l
+    let nbb = n / 32l
+    let ng = d / 4l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (gi in range(rb, re)) {
+                    let g = int64(gi)
+                    let f = dot_mx4q8_laneq4(lutp, wn + g * 4l * nrow, we + g * 4l * nbb, xqp, xsp, n)
+                    myp[g * 4l + 0l] = f.x
+                    myp[g * 4l + 1l] = f.y
+                    myp[g * 4l + 2l] = f.z
+                    myp[g * 4l + 3l] = f.w
+                }
+            }
+        }
+        for (i in range64(ng * 4l, d)) {   // row tail (d % 4): row-major dot
+            myp[i] = dot_mx4q8(lutp, wn + i * nrow, we + i * nbb, xqp, xsp, n)
+        }
+    }
+}
+
 // ===== laneq backend (lane-indexed SDOT over interleaved 4-row groups) — Q8 model load only =====
 // Weights are repacked at load (repack_q8q8_neon) so each accumulator lane is a distinct output row:
 // no per-block horizontal reduce. Activated by select_matmul_backend_for_load at Q8 model load, never
@@ -467,10 +581,10 @@ def dasllama_math_aarch64_neon_register() {
             repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel_neon, needs_repack = false, priority = 10))
         // arm64-laneq: laneq + interleaved repack — the highest priority (20), but needs_repack, so only
         // select_matmul_backend_for_load (at Q8 model load, which then repacks) activates it. Its mx4
-        // GEMV is the row-major TBL+SDOT one (the mx4 planes are not Q8-repacked); the interleaved
-        // MXFP4 repack kernel is the next step of the mx4 arc.
+        // pair reads/writes the interleaved-group mx layout (repack_mx4_neon above).
         register_kernel_backend(KernelBackend(name = "arm64-laneq", mm = @@q8q8_kernel_neon_laneq,
             batch = @@q8q8_batch_kernel_neon_laneq, group3 = @@q8q8_group3_kernel_neon_laneq,
-            repack = @@repack_q8q8_neon, mm_mx4 = @@mx4q8_kernel_neon, needs_repack = true, priority = 20))
+            repack = @@repack_q8q8_neon, mm_mx4 = @@mx4q8_kernel_neon_laneq, repack_mx4 = @@repack_mx4_neon,
+            needs_repack = true, priority = 20))
     }
 }
