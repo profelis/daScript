@@ -132,6 +132,50 @@ def private q8q8_group3_kernel_neon_sdot4x4(var y0p : float?; var y1p : float?; 
     }
 }
 
+// ===== MXFP4·Q8 (native 4-bit expert weights) =====
+
+[hint(unsafe_range_check, noalias = lut, noalias = wn, noalias = we, noalias = xq, noalias = xs)]
+def template dot_mx4q8_template(lut : int8 const ?; wn : uint8 const ?; we : uint8 const ?; xq : int8 const ?; xs : float const ?; n : int64) : float {
+    let nb = n / 32l
+    var f = 0.0
+    for [tune = 1] (bi in range64(nb)) {   // fallback u2 = ggml's ib += 2 shape
+        let wp = unsafe(wn + bi * 16l)
+        let xp = unsafe(xq + bi * 32l)
+        var acc = int4(0, 0, 0, 0)
+        acc = sdot4_w(acc, tbl16_lo(lut, wp), xp)
+        acc = sdot4_w(acc, tbl16_hi(lut, wp), unsafe(xp + 16l))
+        f += float(acc.x + acc.y + acc.z + acc.w) * e8m0_half(uint(unsafe(we[bi]))) * unsafe(xs[bi])
+    }
+    return f
+}
+
+//! ARM TBL+SDOT MXFP4·Q8 dot (the NEON body of ggml_vec_dot_mxfp4_q8_0): per 32-block, one v16i8
+//! nibble load feeds two TBL lookups of the doubled-e2m1 LUT (low nibbles = elems 0..15, high =
+//! 16..31), each result SDOTing in-register against the Q8 activation (sdot4_w — no memory
+//! round-trip), the exact int32 block sum flushing through e8m0_half(we) × xs. Same per-block flush
+//! order as dot_mx4q8_scalar. Only the unroll perms genuinely apply (the body is straight-line
+//! tbl16/sdot4_w intrinsics); fallback u2 mirrors ggml's 2-block iteration. Not `private`: called
+//! from inside the lifted parallel_for worker lambdas.
+[hint(unsafe_range_check, noalias = lut, noalias = wn, noalias = we, noalias = xq, noalias = xs), tuned(fallback = "u2")]
+def dot_mx4q8(lut : int8 const?; wn : uint8 const?; we : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float {}
+
+def private mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    myp[i] = dot_mx4q8(lutp, wn + int64(i) * (n / 2l), we + int64(i) * nb, xqp, xsp, n)
+                }
+            }
+        }
+    }
+}
+
 // ===== laneq backend (lane-indexed SDOT over interleaved 4-row groups) — Q8 model load only =====
 // Weights are repacked at load (repack_q8q8_neon) so each accumulator lane is a distinct output row:
 // no per-block horizontal reduce. Activated by select_matmul_backend_for_load at Q8 model load, never
@@ -420,11 +464,13 @@ def dasllama_math_aarch64_neon_register() {
         // (tests, benchmarks). priority 10 out-ranks portable (0).
         register_kernel_backend(KernelBackend(name = "arm64-sdot", mm = @@q8q8_kernel_neon_sdot4x4,
             batch = @@q8q8_batch_kernel_neon_sdot4x4, group3 = @@q8q8_group3_kernel_neon_sdot4x4,
-            repack = @@repack_q8q8_identity, needs_repack = false, priority = 10))
+            repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel_neon, needs_repack = false, priority = 10))
         // arm64-laneq: laneq + interleaved repack — the highest priority (20), but needs_repack, so only
-        // select_matmul_backend_for_load (at Q8 model load, which then repacks) activates it.
+        // select_matmul_backend_for_load (at Q8 model load, which then repacks) activates it. Its mx4
+        // GEMV is the row-major TBL+SDOT one (the mx4 planes are not Q8-repacked); the interleaved
+        // MXFP4 repack kernel is the next step of the mx4 arc.
         register_kernel_backend(KernelBackend(name = "arm64-laneq", mm = @@q8q8_kernel_neon_laneq,
             batch = @@q8q8_batch_kernel_neon_laneq, group3 = @@q8q8_group3_kernel_neon_laneq,
-            repack = @@repack_q8q8_neon, needs_repack = true, priority = 20))
+            repack = @@repack_q8q8_neon, mm_mx4 = @@mx4q8_kernel_neon, needs_repack = true, priority = 20))
     }
 }

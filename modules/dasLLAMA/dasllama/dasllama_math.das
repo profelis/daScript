@@ -341,16 +341,23 @@ typedef MatmulQ8Q8Group3Fn = function<(var y0p : float?; var y1p : float?; var y
 // In-place repack of one Q8 weight region [d rows x n cols] (raw pointers at the region start) into
 // the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
 typedef RepackQ8Q8Fn = function<(var wp : int8?; var sp : float?; n : int64; d : int64) : void>
+// MXFP4·Q8 GEMV: W kept in its native 4-bit form as two planes — `wn` packed nibbles (16 bytes per
+// 32-block, row stride n/2) + `we` RAW E8M0 scale bytes (1 per block, row stride n/32) — against a
+// pre-quantized Q8 activation. Native half-traffic path for MoE expert stacks (gpt-oss decode).
+typedef MatmulMx4Q8Fn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
 //! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first.
 //! priority = higher wins the auto-select (portable 0; arm64 sdot 10 / laneq 20; x64 vnni 20 later).
+//! mm_mx4 = the MXFP4·Q8 GEMV (native 4-bit expert weights); every backend supplies one (the portable
+//! scalar form at minimum) so the mx4 path dispatches exactly like the Q8 one.
 struct KernelBackend {
     name : string
     mm : MatmulQ8Q8Fn
     batch : MatmulQ8Q8BatchFn
     group3 : MatmulQ8Q8Group3Fn
     repack : RepackQ8Q8Fn
+    mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
     needs_repack : bool
     priority : int
 }
@@ -360,6 +367,7 @@ struct KernelBackend {
 var g_mm_q8q8 = @@q8q8_unset_kernel
 var g_mm_q8q8_batch = @@q8q8_unset_batch
 var g_mm_q8q8_group3 = @@q8q8_unset_group3
+var g_mm_mx4q8 = @@mx4q8_unset_kernel
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 
 var g_kernel_backends : table<string; KernelBackend>
@@ -381,11 +389,14 @@ def private q8q8_unset_kernel(var yp : float?; wp : int8 const?; sp : float cons
 def private q8q8_unset_batch(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) { no_backend() }
 [unused_argument(y0p, y1p, y2p, wp, sp, woff0, woff1, woff2, xqp, xsp, n, d0, d1, d2)]
 def private q8q8_unset_group3(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) { no_backend() }
+[unused_argument(yp, wn, we, xqp, xsp, n, d)]
+def private mx4q8_unset_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
     g_mm_q8q8_batch = be.batch
     g_mm_q8q8_group3 = be.group3
+    g_mm_mx4q8 = be.mm_mx4
     g_repack_q8q8 = be.repack
     g_active_backend = be.name
     g_active_needs_repack = be.needs_repack
@@ -502,6 +513,43 @@ def matmul_q8q8_group3(var y0 : array<float>; var y1 : array<float>; var y2 : ar
             reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
             woff0, woff1, woff2,
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d0, d1, d2)
+    }
+}
+
+// ===== MXFP4·Q8: native 4-bit weights (MoE expert stacks) =====
+// A 32-elem MXFP4 block is 16 packed nibble bytes (low nibble = elem j, high = elem j+16) + one RAW
+// E8M0 scale byte, held in two separate planes so the nibble stream is 16-byte-regular for TBL. The
+// nibbles index the DOUBLED e2m1 table (ggml kvalues_mxfp4); the scale byte converts via e8m0_half
+// (2^(e-128), the half compensating the doubling). Kernels dispatch through g_mm_mx4q8 exactly like
+// the Q8 ones.
+
+//! E8M0 scale byte -> fp32 * 0.5 = 2^(e-128) — pairs with the DOUBLED e2m1 nibble values
+//! (mxfp4_fill_lut). e < 2 lands in fp32-denormal territory -> precomputed bit patterns (mirrors
+//! ggml_e8m0_to_fp32_half; dasllama_gguf keeps a private twin so the generic GGUF reader stays
+//! dependency-free).
+def e8m0_half(e : uint) : float {
+    let bits = e < 2u ? (0x00200000u << e) : ((e - 1u) << 23u)
+    return unsafe(reinterpret<float>(bits))
+}
+
+//! Fill a 16-byte LUT with the MXFP4 e2m1 magnitudes DOUBLED (nibble -> ±{0,.5,1,1.5,2,3,4,6}×2,
+//! OCP MX spec via ggml kvalues_mxfp4) as int8 — the table `tbl16_lo`/`tbl16_hi` and the scalar
+//! kernels index; the halved E8M0 scale (e8m0_half) compensates.
+def mxfp4_fill_lut(var lut : int8[16]) {
+    let kv = fixed_array(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
+    for (i in range(16)) {
+        lut[i] = int8(kv[i])
+    }
+}
+
+//! MXFP4·Q8 GEMV: y = W·x with W native 4-bit — `wn` packed nibbles [d x n/2 bytes] + `we` raw E8M0
+//! scale bytes [d x n/32] — and the activation PRE-quantized to (xq [n], xs [n/32]) by the caller.
+//! Dispatches to the active backend (g_mm_mx4q8). n % 32 == 0.
+def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
     }
 }
 

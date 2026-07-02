@@ -169,10 +169,53 @@ def private q8q8_group3_kernel(var y0p : float?; var y1p : float?; var y2p : flo
     }
 }
 
+//! MXFP4·Q8 dot, scalar reference form (mirrors ggml_vec_dot_mxfp4_q8_0's tail loop): per 32-block,
+//! each of the 16 nibble bytes pairs its low nibble with xq[j] and its high nibble with xq[j+16]
+//! through the doubled-e2m1 `lut`, the exact int32 block sum flushing through e8m0_half(we) × xs.
+//! The per-block flush order matches the NEON dot_mx4q8, so the two agree to reassociation. Not
+//! `private`: the reference for the mx4 unit tests and callable from lifted worker lambdas.
+[hint(unsafe_range_check, noalias = lut, noalias = wn, noalias = we, noalias = xq, noalias = xs)]
+def dot_mx4q8_scalar(lut : int8 const?; wn : uint8 const?; we : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float {
+    let nb = n / 32l
+    var f = 0.0
+    unsafe {
+        for (bi in range64(nb)) {
+            let wb = bi * 16l
+            let xb = bi * 32l
+            var s = 0
+            for (j in range64(16l)) {
+                let b = int(wn[wb + j])
+                s += int(lut[b & 15]) * int(xq[xb + j])
+                s += int(lut[b >> 4]) * int(xq[xb + j + 16l])
+            }
+            f += float(s) * e8m0_half(uint(we[bi])) * xs[bi]
+        }
+    }
+    return f
+}
+
+def private mx4q8_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    myp[i] = dot_mx4q8_scalar(lutp, wn + int64(i) * (n / 2l), we + int64(i) * nb, xqp, xsp, n)
+                }
+            }
+        }
+    }
+}
+
 //! Register the portable Q8·Q8 backend (row-major, no repack). Lowest priority — a platform ISA backend
 //! out-ranks it in the auto-select where available; it stays the fallback everywhere else.
 [init]
 def dasllama_math_default_register() {
     register_kernel_backend(KernelBackend(name = "portable", mm = @@q8q8_kernel, batch = @@q8q8_batch_kernel,
-        group3 = @@q8q8_group3_kernel, repack = @@repack_q8q8_identity, needs_repack = false, priority = 0))
+        group3 = @@q8q8_group3_kernel, repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel,
+        needs_repack = false, priority = 0))
 }
