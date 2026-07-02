@@ -380,7 +380,7 @@ namespace das {
                     return false;
                 }
                 auto info = access->getModuleInfo(mod, fileName);
-                auto module = Module::requireEx(mod, allowPromoted, info.fileName);
+                auto module = Module::requireEx(mod, allowPromoted, modRec.name);
                 if ( !module ) {
                     if ( !info.moduleName.empty() ) {
                         mod = info.moduleName;
@@ -388,7 +388,7 @@ namespace das {
                             *log << string(tab,'\t') << " resolved as " << mod << "\n";
                         }
                     }
-                    module = Module::requireEx(mod, allowPromoted, info.fileName); // try native with that name AGAIN (promoted?)
+                    module = Module::requireEx(mod, allowPromoted, modRec.name); // try native with that name AGAIN (promoted?)
                     if ( !module ) {
                         auto it_r = find_if(req.begin(), req.end(), [&] ( const ModuleInfo & reqM ) {
                             return reqM.moduleName == mod;
@@ -450,6 +450,7 @@ namespace das {
                                 *log << string(tab,'\t') << "from " << fileName << " require " << mod
                                     << " - ok, new module " << info.moduleName << " at " << info.fileName << "\n";
                             }
+                            info.requireName = modRec.name;
                             req.push_back(info);
                         } else {
                             if ( !access->isSameFileName(it_r->fileName, info.fileName) ) {
@@ -1467,7 +1468,7 @@ namespace das {
                 program->thisModule->fromExtraDependency = mod.extraDepModule;
                 if ( program->promoteToBuiltin ) {
                     if ( canShareModule(program) ) {
-                        program->thisModule->promoteToBuiltin(access);
+                        program->thisModule->promoteToBuiltin(access, mod.requireName);
                     } else {
                         return program;
                     }

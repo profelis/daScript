@@ -256,6 +256,39 @@ static void part2_solution(void) {
         das_modulegroup_release(libgrp);
         das_text_release(tout);
     }
+
+    // --- 2c: Requirer in a SUBDIRECTORY — still resolves ---
+    //
+    // The promoted module is matched by its canonical require string
+    // ("my_helpers"), NOT by a file path recomputed relative to the requiring
+    // script's directory. So a `require my_helpers` from a script that lives in
+    // a subdirectory resolves to the same promoted module — no module file
+    // needed, exactly as at the root.
+    {
+        das_text_writer  * tout    = das_text_make_printer();
+        das_module_group * libgrp  = das_modulegroup_make();
+        das_file_access  * fa      = das_fileaccess_make_default();
+
+        // Requirer lives under scripts/app/ — a different directory than the
+        // root loader that promoted my_helpers in Part 2a.
+        das_fileaccess_introduce_file(fa, "scripts/app/consumer.das", USER_SCRIPT, 0);
+
+        das_program * program = das_program_compile("scripts/app/consumer.das", fa, tout, libgrp);
+        int err_count = das_program_err_count(program);
+        printf("Part 2c: requirer in a subdirectory -- compilation %s\n",
+               err_count ? "FAILED (unexpected)" : "succeeded!");
+        for (int i = 0; i < err_count; i++) {
+            das_error * error = das_program_get_error(program, i);
+            char buf[1024];
+            das_error_report(error, buf, sizeof(buf));
+            printf("  error %d: %s\n", i, buf);
+        }
+
+        das_program_release(program);
+        das_fileaccess_release(fa);
+        das_modulegroup_release(libgrp);
+        das_text_release(tout);
+    }
 }
 
 // -----------------------------------------------------------------------
