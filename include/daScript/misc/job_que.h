@@ -88,7 +88,7 @@ namespace das {
         int getNumberOfQueuedJobs();
         int getTotalHwJobs();
         void push(Job && job, JobCategory category, JobPriority priority);
-        void pushBatch(vector<Job> && jobs, JobCategory category, JobPriority priority);   // one lock hold + one notify_all for the whole batch
+        void pushBatch(vector<Job> && jobs, JobCategory category, JobPriority priority);   // one lock hold + one notify for the whole batch (workers wake-propagate, see JobQue::job)
         void parallel_for ( JobStatus & status, int from, int to, const JobChunk & chunk, JobCategory category, JobPriority priority, int chunk_count = -1, int step = 1 );
         void parallel_for ( int from, int to, const JobChunk & chunk, JobCategory category, JobPriority priority, int chunk_count = -1, int step = 1 );
         void parallel_for_with_consume (int from, int to, const JobChunk & chunk, const JobChunk & consume, JobCategory category, JobPriority priority, int chunk_count = -1, int step = 1);
