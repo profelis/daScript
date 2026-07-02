@@ -184,6 +184,16 @@ struct Model {
     qscales : array<float>
     q4blob : array<uint8>
     q4scales : array<float>
+    // Native-MXFP4 expert stacks (valid when experts_mx4): the routed we1/we2/we3 stacks live here
+    // as RAW disk bits — packed nibbles (16 bytes per 32-block) + E8M0 scale bytes (1 per block) —
+    // instead of qblob, halving their resident size and decode traffic vs the old MXFP4->Q8
+    // transcode (and dropping its requant error: the disk bits are exact). we*_off then index these
+    // planes in weight elements (nibble byte = off/2, scale byte = off/32). Set by load_gguf for
+    // q8-mode loads whose expert stacks are MXFP4 on disk (gpt-oss); everything else (attention,
+    // shexp, classifier) stays in qblob.
+    mxq : array<uint8>
+    mxs : array<uint8>
+    experts_mx4 : bool = false
     // Attention projections use PER-LAYER offsets — tensor shapes differ per layer class on gemma4
     // (SWA 16Q/8KV heads of 256 vs global 16Q/1KV of 512); uniform arches fill the flat strides.
     // wv_offs[l] = -1 marks a layer with no attn_v tensor (V reuses the pre-norm K projection).
@@ -280,6 +290,7 @@ struct ArchDesc {
 struct private LayoutSizes {
     fblob_n : int64   // element count of the fp32 aux region
     wblob_n : int64   // element count of the big-weight region
+    mx_n : int64      // element count of the native-MXFP4 expert planes (0 unless experts_mx4)
 }
 
 // Fill both offset tables from the config; return the element counts of each region. The big-weight
@@ -392,16 +403,28 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         t.wo_offs |> push(wo)
         wo += layer_qd(c, l) * dim
     }
+    var mx = 0l
     if (c.n_expert > 0l) {
         // MoE: routed expert stacks — expert e of layer l is a normal 2D matrix at
-        // we*_off + (l*n_expert + e) * (dim*n_ff_exp), so the existing kernels apply per expert
+        // we*_off + (l*n_expert + e) * (dim*n_ff_exp), so the existing kernels apply per expert.
+        // Native-MXFP4 loads keep the stacks in the mxq/mxs planes instead of qblob; we*_off then
+        // count elements within those planes (same expert-major order).
         let ege = dim * c.n_ff_exp   // per-expert element count (same for gate/up and down)
-        t.we1_off = wo
-        wo += layers * c.n_expert * ege
-        t.we2_off = wo
-        wo += layers * c.n_expert * ege
-        t.we3_off = wo
-        wo += layers * c.n_expert * ege
+        if (t.experts_mx4) {
+            t.we1_off = mx
+            mx += layers * c.n_expert * ege
+            t.we2_off = mx
+            mx += layers * c.n_expert * ege
+            t.we3_off = mx
+            mx += layers * c.n_expert * ege
+        } else {
+            t.we1_off = wo
+            wo += layers * c.n_expert * ege
+            t.we2_off = wo
+            wo += layers * c.n_expert * ege
+            t.we3_off = wo
+            wo += layers * c.n_expert * ege
+        }
         if (c.n_ff_shexp > 0l) {
             let she = dim * c.n_ff_shexp
             t.wsh1_off = wo
@@ -434,7 +457,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         t.wcls_off = wo
         wo += c.vocab_size * dim
     }
-    return LayoutSizes(fblob_n = fo, wblob_n = wo)
+    return LayoutSizes(fblob_n = fo, wblob_n = wo, mx_n = mx)
 }
 
 // Reserve exact capacity then size — avoids the array allocator's power-of-2 rounding on big arrays.
@@ -619,11 +642,13 @@ def private repack_q8_weights(var t : Model) {
         repack_q8q8_weight(t.qblob, t.qscales, t.wo_offs[l], qd, dim)
         if (c.n_expert > 0l) {   // MoE: each expert slice is its own 2D tensor, repacked per its shape
             let ege = dim * c.n_ff_exp
-            for (e in range64(c.n_expert)) {
-                let base = (l * c.n_expert + e) * ege
-                repack_q8q8_weight(t.qblob, t.qscales, t.we1_off + base, dim, c.n_ff_exp)
-                repack_q8q8_weight(t.qblob, t.qscales, t.we2_off + base, c.n_ff_exp, dim)
-                repack_q8q8_weight(t.qblob, t.qscales, t.we3_off + base, dim, c.n_ff_exp)
+            if (!t.experts_mx4) {   // native-MXFP4 stacks live in mxq/mxs, row-major (no Q8 repack)
+                for (e in range64(c.n_expert)) {
+                    let base = (l * c.n_expert + e) * ege
+                    repack_q8q8_weight(t.qblob, t.qscales, t.we1_off + base, dim, c.n_ff_exp)
+                    repack_q8q8_weight(t.qblob, t.qscales, t.we2_off + base, c.n_ff_exp, dim)
+                    repack_q8q8_weight(t.qblob, t.qscales, t.we3_off + base, dim, c.n_ff_exp)
+                }
             }
             if (c.n_ff_shexp > 0l) {
                 let she = dim * c.n_ff_shexp
@@ -920,11 +945,24 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         }
         // per-layer output scalars (gemma4 layer_output_scale) — presence detected from the tensors
         t.config.layer_out_scale = gguf_find_tensor(m, "blk.0.layer_output_scale.weight") >= 0
+        // Native-MXFP4 expert stacks (gpt-oss): on a q8 load whose routed expert stacks are all
+        // MXFP4 on disk, keep them in their native nibble + E8M0 planes (see Model.experts_mx4)
+        // instead of transcoding to Q8 — half the resident bytes and decode traffic, exact disk bits.
+        t.experts_mx4 = (t.config.n_expert > 0l && mode == QuantMode.q8
+            && gguf_tensor_type(m, "blk.0.ffn_gate_exps.weight") == GGML_TYPE_MXFP4
+            && gguf_tensor_type(m, "blk.0.ffn_down_exps.weight") == GGML_TYPE_MXFP4
+            && gguf_tensor_type(m, "blk.0.ffn_up_exps.weight") == GGML_TYPE_MXFP4)
         let kv = t.config.kv_dim
         let qd = t.config.n_heads * t.config.head_size   // query width (== dim except Gemma2)
         let sz = layout_offsets(t)
         // fp32 aux (embedding + norms) is always present; the big-weight storage matches `mode`
         reserve_resize(t.fblob, sz.fblob_n)
+        if (sz.mx_n > 0l) {
+            t.mxq |> reserve(sz.mx_n / 2l)
+            t.mxq |> resize(sz.mx_n / 2l)
+            t.mxs |> reserve(sz.mx_n / 32l)
+            t.mxs |> resize(sz.mx_n / 32l)
+        }
         if (mode == QuantMode.q8) {
             t.qblob |> reserve(sz.wblob_n)
             t.qblob |> resize(sz.wblob_n)
@@ -999,9 +1037,19 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 if (t.config.moe_router_bias) {
                     gguf_read_tensor_f32(m, bytes, "blk.{l}.ffn_gate_inp.bias", t.fblob, t.router_b_off + l * ne, ne)
                 }
-                load_big(m, bytes, "blk.{l}.ffn_gate_exps.weight", t, t.we1_off + l * ne * ege, ne * ege, scratch)
-                load_big(m, bytes, "blk.{l}.ffn_down_exps.weight", t, t.we2_off + l * ne * ege, ne * ege, scratch)
-                load_big(m, bytes, "blk.{l}.ffn_up_exps.weight", t, t.we3_off + l * ne * ege, ne * ege, scratch)
+                if (t.experts_mx4) {
+                    // native MXFP4: raw nibble + scale bits straight into the planes (no dequant)
+                    let mo1 = t.we1_off + l * ne * ege
+                    let mo2 = t.we2_off + l * ne * ege
+                    let mo3 = t.we3_off + l * ne * ege
+                    gguf_transcode_mx4(m, bytes, "blk.{l}.ffn_gate_exps.weight", t.mxq, t.mxs, mo1 / 2l, mo1 / 32l, ne * ege)
+                    gguf_transcode_mx4(m, bytes, "blk.{l}.ffn_down_exps.weight", t.mxq, t.mxs, mo2 / 2l, mo2 / 32l, ne * ege)
+                    gguf_transcode_mx4(m, bytes, "blk.{l}.ffn_up_exps.weight", t.mxq, t.mxs, mo3 / 2l, mo3 / 32l, ne * ege)
+                } else {
+                    load_big(m, bytes, "blk.{l}.ffn_gate_exps.weight", t, t.we1_off + l * ne * ege, ne * ege, scratch)
+                    load_big(m, bytes, "blk.{l}.ffn_down_exps.weight", t, t.we2_off + l * ne * ege, ne * ege, scratch)
+                    load_big(m, bytes, "blk.{l}.ffn_up_exps.weight", t, t.we3_off + l * ne * ege, ne * ege, scratch)
+                }
                 if (t.config.moe_exps_bias) {  // per-expert bias stacks, expert-major on disk like the weights
                     let nfe = t.config.n_ff_exp
                     gguf_read_tensor_f32(m, bytes, "blk.{l}.ffn_gate_exps.bias", t.fblob, t.web1_off + l * ne * nfe, ne * nfe)
@@ -1096,18 +1144,25 @@ struct MemFootprint {
     q8_scale_bytes : int64
     q4_bytes : int64
     q4_scale_bytes : int64
+    mx4_bytes : int64
+    mx4_scale_bytes : int64
     total : int64
 }
 
 def footprint(t : Model) : MemFootprint {
-    let aux = int64(length(t.fblob)) * 4l
-    let wf = int64(length(t.wblob)) * 4l
-    let q8 = int64(length(t.qblob))               // int8 -> 1 byte each
-    let q8s = int64(length(t.qscales)) * 4l
-    let q4 = int64(length(t.q4blob))              // uint8 (two nibbles) -> 1 byte each
-    let q4s = int64(length(t.q4scales)) * 4l
+    // long_length throughout: the big blobs exceed INT_MAX elements on 20B-class models (gpt-oss
+    // qblob/mxq), where int length() panics interpreted and silently truncates under the JIT
+    let aux = long_length(t.fblob) * 4l
+    let wf = long_length(t.wblob) * 4l
+    let q8 = long_length(t.qblob)                 // int8 -> 1 byte each
+    let q8s = long_length(t.qscales) * 4l
+    let q4 = long_length(t.q4blob)                // uint8 (two nibbles) -> 1 byte each
+    let q4s = long_length(t.q4scales) * 4l
+    let mx4 = long_length(t.mxq)                  // uint8 (two nibbles) -> 1 byte each
+    let mx4s = long_length(t.mxs)                 // raw E8M0 -> 1 byte per 32-block
     return MemFootprint(aux_fp32_bytes = aux, weight_fp32_bytes = wf, q8_bytes = q8, q8_scale_bytes = q8s,
-                        q4_bytes = q4, q4_scale_bytes = q4s, total = aux + wf + q8 + q8s + q4 + q4s)
+                        q4_bytes = q4, q4_scale_bytes = q4s, mx4_bytes = mx4, mx4_scale_bytes = mx4s,
+                        total = aux + wf + q8 + q8s + q4 + q4s + mx4 + mx4s)
 }
 
 //! Per-step scratch buffers and the KV cache (allocated once, reused every token).
@@ -1192,6 +1247,8 @@ struct Session {
     moe_hs : array<float>       // bucket hidden requant scales (same / 32)
     moe_gout : array<float>     // bucket (then shared-expert) down-projection output (npos x dim)
     moe_eout : array<float>     // routed expert outputs parked by (position, slot) (npos x k x dim)
+    mx4_wq : array<int8>        // grouped-prefill expansion of ONE native-MXFP4 expert to exact Q8 (dim x n_ff_exp)
+    mx4_ws : array<float>       // ... and its per-block scales (same / 32); see expand_mx4_region_q8
 }
 
 //! Allocate the run state sized to a model.
@@ -1630,6 +1687,17 @@ def private mm_at_q8_pre(var y : array<float>; t : Model; woff : int64; xq : arr
     }
 }
 
+// Native-MXFP4 GEMV against a PRE-quantized activation: the weight region [d x n] is viewed into the
+// nibble + E8M0 planes (woff is the weight-element offset, like mm_at_q8_pre). Expert stacks only.
+def private mm_at_mx4_pre(var y : array<float>; t : Model; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    let total = n * d
+    array_view(t.mxq, woff / 2l, total / 2l) $(wn : array<uint8>#) {
+        array_view(t.mxs, woff / 32l, total / 32l) $(we : array<uint8>#) {
+            matmul_mx4q8(y, wn, we, xq, xs, n, d)
+        }
+    }
+}
+
 // Route a big-weight matmul through the Q8, Q4, or fp32 kernel depending on the model's quant mode.
 // xq/xs are the run-state activation-quant scratch (used only by the Q8 path).
 def private mm(var y : array<float>; t : Model; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; n, d : int64) {
@@ -2036,7 +2104,10 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
         let e = l * ne + s.moe_idx[j]
         let base = e * ege
         let ts_gu = ref_time_ticks()
-        if (pre_q8) {
+        if (t.experts_mx4) {   // native 4-bit expert weights — half the Q8 traffic
+            mm_at_mx4_pre(s.hb, t, t.we1_off + base, s.moe_xq, s.moe_xs, dim, nfe)
+            mm_at_mx4_pre(s.hb2, t, t.we3_off + base, s.moe_xq, s.moe_xs, dim, nfe)
+        } elif (pre_q8) {
             mm_at_q8_pre(s.hb, t, t.we1_off + base, s.moe_xq, s.moe_xs, dim, nfe)
             mm_at_q8_pre(s.hb2, t, t.we3_off + base, s.moe_xq, s.moe_xs, dim, nfe)
         } else {
@@ -2052,7 +2123,12 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
         gate_batch(s.hb, s.hb2, c.ffn_act, nfe, 1l)
         prof_add("act", ts_act)
         let ts_down = ref_time_ticks()
-        mm(s.xb2, t, t.we2_off + base, s.hb, s.xq, s.xs, nfe, dim)
+        if (t.experts_mx4) {   // quantize hb like mm's q8 path does, then the native down GEMV
+            quantize_q8_0_into(s.hb, nfe, s.xq, s.xs, 0l, 0l)
+            mm_at_mx4_pre(s.xb2, t, t.we2_off + base, s.xq, s.xs, nfe, dim)
+        } else {
+            mm(s.xb2, t, t.we2_off + base, s.hb, s.xq, s.xs, nfe, dim)
+        }
         if (c.moe_exps_bias) {  // ... and its down bias, inside the routed weight (ggml_add_id order)
             add_bias(s.xb2, 0l, t.fblob, t.web2_off + e * dim, dim)
         }
@@ -2767,11 +2843,53 @@ def private moe_gather_rows(var s : Session; b0, cnt, dim, k : int64) {
     }
 }
 
+// Expand one native-MXFP4 expert region [d x n] (weight-element offset woff in the mxq/mxs planes)
+// into EXACT Q8 blocks in the given scratch: q[j] = the doubled-e2m1 LUT value (already an int8),
+// scale = e8m0_half(e) — no requantization error, every value representable. Grouped prefill runs
+// the proven Q8 batch GEMM off this scratch (one expansion per touched expert amortizes over the
+// whole bucket); repacked to the active backend's interleaved layout when it needs one.
+def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<int8>; var ws : array<float>) {
+    let total = n * d
+    wq |> resize(total)
+    ws |> resize(total / 32l)
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    let nblk = total / 32l
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        let np = addr(t.mxq[woff / 2l])
+        let ep = addr(t.mxs[woff / 32l])
+        var qp = addr(wq[0])
+        var sp = addr(ws[0])
+        maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_total_hw_jobs()) $(bb, be) {
+            unsafe {
+                for (bi0 in range(bb, be)) {
+                    let bi = int64(bi0)
+                    let nb16 = bi * 16l
+                    let qb = bi * 32l
+                    for (j in range64(16l)) {
+                        let b = int(np[nb16 + j])
+                        qp[qb + j] = lutp[b & 15]
+                        qp[qb + j + 16l] = lutp[b >> 4]
+                    }
+                    sp[bi] = e8m0_half(uint(ep[bi]))
+                }
+            }
+        }
+    }
+    if (g_active_needs_repack) {
+        repack_q8q8_weight(wq, ws, 0l, n, d)
+    }
+}
+
 // MoE FFN prefill, grouped: route every position, bucket the (position, slot) pairs by expert, and
 // run ONE batched GEMM chain per touched expert instead of npos*k single-token matmuls (llama.cpp's
 // mul_mat_id shape). Bit-exact vs the per-position reference path: the batch GEMM is bit-for-bit
 // N x the single-token kernel, rows quantize identically, and the reduce applies the k weighted
-// outputs (then the shared expert) in exactly the decode accumulation order.
+// outputs (then the shared expert) in exactly the decode accumulation order. (Native-MXFP4 experts
+// are the one exception — grouped runs the Q8 batch GEMM off an exact expansion while the
+// per-position path runs the mx4 GEMV, so the two differ by kernel summation order, like a kernel
+// perm change; the counting fixtures absorb that by design.)
 def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     let dim = c.dim
@@ -2854,8 +2972,19 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         prof_add("moe_gather", ts_gather)
         let eg = l * ne + e
         let base = eg * dim * nfe
-        mm_b_q8_pre(s.moe_ghb, t, t.we1_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
-        mm_b_q8_pre(s.moe_ghb2, t, t.we3_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        if (t.experts_mx4) {   // exact Q8 expansion of this expert, then the proven batch GEMMs
+            let ts_ex = ref_time_ticks()
+            expand_mx4_region_q8(t, t.we1_off + base, dim, nfe, s.mx4_wq, s.mx4_ws)
+            prof_add("moe_expand", ts_ex)
+            matmul_q8q8_batch(s.moe_ghb, s.mx4_wq, s.mx4_ws, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+            let ts_ex2 = ref_time_ticks()
+            expand_mx4_region_q8(t, t.we3_off + base, dim, nfe, s.mx4_wq, s.mx4_ws)
+            prof_add("moe_expand", ts_ex2)
+            matmul_q8q8_batch(s.moe_ghb2, s.mx4_wq, s.mx4_ws, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        } else {
+            mm_b_q8_pre(s.moe_ghb, t, t.we1_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+            mm_b_q8_pre(s.moe_ghb2, t, t.we3_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        }
         if (c.moe_exps_bias) {  // gpt-oss: this expert's gate/up biases before the activation
             for (r in range64(cnt)) {
                 add_bias(s.moe_ghb, r * nfe, t.fblob, t.web1_off + eg * nfe, nfe)
@@ -2866,7 +2995,14 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
         prof_add("act", ts_act)
         requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
-        mm_b_q8_pre(s.moe_gout, t, t.we2_off + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+        if (t.experts_mx4) {
+            let ts_ex3 = ref_time_ticks()
+            expand_mx4_region_q8(t, t.we2_off + base, nfe, dim, s.mx4_wq, s.mx4_ws)
+            prof_add("moe_expand", ts_ex3)
+            matmul_q8q8_batch(s.moe_gout, s.mx4_wq, s.mx4_ws, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+        } else {
+            mm_b_q8_pre(s.moe_gout, t, t.we2_off + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+        }
         if (c.moe_exps_bias) {  // ... and its down bias, inside the routed weight (ggml_add_id order)
             for (r in range64(cnt)) {
                 add_bias(s.moe_gout, r * dim, t.fblob, t.web2_off + eg * dim, dim)
@@ -2947,7 +3083,11 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
     let ts_norm = ref_time_ticks()
     rms_batch(s.xb_b, s.x_b, t, t.rms_ffn_off + l * dim, dim, npos)
     prof_add("norm", ts_norm)
-    if (t.quant == QuantMode.q8 && g_moe_grouped_prefill) {
+    // Native-MXFP4 experts pay a per-touched-expert Q8 expansion in the grouped path (~120MB of
+    // traffic per expert incl. the repack), so it only wins once buckets average enough rows to
+    // amortize it — under ~8 rows/expert (short chat turns) the per-position mx4 GEMVs are cheaper.
+    let mx4_grouped_pays = !t.experts_mx4 || npos * c.n_expert_used >= 8l * c.n_expert
+    if (t.quant == QuantMode.q8 && g_moe_grouped_prefill && mx4_grouped_pays) {
         ffn_moe_prefill_grouped(t, s, l, npos)
     } else {
         // per-position reference path — moe_ffn_core carries its own section buckets

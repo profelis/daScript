@@ -428,6 +428,15 @@ what it costs today and what the fix would change.
   top_k=0, and all parity fixtures are greedy), but it's the sampling path the tutorials teach.
   Fix = single-pass partial selection (bounded min-heap of size top_k, or threshold-and-count).
   (Spotted tune audit, 2026-07-02.)
+- **MXFP4 grouped prefill pays a per-touched-expert Q8 expansion (~120MB of traffic each, half of
+  it the repack scratch copy).** `expand_mx4_region_q8` writes exact row-major Q8 then runs the
+  load-time `repack_q8q8_weight` (temp copy + interleave) so the laneq batch GEMM applies. Levers,
+  in effort order: (a) expand DIRECTLY into the interleaved layout (folds the repack's copy away —
+  needs a backend-provided expand-repack, not a layout hardcode in common); (b) a native MXFP4
+  batch GEMM (mx4 twin of the laneq 4x4 tile — halves the GEMM's weight streaming too, likely wins
+  outright); (c) the `npos * k >= 8 * n_expert` tiny-batch guard is an ESTIMATED breakeven
+  (4-tok-prompt ttft 1895ms -> 114ms) — sweep it when the mx4 A/B rig exists. (Spotted MXFP4 arc,
+  2026-07-02.)
 - **Flash-attention tile shape is a frozen compile-time constant — deferred x64 tuning axis.**
   `ATTN_FLASH_QT/KV = 64×64` (dasllama_common.das) was chosen on M1 and never swept; tile shape
   is the classic per-box cache parameter, and x64's small private L2 differs in kind from M1's

@@ -23,7 +23,8 @@ def report(tag : string; t : Model) {
     let f = footprint(t)
     print("  {tag}: heap {heap_mb()} MB | footprint {mb(f.total)} MB"
         + " (aux-fp32 {mb(f.aux_fp32_bytes)} | weight-fp32 {mb(f.weight_fp32_bytes)}"
-        + " | q8 {mb(f.q8_bytes + f.q8_scale_bytes)} | q4 {mb(f.q4_bytes + f.q4_scale_bytes)})\n")
+        + " | q8 {mb(f.q8_bytes + f.q8_scale_bytes)} | q4 {mb(f.q4_bytes + f.q4_scale_bytes)}"
+        + " | mx4 {mb(f.mx4_bytes + f.mx4_scale_bytes)})\n")
 }
 
 [export]

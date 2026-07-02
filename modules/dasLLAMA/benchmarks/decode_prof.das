@@ -91,7 +91,9 @@ def private print_traffic_table(t : Model; pos : int64) {
     var shexp = 0.0lf
     if (c.moe) {
         router = double(c.n_layers * dim * c.n_expert) * 4.0lf   // router weights stay fp32
-        moe = double(c.n_layers * c.n_expert_used * 3l * dim * c.n_ff_exp) * wb
+        // native-MXFP4 experts read 17 bytes per 32 weights (nibbles + E8M0); else the active quant
+        let ewb = t.experts_mx4 ? 17.0lf / 32.0lf : wb
+        moe = double(c.n_layers * c.n_expert_used * 3l * dim * c.n_ff_exp) * ewb
         if (c.n_ff_shexp > 0l) {
             shexp = double(c.n_layers * 3l * dim * c.n_ff_shexp) * wb
         }
