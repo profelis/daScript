@@ -13,7 +13,7 @@ second pass -- the *main pass* -- renders the scene from the camera, and for eac
 fragment asks the shadow map "is anything closer to the light here than I am?" If
 yes, the fragment is in shadow.
 
-.. literalinclude:: ../../../../tutorials/opengl/08_shadow/08_shadow.das
+.. literalinclude:: ../../../../../tutorials/opengl/08_shadow/08_shadow.das
    :language: das
    :start-at: shared shader globals
 

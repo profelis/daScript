@@ -9,8 +9,8 @@ dasGlsl. No hand-written GLSL, no committed shader strings. A per-frame
 ``u_aspect`` keeps it square at any window or canvas size.
 
 This is the first rung of an OpenGL / WebGL2 tutorial ladder that mirrors the
-:doc:`dasVulkan series </tutorials/opengl/index>` shader-for-shader: the same
-daslang shader language, the same modern builtins, lowered to a *third* backend.
+`dasVulkan series <https://github.com/borisbat/dasVulkan>`_ shader-for-shader: the
+same daslang shader language, the same modern builtins, lowered to a *third* backend.
 
 One homogeneous program
 -----------------------
@@ -28,7 +28,7 @@ desktop and the web. It exposes the three lifecycle functions ``init`` /
 
 The same ``.das``, byte-for-byte, both places.
 
-.. literalinclude:: ../../../../tutorials/opengl/01_triangle/01_triangle.das
+.. literalinclude:: ../../../../../tutorials/opengl/01_triangle/01_triangle.das
    :language: das
    :start-at: var @in @location
 

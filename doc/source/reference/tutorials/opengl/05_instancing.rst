@@ -15,7 +15,7 @@ usual, while the per-instance data (binding 1, locations 2-4) steps once per
 all five as plain ``@in @location`` inputs -- there is no instancing keyword in the
 shader at all; instancing lives entirely on the host side, in that divisor.
 
-.. literalinclude:: ../../../../tutorials/opengl/05_instancing/05_instancing.das
+.. literalinclude:: ../../../../../tutorials/opengl/05_instancing/05_instancing.das
    :language: das
    :start-at: per-vertex inputs
 

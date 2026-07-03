@@ -11,7 +11,7 @@ Two new ideas after tutorial 04's single 2D texture: the cubemap itself, and the
 **depth=1.0 trick** that lets the skybox fill the background in one draw without
 overdrawing the foreground.
 
-.. literalinclude:: ../../../../tutorials/opengl/06_skybox/06_skybox.das
+.. literalinclude:: ../../../../../tutorials/opengl/06_skybox/06_skybox.das
    :language: das
    :start-at: shared shader globals
 

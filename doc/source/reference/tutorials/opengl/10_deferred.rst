@@ -14,7 +14,7 @@ This is also the first OpenGL rung to load **external assets** -- a Wavefront OB
 PBR texture sets. The loading code is byte-identical to the desktop path; only the web
 needs one extra step to make those files reachable (covered below).
 
-.. literalinclude:: ../../../../tutorials/opengl/10_deferred/10_deferred.das
+.. literalinclude:: ../../../../../tutorials/opengl/10_deferred/10_deferred.das
    :language: das
    :start-at: shared mesh inputs
 

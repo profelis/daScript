@@ -1,7 +1,7 @@
 03 - Signed-Distance-Field Raymarcher
 =====================================
 
-The :doc:`dasVulkan SDF rung <02_mandelbrot>` raymarches the scene in a
+The dasVulkan SDF rung raymarches the scene in a
 **compute shader**, one invocation per pixel, into a storage image. WebGL2 has no
 compute, so -- exactly as for the :doc:`Mandelbrot rung <02_mandelbrot>` -- the
 portable GL idiom is a **fullscreen fragment shader**: a clip-space quad, with the
@@ -13,7 +13,7 @@ shadow + a rim term + atmospheric fog, then Reinhard tone-mapped. The colour
 scheme and shading are a **faithful port of the Vulkan rung**; only the vehicle
 (compute → fragment) and the pixel→ray mapping change.
 
-.. literalinclude:: ../../../../tutorials/opengl/03_sdf/03_sdf.das
+.. literalinclude:: ../../../../../tutorials/opengl/03_sdf/03_sdf.das
    :language: das
    :start-at: var @in @location
 

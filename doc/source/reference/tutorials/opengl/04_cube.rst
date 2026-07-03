@@ -16,7 +16,7 @@ perspective grid -- generated entirely CPU-side at init (no asset file). The
 fragment scrolls the UV vertically over time so the texture drifts like a CRT, and
 a key + rim light pair shades it.
 
-.. literalinclude:: ../../../../tutorials/opengl/04_cube/04_cube.das
+.. literalinclude:: ../../../../../tutorials/opengl/04_cube/04_cube.das
    :language: das
    :start-at: var @in @location
 

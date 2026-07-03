@@ -15,7 +15,7 @@ above 1.0. In an LDR target those cubes would clip to flat white; in the HDR tar
 they carry their real brightness into the post-processing chain, where the bloom
 turns them into glowing light sources.
 
-.. literalinclude:: ../../../../tutorials/opengl/11_hdr/11_hdr.das
+.. literalinclude:: ../../../../../tutorials/opengl/11_hdr/11_hdr.das
    :language: das
    :start-at: scene shader globals
 

@@ -11,7 +11,7 @@ its outputs are captured straight back into a buffer instead of being rasterised
 buffers ping-pong, and a second program draws the freshly-written buffer as glowing
 point sprites.
 
-.. literalinclude:: ../../../../tutorials/opengl/07_particles/07_particles.das
+.. literalinclude:: ../../../../../tutorials/opengl/07_particles/07_particles.das
    :language: das
    :start-at: shared state attributes
 

@@ -1,7 +1,7 @@
 02 - The Mandelbrot Set
 =======================
 
-The :doc:`dasVulkan Mandelbrot rung <01_triangle>` computes the set in a
+The dasVulkan Mandelbrot rung computes the set in a
 **compute shader** -- one invocation per pixel, writing into a storage image.
 WebGL2 has neither compute shaders nor storage images, so the portable OpenGL
 idiom is a **fullscreen fragment shader**: draw two triangles covering the whole
@@ -18,7 +18,7 @@ oscillating zoom and a slow rotation about the seahorse-valley point
 count kills the banding, an IQ cosine palette colours it, and 4×4 supersampling
 antialiases the boundary.
 
-.. literalinclude:: ../../../../tutorials/opengl/02_mandelbrot/02_mandelbrot.das
+.. literalinclude:: ../../../../../tutorials/opengl/02_mandelbrot/02_mandelbrot.das
    :language: das
    :start-at: var @in @location
 
