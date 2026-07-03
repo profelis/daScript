@@ -2183,6 +2183,7 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
         for (j in range64(k)) {
             let e = l * ne + s.moe_idx[j]
             s.moe_offs[j * 2l] = t.we3_off + e * ege
+            s.moe_offs[j * 2l + 1l] = 0l   // ups read the same hoisted xb image (explicit, not inherited from the gate pass)
             s.moe_boffs[j] = t.web3_off + e * nfe
         }
         if (t.experts_mx4) {
