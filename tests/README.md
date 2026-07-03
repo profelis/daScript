@@ -108,6 +108,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_piped_named_call.das | Named-argument call + piped block is a parse error | **expect** `30347` |
 | failed_piped_field.das | Field access + piped block is a parse error | **expect** `30347` |
 | test_bare_block.das | Bare lexical blocks — scoping, nesting, finally, control flow, name reuse | |
+| test_block_in_finally.das | Block locals + finally/defer — invoked from defer/plain finally, declared after defer, early-return path, loop-iterator capture, by-ref mutation visibility (AOT hoisted-block codegen) | |
 | test_nested_data.das | Table `{}` literals as sub-data — structs, arrays, functions, tuples, variants, comprehensions, move semantics | |
 | _test_table_compat.das | Basic table literal compatibility tests | |
 
