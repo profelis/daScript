@@ -35,6 +35,9 @@ struct Args {
     @clarg_doc = "Weight quant mode (default: q8)"
     quant : QuantMode = QuantMode.q8
 
+    @clarg_doc = "Override the decode-attention threading threshold (work units; 0 = always thread, -1 = keep default)"
+    attn_par : int = -1
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -194,5 +197,9 @@ def main() {
     t.config.seq_len = min(t.config.seq_len, ctx_cap)   // cap the KV allocation
     let c = t.config
     print("config: dim={c.dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size} moe={c.moe}\n")
+    if (cfg.attn_par >= 0) {
+        set_decode_attn_par_threshold(int64(cfg.attn_par))
+        print("decode_attn_par_threshold override: {cfg.attn_par}\n")
+    }
     run_profile(t, p, n, p2)
 }

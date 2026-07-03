@@ -1249,6 +1249,7 @@ struct Session {
     moe_acc : array<float>      // weighted expert-output accumulator (dim)
     // decode dispatch-fuse scratch: all k routed experts' projections run as region-list GEMVs
     moe_offs : array<int64>     // packed (weight, activation) element-offset pairs (2 per region)
+    moe_boffs : array<int64>    // per-region fblob bias offsets for the biased groupn forms (k)
     moe_gu : array<float>       // fused gate outputs (k x n_ff_exp)
     moe_gu2 : array<float>      // fused up outputs (k x n_ff_exp)
     moe_dn : array<float>       // fused down outputs (k x dim)
@@ -1307,6 +1308,7 @@ def make_run_state(c : Config) : Session {
         s.moe_xq |> resize(c.dim)
         s.moe_xs |> resize(c.dim / 32l)
         s.moe_offs |> resize(2l * c.n_expert_used)
+        s.moe_boffs |> resize(c.n_expert_used)
         s.moe_gu |> resize(c.n_expert_used * c.n_ff_exp)
         s.moe_gu2 |> resize(c.n_expert_used * c.n_ff_exp)
         s.moe_dn |> resize(c.n_expert_used * c.dim)
@@ -1733,12 +1735,22 @@ def private mm_at_mx4_pre(var y : array<float>; t : Model; woff : int64; xq : ar
 
 // Region-list GEMVs (the MoE decode dispatch fuse): all k routed experts' same-shape projections in
 // ONE fork/join. offs packs (weight, activation) element-offset pairs; region j -> y[j*d .. j*d+d).
+// The boffs forms fold each region's fblob bias vector into the workers' stores (gpt-oss expert
+// biases) — bit-identical to a post-pass add_bias, minus its serial caller-side cost.
 def private mm_at_q8_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
     matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, n, d)
 }
 
+def private mm_at_q8_groupn(var y : array<float>; t : Model; offs, boffs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, t.fblob, boffs, n, d)
+}
+
 def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
     matmul_mx4q8_groupn(y, t.mxq, t.mxs, offs, nregions, xq, xs, n, d)
+}
+
+def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs, boffs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    matmul_mx4q8_groupn(y, t.mxq, t.mxs, offs, nregions, xq, xs, t.fblob, boffs, n, d)
 }
 
 // Route a big-weight matmul through the Q8, Q4, or fp32 kernel depending on the model's quant mode.
@@ -2150,29 +2162,39 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
         // j-ascending weighted reduce — but 3 fork/joins instead of 3k (the mm_moe 86 vs the
         // dense mms' 104 GB/s was mostly this dispatch overhead).
         let ts_gu = ref_time_ticks()
+        let biased = c.moe_exps_bias   // gpt-oss: each expert's biases fold into the workers' stores
         for (j in range64(k)) {
-            s.moe_offs[j * 2l] = t.we1_off + (l * ne + s.moe_idx[j]) * ege
+            let e = l * ne + s.moe_idx[j]
+            s.moe_offs[j * 2l] = t.we1_off + e * ege
             s.moe_offs[j * 2l + 1l] = 0l   // gates share the single hoisted xb image
+            s.moe_boffs[j] = t.web1_off + e * nfe
         }
         if (t.experts_mx4) {   // native 4-bit expert weights — half the Q8 traffic
-            mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            if (biased) {
+                mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            } else {
+                mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            }
+        } elif (biased) {
+            mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
         } else {
             mm_at_q8_groupn(s.moe_gu, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
         }
         for (j in range64(k)) {
-            s.moe_offs[j * 2l] = t.we3_off + (l * ne + s.moe_idx[j]) * ege
+            let e = l * ne + s.moe_idx[j]
+            s.moe_offs[j * 2l] = t.we3_off + e * ege
+            s.moe_boffs[j] = t.web3_off + e * nfe
         }
         if (t.experts_mx4) {
-            mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            if (biased) {
+                mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            } else {
+                mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
+            }
+        } elif (biased) {
+            mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
         } else {
             mm_at_q8_groupn(s.moe_gu2, t, s.moe_offs, k, s.moe_xq, s.moe_xs, dim, nfe)
-        }
-        if (c.moe_exps_bias) {  // gpt-oss: each expert's gate/up biases before the activation
-            for (j in range64(k)) {
-                let e = l * ne + s.moe_idx[j]
-                add_bias(s.moe_gu, j * nfe, t.fblob, t.web1_off + e * nfe, nfe)
-                add_bias(s.moe_gu2, j * nfe, t.fblob, t.web3_off + e * nfe, nfe)
-            }
         }
         prof_add("mm_moe", ts_gu)
         let ts_act = ref_time_ticks()
@@ -2181,18 +2203,21 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
         requant_rows_q8(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds)   // books mm_requant
         let ts_down = ref_time_ticks()
         for (j in range64(k)) {
-            s.moe_offs[j * 2l] = t.we2_off + (l * ne + s.moe_idx[j]) * ege
+            let e = l * ne + s.moe_idx[j]
+            s.moe_offs[j * 2l] = t.we2_off + e * ege
             s.moe_offs[j * 2l + 1l] = j * nfe   // each down reads its own requantized row
+            s.moe_boffs[j] = t.web2_off + e * dim   // down bias inside the routed weight (ggml_add_id order)
         }
         if (t.experts_mx4) {
-            mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
+            if (biased) {
+                mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
+            } else {
+                mm_at_mx4_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
+            }
+        } elif (biased) {
+            mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, s.moe_boffs, k, s.moe_dq, s.moe_ds, nfe, dim)
         } else {
             mm_at_q8_groupn(s.moe_dn, t, s.moe_offs, k, s.moe_dq, s.moe_ds, nfe, dim)
-        }
-        if (c.moe_exps_bias) {  // ... and each down bias, inside the routed weight (ggml_add_id order)
-            for (j in range64(k)) {
-                add_bias(s.moe_dn, j * dim, t.fblob, t.web2_off + (l * ne + s.moe_idx[j]) * dim, dim)
-            }
         }
         prof_add("mm_moe", ts_down)
         let ts_red = ref_time_ticks()

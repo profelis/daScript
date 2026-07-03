@@ -443,6 +443,22 @@ what it costs today and what the fix would change.
   top_k=0, and all parity fixtures are greedy), but it's the sampling path the tutorials teach.
   Fix = single-pass partial selection (bounded min-heap of size top_k, or threshold-and-count).
   (Spotted tune audit, 2026-07-02.)
+- **DONE (MXFP4 arc follow-up, 2026-07-02): the mm_moe bandwidth-gap profile + the bias fold.**
+  Iso-benched the exact decode dispatch shape (4× [2880 x 2880] regions, DRAM-rotating):
+  the fused mx4 groupn GEMV sustains **~101 GB/s — bandwidth parity with the q8 dense kernels**
+  (the "77 GB/s" in-decode reading was largely single-window wobble: same build re-measured
+  90 GB/s an hour later; METHOD: only round-robin interleaved cells within one process are
+  trustworthy on this box, single-window absolutes swing ±10-15%). The pre-fuse 4×1 dispatch
+  shape measures 63-72 GB/s — the dispatch fuse was worth ~30% and is confirmed load-bearing.
+  Follow-up landed: **expert bias vectors fold into the groupn workers' stores** (bp/boffs on the
+  groupn contract; bit-identical to the post-pass add_bias, minus its serial ~36us/layer) —
+  decode 34.7 → **35.2 t/s @ ctx 8 / 33.8 @ ctx 512** (llama.cpp same-window anchor 41.1 →
+  0.86×). Also swept: decode-attn threshold 0-vs-262144 under the spinner at ctx 8/512 —
+  a WASH at both depths (the low-ctx attention is memory-latency-bound; threading's dispatch
+  cost ≈ its serial cost), so the measured default stands; moe_reduce/rope threading rejected
+  (~8us/layer each, below dispatch cost). What remains vs llama.cpp is their continuous-polling
+  threadpool (the bus never idles between ops) — picked up by the x64 arc's jobque work, not
+  patchable here. (Profiling session, 2026-07-02.)
 - **MXFP4 grouped prefill pays a per-touched-expert Q8 expansion (~120MB of traffic each, half of
   it the repack scratch copy).** `expand_mx4_region_q8` writes exact row-major Q8 then runs the
   load-time `repack_q8q8_weight` (temp copy + interleave) so the laneq batch GEMM applies. Levers,

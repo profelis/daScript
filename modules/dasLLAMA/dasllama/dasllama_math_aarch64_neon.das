@@ -181,7 +181,7 @@ def private mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 con
 // experts' gates (or ups, or downs) in ONE fork/join. Per-row math identical to the single-region
 // kernels — bit-exact, only the scheduling changes.
 
-def private q8q8_groupn_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+def private q8q8_groupn_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
     maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
@@ -192,13 +192,17 @@ def private q8q8_groupn_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; s
                 let row = ii % d
                 let woff = offs[r * 2l]
                 let xoff = offs[r * 2l + 1l]
-                myp[ii] = dot_q8q8_sdot4x4(wp + woff + row * n, sp + woff / 32l + row * nb, xqp + xoff, xsp + xoff / 32l, n)
+                var v = dot_q8q8_sdot4x4(wp + woff + row * n, sp + woff / 32l + row * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + row]
+                }
+                myp[ii] = v
             }
         }
     }
 }
 
-def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     let ng = d / 4l
     var myp = yp
@@ -210,7 +214,11 @@ def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp 
                 let g = gg % ng
                 let woff = offs[r * 2l]
                 let xoff = offs[r * 2l + 1l]
-                let f = dot_q8q8_laneq4(wp + woff + g * 4l * n, sp + woff / 32l + g * 4l * nb, xqp + xoff, xsp + xoff / 32l, n)
+                var f = dot_q8q8_laneq4(wp + woff + g * 4l * n, sp + woff / 32l + g * 4l * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    let bb = boffs[r] + g * 4l
+                    f += float4(bp[bb], bp[bb + 1l], bp[bb + 2l], bp[bb + 3l])
+                }
                 let yb = r * d + g * 4l
                 myp[yb + 0l] = f.x
                 myp[yb + 1l] = f.y
@@ -224,13 +232,17 @@ def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp 
             let woff = offs[r * 2l]
             let xoff = offs[r * 2l + 1l]
             for (i in range64(ng * 4l, d)) {
-                myp[r * d + i] = dot_q8q8_sdot4x4(wp + woff + i * n, sp + woff / 32l + i * nb, xqp + xoff, xsp + xoff / 32l, n)
+                var v = dot_q8q8_sdot4x4(wp + woff + i * n, sp + woff / 32l + i * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + i]
+                }
+                myp[r * d + i] = v
             }
         }
     }
 }
 
-def private mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+def private mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
     var lut : int8[16]
@@ -245,15 +257,19 @@ def private mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : ui
                     let row = ii % d
                     let woff = offs[r * 2l]
                     let xoff = offs[r * 2l + 1l]
-                    myp[ii] = dot_mx4q8(lutp, wn + woff / 2l + row * (n / 2l), we + woff / 32l + row * nb,
+                    var v = dot_mx4q8(lutp, wn + woff / 2l + row * (n / 2l), we + woff / 32l + row * nb,
                         xqp + xoff, xsp + xoff / 32l, n)
+                    if (bp != null) {
+                        v += bp[boffs[r] + row]
+                    }
+                    myp[ii] = v
                 }
             }
         }
     }
 }
 
-def private mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+def private mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nrow = n / 2l
     let nbb = n / 32l
     let ng = d / 4l
@@ -270,8 +286,12 @@ def private mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; w
                     let g = gg % ng
                     let woff = offs[r * 2l]
                     let xoff = offs[r * 2l + 1l]
-                    let f = dot_mx4q8_laneq4(lutp, wn + woff / 2l + g * 4l * nrow, we + woff / 32l + g * 4l * nbb,
+                    var f = dot_mx4q8_laneq4(lutp, wn + woff / 2l + g * 4l * nrow, we + woff / 32l + g * 4l * nbb,
                         xqp + xoff, xsp + xoff / 32l, n)
+                    if (bp != null) {
+                        let bb = boffs[r] + g * 4l
+                        f += float4(bp[bb], bp[bb + 1l], bp[bb + 2l], bp[bb + 3l])
+                    }
                     let yb = r * d + g * 4l
                     myp[yb + 0l] = f.x
                     myp[yb + 1l] = f.y
@@ -284,8 +304,12 @@ def private mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; w
             let woff = offs[r * 2l]
             let xoff = offs[r * 2l + 1l]
             for (i in range64(ng * 4l, d)) {
-                myp[r * d + i] = dot_mx4q8(lutp, wn + woff / 2l + i * nrow, we + woff / 32l + i * nbb,
+                var v = dot_mx4q8(lutp, wn + woff / 2l + i * nrow, we + woff / 32l + i * nbb,
                     xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + i]
+                }
+                myp[r * d + i] = v
             }
         }
     }

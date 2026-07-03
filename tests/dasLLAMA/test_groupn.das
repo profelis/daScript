@@ -96,6 +96,95 @@ def test_q8q8_groupn(t : T?) {
 }
 
 [test]
+def test_groupn_bias_fold(t : T?) {
+    t |> run("biased groupN == unbiased + add-after, q8 and mx4, every backend") @(t : T?) {
+        var wf : array<float>
+        var xf : array<float>
+        wf |> resize(int(NREG * D * N))
+        xf |> resize(int(2l * N))
+        for (i in range(int(NREG * D * N))) {
+            wf[i] = sin(float(i) * 0.11f)
+        }
+        for (i in range(int(2l * N))) {
+            xf[i] = cos(float(i) * 0.07f)
+        }
+        let wq0 <- quantize_q8_0(wf, NREG * D * N)
+        let xq <- quantize_q8_0(xf, 2l * N)
+        var wn0 : array<uint8>
+        var we0 : array<uint8>
+        wn0 |> resize(int(NREG * D * N / 2l))
+        we0 |> resize(int(NREG * D * N / 32l))
+        for (i in range(int(NREG * D * N / 2l))) {
+            wn0[i] = uint8((i * 137 + 71) & 0xff)
+        }
+        for (i in range(int(NREG * D * N / 32l))) {
+            we0[i] = uint8(120 + (i * 7) % 16)
+        }
+        // one bias vector per region, in a shared "fblob"-style buffer at per-region offsets
+        var bias : array<float>
+        var boffs : array<int64>
+        bias |> resize(int(NREG * D))
+        boffs |> resize(int(NREG))
+        for (i in range(int(NREG * D))) {
+            bias[i] = 0.25 * float(i % 7) - 0.5
+        }
+        for (r in range64(NREG)) {
+            boffs[r] = r * D
+        }
+        var offs : array<int64>
+        build_offs(offs)
+        let saved = active_kernel_backend()
+        for (name in kernel_backend_names()) {
+            pin_kernel_backend(name)
+            var wq : array<int8>
+            var ws : array<float>
+            var wn : array<uint8>
+            var we : array<uint8>
+            wq := wq0.q
+            ws := wq0.scales
+            wn := wn0
+            we := we0
+            if (kernel_backend_needs_repack(name)) {
+                for (r in range64(NREG)) {
+                    repack_q8q8_weight(wq, ws, r * D * N, N, D)
+                    repack_mx4_weight(wn, we, r * D * N, N, D)
+                }
+            }
+            // q8: reference = unbiased + add-after
+            var want : array<float>
+            want |> resize(int(NREG * D))
+            matmul_q8q8_groupn(want, wq, ws, offs, NREG, xq.q, xq.scales, N, D)
+            for (r in range64(NREG)) {
+                for (i in range64(D)) {
+                    want[r * D + i] += bias[boffs[r] + i]
+                }
+            }
+            var y : array<float>
+            y |> resize(int(NREG * D))
+            matmul_q8q8_groupn(y, wq, ws, offs, NREG, xq.q, xq.scales, bias, boffs, N, D)
+            for (i in range(int(NREG * D))) {
+                t |> equal(y[i], want[i])   // bit-identical: same add, same chain point
+            }
+            // mx4: same contract
+            matmul_mx4q8_groupn(want, wn, we, offs, NREG, xq.q, xq.scales, N, D)
+            for (r in range64(NREG)) {
+                for (i in range64(D)) {
+                    want[r * D + i] += bias[boffs[r] + i]
+                }
+            }
+            matmul_mx4q8_groupn(y, wn, we, offs, NREG, xq.q, xq.scales, bias, boffs, N, D)
+            for (i in range(int(NREG * D))) {
+                t |> equal(y[i], want[i])
+            }
+        }
+        clear_kernel_backend_pin()
+        if (saved != "") {
+            select_kernel_backend(saved)
+        }
+    }
+}
+
+[test]
 def test_mx4q8_groupn(t : T?) {
     t |> run("mx4 groupN == per-region GEMV under every backend (repack where needed)") @(t : T?) {
         var wn0 : array<uint8>

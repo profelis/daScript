@@ -211,7 +211,7 @@ def private mx4q8_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; 
     }
 }
 
-def private q8q8_groupn_kernel(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+def private q8q8_groupn_kernel(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
     maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
@@ -222,13 +222,17 @@ def private q8q8_groupn_kernel(var yp : float?; wp : int8 const?; sp : float con
                 let row = ii % d
                 let woff = offs[r * 2l]
                 let xoff = offs[r * 2l + 1l]
-                myp[ii] = dot_q8q8(wp + woff + row * n, sp + woff / 32l + row * nb, xqp + xoff, xsp + xoff / 32l, n)
+                var v = dot_q8q8(wp + woff + row * n, sp + woff / 32l + row * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + row]
+                }
+                myp[ii] = v
             }
         }
     }
 }
 
-def private mx4q8_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) {
+def private mx4q8_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
     var lut : int8[16]
@@ -243,8 +247,12 @@ def private mx4q8_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 c
                     let row = ii % d
                     let woff = offs[r * 2l]
                     let xoff = offs[r * 2l + 1l]
-                    myp[ii] = dot_mx4q8_scalar(lutp, wn + woff / 2l + row * (n / 2l), we + woff / 32l + row * nb,
+                    var v = dot_mx4q8_scalar(lutp, wn + woff / 2l + row * (n / 2l), we + woff / 32l + row * nb,
                         xqp + xoff, xsp + xoff / 32l, n)
+                    if (bp != null) {
+                        v += bp[boffs[r] + row]
+                    }
+                    myp[ii] = v
                 }
             }
         }

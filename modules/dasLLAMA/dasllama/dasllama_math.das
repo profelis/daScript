@@ -353,10 +353,13 @@ typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d :
 // per region: [2r] = the weight-element offset of region r's rows (into the blob the wp/sp — or
 // wn/we — pointers base), [2r+1] = the activation-element offset (into xqp/xsp; xsp offset =
 // element/32) — so regions may share one activation (gates/ups) or each bring their own (downs).
-// Region r's d outputs land at yp + r*d. Bit-exact: the same per-row dots, only scheduled in one
-// parallel_for.
-typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
-typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+// Region r's d outputs land at yp + r*d. A non-null `bp` adds a per-region bias vector at the
+// store — region r's row `row` gets + bp[boffs[r] + row], done by the worker that owns the row
+// (the alternative is a serial caller-side add_bias pass, ~36us/layer on gpt-oss); bit-identical
+// to add-after (same add, same chain point). Bit-exact vs the per-region loop: the same per-row
+// dots, only scheduled in one parallel_for.
+typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
 //! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
@@ -414,10 +417,10 @@ def private q8q8_unset_batch(var yp : float?; wp : int8 const?; sp : float const
 def private q8q8_unset_group3(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) { no_backend() }
 [unused_argument(yp, wn, we, xqp, xsp, n, d)]
 def private mx4q8_unset_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
-[unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, n, d)]
-def private q8q8_unset_groupn(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
-[unused_argument(yp, wn, we, offs, nregions, xqp, xsp, n, d)]
-def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private q8q8_unset_groupn(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
@@ -612,7 +615,20 @@ def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<fl
         invoke(g_mm_q8q8_groupn, addr(y[0]),
             reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
             reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased form: adds bias[boffs[r] + row] at the store (see the MatmulQ8Q8GroupNFn doc).
+def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; offs : array<int64>; nregions : int64;
+                       xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_groupn, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
     }
 }
 
@@ -624,7 +640,20 @@ def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<
         invoke(g_mm_mx4q8_groupn, addr(y[0]),
             reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
             reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased form: adds bias[boffs[r] + row] at the store (see the MatmulQ8Q8GroupNFn doc).
+def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                        xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
     }
 }
 
