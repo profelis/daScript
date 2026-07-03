@@ -2,6 +2,7 @@ options gen2
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
+require dasllama/dasllama_math   // setup_dasllama_jobque_ (the engine-standard jobque config)
 require daslib/jobque_boost
 require daslib/clargs
 require math
@@ -146,9 +147,7 @@ def private run_profile(var t : Model; p, n, p2 : int64) {
     let c = t.config
     var s <- make_run_state(c)
     with_job_que() {
-        set_jobque_fork_pool(true, true)
-        set_jobque_batch_dispatch(true)
-        set_jobque_worker_spin(1000)
+        setup_dasllama_jobque_()   // pooled forks + batched dispatch + spin window + join poll (the engine standard)
         // warmup — JIT both paths (the real prefill below overwrites these cache positions)
         let warm <- build_prompt(8l)
         for (wp in range64(8l)) {
