@@ -54,6 +54,12 @@ def main {
     let c = t.config
     print("config: dim={c.dim} hidden={c.hidden_dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size}\n")
     print("active backend: {active_kernel_backend()}\n")
+    // the prompt below is hardcoded Llama-3 token ids (128000 = <|begin_of_text|>); a smaller
+    // vocab reads past the embedding table (prefill_perf is the shape-agnostic harness)
+    if (c.vocab_size <= 128000l) {
+        print("vocab {c.vocab_size} can't index llama-3 token ids — use a Llama-3 gguf here\n")
+        return
+    }
 
     var s <- make_run_state(c)
     let prompt = [128000l, 12805l, 5304l, 264l, 892l]
@@ -70,6 +76,17 @@ def main {
             let join_spin = to_int(get_env_variable("DAS_JOBQUE_JOIN_SPIN"))
             set_jobque_join_spin(join_spin)
             print("join spin override: level {join_spin}\n")
+        }
+        // A/B the matmul min-grains (rows per chunk floor); 0 = clamp off
+        if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS")) {
+            let mg = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS"))
+            set_matmul_min_chunk_rows(mg)
+            print("min chunk rows override: {mg}\n")
+        }
+        if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV")) {
+            let mgv = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV"))
+            set_matmul_min_chunk_rows_gemv(mgv)
+            print("gemv min chunk rows override: {mgv}\n")
         }
         // prefill (untimed)
         var pos = 0l

@@ -321,13 +321,75 @@ measured), and the non-GEMM loop audit — `dasllama_common.das:2012` forces dec
 unconditionally under team mode (M1-tuned), plus M1-tuned per-pass thresholds; instrument =
 `decode_prof.das` per-op attribution at T=24 vs default.
 
+## Session 2 (2026-07-03 evening) — GEMV grain, the settled 32-anomaly, the dispatch-tax decomposition
+
+**Box continuity break:** the box REBOOTED ~19:03 (uptime reset; `/data` intact) and was re-set-up:
+cmake reconfigure 19:14, models re-copied 19:25-19:29, full-tree rsync 20:35, `bin/` rebuilt 20:52
+(now the shared-lib layout — `liblibDaScriptDyn.so`, 97KB launcher). Engine revalidated green after
+(floor + suite). Consequence: cross-reboot absolute comparisons join the thermal caveat — in-batch
+ratios only.
+
+**Harness gotcha (cost 20 min):** `llama3_perf.das` drives HARDCODED Llama-3 token ids (128000 =
+begin_of_text). A smaller-vocab model (SmolLM, 49152) reads past the embedding table →
+"array index out of range" at `dequant_q8_row` — looks exactly like an engine bug and isn't.
+Guard added (vocab check + exit). Shape-agnostic harness = `prefill_perf` (tokens 1000..5999).
+
+### GEMV-specific min grain — implemented (the decode half of the grain fix)
+ggml uses grain 16 for GEMM but **64 for GEMV** (`nr0==1||nr1==1`). Mirrored: `matmul_chunks_gemv`
++ `g_matmul_min_chunk_rows_gemv` (default 64, env `DASLLAMA_MIN_CHUNK_ROWS_GEMV` in
+llama3_perf/prefill_perf). All 50 GEMV-shaped dispatch sites (mm / group3 / groupn kernels, the
+fp32+q8+q4 matvecs) across the 4 math files switched; batch/prefill sites keep grain 16. Both
+grain knobs wired into the `box_profile` runtime rail (`matmul_min_chunk_rows{,_gemv}`).
+
+### Grain ladder — Llama-1B decode @ defaults (95 workers), sequential runs
+| gemv grain | 0 | 16 (old) | 32 | 64 | 128 | 256 | 512 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| tok/s | 42.5 | 44.4 | 43.3 | 49.2–52.2 | **57.3** | 53.1 | 44.4 |
+
+@ T=24 knee: g64 94.9 ≈ g128 94.3 (knee is rendezvous-bound, not chunk-bound); g256 74.5 (starves
+25 lanes). **The grain-32 anomaly is SETTLED: real, not noise** — 32 ≈ 16 ≈ 0; the win only starts
+at 64. **Default stays 64** (ggml parity; M1's 9 lanes would starve small-d GEMVs at 128); EPYC's
+box_profile should carry **128**.
+
+### Per-op attribution (llama3_perf built-in profile, µs/token, 64-tok window)
+| bucket | defaults g16 | defaults g128 | T=24 g64 |
+|---|--:|--:|--:|
+| mm_qkv (group3, 3072 rows) | 10752 | 4178 | 2032 |
+| mm_ffn (w13 16384 + w2 2048) | 6924 | 8212 | 5220 |
+| mm_wo | 1220 | 1568 | 681 |
+| attn (forced-par under team) | 1363 | 1094 | 455 |
+| final (cls) | 1539 | 1624 | 1468 |
+| **TOTAL** | **22196** | **17168** | **10222** |
+
+Three structural readings:
+1. **Per-shape grain conflict:** mm_qkv wants coarse (2.6× win at 128); mm_ffn wants fine — its
+   w2 (d=2048) drops to 16 chunks at g128 and loses 19% (bandwidth-starved at 16 active lanes).
+   One global GEMV grain is a compromise → per-shape grain (or a work-based grain) is the next
+   rung — ledger.
+2. **The dispatch tax is ~flat per dispatch and scales with lane count:** every bucket except
+   `final` costs ~2× more at 96 lanes than at 24 at comparable chunk counts; the defaults-vs-T24
+   delta ≈ 86 µs/dispatch × 81 dispatches/token. Chunking can't remove it (team rendezvous
+   involves every lane regardless of who gets work) → the structural lever is a **decode lane
+   cap** (dispatch on a subset of the team) or cheaper rendezvous. This is the whole remaining
+   defaults-vs-knee gap (57 → 95 t/s).
+3. **Boris's forced-attn hunch: confirmed, secondary.** The team-mode-unconditional decode attn
+   dispatch costs ~0.9 ms/tok extra at 96 lanes vs 24 (6% share) — real, but the same tax hits
+   every dispatch; fixing attn alone buys ~5%.
+
+Floor (post-reboot revalidation): SmolLM T=1 per-token 105-122 t/s, prefill ~330 t/s — sane.
+
 ## Open items / next
-- [ ] ggml min-chunk-size comparison (teammate) → pick MIN_ROWS_PER_CHUNK / work metric.
-- [ ] Implement + measure the min-chunk-size clamp; re-run the thread sweep (192 should stop losing).
+- [x] ggml min-chunk-size comparison (teammate) → pick MIN_ROWS_PER_CHUNK / work metric.
+- [x] Implement + measure the min-chunk-size clamp (batch grain day-1; GEMV grain session 2).
+- [x] GEMV grain ladder → 128 on this box; grain-32 anomaly settled (real, mechanism understood).
+- [ ] **Decode lane cap** — dispatch decode matvecs on min(lanes, work/grain) TEAM lanes so the
+      other lanes skip the rendezvous entirely; the ~86 µs/dispatch tax × 81 disp/tok IS the
+      defaults-vs-knee gap. Needs jobque support (team subset dispatch) — design with Boris.
+- [ ] Per-shape / work-based GEMV grain (mm_qkv vs mm_ffn pull opposite) — after the lane cap.
 - [ ] Per-cell VNNI-vs-donor A/B at a fixed thread count (the promote/delete question). Pin 96 baseline.
 - [ ] #3370 dispatch-lanes utilization delta on 96 cores.
 - [ ] In-model dasLLAMA vs llama.cpp (same thread count both sides), Llama-1B + Llama-8B + gpt-oss.
-- [ ] `tune_kernels` → box_profile.json for the EPYC.
+- [ ] `tune_kernels` → box_profile.json for the EPYC (carry gemv grain 128 + T knee).
 
 ## Campaign method reminders
 - Correctness before speed; real-model tests = **small model, one run at a time** (the oracle

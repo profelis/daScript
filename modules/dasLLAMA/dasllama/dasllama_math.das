@@ -196,6 +196,20 @@ def public matmul_chunks(rows, want : int) : int {
     return g_matmul_min_chunk_rows <= 0 ? want : clamp(rows / g_matmul_min_chunk_rows, 1, want)
 }
 
+// Coarser grain for GEMV-shaped splits (ggml mul_mat: chunk_size 16 -> 64 when nr0==1||nr1==1):
+// a decode matvec row is one dot, far less work than a GEMM row reused across ntok tokens, and
+// the coarser floor doubles as the decode lane cap (EPYC 9654: grain 64 = +13-15% decode at
+// default threads). 0 disables.
+var g_matmul_min_chunk_rows_gemv = 64
+def public set_matmul_min_chunk_rows_gemv(v : int) { g_matmul_min_chunk_rows_gemv = max(v, 0) }
+def public get_matmul_min_chunk_rows_gemv() : int { return g_matmul_min_chunk_rows_gemv }
+
+//! matmul_chunks for the GEMV-shaped dispatches (single-token mm / group3 / groupn): the same
+//! clamp with the coarser GEMV grain. `rows` is the TOTAL row count of the split range.
+def public matmul_chunks_gemv(rows, want : int) : int {
+    return g_matmul_min_chunk_rows_gemv <= 0 ? want : clamp(rows / g_matmul_min_chunk_rows_gemv, 1, want)
+}
+
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.
 //! W is row-major [d rows x n cols], x is [n], y is [d]; each y[i] is one dot
 //! product of W's i-th row with x. Shapes match llama2.c (n = input dim, d = output dim).
@@ -206,7 +220,7 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
         var yp = addr(y[0])                              // var: stays a writable pointer when captured
         let wp = reinterpret<float const?>(addr(w[0]))   // strip the `#` if w is a view
         let xp = addr(x[0])
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot(wp + int64(i) * n, xp, n)
@@ -365,7 +379,7 @@ def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #;
         let sp = reinterpret<float const?>(addr(ws[0]))
         let xp = addr(x[0])
         // default 2 chunks per hw job (knob): Q8 dequant-in-dot is compute-bound and threads better than fp32
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), g_q8_chunks_per_job * get_dispatch_lanes())) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), g_q8_chunks_per_job * get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q8(wp + int64(i) * n, sp + int64(i) * nb, xp, n)
@@ -886,7 +900,7 @@ def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #
         let xp = addr(x[0])
         // default 4 chunks per hw job (knob): the heavy nibble unpack makes each row compute-bound, so finer
         // splitting balances better (esp. the classifier) — more than the compute-light Q8 path.
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), g_q4_chunks_per_job * get_dispatch_lanes())) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job * get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)
