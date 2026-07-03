@@ -5,7 +5,7 @@ module dasllama_math_default shared public
 require dasllama/dasllama_math       // KernelBackend + register_kernel_backend + g_matmul_par_threshold + repack_q8q8_identity
 require dasllama/dasllama_tune       // [tuned]: reconstitute dot_q8q8 from its template with per-box loop hints
 require daslib/jobque_boost public   // parallel_for / notify_and_release (the kernels expand parallel_for)
-require dasllama/dasllama_par        // maybe_parallel_for / get_total_hw_jobs
+require dasllama/dasllama_par        // maybe_parallel_for
 require math
 
 // The PORTABLE Q8·Q8 kernel backend — auto-vectorized dot_q8q8, no repack (row-major weights). It is
@@ -224,7 +224,7 @@ def mx4q8_batch_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xq
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wn + int64(i) * (n / 2l)
@@ -247,7 +247,7 @@ def mx4q8_batch_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 con
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let ii = int64(i)
