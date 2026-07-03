@@ -296,10 +296,13 @@ probe (flattered — caller self-serves; real-work cost higher but orders cheape
 | Llama-1B decode knee | — | **97 @ T=24** (70% of lcpp 139) |
 | Llama-1B prefill-512 @default | 495 | **969** (37% of lcpp 2605; N=256: 1120) |
 
-**Decode residual:** lcpp holds 139 at 96 threads via GEMV grain 64 (⇒ ~32 effective threads,
-emergent); our grain-64 env test: decode 43.9→**53.8** t/s at default (+13-15%; grain-32
-measured worse — sequential-run noise/imbalance, treat as unsettled). Full fix needs
-decode-lane limiting or cheaper rendezvous — tuning territory.
+**Decode residual:** ~~lcpp holds 139 via GEMV grain 64 ⇒ ~32 effective threads, emergent~~ —
+WRONG inference, corrected session 2 against the source: a decode GEMV lands in ggml's
+anti-fragmentation FALLBACK (grid < nth*4 ⇒ exactly-nth equal chunks, `ggml-cpu.c:1403`), so
+ALL 96 threads work ~22-row slices; grain 64 is a strategy *selector*, not a lane cap, and
+their flat curve is carried by the ~µs barrier alone. Our grain-64 env test: decode
+43.9→**53.8** t/s at default (+13-15%). Full fix = cheaper rendezvous (barrier-cheap epoch),
+NOT lane limiting — see session 2.
 
 **Day total: Llama-1B decode 7.6 → 97 t/s (12.7×) with knee-threads, 43-54 at defaults;
 prefill-512 2×.** Fixes: min-grain clamp + phys-core cap (committed) + team-default (pending
@@ -377,6 +380,33 @@ Three structural readings:
    every dispatch; fixing attn alone buys ~5%.
 
 Floor (post-reboot revalidation): SmolLM T=1 per-token 105-122 t/s, prefill ~330 t/s — sane.
+
+### Team-slot cache-line surgery — NEGATIVE RESULT (do not retry)
+Hypothesis: the ~86µs/dispatch tax = claim-line refetch storm (spinners acquire-poll `mTeamSeq`
+on the same line `mTeamOp` claims hammer). Tested 4 layouts, bracketed with controls, Llama-1B
+decode @ defaults:
+| variant | g128 | g16 |
+|---|--:|--:|
+| ctrl / ctrl2 / ctrl3 (unpadded, shipped) | 58.7 / 61.3 / **61.4** | 47.5 / 45.6 / 34.1 |
+| alignas(64) op, remaining, parked each own line | 50.9 | 33.1 |
+| + per-iteration test-before-claim peek | 52.4 | 34.2 |
+| seq isolated, op+remaining paired | 50.0 | 31.6 |
+| ditto + entry-only peek | 56.4 | 33.9 |
+**Every padded layout LOSES to the unpadded original** (−8-18% @ g128). The co-located slot is
+load-bearing, not accidental. Also: the g16 CONTROL itself swung 47.5→34.1 across brackets —
+fine-grain (192-chunk) decode is chaotically sensitive to box state after hours of load; g128 is
+stable (58.7-61.4). Coarse grain buys *stability*, not just speed. Always bracket controls.
+
+**Why ggml is still cheaper per op (the real mechanical difference, `ggml-cpu.c:1414-1441`):**
+in the decode (equal-split fallback) regime ggml has NO shared claim atomic at all — thread i
+takes chunk i (`current_chunk = ith`), and `nth >= nchunk` short-circuits the `atomic_fetch_add`
+path entirely. Per-op sync = static slice + one barrier arrival. Ours = seq poll + dynamic
+fetch_add claims + remaining decrements on every op. The residual tax is the *protocol*, not the
+line layout. Candidate designs (undecided — instrument first): (A) static partition when
+`numChunks <= lanes` (ggml-exact; loses robustness to a busy/parked worker — needs a caller
+sweep for unserved chunks), (B) sharded claim counters, (C) neither — measure the actual
+anatomy (publish→first-claim, →last-claim, →join-done, caller-vs-worker claim share) with rdtsc
+instrumentation in teamParallelFor at T=24 vs 96 before any further surgery.
 
 ## Open items / next
 - [x] ggml min-chunk-size comparison (teammate) → pick MIN_ROWS_PER_CHUNK / work metric.
