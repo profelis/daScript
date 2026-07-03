@@ -16,3 +16,4 @@ indicates that the type needs marking by the garbage collector.
 indicates that the type needs marking of strings by the garbage collector.
 indicates that the type needs lock checking.
 indicates that the type is private.
+indicates that the struct field is a class method.

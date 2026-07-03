@@ -209,6 +209,9 @@ namespace das {
             if (var.privateField) {
                 vi->flags |= TypeInfo::flag_private;
             }
+            if (var.classMethod) {
+                vi->flags |= TypeInfo::flag_classMethod;
+            }
             sti->fields[i] = vi;
         }
         sti->firstGcField = sti->count;
