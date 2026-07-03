@@ -103,6 +103,7 @@ def private q8q8_group3_kernel_neon_sdot4x4(var y0p : float?; var y1p : float?; 
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
+    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
     parallel_for(0, int(dtot), get_total_hw_jobs()) $(rb, re, wg) {
         unsafe {
             for (gi in range(rb, re)) {
@@ -655,6 +656,7 @@ def private q8q8_group3_kernel_neon_laneq(var y0p : float?; var y1p : float?; va
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
+    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
     parallel_for(0, int(ngtot), get_total_hw_jobs()) $(rb, re, wg) {
         unsafe {
             for (gi in range(rb, re)) {

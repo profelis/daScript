@@ -38,11 +38,13 @@ class private MaybeParallelForMacro : AstFunctionAnnotation {
         let wgN = make_unique_private_name("mpf_wg", call.at)
         var qb = qmacro_block() {
             if ($e(call.arguments[0])) {
+                count_parallel_dispatch($e(call.arguments[3]))   // dispatch observability (dasllama_math)
                 parallel_for($e(call.arguments[1]), $e(call.arguments[2]), $e(call.arguments[3])) <| $($i(rbN), $i(reN), $i(wgN)) {
                     invoke($e(call.arguments[4]), $i(rbN), $i(reN))
                     $i(wgN) |> notify_and_release
                 }
             } else {
+                count_inline_run()
                 invoke($e(call.arguments[4]), $e(call.arguments[1]), $e(call.arguments[2]))
             }
         }

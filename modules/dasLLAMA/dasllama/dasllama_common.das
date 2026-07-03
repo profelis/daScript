@@ -2557,13 +2557,37 @@ def get_moe_grouped_prefill() : bool {
 var g_forward_prof_acc : table<string; int64>
 
 //! Start a fresh measurement window (zero the per-section accumulators).
+var g_forward_prof_disp : table<string; int64>    // parallel_for dispatches per section
+var g_forward_prof_chunks : table<string; int64>   // chunks (jobs) pushed per section
+var g_forward_prof_inline : table<string; int64>   // inline (non-dispatched) runs per section
+var g_prof_mark_disp = 0l
+var g_prof_mark_chunks = 0l
+var g_prof_mark_inline = 0l
+
 def forward_profile_reset() {
     g_forward_prof_acc |> clear()
+    g_forward_prof_disp |> clear()
+    g_forward_prof_chunks |> clear()
+    g_forward_prof_inline |> clear()
+    g_prof_mark_disp = get_disp_count()
+    g_prof_mark_chunks = get_disp_chunks()
+    g_prof_mark_inline = get_disp_inline()
 }
 
+// Sections are sequential and each span ends in exactly one prof_add, so the dispatch-counter
+// deltas since the previous prof_add belong to `name` — jobs-per-section with no call-site changes.
 def private prof_add(name : string; t0 : int64) {
     let cur = g_forward_prof_acc?[name] ?? 0l
     g_forward_prof_acc[name] = cur + int64(get_time_usec(t0))
+    let dc = get_disp_count()
+    let ch = get_disp_chunks()
+    let il = get_disp_inline()
+    g_forward_prof_disp[name] = (g_forward_prof_disp?[name] ?? 0l) + (dc - g_prof_mark_disp)
+    g_forward_prof_chunks[name] = (g_forward_prof_chunks?[name] ?? 0l) + (ch - g_prof_mark_chunks)
+    g_forward_prof_inline[name] = (g_forward_prof_inline?[name] ?? 0l) + (il - g_prof_mark_inline)
+    g_prof_mark_disp = dc
+    g_prof_mark_chunks = ch
+    g_prof_mark_inline = il
 }
 
 //! The accumulated time (us) for one section since the last reset (0 if the section never ran).
@@ -2577,9 +2601,12 @@ def forward_profile_report() {
     for (v in values(g_forward_prof_acc)) {
         total += v
     }
-    to_log(LOG_INFO, "=== forward profile (us, summed over the window; prefill + decode share the buckets) ===\n")
+    to_log(LOG_INFO, "=== forward profile (us | % | dispatches | chunks | inline-runs; prefill + decode share the buckets) ===\n")
     for (k, v in keys(g_forward_prof_acc), values(g_forward_prof_acc)) {
-        to_log(LOG_INFO, "  {k}: {v} ({100l * v / max(total, 1l)}%)\n")
+        let dd = g_forward_prof_disp?[k] ?? 0l
+        let cc = g_forward_prof_chunks?[k] ?? 0l
+        let ii = g_forward_prof_inline?[k] ?? 0l
+        to_log(LOG_INFO, "  {k}: {v} ({100l * v / max(total, 1l)}%) | disp {dd} | chunks {cc} | inline {ii}\n")
     }
     to_log(LOG_INFO, "  TOTAL: {total}\n")
 }
