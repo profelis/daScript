@@ -17,7 +17,7 @@ shows the **left half of the 1x image beside the right half of the resolved 4x i
 split by a bright divider. Left of the line the spikes stair-step and crawl as the ball
 spins; right of it they are smooth.
 
-.. literalinclude:: ../../../../tutorials/opengl/09_msaa/09_msaa.das
+.. literalinclude:: ../../../../../tutorials/opengl/09_msaa/09_msaa.das
    :language: das
    :start-at: GL objects
 
