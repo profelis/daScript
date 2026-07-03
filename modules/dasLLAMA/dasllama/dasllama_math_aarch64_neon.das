@@ -71,7 +71,7 @@ def dot_q8q8_sdot4x4(wq : int8 const?; ws : float const?; xq : int8 const?; xs :
 def private q8q8_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 myp[i] = dot_q8q8_sdot4x4(wp + int64(i) * n, sp + int64(i) * nb, xqp, xsp, n)
@@ -156,7 +156,7 @@ def private mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 con
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     myp[i] = dot_mx4q8(lutp, wn + int64(i) * (n / 2l), we + int64(i) * nb, xqp, xsp, n)
@@ -174,7 +174,7 @@ def private mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 con
 def private q8q8_groupn_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let ii = int64(i)
@@ -196,7 +196,7 @@ def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp 
     let nb = n / 32l
     let ng = d / 4l
     var myp = yp
-    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), get_total_hw_jobs()) $(gb, ge) {
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(gb, ge) {
         unsafe {
             for (gi in range(gb, ge)) {
                 let gg = int64(gi)
@@ -239,7 +239,7 @@ def private mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : ui
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let ii = int64(i)
@@ -268,7 +268,7 @@ def private mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; w
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), get_total_hw_jobs()) $(gb, ge) {
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(gb, ge) {
             unsafe {
                 for (gi in range(gb, ge)) {
                     let gg = int64(gi)
@@ -401,7 +401,7 @@ def private mx4q8_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uin
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(rb, re) {
             unsafe {
                 for (gi in range(rb, re)) {
                     let g = int64(gi)
@@ -577,7 +577,7 @@ def private q8q8_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float
     let nb = n / 32l
     let ng = d / 4l
     var myp = yp
-    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(rb, re) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -606,7 +606,7 @@ def private q8q8_batch_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp :
     // Clamp to keep TB×n within the per-box L2 budget (inert at the default TB=128): above ~L2/n the
     // slice spills and prefill cliffs (measured n=8192 ~TB 1024, n=14336 ~512 on M1 Max).
     let TB = effective_token_block(g_q8_token_block, n)
-    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(rb, re) {
         unsafe {
             var tb = 0l
             while (tb < ntok) {

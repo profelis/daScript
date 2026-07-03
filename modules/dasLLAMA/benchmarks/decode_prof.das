@@ -39,6 +39,9 @@ struct Args {
     @clarg_doc = "Override the decode-attention threading threshold (work units; 0 = always thread, -1 = keep default)"
     attn_par : int = -1
 
+    @clarg_doc = "Override the quantized-matmul oversplit factor (chunks per hw job; -1 = keep default)"
+    chunks : int = -1
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -199,6 +202,10 @@ def main() {
     if (cfg.attn_par >= 0) {
         set_decode_attn_par_threshold(int64(cfg.attn_par))
         print("decode_attn_par_threshold override: {cfg.attn_par}\n")
+    }
+    if (cfg.chunks >= 1) {
+        set_q8_batch_chunks_per_job(cfg.chunks)
+        print("q8_batch_chunks_per_job override: {cfg.chunks}\n")
     }
     run_profile(t, p, n, p2)
 }
