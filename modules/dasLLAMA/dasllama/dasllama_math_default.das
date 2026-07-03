@@ -214,6 +214,64 @@ def mx4q8_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : in
     }
 }
 
+// Portable mx4 batch: rows-outer / tokens-inner over the scalar row dot. NOT flagged
+// mx4_native_batch — in-model grouped prefill keeps the expand-to-Q8 + vectorized Q8 batch path,
+// which beats per-token scalar LUT dots; this form exists as the probe/A-B reference (bit-identical
+// to ntok x mx4q8_kernel).
+def mx4q8_batch_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    let nb = n / 32l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let wrow = wn + int64(i) * (n / 2l)
+                    let erow = we + int64(i) * nb
+                    for (tk in range64(ntok)) {
+                        myp[tk * d + int64(i)] = dot_mx4q8_scalar(lutp, wrow, erow, xqp + tk * n, xsp + tk * nb, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Portable mx4 batch groupN: per (region, row) scalar dots over each region's token-row range —
+// the probe/A-B reference twin of mx4q8_batch_kernel (NOT flagged; see that kernel's note).
+def mx4q8_batch_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let ii = int64(i)
+                    let r = ii / d
+                    let row = ii % d
+                    let woff = offs[r * 3l]
+                    let row0 = offs[r * 3l + 1l]
+                    let cnt = offs[r * 3l + 2l]
+                    let wrow = wn + woff / 2l + row * (n / 2l)
+                    let erow = we + woff / 32l + row * nb
+                    for (tk in range64(cnt)) {
+                        var v = dot_mx4q8_scalar(lutp, wrow, erow, xqp + (row0 + tk) * n, xsp + (row0 + tk) * nb, n)
+                        if (bp != null) {
+                            v += bp[boffs[r] + row]
+                        }
+                        myp[(row0 + tk) * d + row] = v
+                    }
+                }
+            }
+        }
+    }
+}
+
 def q8q8_groupn_kernel(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
@@ -268,6 +326,7 @@ def mx4q8_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; o
 def dasllama_math_default_register() {
     register_kernel_backend(KernelBackend(name = "portable", mm = @@q8q8_kernel, batch = @@q8q8_batch_kernel,
         group3 = @@q8q8_group3_kernel, repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel,
+        mx4_batch = @@mx4q8_batch_kernel, mx4_batch_groupn = @@mx4q8_batch_groupn_kernel,
         groupn = @@q8q8_groupn_kernel, groupn_mx4 = @@mx4q8_groupn_kernel,
         needs_repack = false, priority = 0))
 }

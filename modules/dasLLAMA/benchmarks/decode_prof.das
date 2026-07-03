@@ -4,7 +4,9 @@ options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%);
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require daslib/jobque_boost
 require daslib/clargs
+require daslib/fio
 require math
+require dasllama/dasllama_math  // pin_kernel_backend / active_kernel_backend (engine-level, not re-exported)
 
 // Per-op DECODE profile: prefill a synthetic prompt to depth P, then greedily decode N tokens with
 // the forward-section profiler windowed to just the decode loop. Prints the measured per-bucket
@@ -191,12 +193,18 @@ def main() {
     let p = max(int64(cfg.prefill), 8l)
     let n = max(int64(cfg.ngen), 1l)
     let p2 = int64(cfg.prefill2)
+    // backend pin for A/B on one binary (e.g. portable vs x64-avx2-repack) — must land BEFORE
+    // load_gguf: select_matmul_backend_for_load honors the pin at load, which decides repack
+    if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
+        pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
+    }
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)
     let ctx_cap = max(2048l, max(p, p2) + n + 8l)
     t.config.seq_len = min(t.config.seq_len, ctx_cap)   // cap the KV allocation
     let c = t.config
     print("config: dim={c.dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size} moe={c.moe}\n")
+    print("active backend: {active_kernel_backend()}\n")
     if (cfg.attn_par >= 0) {
         set_decode_attn_par_threshold(int64(cfg.attn_par))
         print("decode_attn_par_threshold override: {cfg.attn_par}\n")

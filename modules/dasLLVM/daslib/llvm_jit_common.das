@@ -403,6 +403,41 @@ var public g_target_is_x64 = false
 // either, so the intrinsics compile their portable fallback bodies: correct, just not fast.
 var public g_target_x64_avx2 = false
 
+// The AVX kernel-matrix tiers (x64_avx dot32_vnni / dot64_acc16 / mx4_dequant64 families) gate on
+// finer cpuid truth, same contract as g_target_x64_avx2 — each flag guards its own lookup table in
+// llvm_jit_intrin, and a false flag means the call compiles its daslang body (which delegates to
+// the next tier down, so degradation is graceful). vnni256 = 256-bit VPDPBUSD (VEX AVX-VNNI, or
+// EVEX AVX512-VNNI+VL); avx512bw = zmm byte ops (VPABSB/VPMADDUBSW/VPSHUFB at 512 need BW, not
+// just F); avx512vnni = zmm VPDPBUSD (requires the bw gate too — the sign trick around it is BW).
+// DAS_JIT_X64_FORCE_FEATURES (comma-separated cpuid names, e.g. "avxvnni,avx512f,avx512bw") ORs
+// features in for EMISSION-ONLY verification on a box without them: the DLL codegens and can be
+// disassembled, but executing the forced sequences is an illegal instruction — compile/disasm
+// only. The force string is folded into the DLL cache key (jit_dll_basename) so a forced artifact
+// never cache-hits a normal run.
+var public g_target_x64_vnni256 = false
+var public g_target_x64_avx512bw = false
+var public g_target_x64_avx512vnni = false
+
+def private x64_forced_feature(name : string) : bool {
+    for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")) {
+        if (part == name) {
+            return true
+        }
+    }
+    return false
+}
+
+def private x64_target_feature(name : string) : bool {
+    return cpu_supports(name) || x64_forced_feature(name)
+}
+
+// The forced names as an LLVM target-feature append ("+avxvnni,+avx512bw"); the five matrix names
+// are spelled identically in cpuid and LLVM. Empty when the env is unset.
+def public x64_forced_plus_features() : string {
+    let plus <- [for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")); "+{part}"; where !empty(part)]
+    return join(plus, ",")
+}
+
 // Cross-compile a wasm object compatible with a -pthread (SharedArrayBuffer)
 // runtime: add +atomics,+bulk-memory to the target_features section so wasm-ld
 // links it into a --shared-memory build. Set from the --jit-threads CLI flag in
@@ -512,6 +547,12 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
     // AVX2 gate for the x64 intrinsic table (see the declaration comment): host targets take the
     // running box's cpuid truth; cross targets get empty features, so no AVX2 emission there.
     g_target_x64_avx2 = g_target_is_x64 && empty(target_triple) && cpu_supports("avx2")
+    // Matrix-tier gates (see the declaration comment): cpuid truth OR'd with the
+    // DAS_JIT_X64_FORCE_FEATURES emission-only override.
+    g_target_x64_vnni256 = g_target_x64_avx2 && (x64_target_feature("avxvnni")
+        || (x64_target_feature("avx512vnni") && x64_target_feature("avx512vl")))
+    g_target_x64_avx512bw = g_target_x64_avx2 && x64_target_feature("avx512f") && x64_target_feature("avx512bw")
+    g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_target_feature("avx512vnni")
     if (!(target_triple |> empty())) {
         // wasm32 target isn't always part of LLVMInitializeAllTargets in
         // prebuilt LLVM.dll — call the explicit wasm initializer when needed.
@@ -1026,6 +1067,13 @@ def public with_default_target_machine(opt_level : uint; use_host_cpu : bool;
     // SDOT; -mcpu=generic -mattr=+dotprod emits `sdot.4s`.)
     if (use_host_cpu && g_target_is_aarch64) {
         let feats = empty(features_msg) ? "+dotprod" : "{features_msg},+dotprod"
+        with_target_machine(triple_msg, cpu_msg, feats, opt_level, blk)
+    } elif (use_host_cpu && g_target_is_x64 && !empty(x64_forced_plus_features())) {
+        // DAS_JIT_X64_FORCE_FEATURES emission-only override (see the g_target_x64_* declaration
+        // comment): append AFTER the host features — the last occurrence of a feature wins in
+        // LLVM's SubtargetFeatures, so "+avx512f" here overrides the host list's "-avx512f".
+        let forced = x64_forced_plus_features()
+        let feats = empty(features_msg) ? forced : "{features_msg},{forced}"
         with_target_machine(triple_msg, cpu_msg, feats, opt_level, blk)
     } else {
         with_target_machine(triple_msg, cpu_msg, features_msg, opt_level, blk)

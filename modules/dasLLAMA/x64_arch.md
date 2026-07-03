@@ -118,6 +118,11 @@ of it.
 | `x64-avx2-repack` | `dasllama_math_x64_avx.das` | 20 | **yes** | same |
 | `x64-avx2-acc8` | `dasllama_math_x64_avx.das` | 9 | no | same — pinnable experiment |
 | `x64-avx2-ps` | `dasllama_math_x64_avx.das` | 8 | no | same — pinnable experiment |
+| `x64-vnni256` | `dasllama_math_x64_avx.das` | 7 | no | avx2 gate && `DASLLAMA_AVX_MATRIX=1` && (`avxvnni` \|\| `avx512vnni`+`vl`) — matrix, pin-only |
+| `x64-vnni256-acc8` | `dasllama_math_x64_avx.das` | 6 | no | same — matrix, pin-only |
+| `x64-vnni256-repack` | `dasllama_math_x64_avx.das` | 5 | **yes** | same — matrix, pin-only |
+| `x64-avx512bw` | `dasllama_math_x64_avx.das` | 4 | no | avx2 gate && `DASLLAMA_AVX_MATRIX=1` && `avx512f`+`bw` — matrix, pin-only |
+| `x64-avx512vnni` | `dasllama_math_x64_avx.das` | 3 | no | same && `avx512vnni` — matrix, pin-only |
 
 The `jit_enabled()` half of the gate matters: off-JIT the intrinsic functions run their scalar
 fallback bodies, which are *slower* than the vectorized portable kernels — so interp/AOT stay
@@ -130,9 +135,30 @@ issue `llvm.x86.avx2.*` against a TargetMachine whose cpuid features lack `+avx2
 "Cannot select" at codegen that would kill EVERY dasLLAMA program under `-jit` on such a box,
 since the umbrella requires this module and the JIT compiles the whole program up-front. With
 the gate, an AVX2-less x64 box compiles the intrinsics' portable fallback bodies (correct,
-slow) and keeps `portable` selected. The same rail answers future ISA tiers: a `"x64-vnni"`
-backend gates on `cpu_supports("avx512vnni") || cpu_supports("avxvnni")`, AVX-512 kernels on
-`cpu_supports("avx512f")` — the builtin knows the leaf-7 map, and unknown names fail closed.
+slow) and keeps `portable` selected. The same rail answers the higher ISA tiers: the AVX
+kernel matrix below gates on `cpu_supports("avxvnni"/"avx512f"/"avx512bw"/"avx512vl"/
+"avx512vnni")` — the builtin knows the leaf-7 map, and unknown names fail closed.
+
+**The AVX kernel matrix (2026-07, unmeasured — default OFF):** VNNI / AVX-512 twins of the
+shipped kernels, built to be measured on rented bare metal (the 3990X has none of the tiers).
+`DASLLAMA_AVX_MATRIX=1` enables registration (plus per-tier cpuid gates); priorities all sit
+below the shipped backends, so nothing auto-selects even when enabled — A/B via
+`DASLLAMA_PIN_BACKEND`. `DASLLAMA_AVX_MATRIX_FORCE=1` registers tiers the box lacks (they run
+the delegating fallbacks — correct, for probe/validation only). Intrinsics (in
+`llvm/daslib/x64_avx.das`, each an exact twin of its donor): `dot32_vnni` / `dot32_acc8_vnni` /
+`dot32_mx4_vnni` = ONE `VPDPBUSD` ymm replacing the `VPMADDUBSW+VPMADDWD` pair (integer
+identity); `dot64_acc16(_vnni)` = TWO blocks per call on zmm into a float[16] memory
+accumulator (`VPSIGNB` has no 512-bit form — sign application is compare+negate+select, lowered
+to `VPMOVB2M`+masked `VPSUBB`); `mx4_dequant64` = two-block MXFP4 dequant via ONE zmm `VPSHUFB`.
+JIT gates `g_target_x64_vnni256 / _avx512bw / _avx512vnni` (llvm_jit_common) mirror the cpuid
+truth per tier; `DAS_JIT_X64_FORCE_FEATURES=avxvnni,avx512f,avx512bw,avx512vl,avx512vnni`
+appends target features for EMISSION-ONLY disasm verification on a box without them (folded
+into the DLL cache key; never execute forced artifacts). Exactness gates live in
+`harness/avx_matrix_probe.das`: every vnni backend is BIT-EXACT vs its donor; z16 tiers gate
+rel<1e-5 vs portable (the acc8/ps float-shape class) + a bit-exact strip-expansion contract.
+Full detail — intrinsic/emitter facts, backend/slot map, validation status, the rented-box
+measurement runbook, and the PR-time TODO — lives in **`avx_kernel_matrix.md`** (next to this
+file).
 
 **The x64 backends** (all in `dasllama_math_x64_avx.das`, shipped 2026-07): `x64-avx2` =
 row-major dot4x4 over the `dot32` ymm intrinsic (the auto row-major default); `x64-avx2-repack` =
