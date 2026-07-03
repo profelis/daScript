@@ -392,11 +392,16 @@ what it costs today and what the fix would change.
   directly on a repack backend; short prompts route per-position (npos·k ≥ 8·n_expert guard).
   On top, the MoE decode dispatch fuse: region-list groupn/groupn_mx4 kernels run all k
   experts' gates (ups, downs) in ONE fork/join — 288 → ~72 mm dispatches/token, bit-exact.
-  Measured (NOISY box, 4-tok smoke): decode 22.0 → 32 t/s (llama.cpp anchor 39.9), resident
-  26 → 13.2GB, every fixture token-for-token unchanged (no refreeze — the counting fixtures
-  absorbed all kernel-order changes). Official quiet-box A/B (decode_prof two-window +
-  same-window llama-bench) still pending. (Spotted wave 5; the Q4_0 halfway house was skipped —
-  native landed directly.)
+  Measured (QUIET box, 2026-07-02, same-window anchors): decode 22.0 → **31.8 t/s** @ ctx 8
+  (30.7 @ ctx 512) vs llama-bench tg64 41.1 — **0.55× → 0.77×**; per-op profile: mm_moe 50%
+  measured vs 47.9% theoretical share (the 66/66 format asymmetry is GONE), MoE mms sustain
+  ~77GB/s vs the dense mms' ~99 (the remaining MoE-efficiency gap = the next lever); 12B decode
+  7.98 vs anchor 8.67 (92%, unchanged — dense path untouched); resident 26 → 13.2GB; every
+  fixture token-for-token unchanged (no refreeze — the counting fixtures absorbed all
+  kernel-order changes). Cost paid: gpt-oss pp512 ~186 → ~121-149 t/s (the per-expert
+  expansion) vs llama.cpp's 119.9 — still ≥ parity; the native mx4 batch GEMM in the expansion
+  entry below reclaims it. (Spotted wave 5; the Q4_0 halfway house was skipped — native landed
+  directly.)
 - **q4 has no batched prefill kernel — prefill collapses to decode rate.** The q4 path serves
   everything through the scalar fp32-activation `dot_q4`/`matmul_q4` (no q8-style token-blocked
   batch GEMM, no NEON arm, no repack backend), so a q4 prefill runs at generation speed:
