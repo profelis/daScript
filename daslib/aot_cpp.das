@@ -1120,6 +1120,14 @@ def public aotFuncName(func : Function?) {
     }
 }
 
+def private isBlockLet(variable : VariablePtr) : bool {
+    if (!variable._type.isGoodBlockType) {
+        return false
+    }
+    assert(variable.init != null && variable.init is ExprMakeBlock, "block local must be initialized with a make block expression")
+    return true
+}
+
 class public BlockVariableCollector : AstVisitor {
     //! AST visitor that collects block-level variable declarations for AOT code generation.
     def override preVisitExprBlock(blk : ExprBlock?) {
@@ -1196,6 +1204,9 @@ class public BlockVariableCollector : AstVisitor {
     def override preVisitExprLetVariable(let_var : ExprLet?; var variable : VariablePtr; last : bool) {
         var bfinal = getFinalBlock()
         if (bfinal != null) {
+            if (isBlockLet(variable)) {
+                blockLets[bfinal] |> push(variable);
+            }
             bfinal = getTopBlock();
             variables[bfinal] |> push(variable);
             moved |> insert(variable);
@@ -1263,6 +1274,7 @@ class public BlockVariableCollector : AstVisitor {
 
     @do_not_delete stack :      array<ExprBlock?>
     @do_not_delete variables :  table<ExprBlock?, array<Variable?>>
+    @do_not_delete blockLets :  table<ExprBlock?, array<Variable?>>
     @do_not_delete localTemps : table<ExprBlock?, array<Expression?>>
     @do_not_delete stackNew :   table<ExprBlock?, array<Expression?>>
 
@@ -1616,6 +1628,8 @@ class public CppAot : AstVisitor {
         // pre-declare variables
         assume vars = collector.variables[blk];
         for (variable in vars) {
+            // hoisted blocks are fully emitted at the top of their own scope
+            continue if (isBlockLet(variable))
             write(*ss, "{tabs()}");
             describeVarLocalCppType(ss, variable._type, cross_platform);
             let varname = collector.getVarName(variable);
@@ -1651,6 +1665,37 @@ class public CppAot : AstVisitor {
                 write(*ss, "{tabs()}{stackNewPointeeType(nw, cross_platform)} {nm}; {nm};\n");
             }
         }
+        // hoisted block lets are emitted here in full
+        collector.blockLets.get(blk) $(blets) {
+            for (variable in blets) {
+                emitBlockLet(variable);
+            }
+        }
+    }
+    def emitBlockLet(var variable : VariablePtr) {
+        let varname = collector.getVarName(variable);
+        let constRef = (variable._type.flags.constant &&
+                       variable._type.isRefType &&
+                       !variable._type.flags.ref)
+        let cvname = constRef ? varname + "_ConstRef" : varname;
+        var mkb = variable.init as ExprMakeBlock;
+        var mblk = mkb._block as ExprBlock;
+        mblk.blockFlags.aotSkipMakeBlock = true;
+        write(*ss, "{tabs()}auto {cvname}_TempFunctor = ");
+        visit_expression(variable.init, adapter);
+        write(*ss, ";\n{tabs()}");
+        mblk.blockFlags.aotSkipMakeBlock = false;
+        mkb.aotFunctorName := cvname + "_TempFunctor";
+        write(*ss, "auto {cvname} = ");
+        visit_expression(variable.init, adapter);
+        write(*ss, ";\n");
+        if (constRef) {
+            write(*ss, tabs());
+            describeLocalCppType(ss, variable._type, cross_platform);
+            write(*ss, " & {varname} = {cvname};\n");
+        }
+        mkb.aotFunctorName := cvname;
+        mblk.blockFlags.aotSkipMakeBlock = true;
     }
     def override preVisitExprBlockArgumentInit(blk : ExprBlock?; variable : VariablePtr; init : ExpressionPtr) {
         write(*ss, "\n#if 0\n");
@@ -1694,17 +1739,14 @@ class public CppAot : AstVisitor {
     }
 // let
     def override preVisitExprLetVariable(let_ : ExprLet?; var variable : VariablePtr; last : bool) {
-        let vname = collector.getVarName(variable);
-        if (variable.init != null && variable.init is ExprMakeBlock) {
-            var mkb = variable.init as ExprMakeBlock;
-            var blk = mkb._block as ExprBlock;
-            blk.blockFlags.aotSkipMakeBlock = true;
-            write(*ss, "auto {vname}_TempFunctor = ");
-            visit_expression(variable.init, adapter);
-            write(*ss, ";\n{tabs()}");
-            blk.blockFlags.aotSkipMakeBlock = false;
-            mkb.aotFunctorName := vname + "_TempFunctor";
+        if (isBlockLet(variable)) {
+            if (!collector.isMoved(variable)) {
+                emitBlockLet(variable);
+                write(*ss, tabs());
+            }
+            return
         }
+        let vname = collector.getVarName(variable);
         if (!collector.isMoved(variable)) {
             describeVarLocalCppType(ss, variable._type, cross_platform);
             write(*ss, " ");
@@ -1727,7 +1769,7 @@ class public CppAot : AstVisitor {
     }
     def override visitExprLetVariable(let_ : ExprLet?; variable : VariablePtr; last : bool) {
         if (!last) write(*ss, "; ");
-        if (!collector.isMoved(variable)) {
+        if (!collector.isMoved(variable) && !isBlockLet(variable)) {
             if (variable._type.flags.constant && variable._type.isRefType && !variable._type.flags.ref) {
                 let vname = collector.getVarName(variable);
                 write(*ss, ";\n{tabs()}");
@@ -1739,10 +1781,12 @@ class public CppAot : AstVisitor {
             var mkb = variable.init as ExprMakeBlock;
             // Restore ast as it was before, just for consistency.
             mkb.aotFunctorName := ""
+            (mkb._block as ExprBlock).blockFlags.aotSkipMakeBlock = false;
         }
         return variable;
     }
     def override preVisitExprLetVariableInit(let_ : ExprLet?; variable : VariablePtr; expr : ExpressionPtr) {
+        return if (isBlockLet(variable))   // fully emitted via emitBlockLet; renders as `name;`
         if (variable.flags.init_via_move && variable.init is ExprMakeBlock) {
             write(*ss, " = ");
         } elif (variable.flags.init_via_move) {
@@ -1789,6 +1833,7 @@ class public CppAot : AstVisitor {
         }
     }
     def override visitExprLetVariableInit(let_ : ExprLet?; variable : VariablePtr; expr : ExpressionPtr) {
+        return expr if (isBlockLet(variable))
         if (expr._type.isString) {
             write(*ss, ")");
         }
