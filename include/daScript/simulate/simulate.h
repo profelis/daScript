@@ -837,9 +837,12 @@ namespace das
         bool                            verySafeContext = false;    // when true, array and table reserves don't free memory
         bool                            sharedPtrContext = false;   // there is a shared ptr to this context
         bool                            skipInitShutdownScript = false; // this (cloned) context skipped global init, so skip shutdown too
-        bool                            keepForkContexts = false;   // pool job-fork contexts on this context instead of clone/destroy per job
-        bool                            forkSkipInitScript = false; // when pooling, clone job-forks with CopyOptions::skipInitScript (pure-data jobs)
-        bool                            forkSkipHeapReset = false;  // when pooling, skip restartHeaps() on reuse (pure-compute jobs whose only fork-heap alloc, the lambda capture, is freed LIFO per job — see acquireForkContext)
+        // atomic (relaxed): a job's post-notify cleanup reads these on a worker while the main
+        // thread may already be toggling them for the next batch — either value is coherent at
+        // the boundary (the fork either pools or deletes), it just must not be a data race
+        atomic<bool>                    keepForkContexts{false};    // pool job-fork contexts on this context instead of clone/destroy per job
+        atomic<bool>                    forkSkipInitScript{false};  // when pooling, clone job-forks with CopyOptions::skipInitScript (pure-data jobs)
+        atomic<bool>                    forkSkipHeapReset{false};   // when pooling, skip restartHeaps() on reuse (pure-compute jobs whose only fork-heap alloc, the lambda capture, is freed LIFO per job — see acquireForkContext)
     public:
         // Job-fork context pooling (opt-in via keepForkContexts). Forks are reused across new_job
         // dispatches instead of cloned/destroyed each time; acquire runs on the dispatching thread,

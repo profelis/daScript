@@ -614,15 +614,15 @@ namespace das {
         // Pool the per-job fork contexts on this (dispatching) context instead of cloning/destroying
         // one per new_job, and optionally clone them skip-init. Only safe when the dispatched jobs are
         // pure data processing (no globals, no Features referencing the fork) — e.g. parallel_for matmul.
-        context->keepForkContexts = keep;
-        context->forkSkipInitScript = skipInit;
+        context->keepForkContexts.store(keep, std::memory_order_relaxed);
+        context->forkSkipInitScript.store(skipInit, std::memory_order_relaxed);
     }
 
     void set_jobque_fork_skip_heap_reset ( bool skip, Context * context, LineInfoArg * ) {
         // Skip restartHeaps() when reusing a pooled fork (see Context::acquireForkContext). Only safe
         // when the dispatched jobs are pure compute that never leaks onto the fork heap — e.g.
         // parallel_for matmul, whose only fork-heap alloc (the lambda capture) is freed LIFO per job.
-        context->forkSkipHeapReset = skip;
+        context->forkSkipHeapReset.store(skip, std::memory_order_relaxed);
     }
 
     void set_jobque_worker_spin ( int32_t usec, Context * context, LineInfoArg * at ) {
@@ -683,7 +683,7 @@ namespace das {
 
     void new_job_invoke ( Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
         if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
-        if ( context->keepForkContexts ) {
+        if ( context->keepForkContexts.load(std::memory_order_relaxed) ) {
             // pooled path: borrow a reusable fork, return it to the pool when the job finishes
             Context * forkContext = context->acquireForkContext(uint32_t(ContextCategory::job_clone));
             auto ptr = forkContext->allocate(lambdaSize + 16, lineinfo);
@@ -760,7 +760,7 @@ namespace das {
         vector<Context *> forkCtx(nW);
         vector<char *> clonePtr(nW);
         vector<shared_ptr<Context>> ownedCtx;   // non-pooled path: keep clones alive till the join
-        bool pooled = context->keepForkContexts;
+        bool pooled = context->keepForkContexts.load(std::memory_order_relaxed);
         if ( !pooled ) ownedCtx.resize(nW);
         for ( int w = 0; w != nW; ++w ) {
             Context * fc;
