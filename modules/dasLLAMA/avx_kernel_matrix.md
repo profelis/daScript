@@ -6,17 +6,15 @@ architecture and the shipped-backend story; its backend table includes the matri
 
 **What this is.** VNNI / AVX-512 twins of the shipped x64 kernels — one backend per
 (ISA tier × kernel shape) cell — so a bare-metal box that HAS the tiers can A/B every cell
-in-process against its shipped donor. The dev box (3990X, znver2) has none of the tiers:
-everything here is **correctness-validated but performance-unmeasured**. The plan is to rent
-hardware, measure, then promote winners / delete losers. Until then the matrix is invisible:
-registration requires `DASLLAMA_AVX_MATRIX=1`, and even enabled, every matrix priority sits
-below every shipped backend — pin-only by construction.
+in-process against its shipped donor. Correctness was proven on real VNNI/AVX-512 silicon
+(EPYC 9654, 2026-07-03: probe + gpt-oss token-for-token across 4 backends), so registration
+is now unconditional per-tier (`cpu_supports` gated, no master switch); every matrix priority
+still sits below every shipped backend — pin-only until the ISA ladder promotes a tier.
 
 ## Switches
 
 | Switch | Effect |
 |---|---|
-| `DASLLAMA_AVX_MATRIX=1` | Master enable — matrix backends register (still per-tier `cpu_supports` gated) |
 | `DASLLAMA_AVX_MATRIX_FORCE=1` | Register tiers the box LACKS. Safe everywhere: kernels run the delegating fallbacks (correct, ymm-speed on an AVX2 box). Probe/validation only |
 | `DAS_JIT_X64_FORCE_FEATURES=avxvnni,avx512f,avx512bw,avx512vl,avx512vnni` | JIT-side: flips the emitter gates AND appends `+feature` to the TargetMachine — **emission-only** (compile + disasm the DLL; executing forced sequences on a box without them is an illegal instruction). Folded into the DLL cache key, so forced artifacts never cache-hit normal runs. DLL path only (in-memory MCJIT mode is not covered) |
 | `DASLLAMA_PIN_BACKEND=<name>` | The measurement instrument (existing) — pin BEFORE `load_gguf` for repack backends |
@@ -83,8 +81,8 @@ source so a pin-A/B isolates the dot alone).
 
 ## Validation status (3990X, 2026-07-03 — all green)
 
-- `harness/avx_matrix_probe.das`, plain AND `-jit`, with `DASLLAMA_AVX_MATRIX=1` +
-  `DASLLAMA_AVX_MATRIX_FORCE=1`:
+- `harness/avx_matrix_probe.das`, plain AND `-jit`, with `DASLLAMA_AVX_MATRIX_FORCE=1`
+  (registration itself is unconditional since the EPYC validation):
   - intrinsic identity gates exact over 64 blocks incl. extremes (w rolls all 256 bytes incl.
     −128; x block 0 pinned ±127);
   - every VNNI backend **bit-exact vs its donor** across all facades — mm, batch, groupn
@@ -113,7 +111,7 @@ Hardware want-list: `avxvnni` (Alder Lake / Sapphire Rapids+) **or** `avx512vnni
 (Ice Lake SP+ — the vnni256 gate reaches it via the vl arm), plus `avx512f/bw` for the z16
 tiers. Verify first: `cpu_supports` probe (all five names + `avx2`/`fma`).
 
-1. **Correctness first, real hardware paths:** `DASLLAMA_AVX_MATRIX=1` (NO force) →
+1. **Correctness first, real hardware paths:** (NO force) →
    `daslang modules/dasLLAMA/harness/avx_matrix_probe.das` plain AND `-jit`. Also run
    `harness/mx4x64_probe.das -jit` (shipped tiers must still hold on the new silicon).
 2. **Per-cell measurement, pin-A/B vs donor** (interleaved best-of; A-B-A brackets for any

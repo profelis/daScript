@@ -1032,17 +1032,16 @@ def private mx4q8_batch_groupn_kernel_x64_grp4(var yp : float?; wn : uint8 const
     }
 }
 
-// ===== AVX KERNEL MATRIX (experimental, default OFF) =====
+// ===== AVX KERNEL MATRIX =====
 // VNNI / AVX-512 twins of the shipped kernels, one backend per (ISA tier x kernel shape) cell so a
-// bare-metal box that has the tiers can A/B them in-process via DASLLAMA_PIN_BACKEND (this 3990X
-// has none — the matrix exists to be measured on rented hardware, then promoted or deleted).
-// Registration is gated g_avx_matrix_enabled && cpu_supports(...); priorities all sit BELOW the
-// shipped backends, so even with the flag on nothing auto-selects — pin-only by construction.
+// box that has the tiers can A/B them in-process via DASLLAMA_PIN_BACKEND (verified bit-exact on
+// EPYC 9654 VNNI/AVX-512 silicon — probe + gpt-oss token-for-token, 4 backends).
+// Registration is gated on cpu_supports(...) per tier; priorities all sit BELOW the shipped
+// backends, so nothing auto-selects — pin-only until the ISA ladder promotes a tier.
 // Every dot delegates to a proven intrinsic when its tier is absent (see x64_avx.das), so a
-// force-registered backend on this box runs the ymm sign-trick path and stays CORRECT — that is
-// what the exactness probes exercise here.
+// force-registered backend on a tier-less box runs the ymm sign-trick path and stays CORRECT —
+// that is what the exactness probes exercise there.
 
-var public g_avx_matrix_enabled = false   // DASLLAMA_AVX_MATRIX=1 — master switch, default OFF
 var public g_avx_matrix_force = false     // DASLLAMA_AVX_MATRIX_FORCE=1 — register tiers the box lacks (fallback-correct; probe/validation only)
 
 def private matrix_has(feature : string) : bool {
@@ -2129,7 +2128,6 @@ def private mx4q8_batch_groupn_kernel_x64_z16vnni(var yp : float?; wn : uint8 co
 
 [init]
 def dasllama_math_x64_avx_register() {
-    g_avx_matrix_enabled = get_env_variable("DASLLAMA_AVX_MATRIX") == "1"
     g_avx_matrix_force = get_env_variable("DASLLAMA_AVX_MATRIX_FORCE") == "1"
     // Only register under JIT on x86-64 WITH AVX2. Off-JIT (interpreter or AOT) dot32 runs its SCALAR
     // fallback body — slower than the portable dot_q8q8, which the vectorizer handles — so the
@@ -2183,58 +2181,56 @@ def dasllama_math_x64_avx_register() {
             mm_mx4 = @@mx4q8_kernel_x64, mx4_batch = @@mx4q8_batch_kernel_x64_grp4,
             mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_grp4, mx4_native_batch = true,
             groupn = @@q8q8_groupn_kernel_x64_grp4, groupn_mx4 = @@mx4q8_groupn_kernel_x64))
-        // ===== AVX kernel matrix (see the section comment) — default OFF, pin-only priorities =====
-        // The 3990X has none of these tiers; a slot without a per-tier twin points at the shipped
-        // kernel it shares (mirrors x64-avx2-acc8 reusing the row-major mx4 natives), so a pin-A/B
-        // against the donor backend isolates exactly the slots that differ.
-        if (g_avx_matrix_enabled) {
-            let has_vnni256 = matrix_has("avxvnni") || (matrix_has("avx512vnni") && matrix_has("avx512vl"))
-            let has_zbw = matrix_has("avx512f") && matrix_has("avx512bw")
-            let has_zvnni = has_zbw && matrix_has("avx512vnni")
-            if (has_vnni256) {
-                // x64-vnni256: dot4x4 family with the VPDPBUSD dot — A/B donor is x64-avx2
-                register_kernel_backend(KernelBackend(name = "x64-vnni256", mm = @@q8q8_kernel_x64_vnni,
-                    batch = @@q8q8_batch_kernel_x64_vnni, group3 = @@q8q8_group3_kernel_x64_vnni,
-                    repack = @@repack_q8q8_identity, needs_repack = false, priority = 7,
-                    mm_mx4 = @@mx4q8_kernel_x64_vnni, mx4_batch = @@mx4q8_batch_kernel_x64_vnni,
-                    mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_vnni, mx4_native_batch = true,
-                    groupn = @@q8q8_groupn_kernel_x64_vnni, groupn_mx4 = @@mx4q8_groupn_kernel_x64_vnni))
-                // x64-vnni256-acc8: acc8 family with the VPDPBUSD dot — A/B donor is x64-avx2-acc8
-                register_kernel_backend(KernelBackend(name = "x64-vnni256-acc8", mm = @@q8q8_kernel_x64_acc8vnni,
-                    batch = @@q8q8_batch_kernel_x64_acc8vnni, group3 = @@q8q8_group3_kernel_x64_acc8vnni,
-                    repack = @@repack_q8q8_identity, needs_repack = false, priority = 6,
-                    mm_mx4 = @@mx4q8_kernel_x64_vnni, mx4_batch = @@mx4q8_batch_kernel_x64_vnni,
-                    mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_vnni, mx4_native_batch = true,
-                    groupn = @@q8q8_groupn_kernel_x64_vnni, groupn_mx4 = @@mx4q8_groupn_kernel_x64_vnni))
-                // x64-vnni256-repack: grp4 family with the VPDPBUSD dot — A/B donor is
-                // x64-avx2-repack (same interleave, same repack fn; pin BEFORE load_gguf)
-                register_kernel_backend(KernelBackend(name = "x64-vnni256-repack", mm = @@q8q8_kernel_x64_grp4vnni,
-                    batch = @@q8q8_batch_kernel_x64_grp4vnni, group3 = @@q8q8_group3_kernel_x64_grp4vnni,
-                    repack = @@repack_q8q8_x64, needs_repack = true, priority = 5,
-                    mm_mx4 = @@mx4q8_kernel_x64_vnni, mx4_batch = @@mx4q8_batch_kernel_x64_grp4vnni,
-                    mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_grp4vnni, mx4_native_batch = true,
-                    groupn = @@q8q8_groupn_kernel_x64_grp4vnni, groupn_mx4 = @@mx4q8_groupn_kernel_x64_vnni))
-            }
-            if (has_zbw) {
-                // x64-avx512bw: z16 family, VPMADDUBSW+VPMADDWD zmm chain — mx4 slots shared with
-                // x64-avx2 (no zmm mx4 twin; the mx4 delta is the vnni/z16vnni backends' to show)
-                register_kernel_backend(KernelBackend(name = "x64-avx512bw", mm = @@q8q8_kernel_x64_z16,
-                    batch = @@q8q8_batch_kernel_x64_z16, group3 = @@q8q8_group3_kernel_x64_z16,
-                    repack = @@repack_q8q8_identity, needs_repack = false, priority = 4,
-                    mm_mx4 = @@mx4q8_kernel_x64, mx4_batch = @@mx4q8_batch_kernel_x64,
-                    mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64, mx4_native_batch = true,
-                    groupn = @@q8q8_groupn_kernel_x64_z16, groupn_mx4 = @@mx4q8_groupn_kernel_x64))
-            }
-            if (has_zvnni) {
-                // x64-avx512vnni: z16 family with the zmm VPDPBUSD dot + mx4 strips through
-                // mx4_dequant64 — A/B donors are x64-avx512bw (dot step) and x64-vnni256 (mx4)
-                register_kernel_backend(KernelBackend(name = "x64-avx512vnni", mm = @@q8q8_kernel_x64_z16vnni,
-                    batch = @@q8q8_batch_kernel_x64_z16vnni, group3 = @@q8q8_group3_kernel_x64_z16vnni,
-                    repack = @@repack_q8q8_identity, needs_repack = false, priority = 3,
-                    mm_mx4 = @@mx4q8_kernel_x64_vnni, mx4_batch = @@mx4q8_batch_kernel_x64_z16vnni,
-                    mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_z16vnni, mx4_native_batch = true,
-                    groupn = @@q8q8_groupn_kernel_x64_z16vnni, groupn_mx4 = @@mx4q8_groupn_kernel_x64_vnni))
-            }
+        // ===== AVX kernel matrix (see the section comment) — pin-only priorities =====
+        // A slot without a per-tier twin points at the shipped kernel it shares (mirrors
+        // x64-avx2-acc8 reusing the row-major mx4 natives), so a pin-A/B against the donor
+        // backend isolates exactly the slots that differ.
+        let has_vnni256 = matrix_has("avxvnni") || (matrix_has("avx512vnni") && matrix_has("avx512vl"))
+        let has_zbw = matrix_has("avx512f") && matrix_has("avx512bw")
+        let has_zvnni = has_zbw && matrix_has("avx512vnni")
+        if (has_vnni256) {
+            // x64-vnni256: dot4x4 family with the VPDPBUSD dot — A/B donor is x64-avx2
+            register_kernel_backend(KernelBackend(name = "x64-vnni256", mm = @@q8q8_kernel_x64_vnni,
+                batch = @@q8q8_batch_kernel_x64_vnni, group3 = @@q8q8_group3_kernel_x64_vnni,
+                repack = @@repack_q8q8_identity, needs_repack = false, priority = 7,
+                mm_mx4 = @@mx4q8_kernel_x64_vnni, mx4_batch = @@mx4q8_batch_kernel_x64_vnni,
+                mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_vnni, mx4_native_batch = true,
+                groupn = @@q8q8_groupn_kernel_x64_vnni, groupn_mx4 = @@mx4q8_groupn_kernel_x64_vnni))
+            // x64-vnni256-acc8: acc8 family with the VPDPBUSD dot — A/B donor is x64-avx2-acc8
+            register_kernel_backend(KernelBackend(name = "x64-vnni256-acc8", mm = @@q8q8_kernel_x64_acc8vnni,
+                batch = @@q8q8_batch_kernel_x64_acc8vnni, group3 = @@q8q8_group3_kernel_x64_acc8vnni,
+                repack = @@repack_q8q8_identity, needs_repack = false, priority = 6,
+                mm_mx4 = @@mx4q8_kernel_x64_vnni, mx4_batch = @@mx4q8_batch_kernel_x64_vnni,
+                mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_vnni, mx4_native_batch = true,
+                groupn = @@q8q8_groupn_kernel_x64_vnni, groupn_mx4 = @@mx4q8_groupn_kernel_x64_vnni))
+            // x64-vnni256-repack: grp4 family with the VPDPBUSD dot — A/B donor is
+            // x64-avx2-repack (same interleave, same repack fn; pin BEFORE load_gguf)
+            register_kernel_backend(KernelBackend(name = "x64-vnni256-repack", mm = @@q8q8_kernel_x64_grp4vnni,
+                batch = @@q8q8_batch_kernel_x64_grp4vnni, group3 = @@q8q8_group3_kernel_x64_grp4vnni,
+                repack = @@repack_q8q8_x64, needs_repack = true, priority = 5,
+                mm_mx4 = @@mx4q8_kernel_x64_vnni, mx4_batch = @@mx4q8_batch_kernel_x64_grp4vnni,
+                mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_grp4vnni, mx4_native_batch = true,
+                groupn = @@q8q8_groupn_kernel_x64_grp4vnni, groupn_mx4 = @@mx4q8_groupn_kernel_x64_vnni))
+        }
+        if (has_zbw) {
+            // x64-avx512bw: z16 family, VPMADDUBSW+VPMADDWD zmm chain — mx4 slots shared with
+            // x64-avx2 (no zmm mx4 twin; the mx4 delta is the vnni/z16vnni backends' to show)
+            register_kernel_backend(KernelBackend(name = "x64-avx512bw", mm = @@q8q8_kernel_x64_z16,
+                batch = @@q8q8_batch_kernel_x64_z16, group3 = @@q8q8_group3_kernel_x64_z16,
+                repack = @@repack_q8q8_identity, needs_repack = false, priority = 4,
+                mm_mx4 = @@mx4q8_kernel_x64, mx4_batch = @@mx4q8_batch_kernel_x64,
+                mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64, mx4_native_batch = true,
+                groupn = @@q8q8_groupn_kernel_x64_z16, groupn_mx4 = @@mx4q8_groupn_kernel_x64))
+        }
+        if (has_zvnni) {
+            // x64-avx512vnni: z16 family with the zmm VPDPBUSD dot + mx4 strips through
+            // mx4_dequant64 — A/B donors are x64-avx512bw (dot step) and x64-vnni256 (mx4)
+            register_kernel_backend(KernelBackend(name = "x64-avx512vnni", mm = @@q8q8_kernel_x64_z16vnni,
+                batch = @@q8q8_batch_kernel_x64_z16vnni, group3 = @@q8q8_group3_kernel_x64_z16vnni,
+                repack = @@repack_q8q8_identity, needs_repack = false, priority = 3,
+                mm_mx4 = @@mx4q8_kernel_x64_vnni, mx4_batch = @@mx4q8_batch_kernel_x64_z16vnni,
+                mx4_batch_groupn = @@mx4q8_batch_groupn_kernel_x64_z16vnni, mx4_native_batch = true,
+                groupn = @@q8q8_groupn_kernel_x64_z16vnni, groupn_mx4 = @@mx4q8_groupn_kernel_x64_vnni))
         }
     }
 }

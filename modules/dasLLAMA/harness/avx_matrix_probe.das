@@ -14,10 +14,10 @@ options persistent_heap
 //   - x64-avx512vnni vs x64-avx512bw -> BIT-EXACT (same z16 shape, same identity)
 //   - x64-avx512bw vs portable -> rel tolerance 1e-5 (the z16 float[16] partitioning, the
 //     acc8/ps gate class)
-// Backends register only under DASLLAMA_AVX_MATRIX=1 && cpu_supports(tier); on a box without the
-// tiers add DASLLAMA_AVX_MATRIX_FORCE=1 — forced backends run the delegating fallbacks, which is
+// Backends register under cpu_supports(tier); on a box without the tiers add
+// DASLLAMA_AVX_MATRIX_FORCE=1 — forced backends run the delegating fallbacks, which is
 // exactly what the plumbing gates need. Without registration the backend section SKIPs.
-// Run: DASLLAMA_AVX_MATRIX=1 DASLLAMA_AVX_MATRIX_FORCE=1 daslang [-jit] modules/dasLLAMA/harness/avx_matrix_probe.das
+// Run: DASLLAMA_AVX_MATRIX_FORCE=1 daslang [-jit] modules/dasLLAMA/harness/avx_matrix_probe.das
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default
@@ -246,7 +246,7 @@ def check_backend(name, donor : string; exact, repacked, mx4_batch_exact : bool;
     let nb = n / 32l
     select_kernel_backend(name)
     if (active_kernel_backend() != name) {
-        print("backend {name}: SKIP (not registered — need DASLLAMA_AVX_MATRIX=1 [+ _FORCE=1] and -jit)\n")
+        print("backend {name}: SKIP (not registered — need the cpu tier or DASLLAMA_AVX_MATRIX_FORCE=1, and -jit)\n")
         return
     }
     let rows = pd.nregions * d
@@ -372,7 +372,7 @@ def check_backends(n, d, ntok, nregions : int64) {
 
 [export]
 def main {
-    print("avx matrix: enabled={g_avx_matrix_enabled} force={g_avx_matrix_force} cpu: avxvnni={cpu_supports("avxvnni")} avx512bw={cpu_supports("avx512bw")} avx512vnni={cpu_supports("avx512vnni")}\n")
+    print("avx matrix: force={g_avx_matrix_force} cpu: avxvnni={cpu_supports("avxvnni")} avx512bw={cpu_supports("avx512bw")} avx512vnni={cpu_supports("avx512vnni")}\n")
     print("backends: {kernel_backend_names()}\n")
     if (!jit_enabled()) {
         print("NOTE: no -jit — probing the FALLBACK bodies (valid; run again with -jit)\n")
