@@ -149,11 +149,15 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     return tok
 }
 
-def private run_profile(var t : Model; p, n, p2 : int64) {
+def private run_profile(var t : Model; p, n, p2 : int64; team : bool) {
     let c = t.config
     var s <- make_run_state(c)
     with_job_que() {
         setup_dasllama_jobque_()   // pooled forks + batched dispatch + spin window + join poll (the engine standard)
+        if (team) {   // needs the live job que — must sit inside with_job_que
+            set_jobque_team_mode(true)
+            print("team dispatch: on\n")
+        }
         // warmup — JIT both paths (the real prefill below overwrites these cache positions)
         let warm <- build_prompt(8l)
         for (wp in range64(8l)) {
@@ -206,13 +210,9 @@ def main() {
         set_decode_attn_par_threshold(int64(cfg.attn_par))
         print("decode_attn_par_threshold override: {cfg.attn_par}\n")
     }
-    if (cfg.team) {
-        set_jobque_team_mode(true)
-        print("team dispatch: on\n")
-    }
     if (cfg.chunks >= 1) {
         set_q8_batch_chunks_per_job(cfg.chunks)
         print("q8_batch_chunks_per_job override: {cfg.chunks}\n")
     }
-    run_profile(t, p, n, p2)
+    run_profile(t, p, n, p2, cfg.team)
 }
