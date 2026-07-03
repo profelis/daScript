@@ -204,10 +204,12 @@ var g_matmul_min_chunk_rows_gemv = 64
 def public set_matmul_min_chunk_rows_gemv(v : int) { g_matmul_min_chunk_rows_gemv = max(v, 0) }
 def public get_matmul_min_chunk_rows_gemv() : int { return g_matmul_min_chunk_rows_gemv }
 
-//! matmul_chunks for the GEMV-shaped dispatches (single-token mm / group3 / groupn): the same
-//! clamp with the coarser GEMV grain. `rows` is the TOTAL row count of the split range.
+//! matmul_chunks for the GEMV-shaped dispatches (single-token mm / group3 / groupn): the coarser
+//! GEMV grain, capped at ONE chunk per lane (ggml's mul_mat decode fallback — equal split, no
+//! oversplit). A decode chunk is one bandwidth stream; oversplit only quantizes the tail (EPYC
+//! T=24 anatomy: last lane's +1 chunk = 37% of op wall). `rows` is the TOTAL split row count.
 def public matmul_chunks_gemv(rows, want : int) : int {
-    return g_matmul_min_chunk_rows_gemv <= 0 ? want : clamp(rows / g_matmul_min_chunk_rows_gemv, 1, want)
+    return g_matmul_min_chunk_rows_gemv <= 0 ? want : clamp(rows / g_matmul_min_chunk_rows_gemv, 1, min(want, get_dispatch_lanes()))
 }
 
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.

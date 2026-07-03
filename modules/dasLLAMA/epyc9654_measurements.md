@@ -408,6 +408,36 @@ sweep for unserved chunks), (B) sharded claim counters, (C) neither — measure 
 anatomy (publish→first-claim, →last-claim, →join-done, caller-vs-worker claim share) with rdtsc
 instrumentation in teamParallelFor at T=24 vs 96 before any further surgery.
 
+### Team dispatch anatomy (rdtsc instrument, `DAS_TEAM_PROF=1`) — the tax theory FALSIFIED
+`teamParallelFor` phase averages, Llama-1B decode (4485 ops ≈ 70/token):
+| avg per op | T=96 g128 | T=24 g64 |
+|---|--:|--:|
+| publish (stores + seq + wake check) | 789 ns | 359 ns |
+| first worker claim after publish | **+206 ns** | +295 ns |
+| last worker claim starts | +9.2 µs | +3.3 µs |
+| caller-serve (its ~1 chunk of ~40) | 107 µs | 68 µs |
+| join-tail after caller done | 24.5 µs | **41.1 µs (37% of op)** |
+| total | 133 µs | 110 µs |
+**The rendezvous is ALREADY barrier-cheap** — sub-µs publish, 200 ns worker reaction, 0% solo
+ops. The "~86 µs/dispatch tax" was a confound: per-chunk COMPUTE inflates with active-lane count
+(same-shape chunk 68→107 µs from T24→T96 — bandwidth/frequency contention), not sync. Protocol
+surgery (static partition, sharded counters) is pointless — closed.
+
+**Equal-split GEMV cap (ggml fallback shape, `min(want, lanes)` in matmul_chunks_gemv): NEUTRAL,
+kept.** T24 92.2-96.0 (was 94.3-94.9), T96 g64 51.3 (was 49-52). Join-tail 41→31 µs, but larger
+per-chunk time absorbed it. Kept for ggml parity + smaller tail + no-oversplit simplicity.
+
+### The remaining decode gap, decomposed (the campaign's new frame)
+- Defaults (96 lanes): per-chunk inflation — more active lanes = slower every stream. Coarse
+  grain (128) mitigates; structural fix unknown (lcpp plateaus by equal-splitting tiny slices
+  across all 96 — their per-thread streams shrink but wall holds).
+- **Knee (T=24): pure memory-path efficiency.** Per decoded token both engines stream the same
+  1.2 GB of weights; we do it at ~113 GB/s (10.6 ms/tok), llama-bench at ~164 GB/s (7.3 ms/tok),
+  both against the same ~180 GB/s 24-core-DRAM ceiling. Sync µs, chunking exhausted → the 1.45×
+  is kernel/memory-path (prefetch, requant overhead, repack layout, NT loads). This is
+  `tune_kernels` + ISA-ladder territory — the original mission, now with the target metric:
+  **GB/s per decoded token at T=24**.
+
 ## Open items / next
 - [x] ggml min-chunk-size comparison (teammate) → pick MIN_ROWS_PER_CHUNK / work metric.
 - [x] Implement + measure the min-chunk-size clamp (batch grain day-1; GEMV grain session 2).

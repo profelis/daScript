@@ -182,6 +182,15 @@ namespace das {
         // (worker: parked++ then read seq; publisher: bump seq then read parked — all four seq_cst),
         // so either the worker sees the new op before sleeping or the publisher sees it parked.
         atomic<int32_t>  mParkedWorkers{0};
+        // team dispatch anatomy profiler (env DAS_TEAM_PROF=1): per-op phase aggregates, dumped
+        // at queue destruction. Caller-side counters except the two claim-timestamp slots;
+        // worker stores happen only under the flag (they perturb the op being measured).
+        bool mTeamProf = false;
+        atomic<uint64_t> mTeamFirstClaimT{0};   // current op: first worker claim ts (0 = none yet)
+        atomic<uint64_t> mTeamLastClaimT{0};    // current op: last worker claim ts
+        uint64_t mTPn = 0, mTPchunks = 0, mTPcallerChunks = 0, mTPsolo = 0;
+        uint64_t mTPpub = 0, mTPserve = 0, mTPtail = 0, mTPtotal = 0;
+        uint64_t mTPreact = 0, mTPreactN = 0, mTPlastRel = 0, mTPlastN = 0;
     protected:
         mutex mEvalMainThreadMutex;
         vector<Job> mEvalMainThread;

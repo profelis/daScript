@@ -1,6 +1,7 @@
 #include "daScript/misc/platform.h"
 
 #include "daScript/misc/job_que.h"
+#include "daScript/misc/performance_time.h"
 #include "daScript/simulate/debug_info.h"
 #include "daScript/simulate/aot_builtin_jobque.h"
 #include "daScript/misc/string_writer.h"
@@ -157,6 +158,7 @@ namespace das {
         , mThreadCount( 0 )
         , mJobsRunning(0) {
         mThreadCount = get_num_threads();
+        mTeamProf = getenv("DAS_TEAM_PROF") != nullptr;
         SetCurrentThreadPriority(JobPriority::High);
         for (int j = 0, js = mThreadCount; j < js; j++) {
             mThreads.emplace_back(make_unique<thread>([this, j]() {
@@ -169,6 +171,17 @@ namespace das {
 
     JobQue::~JobQue () {
         join();
+        if ( mTeamProf && mTPn ) {
+            auto avg = [&](uint64_t sum, uint64_t n) -> unsigned long long { return n ? (unsigned long long)(sum / n) : 0ull; };
+            fprintf(stderr, "[team-prof] ops=%llu avg-chunks=%llu caller-chunk-share=%llu%% solo-ops(no worker claimed)=%llu%%\n",
+                (unsigned long long)mTPn, avg(mTPchunks, mTPn),
+                mTPchunks ? (unsigned long long)(mTPcallerChunks * 100 / mTPchunks) : 0ull,
+                (unsigned long long)(mTPsolo * 100 / mTPn));
+            fprintf(stderr, "[team-prof] avg ns/op: publish=%llu caller-serve=%llu join-tail=%llu total=%llu\n",
+                avg(mTPpub, mTPn), avg(mTPserve, mTPn), avg(mTPtail, mTPn), avg(mTPtotal, mTPn));
+            fprintf(stderr, "[team-prof] worker claims, ns after publish: first=+%llu (on %llu%% of ops) last=+%llu\n",
+                avg(mTPreact, mTPreactN), (unsigned long long)(mTPreactN * 100 / mTPn), avg(mTPlastRel, mTPlastN));
+        }
     }
 
     void JobQue::EvalOnMainThread(Job && expr) {
@@ -419,6 +432,12 @@ namespace das {
             uint64_t claim = mTeamOp.fetch_add(1, std::memory_order_acq_rel);
             uint32_t c = uint32_t(claim);
             if ( c >= uint32_t(claim >> 32) ) break;
+            if ( mTeamProf ) {   // anatomy profiler: stamp this op's first/last worker claim
+                uint64_t t = uint64_t(ref_time_ticks());
+                uint64_t z = 0;
+                mTeamFirstClaimT.compare_exchange_strong(z, t, std::memory_order_relaxed);
+                mTeamLastClaimT.store(t, std::memory_order_relaxed);
+            }
             (*mTeamWork)(int(c), threadIndex);
             mTeamRemaining.fetch_sub(1, std::memory_order_release);
             ran = true;
@@ -431,6 +450,13 @@ namespace das {
         if ( numChunks <= 1 || nW == 0 || !getTeamMode() ) {
             for ( int c = 0; c != numChunks; ++c ) work(c, nW);
             return;
+        }
+        uint64_t t0 = 0, tp = 0, tc = 0;
+        int callerChunks = 0;
+        if ( mTeamProf ) {
+            t0 = uint64_t(ref_time_ticks());
+            mTeamFirstClaimT.store(0, std::memory_order_relaxed);
+            mTeamLastClaimT.store(0, std::memory_order_relaxed);
         }
         mTeamWork = &work;
         mTeamRemaining.store(numChunks, std::memory_order_relaxed);
@@ -447,17 +473,29 @@ namespace das {
             lock_guard<mutex> lock(mFifoMutex);
             mCond.notify_all();
         }
+        if ( mTeamProf ) tp = uint64_t(ref_time_ticks());
         for (;;) {
             uint64_t claim = mTeamOp.fetch_add(1, std::memory_order_acq_rel);
             uint32_t c = uint32_t(claim);
             if ( c >= uint32_t(claim >> 32) ) break;
             work(int(c), nW);
             mTeamRemaining.fetch_sub(1, std::memory_order_release);
+            ++callerChunks;
         }
+        if ( mTeamProf ) tc = uint64_t(ref_time_ticks());
         // join: acquire pairs with the workers' release decrements, so their chunk writes are
         // visible here. Unbounded spin — the tail is at most one chunk per worker.
         while ( mTeamRemaining.load(std::memory_order_acquire) != 0 ) jobque_spin_relax();
         mTeamWork = nullptr;
+        if ( mTeamProf ) {
+            uint64_t tj = uint64_t(ref_time_ticks());
+            mTPn++; mTPchunks += uint64_t(numChunks); mTPcallerChunks += uint64_t(callerChunks);
+            mTPpub += tp - t0; mTPserve += tc - tp; mTPtail += tj - tc; mTPtotal += tj - t0;
+            uint64_t fc = mTeamFirstClaimT.load(std::memory_order_relaxed);
+            if ( fc ) { mTPreact += fc > tp ? fc - tp : 0; mTPreactN++; } else { mTPsolo++; }
+            uint64_t lc = mTeamLastClaimT.load(std::memory_order_relaxed);
+            if ( lc ) { mTPlastRel += lc > tp ? lc - tp : 0; mTPlastN++; }
+        }
     }
 
     void JobQue::parallel_for ( JobStatus & status, int from, int to, const JobChunk & chunk,
