@@ -1,0 +1,1 @@
+Enables or disables team dispatch mode on the current job queue (sticky, opt-in). In team mode, workers self-serve chunks off a single published atomic instead of taking one fifo job per chunk, which makes team_parallel_for cost one atomic bump per dispatch. Must be called inside a with_job_que block. Pairs with set_jobque_worker_spin for the hybrid poll/park window.
