@@ -103,8 +103,9 @@ def private q8q8_group3_kernel_neon_sdot4x4(var y0p : float?; var y1p : float?; 
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
-    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
-    parallel_for(0, int(dtot), get_total_hw_jobs()) $(rb, re, wg) {
+    // oversplit only under team dispatch: ×4 chunks cost the fifo path ~20% on this small mm
+    // (measured 1B mm_qkv 86.6k → 108k us) but win ~19% when workers self-serve them
+    maybe_parallel_for(n * dtot >= g_matmul_par_threshold, 0, int(dtot), get_total_hw_jobs() * (get_jobque_team_mode() ? get_q8_batch_chunks_per_job() : 1)) $(rb, re) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -119,7 +120,6 @@ def private q8q8_group3_kernel_neon_sdot4x4(var y0p : float?; var y1p : float?; 
                 }
             }
         }
-        wg |> notify_and_release
     }
 }
 
@@ -656,8 +656,8 @@ def private q8q8_group3_kernel_neon_laneq(var y0p : float?; var y1p : float?; va
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
-    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
-    parallel_for(0, int(ngtot), get_total_hw_jobs()) $(rb, re, wg) {
+    // oversplit only under team dispatch — same trade as the sdot4x4 group3 above
+    maybe_parallel_for(n * (d0 + d1 + d2) >= g_matmul_par_threshold, 0, int(ngtot), get_total_hw_jobs() * (get_jobque_team_mode() ? get_q8_batch_chunks_per_job() : 1)) $(rb, re) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -684,7 +684,6 @@ def private q8q8_group3_kernel_neon_laneq(var y0p : float?; var y1p : float?; va
                 }
             }
         }
-        wg |> notify_and_release
     }
     unsafe {
         for (i in range64(ng0 * 4l, d0)) {

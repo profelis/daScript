@@ -150,8 +150,7 @@ def private q8q8_group3_kernel(var y0p : float?; var y1p : float?; var y2p : flo
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
-    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
-    parallel_for(0, int(dtot), get_total_hw_jobs()) $(rb, re, wg) {
+    maybe_parallel_for(n * dtot >= g_matmul_par_threshold, 0, int(dtot), get_total_hw_jobs()) $(rb, re) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -166,7 +165,6 @@ def private q8q8_group3_kernel(var y0p : float?; var y1p : float?; var y2p : flo
                 }
             }
         }
-        wg |> notify_and_release
     }
 }
 
