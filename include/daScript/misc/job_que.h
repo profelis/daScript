@@ -111,11 +111,14 @@ namespace das {
         // thread-wake per job — measured ~3-4.5us per notify_one to a PARKED worker vs ~0.1us to a
         // spinning one, paid serially by the DISPATCHING thread. Opt-in: spinning burns idle CPU.
         void setWorkerSpin ( int usec ) { mSpinUs = usec; }
-        // Team mode (opt-in, sticky): workers never park; alongside the fifo they poll a single
-        // published team op and self-serve chunks off one atomic (the ggml threadpool shape).
-        // teamParallelFor replaces the whole per-chunk fifo path — no push, no mutex, no wait
-        // group, no condvar — with one seq bump per dispatch; join is a spin on a remaining
-        // counter. Single dispatcher at a time; spinning burns idle CPU while the flag is on.
+        // Team mode (opt-in, sticky): alongside the fifo, workers poll a single published team op
+        // and self-serve chunks off one atomic (the ggml threadpool shape). teamParallelFor
+        // replaces the whole per-chunk fifo path — no push, no mutex, no wait group, no condvar —
+        // with one seq bump per dispatch; join is a spin on a remaining counter. Hybrid poll/park
+        // like ggml's --poll: workers spin only for the setWorkerSpin window, then park; a publish
+        // that finds parked workers takes the fifo mutex and notifies (zero mutex traffic while
+        // everyone spins). Pair with setWorkerSpin — with a 0 window every publish pays the wake.
+        // Single dispatcher at a time.
         void setTeamMode ( bool on );
         bool getTeamMode () const { return mTeamMode.load(std::memory_order_relaxed) != 0; }
         int getNumWorkers () const { return mThreadCount.load(); }
@@ -169,6 +172,10 @@ namespace das {
         atomic<int32_t>  mTeamRemaining{0};
         int              mTeamNumChunks = 0;
         const JobChunk * mTeamWork = nullptr;
+        // workers currently in cond_wait — the publish-side wake gate. Dekker pair with mTeamSeq
+        // (worker: parked++ then read seq; publisher: bump seq then read parked — all four seq_cst),
+        // so either the worker sees the new op before sleeping or the publisher sees it parked.
+        atomic<int32_t>  mParkedWorkers{0};
     protected:
         mutex mEvalMainThreadMutex;
         vector<Job> mEvalMainThread;

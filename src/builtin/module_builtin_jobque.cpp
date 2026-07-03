@@ -726,10 +726,12 @@ namespace das {
     }
 
     void set_jobque_team_mode ( bool on, Context * context, LineInfoArg * at ) {
-        // Sticky team dispatch (see JobQue::setTeamMode): workers never park and poll a published
-        // team op alongside the fifo; team_parallel_for then costs one seq bump instead of a
-        // per-chunk fifo push + wait group. Opt in for fork/join-heavy compute (LLM decode);
-        // spinning burns idle CPU while on.
+        // Sticky team dispatch (see JobQue::setTeamMode): workers poll a published team op
+        // alongside the fifo; team_parallel_for then costs one seq bump instead of a per-chunk
+        // fifo push + wait group. Hybrid poll/park (the ggml --poll shape): workers spin for the
+        // set_jobque_worker_spin window then park, and a publish that finds parked workers pays
+        // the wake — pair with a worker spin window for back-to-back dispatch bursts. Opt in for
+        // fork/join-heavy compute (LLM decode).
         if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
         g_jobQue->setTeamMode(on);
     }

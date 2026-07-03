@@ -273,16 +273,20 @@ namespace das {
             // a spinning worker it's a ~0.1us no-waiter check. A fork/join burst (LLM decode token =
             // dozens of back-to-back parallel_for matmuls) keeps workers in the spin window the whole
             // time, so only the burst's first dispatch pays the wakes.
-            // Team mode extends the same window: poll the team slot too, and never let the deadline
-            // expire while the flag stays on (team publishes don't notify — a parked worker would
-            // sleep through them).
+            // Team mode extends the same window: poll the team slot too. The window stays BOUNDED
+            // (the ggml hybrid poll/park shape) — after it expires the worker parks, and a team
+            // publish that finds parked workers notifies (see teamParallelFor's wake gate).
             int spinUs = mSpinUs.load(std::memory_order_relaxed);
             bool teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
             if ( (spinUs > 0 || teamMode) && !mShutdown.load(std::memory_order_relaxed) ) {
                 auto deadline = chrono::steady_clock::now() + chrono::microseconds(spinUs);
                 for (;;) {
                     if ( mShutdown.load(std::memory_order_relaxed) ) break;
-                    if ( teamMode ) runTeamChunks(threadIndex, teamSeqSeen);
+                    teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
+                    if ( teamMode && runTeamChunks(threadIndex, teamSeqSeen) ) {
+                        // served team chunks — fresh spin window, same as a fifo raid restarting the loop
+                        deadline = chrono::steady_clock::now() + chrono::microseconds(spinUs);
+                    }
                     // try_lock, NOT lock: every spinner that sees the same count blip races here, and
                     // blocking losers would queue on the mutex — a convoy the dispatcher's next push
                     // waits behind (measured 45us push stalls). try_lock losers just keep spinning,
@@ -305,10 +309,7 @@ namespace das {
                         if ( gotJob ) break;
                     }
                     jobque_spin_pause();
-                    if ( chrono::steady_clock::now() >= deadline ) {
-                        teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
-                        if ( !teamMode ) break;     // flag went off mid-window → allow the park below
-                    }
+                    if ( chrono::steady_clock::now() >= deadline ) break;
                 }
             }
             if ( !gotJob ) {
@@ -319,11 +320,17 @@ namespace das {
                 // dispatch path needs, throttling parallel_for when most workers are idle between
                 // a token's many small matmuls. push()/parallel_for already notify, so latency is
                 // unaffected; join() sets mShutdown under the lock and notifies to wake all workers.
-                // setTeamMode(true) also notifies: parked workers must re-enter the spin loop to see
-                // team publishes, hence the empty-fifo continue.
-                mCond.wait(lock, [&]() { return mFifo.size() != 0 || mShutdown.load() || mTeamMode.load(std::memory_order_relaxed) != 0; });
+                // A team publish notifies only when it sees us parked (the seq_cst parked++ /
+                // seq-check pair below vs the publisher's seq-bump / parked-check closes the
+                // sleep/wake race), hence the team clause in the predicate + the empty-fifo continue.
+                mParkedWorkers.fetch_add(1, std::memory_order_seq_cst);
+                mCond.wait(lock, [&]() {
+                    return mFifo.size() != 0 || mShutdown.load()
+                        || mTeamSeq.load(std::memory_order_seq_cst) != teamSeqSeen;
+                });
+                mParkedWorkers.fetch_sub(1, std::memory_order_relaxed);
                 if ( mShutdown ) break;
-                if ( mFifo.empty() ) continue;      // team-mode wake, no fifo work → back to the spin/team poll
+                if ( mFifo.empty() ) continue;      // team wake, no fifo work → back to the spin/team poll
                 job = das::move(mFifo.front().function);
                 mThreads[threadIndex].currentPriority = mFifo.front().priority;
                 mThreads[threadIndex].currentCategory = mFifo.front().category;
@@ -359,12 +366,8 @@ namespace das {
     }
 
     void JobQue::setTeamMode ( bool on ) {
+        // no wake needed: parked workers are woken by the first publish's wake gate
         mTeamMode.store(on ? 1 : 0, std::memory_order_relaxed);
-        if ( on ) {
-            // parked workers must move to the spin loop — team publishes don't notify
-            lock_guard<mutex> lock(mFifoMutex);
-            mCond.notify_all();
-        }
     }
 
     bool JobQue::runTeamChunks ( int threadIndex, uint32_t & seqSeen ) {
@@ -395,7 +398,15 @@ namespace das {
         mTeamNumChunks = numChunks;
         mTeamRemaining.store(numChunks, std::memory_order_relaxed);
         mTeamChunkNext.store(0, std::memory_order_release);
-        mTeamSeq.fetch_add(1, std::memory_order_release);
+        // seq_cst bump + parked check: the Dekker pair with the worker's parked++ / seq-check —
+        // either the parking worker sees this op, or we see it parked and pay the wake. No mutex
+        // touched while everyone spins (ggml's kickoff locks unconditionally; it can afford to at
+        // one publish per graph — we publish per op).
+        mTeamSeq.fetch_add(1, std::memory_order_seq_cst);
+        if ( mParkedWorkers.load(std::memory_order_seq_cst) > 0 ) {
+            lock_guard<mutex> lock(mFifoMutex);
+            mCond.notify_all();
+        }
         for (;;) {
             int c = mTeamChunkNext.fetch_add(1, std::memory_order_acq_rel);
             if ( c >= numChunks ) break;
