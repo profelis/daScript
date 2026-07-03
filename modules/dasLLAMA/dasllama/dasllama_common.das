@@ -1993,7 +1993,9 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let ts_attn = ref_time_ticks()
     let seq_len = c.seq_len
     let attn_softcap = c.attn_logit_softcap
-    let attn_par = cnt * head_size * n_heads >= g_decode_attn_par_threshold
+    // team dispatch costs ~µs, so the fifo-measured crossover no longer applies: always thread
+    // (ggml threads flash-attn at any depth; measured 1B ctx8 attn 420 → 194 µs/tok under team)
+    let attn_par = get_jobque_team_mode() || cnt * head_size * n_heads >= g_decode_attn_par_threshold
     let sinksp = (c.attn_sinks
         ? unsafe(reinterpret<float const?>(unsafe(addr(t.fblob[t.sinks_off + l * n_heads]))))
         : null)
@@ -2484,7 +2486,8 @@ def get_act_par_threshold() : int64 => g_act_par_threshold
 // amortize first. Default MEASURED (M1 Max, quiet box, 2026-07-02): the inline-vs-threaded
 // crossover sits at ~200-260K work on both Llama-3.2-1B (hs 64 × 32 heads) and gemma-4-12B
 // (hs 512 × 16 heads); below it threading costs ≤2%, above it wins grow to +74%/+89% at 2048 ctx.
-// Set huge to disable, 0 to always thread (the A/B).
+// Set huge to disable, 0 to always thread (the A/B). Under team dispatch the gate is bypassed —
+// the ~90µs fifo fork/join this crossover amortizes shrinks to ~µs, and threading wins at any depth.
 var g_decode_attn_par_threshold = 262_144l
 def set_decode_attn_par_threshold(v : int64) { g_decode_attn_par_threshold = max(v, 0l) }
 def get_decode_attn_par_threshold() : int64 => g_decode_attn_par_threshold
