@@ -162,15 +162,18 @@ namespace das {
         atomic<int32_t> mSpinUs{0};
         atomic<int32_t> mFifoCount{0};  // lock-free mirror of mFifo.size() for the spin poll
     protected:
-        // team-mode publish slot. Publish order: work/numChunks/remaining, then chunkNext release-
-        // store(0), then seq release-bump — a worker entering via either the seq acquire-load or the
-        // chunkNext acq_rel fetch_add is guaranteed to see the whole op. mTeamWork points at the
-        // dispatcher's stack; valid because teamParallelFor doesn't return until remaining hits 0.
+        // team-mode publish slot. Publish order: work/remaining, then the mTeamOp single-word
+        // store {numChunks:32 | counter:32}, then the seq bump. Claimers fetch_add mTeamOp, so a
+        // claim carries its op's chunk count with the index — overflow (c >= K) self-describes,
+        // and an index can never pair with another op's count (the straggler epoch race a split
+        // counter + plain count field allowed). A valid claim's pending remaining-decrement blocks
+        // that op's join, which keeps mTeamWork (the dispatcher's stack) alive while dereferenced.
+        // mTeamSeq is only the publish generation: the park predicate + the workers' "anything
+        // new?" fast-path (so idle spinners don't touch mTeamOp).
         atomic<int32_t>  mTeamMode{0};
         atomic<uint32_t> mTeamSeq{0};
-        atomic<int32_t>  mTeamChunkNext{0};
+        atomic<uint64_t> mTeamOp{0};
         atomic<int32_t>  mTeamRemaining{0};
-        int              mTeamNumChunks = 0;
         const JobChunk * mTeamWork = nullptr;
         // workers currently in cond_wait — the publish-side wake gate. Dekker pair with mTeamSeq
         // (worker: parked++ then read seq; publisher: bump seq then read parked — all four seq_cst),

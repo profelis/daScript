@@ -376,12 +376,16 @@ namespace das {
         seqSeen = seq;
         bool ran = false;
         for (;;) {
-            // acq_rel pairs with the publisher's release-store(0): a straggler still in this loop
-            // when the NEXT op publishes crosses over cleanly — it claims a fresh chunk index and
-            // sees that op's work/numChunks. Every chunk of every op runs exactly once regardless.
-            int c = mTeamChunkNext.fetch_add(1, std::memory_order_acq_rel);
-            if ( c >= mTeamNumChunks ) break;
-            (*mTeamWork)(c, threadIndex);
+            // one fetch_add returns {numChunks, index} as a unit, so overflow (c >= K) self-
+            // describes — a straggler racing the next publish either gets {K_old, c >= K_old}
+            // (break) or a genuinely valid chunk of the new op (serve it; the acquire pairs with
+            // the publish store, so mTeamWork/mTeamRemaining are that op's). A valid claim's
+            // pending decrement blocks that op's join, which is what keeps mTeamWork stable
+            // (it points at the dispatcher's stack) for exactly as long as we can dereference it.
+            uint64_t claim = mTeamOp.fetch_add(1, std::memory_order_acq_rel);
+            uint32_t c = uint32_t(claim);
+            if ( c >= uint32_t(claim >> 32) ) break;
+            (*mTeamWork)(int(c), threadIndex);
             mTeamRemaining.fetch_sub(1, std::memory_order_release);
             ran = true;
         }
@@ -395,9 +399,11 @@ namespace das {
             return;
         }
         mTeamWork = &work;
-        mTeamNumChunks = numChunks;
         mTeamRemaining.store(numChunks, std::memory_order_relaxed);
-        mTeamChunkNext.store(0, std::memory_order_release);
+        // single-word publish: {numChunks, counter=0}. Claimers fetch_add this word, so an index
+        // can never pair with another op's chunk count — the straggler epoch race a separate
+        // counter + plain count field had (double-served chunk, lost decrement, dangling work).
+        mTeamOp.store(uint64_t(uint32_t(numChunks)) << 32, std::memory_order_seq_cst);
         // seq_cst bump + parked check: the Dekker pair with the worker's parked++ / seq-check —
         // either the parking worker sees this op, or we see it parked and pay the wake. No mutex
         // touched while everyone spins (ggml's kickoff locks unconditionally; it can afford to at
@@ -408,9 +414,10 @@ namespace das {
             mCond.notify_all();
         }
         for (;;) {
-            int c = mTeamChunkNext.fetch_add(1, std::memory_order_acq_rel);
-            if ( c >= numChunks ) break;
-            work(c, nW);
+            uint64_t claim = mTeamOp.fetch_add(1, std::memory_order_acq_rel);
+            uint32_t c = uint32_t(claim);
+            if ( c >= uint32_t(claim >> 32) ) break;
+            work(int(c), nW);
             mTeamRemaining.fetch_sub(1, std::memory_order_release);
         }
         // join: acquire pairs with the workers' release decrements, so their chunk writes are
