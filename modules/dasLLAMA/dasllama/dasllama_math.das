@@ -159,6 +159,16 @@ var g_q8_batch_chunks_per_job = 4
 def public set_q8_batch_chunks_per_job(v : int) { g_q8_batch_chunks_per_job = max(v, 1) }
 def public get_q8_batch_chunks_per_job() : int { return g_q8_batch_chunks_per_job }
 
+// Dispatch lanes for a fork/join chunk split: the worker threads PLUS the calling thread, which
+// serves chunks too (team mode by design; fifo via the dispatcher work-steal). Chunk counts sized
+// to workers alone leave the last wave short — 7 workers x4 = 28 chunks on 8 lanes = 87.5%
+// utilization; sizing to lanes took the decode GEMV from ~109 to ~118 GB/s on M1 Max, llama.cpp's
+// exact repack-path rate (bench_gemv_decode). Knob for A/B: false = the old workers-only split.
+var g_dispatch_caller_lane = true
+def public set_dispatch_caller_lane(v : bool) { g_dispatch_caller_lane = v }
+def public get_dispatch_caller_lane() : bool { return g_dispatch_caller_lane }
+def public get_dispatch_lanes() : int { return get_total_hw_jobs() + (g_dispatch_caller_lane ? 1 : 0) }
+
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.
 //! W is row-major [d rows x n cols], x is [n], y is [d]; each y[i] is one dot
 //! product of W's i-th row with x. Shapes match llama2.c (n = input dim, d = output dim).
@@ -169,7 +179,7 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
         var yp = addr(y[0])                              // var: stays a writable pointer when captured
         let wp = reinterpret<float const?>(addr(w[0]))   // strip the `#` if w is a view
         let xp = addr(x[0])
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot(wp + int64(i) * n, xp, n)
@@ -188,7 +198,7 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
         var yp = addr(y[0])
         let wp = reinterpret<float const?>(addr(w[0]))
         let xp = reinterpret<float const?>(addr(x[0]))
-        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wp + int64(i) * n
@@ -328,7 +338,7 @@ def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #;
         let sp = reinterpret<float const?>(addr(ws[0]))
         let xp = addr(x[0])
         // default 2 chunks per hw job (knob): Q8 dequant-in-dot is compute-bound and threads better than fp32
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), g_q8_chunks_per_job * get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), g_q8_chunks_per_job * get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q8(wp + int64(i) * n, sp + int64(i) * nb, xp, n)
@@ -366,6 +376,24 @@ def public get_q8_l2_budget() : int64 { return g_q8_l2_budget }
 def public effective_token_block(tb, n : int64) : int64 {
     return clamp(tb, 1l, max(1l, g_q8_l2_budget / max(n, 1l)))   // floor 1 (a 0 block width infinite-loops the kernel)
 }
+
+// ===== dispatch observability (jobs-per-section profiling) =====
+// maybe_parallel_for's macro emits these on every decision; the forward profiler attributes the
+// deltas to its sections, so a side-by-side vs llama.cpp can compare dispatch counts and chunk
+// granularity, not just time. Counters live on the MAIN context (dispatch happens caller-side).
+var g_disp_count = 0l    // parallel_for dispatches taken
+var g_disp_chunks = 0l   // chunks (jobs) pushed across those dispatches
+var g_disp_inline = 0l   // maybe_parallel_for calls that ran inline instead
+def count_parallel_dispatch(njobs : int) {
+    g_disp_count++
+    g_disp_chunks += int64(njobs)
+}
+def count_inline_run() {
+    g_disp_inline++
+}
+def get_disp_count() : int64 => g_disp_count
+def get_disp_chunks() : int64 => g_disp_chunks
+def get_disp_inline() : int64 => g_disp_inline
 
 // ===== Q8·Q8 matmul: pluggable kernel-backend registry =====
 // The three public matmuls (matmul_q8q8 / _batch / _group3) extract raw pointers ONCE in the main
@@ -831,7 +859,7 @@ def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #
         let xp = addr(x[0])
         // default 4 chunks per hw job (knob): the heavy nibble unpack makes each row compute-bound, so finer
         // splitting balances better (esp. the classifier) — more than the compute-light Q8 path.
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), g_q4_chunks_per_job * get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), g_q4_chunks_per_job * get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)

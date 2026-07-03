@@ -4,6 +4,7 @@ module matmul_variants shared public
 
 require daslib/jobque_boost
 require llvm/daslib/aarch64_neon  // sdot4: JIT-emitted ARM SDOT (scalar fallback elsewhere)
+require math  // mad: fused multiply-add in the decode-GEMV flush variants
 
 // Experiment ledger for the matmul kernel. Every optimization attempt lives here as
 // its own function so bench_matmul.das can compare them head-to-head (and against the
@@ -1237,4 +1238,475 @@ def matmul_par(var y : array<float>; w : array<float> | #; x : array<float>; n, 
             wg |> notify_and_release
         }
     }
+}
+
+// ===== decode-GEMV variant race — the top-end weight-streaming hunt =====
+// Decode GEMV (1 token) is pure weight streaming. llama.cpp's live M1 kernel
+// (ggml_gemv_q8_0_4x4_q8_0 — their 4x8 tier needs i8mm, absent on M1) is the SAME shape as
+// dot_q8q8_laneq4 yet sustains ~119 GB/s in-situ vs our ~101. These variants probe the three
+// structural deltas, one axis at a time: block-loop unroll / loads in flight (u2h, u2, u4),
+// fma flush + split sdot chain (mad, ilp2), dual-group shared-activation streams (2g), and
+// their single-stream layout — scales inline ahead of the quants (inline*; theirs are fp16,
+// these stay fp32 = 8 more bytes per block-group). Raced by bench_gemv_decode.das.
+
+//! base + [unroll_count=2] on the block loop — the "let LLVM unroll like their -O3 build" cell.
+[hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_u2h(wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        for [unroll_count = 2] (bi in range64(nb)) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq(acc, wg + wb, xq + xb, 0)
+            acc = sdot4_laneq(acc, wg + wb + 16l, xq + xb, 1)
+            acc = sdot4_laneq(acc, wg + wb + 32l, xq + xb, 2)
+            acc = sdot4_laneq(acc, wg + wb + 48l, xq + xb, 3)
+            acc = sdot4_laneq(acc, wg + wb + 64l, xq + xb + 16l, 0)
+            acc = sdot4_laneq(acc, wg + wb + 80l, xq + xb + 16l, 1)
+            acc = sdot4_laneq(acc, wg + wb + 96l, xq + xb + 16l, 2)
+            acc = sdot4_laneq(acc, wg + wb + 112l, xq + xb + 16l, 3)
+            let s = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let xsb = xs[bi]
+            f += float4(acc) * s * float4(xsb, xsb, xsb, xsb)
+        }
+    }
+    return f
+}
+
+//! base with an fma flush: one mad on the f chain instead of mul+mul+add (ggml's vfmaq_f32).
+[hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_mad(wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        for (bi in range64(nb)) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq(acc, wg + wb, xq + xb, 0)
+            acc = sdot4_laneq(acc, wg + wb + 16l, xq + xb, 1)
+            acc = sdot4_laneq(acc, wg + wb + 32l, xq + xb, 2)
+            acc = sdot4_laneq(acc, wg + wb + 48l, xq + xb, 3)
+            acc = sdot4_laneq(acc, wg + wb + 64l, xq + xb + 16l, 0)
+            acc = sdot4_laneq(acc, wg + wb + 80l, xq + xb + 16l, 1)
+            acc = sdot4_laneq(acc, wg + wb + 96l, xq + xb + 16l, 2)
+            acc = sdot4_laneq(acc, wg + wb + 112l, xq + xb + 16l, 3)
+            let s = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let xsb = xs[bi]
+            f = mad(float4(acc), s * float4(xsb, xsb, xsb, xsb), f)
+        }
+    }
+    return f
+}
+
+//! unroll hint + fma flush combined — the closest spelling of their exact -O3 kernel.
+[hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_u2h_mad(wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        for [unroll_count = 2] (bi in range64(nb)) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq(acc, wg + wb, xq + xb, 0)
+            acc = sdot4_laneq(acc, wg + wb + 16l, xq + xb, 1)
+            acc = sdot4_laneq(acc, wg + wb + 32l, xq + xb, 2)
+            acc = sdot4_laneq(acc, wg + wb + 48l, xq + xb, 3)
+            acc = sdot4_laneq(acc, wg + wb + 64l, xq + xb + 16l, 0)
+            acc = sdot4_laneq(acc, wg + wb + 80l, xq + xb + 16l, 1)
+            acc = sdot4_laneq(acc, wg + wb + 96l, xq + xb + 16l, 2)
+            acc = sdot4_laneq(acc, wg + wb + 112l, xq + xb + 16l, 3)
+            let s = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let xsb = xs[bi]
+            f = mad(float4(acc), s * float4(xsb, xsb, xsb, xsb), f)
+        }
+    }
+    return f
+}
+
+//! split the 8-sdot chain into two independent 4-sdot chains (halves the int dependency chain;
+//! int add is exact so the result is bit-identical to base).
+[hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_ilp2(wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        for (bi in range64(nb)) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var a0 = int4(0, 0, 0, 0)
+            var a1 = int4(0, 0, 0, 0)
+            a0 = sdot4_laneq(a0, wg + wb, xq + xb, 0)
+            a1 = sdot4_laneq(a1, wg + wb + 64l, xq + xb + 16l, 0)
+            a0 = sdot4_laneq(a0, wg + wb + 16l, xq + xb, 1)
+            a1 = sdot4_laneq(a1, wg + wb + 80l, xq + xb + 16l, 1)
+            a0 = sdot4_laneq(a0, wg + wb + 32l, xq + xb, 2)
+            a1 = sdot4_laneq(a1, wg + wb + 96l, xq + xb + 16l, 2)
+            a0 = sdot4_laneq(a0, wg + wb + 48l, xq + xb, 3)
+            a1 = sdot4_laneq(a1, wg + wb + 112l, xq + xb + 16l, 3)
+            let acc = a0 + a1
+            let s = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let xsb = xs[bi]
+            f += float4(acc) * s * float4(xsb, xsb, xsb, xsb)
+        }
+    }
+    return f
+}
+
+//! ilp2 + fma flush.
+[hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_ilp2_mad(wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        for (bi in range64(nb)) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var a0 = int4(0, 0, 0, 0)
+            var a1 = int4(0, 0, 0, 0)
+            a0 = sdot4_laneq(a0, wg + wb, xq + xb, 0)
+            a1 = sdot4_laneq(a1, wg + wb + 64l, xq + xb + 16l, 0)
+            a0 = sdot4_laneq(a0, wg + wb + 16l, xq + xb, 1)
+            a1 = sdot4_laneq(a1, wg + wb + 80l, xq + xb + 16l, 1)
+            a0 = sdot4_laneq(a0, wg + wb + 32l, xq + xb, 2)
+            a1 = sdot4_laneq(a1, wg + wb + 96l, xq + xb + 16l, 2)
+            a0 = sdot4_laneq(a0, wg + wb + 48l, xq + xb, 3)
+            a1 = sdot4_laneq(a1, wg + wb + 112l, xq + xb + 16l, 3)
+            let acc = a0 + a1
+            let s = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let xsb = xs[bi]
+            f = mad(float4(acc), s * float4(xsb, xsb, xsb, xsb), f)
+        }
+    }
+    return f
+}
+
+//! hand-unrolled 2 blocks in flight: independent int accs AND independent f chains (f0+f1 at the
+//! end — reorders the fp sum, ~ulp drift). Doubles the weight loads outstanding per iteration.
+[hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_u2(wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f0 = float4(0.0, 0.0, 0.0, 0.0)
+    var f1 = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        var bi = 0l
+        while (bi + 2l <= nb) {
+            let wb0 = bi * 128l
+            let wb1 = wb0 + 128l
+            let xb0 = bi * 32l
+            let xb1 = xb0 + 32l
+            var a0 = int4(0, 0, 0, 0)
+            var a1 = int4(0, 0, 0, 0)
+            a0 = sdot4_laneq(a0, wg + wb0, xq + xb0, 0); a1 = sdot4_laneq(a1, wg + wb1, xq + xb1, 0)
+            a0 = sdot4_laneq(a0, wg + wb0 + 16l, xq + xb0, 1); a1 = sdot4_laneq(a1, wg + wb1 + 16l, xq + xb1, 1)
+            a0 = sdot4_laneq(a0, wg + wb0 + 32l, xq + xb0, 2); a1 = sdot4_laneq(a1, wg + wb1 + 32l, xq + xb1, 2)
+            a0 = sdot4_laneq(a0, wg + wb0 + 48l, xq + xb0, 3); a1 = sdot4_laneq(a1, wg + wb1 + 48l, xq + xb1, 3)
+            a0 = sdot4_laneq(a0, wg + wb0 + 64l, xq + xb0 + 16l, 0); a1 = sdot4_laneq(a1, wg + wb1 + 64l, xq + xb1 + 16l, 0)
+            a0 = sdot4_laneq(a0, wg + wb0 + 80l, xq + xb0 + 16l, 1); a1 = sdot4_laneq(a1, wg + wb1 + 80l, xq + xb1 + 16l, 1)
+            a0 = sdot4_laneq(a0, wg + wb0 + 96l, xq + xb0 + 16l, 2); a1 = sdot4_laneq(a1, wg + wb1 + 96l, xq + xb1 + 16l, 2)
+            a0 = sdot4_laneq(a0, wg + wb0 + 112l, xq + xb0 + 16l, 3); a1 = sdot4_laneq(a1, wg + wb1 + 112l, xq + xb1 + 16l, 3)
+            let s0 = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let s1 = float4(sg[bi * 4l + 4l], sg[bi * 4l + 5l], sg[bi * 4l + 6l], sg[bi * 4l + 7l])
+            let x0 = xs[bi]
+            let x1 = xs[bi + 1l]
+            f0 += float4(a0) * s0 * float4(x0, x0, x0, x0)
+            f1 += float4(a1) * s1 * float4(x1, x1, x1, x1)
+            bi += 2l
+        }
+        while (bi < nb) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq(acc, wg + wb, xq + xb, 0)
+            acc = sdot4_laneq(acc, wg + wb + 16l, xq + xb, 1)
+            acc = sdot4_laneq(acc, wg + wb + 32l, xq + xb, 2)
+            acc = sdot4_laneq(acc, wg + wb + 48l, xq + xb, 3)
+            acc = sdot4_laneq(acc, wg + wb + 64l, xq + xb + 16l, 0)
+            acc = sdot4_laneq(acc, wg + wb + 80l, xq + xb + 16l, 1)
+            acc = sdot4_laneq(acc, wg + wb + 96l, xq + xb + 16l, 2)
+            acc = sdot4_laneq(acc, wg + wb + 112l, xq + xb + 16l, 3)
+            let s = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let xsb = xs[bi]
+            f0 += float4(acc) * s * float4(xsb, xsb, xsb, xsb)
+            bi++
+        }
+    }
+    return f0 + f1
+}
+
+//! u2 + fma flush.
+[hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_u2_mad(wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f0 = float4(0.0, 0.0, 0.0, 0.0)
+    var f1 = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        var bi = 0l
+        while (bi + 2l <= nb) {
+            let wb0 = bi * 128l
+            let wb1 = wb0 + 128l
+            let xb0 = bi * 32l
+            let xb1 = xb0 + 32l
+            var a0 = int4(0, 0, 0, 0)
+            var a1 = int4(0, 0, 0, 0)
+            a0 = sdot4_laneq(a0, wg + wb0, xq + xb0, 0); a1 = sdot4_laneq(a1, wg + wb1, xq + xb1, 0)
+            a0 = sdot4_laneq(a0, wg + wb0 + 16l, xq + xb0, 1); a1 = sdot4_laneq(a1, wg + wb1 + 16l, xq + xb1, 1)
+            a0 = sdot4_laneq(a0, wg + wb0 + 32l, xq + xb0, 2); a1 = sdot4_laneq(a1, wg + wb1 + 32l, xq + xb1, 2)
+            a0 = sdot4_laneq(a0, wg + wb0 + 48l, xq + xb0, 3); a1 = sdot4_laneq(a1, wg + wb1 + 48l, xq + xb1, 3)
+            a0 = sdot4_laneq(a0, wg + wb0 + 64l, xq + xb0 + 16l, 0); a1 = sdot4_laneq(a1, wg + wb1 + 64l, xq + xb1 + 16l, 0)
+            a0 = sdot4_laneq(a0, wg + wb0 + 80l, xq + xb0 + 16l, 1); a1 = sdot4_laneq(a1, wg + wb1 + 80l, xq + xb1 + 16l, 1)
+            a0 = sdot4_laneq(a0, wg + wb0 + 96l, xq + xb0 + 16l, 2); a1 = sdot4_laneq(a1, wg + wb1 + 96l, xq + xb1 + 16l, 2)
+            a0 = sdot4_laneq(a0, wg + wb0 + 112l, xq + xb0 + 16l, 3); a1 = sdot4_laneq(a1, wg + wb1 + 112l, xq + xb1 + 16l, 3)
+            let s0 = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let s1 = float4(sg[bi * 4l + 4l], sg[bi * 4l + 5l], sg[bi * 4l + 6l], sg[bi * 4l + 7l])
+            let x0 = xs[bi]
+            let x1 = xs[bi + 1l]
+            f0 = mad(float4(a0), s0 * float4(x0, x0, x0, x0), f0)
+            f1 = mad(float4(a1), s1 * float4(x1, x1, x1, x1), f1)
+            bi += 2l
+        }
+        while (bi < nb) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq(acc, wg + wb, xq + xb, 0)
+            acc = sdot4_laneq(acc, wg + wb + 16l, xq + xb, 1)
+            acc = sdot4_laneq(acc, wg + wb + 32l, xq + xb, 2)
+            acc = sdot4_laneq(acc, wg + wb + 48l, xq + xb, 3)
+            acc = sdot4_laneq(acc, wg + wb + 64l, xq + xb + 16l, 0)
+            acc = sdot4_laneq(acc, wg + wb + 80l, xq + xb + 16l, 1)
+            acc = sdot4_laneq(acc, wg + wb + 96l, xq + xb + 16l, 2)
+            acc = sdot4_laneq(acc, wg + wb + 112l, xq + xb + 16l, 3)
+            let s = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let xsb = xs[bi]
+            f0 = mad(float4(acc), s * float4(xsb, xsb, xsb, xsb), f0)
+            bi++
+        }
+    }
+    return f0 + f1
+}
+
+//! hand-unrolled 4 blocks in flight (4 int accs, 4 f chains) + fma flush — max outstanding loads,
+//! at the edge of register pressure (32 weight vectors live per iteration if LLVM holds them all).
+[hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_u4_mad(wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f0 = float4(0.0, 0.0, 0.0, 0.0)
+    var f1 = float4(0.0, 0.0, 0.0, 0.0)
+    var f2 = float4(0.0, 0.0, 0.0, 0.0)
+    var f3 = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        var bi = 0l
+        while (bi + 4l <= nb) {
+            let wb0 = bi * 128l
+            let wb1 = wb0 + 128l
+            let wb2 = wb0 + 256l
+            let wb3 = wb0 + 384l
+            let xb0 = bi * 32l
+            let xb1 = xb0 + 32l
+            let xb2 = xb0 + 64l
+            let xb3 = xb0 + 96l
+            var a0 = int4(0, 0, 0, 0)
+            var a1 = int4(0, 0, 0, 0)
+            var a2 = int4(0, 0, 0, 0)
+            var a3 = int4(0, 0, 0, 0)
+            a0 = sdot4_laneq(a0, wg + wb0, xq + xb0, 0); a1 = sdot4_laneq(a1, wg + wb1, xq + xb1, 0); a2 = sdot4_laneq(a2, wg + wb2, xq + xb2, 0); a3 = sdot4_laneq(a3, wg + wb3, xq + xb3, 0)
+            a0 = sdot4_laneq(a0, wg + wb0 + 16l, xq + xb0, 1); a1 = sdot4_laneq(a1, wg + wb1 + 16l, xq + xb1, 1); a2 = sdot4_laneq(a2, wg + wb2 + 16l, xq + xb2, 1); a3 = sdot4_laneq(a3, wg + wb3 + 16l, xq + xb3, 1)
+            a0 = sdot4_laneq(a0, wg + wb0 + 32l, xq + xb0, 2); a1 = sdot4_laneq(a1, wg + wb1 + 32l, xq + xb1, 2); a2 = sdot4_laneq(a2, wg + wb2 + 32l, xq + xb2, 2); a3 = sdot4_laneq(a3, wg + wb3 + 32l, xq + xb3, 2)
+            a0 = sdot4_laneq(a0, wg + wb0 + 48l, xq + xb0, 3); a1 = sdot4_laneq(a1, wg + wb1 + 48l, xq + xb1, 3); a2 = sdot4_laneq(a2, wg + wb2 + 48l, xq + xb2, 3); a3 = sdot4_laneq(a3, wg + wb3 + 48l, xq + xb3, 3)
+            a0 = sdot4_laneq(a0, wg + wb0 + 64l, xq + xb0 + 16l, 0); a1 = sdot4_laneq(a1, wg + wb1 + 64l, xq + xb1 + 16l, 0); a2 = sdot4_laneq(a2, wg + wb2 + 64l, xq + xb2 + 16l, 0); a3 = sdot4_laneq(a3, wg + wb3 + 64l, xq + xb3 + 16l, 0)
+            a0 = sdot4_laneq(a0, wg + wb0 + 80l, xq + xb0 + 16l, 1); a1 = sdot4_laneq(a1, wg + wb1 + 80l, xq + xb1 + 16l, 1); a2 = sdot4_laneq(a2, wg + wb2 + 80l, xq + xb2 + 16l, 1); a3 = sdot4_laneq(a3, wg + wb3 + 80l, xq + xb3 + 16l, 1)
+            a0 = sdot4_laneq(a0, wg + wb0 + 96l, xq + xb0 + 16l, 2); a1 = sdot4_laneq(a1, wg + wb1 + 96l, xq + xb1 + 16l, 2); a2 = sdot4_laneq(a2, wg + wb2 + 96l, xq + xb2 + 16l, 2); a3 = sdot4_laneq(a3, wg + wb3 + 96l, xq + xb3 + 16l, 2)
+            a0 = sdot4_laneq(a0, wg + wb0 + 112l, xq + xb0 + 16l, 3); a1 = sdot4_laneq(a1, wg + wb1 + 112l, xq + xb1 + 16l, 3); a2 = sdot4_laneq(a2, wg + wb2 + 112l, xq + xb2 + 16l, 3); a3 = sdot4_laneq(a3, wg + wb3 + 112l, xq + xb3 + 16l, 3)
+            let s0 = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let s1 = float4(sg[bi * 4l + 4l], sg[bi * 4l + 5l], sg[bi * 4l + 6l], sg[bi * 4l + 7l])
+            let s2 = float4(sg[bi * 4l + 8l], sg[bi * 4l + 9l], sg[bi * 4l + 10l], sg[bi * 4l + 11l])
+            let s3 = float4(sg[bi * 4l + 12l], sg[bi * 4l + 13l], sg[bi * 4l + 14l], sg[bi * 4l + 15l])
+            let x0 = xs[bi]
+            let x1 = xs[bi + 1l]
+            let x2 = xs[bi + 2l]
+            let x3 = xs[bi + 3l]
+            f0 = mad(float4(a0), s0 * float4(x0, x0, x0, x0), f0)
+            f1 = mad(float4(a1), s1 * float4(x1, x1, x1, x1), f1)
+            f2 = mad(float4(a2), s2 * float4(x2, x2, x2, x2), f2)
+            f3 = mad(float4(a3), s3 * float4(x3, x3, x3, x3), f3)
+            bi += 4l
+        }
+        while (bi < nb) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq(acc, wg + wb, xq + xb, 0)
+            acc = sdot4_laneq(acc, wg + wb + 16l, xq + xb, 1)
+            acc = sdot4_laneq(acc, wg + wb + 32l, xq + xb, 2)
+            acc = sdot4_laneq(acc, wg + wb + 48l, xq + xb, 3)
+            acc = sdot4_laneq(acc, wg + wb + 64l, xq + xb + 16l, 0)
+            acc = sdot4_laneq(acc, wg + wb + 80l, xq + xb + 16l, 1)
+            acc = sdot4_laneq(acc, wg + wb + 96l, xq + xb + 16l, 2)
+            acc = sdot4_laneq(acc, wg + wb + 112l, xq + xb + 16l, 3)
+            let s = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let xsb = xs[bi]
+            f0 = mad(float4(acc), s * float4(xsb, xsb, xsb, xsb), f0)
+            bi++
+        }
+    }
+    return (f0 + f1) + (f2 + f3)
+}
+
+//! two ADJACENT 4-row groups per pass (8 output rows), sharing the activation loads across both
+//! weight streams. Writes yp[0..7]. Group pair = rows 8g..8g+7 of the laneq layout.
+[hint(unsafe_range_check, noalias = yp, noalias = wg, noalias = sg, noalias = xq, noalias = xs)]
+def dot_q8q8_laneq4_2g(var yp : float?; wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n : int64) {
+    let nb = n / 32l
+    var fa = float4(0.0, 0.0, 0.0, 0.0)
+    var fb = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        let wh = wg + 4l * n
+        let sh = sg + 4l * nb
+        for (bi in range64(nb)) {
+            let wb = bi * 128l
+            let xb = bi * 32l
+            var aa = int4(0, 0, 0, 0)
+            var ab = int4(0, 0, 0, 0)
+            aa = sdot4_laneq(aa, wg + wb, xq + xb, 0); ab = sdot4_laneq(ab, wh + wb, xq + xb, 0)
+            aa = sdot4_laneq(aa, wg + wb + 16l, xq + xb, 1); ab = sdot4_laneq(ab, wh + wb + 16l, xq + xb, 1)
+            aa = sdot4_laneq(aa, wg + wb + 32l, xq + xb, 2); ab = sdot4_laneq(ab, wh + wb + 32l, xq + xb, 2)
+            aa = sdot4_laneq(aa, wg + wb + 48l, xq + xb, 3); ab = sdot4_laneq(ab, wh + wb + 48l, xq + xb, 3)
+            aa = sdot4_laneq(aa, wg + wb + 64l, xq + xb + 16l, 0); ab = sdot4_laneq(ab, wh + wb + 64l, xq + xb + 16l, 0)
+            aa = sdot4_laneq(aa, wg + wb + 80l, xq + xb + 16l, 1); ab = sdot4_laneq(ab, wh + wb + 80l, xq + xb + 16l, 1)
+            aa = sdot4_laneq(aa, wg + wb + 96l, xq + xb + 16l, 2); ab = sdot4_laneq(ab, wh + wb + 96l, xq + xb + 16l, 2)
+            aa = sdot4_laneq(aa, wg + wb + 112l, xq + xb + 16l, 3); ab = sdot4_laneq(ab, wh + wb + 112l, xq + xb + 16l, 3)
+            let sa = float4(sg[bi * 4l], sg[bi * 4l + 1l], sg[bi * 4l + 2l], sg[bi * 4l + 3l])
+            let sb = float4(sh[bi * 4l], sh[bi * 4l + 1l], sh[bi * 4l + 2l], sh[bi * 4l + 3l])
+            let xsb = xs[bi]
+            fa += float4(aa) * sa * float4(xsb, xsb, xsb, xsb)
+            fb += float4(ab) * sb * float4(xsb, xsb, xsb, xsb)
+        }
+        yp[0l] = fa.x
+        yp[1l] = fa.y
+        yp[2l] = fa.z
+        yp[3l] = fa.w
+        yp[4l] = fb.x
+        yp[5l] = fb.y
+        yp[6l] = fb.z
+        yp[7l] = fb.w
+    }
+}
+
+// Single-stream inline-scale layout (llama.cpp block_q8_0x4 shape, fp32 scales): per 4-row group,
+// nb super-blocks of 144 bytes = [16B float4 block scales][128B interleaved quants]. Built from the
+// laneq layout at load — repack_q8q8_inline below.
+def repack_q8q8_inline(wgq : array<int8>; wgs : array<float>; n, d : int64; var out : array<int8>) {
+    let nb = n / 32l
+    let ng = d / 4l
+    out |> reserve(ng * nb * 144l)
+    out |> resize(ng * nb * 144l)
+    unsafe {
+        let wp = reinterpret<int8 const?>(addr(wgq[0]))
+        let sp = reinterpret<int8 const?>(addr(wgs[0]))
+        var op = addr(out[0])
+        for (g in range64(ng)) {
+            for (bi in range64(nb)) {
+                let dst = (g * nb + bi) * 144l
+                let ssrc = (g * 4l * nb + bi * 4l) * 4l
+                for (k in range64(16l)) {
+                    op[dst + k] = sp[ssrc + k]
+                }
+                let qsrc = g * 4l * n + bi * 128l
+                for (k in range64(128l)) {
+                    op[dst + 16l + k] = wp[qsrc + k]
+                }
+            }
+        }
+    }
+}
+
+//! GEMV over the inline-scale single-stream layout: one pointer walk, scales load from the same
+//! cache lines as the quants (kills the second stream; still 8 more bytes/group than their fp16).
+[hint(unsafe_range_check, noalias = gp, noalias = xq, noalias = xs)]
+def dot_q8q8_inline4(gp : int8 const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        for (bi in range64(nb)) {
+            let bb = bi * 144l
+            let wb = bb + 16l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq(acc, gp + wb, xq + xb, 0)
+            acc = sdot4_laneq(acc, gp + wb + 16l, xq + xb, 1)
+            acc = sdot4_laneq(acc, gp + wb + 32l, xq + xb, 2)
+            acc = sdot4_laneq(acc, gp + wb + 48l, xq + xb, 3)
+            acc = sdot4_laneq(acc, gp + wb + 64l, xq + xb + 16l, 0)
+            acc = sdot4_laneq(acc, gp + wb + 80l, xq + xb + 16l, 1)
+            acc = sdot4_laneq(acc, gp + wb + 96l, xq + xb + 16l, 2)
+            acc = sdot4_laneq(acc, gp + wb + 112l, xq + xb + 16l, 3)
+            let s4p = reinterpret<float4 const?>(gp + bb)
+            let s = s4p[0]
+            let xsb = xs[bi]
+            f += float4(acc) * s * float4(xsb, xsb, xsb, xsb)
+        }
+    }
+    return f
+}
+
+//! inline layout + 2 super-blocks in flight + fma flush — the full stack on the single stream.
+[hint(unsafe_range_check, noalias = gp, noalias = xq, noalias = xs)]
+def dot_q8q8_inline4_u2_mad(gp : int8 const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f0 = float4(0.0, 0.0, 0.0, 0.0)
+    var f1 = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        var bi = 0l
+        while (bi + 2l <= nb) {
+            let bb0 = bi * 144l
+            let bb1 = bb0 + 144l
+            let wb0 = bb0 + 16l
+            let wb1 = bb1 + 16l
+            let xb0 = bi * 32l
+            let xb1 = xb0 + 32l
+            var a0 = int4(0, 0, 0, 0)
+            var a1 = int4(0, 0, 0, 0)
+            a0 = sdot4_laneq(a0, gp + wb0, xq + xb0, 0); a1 = sdot4_laneq(a1, gp + wb1, xq + xb1, 0)
+            a0 = sdot4_laneq(a0, gp + wb0 + 16l, xq + xb0, 1); a1 = sdot4_laneq(a1, gp + wb1 + 16l, xq + xb1, 1)
+            a0 = sdot4_laneq(a0, gp + wb0 + 32l, xq + xb0, 2); a1 = sdot4_laneq(a1, gp + wb1 + 32l, xq + xb1, 2)
+            a0 = sdot4_laneq(a0, gp + wb0 + 48l, xq + xb0, 3); a1 = sdot4_laneq(a1, gp + wb1 + 48l, xq + xb1, 3)
+            a0 = sdot4_laneq(a0, gp + wb0 + 64l, xq + xb0 + 16l, 0); a1 = sdot4_laneq(a1, gp + wb1 + 64l, xq + xb1 + 16l, 0)
+            a0 = sdot4_laneq(a0, gp + wb0 + 80l, xq + xb0 + 16l, 1); a1 = sdot4_laneq(a1, gp + wb1 + 80l, xq + xb1 + 16l, 1)
+            a0 = sdot4_laneq(a0, gp + wb0 + 96l, xq + xb0 + 16l, 2); a1 = sdot4_laneq(a1, gp + wb1 + 96l, xq + xb1 + 16l, 2)
+            a0 = sdot4_laneq(a0, gp + wb0 + 112l, xq + xb0 + 16l, 3); a1 = sdot4_laneq(a1, gp + wb1 + 112l, xq + xb1 + 16l, 3)
+            let s0p = reinterpret<float4 const?>(gp + bb0)
+            let s1p = reinterpret<float4 const?>(gp + bb1)
+            let s0 = s0p[0]
+            let s1 = s1p[0]
+            let x0 = xs[bi]
+            let x1 = xs[bi + 1l]
+            f0 = mad(float4(a0), s0 * float4(x0, x0, x0, x0), f0)
+            f1 = mad(float4(a1), s1 * float4(x1, x1, x1, x1), f1)
+            bi += 2l
+        }
+        while (bi < nb) {
+            let bb = bi * 144l
+            let wb = bb + 16l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq(acc, gp + wb, xq + xb, 0)
+            acc = sdot4_laneq(acc, gp + wb + 16l, xq + xb, 1)
+            acc = sdot4_laneq(acc, gp + wb + 32l, xq + xb, 2)
+            acc = sdot4_laneq(acc, gp + wb + 48l, xq + xb, 3)
+            acc = sdot4_laneq(acc, gp + wb + 64l, xq + xb + 16l, 0)
+            acc = sdot4_laneq(acc, gp + wb + 80l, xq + xb + 16l, 1)
+            acc = sdot4_laneq(acc, gp + wb + 96l, xq + xb + 16l, 2)
+            acc = sdot4_laneq(acc, gp + wb + 112l, xq + xb + 16l, 3)
+            let s4p = reinterpret<float4 const?>(gp + bb)
+            let s = s4p[0]
+            let xsb = xs[bi]
+            f0 = mad(float4(acc), s * float4(xsb, xsb, xsb, xsb), f0)
+            bi++
+        }
+    }
+    return f0 + f1
 }

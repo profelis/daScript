@@ -376,18 +376,18 @@ namespace das
             // fork-heap allocation in the pooled new_job path is the lambda capture, freed LIFO by
             // das_delete at job end — so the heap does not grow across reuses. A job that LEAKS onto
             // the fork heap would accumulate; same pure-data contract as keepForkContexts.
-            if ( !forkSkipHeapReset ) fork->restartHeaps();
+            if ( !forkSkipHeapReset.load(std::memory_order_relaxed) ) fork->restartHeaps();
             return fork;
         }
         // none pooled: clone a fresh fork (skip the init script for pure-data jobs)
         CopyOptions opts;
         opts.category = category_;
-        opts.skipInitScript = forkSkipInitScript;
+        opts.skipInitScript = forkSkipInitScript.load(std::memory_order_relaxed);
         return new Context(*this, opts);
     }
 
     void Context::releaseForkContext ( Context * forkContext ) {
-        if ( keepForkContexts ) {
+        if ( keepForkContexts.load(std::memory_order_relaxed) ) {
             lock_guard<mutex> guard(forkContextPoolMutex);
             forkContextPool.push_back(forkContext);
         } else {

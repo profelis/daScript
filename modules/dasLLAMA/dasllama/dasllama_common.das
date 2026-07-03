@@ -1276,6 +1276,8 @@ struct Session {
     moe_hs : array<float>       // bucket hidden requant scales (same / 32)
     moe_gout : array<float>     // bucket (then shared-expert) down-projection output (npos x dim)
     moe_eout : array<float>     // routed expert outputs parked by (position, slot) (npos x k x dim)
+    ffn_offs : array<int64>     // dense/shexp gate+up fuse: 2 region (weight, activation) offset pairs
+    ffn_gu : array<float>       // dense/shexp gate+up fuse output — gate half then up half (2 x max_ffn_width)
     mx4_wq : array<int8>        // grouped-prefill expansion of ONE native-MXFP4 expert to exact Q8 (dim x n_ff_exp)
     mx4_ws : array<float>       // ... and its per-block scales (same / 32); see expand_mx4_region_q8
 }
@@ -1316,6 +1318,8 @@ def make_run_state(c : Config) : Session {
         s.moe_dq |> resize(c.n_expert_used * c.n_ff_exp)
         s.moe_ds |> resize(c.n_expert_used * c.n_ff_exp / 32l)
     }
+    s.ffn_offs |> resize(4)
+    s.ffn_gu |> resize(2l * ffw)
     let maxn = max(xdim, ffw)   // the Q8·Q8 path quantizes whichever activation feeds a matmul
     s.xq |> resize(maxn)
     s.xs |> resize(maxn / 32l)
@@ -1393,7 +1397,7 @@ def apply_box_profile_runtime(path : string = "") {
     }
     // "threads" is advisory — the worker count is fixed at jobque creation, controlled by the
     // DAS_JOBQUE_THREADS env (see tune_for_this_box.md); a profile can only recommend it. No live
-    // comparison here: get_total_hw_jobs() throws outside a job queue, and load_model may run there.
+    // comparison here: get_dispatch_lanes() throws outside a job queue, and load_model may run there.
     let adv = read_json_field(rt, "threads", -1l)
     if (adv > 0l) {
         to_log(LOG_INFO, "dasLLAMA: box profile advises threads = {adv} — ensure DAS_JOBQUE_THREADS={adv}\n")
@@ -1473,7 +1477,7 @@ def private rms_batch(var out : array<float>; src : array<float>; t : Model; wof
         var op = addr(out[0])
         let ip = reinterpret<float const?>(addr(src[0]))
         let wp = reinterpret<float const?>(addr(t.fblob[woff]))
-        maybe_parallel_for(dim * npos >= g_norm_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(dim * npos >= g_norm_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let off = int64(p) * dim
@@ -1504,7 +1508,7 @@ def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model
         var kp = addr(k_b[0])
         let ffp = has_ff ? reinterpret<float const?>(addr(t.rope_freqs[0])) : null
         let rope_par = (qd + kv_dim) * npos >= g_rope_par_threshold
-        maybe_parallel_for(rope_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(rope_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let pp = int64(p)
@@ -1566,7 +1570,7 @@ def private rope_batch_tab(var q_b : array<float>; var k_b : array<float>; cos_t
         let cp = reinterpret<float const?>(addr(cos_tab[0]))
         let sp = reinterpret<float const?>(addr(sin_tab[0]))
         let rope_par = (qd + kv_dim) * npos >= g_rope_par_threshold
-        maybe_parallel_for(rope_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(rope_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let pp = int64(p)
@@ -1598,7 +1602,7 @@ def private kv_store_batch(var key_cache : array<float>; var value_cache : array
         var vcp = addr(value_cache[0])
         let kbp = reinterpret<float const?>(addr(k_b[0]))
         let vbp = reinterpret<float const?>(addr(v_b[0]))
-        maybe_parallel_for(kv_dim * npos >= g_kv_store_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(kv_dim * npos >= g_kv_store_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             let m0 = int64(rb) * kv_dim
             let cnt = (int64(re) - int64(rb)) * kv_dim
             unsafe {
@@ -1615,13 +1619,20 @@ def private kv_store_batch(var key_cache : array<float>; var value_cache : array
 // the only non-bit-exactness is exp4's ~2 ulp. Fork workers touch raw base pointers; self-gates on
 // g_act_par_threshold so small prompts (and decode, npos=1) run inline.
 def private gate_batch(var g : array<float>; u : array<float>; act : FfnAct; hidden, npos : int64) {
+    unsafe {
+        gate_batch(addr(g[0]), reinterpret<float const?>(addr(u[0])), act, hidden, npos)
+    }
+}
+
+// pointer-level core — the fused gate+up dispatch acts on the halves of one groupn output buffer
+def private gate_batch(var gp0 : float?; up0 : float const?; act : FfnAct; hidden, npos : int64) {
     let is_gelu = act == FfnAct.gelu
     let is_oai = act == FfnAct.swiglu_oai
     let vec = g_act_vec
     unsafe {
-        var gp = addr(g[0])
-        var up = reinterpret<float const?>(addr(u[0]))
-        maybe_parallel_for(hidden * npos >= g_act_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        var gp = gp0
+        var up = up0
+        maybe_parallel_for(hidden * npos >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let off = int64(p) * hidden
@@ -1783,7 +1794,7 @@ def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<i
         var qp = addr(xqb[0])
         var sp = addr(xsb[0])
         let rq_par = n * npos >= g_requant_par_threshold
-        maybe_parallel_for(rq_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(rq_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let pp = int64(p)
@@ -1957,13 +1968,30 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         prof_add("norm", ts_vnorm)
     }
     // RoPE on q (qd) and k (kv_dim) — sliding layers may use their own θ / position scale (Gemma3),
-    // and p-RoPE arches (gemma4) apply the rope_freqs factors to GLOBAL layers only
+    // and p-RoPE arches (gemma4) apply the rope_freqs factors to GLOBAL layers only. Table path:
+    // this position's cos/sin row was built ONCE in forward() (bit-identical values) — the leaves
+    // are called DIRECTLY, same as rope_batch_tab, to dodge the pass-through-const-write-elision.
     let ts_rope = ref_time_ticks()
-    let theta = is_sliding ? c.rope_freq_base_swa : c.rope_freq_base
-    let fscale = is_sliding ? c.rope_freq_scale_swa : c.rope_freq_scale
-    let use_ff = !(c.rope_ff_global_only && is_sliding)
-    rope_apply(s.q, pos, head_size, qd, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
-    rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+    if (g_use_rope_table) {
+        let swa_row = is_sliding && has_dual_rope(c)
+        unsafe {
+            let crow = swa_row ? reinterpret<float const?>(addr(s.rope_cos_swa[0])) : reinterpret<float const?>(addr(s.rope_cos[0]))
+            let srow = swa_row ? reinterpret<float const?>(addr(s.rope_sin_swa[0])) : reinterpret<float const?>(addr(s.rope_sin[0]))
+            if (c.rope_neox) {
+                rope_scaled_neox_tab(addr(s.q[0]), head_size, qd, crow, srow)
+                rope_scaled_neox_tab(addr(s.k[0]), head_size, kv_dim, crow, srow)
+            } else {
+                rope_scaled_tab(addr(s.q[0]), head_size, qd, crow, srow)
+                rope_scaled_tab(addr(s.k[0]), head_size, kv_dim, crow, srow)
+            }
+        }
+    } else {
+        let theta = is_sliding ? c.rope_freq_base_swa : c.rope_freq_base
+        let fscale = is_sliding ? c.rope_freq_scale_swa : c.rope_freq_scale
+        let use_ff = !(c.rope_ff_global_only && is_sliding)
+        rope_apply(s.q, pos, head_size, qd, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+        rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+    }
     prof_add("rope", ts_rope)
     // store k, v for this position into the KV cache
     let ts_kv = ref_time_ticks()
@@ -1979,7 +2007,9 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let ts_attn = ref_time_ticks()
     let seq_len = c.seq_len
     let attn_softcap = c.attn_logit_softcap
-    let attn_par = cnt * head_size * n_heads >= g_decode_attn_par_threshold
+    // team dispatch costs ~µs, so the fifo-measured crossover no longer applies: always thread
+    // (ggml threads flash-attn at any depth; measured 1B ctx8 attn 420 → 194 µs/tok under team)
+    let attn_par = get_jobque_team_mode() || cnt * head_size * n_heads >= g_decode_attn_par_threshold
     let sinksp = (c.attn_sinks
         ? unsafe(reinterpret<float const?>(unsafe(addr(t.fblob[t.sinks_off + l * n_heads]))))
         : null)
@@ -1989,7 +2019,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         let vcp = reinterpret<float const?>(addr(s.value_cache[0]))
         var xbp = addr(s.xb[0])
         var attp = addr(s.att[0])
-        maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (h in range(rb, re)) {
                     let hh = int64(h)
@@ -2047,16 +2077,37 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
     prof_add("norm", ts_norm1)
     // gated FFN: hb = act(W1·xb) * (W3·xb) — silu (SwiGLU) or gelu (GeGLU, Gemma2)
     let ts_ffn = ref_time_ticks()
-    mm(s.hb, t, t.w1_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
-    mm(s.hb2, t, t.w3_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
-    prof_add("mm_ffn", ts_ffn)
-    let ts_act = ref_time_ticks()
-    gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)   // fused act*gate; same kernel as prefill (npos=1 → inline)
-    prof_add("act", ts_act)
-    // down projection, optional post-FFN norm, residual
-    let ts_ffn2 = ref_time_ticks()
-    mm(s.xb, t, t.w2_off + l * hidden * dim, s.hb, s.xq, s.xs, hidden, dim)
-    prof_add("mm_ffn", ts_ffn2)
+    if (t.quant == QuantMode.q8) {
+        // gate+up share the activation: ONE quantize + ONE region-list dispatch into ffn_gu's
+        // halves (bit-identical — same quants, same per-row dots, only the scheduling changes)
+        quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+        s.ffn_offs[0] = t.w1_off + l * dim * hidden
+        s.ffn_offs[1] = 0l
+        s.ffn_offs[2] = t.w3_off + l * dim * hidden
+        s.ffn_offs[3] = 0l
+        mm_at_q8_groupn(s.ffn_gu, t, s.ffn_offs, 2l, s.xq, s.xs, dim, hidden)
+        prof_add("mm_ffn", ts_ffn)
+        let ts_act = ref_time_ticks()
+        unsafe {
+            gate_batch(addr(s.ffn_gu[0]), reinterpret<float const?>(addr(s.ffn_gu[hidden])), c.ffn_act, hidden, 1l)
+        }
+        prof_add("act", ts_act)
+        // down projection off the gated half
+        let ts_down = ref_time_ticks()
+        quantize_q8_0_into(s.ffn_gu, hidden, s.xq, s.xs, 0l, 0l)
+        mm_at_q8_pre(s.xb, t, t.w2_off + l * hidden * dim, s.xq, s.xs, hidden, dim)
+        prof_add("mm_ffn", ts_down)
+    } else {
+        mm(s.hb, t, t.w1_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
+        mm(s.hb2, t, t.w3_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
+        prof_add("mm_ffn", ts_ffn)
+        let ts_act = ref_time_ticks()
+        gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)   // fused act*gate; same kernel as prefill (npos=1 → inline)
+        prof_add("act", ts_act)
+        let ts_ffn2 = ref_time_ticks()
+        mm(s.xb, t, t.w2_off + l * hidden * dim, s.hb, s.xq, s.xs, hidden, dim)
+        prof_add("mm_ffn", ts_ffn2)
+    }
     let ts_resid1 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm before the residual add
         rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
@@ -2285,14 +2336,23 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
         let nsh = c.n_ff_shexp
         let she = dim * nsh
         if (pre_q8) {
-            mm_at_q8_pre(s.hb, t, t.wsh1_off + l * she, s.moe_xq, s.moe_xs, dim, nsh)
-            mm_at_q8_pre(s.hb2, t, t.wsh3_off + l * she, s.moe_xq, s.moe_xs, dim, nsh)
+            // shexp gate+up share the hoisted xb quants: one region-list dispatch, act on the halves
+            s.ffn_offs[0] = t.wsh1_off + l * she
+            s.ffn_offs[1] = 0l
+            s.ffn_offs[2] = t.wsh3_off + l * she
+            s.ffn_offs[3] = 0l
+            mm_at_q8_groupn(s.ffn_gu, t, s.ffn_offs, 2l, s.moe_xq, s.moe_xs, dim, nsh)
+            unsafe {
+                gate_batch(addr(s.ffn_gu[0]), reinterpret<float const?>(addr(s.ffn_gu[nsh])), c.ffn_act, nsh, 1l)
+            }
+            quantize_q8_0_into(s.ffn_gu, nsh, s.xq, s.xs, 0l, 0l)
+            mm_at_q8_pre(s.xb2, t, t.wsh2_off + l * she, s.xq, s.xs, nsh, dim)
         } else {
             mm(s.hb, t, t.wsh1_off + l * she, s.xb, s.xq, s.xs, dim, nsh)
             mm(s.hb2, t, t.wsh3_off + l * she, s.xb, s.xq, s.xs, dim, nsh)
+            gate_batch(s.hb, s.hb2, c.ffn_act, nsh, 1l)
+            mm(s.xb2, t, t.wsh2_off + l * she, s.hb, s.xq, s.xs, nsh, dim)
         }
-        gate_batch(s.hb, s.hb2, c.ffn_act, nsh, 1l)
-        mm(s.xb2, t, t.wsh2_off + l * she, s.hb, s.xq, s.xs, nsh, dim)
         for (i in range64(dim)) {
             s.moe_acc[i] += g * s.xb2[i]
         }
@@ -2360,6 +2420,20 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     }
     prof_add("embed", ts_embed)
 
+    // this position's RoPE cos/sin row(s), shared across all layers and q/k (the decode twin of
+    // prefill's table: the classic path recomputes pow/cos/sin per PAIR per layer — bit-identical
+    // values, trig deduplicated). Dual-rope arches get the sliding class's row alongside.
+    if (g_use_rope_table) {
+        let ts_rope_build = ref_time_ticks()
+        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l, c.head_size, true)
+        if (has_dual_rope(c)) {
+            let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
+            build_rope_table(s.rope_cos_swa, s.rope_sin_swa, t, c.rope_freq_base_swa, c.rope_freq_scale_swa,
+                             pos, 1l, swa_hs, !c.rope_ff_global_only)
+        }
+        prof_add("rope_build", ts_rope_build)
+    }
+
     // per-layer transformer stack — attention then FFN, each through the arch's registered block
     for (l in range64(c.n_layers)) {
         t.blocks.attn_decode(t, s, l, pos)
@@ -2426,7 +2500,8 @@ def get_act_par_threshold() : int64 => g_act_par_threshold
 // amortize first. Default MEASURED (M1 Max, quiet box, 2026-07-02): the inline-vs-threaded
 // crossover sits at ~200-260K work on both Llama-3.2-1B (hs 64 × 32 heads) and gemma-4-12B
 // (hs 512 × 16 heads); below it threading costs ≤2%, above it wins grow to +74%/+89% at 2048 ctx.
-// Set huge to disable, 0 to always thread (the A/B).
+// Set huge to disable, 0 to always thread (the A/B). Under team dispatch the gate is bypassed —
+// the ~90µs fifo fork/join this crossover amortizes shrinks to ~µs, and threading wins at any depth.
 var g_decode_attn_par_threshold = 262_144l
 def set_decode_attn_par_threshold(v : int64) { g_decode_attn_par_threshold = max(v, 0l) }
 def get_decode_attn_par_threshold() : int64 => g_decode_attn_par_threshold
@@ -2511,13 +2586,37 @@ def get_moe_grouped_prefill() : bool {
 var g_forward_prof_acc : table<string; int64>
 
 //! Start a fresh measurement window (zero the per-section accumulators).
+var g_forward_prof_disp : table<string; int64>    // parallel_for dispatches per section
+var g_forward_prof_chunks : table<string; int64>   // chunks (jobs) pushed per section
+var g_forward_prof_inline : table<string; int64>   // inline (non-dispatched) runs per section
+var g_prof_mark_disp = 0l
+var g_prof_mark_chunks = 0l
+var g_prof_mark_inline = 0l
+
 def forward_profile_reset() {
     g_forward_prof_acc |> clear()
+    g_forward_prof_disp |> clear()
+    g_forward_prof_chunks |> clear()
+    g_forward_prof_inline |> clear()
+    g_prof_mark_disp = get_disp_count()
+    g_prof_mark_chunks = get_disp_chunks()
+    g_prof_mark_inline = get_disp_inline()
 }
 
+// Sections are sequential and each span ends in exactly one prof_add, so the dispatch-counter
+// deltas since the previous prof_add belong to `name` — jobs-per-section with no call-site changes.
 def private prof_add(name : string; t0 : int64) {
     let cur = g_forward_prof_acc?[name] ?? 0l
     g_forward_prof_acc[name] = cur + int64(get_time_usec(t0))
+    let dc = get_disp_count()
+    let ch = get_disp_chunks()
+    let il = get_disp_inline()
+    g_forward_prof_disp[name] = (g_forward_prof_disp?[name] ?? 0l) + (dc - g_prof_mark_disp)
+    g_forward_prof_chunks[name] = (g_forward_prof_chunks?[name] ?? 0l) + (ch - g_prof_mark_chunks)
+    g_forward_prof_inline[name] = (g_forward_prof_inline?[name] ?? 0l) + (il - g_prof_mark_inline)
+    g_prof_mark_disp = dc
+    g_prof_mark_chunks = ch
+    g_prof_mark_inline = il
 }
 
 //! The accumulated time (us) for one section since the last reset (0 if the section never ran).
@@ -2531,9 +2630,12 @@ def forward_profile_report() {
     for (v in values(g_forward_prof_acc)) {
         total += v
     }
-    to_log(LOG_INFO, "=== forward profile (us, summed over the window; prefill + decode share the buckets) ===\n")
+    to_log(LOG_INFO, "=== forward profile (us | % | dispatches | chunks | inline-runs; prefill + decode share the buckets) ===\n")
     for (k, v in keys(g_forward_prof_acc), values(g_forward_prof_acc)) {
-        to_log(LOG_INFO, "  {k}: {v} ({100l * v / max(total, 1l)}%)\n")
+        let dd = g_forward_prof_disp?[k] ?? 0l
+        let cc = g_forward_prof_chunks?[k] ?? 0l
+        let ii = g_forward_prof_inline?[k] ?? 0l
+        to_log(LOG_INFO, "  {k}: {v} ({100l * v / max(total, 1l)}%) | disp {dd} | chunks {cc} | inline {ii}\n")
     }
     to_log(LOG_INFO, "  TOTAL: {total}\n")
 }
@@ -2684,7 +2786,7 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
             // per-head packing scratch bases (sized in forward_prefill for this mode)
             var qpk0 = addr(s.fa_q[0]);  var kpk0 = addr(s.fa_k[0]);  var vpk0 = addr(s.fa_v[0])
             var kqp0 = addr(s.fa_kq[0]); var vkqp0 = addr(s.fa_vkq[0])
-            maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+            maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
                 unsafe {
                     for (h in range(rb, re)) {
                         let hh = int64(h)
@@ -2703,7 +2805,7 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
                 }
             }
         } elif (g_attn_prefill_mode == AttnPrefillMode.blocked) {
-            maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+            maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
                 unsafe {
                     for (h in range(rb, re)) {
                         let hh = int64(h)
@@ -2774,7 +2876,7 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
                 }
             }
         } else {
-            maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+            maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
                 unsafe {
                     for (h in range(rb, re)) {
                         let hh = int64(h)
@@ -3019,7 +3121,7 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
         var qp = addr(wq[0])
         var sp = addr(ws[0])
         // scale bytes: 1:1 positional map in both the row-major and the interleaved layout
-        maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_total_hw_jobs()) $(sb, se) {
+        maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_dispatch_lanes()) $(sb, se) {
             unsafe {
                 for (bi in range(sb, se)) {
                     sp[bi] = e8m0_half(uint(ep[bi]))
@@ -3029,7 +3131,7 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
         if (g_active_mx4_expand_interleaved) {
             // interleaved: whole 4-row block-groups first, then the row-major tail rows
             let ngrp = (d / 4l) * (n / 32l)
-            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_total_hw_jobs()) $(gb, ge) {
+            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_dispatch_lanes()) $(gb, ge) {
                 unsafe {
                     for (bg0 in range(gb, ge)) {
                         let bg = int64(bg0)
@@ -3053,7 +3155,7 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
                 }
             }
         } else {
-            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_total_hw_jobs()) $(bb, be) {
+            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_dispatch_lanes()) $(bb, be) {
                 unsafe {
                     for (bi0 in range(bb, be)) {
                         let bi = int64(bi0)
@@ -3332,7 +3434,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let wp = reinterpret<float const?>(addr(s.moe_w_b[0]))
         let sp = nsh > 0l ? reinterpret<float const?>(addr(s.moe_gout[0])) : null
         let gp = nsh > 0l ? reinterpret<float const?>(addr(s.moe_gl_b[0])) : null
-        maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let pp = int64(p)

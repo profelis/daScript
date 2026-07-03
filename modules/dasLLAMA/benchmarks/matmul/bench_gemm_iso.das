@@ -120,6 +120,12 @@ def bench_gemm_iso(b : B?) {
             set_jobque_worker_spin(spin_us)
             to_log(LOG_INFO, "worker spin override: {spin_us}us\n")
         }
+        // A/B the batch-oversplit knob (chunks per hw job) across alternating runs
+        if (has_env_variable("DASLLAMA_BATCH_CHUNKS")) {
+            let bc = to_int(get_env_variable("DASLLAMA_BATCH_CHUNKS"))
+            set_q8_batch_chunks_per_job(bc)
+            to_log(LOG_INFO, "batch chunks override: {bc}\n")
+        }
         // backend pin for row-major A/Bs on one binary (e.g. x64-avx2 vs x64-avx2-acc8), same
         // env contract as llama3_perf; the repack half below still switches to the repack tier
         if (has_env_variable("DASLLAMA_PIN_BACKEND")) {

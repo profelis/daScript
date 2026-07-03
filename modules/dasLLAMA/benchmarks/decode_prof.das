@@ -2,6 +2,7 @@ options gen2
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
+require dasllama/dasllama_math   // setup_dasllama_jobque_ (the engine-standard jobque config)
 require daslib/jobque_boost
 require daslib/clargs
 require daslib/fio
@@ -39,6 +40,15 @@ struct Args {
 
     @clarg_doc = "Override the decode-attention threading threshold (work units; 0 = always thread, -1 = keep default)"
     attn_par : int = -1
+
+    @clarg_doc = "Override the quantized-matmul oversplit factor (chunks per hw job; -1 = keep default)"
+    chunks : int = -1
+
+    @clarg_doc = "Team dispatch: workers self-serve chunks off one published atomic instead of per-chunk fifo jobs"
+    team : bool
+
+    @clarg_doc = "A/B: size chunk counts to workers only (the pre-fix split), not workers + caller lane"
+    legacy_lanes : bool
 
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
@@ -144,13 +154,15 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     return tok
 }
 
-def private run_profile(var t : Model; p, n, p2 : int64) {
+def private run_profile(var t : Model; p, n, p2 : int64; team : bool) {
     let c = t.config
     var s <- make_run_state(c)
     with_job_que() {
-        set_jobque_fork_pool(true, true)
-        set_jobque_batch_dispatch(true)
-        set_jobque_worker_spin(1000)
+        setup_dasllama_jobque_()   // pooled forks + batched dispatch + spin window + join poll (the engine standard)
+        if (team) {   // needs the live job que — must sit inside with_job_que
+            set_jobque_team_mode(true)
+            print("team dispatch: on\n")
+        }
         // warmup — JIT both paths (the real prefill below overwrites these cache positions)
         let warm <- build_prompt(8l)
         for (wp in range64(8l)) {
@@ -209,5 +221,13 @@ def main() {
         set_decode_attn_par_threshold(int64(cfg.attn_par))
         print("decode_attn_par_threshold override: {cfg.attn_par}\n")
     }
-    run_profile(t, p, n, p2)
+    if (cfg.chunks >= 1) {
+        set_q8_batch_chunks_per_job(cfg.chunks)
+        print("q8_batch_chunks_per_job override: {cfg.chunks}\n")
+    }
+    if (cfg.legacy_lanes) {
+        set_dispatch_caller_lane(false)
+        print("dispatch lanes: workers only (legacy)\n")
+    }
+    run_profile(t, p, n, p2, cfg.team)
 }

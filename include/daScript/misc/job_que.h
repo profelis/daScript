@@ -111,6 +111,18 @@ namespace das {
         // thread-wake per job — measured ~3-4.5us per notify_one to a PARKED worker vs ~0.1us to a
         // spinning one, paid serially by the DISPATCHING thread. Opt-in: spinning burns idle CPU.
         void setWorkerSpin ( int usec ) { mSpinUs = usec; }
+        // Team mode (opt-in, sticky): alongside the fifo, workers poll a single published team op
+        // and self-serve chunks off one atomic (the ggml threadpool shape). teamParallelFor
+        // replaces the whole per-chunk fifo path — no push, no mutex, no wait group, no condvar —
+        // with one seq bump per dispatch; join is a spin on a remaining counter. Hybrid poll/park
+        // like ggml's --poll: workers spin only for the setWorkerSpin window, then park; a publish
+        // that finds parked workers takes the fifo mutex and notifies (zero mutex traffic while
+        // everyone spins). Pair with setWorkerSpin — with a 0 window every publish pays the wake.
+        // Single dispatcher at a time.
+        void setTeamMode ( bool on );
+        bool getTeamMode () const { return mTeamMode.load(std::memory_order_relaxed) != 0; }
+        int getNumWorkers () const { return mThreadCount.load(); }
+        void teamParallelFor ( int numChunks, const JobChunk & work );   // work(chunkIndex, workerSlot); caller participates as slot getNumWorkers()
     protected:
         struct JobEntry {
             JobEntry( Job&& _function, JobCategory _category, JobPriority _priority) {
@@ -135,6 +147,7 @@ namespace das {
         void join();
         void job(int threadIndex);
         void submit(Job && job, JobCategory category, JobPriority priority);
+        bool runTeamChunks(int threadIndex, uint32_t & seqSeen);
     protected:
         condition_variable mCond;
         int mSleepMs;
@@ -148,6 +161,24 @@ namespace das {
         atomic<int> mJobsRunning{0};
         atomic<int32_t> mSpinUs{0};
         atomic<int32_t> mFifoCount{0};  // lock-free mirror of mFifo.size() for the spin poll
+    protected:
+        // team-mode publish slot. Publish order: work/remaining, then the mTeamOp single-word
+        // store {numChunks:32 | counter:32}, then the seq bump. Claimers fetch_add mTeamOp, so a
+        // claim carries its op's chunk count with the index — overflow (c >= K) self-describes,
+        // and an index can never pair with another op's count (the straggler epoch race a split
+        // counter + plain count field allowed). A valid claim's pending remaining-decrement blocks
+        // that op's join, which keeps mTeamWork (the dispatcher's stack) alive while dereferenced.
+        // mTeamSeq is only the publish generation: the park predicate + the workers' "anything
+        // new?" fast-path (so idle spinners don't touch mTeamOp).
+        atomic<int32_t>  mTeamMode{0};
+        atomic<uint32_t> mTeamSeq{0};
+        atomic<uint64_t> mTeamOp{0};
+        atomic<int32_t>  mTeamRemaining{0};
+        const JobChunk * mTeamWork = nullptr;
+        // workers currently in cond_wait — the publish-side wake gate. Dekker pair with mTeamSeq
+        // (worker: parked++ then read seq; publisher: bump seq then read parked — all four seq_cst),
+        // so either the worker sees the new op before sleeping or the publisher sees it parked.
+        atomic<int32_t>  mParkedWorkers{0};
     protected:
         mutex mEvalMainThreadMutex;
         vector<Job> mEvalMainThread;
