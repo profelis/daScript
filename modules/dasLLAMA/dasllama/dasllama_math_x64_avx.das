@@ -68,7 +68,7 @@ def dot_q8q8_x64dot4x4(wq : int8 const?; ws : float const?; xq : int8 const?; xs
 def private q8q8_kernel_x64_dot4x4(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 myp[i] = dot_q8q8_x64dot4x4(wp + int64(i) * n, sp + int64(i) * nb, xqp, xsp, n)
@@ -80,7 +80,7 @@ def private q8q8_kernel_x64_dot4x4(var yp : float?; wp : int8 const?; sp : float
 def private q8q8_batch_kernel_x64_dot4x4(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n
@@ -100,8 +100,8 @@ def private q8q8_group3_kernel_x64_dot4x4(var y0p : float?; var y1p : float?; va
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
-    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
-    parallel_for(0, int(dtot), get_total_hw_jobs()) $(rb, re, wg) {
+    count_parallel_dispatch(get_dispatch_lanes())   // dispatch observability (raw parallel_for site)
+    parallel_for(0, int(dtot), get_dispatch_lanes()) $(rb, re, wg) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -159,7 +159,7 @@ def dot_q8q8_x64ps(wq : int8 const?; ws : float const?; xq : int8 const?; xs : f
 def private q8q8_kernel_x64_ps(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 myp[i] = dot_q8q8_x64ps(wp + int64(i) * n, sp + int64(i) * nb, xqp, xsp, n)
@@ -171,7 +171,7 @@ def private q8q8_kernel_x64_ps(var yp : float?; wp : int8 const?; sp : float con
 def private q8q8_batch_kernel_x64_ps(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n
@@ -191,8 +191,8 @@ def private q8q8_group3_kernel_x64_ps(var y0p : float?; var y1p : float?; var y2
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
-    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
-    parallel_for(0, int(dtot), get_total_hw_jobs()) $(rb, re, wg) {
+    count_parallel_dispatch(get_dispatch_lanes())   // dispatch observability (raw parallel_for site)
+    parallel_for(0, int(dtot), get_dispatch_lanes()) $(rb, re, wg) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -258,7 +258,7 @@ def dot_q8q8_x64acc8(wq : int8 const?; ws : float const?; xq : int8 const?; xs :
 def private q8q8_kernel_x64_acc8(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 myp[i] = dot_q8q8_x64acc8(wp + int64(i) * n, sp + int64(i) * nb, xqp, xsp, n)
@@ -274,7 +274,7 @@ def private q8q8_batch_kernel_x64_acc8(var yp : float?; wp : int8 const?; sp : f
     // chunks from the fifo, so a straggler strands one small chunk instead of a whole 1/K range.
     // Measured on the 3990X @32 workers, qo x 512 tokens: x1 473, x4 655, x8 627 GMAC/s (hardware
     // ceiling 772 same-session) — x4 is the knee; ggml's chunked mul_mat is the same defense.
-    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs() * get_q8_batch_chunks_per_job()) $(rb, re) {
+    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes() * get_q8_batch_chunks_per_job()) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n
@@ -294,8 +294,8 @@ def private q8q8_group3_kernel_x64_acc8(var y0p : float?; var y1p : float?; var 
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
-    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
-    parallel_for(0, int(dtot), get_total_hw_jobs()) $(rb, re, wg) {
+    count_parallel_dispatch(get_dispatch_lanes())   // dispatch observability (raw parallel_for site)
+    parallel_for(0, int(dtot), get_dispatch_lanes()) $(rb, re, wg) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -452,7 +452,7 @@ def private q8q8_kernel_x64_grp4(var yp : float?; wp : int8 const?; sp : float c
     let nb = n / 32l
     let ng = d / 4l
     var myp = yp
-    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs()) $(rb, re) {
+    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), get_dispatch_lanes()) $(rb, re) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -482,7 +482,7 @@ def private q8q8_batch_kernel_x64_grp4(var yp : float?; wp : int8 const?; sp : f
     // @32 workers ntok=512: kv ng=128 x1 456 > x2 447 > x4 425 GMAC/s (floor binds -> x1); qo
     // ng=512 x4 473 > x1 430 (floor doesn't bind -> full oversplit).
     let TB = effective_token_block(g_q8_token_block, n)
-    let hw = get_total_hw_jobs()
+    let hw = get_dispatch_lanes()
     let njobs = clamp(int(ng / 4l), hw, hw * get_q8_batch_chunks_per_job())
     maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(ng), njobs) $(rb, re) {
         unsafe {
@@ -533,8 +533,8 @@ def private q8q8_group3_kernel_x64_grp4(var y0p : float?; var y1p : float?; var 
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
-    count_parallel_dispatch(get_total_hw_jobs())   // dispatch observability (raw parallel_for site)
-    parallel_for(0, int(ngtot), get_total_hw_jobs()) $(rb, re, wg) {
+    count_parallel_dispatch(get_dispatch_lanes())   // dispatch observability (raw parallel_for site)
+    parallel_for(0, int(ngtot), get_dispatch_lanes()) $(rb, re, wg) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)

@@ -45,6 +45,9 @@ struct Args {
     @clarg_doc = "Team dispatch: workers self-serve chunks off one published atomic instead of per-chunk fifo jobs"
     team : bool
 
+    @clarg_doc = "A/B: size chunk counts to workers only (the pre-fix split), not workers + caller lane"
+    legacy_lanes : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -213,6 +216,10 @@ def main() {
     if (cfg.chunks >= 1) {
         set_q8_batch_chunks_per_job(cfg.chunks)
         print("q8_batch_chunks_per_job override: {cfg.chunks}\n")
+    }
+    if (cfg.legacy_lanes) {
+        set_dispatch_caller_lane(false)
+        print("dispatch lanes: workers only (legacy)\n")
     }
     run_profile(t, p, n, p2, cfg.team)
 }

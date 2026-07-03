@@ -1397,7 +1397,7 @@ def apply_box_profile_runtime(path : string = "") {
     }
     // "threads" is advisory — the worker count is fixed at jobque creation, controlled by the
     // DAS_JOBQUE_THREADS env (see tune_for_this_box.md); a profile can only recommend it. No live
-    // comparison here: get_total_hw_jobs() throws outside a job queue, and load_model may run there.
+    // comparison here: get_dispatch_lanes() throws outside a job queue, and load_model may run there.
     let adv = read_json_field(rt, "threads", -1l)
     if (adv > 0l) {
         to_log(LOG_INFO, "dasLLAMA: box profile advises threads = {adv} — ensure DAS_JOBQUE_THREADS={adv}\n")
@@ -1477,7 +1477,7 @@ def private rms_batch(var out : array<float>; src : array<float>; t : Model; wof
         var op = addr(out[0])
         let ip = reinterpret<float const?>(addr(src[0]))
         let wp = reinterpret<float const?>(addr(t.fblob[woff]))
-        maybe_parallel_for(dim * npos >= g_norm_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(dim * npos >= g_norm_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let off = int64(p) * dim
@@ -1508,7 +1508,7 @@ def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model
         var kp = addr(k_b[0])
         let ffp = has_ff ? reinterpret<float const?>(addr(t.rope_freqs[0])) : null
         let rope_par = (qd + kv_dim) * npos >= g_rope_par_threshold
-        maybe_parallel_for(rope_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(rope_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let pp = int64(p)
@@ -1570,7 +1570,7 @@ def private rope_batch_tab(var q_b : array<float>; var k_b : array<float>; cos_t
         let cp = reinterpret<float const?>(addr(cos_tab[0]))
         let sp = reinterpret<float const?>(addr(sin_tab[0]))
         let rope_par = (qd + kv_dim) * npos >= g_rope_par_threshold
-        maybe_parallel_for(rope_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(rope_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let pp = int64(p)
@@ -1602,7 +1602,7 @@ def private kv_store_batch(var key_cache : array<float>; var value_cache : array
         var vcp = addr(value_cache[0])
         let kbp = reinterpret<float const?>(addr(k_b[0]))
         let vbp = reinterpret<float const?>(addr(v_b[0]))
-        maybe_parallel_for(kv_dim * npos >= g_kv_store_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(kv_dim * npos >= g_kv_store_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             let m0 = int64(rb) * kv_dim
             let cnt = (int64(re) - int64(rb)) * kv_dim
             unsafe {
@@ -1632,7 +1632,7 @@ def private gate_batch(var gp0 : float?; up0 : float const?; act : FfnAct; hidde
     unsafe {
         var gp = gp0
         var up = up0
-        maybe_parallel_for(hidden * npos >= g_act_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(hidden * npos >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let off = int64(p) * hidden
@@ -1794,7 +1794,7 @@ def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<i
         var qp = addr(xqb[0])
         var sp = addr(xsb[0])
         let rq_par = n * npos >= g_requant_par_threshold
-        maybe_parallel_for(rq_par, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(rq_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let pp = int64(p)
@@ -2005,7 +2005,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         let vcp = reinterpret<float const?>(addr(s.value_cache[0]))
         var xbp = addr(s.xb[0])
         var attp = addr(s.att[0])
-        maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (h in range(rb, re)) {
                     let hh = int64(h)
@@ -2760,7 +2760,7 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
             // per-head packing scratch bases (sized in forward_prefill for this mode)
             var qpk0 = addr(s.fa_q[0]);  var kpk0 = addr(s.fa_k[0]);  var vpk0 = addr(s.fa_v[0])
             var kqp0 = addr(s.fa_kq[0]); var vkqp0 = addr(s.fa_vkq[0])
-            maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+            maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
                 unsafe {
                     for (h in range(rb, re)) {
                         let hh = int64(h)
@@ -2779,7 +2779,7 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
                 }
             }
         } elif (g_attn_prefill_mode == AttnPrefillMode.blocked) {
-            maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+            maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
                 unsafe {
                     for (h in range(rb, re)) {
                         let hh = int64(h)
@@ -2850,7 +2850,7 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
                 }
             }
         } else {
-            maybe_parallel_for(attn_par, 0, int(n_heads), get_total_hw_jobs()) $(rb, re) {
+            maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
                 unsafe {
                     for (h in range(rb, re)) {
                         let hh = int64(h)
@@ -3092,7 +3092,7 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
         var qp = addr(wq[0])
         var sp = addr(ws[0])
         // scale bytes: 1:1 positional map in both the row-major and the interleaved layout
-        maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_total_hw_jobs()) $(sb, se) {
+        maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_dispatch_lanes()) $(sb, se) {
             unsafe {
                 for (bi in range(sb, se)) {
                     sp[bi] = e8m0_half(uint(ep[bi]))
@@ -3102,7 +3102,7 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
         if (g_active_needs_repack) {
             // interleaved: whole 4-row block-groups first, then the row-major tail rows
             let ngrp = (d / 4l) * (n / 32l)
-            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_total_hw_jobs()) $(gb, ge) {
+            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_dispatch_lanes()) $(gb, ge) {
                 unsafe {
                     for (bg0 in range(gb, ge)) {
                         let bg = int64(bg0)
@@ -3126,7 +3126,7 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
                 }
             }
         } else {
-            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_total_hw_jobs()) $(bb, be) {
+            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(nblk), get_dispatch_lanes()) $(bb, be) {
                 unsafe {
                     for (bi0 in range(bb, be)) {
                         let bi = int64(bi0)
@@ -3300,7 +3300,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let wp = reinterpret<float const?>(addr(s.moe_w_b[0]))
         let sp = nsh > 0l ? reinterpret<float const?>(addr(s.moe_gout[0])) : null
         let gp = nsh > 0l ? reinterpret<float const?>(addr(s.moe_gl_b[0])) : null
-        maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
+        maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
                     let pp = int64(p)
