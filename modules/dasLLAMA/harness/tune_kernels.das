@@ -46,6 +46,8 @@ struct GridRms {}
 struct GridDotQ4 {}
 [dasllama_grid(src = "dot_q8q8_template")]
 struct GridDotQ8Q8 {}
+[dasllama_grid(src = "dot_mx4q8_template")]
+struct GridDotMx4Q8 {}
 [dasllama_grid(src = "quantize_q8_0_into_ptr_template")]
 struct GridQuant {}
 [dasllama_grid(src = "rope_scaled_neox_tab_template")]
@@ -640,6 +642,85 @@ def bench_dot_q8q8() : string {
     return report("dot_q8q8", names, best, ok, "vec16")
 }
 
+// ===== dot_mx4q8: native-MXFP4 weight planes (deterministic nibbles + E8M0 bytes) vs Q8 activation.
+// The vec* perms are inert (straight-line tbl16/sdot4_w intrinsic body — the hint is ignored), so
+// only the unroll rows genuinely compete, exactly like laneq4x4.
+
+def bench_dot_mx4q8() : string {
+    let vs <- dot_mx4q8_template_variants()
+    let nv = length(vs)
+    let nb = N / 32l
+    var wn : array<uint8>
+    var we : array<uint8>
+    wn |> resize(int(N / 2l))
+    we |> resize(int(nb))
+    for (i in range(int(N / 2l))) {
+        wn[i] = uint8((i * 137 + 71) & 0xff)
+    }
+    for (i in range(int(nb))) {
+        we[i] = uint8(120 + (i * 7) % 16)
+    }
+    var xf : array<float>
+    xf |> resize(int(N))
+    for (i in range(int(N))) {
+        xf[i] = cos(float(i) * 0.07f)
+    }
+    let xq <- quantize_q8_0(xf, N)
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    var want = 0.0lf
+    for (bi in range64(nb)) {
+        var iacc = 0
+        for (j in range64(16l)) {
+            let b = int(wn[bi * 16l + j])
+            iacc += int(lut[b & 15]) * int(xq.q[bi * 32l + j])
+            iacc += int(lut[b >> 4]) * int(xq.q[bi * 32l + j + 16l])
+        }
+        want += double(iacc) * double(e8m0_half(uint(we[bi]))) * double(xq.scales[bi])
+    }
+    let lutp = unsafe(addr(lut[0]))
+    let wnp = unsafe(addr(wn[0]))
+    let wep = unsafe(addr(we[0]))
+    let xqp = unsafe(addr(xq.q[0]))
+    let xsp = unsafe(addr(xq.scales[0]))
+
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        let f = vs[i]._1
+        let got = double(f(lutp, wnp, wep, xqp, xsp, N))
+        ok[i] = abs(got - want) / (abs(want) + 1.0lf) <= TOL
+    }
+
+    var sink = 0.0f
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                sink += f(lutp, wnp, wep, xqp, xsp, N)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+    }
+    if (sink == 12345.678f) {
+        print("")   // keep sink live
+    }
+    return report("dot_mx4q8", names, best, ok, "u2")
+}
+
 // ===== quantize_q8_0_into_ptr: EXACT gate — every variant must produce byte-identical quants and
 // scales to the module's quantize_q8_0 reference (the store loop is elementwise round+narrow; any
 // difference under a perm is a miscompile, not a tolerance question).
@@ -1016,6 +1097,7 @@ def main {
     let rmsw = bench_rmsnorm()
     let dq4w = bench_dot_q4()
     let dq8w = bench_dot_q8q8()
+    let dmx4w = bench_dot_mx4q8()
     let quantw = bench_quantize()
     let ropew = bench_rope_tab()
     let gemmw = bench_gemm_tile()
@@ -1025,12 +1107,12 @@ def main {
     // [tuned(fallback=...)] perm; bare [tuned] ships the vec8_u2 majority = BASELINE).
     print("\n===== summary (winner per kernel) =====\n")
     let knames = fixed_array("dot", "axpy", "add_inplace", "mul_inplace", "scale_inplace", "copy_floats",
-        "softmax", "rmsnorm", "dot_q4", "dot_q8q8", "quantize_q8_0_into_ptr",
+        "softmax", "rmsnorm", "dot_q4", "dot_q8q8", "dot_mx4q8", "quantize_q8_0_into_ptr",
         "rope_scaled_neox_tab", "gemm_f32_uk_4x16", "dot_q8q8_laneq4x4")
     let kwin = fixed_array(dotw, axpyw, addw, mulw, scalew, copyw,
-        softmaxw, rmsw, dq4w, dq8w, quantw, ropew, gemmw, laneqw)
+        softmaxw, rmsw, dq4w, dq8w, dmx4w, quantw, ropew, gemmw, laneqw)
     let kfall = fixed_array(BASELINE, BASELINE, BASELINE, BASELINE, BASELINE, BASELINE,
-        BASELINE, "plain", "vec4_u4", "vec16", "plain",
+        BASELINE, "plain", "vec4_u4", "vec16", "u2", "plain",
         BASELINE, "u2", "u2")
     var changed = 0
     for (k, w, f in knames, kwin, kfall) {
@@ -1060,7 +1142,7 @@ def main {
     let profile = JV((dot = dotw, axpy = axpyw, add_inplace = addw,
         mul_inplace = mulw, scale_inplace = scalew, copy_floats = copyw,
         softmax = softmaxw, softmax_sink = softmaxw, rmsnorm = rmsw,
-        dot_q4 = dq4w, dot_q8q8 = dq8w, quantize_q8_0_into_ptr = quantw,
+        dot_q4 = dq4w, dot_q8q8 = dq8w, dot_mx4q8 = dmx4w, quantize_q8_0_into_ptr = quantw,
         rope_scaled_neox_tab = ropew, gemm_f32_uk_4x16 = gemmw, dot_q8q8_laneq4x4 = laneqw,
         runtime = runtime))
     let js = write_json(profile)

@@ -132,6 +132,303 @@ def private q8q8_group3_kernel_neon_sdot4x4(var y0p : float?; var y1p : float?; 
     }
 }
 
+// ===== MXFP4·Q8 (native 4-bit expert weights) =====
+
+[hint(unsafe_range_check, noalias = lut, noalias = wn, noalias = we, noalias = xq, noalias = xs)]
+def template dot_mx4q8_template(lut : int8 const ?; wn : uint8 const ?; we : uint8 const ?; xq : int8 const ?; xs : float const ?; n : int64) : float {
+    let nb = n / 32l
+    var f = 0.0
+    for [tune = 1] (bi in range64(nb)) {   // fallback u2 = ggml's ib += 2 shape
+        let wp = unsafe(wn + bi * 16l)
+        let xp = unsafe(xq + bi * 32l)
+        var acc = int4(0, 0, 0, 0)
+        acc = sdot4_w(acc, tbl16_lo(lut, wp), xp)
+        acc = sdot4_w(acc, tbl16_hi(lut, wp), unsafe(xp + 16l))
+        f += float(acc.x + acc.y + acc.z + acc.w) * e8m0_half(uint(unsafe(we[bi]))) * unsafe(xs[bi])
+    }
+    return f
+}
+
+//! ARM TBL+SDOT MXFP4·Q8 dot (the NEON body of ggml_vec_dot_mxfp4_q8_0): per 32-block, one v16i8
+//! nibble load feeds two TBL lookups of the doubled-e2m1 LUT (low nibbles = elems 0..15, high =
+//! 16..31), each result SDOTing in-register against the Q8 activation (sdot4_w — no memory
+//! round-trip), the exact int32 block sum flushing through e8m0_half(we) × xs. Same per-block flush
+//! order as dot_mx4q8_scalar. Only the unroll perms genuinely apply (the body is straight-line
+//! tbl16/sdot4_w intrinsics); fallback u2 mirrors ggml's 2-block iteration. Not `private`: called
+//! from inside the lifted parallel_for worker lambdas.
+[hint(unsafe_range_check, noalias = lut, noalias = wn, noalias = we, noalias = xq, noalias = xs), tuned(fallback = "u2")]
+def dot_mx4q8(lut : int8 const?; wn : uint8 const?; we : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float {}
+
+def private mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    myp[i] = dot_mx4q8(lutp, wn + int64(i) * (n / 2l), we + int64(i) * nb, xqp, xsp, n)
+                }
+            }
+        }
+    }
+}
+
+// ===== region-list (groupN) kernels — the MoE decode dispatch fuse =====
+// One parallel_for over nregions * d rows (or nregions * d/4 interleaved groups): all k routed
+// experts' gates (or ups, or downs) in ONE fork/join. Per-row math identical to the single-region
+// kernels — bit-exact, only the scheduling changes.
+
+def private q8q8_groupn_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+        unsafe {
+            for (i in range(rb, re)) {
+                let ii = int64(i)
+                let r = ii / d
+                let row = ii % d
+                let woff = offs[r * 2l]
+                let xoff = offs[r * 2l + 1l]
+                var v = dot_q8q8_sdot4x4(wp + woff + row * n, sp + woff / 32l + row * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + row]
+                }
+                myp[ii] = v
+            }
+        }
+    }
+}
+
+def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nb = n / 32l
+    let ng = d / 4l
+    var myp = yp
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), get_total_hw_jobs()) $(gb, ge) {
+        unsafe {
+            for (gi in range(gb, ge)) {
+                let gg = int64(gi)
+                let r = gg / ng
+                let g = gg % ng
+                let woff = offs[r * 2l]
+                let xoff = offs[r * 2l + 1l]
+                var f = dot_q8q8_laneq4(wp + woff + g * 4l * n, sp + woff / 32l + g * 4l * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    let bb = boffs[r] + g * 4l
+                    f += float4(bp[bb], bp[bb + 1l], bp[bb + 2l], bp[bb + 3l])
+                }
+                let yb = r * d + g * 4l
+                myp[yb + 0l] = f.x
+                myp[yb + 1l] = f.y
+                myp[yb + 2l] = f.z
+                myp[yb + 3l] = f.w
+            }
+        }
+    }
+    unsafe {
+        for (r in range64(nregions)) {   // row tails (d % 4): row-major sdot4x4 per region
+            let woff = offs[r * 2l]
+            let xoff = offs[r * 2l + 1l]
+            for (i in range64(ng * 4l, d)) {
+                var v = dot_q8q8_sdot4x4(wp + woff + i * n, sp + woff / 32l + i * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + i]
+                }
+                myp[r * d + i] = v
+            }
+        }
+    }
+}
+
+def private mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let ii = int64(i)
+                    let r = ii / d
+                    let row = ii % d
+                    let woff = offs[r * 2l]
+                    let xoff = offs[r * 2l + 1l]
+                    var v = dot_mx4q8(lutp, wn + woff / 2l + row * (n / 2l), we + woff / 32l + row * nb,
+                        xqp + xoff, xsp + xoff / 32l, n)
+                    if (bp != null) {
+                        v += bp[boffs[r] + row]
+                    }
+                    myp[ii] = v
+                }
+            }
+        }
+    }
+}
+
+def private mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nrow = n / 2l
+    let nbb = n / 32l
+    let ng = d / 4l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), get_total_hw_jobs()) $(gb, ge) {
+            unsafe {
+                for (gi in range(gb, ge)) {
+                    let gg = int64(gi)
+                    let r = gg / ng
+                    let g = gg % ng
+                    let woff = offs[r * 2l]
+                    let xoff = offs[r * 2l + 1l]
+                    var f = dot_mx4q8_laneq4(lutp, wn + woff / 2l + g * 4l * nrow, we + woff / 32l + g * 4l * nbb,
+                        xqp + xoff, xsp + xoff / 32l, n)
+                    if (bp != null) {
+                        let bb = boffs[r] + g * 4l
+                        f += float4(bp[bb], bp[bb + 1l], bp[bb + 2l], bp[bb + 3l])
+                    }
+                    let yb = r * d + g * 4l
+                    myp[yb + 0l] = f.x
+                    myp[yb + 1l] = f.y
+                    myp[yb + 2l] = f.z
+                    myp[yb + 3l] = f.w
+                }
+            }
+        }
+        for (r in range64(nregions)) {   // row tails (d % 4): row-major dot per region
+            let woff = offs[r * 2l]
+            let xoff = offs[r * 2l + 1l]
+            for (i in range64(ng * 4l, d)) {
+                var v = dot_mx4q8(lutp, wn + woff / 2l + i * nrow, we + woff / 32l + i * nbb,
+                    xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + i]
+                }
+                myp[r * d + i] = v
+            }
+        }
+    }
+}
+
+// ===== MXFP4 laneq form (interleaved 4-row groups) — mx4 model load only =====
+// The mx repack (repack_mx4_neon) interleaves nibble BYTES 4-rows-per-sub-chunk: block bi of a
+// group is 64 bytes at + bi*64, sub-chunk j (j = 0..3) = [r0 nb(4j..4j+3) | r1 | r2 | r3] — so ONE
+// v16i8 load + tbl16_lo/tbl16_hi yields BOTH laneq weight vectors of that sub-chunk (k 4j..4j+3
+// and k 16+4j..19+4j across the 4 rows; a nibble byte x holds elems x low / x+16 high). E8M0
+// scale bytes interleave 4-per-block ([r0e r1e r2e r3e] at + bi*4). Tail rows (d % 4) stay
+// row-major and run the row-major dot_mx4q8. This is the mx4 twin of llama.cpp's block_mxfp4x4
+// repacked GEMV — where its gpt-oss decode number lives.
+
+//! Interleaved MXFP4·Q8 dot over one 4-row group against one token: per 32-block, 4 nibble loads
+//! feed 8 TBL + 8 indexed SDOT (each tbl result is one laneq weight vector, fed as a VALUE via
+//! sdot4_laneq_w) — accumulator lane L is output row L, flushed through the 4 rows' e8m0_half
+//! scales × the token block scale. No horizontal reduce. Not `private`: called from inside the
+//! lifted parallel_for worker lambdas.
+[hint(unsafe_range_check, noalias = lut, noalias = wg, noalias = eg, noalias = xq, noalias = xs)]
+def dot_mx4q8_laneq4(lut : int8 const?; wg : uint8 const?; eg : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float4 {
+    let nb = n / 32l
+    var f = float4(0.0, 0.0, 0.0, 0.0)
+    unsafe {
+        for (bi in range64(nb)) {
+            let wb = bi * 64l
+            let xb = bi * 32l
+            var acc = int4(0, 0, 0, 0)
+            acc = sdot4_laneq_w(acc, tbl16_lo(lut, wg + wb), xq + xb, 0)
+            acc = sdot4_laneq_w(acc, tbl16_hi(lut, wg + wb), xq + xb + 16l, 0)
+            acc = sdot4_laneq_w(acc, tbl16_lo(lut, wg + wb + 16l), xq + xb, 1)
+            acc = sdot4_laneq_w(acc, tbl16_hi(lut, wg + wb + 16l), xq + xb + 16l, 1)
+            acc = sdot4_laneq_w(acc, tbl16_lo(lut, wg + wb + 32l), xq + xb, 2)
+            acc = sdot4_laneq_w(acc, tbl16_hi(lut, wg + wb + 32l), xq + xb + 16l, 2)
+            acc = sdot4_laneq_w(acc, tbl16_lo(lut, wg + wb + 48l), xq + xb, 3)
+            acc = sdot4_laneq_w(acc, tbl16_hi(lut, wg + wb + 48l), xq + xb + 16l, 3)
+            let s = float4(e8m0_half(uint(eg[bi * 4l])), e8m0_half(uint(eg[bi * 4l + 1l])),
+                e8m0_half(uint(eg[bi * 4l + 2l])), e8m0_half(uint(eg[bi * 4l + 3l])))
+            let xsb = xs[bi]
+            f += float4(acc) * s * float4(xsb, xsb, xsb, xsb)
+        }
+    }
+    return f
+}
+
+// In-place repack of one MXFP4 region [d x n] into the interleaved-group layout above. Copies both
+// planes to a scratch, then writes the interleaved layout back; tail rows (d % 4) stay row-major.
+// Runs once per expert tensor at load, on the main context.
+def private repack_mx4_neon(var np : uint8?; var ep : uint8?; n, d : int64) {
+    let nrow = n / 2l    // nibble bytes per row
+    let nbb = n / 32l    // blocks per row
+    let ng = d / 4l
+    var tn : array<uint8>
+    var te : array<uint8>
+    tn |> resize(d * nrow)
+    te |> resize(d * nbb)
+    unsafe {
+        var tnp = addr(tn[0])
+        var tep = addr(te[0])
+        for (i in range64(d * nrow)) {
+            tnp[i] = np[i]
+        }
+        for (i in range64(d * nbb)) {
+            tep[i] = ep[i]
+        }
+        for (g in range64(ng)) {
+            let gnb = g * 4l * nrow
+            for (bi in range64(nbb)) {
+                let dst = gnb + bi * 64l
+                for (j in range64(4l)) {
+                    for (r in range64(4l)) {
+                        let src = (g * 4l + r) * nrow + bi * 16l + j * 4l
+                        let dj = dst + j * 16l + r * 4l
+                        np[dj + 0l] = tnp[src + 0l]
+                        np[dj + 1l] = tnp[src + 1l]
+                        np[dj + 2l] = tnp[src + 2l]
+                        np[dj + 3l] = tnp[src + 3l]
+                    }
+                }
+            }
+            let geb = g * 4l * nbb
+            for (bi in range64(nbb)) {
+                for (r in range64(4l)) {
+                    ep[geb + bi * 4l + r] = tep[(g * 4l + r) * nbb + bi]
+                }
+            }
+        }
+    }
+    delete tn
+    delete te
+}
+
+def private mx4q8_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nrow = n / 2l
+    let nbb = n / 32l
+    let ng = d / 4l
+    var myp = yp
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), get_total_hw_jobs()) $(rb, re) {
+            unsafe {
+                for (gi in range(rb, re)) {
+                    let g = int64(gi)
+                    let f = dot_mx4q8_laneq4(lutp, wn + g * 4l * nrow, we + g * 4l * nbb, xqp, xsp, n)
+                    myp[g * 4l + 0l] = f.x
+                    myp[g * 4l + 1l] = f.y
+                    myp[g * 4l + 2l] = f.z
+                    myp[g * 4l + 3l] = f.w
+                }
+            }
+        }
+        for (i in range64(ng * 4l, d)) {   // row tail (d % 4): row-major dot
+            myp[i] = dot_mx4q8(lutp, wn + i * nrow, we + i * nbb, xqp, xsp, n)
+        }
+    }
+}
+
 // ===== laneq backend (lane-indexed SDOT over interleaved 4-row groups) — Q8 model load only =====
 // Weights are repacked at load (repack_q8q8_neon) so each accumulator lane is a distinct output row:
 // no per-block horizontal reduce. Activated by select_matmul_backend_for_load at Q8 model load, never
@@ -420,11 +717,16 @@ def dasllama_math_aarch64_neon_register() {
         // (tests, benchmarks). priority 10 out-ranks portable (0).
         register_kernel_backend(KernelBackend(name = "arm64-sdot", mm = @@q8q8_kernel_neon_sdot4x4,
             batch = @@q8q8_batch_kernel_neon_sdot4x4, group3 = @@q8q8_group3_kernel_neon_sdot4x4,
-            repack = @@repack_q8q8_identity, needs_repack = false, priority = 10))
+            repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel_neon,
+            groupn = @@q8q8_groupn_kernel_neon_sdot4x4, groupn_mx4 = @@mx4q8_groupn_kernel_neon,
+            needs_repack = false, priority = 10))
         // arm64-laneq: laneq + interleaved repack — the highest priority (20), but needs_repack, so only
-        // select_matmul_backend_for_load (at Q8 model load, which then repacks) activates it.
+        // select_matmul_backend_for_load (at Q8 model load, which then repacks) activates it. Its mx4
+        // pair reads/writes the interleaved-group mx layout (repack_mx4_neon above).
         register_kernel_backend(KernelBackend(name = "arm64-laneq", mm = @@q8q8_kernel_neon_laneq,
             batch = @@q8q8_batch_kernel_neon_laneq, group3 = @@q8q8_group3_kernel_neon_laneq,
-            repack = @@repack_q8q8_neon, needs_repack = true, priority = 20))
+            repack = @@repack_q8q8_neon, mm_mx4 = @@mx4q8_kernel_neon_laneq, repack_mx4 = @@repack_mx4_neon,
+            groupn = @@q8q8_groupn_kernel_neon_laneq, groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq,
+            needs_repack = true, priority = 20))
     }
 }

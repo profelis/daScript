@@ -474,7 +474,7 @@ def test_parity_gemma4_12b(t : T?) {
     }
 }
 
-// gpt-oss-20b (arch "gpt-oss", MXFP4 experts transcoded to Q8 at load) — the wave-5 stack: per-head
+// gpt-oss-20b (arch "gpt-oss", native-MXFP4 expert planes — attn/cls Q8) — the wave-5 stack: per-head
 // attention sinks, YaRN rope (factor 32 / 4096), alternating 128-token SWA, softmax-after-top-k
 // routing with router + per-expert + QKV + output-projection biases, clamped SwiGLU. Counting
 // prompt "1, 2, 3, 4, 5, 6, 7," (no BOS — gpt-4o pre adds none). The o200k ids for the prompt
@@ -490,7 +490,7 @@ let GPTOSS_GEN <- [220l, 23l, 11l, 220l, 24l, 11l, 220l, 702l, 11l, 220l,
 // The second gpt-oss fixture, window-engaged: "1, 2, …, 150," (449 tokens ≫ the 128-token window,
 // so sliding layers genuinely clip — kstart > 0) ENCODED IN-TEST through the gpt-4o pre-tokenizer
 // (verified id-for-id against the oracle's tokenization), gating the tokenizer AND the forward,
-// same pattern as the gemma4 fixture. Both fixtures share ONE model load (the ~26GB Q8 transcode
+// same pattern as the gemma4 fixture. Both fixtures share ONE model load (the ~13GB native-mx4 resident
 // is the suite's biggest resident — loading it twice back-to-back OOMs a 64GB box).
 let GPTOSS_LONG_GEN <- [220l, 17395l, 11l, 220l, 17336l, 11l, 220l, 17773l, 11l, 220l,
                         19145l, 11l, 220l, 17385l, 11l, 220l, 18369l, 11l, 220l, 19676l,
@@ -508,7 +508,7 @@ def private gptoss_counting_prompt() : string {
 
 [test]
 def test_parity_gptoss_20b(t : T?) {
-    t |> run("gpt-oss forward (gpt-oss-20b MXFP4->Q8, sinks + YaRN + MoE biases; short + window-engaged)") @(t : T?) {
+    t |> run("gpt-oss forward (gpt-oss-20b native-MXFP4 experts, sinks + YaRN + MoE biases; short + window-engaged)") @(t : T?) {
         if (!jit_enabled()) {
             t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
             return

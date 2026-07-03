@@ -341,16 +341,42 @@ typedef MatmulQ8Q8Group3Fn = function<(var y0p : float?; var y1p : float?; var y
 // In-place repack of one Q8 weight region [d rows x n cols] (raw pointers at the region start) into
 // the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
 typedef RepackQ8Q8Fn = function<(var wp : int8?; var sp : float?; n : int64; d : int64) : void>
+// MXFP4·Q8 GEMV: W kept in its native 4-bit form as two planes — `wn` packed nibbles (16 bytes per
+// 32-block, row stride n/2) + `we` RAW E8M0 scale bytes (1 per block, row stride n/32) — against a
+// pre-quantized Q8 activation. Native half-traffic path for MoE expert stacks (gpt-oss decode).
+typedef MatmulMx4Q8Fn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+// In-place repack of one MXFP4 region [d rows x n cols] (raw plane pointers at the region start)
+// into the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
+typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d : int64) : void>
+// Region-list GEMV, ONE dispatch for N same-shape [d x n] projections (the MoE decode fuse: all k
+// routed experts' gates — or ups, or downs — in one fork/join instead of k). `offs` packs PAIRS
+// per region: [2r] = the weight-element offset of region r's rows (into the blob the wp/sp — or
+// wn/we — pointers base), [2r+1] = the activation-element offset (into xqp/xsp; xsp offset =
+// element/32) — so regions may share one activation (gates/ups) or each bring their own (downs).
+// Region r's d outputs land at yp + r*d. A non-null `bp` adds a per-region bias vector at the
+// store — region r's row `row` gets + bp[boffs[r] + row], done by the worker that owns the row
+// (the alternative is a serial caller-side add_bias pass, ~36us/layer on gpt-oss); bit-identical
+// to add-after (same add, same chain point). Bit-exact vs the per-region loop: the same per-row
+// dots, only scheduled in one parallel_for.
+typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
-//! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first.
+//! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
+//! (mm_mx4 and repack_mx4 follow the same flag — one layout decision per backend).
 //! priority = higher wins the auto-select (portable 0; arm64 sdot 10 / laneq 20; x64 vnni 20 later).
+//! mm_mx4 = the MXFP4·Q8 GEMV (native 4-bit expert weights); every backend supplies one (the portable
+//! scalar form at minimum) so the mx4 path dispatches exactly like the Q8 one.
 struct KernelBackend {
     name : string
     mm : MatmulQ8Q8Fn
     batch : MatmulQ8Q8BatchFn
     group3 : MatmulQ8Q8Group3Fn
     repack : RepackQ8Q8Fn
+    mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
+    repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
+    groupn : MatmulQ8Q8GroupNFn = @@q8q8_unset_groupn
+    groupn_mx4 : MatmulMx4GroupNFn = @@mx4q8_unset_groupn
     needs_repack : bool
     priority : int
 }
@@ -360,7 +386,11 @@ struct KernelBackend {
 var g_mm_q8q8 = @@q8q8_unset_kernel
 var g_mm_q8q8_batch = @@q8q8_unset_batch
 var g_mm_q8q8_group3 = @@q8q8_unset_group3
+var g_mm_mx4q8 = @@mx4q8_unset_kernel
+var g_mm_q8q8_groupn = @@q8q8_unset_groupn
+var g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
+var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 
 var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
@@ -372,6 +402,10 @@ var g_backend_pin = ""              // A/B: force this backend by name; "" = aut
 [unused_argument(wp, sp, n, d)]
 def repack_q8q8_identity(var wp : int8?; var sp : float?; n, d : int64) {}
 
+//! Default MXFP4 repack: no-op — the planes stay row-major for the portable / row-major kernels.
+[unused_argument(np, ep, n, d)]
+def repack_mx4_identity(var np : uint8?; var ep : uint8?; n, d : int64) {}
+
 def private no_backend() {
     panic("dasLLAMA: no Q8·Q8 kernel backend registered — require dasllama/dasllama_math_default")
 }
@@ -381,12 +415,22 @@ def private q8q8_unset_kernel(var yp : float?; wp : int8 const?; sp : float cons
 def private q8q8_unset_batch(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) { no_backend() }
 [unused_argument(y0p, y1p, y2p, wp, sp, woff0, woff1, woff2, xqp, xsp, n, d0, d1, d2)]
 def private q8q8_unset_group3(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) { no_backend() }
+[unused_argument(yp, wn, we, xqp, xsp, n, d)]
+def private mx4q8_unset_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private q8q8_unset_groupn(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
     g_mm_q8q8_batch = be.batch
     g_mm_q8q8_group3 = be.group3
+    g_mm_mx4q8 = be.mm_mx4
+    g_mm_q8q8_groupn = be.groupn
+    g_mm_mx4q8_groupn = be.groupn_mx4
     g_repack_q8q8 = be.repack
+    g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
     g_active_needs_repack = be.needs_repack
 }
@@ -466,6 +510,26 @@ def repack_q8q8_weight(var qblob : array<int8>; var qscales : array<float>; woff
     }
 }
 
+//! Repack one native-MXFP4 weight tensor (region at weight-element offset woff in the mxq/mxs
+//! planes, shape [d rows x n cols]) into the active backend's layout, IN PLACE. No-op unless a
+//! repack backend is enabled. n % 32 == 0.
+def repack_mx4_weight(var mxq : array<uint8>; var mxs : array<uint8>; woff, n, d : int64) {
+    unsafe {
+        invoke(g_repack_mx4, addr(mxq[woff / 2l]), addr(mxs[woff / 32l]), n, d)
+    }
+}
+
+//! Does backend `name` read an interleaved (repacked) weight layout? false for unknown names.
+//! Lets tests / direct callers skip layout-mismatched A/Bs (a repack backend cannot run on
+//! row-major buffers).
+def kernel_backend_needs_repack(name : string) : bool {
+    var r = false
+    g_kernel_backends |> get(name) $(be) {
+        r = be.needs_repack
+    }
+    return r
+}
+
 //! Q8·Q8 matmul: y = W·x with W as int8 quants `wq` [d x n] + scales `ws` [d x n/32] and the
 //! activation PRE-quantized to (xq [n], xs [n/32]) by the caller (it's shared across all d rows, so
 //! quantizing once amortizes). Dispatches to the active backend (g_mm_q8q8). n % 32 == 0.
@@ -502,6 +566,94 @@ def matmul_q8q8_group3(var y0 : array<float>; var y1 : array<float>; var y2 : ar
             reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
             woff0, woff1, woff2,
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d0, d1, d2)
+    }
+}
+
+// ===== MXFP4·Q8: native 4-bit weights (MoE expert stacks) =====
+// A 32-elem MXFP4 block is 16 packed nibble bytes (low nibble = elem j, high = elem j+16) + one RAW
+// E8M0 scale byte, held in two separate planes so the nibble stream is 16-byte-regular for TBL. The
+// nibbles index the DOUBLED e2m1 table (ggml kvalues_mxfp4); the scale byte converts via e8m0_half
+// (2^(e-128), the half compensating the doubling). Kernels dispatch through g_mm_mx4q8 exactly like
+// the Q8 ones.
+
+//! E8M0 scale byte -> fp32 * 0.5 = 2^(e-128) — pairs with the DOUBLED e2m1 nibble values
+//! (mxfp4_fill_lut). e < 2 lands in fp32-denormal territory -> precomputed bit patterns (mirrors
+//! ggml_e8m0_to_fp32_half; dasllama_gguf keeps a private twin so the generic GGUF reader stays
+//! dependency-free).
+def e8m0_half(e : uint) : float {
+    let bits = e < 2u ? (0x00200000u << e) : ((e - 1u) << 23u)
+    return unsafe(reinterpret<float>(bits))
+}
+
+//! Fill a 16-byte LUT with the MXFP4 e2m1 magnitudes DOUBLED (nibble -> ±{0,.5,1,1.5,2,3,4,6}×2,
+//! OCP MX spec via ggml kvalues_mxfp4) as int8 — the table `tbl16_lo`/`tbl16_hi` and the scalar
+//! kernels index; the halved E8M0 scale (e8m0_half) compensates.
+def mxfp4_fill_lut(var lut : int8[16]) {
+    let kv = fixed_array(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
+    for (i in range(16)) {
+        lut[i] = int8(kv[i])
+    }
+}
+
+//! MXFP4·Q8 GEMV: y = W·x with W native 4-bit — `wn` packed nibbles [d x n/2 bytes] + `we` raw E8M0
+//! scale bytes [d x n/32] — and the activation PRE-quantized to (xq [n], xs [n/32]) by the caller.
+//! Dispatches to the active backend (g_mm_mx4q8). n % 32 == 0.
+def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
+//! Region-list Q8·Q8 GEMV: ONE dispatch for `nregions` same-shape [d x n] projections (see the
+//! MatmulQ8Q8GroupNFn doc for the packed `offs` pairs). wq/ws are the WHOLE blob (offsets are
+//! absolute); xq/xs hold the activation row(s) the offs pairs index. Region r -> y[r*d .. r*d+d).
+def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; offs : array<int64>; nregions : int64;
+                       xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_groupn, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased form: adds bias[boffs[r] + row] at the store (see the MatmulQ8Q8GroupNFn doc).
+def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; offs : array<int64>; nregions : int64;
+                       xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_groupn, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
+    }
+}
+
+//! Region-list MXFP4·Q8 GEMV — the native-4-bit twin of matmul_q8q8_groupn (offsets in weight
+//! elements into the whole nibble/scale planes; the kernels derive the /2 and /32 byte positions).
+def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                        xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased form: adds bias[boffs[r] + row] at the store (see the MatmulQ8Q8GroupNFn doc).
+def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                        xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
     }
 }
 

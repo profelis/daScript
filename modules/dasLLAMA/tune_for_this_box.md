@@ -16,7 +16,7 @@ finish it first; tuning an incorrect kernel is worse than pointless).
 | Axis | Knob | Bound when | Consumer |
 |---|---|---|---|
 | Kernel backend (ISA) | auto by priority; `pin_kernel_backend(name)` for A/B; loader picks repack backends; profile `runtime.backend` pins | runtime | `matmul_q8q8*` wrappers |
-| Loop hints per kernel (`vectorize_width` × `unroll_count`) | `box_profile.json` flat keys, read at **compile time** by `[tuned]` | compile (JIT re-keys automatically) | all 15 `[tuned]` kernels: dot, axpy, add/mul/scale_inplace, copy_floats, softmax(+_sink), rmsnorm, dot_q4, dot_q8q8, quantize_q8_0_into_ptr, rope_scaled_neox_tab, gemm_f32_uk_4x16, dot_q8q8_laneq4x4 |
+| Loop hints per kernel (`vectorize_width` × `unroll_count`) | `box_profile.json` flat keys, read at **compile time** by `[tuned]` | compile (JIT re-keys automatically) | all 16 `[tuned]` kernels: dot, axpy, add/mul/scale_inplace, copy_floats, softmax(+_sink), rmsnorm, dot_q4, dot_q8q8, dot_mx4q8, quantize_q8_0_into_ptr, rope_scaled_neox_tab, gemm_f32_uk_4x16, dot_q8q8_laneq4x4 |
 | Token block `TB` | `set_q8_token_block(n)` (default 128) / profile `runtime.q8_token_block` | runtime | the repack-tier batch kernel only |
 | L2 budget (TB cliff guard) | `set_q8_l2_budget(bytes)` (default 4 MB — provisional, one M1 Max) / profile `runtime.q8_l2_budget` | runtime | `effective_token_block(tb, n) = clamp(tb, 1, budget/n)` (dasllama_math.das) |
 | Threading thresholds | `set_matmul_par_threshold`, `set_decode_attn_par_threshold` (decode attention over heads — default 262144, the measured M1 Max crossover; sweep inline-vs-threaded at a few context depths to re-derive on a new box), + the six prefill-pass setters (`set_attn/requant/norm/rope/kv_store/act_par_threshold`) / profile `runtime.*_par_threshold` | runtime | every `maybe_parallel_for` gate — the crossovers encode the box's ~90µs (M1) job-dispatch cost |
@@ -156,10 +156,12 @@ other models. This is the kernel scoreboard; `prefill_perf.das` is the end-to-en
 
 ## Tool 4 — per-op profiling (ours and theirs)
 
-- **Ours:** `prefill_profile_report()` buckets (embed / rope_build / rope / kv_store / attn /
-  mm_qkv / mm_wo / mm_ffn / act / gate / final...) — `benchmarks/prefill_perf.das` drives
-  them. Caveat: `mm_gemm`/`mm_requant` are inner-leaf timers of ALL matmuls and double-count
-  against the `mm_*` site buckets — compare within a tier, don't sum across tiers.
+- **Ours:** `forward_profile_report()` buckets (embed / rope_build / rope / kv_store / attn /
+  mm_qkv / mm_wo / mm_ffn / mm_moe / act / gate / final...) — decode and prefill feed the same
+  accumulator, so reset the window around whichever phase you're measuring
+  (`benchmarks/prefill_perf.das` exercises the prefill paths). Caveat: `mm_gemm`/`mm_requant`
+  are inner-leaf timers of the batched matmuls and double-count against the `mm_*` site
+  buckets — compare within a tier, don't sum across tiers.
 - **Theirs (the recipe that found the M1 gap):** patch llama.cpp's
   `ggml_graph_compute_thread` (ggml-cpu.c) to accumulate thread-0 wall time per `node->op`
   into a static table dumped at exit → a MUL_MAT / FLASH_ATTN_EXT / ROPE / ... breakdown to

@@ -361,7 +361,10 @@ what it costs today and what the fix would change.
   is the next lever). gpt-oss-20b: prefill us ~219 vs 117 (~1.9× FASTER — the grouped MoE GEMM);
   decode us ~19 vs ~39-42 (~0.47× — exactly the MXFP4→Q8 doubled expert-weight-traffic asymmetry
   quantified: the native-MXFP4/Q4_0 entry below is now the headline gpt-oss decode lever).
-  (Spotted waves 3/5.)
+  POST-JOBQUE (#3361 wake propagation + batch dispatch + worker spin, same-window anchors):
+  12B decode 7.3 → 7.9 t/s vs 8.63 (gap 84% → ~92%); gpt-oss decode 19.2 → 22.0 vs 39.9
+  (0.47× → 0.55×) — the dispatch-latency share of the decode gap is banked; what remains on
+  gpt-oss is the weight-format asymmetry. (Spotted waves 3/5.)
 - **DONE (perf pass, 2026-07-02): MoE prefill runs expert-bucketed grouped GEMMs — bit-exact.**
   `ffn_moe_prefill_grouped` routes every position (one batched router GEMM + the shared
   `moe_select`), CSR-buckets the (position, slot) pairs by expert, runs one batched GEMM chain
@@ -378,12 +381,27 @@ what it costs today and what the fix would change.
   down-projections quantize s.hb into the shared xq/xs, which would clobber a hoisted image
   there) and routes every gate/up matmul through `mm_at_q8_pre`. Bit-identical (same quants).
   (Spotted wave 4.)
-- **MXFP4 experts transcode to Q8 — doubling their bytes.** gpt-oss-20b's expert stacks are
-  4.25 bit/weight on disk (~10GB) but run as Q8 (~19GB + 2.4GB scales): 2× the resident memory
-  AND 2× the decode weight traffic vs a native MXFP4 kernel (per-block E8M0 scale + 16-entry
-  nibble LUT — the int8 side of the SDOT pipeline could eat un-LUTed nibbles with a lane
-  table). Q4_0 storage is the existing halfway house (same 4-bit traffic, one lossy requant,
-  no new kernel) — worth an A/B before writing MXFP4-native matmuls. (Spotted wave 5.)
+- **DONE (MXFP4 arc, 2026-07-02): native-MXFP4 expert stacks + repacked TBL/SDOT kernels + the
+  MoE dispatch fuse.** Was: gpt-oss-20b's 4.25-bit expert stacks ran as Q8 (2× resident, 2×
+  decode traffic). Now: the stacks stay as raw nibble + E8M0 planes (mxq/mxs, exact disk bits —
+  the old dequant→requant amax error is gone), decoded in-register by new aarch64_neon
+  intrinsics (tbl16_lo/tbl16_hi = vqtbl1q_s8 of the doubled-e2m1 LUT; sdot4_w / sdot4_laneq_w
+  take the tbl result as a VALUE) through dot_mx4q8 ([tuned], row-major) and dot_mx4q8_laneq4
+  (interleaved 4-row repack, the block_mxfp4x4 twin). Grouped prefill expands each touched
+  expert to EXACT Q8 (lossless: q = LUT int, scale = e8m0_half), writing the interleaved form
+  directly on a repack backend; short prompts route per-position (npos·k ≥ 8·n_expert guard).
+  On top, the MoE decode dispatch fuse: region-list groupn/groupn_mx4 kernels run all k
+  experts' gates (ups, downs) in ONE fork/join — 288 → ~72 mm dispatches/token, bit-exact.
+  Measured (QUIET box, 2026-07-02, same-window anchors): decode 22.0 → **31.8 t/s** @ ctx 8
+  (30.7 @ ctx 512) vs llama-bench tg64 41.1 — **0.55× → 0.77×**; per-op profile: mm_moe 50%
+  measured vs 47.9% theoretical share (the 66/66 format asymmetry is GONE), MoE mms sustain
+  ~77GB/s vs the dense mms' ~99 (the remaining MoE-efficiency gap = the next lever); 12B decode
+  7.98 vs anchor 8.67 (92%, unchanged — dense path untouched); resident 26 → 13.2GB; every
+  fixture token-for-token unchanged (no refreeze — the counting fixtures absorbed all
+  kernel-order changes). Cost paid: gpt-oss pp512 ~186 → ~121-149 t/s (the per-expert
+  expansion) vs llama.cpp's 119.9 — still ≥ parity; the native mx4 batch GEMM in the expansion
+  entry below reclaims it. (Spotted wave 5; the Q4_0 halfway house was skipped — native landed
+  directly.)
 - **q4 has no batched prefill kernel — prefill collapses to decode rate.** The q4 path serves
   everything through the scalar fp32-activation `dot_q4`/`matmul_q4` (no q8-style token-blocked
   batch GEMM, no NEON arm, no repack backend), so a q4 prefill runs at generation speed:
@@ -425,6 +443,31 @@ what it costs today and what the fix would change.
   top_k=0, and all parity fixtures are greedy), but it's the sampling path the tutorials teach.
   Fix = single-pass partial selection (bounded min-heap of size top_k, or threshold-and-count).
   (Spotted tune audit, 2026-07-02.)
+- **DONE (MXFP4 arc follow-up, 2026-07-02): the mm_moe bandwidth-gap profile + the bias fold.**
+  Iso-benched the exact decode dispatch shape (4× [2880 x 2880] regions, DRAM-rotating):
+  the fused mx4 groupn GEMV sustains **~101 GB/s — bandwidth parity with the q8 dense kernels**
+  (the "77 GB/s" in-decode reading was largely single-window wobble: same build re-measured
+  90 GB/s an hour later; METHOD: only round-robin interleaved cells within one process are
+  trustworthy on this box, single-window absolutes swing ±10-15%). The pre-fuse 4×1 dispatch
+  shape measures 63-72 GB/s — the dispatch fuse was worth ~30% and is confirmed load-bearing.
+  Follow-up landed: **expert bias vectors fold into the groupn workers' stores** (bp/boffs on the
+  groupn contract; bit-identical to the post-pass add_bias, minus its serial ~36us/layer) —
+  decode 34.7 → **35.2 t/s @ ctx 8 / 33.8 @ ctx 512** (llama.cpp same-window anchor 41.1 →
+  0.86×). Also swept: decode-attn threshold 0-vs-262144 under the spinner at ctx 8/512 —
+  a WASH at both depths (the low-ctx attention is memory-latency-bound; threading's dispatch
+  cost ≈ its serial cost), so the measured default stands; moe_reduce/rope threading rejected
+  (~8us/layer each, below dispatch cost). What remains vs llama.cpp is their continuous-polling
+  threadpool (the bus never idles between ops) — picked up by the x64 arc's jobque work, not
+  patchable here. (Profiling session, 2026-07-02.)
+- **MXFP4 grouped prefill pays a per-touched-expert Q8 expansion (~120MB of traffic each, half of
+  it the repack scratch copy).** `expand_mx4_region_q8` writes exact row-major Q8 then runs the
+  load-time `repack_q8q8_weight` (temp copy + interleave) so the laneq batch GEMM applies. Levers,
+  in effort order: (a) expand DIRECTLY into the interleaved layout (folds the repack's copy away —
+  needs a backend-provided expand-repack, not a layout hardcode in common); (b) a native MXFP4
+  batch GEMM (mx4 twin of the laneq 4x4 tile — halves the GEMM's weight streaming too, likely wins
+  outright); (c) the `npos * k >= 8 * n_expert` tiny-batch guard is an ESTIMATED breakeven
+  (4-tok-prompt ttft 1895ms -> 114ms) — sweep it when the mx4 A/B rig exists. (Spotted MXFP4 arc,
+  2026-07-02.)
 - **Flash-attention tile shape is a frozen compile-time constant — deferred x64 tuning axis.**
   `ATTN_FLASH_QT/KV = 64×64` (dasllama_common.das) was chosen on M1 and never swept; tile shape
   is the classic per-box cache parameter, and x64's small private L2 differs in kind from M1's
