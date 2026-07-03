@@ -438,18 +438,48 @@ per-chunk time absorbed it. Kept for ggml parity + smaller tail + no-oversplit s
   `tune_kernels` + ISA-ladder territory — the original mission, now with the target metric:
   **GB/s per decoded token at T=24**.
 
+### Session 3 (2026-07-03 night): `tune_kernels` ran → box_profile.json exists (the original mission artifact)
+Sweep is fast (~1 min wall, 15 kernels × 20 perms, interleaved best-of, all correctness gates
+green). Real winners vs shipped fallbacks (rest ≤2-3% = noise floor, honest shape):
+| kernel | shipped | winner | isolated Δ |
+|---|---|---|--:|
+| dot_q8q8 | vec16 | u2 (any unroll ≥2; bare vec16 = worst) | **−22.5%** |
+| dot_q4 | vec4_u4 | vec8_u8 | −16% |
+| rope_scaled_neox_tab | vec8_u2 | plain | −21% |
+| rmsnorm | plain | vec8_u2 | **−87% (7.7×)** |
+Zen4 reading: plain `vec8` rules the float elementwise set (double-pumped 512 — 256-bit-shaped
+loops already saturate); vec16/vec32 only ever win on don't-care bandwidth kernels.
+**End-to-end: NEUTRAL.** ABBA brackets, 1B decode, gemv grain 128 pinned via env both sides:
+T=24 base 89.8/88.7 vs prof 90.2/88.4; defaults base 60.2/57.6 vs prof 64.4/56.3 (defaults
+swing 56-64 — chaotic, as usual). Why: decode's hot GEMVs run the repack-backend matrix
+kernels (hand intrinsics, not `[tuned]` templates), and the real wins live in ~1%-of-token
+buckets (rmsnorm, rope). The profile is still right: no-harm + big wins for portable-tier
+consumers. Runtime section hand-carries `matmul_min_chunk_rows_gemv=128`; the tuner writer
+now snapshots both grain knobs (was missing — predates session 2).
+**Note absolute drift again:** T=24 ~89 t/s tonight vs 94-96 this afternoon, same code —
+cross-session absolutes remain polluted; only in-bracket deltas count.
+
+### AVX_MATRIX master switch REMOVED (Boris, post-validation)
+Correctness held on real silicon (probe + gpt-oss token-for-token, 4 backends) → the
+`DASLLAMA_AVX_MATRIX=1` env gate is redundant. Matrix tiers now register unconditionally
+per-tier (`cpu_supports` gated); priorities unchanged (3-7, below shipped) so auto-selection
+is untouched — still pin-only until the ISA ladder promotes. `DASLLAMA_AVX_MATRIX_FORCE=1`
+kept (probe/validation on tier-less boxes). Suite sweeps now cover matrix backends by default
+on capable hardware.
+
 ## Open items / next
 - [x] ggml min-chunk-size comparison (teammate) → pick MIN_ROWS_PER_CHUNK / work metric.
 - [x] Implement + measure the min-chunk-size clamp (batch grain day-1; GEMV grain session 2).
 - [x] GEMV grain ladder → 128 on this box; grain-32 anomaly settled (real, mechanism understood).
-- [ ] **Decode lane cap** — dispatch decode matvecs on min(lanes, work/grain) TEAM lanes so the
-      other lanes skip the rendezvous entirely; the ~86 µs/dispatch tax × 81 disp/tok IS the
-      defaults-vs-knee gap. Needs jobque support (team subset dispatch) — design with Boris.
-- [ ] Per-shape / work-based GEMV grain (mm_qkv vs mm_ffn pull opposite) — after the lane cap.
+- [x] ~~Decode lane cap~~ CLOSED session 2c — the "86 µs tax" was per-chunk compute inflation
+      (bandwidth/frequency contention), not rendezvous; equal-split cap landed neutral, kept.
+- [ ] Per-shape / work-based GEMV grain (mm_qkv vs mm_ffn pull opposite) — low prio.
 - [ ] Per-cell VNNI-vs-donor A/B at a fixed thread count (the promote/delete question). Pin 96 baseline.
 - [ ] #3370 dispatch-lanes utilization delta on 96 cores.
 - [ ] In-model dasLLAMA vs llama.cpp (same thread count both sides), Llama-1B + Llama-8B + gpt-oss.
-- [ ] `tune_kernels` → box_profile.json for the EPYC (carry gemv grain 128 + T knee).
+- [x] `tune_kernels` → box_profile.json for the EPYC (gemv grain 128 carried; session 3).
+- [ ] **ISA-yield ladder** (portable→avx2→vnni256→avx512bw→avx512vnni, pin-interleaved) with the
+      target metric GB/s per decoded token at T=24 (113 now, lcpp 164) — THE open perf lever.
 
 ## Campaign method reminders
 - Correctness before speed; real-model tests = **small model, one run at a time** (the oracle

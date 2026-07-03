@@ -1133,6 +1133,8 @@ def main {
     // apply_box_profile_runtime. TB/L2-budget refinement stays manual (tune_tb.das shows the raw
     // cliff; edit the file under the knee); "threads" is advisory — set DAS_JOBQUE_THREADS to change it.
     let runtime = JV((q8_token_block = get_q8_token_block(), q8_l2_budget = get_q8_l2_budget(),
+        matmul_min_chunk_rows = get_matmul_min_chunk_rows(),
+        matmul_min_chunk_rows_gemv = get_matmul_min_chunk_rows_gemv(),
         matmul_par_threshold = get_matmul_par_threshold(), attn_par_threshold = get_attn_par_threshold(),
         decode_attn_par_threshold = get_decode_attn_par_threshold(),
         requant_par_threshold = get_requant_par_threshold(), norm_par_threshold = get_norm_par_threshold(),
