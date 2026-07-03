@@ -717,6 +717,6 @@ def dasllama_math_aarch64_neon_register() {
             batch = @@q8q8_batch_kernel_neon_laneq, group3 = @@q8q8_group3_kernel_neon_laneq,
             repack = @@repack_q8q8_neon, mm_mx4 = @@mx4q8_kernel_neon_laneq, repack_mx4 = @@repack_mx4_neon,
             groupn = @@q8q8_groupn_kernel_neon_laneq, groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq,
-            needs_repack = true, priority = 20))
+            needs_repack = true, mx4_expand_interleaved = true, priority = 20))
     }
 }

@@ -1795,6 +1795,20 @@ def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<i
     prof_add("mm_requant", ts_rq)
 }
 
+// Batched native-MXFP4 GEMM against a PRE-quantized activation image (the batch analog of
+// mm_at_mx4_pre): grouped MoE prefill dispatches here — no Q8 expansion — when the active backend
+// carries a native mx4 batch kernel (g_active_mx4_native_batch).
+def private mm_b_mx4_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
+    let total = n * d
+    let ts_gemm = ref_time_ticks()
+    array_view(t.mxq, woff / 2l, total / 2l) $(wn : array<uint8>#) {
+        array_view(t.mxs, woff / 32l, total / 32l) $(we : array<uint8>#) {
+            matmul_mx4q8_batch(y, wn, we, xqb, xsb, n, d, npos)
+        }
+    }
+    prof_add("mm_gemm", ts_gemm)
+}
+
 // Batched Q8 GEMM against a PRE-quantized activation image (the batch analog of mm_at_q8_pre) —
 // the grouped MoE prefill runs many GEMMs off one requant (the whole-batch image or a gathered
 // expert bucket).
@@ -2477,6 +2491,18 @@ def set_moe_grouped_prefill(on : bool) {
     g_moe_grouped_prefill = on
 }
 
+// Fused expert GEMMs in grouped MoE prefill (native mx4-batch backends only): all touched experts'
+// gate / up / down projections run as three region-list dispatches per layer (the llama.cpp
+// mul_mat_id shape) instead of a per-expert call chain. A/B toggle; bit-identical either way (the
+// same per-row dots, only the scheduling changes).
+var g_moe_fused_expert_gemms = true
+
+//! Select fused (region-list, default) vs per-expert expert GEMMs in the grouped MoE prefill on a
+//! native mx4-batch backend. Bit-identical either way — A/B benchmarking toggle.
+def set_moe_fused_expert_gemms(on : bool) {
+    g_moe_fused_expert_gemms = on
+}
+
 //! Whether the MoE prefill uses the grouped expert-bucketed path.
 def get_moe_grouped_prefill() : bool {
     return g_moe_grouped_prefill
@@ -2971,11 +2997,14 @@ def private moe_gather_rows(var s : Session; b0, cnt, dim, k : int64) {
 // into EXACT Q8 blocks in the given scratch: q[j] = the doubled-e2m1 LUT value (already an int8),
 // scale = e8m0_half(e) — no requantization error, every value representable. Grouped prefill runs
 // the proven Q8 batch GEMM off this scratch (one expansion per touched expert amortizes over the
-// whole bucket). On a repack backend the mx planes are ALREADY interleaved (repack_mx4_stacks),
-// and the interleaved nibble order maps byte-for-byte onto the interleaved Q8 order — nibble byte
-// `off` (0..63) of block-group bg lands at q8[bg*128 + off] (low nibbles, k-chunk 0..15) and
-// q8[bg*128 + 64 + off] (high, k 16..31), with the scale bytes 1:1 positional in BOTH layouts —
-// so the expansion writes the repacked form directly, no separate repack pass.
+// whole bucket). On a backend with mx4_expand_interleaved (arm64-laneq) the mx planes are ALREADY
+// interleaved (repack_mx4_stacks), and the interleaved nibble order maps byte-for-byte onto the
+// interleaved Q8 order — nibble byte `off` (0..63) of block-group bg lands at q8[bg*128 + off]
+// (low nibbles, k-chunk 0..15) and q8[bg*128 + 64 + off] (high, k 16..31), with the scale bytes
+// 1:1 positional in BOTH layouts — so the expansion writes the repacked form directly, no separate
+// repack pass. A repack backend WITHOUT that map (x64 grp4: repack_mx4 is identity, so the planes
+// are row-major, and the Q8 interleave is block-granular) expands row-major here and repacks the
+// scratch through the backend's own repack below.
 def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<int8>; var ws : array<float>) {
     let total = n * d
     wq |> resize(total)
@@ -2997,7 +3026,7 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
                 }
             }
         }
-        if (g_active_needs_repack) {
+        if (g_active_mx4_expand_interleaved) {
             // interleaved: whole 4-row block-groups first, then the row-major tail rows
             let ngrp = (d / 4l) * (n / 32l)
             maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_total_hw_jobs()) $(gb, ge) {
@@ -3040,6 +3069,12 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
             }
         }
     }
+    if (g_active_needs_repack && !g_active_mx4_expand_interleaved) {
+        // row-major-expanded scratch on a repack backend: interleave it through the backend's own
+        // Q8 repack so the batch kernels read their layout (x64 grp4). Bit-identical data, layout
+        // only; the direct-into-interleaved expand is the recorded follow-up lever.
+        repack_q8q8_weight(wq, ws, 0l, n, d)
+    }
 }
 
 // MoE FFN prefill, grouped: route every position, bucket the (position, slot) pairs by expert, and
@@ -3047,9 +3082,9 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
 // mul_mat_id shape). Bit-exact vs the per-position reference path: the batch GEMM is bit-for-bit
 // N x the single-token kernel, rows quantize identically, and the reduce applies the k weighted
 // outputs (then the shared expert) in exactly the decode accumulation order. (Native-MXFP4 experts
-// are the one exception — grouped runs the Q8 batch GEMM off an exact expansion while the
-// per-position path runs the mx4 GEMV, so the two differ by kernel summation order, like a kernel
-// perm change; the counting fixtures absorb that by design.)
+// are the one exception — grouped runs the backend's native mx4 batch kernel, or the Q8 batch GEMM
+// off an exact expansion, while the per-position path runs the mx4 GEMV, so the two may differ by
+// kernel summation order, like a kernel perm change; the counting fixtures absorb that by design.)
 def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     let dim = c.dim
@@ -3060,18 +3095,22 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     let nsh = c.n_ff_shexp
     let nfx = max(nfe, nsh)
     let nk = npos * k
+    // fused expert GEMMs (native mx4-batch backends): the gather / hidden / output images span
+    // every routed row at once (nk rows, bucket-ordered) instead of one expert's bucket at a time
+    let fused = t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms
+    let grows = fused ? nk : npos
     s.moe_rlog |> resize(npos * ne)
     s.moe_idx_b |> resize(nk)
     s.moe_w_b |> resize(nk)
     s.moe_cnt |> resize(ne)
     s.moe_bkt |> resize(nk)
-    s.moe_gxq |> resize(npos * dim)
-    s.moe_gxs |> resize(npos * nb)
-    s.moe_ghb |> resize(npos * nfx)
-    s.moe_ghb2 |> resize(npos * nfx)
-    s.moe_hq |> resize(npos * nfx)
-    s.moe_hs |> resize(npos * nfx / 32l)
-    s.moe_gout |> resize(npos * dim)
+    s.moe_gxq |> resize(grows * dim)
+    s.moe_gxs |> resize(grows * nb)
+    s.moe_ghb |> resize(grows * nfx)
+    s.moe_ghb2 |> resize(grows * nfx)
+    s.moe_hq |> resize(grows * nfx)
+    s.moe_hs |> resize(grows * nfx / 32l)
+    s.moe_gout |> resize(grows * dim)
     s.moe_eout |> resize(nk * dim)
     if (nsh > 0l) {
         s.moe_gl_b |> resize(npos)
@@ -3119,9 +3158,92 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     // 2. quantize every normed activation row ONCE (same per-row quants as the decode hoist)
     requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
 
+    // 3F. fused expert GEMMs (native mx4-batch backends): gather every routed row once (bucket
+    //     order), then ALL touched experts' gates, ups, and downs each run as ONE region-list
+    //     dispatch — the llama.cpp mul_mat_id shape, 3 fork/joins per layer instead of 3 per
+    //     expert, with chunks spanning experts so bucket-count imbalance load-balances. Bit-exact
+    //     vs the per-expert loop below: the same per-row dots / bias / act / requant per row, only
+    //     the scheduling changes.
+    if (fused) {
+        let ts_gather = ref_time_ticks()
+        moe_gather_rows(s, 0l, nk, dim, k)
+        prof_add("moe_gather", ts_gather)
+        // region triples (woff, row0, cnt) per touched expert; the three planes share row0/cnt
+        var offs1 : array<int64>
+        var offs3 : array<int64>
+        var offs2 : array<int64>
+        var boffs1 : array<int64>
+        var boffs3 : array<int64>
+        var boffs2 : array<int64>
+        offs1 |> reserve(ne * 3l)
+        offs3 |> reserve(ne * 3l)
+        offs2 |> reserve(ne * 3l)
+        if (c.moe_exps_bias) {
+            boffs1 |> reserve(ne)
+            boffs3 |> reserve(ne)
+            boffs2 |> reserve(ne)
+        }
+        var nreg = 0l
+        for (e in range64(ne)) {
+            let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
+            let cnt = s.moe_cnt[e] - b0
+            if (cnt == 0l) {
+                continue
+            }
+            let eg = l * ne + e
+            let base = eg * dim * nfe
+            offs1 |> push(t.we1_off + base)
+            offs1 |> push(b0)
+            offs1 |> push(cnt)
+            offs3 |> push(t.we3_off + base)
+            offs3 |> push(b0)
+            offs3 |> push(cnt)
+            offs2 |> push(t.we2_off + base)
+            offs2 |> push(b0)
+            offs2 |> push(cnt)
+            if (c.moe_exps_bias) {
+                boffs1 |> push(t.web1_off + eg * nfe)
+                boffs3 |> push(t.web3_off + eg * nfe)
+                boffs2 |> push(t.web2_off + eg * dim)
+            }
+            nreg++
+        }
+        let ts_g1 = ref_time_ticks()
+        if (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
+            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, offs1, nreg, s.moe_gxq, s.moe_gxs, t.fblob, boffs1, dim, nfe)
+            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, offs3, nreg, s.moe_gxq, s.moe_gxs, t.fblob, boffs3, dim, nfe)
+        } else {
+            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, offs1, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+        }
+        prof_add("mm_gemm", ts_g1)
+        let ts_act = ref_time_ticks()
+        gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, nk)
+        prof_add("act", ts_act)
+        requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
+        let ts_g3 = ref_time_ticks()
+        if (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
+            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, boffs2, nfe, dim)
+        } else {
+            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
+        }
+        prof_add("mm_gemm", ts_g3)
+        let ts_park = ref_time_ticks()
+        for (j in range64(nk)) {   // bucket row j -> the (position, slot) grid row for the reduce
+            copy_floats(s.moe_gout, j * dim, s.moe_eout, s.moe_bkt[j] * dim, dim)
+        }
+        prof_add("moe_park", ts_park)
+        delete offs1
+        delete offs3
+        delete offs2
+        delete boffs1
+        delete boffs3
+        delete boffs2
+    }
+
     // 3. one batched GEMM chain per touched expert over its gathered rows; raw down-projection
-    //    rows park in the (position, slot) grid for the ordered reduce
-    for (e in range64(ne)) {
+    //    rows park in the (position, slot) grid for the ordered reduce (skipped when fused ran)
+    for (e in range64(fused ? 0l : ne)) {
         let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
         let cnt = s.moe_cnt[e] - b0
         if (cnt == 0l) {
@@ -3132,15 +3254,23 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         prof_add("moe_gather", ts_gather)
         let eg = l * ne + e
         let base = eg * dim * nfe
-        if (t.experts_mx4) {   // exact Q8 expansion of this expert, then the proven batch GEMMs
+        if (t.experts_mx4 && g_active_mx4_native_batch) {
+            // native mx4 batch GEMMs straight off the nibble/E8M0 planes — no expansion
+            mm_b_mx4_pre(s.moe_ghb, t, t.we1_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+            mm_b_mx4_pre(s.moe_ghb2, t, t.we3_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        } elif (t.experts_mx4) {   // exact Q8 expansion of this expert, then the proven batch GEMMs
             let ts_ex = ref_time_ticks()
             expand_mx4_region_q8(t, t.we1_off + base, dim, nfe, s.mx4_wq, s.mx4_ws)
             prof_add("moe_expand", ts_ex)
+            let ts_g1 = ref_time_ticks()
             matmul_q8q8_batch(s.moe_ghb, s.mx4_wq, s.mx4_ws, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+            prof_add("mm_gemm", ts_g1)
             let ts_ex2 = ref_time_ticks()
             expand_mx4_region_q8(t, t.we3_off + base, dim, nfe, s.mx4_wq, s.mx4_ws)
             prof_add("moe_expand", ts_ex2)
+            let ts_g2 = ref_time_ticks()
             matmul_q8q8_batch(s.moe_ghb2, s.mx4_wq, s.mx4_ws, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+            prof_add("mm_gemm", ts_g2)
         } else {
             mm_b_q8_pre(s.moe_ghb, t, t.we1_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
             mm_b_q8_pre(s.moe_ghb2, t, t.we3_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
@@ -3155,11 +3285,15 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
         prof_add("act", ts_act)
         requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
-        if (t.experts_mx4) {
+        if (t.experts_mx4 && g_active_mx4_native_batch) {
+            mm_b_mx4_pre(s.moe_gout, t, t.we2_off + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+        } elif (t.experts_mx4) {
             let ts_ex3 = ref_time_ticks()
             expand_mx4_region_q8(t, t.we2_off + base, nfe, dim, s.mx4_wq, s.mx4_ws)
             prof_add("moe_expand", ts_ex3)
+            let ts_g3 = ref_time_ticks()
             matmul_q8q8_batch(s.moe_gout, s.mx4_wq, s.mx4_ws, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+            prof_add("mm_gemm", ts_g3)
         } else {
             mm_b_q8_pre(s.moe_gout, t, t.we2_off + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
         }
@@ -3246,6 +3380,8 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
     // Native-MXFP4 experts pay a per-touched-expert Q8 expansion in the grouped path (~120MB of
     // traffic per expert incl. the repack), so it only wins once buckets average enough rows to
     // amortize it — under ~8 rows/expert (short chat turns) the per-position mx4 GEMVs are cheaper.
+    // A native mx4-batch backend (x64) has no expansion tax, so its crossover sits lower (per-fork
+    // overhead only) — the 8-rows/expert gate is kept until re-measured there.
     let mx4_grouped_pays = !t.experts_mx4 || npos * c.n_expert_used >= 8l * c.n_expert
     if (t.quant == QuantMode.q8 && g_moe_grouped_prefill && mx4_grouped_pays) {
         ffn_moe_prefill_grouped(t, s, l, npos)

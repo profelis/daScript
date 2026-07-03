@@ -98,3 +98,51 @@ def dot32_acc8(var acc : float?; w : int8 const?; x : int8 const?; s : float) {
         }
     }
 }
+
+//! MXFP4-dequantizing dot32: one MXFP4 block's 16 packed nibble bytes expand through a 16-entry
+//! signed LUT — element j (j in 0..15) = lut[wn[j] & 15], element 16+j = lut[wn[j] >> 4] — and the
+//! 32 dequantized int8 dot against 32 int8 of `x` into the 4 lanes of `acc` with dot32's exact
+//! lane grouping (lane j += dot of element quad j PLUS quad j+4, which pairs each nibble byte's lo
+//! and hi products in one lane). On x86-64 the JIT loads the 16 nibble bytes once, selects lo/hi
+//! nibbles (VPAND / VPSRLW+VPAND), dequantizes both halves with ONE ymm VPSHUFB of the LUT
+//! broadcast to both 128-bit lanes (indices are 0..15 with bit 7 clear, so PSHUFB's zeroing path
+//! never fires and its per-lane semantics match the [lo | hi] layout), then runs dot32's exact
+//! sign-trick chain and fold on the result. Integer arithmetic throughout, so hardware and this
+//! fallback agree bit for bit. Saturation is structurally impossible (|lut| <= 12, the doubled
+//! e2m1 table, bounds PMADDUBSW pair sums by 12*128*2 = 3072 << 32767), but the sign trick's
+//! EXACTNESS PRECONDITION on `x` is unchanged from dot32: values in [-127, 127] — PSIGNB of -128
+//! wraps to -128 when the LUT weight is negative (off by 2*|lut|*128 per such pair). The Q8
+//! quantizer guarantees the range by construction (d = amax/127), exactly as on the Q8 path.
+//! Pointers are passed pre-offset by the caller.
+def dot32_mx4(acc : int4; lut : int8 const?; wn : uint8 const?; x : int8 const?) : int4 {
+    var s0 = 0
+    var s1 = 0
+    var s2 = 0
+    var s3 = 0
+    unsafe {
+        for (e in range(4)) {
+            s0 += int(lut[int(wn[e]) & 15]) * int(x[e]) + int(lut[int(wn[e]) >> 4]) * int(x[16 + e])
+            s1 += int(lut[int(wn[4 + e]) & 15]) * int(x[4 + e]) + int(lut[int(wn[4 + e]) >> 4]) * int(x[20 + e])
+            s2 += int(lut[int(wn[8 + e]) & 15]) * int(x[8 + e]) + int(lut[int(wn[8 + e]) >> 4]) * int(x[24 + e])
+            s3 += int(lut[int(wn[12 + e]) & 15]) * int(x[12 + e]) + int(lut[int(wn[12 + e]) >> 4]) * int(x[28 + e])
+        }
+    }
+    return acc + int4(s0, s1, s2, s3)
+}
+
+//! MXFP4 block dequant to memory: one block's 16 packed nibble bytes expand through the 16-entry
+//! signed LUT — dst[j] = lut[wn[j] & 15], dst[16+j] = lut[wn[j] >> 4] — writing the 32 int8 a Q8
+//! expansion of the block would produce (dot32_mx4's dequant half, stored instead of dotted). On
+//! x86-64 the JIT emits the identical in-register sequence (nibble select + ONE ymm VPSHUFB of the
+//! LUT broadcast) followed by a single 32-byte store — ~8x fewer ops than this scalar loop, which
+//! is the interp / AOT / non-x64 fallback. Byte-for-byte identical either way (pure integer LUT).
+//! Pointers are passed pre-offset by the caller; dst needs no alignment.
+def mx4_dequant32(lut : int8 const?; wn : uint8 const?; var dst : int8?) {
+    unsafe {
+        for (j in range(16)) {
+            let b = int(wn[j])
+            dst[j] = lut[b & 15]
+            dst[16 + j] = lut[b >> 4]
+        }
+    }
+}

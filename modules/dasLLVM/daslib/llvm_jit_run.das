@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x34ul   // x64_avx dot32/dot32_ps/dot32_acc8 family + aarch64 sdot4_laneq_w/tbl16 (two arcs merged; 0x34 sits above both lineages' 0x31-0x33)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x36ul   // x64_avx mx4_dequant32 (ymm PSHUFB MXFP4 block dequant to memory)
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 

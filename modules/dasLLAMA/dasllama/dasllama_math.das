@@ -393,6 +393,10 @@ typedef RepackQ8Q8Fn = function<(var wp : int8?; var sp : float?; n : int64; d :
 // 32-block, row stride n/2) + `we` RAW E8M0 scale bytes (1 per block, row stride n/32) — against a
 // pre-quantized Q8 activation. Native half-traffic path for MoE expert stacks (gpt-oss decode).
 typedef MatmulMx4Q8Fn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+// Batched MXFP4·Q8 GEMM — the batch analog of MatmulMx4Q8Fn (Y token-major [ntok x d], activations
+// pre-quantized per token like MatmulQ8Q8BatchFn). Grouped MoE prefill dispatches here INSTEAD of
+// expanding the expert to Q8 scratch when the backend sets mx4_native_batch.
+typedef MatmulMx4Q8BatchFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64; ntok : int64) : void>
 // In-place repack of one MXFP4 region [d rows x n cols] (raw plane pointers at the region start)
 // into the active backend's preferred layout. Default = no-op (row-major). n % 32 == 0.
 typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d : int64) : void>
@@ -408,6 +412,15 @@ typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d :
 // dots, only scheduled in one parallel_for.
 typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
 typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// Region-list batched MXFP4·Q8 GEMM — the batch analog of MatmulMx4GroupNFn and the llama.cpp
+// mul_mat_id shape: ONE dispatch runs every routed expert's same-shape [d x n] GEMM over its own
+// row range of a shared token-row image. `offs` packs TRIPLES per region: [3r] = the weight-element
+// offset of region r's rows, [3r+1] = row0, [3r+2] = cnt — region r consumes activation rows
+// row0..row0+cnt of (xqp, xsp) AND produces y rows row0..row0+cnt (token-major, y[(row0+tk)*d +
+// row]); the row ranges of the regions partition the image. A non-null bp folds bp[boffs[r] + row]
+// into every store of region r (per-expert bias vectors). Bit-exact vs a per-region loop of the
+// same backend's mx4 batch kernel — the same per-row dots, one fork instead of nregions.
+typedef MatmulMx4Q8BatchGroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
 //! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
@@ -422,10 +435,28 @@ struct KernelBackend {
     group3 : MatmulQ8Q8Group3Fn
     repack : RepackQ8Q8Fn
     mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
+    // The mx4 BATCH kernels are optional (unlike mm_mx4): they are only dispatched when
+    // mx4_native_batch is set, so backends without them (arm64 — the laneq plane interleave makes a
+    // generic row-major fallback read garbage, not just run slow) keep the panic stubs and the
+    // expansion path instead. A backend that sets the flag must supply BOTH forms.
+    mx4_batch : MatmulMx4Q8BatchFn = @@mx4q8_unset_batch
+    mx4_batch_groupn : MatmulMx4Q8BatchGroupNFn = @@mx4q8_unset_batch_groupn
     repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
     groupn : MatmulQ8Q8GroupNFn = @@q8q8_unset_groupn
     groupn_mx4 : MatmulMx4GroupNFn = @@mx4q8_unset_groupn
     needs_repack : bool
+    // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the laneq byte-for-byte
+    // expand map (expand_mx4_region_q8's direct-interleave branch): nibble byte `off` of block-
+    // group bg -> q8[bg*128 + off] / q8[bg*128 + 64 + off], scale bytes 1:1 positional. True only
+    // for arm64-laneq. When false on a needs_repack backend (x64 grp4: repack_mx4 is identity and
+    // the Q8 interleave is block-granular), grouped prefill expands row-major and repacks the
+    // scratch through `repack` instead.
+    mx4_expand_interleaved : bool = false
+    // The backend's mx4_batch beats expand-to-Q8 + Q8 batch, so grouped MoE prefill should dispatch
+    // matmul_mx4q8_batch instead of expand_mx4_region_q8 (x64: the expansion's 3·d·n Q8 scratch
+    // round-trip through DRAM was 87% of gpt-oss prefill wall). The slot may be set without the
+    // flag (probe/A-B reference) — the flag is the in-model routing decision.
+    mx4_native_batch : bool = false
     priority : int
 }
 
@@ -435,6 +466,8 @@ var g_mm_q8q8 = @@q8q8_unset_kernel
 var g_mm_q8q8_batch = @@q8q8_unset_batch
 var g_mm_q8q8_group3 = @@q8q8_unset_group3
 var g_mm_mx4q8 = @@mx4q8_unset_kernel
+var g_mm_mx4q8_batch = @@mx4q8_unset_batch
+var g_mm_mx4q8_batch_groupn = @@mx4q8_unset_batch_groupn
 var g_mm_q8q8_groupn = @@q8q8_unset_groupn
 var g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
@@ -444,6 +477,8 @@ var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
 var g_active_priority = -1          // priority of the active row-major default (auto-activate compare)
 var g_active_needs_repack = false   // does the active backend need repacked weights?
+var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
+var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
 
 //! Default repack: no-op — weights stay row-major for the portable / sdot4x4 kernels.
@@ -465,6 +500,16 @@ def private q8q8_unset_batch(var yp : float?; wp : int8 const?; sp : float const
 def private q8q8_unset_group3(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) { no_backend() }
 [unused_argument(yp, wn, we, xqp, xsp, n, d)]
 def private mx4q8_unset_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wn, we, xqp, xsp, n, d, ntok)]
+def private mx4q8_unset_batch(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    // reachable with a registered backend (unlike the other stubs): the slot is optional — see
+    // KernelBackend.mx4_batch
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' provides no MXFP4·Q8 batch kernel (mx4_batch)")
+}
+[unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private mx4q8_unset_batch_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' provides no MXFP4·Q8 batch groupN kernel (mx4_batch_groupn)")
+}
 [unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, bp, boffs, n, d)]
 def private q8q8_unset_groupn(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
 [unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
@@ -475,12 +520,16 @@ def private activate(be : KernelBackend) {
     g_mm_q8q8_batch = be.batch
     g_mm_q8q8_group3 = be.group3
     g_mm_mx4q8 = be.mm_mx4
+    g_mm_mx4q8_batch = be.mx4_batch
+    g_mm_mx4q8_batch_groupn = be.mx4_batch_groupn
     g_mm_q8q8_groupn = be.groupn
     g_mm_mx4q8_groupn = be.groupn_mx4
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
     g_active_needs_repack = be.needs_repack
+    g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
+    g_active_mx4_native_batch = be.mx4_native_batch
 }
 
 //! Register a kernel backend under its name. Auto-activates it as the row-major default when it is the
@@ -651,6 +700,44 @@ def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> 
         invoke(g_mm_mx4q8, addr(y[0]),
             reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
+//! Batched MXFP4·Q8 GEMM for prefill — the batch analog of matmul_mx4q8 (Y token-major [ntok x d],
+//! activations PRE-quantized per token into xq [ntok x n] / xs [ntok x n/32]). Dispatches to the
+//! active backend (g_mm_mx4q8_batch); only backends flagged mx4_native_batch provide one (the stub
+//! panics — the grouped prefill routes through the Q8 expansion elsewhere). n % 32 == 0.
+def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_batch, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+    }
+}
+
+//! Region-list batched MXFP4·Q8 GEMM — every routed expert's [d x n] GEMM over its own row range
+//! of one token-row image, in ONE dispatch (see the MatmulMx4Q8BatchGroupNFn doc for the packed
+//! `offs` triples). Only backends flagged mx4_native_batch provide one. n % 32 == 0.
+def matmul_mx4q8_batch_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                              xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_batch_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased form: folds bias[boffs[r] + row] into every store of region r (per-expert bias vectors).
+def matmul_mx4q8_batch_groupn(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; offs : array<int64>; nregions : int64;
+                              xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_batch_groupn, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
     }
 }
 

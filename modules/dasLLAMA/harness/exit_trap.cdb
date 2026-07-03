@@ -1,0 +1,7 @@
+bp ntdll!RtlExitUserProcess ".if (@rcx != 0) { .echo ===NONZERO-EXIT===; r rcx; k 80; qd } .else { gc }"
+g
+.echo ===STOPPED-NON-EXIT===
+r
+k 80
+~*k 40
+qd
