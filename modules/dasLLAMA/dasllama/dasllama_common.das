@@ -1276,6 +1276,8 @@ struct Session {
     moe_hs : array<float>       // bucket hidden requant scales (same / 32)
     moe_gout : array<float>     // bucket (then shared-expert) down-projection output (npos x dim)
     moe_eout : array<float>     // routed expert outputs parked by (position, slot) (npos x k x dim)
+    ffn_offs : array<int64>     // dense/shexp gate+up fuse: 2 region (weight, activation) offset pairs
+    ffn_gu : array<float>       // dense/shexp gate+up fuse output — gate half then up half (2 x max_ffn_width)
     mx4_wq : array<int8>        // grouped-prefill expansion of ONE native-MXFP4 expert to exact Q8 (dim x n_ff_exp)
     mx4_ws : array<float>       // ... and its per-block scales (same / 32); see expand_mx4_region_q8
 }
@@ -1316,6 +1318,8 @@ def make_run_state(c : Config) : Session {
         s.moe_dq |> resize(c.n_expert_used * c.n_ff_exp)
         s.moe_ds |> resize(c.n_expert_used * c.n_ff_exp / 32l)
     }
+    s.ffn_offs |> resize(4)
+    s.ffn_gu |> resize(2l * ffw)
     let maxn = max(xdim, ffw)   // the Q8·Q8 path quantizes whichever activation feeds a matmul
     s.xq |> resize(maxn)
     s.xs |> resize(maxn / 32l)
@@ -1615,12 +1619,19 @@ def private kv_store_batch(var key_cache : array<float>; var value_cache : array
 // the only non-bit-exactness is exp4's ~2 ulp. Fork workers touch raw base pointers; self-gates on
 // g_act_par_threshold so small prompts (and decode, npos=1) run inline.
 def private gate_batch(var g : array<float>; u : array<float>; act : FfnAct; hidden, npos : int64) {
+    unsafe {
+        gate_batch(addr(g[0]), reinterpret<float const?>(addr(u[0])), act, hidden, npos)
+    }
+}
+
+// pointer-level core — the fused gate+up dispatch acts on the halves of one groupn output buffer
+def private gate_batch(var gp0 : float?; up0 : float const?; act : FfnAct; hidden, npos : int64) {
     let is_gelu = act == FfnAct.gelu
     let is_oai = act == FfnAct.swiglu_oai
     let vec = g_act_vec
     unsafe {
-        var gp = addr(g[0])
-        var up = reinterpret<float const?>(addr(u[0]))
+        var gp = gp0
+        var up = up0
         maybe_parallel_for(hidden * npos >= g_act_par_threshold, 0, int(npos), get_total_hw_jobs()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
@@ -1943,13 +1954,30 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         prof_add("norm", ts_vnorm)
     }
     // RoPE on q (qd) and k (kv_dim) — sliding layers may use their own θ / position scale (Gemma3),
-    // and p-RoPE arches (gemma4) apply the rope_freqs factors to GLOBAL layers only
+    // and p-RoPE arches (gemma4) apply the rope_freqs factors to GLOBAL layers only. Table path:
+    // this position's cos/sin row was built ONCE in forward() (bit-identical values) — the leaves
+    // are called DIRECTLY, same as rope_batch_tab, to dodge the pass-through-const-write-elision.
     let ts_rope = ref_time_ticks()
-    let theta = is_sliding ? c.rope_freq_base_swa : c.rope_freq_base
-    let fscale = is_sliding ? c.rope_freq_scale_swa : c.rope_freq_scale
-    let use_ff = !(c.rope_ff_global_only && is_sliding)
-    rope_apply(s.q, pos, head_size, qd, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
-    rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+    if (g_use_rope_table) {
+        let swa_row = is_sliding && has_dual_rope(c)
+        unsafe {
+            let crow = swa_row ? reinterpret<float const?>(addr(s.rope_cos_swa[0])) : reinterpret<float const?>(addr(s.rope_cos[0]))
+            let srow = swa_row ? reinterpret<float const?>(addr(s.rope_sin_swa[0])) : reinterpret<float const?>(addr(s.rope_sin[0]))
+            if (c.rope_neox) {
+                rope_scaled_neox_tab(addr(s.q[0]), head_size, qd, crow, srow)
+                rope_scaled_neox_tab(addr(s.k[0]), head_size, kv_dim, crow, srow)
+            } else {
+                rope_scaled_tab(addr(s.q[0]), head_size, qd, crow, srow)
+                rope_scaled_tab(addr(s.k[0]), head_size, kv_dim, crow, srow)
+            }
+        }
+    } else {
+        let theta = is_sliding ? c.rope_freq_base_swa : c.rope_freq_base
+        let fscale = is_sliding ? c.rope_freq_scale_swa : c.rope_freq_scale
+        let use_ff = !(c.rope_ff_global_only && is_sliding)
+        rope_apply(s.q, pos, head_size, qd, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+        rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+    }
     prof_add("rope", ts_rope)
     // store k, v for this position into the KV cache
     let ts_kv = ref_time_ticks()
@@ -2033,16 +2061,37 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
     prof_add("norm", ts_norm1)
     // gated FFN: hb = act(W1·xb) * (W3·xb) — silu (SwiGLU) or gelu (GeGLU, Gemma2)
     let ts_ffn = ref_time_ticks()
-    mm(s.hb, t, t.w1_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
-    mm(s.hb2, t, t.w3_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
-    prof_add("mm_ffn", ts_ffn)
-    let ts_act = ref_time_ticks()
-    gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)   // fused act*gate; same kernel as prefill (npos=1 → inline)
-    prof_add("act", ts_act)
-    // down projection, optional post-FFN norm, residual
-    let ts_ffn2 = ref_time_ticks()
-    mm(s.xb, t, t.w2_off + l * hidden * dim, s.hb, s.xq, s.xs, hidden, dim)
-    prof_add("mm_ffn", ts_ffn2)
+    if (t.quant == QuantMode.q8) {
+        // gate+up share the activation: ONE quantize + ONE region-list dispatch into ffn_gu's
+        // halves (bit-identical — same quants, same per-row dots, only the scheduling changes)
+        quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+        s.ffn_offs[0] = t.w1_off + l * dim * hidden
+        s.ffn_offs[1] = 0l
+        s.ffn_offs[2] = t.w3_off + l * dim * hidden
+        s.ffn_offs[3] = 0l
+        mm_at_q8_groupn(s.ffn_gu, t, s.ffn_offs, 2l, s.xq, s.xs, dim, hidden)
+        prof_add("mm_ffn", ts_ffn)
+        let ts_act = ref_time_ticks()
+        unsafe {
+            gate_batch(addr(s.ffn_gu[0]), reinterpret<float const?>(addr(s.ffn_gu[hidden])), c.ffn_act, hidden, 1l)
+        }
+        prof_add("act", ts_act)
+        // down projection off the gated half
+        let ts_down = ref_time_ticks()
+        quantize_q8_0_into(s.ffn_gu, hidden, s.xq, s.xs, 0l, 0l)
+        mm_at_q8_pre(s.xb, t, t.w2_off + l * hidden * dim, s.xq, s.xs, hidden, dim)
+        prof_add("mm_ffn", ts_down)
+    } else {
+        mm(s.hb, t, t.w1_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
+        mm(s.hb2, t, t.w3_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
+        prof_add("mm_ffn", ts_ffn)
+        let ts_act = ref_time_ticks()
+        gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)   // fused act*gate; same kernel as prefill (npos=1 → inline)
+        prof_add("act", ts_act)
+        let ts_ffn2 = ref_time_ticks()
+        mm(s.xb, t, t.w2_off + l * hidden * dim, s.hb, s.xq, s.xs, hidden, dim)
+        prof_add("mm_ffn", ts_ffn2)
+    }
     let ts_resid1 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm before the residual add
         rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
@@ -2271,14 +2320,23 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
         let nsh = c.n_ff_shexp
         let she = dim * nsh
         if (pre_q8) {
-            mm_at_q8_pre(s.hb, t, t.wsh1_off + l * she, s.moe_xq, s.moe_xs, dim, nsh)
-            mm_at_q8_pre(s.hb2, t, t.wsh3_off + l * she, s.moe_xq, s.moe_xs, dim, nsh)
+            // shexp gate+up share the hoisted xb quants: one region-list dispatch, act on the halves
+            s.ffn_offs[0] = t.wsh1_off + l * she
+            s.ffn_offs[1] = 0l
+            s.ffn_offs[2] = t.wsh3_off + l * she
+            s.ffn_offs[3] = 0l
+            mm_at_q8_groupn(s.ffn_gu, t, s.ffn_offs, 2l, s.moe_xq, s.moe_xs, dim, nsh)
+            unsafe {
+                gate_batch(addr(s.ffn_gu[0]), reinterpret<float const?>(addr(s.ffn_gu[nsh])), c.ffn_act, nsh, 1l)
+            }
+            quantize_q8_0_into(s.ffn_gu, nsh, s.xq, s.xs, 0l, 0l)
+            mm_at_q8_pre(s.xb2, t, t.wsh2_off + l * she, s.xq, s.xs, nsh, dim)
         } else {
             mm(s.hb, t, t.wsh1_off + l * she, s.xb, s.xq, s.xs, dim, nsh)
             mm(s.hb2, t, t.wsh3_off + l * she, s.xb, s.xq, s.xs, dim, nsh)
+            gate_batch(s.hb, s.hb2, c.ffn_act, nsh, 1l)
+            mm(s.xb2, t, t.wsh2_off + l * she, s.hb, s.xq, s.xs, nsh, dim)
         }
-        gate_batch(s.hb, s.hb2, c.ffn_act, nsh, 1l)
-        mm(s.xb2, t, t.wsh2_off + l * she, s.hb, s.xq, s.xs, nsh, dim)
         for (i in range64(dim)) {
             s.moe_acc[i] += g * s.xb2[i]
         }
@@ -2345,6 +2403,20 @@ def forward(t : Model; var s : Session; token, pos : int64) {
         scale_inplace(unsafe(addr(s.x[0])), c.embed_scale, dim)
     }
     prof_add("embed", ts_embed)
+
+    // this position's RoPE cos/sin row(s), shared across all layers and q/k (the decode twin of
+    // prefill's table: the classic path recomputes pow/cos/sin per PAIR per layer — bit-identical
+    // values, trig deduplicated). Dual-rope arches get the sliding class's row alongside.
+    if (g_use_rope_table) {
+        let ts_rope_build = ref_time_ticks()
+        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l, c.head_size, true)
+        if (has_dual_rope(c)) {
+            let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
+            build_rope_table(s.rope_cos_swa, s.rope_sin_swa, t, c.rope_freq_base_swa, c.rope_freq_scale_swa,
+                             pos, 1l, swa_hs, !c.rope_ff_global_only)
+        }
+        prof_add("rope_build", ts_rope_build)
+    }
 
     // per-layer transformer stack — attention then FFN, each through the arch's registered block
     for (l in range64(c.n_layers)) {
