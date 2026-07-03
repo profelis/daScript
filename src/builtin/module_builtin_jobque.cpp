@@ -634,7 +634,8 @@ namespace das {
     }
 
     // Batched fork-job dispatch (opt-in, per DISPATCHING thread): new_job keeps the finished job
-    // closures locally and join() publishes the whole batch under ONE fifo lock + one notify_all.
+    // closures locally and join() publishes the whole batch under ONE fifo lock + one notify —
+    // the woken worker wake-propagates to the rest (JobQue::job), so the fan-out is log-depth.
     // Removes the per-job push/wake interleaving that stalls a fork/join dispatch loop: every
     // notify_one to a parked worker costs the dispatcher an OS thread-wake (~3-4.5us) serially, and
     // with spinning workers the per-push lock acquisition contends with every consumer's pop.
