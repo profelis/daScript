@@ -56,7 +56,9 @@ namespace das {
             }
             bool ignoreNextField = false;
             if ( si->flags & StructInfo::flag_class ) {
-                if (name == "__rtti" || name == "__finalize") {
+                // A class carries its methods as function-pointer fields. They aren't data —
+                // skip them entirely (rather than emit "kek":null) along with the class plumbing.
+                if (name == "__rtti" || name == "__finalize" || (vi->flags & TypeInfo::flag_classMethod)) {
                     ignoreNextField = true;
                 }
             }
@@ -339,6 +341,18 @@ namespace das {
             // uint64_t-backed values with the top bit set will compare bit-for-bit equal because the
             // stored value already round-tripped through int64_t at EnumValueInfo build time.
             Enum(value,info);
+        }
+        // A function pointer / block isn't JSON data. Emit `null` rather than nothing so the output
+        // stays valid JSON. Class methods are dropped earlier (flag_classMethod); this still guards
+        // the __lambda/__finalize fields inside a lambda's capture struct and any function-typed
+        // field, which otherwise left a dangling `:` and produced invalid JSON.
+        virtual void WalkFunction ( Func * ) override {
+            if ( !ignoreNextFields.empty() && ignoreNextFields.back() ) return;
+            ss << "null";
+        }
+        virtual void WalkBlock ( Block * ) override {
+            if ( !ignoreNextFields.empty() && ignoreNextFields.back() ) return;
+            ss << "null";
         }
 
         virtual bool revisitStructure ( char * /*ps*/, StructInfo * /*si*/ ) override {

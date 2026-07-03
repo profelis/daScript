@@ -373,6 +373,7 @@ namespace das
             flag_heapGC = 1<<13,
             flag_stringHeapGC = 1<<14,
             flag_private = 1<<15,
+            flag_classMethod = 1<<16,   // struct field is a class method (set on the field VarInfo)
         };
         union {
             StructInfo *                structType;
