@@ -146,3 +146,72 @@ def mx4_dequant32(lut : int8 const?; wn : uint8 const?; var dst : int8?) {
         }
     }
 }
+
+// ===== AVX kernel matrix tiers (VNNI / AVX-512) =====
+// Recognition is per-tier: each name below sits in its own JIT lookup table gated on the matching
+// g_target_x64_* flag (cpuid truth — see llvm_jit_common.das), so on a box without the tier the
+// call compiles its daslang body instead. Every body here DELEGATES to the established intrinsic
+// of the same math (dot32 / dot32_acc8 / mx4_dequant32) — exactness by construction, and on an
+// AVX2-only box the delegate is itself recognized, so a matrix kernel degrades to the proven ymm
+// sign-trick path rather than to scalar code.
+
+//! dot32 with the VNNI dot step: same signature, same exact int4 result, lane for lane. On x86-64
+//! with 256-bit VNNI (AVX-VNNI, or AVX512-VNNI+VL) the JIT replaces dot32's VPMADDUBSW+VPMADDWD
+//! pair with ONE VPDPBUSD (u8×s8 quad dot into i32 — no 16-bit intermediate at all, so PMADDUBSW's
+//! saturation headroom analysis becomes moot); the VPABSB/VPSIGNB sign trick and the high/low fold
+//! are unchanged. EXACTNESS PRECONDITION stays dot32's: `x` values in [-127, 127] (PSIGNB of -128
+//! wraps); the Q8 quantizer guarantees the range.
+def dot32_vnni(acc : int4; w : int8 const?; x : int8 const?) : int4 {
+    return dot32(acc, w, x)
+}
+
+//! dot32_acc8 with the VNNI dot step (see dot32_vnni): the 8 int32 quads come from ONE VPDPBUSD
+//! instead of the VPMADDUBSW+VPMADDWD pair, then convert and multiply-accumulate into the caller's
+//! 8-float memory accumulator exactly as dot32_acc8 does. Same exactness precondition and the same
+//! _jit_fast_math FMA-contraction laxity.
+def dot32_acc8_vnni(var acc : float?; w : int8 const?; x : int8 const?; s : float) {
+    dot32_acc8(acc, w, x, s)
+}
+
+//! dot32_mx4 with the VNNI dot step (see dot32_vnni): the ymm PSHUFB LUT dequant is unchanged;
+//! the dequantized block dots against `x` via ONE VPDPBUSD instead of the VPMADDUBSW+VPMADDWD
+//! pair. Integer arithmetic throughout — bit-identical to dot32_mx4 and to this fallback.
+def dot32_mx4_vnni(acc : int4; lut : int8 const?; wn : uint8 const?; x : int8 const?) : int4 {
+    return dot32_mx4(acc, lut, wn, x)
+}
+
+//! 512-bit dot32_acc8: TWO consecutive Q8 blocks (64 int8 per operand) per call, accumulating into
+//! a caller-local float[16] — lane j (j in 0..7) += float(dot of block-0 quad j) * s0, lane 8+j +=
+//! float(dot of block-1 quad j) * s1. On x86-64 with AVX-512BW the JIT emits the sign trick on zmm
+//! (VPABSB; VPSIGNB has no 512-bit form, so sign application is compare+negate+select — same
+//! values, w==0 lanes stay un-zeroed but multiply against |w|=0 anyway) + VPMADDUBSW/VPMADDWD zmm,
+//! then VCVTDQ2PS and one multiply-accumulate against the [s0 x8 | s1 x8] scale vector, promoted
+//! into a zmm register across a block loop by LICM. Same exactness precondition on `x` as dot32;
+//! same _jit_fast_math contraction laxity. Caller guarantees TWO full blocks (n%64 tails use
+//! dot32_acc8 on the same accumulator's low half).
+def dot64_acc16(var acc : float?; w : int8 const?; x : int8 const?; s0, s1 : float) {
+    unsafe {
+        dot32_acc8(acc, w, x, s0)
+        dot32_acc8(acc + 8, w + 32, x + 32, s1)
+    }
+}
+
+//! dot64_acc16 with the VNNI dot step: the zmm VPMADDUBSW+VPMADDWD pair becomes ONE VPDPBUSD
+//! (AVX512-VNNI), everything else as dot64_acc16 — including this fallback, which delegates to it
+//! (so on an AVX512BW-without-VNNI box the body itself JITs to the zmm multiply-add chain).
+def dot64_acc16_vnni(var acc : float?; w : int8 const?; x : int8 const?; s0, s1 : float) {
+    dot64_acc16(acc, w, x, s0, s1)
+}
+
+//! 512-bit mx4_dequant32: TWO consecutive MXFP4 blocks (32 nibble bytes) expand through the LUT in
+//! one shot — dst[0..31] = block 0's [lo | hi], dst[32..63] = block 1's. On x86-64 with AVX-512BW
+//! the JIT selects both blocks' nibbles, concatenates the four 16-byte index groups to one zmm,
+//! and looks them up with ONE VPSHUFB zmm against the LUT broadcast to all four 128-bit lanes,
+//! then a single 64-byte store. Byte-for-byte identical to two mx4_dequant32 calls (pure integer
+//! LUT). Pointers pre-offset by the caller; dst needs no alignment.
+def mx4_dequant64(lut : int8 const?; wn : uint8 const?; var dst : int8?) {
+    unsafe {
+        mx4_dequant32(lut, wn, dst)
+        mx4_dequant32(lut, wn + 16, dst + 32)
+    }
+}

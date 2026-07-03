@@ -23,6 +23,12 @@ def test_cpu_supports(t : T?) {
             if (cpu_supports("avx512vnni")) {
                 t |> success(cpu_supports("avx512f"), "avx512vnni implies avx512f")
             }
+            if (cpu_supports("avx512bw")) {
+                t |> success(cpu_supports("avx512f"), "avx512bw implies avx512f")
+            }
+            if (cpu_supports("avx512vl")) {
+                t |> success(cpu_supports("avx512f"), "avx512vl implies avx512f")
+            }
         } else {
             t |> success(!cpu_supports("avx2"), "x86 feature names report false off-x86")
             t |> success(!cpu_supports("sse4.2"), "x86 feature names report false off-x86")

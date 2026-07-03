@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x36ul   // x64_avx mx4_dequant32 (ymm PSHUFB MXFP4 block dequant to memory)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x37ul   // x64_avx AVX kernel-matrix tiers (dot32*_vnni, dot64_acc16(_vnni), mx4_dequant64)
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -133,6 +133,30 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
     // AVX2 gates the x64 intrinsic table (g_target_x64_avx2): a DLL jitted with AVX2 emission must
     // never cache-hit on an AVX2-less host sharing the cache dir (illegal instruction), and vice versa.
     h = (h ^ (cpu_supports("avx2") ? 1ul : 0ul)) * JIT_FNV_PRIME
+    // Matrix-tier gates (g_target_x64_vnni256 / avx512bw / avx512vnni) key emission the same way —
+    // fold each cpuid bit, plus the DAS_JIT_X64_FORCE_FEATURES override string (emission-only
+    // diagnostics — a forced artifact must never cache-hit a normal run, and vice versa).
+    var isa = 0ul
+    if (cpu_supports("avxvnni")) {
+        isa |= 1ul
+    }
+    if (cpu_supports("avx512f")) {
+        isa |= 2ul
+    }
+    if (cpu_supports("avx512bw")) {
+        isa |= 4ul
+    }
+    if (cpu_supports("avx512vl")) {
+        isa |= 8ul
+    }
+    if (cpu_supports("avx512vnni")) {
+        isa |= 16ul
+    }
+    h = (h ^ isa) * JIT_FNV_PRIME
+    let forced = get_env_variable("DAS_JIT_X64_FORCE_FEATURES")
+    if (!empty(forced)) {
+        h = (h ^ hash(forced)) * JIT_FNV_PRIME
+    }
     return "{h}"
 }
 

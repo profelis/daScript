@@ -166,6 +166,23 @@ let g_x64_intrin_lookup <- {
     "x64_avx::mx4_dequant32" => @@intrinsic_mx4_dequant32_x64
 }
 
+// AVX kernel-matrix tiers — same contract, finer gates (see the g_target_x64_* declarations in
+// llvm_jit_common). A name whose gate is false compiles its daslang body, which delegates to the
+// tier below (dot32 / dot32_acc8 / mx4_dequant32), so the call degrades to the proven ymm path
+// rather than to scalar code.
+let g_x64_vnni256_intrin_lookup <- {   // 256-bit VPDPBUSD (VEX AVX-VNNI, or EVEX AVX512-VNNI+VL)
+    "x64_avx::dot32_vnni" => @@intrinsic_dot32_vnni_x64,
+    "x64_avx::dot32_acc8_vnni" => @@intrinsic_dot32_acc8_vnni_x64,
+    "x64_avx::dot32_mx4_vnni" => @@intrinsic_dot32_mx4_vnni_x64
+}
+let g_x64_avx512bw_intrin_lookup <- {   // zmm byte ops (VPABSB/VPMADDUBSW/VPSHUFB at 512 need BW)
+    "x64_avx::dot64_acc16" => @@intrinsic_dot64_acc16_x64,
+    "x64_avx::mx4_dequant64" => @@intrinsic_mx4_dequant64_x64
+}
+let g_x64_avx512vnni_intrin_lookup <- {   // zmm VPDPBUSD (the bw gate is a prerequisite)
+    "x64_avx::dot64_acc16_vnni" => @@intrinsic_dot64_acc16_vnni_x64
+}
+
 def public has_intrinsic(expr : ExprCallFunc?) {
     var result = false
     assume argType = expr.arguments[0]._type
@@ -197,6 +214,21 @@ def public has_intrinsic(expr : ExprCallFunc?) {
             result = true
         }
     }
+    if (!result && g_target_x64_vnni256) {
+        g_x64_vnni256_intrin_lookup |> get(call_name) $(_pfun) {
+            result = true
+        }
+    }
+    if (!result && g_target_x64_avx512bw) {
+        g_x64_avx512bw_intrin_lookup |> get(call_name) $(_pfun) {
+            result = true
+        }
+    }
+    if (!result && g_target_x64_avx512vnni) {
+        g_x64_avx512vnni_intrin_lookup |> get(call_name) $(_pfun) {
+            result = true
+        }
+    }
     return result
 }
 
@@ -213,6 +245,21 @@ def public lookup_intinsic(g_ctx : LLVMContextRef; g_builder : LLVMOpaqueBuilder
     }
     if (result == null && g_target_x64_avx2) {
         g_x64_intrin_lookup |> get(call_name) $(pfun) {
+            result = pfun |> invoke(JitCtx(ctx = g_ctx, builder = g_builder, types = types), expr, arguments)
+        }
+    }
+    if (result == null && g_target_x64_vnni256) {
+        g_x64_vnni256_intrin_lookup |> get(call_name) $(pfun) {
+            result = pfun |> invoke(JitCtx(ctx = g_ctx, builder = g_builder, types = types), expr, arguments)
+        }
+    }
+    if (result == null && g_target_x64_avx512bw) {
+        g_x64_avx512bw_intrin_lookup |> get(call_name) $(pfun) {
+            result = pfun |> invoke(JitCtx(ctx = g_ctx, builder = g_builder, types = types), expr, arguments)
+        }
+    }
+    if (result == null && g_target_x64_avx512vnni) {
+        g_x64_avx512vnni_intrin_lookup |> get(call_name) $(pfun) {
             result = pfun |> invoke(JitCtx(ctx = g_ctx, builder = g_builder, types = types), expr, arguments)
         }
     }
@@ -1594,6 +1641,12 @@ def private splat_v16i8(ctx : JitCtx; v : int) : LLVMOpaqueValue? {
     return LLVMConstVector(array_data_ptr(elems), 16u)
 }
 
+// v32i8 twin (the mx4_dequant64 two-block nibble ops)
+def private splat_v32i8(ctx : JitCtx; v : int) : LLVMOpaqueValue? {
+    var elems <- [for (_i in range(32)); LLVMConstInt(ctx.types.t_int8, uint64(v), 0)]
+    return LLVMConstVector(array_data_ptr(elems), 32u)
+}
+
 // Emitter for aarch64_neon::tbl16_lo / tbl16_hi (gated by g_aarch64_intrin_lookup, only reached on
 // aarch64). tbl16_lo/hi(table:int8 const?; nib:uint8 const?):int4 — load 16 table bytes + 16 nibble
 // bytes (unaligned v16i8), select each byte's low (AND 0x0f) or high (USHR 4) nibble, and emit one
@@ -1703,11 +1756,21 @@ def intrinsic_dot4_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : arra
 // quads j and j+4 — exactly the daslang fallback's grouping, so both paths agree bit for bit.
 // Saturation analysis is dot4's, unchanged: pair sums bounded by 128*127*2 = 32512 < 32767.
 def intrinsic_dot32_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
-    var folded = emit_dot32_folded(ctx, _expr, arguments[1], arguments[2])
+    var folded = emit_dot32_folded(ctx, _expr, arguments[1], arguments[2], false)
     if (folded == null) {
         return null
     }
     return LLVMBuildAdd(ctx.builder, arguments[0], folded, "dot32")
+}
+
+// Emitter for x64_avx::dot32_vnni (gated by g_x64_vnni256_intrin_lookup): dot32's chain and fold
+// with the VPMADDUBSW+VPMADDWD pair replaced by ONE VPDPBUSD — identical exact int4 result.
+def intrinsic_dot32_vnni_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    var folded = emit_dot32_folded(ctx, _expr, arguments[1], arguments[2], true)
+    if (folded == null) {
+        return null
+    }
+    return LLVMBuildAdd(ctx.builder, arguments[0], folded, "dot32_vnni")
 }
 
 // Emitter for x64_avx::dot32_ps: dot32's exact chain and fold, then VCVTDQ2PS on the int4 partials
@@ -1715,7 +1778,7 @@ def intrinsic_dot32_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : arr
 // accumulator. Lane for lane the daslang fallback (acc + float4(dot32(0,w,x)) * s) under strict FP;
 // _jit_fast_math may contract the mul+add, the same laxity as every float kernel.
 def intrinsic_dot32_ps_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
-    var folded = emit_dot32_folded(ctx, _expr, arguments[1], arguments[2])
+    var folded = emit_dot32_folded(ctx, _expr, arguments[1], arguments[2], false)
     if (folded == null) {
         return null
     }
@@ -1737,7 +1800,17 @@ def intrinsic_dot32_ps_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : 
 // every float kernel. The das call is void — the returned value only marks "intrinsic emitted" for
 // make_call (null would mean "not an intrinsic, emit the fallback call").
 def intrinsic_dot32_acc8_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
-    var quads = emit_dot32_quads(ctx, _expr, arguments[1], arguments[2])
+    return emit_dot32_acc8(ctx, _expr, arguments, false)
+}
+
+// Emitter for x64_avx::dot32_acc8_vnni (gated by g_x64_vnni256_intrin_lookup): the acc8 shape with
+// the quads from ONE VPDPBUSD — identical exact quads, identical float tail.
+def intrinsic_dot32_acc8_vnni_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    return emit_dot32_acc8(ctx, _expr, arguments, true)
+}
+
+def emit_dot32_acc8(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>; use_vnni : bool) : LLVMOpaqueValue? {
+    var quads = emit_dot32_quads(ctx, _expr, arguments[1], arguments[2], use_vnni)
     if (quads == null) {
         return null
     }
@@ -1762,6 +1835,16 @@ def intrinsic_dot32_acc8_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments 
 // sums to 3072, no saturation). The x64_avx module's daslang body is the interp / AOT / non-x64
 // fallback; integer arithmetic throughout, so both paths agree bit for bit.
 def intrinsic_dot32_mx4_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    return emit_dot32_mx4(ctx, _expr, arguments, false)
+}
+
+// Emitter for x64_avx::dot32_mx4_vnni (gated by g_x64_vnni256_intrin_lookup): the mx4 LUT dequant
+// unchanged, the dot step as ONE VPDPBUSD — identical exact int4 result.
+def intrinsic_dot32_mx4_vnni_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    return emit_dot32_mx4(ctx, _expr, arguments, true)
+}
+
+def emit_dot32_mx4(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>; use_vnni : bool) : LLVMOpaqueValue? {
     let v32i8 = LLVMVectorType(ctx.types.t_int8, 32u)
     var wvec = emit_mx4_dequant_v(ctx, _expr, arguments[1], arguments[2])
     if (wvec == null) {
@@ -1770,7 +1853,7 @@ def intrinsic_dot32_mx4_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments :
     var xptr = LLVMBuildPointerCast(ctx.builder, arguments[3], LLVMPointerType(v32i8, 0u), "")
     var xvec = LLVMBuildLoad2(ctx.builder, v32i8, xptr, "")
     LLVMSetAlignment(xvec, 1u)
-    var quads = emit_dot32_quads_v(ctx, _expr, wvec, xvec)
+    var quads = emit_dot32_quads_v(ctx, _expr, wvec, xvec, use_vnni)
     if (quads == null) {
         return null
     }
@@ -1836,8 +1919,8 @@ def emit_mx4_dequant_v(var ctx : JitCtx; _expr : ExprCallFunc?; lutArg, wnArg : 
 
 // dot32's folded partials: emit_dot32_quads + the v8i32 → v4i32 fold (high 128-bit half added onto
 // the low — VEXTRACTI128 + VPADDD). Lane j = quads j + j+4. Null propagates from the core.
-def emit_dot32_folded(var ctx : JitCtx; _expr : ExprCallFunc?; wArg, xArg : LLVMOpaqueValue?) : LLVMOpaqueValue? {
-    var quads = emit_dot32_quads(ctx, _expr, wArg, xArg)
+def emit_dot32_folded(var ctx : JitCtx; _expr : ExprCallFunc?; wArg, xArg : LLVMOpaqueValue?; use_vnni : bool) : LLVMOpaqueValue? {
+    var quads = emit_dot32_quads(ctx, _expr, wArg, xArg, use_vnni)
     if (quads == null) {
         return null
     }
@@ -1848,7 +1931,7 @@ def emit_dot32_folded(var ctx : JitCtx; _expr : ExprCallFunc?; wArg, xArg : LLVM
 
 // The shared dot32 core: loads + sign-trick chain to the raw v8i32 quads (quad j = the dot of bytes
 // 4j..4j+3), NO fold. Returns the quads, or null after failed_E on a missing target intrinsic.
-def emit_dot32_quads(var ctx : JitCtx; _expr : ExprCallFunc?; wArg, xArg : LLVMOpaqueValue?) : LLVMOpaqueValue? {
+def emit_dot32_quads(var ctx : JitCtx; _expr : ExprCallFunc?; wArg, xArg : LLVMOpaqueValue?; use_vnni : bool) : LLVMOpaqueValue? {
     let v32i8 = LLVMVectorType(ctx.types.t_int8, 32u)
     var wptr = LLVMBuildPointerCast(ctx.builder, wArg, LLVMPointerType(v32i8, 0u), "")
     var xptr = LLVMBuildPointerCast(ctx.builder, xArg, LLVMPointerType(v32i8, 0u), "")
@@ -1856,12 +1939,15 @@ def emit_dot32_quads(var ctx : JitCtx; _expr : ExprCallFunc?; wArg, xArg : LLVMO
     LLVMSetAlignment(wvec, 1u)
     var xvec = LLVMBuildLoad2(ctx.builder, v32i8, xptr, "")
     LLVMSetAlignment(xvec, 1u)
-    return emit_dot32_quads_v(ctx, _expr, wvec, xvec)
+    return emit_dot32_quads_v(ctx, _expr, wvec, xvec, use_vnni)
 }
 
 // The dot32 sign-trick chain on already-materialized v32i8 VALUES (w may be an in-register dequant
-// result, e.g. dot32_mx4's PSHUFB output). Returns the raw v8i32 quads, or null after failed_E.
-def emit_dot32_quads_v(var ctx : JitCtx; _expr : ExprCallFunc?; wvec, xvec : LLVMOpaqueValue?) : LLVMOpaqueValue? {
+// result, e.g. dot32_mx4's PSHUFB output). use_vnni replaces the VPMADDUBSW+VPMADDWD pair with ONE
+// VPDPBUSD (identical exact quads: u8×s8 pair dots summed into i32, no 16-bit intermediate) — only
+// reached through the g_x64_vnni256_intrin_lookup gate. Returns the raw v8i32 quads (quad j = the
+// dot of bytes 4j..4j+3), or null after failed_E on a missing target intrinsic.
+def emit_dot32_quads_v(var ctx : JitCtx; _expr : ExprCallFunc?; wvec, xvec : LLVMOpaqueValue?; use_vnni : bool) : LLVMOpaqueValue? {
     let v32i8 = LLVMVectorType(ctx.types.t_int8, 32u)
     let v16i16 = LLVMVectorType(ctx.types.t_int16, 16u)
     let v8i32 = LLVMVectorType(ctx.types.t_int32, 8u)
@@ -1885,6 +1971,19 @@ def emit_dot32_quads_v(var ctx : JitCtx; _expr : ExprCallFunc?; wvec, xvec : LLV
     var psignTy = LLVMFunctionType(v32i8, b2Types)
     var psignArgs <- [xvec, wvec]
     var sx = LLVMBuildCall2(ctx.builder, psignTy, psign_decl, psignArgs, "dot32.signx")
+    if (use_vnni) {
+        // quads = VPDPBUSD(0, uw, sx) : v8i32 — the whole u8×s8 quad dot in one instruction
+        let dp_id = LLVMLookupIntrinsicID("llvm.x86.avx512.vpdpbusd.256")
+        var dp_decl = LLVMGetIntrinsicDeclaration(g_mod, dp_id, noTypes)
+        if (dp_decl == null) {
+            failed_E(_expr, "missing intrinsic llvm.x86.avx512.vpdpbusd.256 (non-x64 target?)")
+            return null
+        }
+        var dpArgTypes <- [v8i32, v32i8, v32i8]
+        var dpTy = LLVMFunctionType(v8i32, dpArgTypes)
+        var dpArgs <- [LLVMConstNull(v8i32), uw, sx]
+        return LLVMBuildCall2(ctx.builder, dpTy, dp_decl, dpArgs, "dot32.quads")
+    }
     // pairs = VPMADDUBSW(uw, sx) : v16i16
     let madd_id = LLVMLookupIntrinsicID("llvm.x86.avx2.pmadd.ub.sw")
     var madd_decl = LLVMGetIntrinsicDeclaration(g_mod, madd_id, noTypes)
@@ -1910,6 +2009,145 @@ def emit_dot32_quads_v(var ctx : JitCtx; _expr : ExprCallFunc?; wvec, xvec : LLV
     var maddwdTy = LLVMFunctionType(v8i32, w2Types)
     var maddwdArgs <- [pairs, ones]
     return LLVMBuildCall2(ctx.builder, maddwdTy, maddwd_decl, maddwdArgs, "dot32.quads")
+}
+
+def intrinsic_dot64_acc16_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    return emit_dot64_acc16(ctx, _expr, arguments, false)
+}
+
+def intrinsic_dot64_acc16_vnni_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    return emit_dot64_acc16(ctx, _expr, arguments, true)
+}
+
+// Emitter core for x64_avx::dot64_acc16 / dot64_acc16_vnni (gated by g_x64_avx512bw_intrin_lookup /
+// g_x64_avx512vnni_intrin_lookup): TWO Q8 blocks per call on zmm. The sign trick loses VPSIGNB at
+// 512 bits, so sign application is compare+negate+select (VPMOVB2M/VPCMPB + VPSUBB + VPBLENDMB
+// class under BW) — w==0 lanes keep x instead of zeroing, but they multiply |w| = 0 anyway, so the
+// quads are unchanged. use_vnni: the 16 quads come from ONE VPDPBUSD zmm; otherwise from the
+// VPMADDUBSW+VPMADDWD zmm pair (saturation headroom analysis is dot32's, unchanged). Tail: the 16
+// int32 quads convert to float (VCVTDQ2PS zmm, exact — each quad bounded < 2^24) and multiply-
+// accumulate against the [s0 x8 | s1 x8] scale vector into the caller's 16-float memory
+// accumulator (load-op-store; LICM promotes it to a zmm across a block loop). The das call is
+// void — the returned value only marks "intrinsic emitted" for make_call.
+def emit_dot64_acc16(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>; use_vnni : bool) : LLVMOpaqueValue? {
+    let v64i8 = LLVMVectorType(ctx.types.t_int8, 64u)
+    let v32i16 = LLVMVectorType(ctx.types.t_int16, 32u)
+    let v16i32 = LLVMVectorType(ctx.types.t_int32, 16u)
+    let v16f32 = LLVMVectorType(ctx.types.t_float, 16u)
+    var wptr = LLVMBuildPointerCast(ctx.builder, arguments[1], LLVMPointerType(v64i8, 0u), "")
+    var xptr = LLVMBuildPointerCast(ctx.builder, arguments[2], LLVMPointerType(v64i8, 0u), "")
+    var wvec = LLVMBuildLoad2(ctx.builder, v64i8, wptr, "")
+    LLVMSetAlignment(wvec, 1u)
+    var xvec = LLVMBuildLoad2(ctx.builder, v64i8, xptr, "")
+    LLVMSetAlignment(xvec, 1u)
+    // uw = |w| — generic @llvm.abs.v64i8 (lowers to VPABSB zmm); is_int_min_poison = false keeps -128 defined
+    let abs_id = LLVMLookupIntrinsicID("llvm.abs")
+    var absTypes <- [v64i8]
+    var abs_decl = LLVMGetIntrinsicDeclaration(g_mod, abs_id, absTypes)
+    var absArgTypes <- [v64i8, ctx.types.t_int1]
+    var absTy = LLVMFunctionType(v64i8, absArgTypes)
+    var absArgs <- [wvec, ctx.types.ConstI1(false)]
+    var uw = LLVMBuildCall2(ctx.builder, absTy, abs_decl, absArgs, "dot64.absw")
+    // sx = x with w's sign (no zeroing — see above): select(w < 0, -x, x)
+    var zero64 = LLVMConstNull(v64i8)
+    var wneg = LLVMBuildICmp(ctx.builder, LLVMIntPredicate.LLVMIntSLT, wvec, zero64, "dot64.wneg")
+    var xneg = LLVMBuildSub(ctx.builder, zero64, xvec, "dot64.negx")
+    var sx = LLVMBuildSelect(ctx.builder, wneg, xneg, xvec, "dot64.signx")
+    var quads : LLVMOpaqueValue?
+    var noTypes : array<LLVMOpaqueType?>
+    if (use_vnni) {
+        // quads = VPDPBUSD(0, uw, sx) : v16i32
+        let dp_id = LLVMLookupIntrinsicID("llvm.x86.avx512.vpdpbusd.512")
+        var dp_decl = LLVMGetIntrinsicDeclaration(g_mod, dp_id, noTypes)
+        if (dp_decl == null) {
+            failed_E(_expr, "missing intrinsic llvm.x86.avx512.vpdpbusd.512 (non-x64 target?)")
+            return null
+        }
+        var dpArgTypes <- [v16i32, v64i8, v64i8]
+        var dpTy = LLVMFunctionType(v16i32, dpArgTypes)
+        var dpArgs <- [LLVMConstNull(v16i32), uw, sx]
+        quads = LLVMBuildCall2(ctx.builder, dpTy, dp_decl, dpArgs, "dot64.quads")
+    } else {
+        // pairs = VPMADDUBSW(uw, sx) : v32i16 ; quads = VPMADDWD(pairs, splat(1)) : v16i32
+        let madd_id = LLVMLookupIntrinsicID("llvm.x86.avx512.pmaddubs.w.512")
+        var madd_decl = LLVMGetIntrinsicDeclaration(g_mod, madd_id, noTypes)
+        if (madd_decl == null) {
+            failed_E(_expr, "missing intrinsic llvm.x86.avx512.pmaddubs.w.512 (non-x64 target?)")
+            return null
+        }
+        var b2Types <- [v64i8, v64i8]
+        var maddTy = LLVMFunctionType(v32i16, b2Types)
+        var maddArgs <- [uw, sx]
+        var pairs = LLVMBuildCall2(ctx.builder, maddTy, madd_decl, maddArgs, "dot64.pairs")
+        let maddwd_id = LLVMLookupIntrinsicID("llvm.x86.avx512.pmaddw.d.512")
+        var maddwd_decl = LLVMGetIntrinsicDeclaration(g_mod, maddwd_id, noTypes)
+        if (maddwd_decl == null) {
+            failed_E(_expr, "missing intrinsic llvm.x86.avx512.pmaddw.d.512 (non-x64 target?)")
+            return null
+        }
+        var oneElems <- [for (_j in range(32)); ctx.types.ConstI16(int16(1))]
+        var ones = LLVMConstVector(array_data_ptr(oneElems), uint(length(oneElems)))
+        var w2Types <- [v32i16, v32i16]
+        var maddwdTy = LLVMFunctionType(v16i32, w2Types)
+        var maddwdArgs <- [pairs, ones]
+        quads = LLVMBuildCall2(ctx.builder, maddwdTy, maddwd_decl, maddwdArgs, "dot64.quads")
+    }
+    var accPtr = LLVMBuildPointerCast(ctx.builder, arguments[0], LLVMPointerType(v16f32, 0u), "")
+    var accVec = LLVMBuildLoad2(ctx.builder, v16f32, accPtr, "acc16.load")
+    LLVMSetAlignment(accVec, 4u)
+    var fp = LLVMBuildSIToFP(ctx.builder, quads, v16f32, "acc16.cvt")
+    // scale vector = [s0 x8 | s1 x8]: block 0's quads scale by s0, block 1's by s1
+    var sv = LLVMGetUndef(v16f32)
+    sv = LLVMBuildInsertElement(ctx.builder, sv, arguments[3], ctx.types.ConstI32(0ul), "")
+    sv = LLVMBuildInsertElement(ctx.builder, sv, arguments[4], ctx.types.ConstI32(1ul), "")
+    sv = LLVMBuildShuffleVector(ctx.builder, ctx.types, sv, sv, [for (j in range(16)); j / 8], "acc16.splat")
+    var scaled = LLVMBuildFMul(ctx.builder, fp, sv, "acc16.scale")
+    var sum = LLVMBuildFAdd(ctx.builder, accVec, scaled, "acc16.sum")
+    var wrt = LLVMBuildStore(ctx.builder, sum, accPtr)
+    LLVMSetAlignment(wrt, 4u)
+    return sum
+}
+
+// Emitter for x64_avx::mx4_dequant64 (gated by g_x64_avx512bw_intrin_lookup): TWO MXFP4 blocks'
+// nibbles (32 bytes) select lo/hi, concatenate to the zmm index layout [lo0 | hi0 | lo1 | hi1]
+// (128-bit lane per 16-byte group), and look up with ONE VPSHUFB zmm against the LUT broadcast to
+// all four lanes (indices 0..15, bit 7 clear — the zeroing path never fires, and VPSHUFB's
+// per-128-bit-lane semantics match the layout exactly), then one 64-byte store. Byte-for-byte the
+// daslang fallback (two mx4_dequant32 calls). The das call is void — the returned value only marks
+// "intrinsic emitted" for make_call.
+def intrinsic_mx4_dequant64_x64(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    let v16i8 = LLVMVectorType(ctx.types.t_int8, 16u)
+    let v32i8 = LLVMVectorType(ctx.types.t_int8, 32u)
+    let v64i8 = LLVMVectorType(ctx.types.t_int8, 64u)
+    var tptr = LLVMBuildPointerCast(ctx.builder, arguments[0], LLVMPointerType(v16i8, 0u), "")
+    var nptr = LLVMBuildPointerCast(ctx.builder, arguments[1], LLVMPointerType(v32i8, 0u), "")
+    var tvec = LLVMBuildLoad2(ctx.builder, v16i8, tptr, "mx4z.lut")
+    LLVMSetAlignment(tvec, 1u)
+    var nvec = LLVMBuildLoad2(ctx.builder, v32i8, nptr, "mx4z.nib")
+    LLVMSetAlignment(nvec, 1u)
+    var lo = LLVMBuildAnd(ctx.builder, nvec, splat_v32i8(ctx, 15), "mx4z.nib.lo")
+    var hi = LLVMBuildLShr(ctx.builder, nvec, splat_v32i8(ctx, 4), "mx4z.nib.hi")
+    // idx byte j: 128-bit lane j/16 alternates lo/hi, advancing 16 source bytes every 2 lanes
+    var idx = LLVMBuildShuffleVector(ctx.builder, ctx.types, lo, hi,
+        [for (j in range(64)); ((j / 16) % 2 == 0 ? 0 : 32) + (j / 32) * 16 + (j % 16)], "mx4z.idx")
+    var tbl = LLVMBuildShuffleVector(ctx.builder, ctx.types, tvec, tvec,
+        [for (j in range(64)); j % 16], "mx4z.tbl")
+    // w = VPSHUFB(tbl, idx) : v64i8 — all four 128-bit lanes index the same 16 LUT bytes
+    let shuf_id = LLVMLookupIntrinsicID("llvm.x86.avx512.pshuf.b.512")
+    var noTypes : array<LLVMOpaqueType?>
+    var shuf_decl = LLVMGetIntrinsicDeclaration(g_mod, shuf_id, noTypes)
+    if (shuf_decl == null) {
+        failed_E(_expr, "missing intrinsic llvm.x86.avx512.pshuf.b.512 (non-x64 target?)")
+        return null
+    }
+    var b2Types <- [v64i8, v64i8]
+    var shufTy = LLVMFunctionType(v64i8, b2Types)
+    var shufArgs <- [tbl, idx]
+    var w = LLVMBuildCall2(ctx.builder, shufTy, shuf_decl, shufArgs, "mx4z.w")
+    var dptr = LLVMBuildPointerCast(ctx.builder, arguments[2], LLVMPointerType(v64i8, 0u), "")
+    var wrt = LLVMBuildStore(ctx.builder, w, dptr)
+    LLVMSetAlignment(wrt, 1u)
+    return w
 }
 
 def intrinsic_math_store_neq_mask(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {
