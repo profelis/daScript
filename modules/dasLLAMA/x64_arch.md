@@ -156,9 +156,9 @@ appends target features for EMISSION-ONLY disasm verification on a box without t
 into the DLL cache key; never execute forced artifacts). Exactness gates live in
 `harness/avx_matrix_probe.das`: every vnni backend is BIT-EXACT vs its donor; z16 tiers gate
 rel<1e-5 vs portable (the acc8/ps float-shape class) + a bit-exact strip-expansion contract.
-Measurement plan + shapes: the arc memory (dot32-VNNI saves ~1 µop/block but moves the dot off
-the FMA-port pair; the 512 tiers halve blocks/instr; acc8 was the 1-core winner on Zen2 — all
-of it is priority-by-measurement on the rented box).
+Full detail — intrinsic/emitter facts, backend/slot map, validation status, the rented-box
+measurement runbook, and the PR-time TODO — lives in **`avx_kernel_matrix.md`** (next to this
+file).
 
 **The x64 backends** (all in `dasllama_math_x64_avx.das`, shipped 2026-07): `x64-avx2` =
 row-major dot4x4 over the `dot32` ymm intrinsic (the auto row-major default); `x64-avx2-repack` =
