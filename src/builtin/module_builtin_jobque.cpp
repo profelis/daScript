@@ -965,6 +965,14 @@ namespace das {
         return JobQue::get_num_threads();
     }
 
+    int getTotalHwCores () {
+        return JobQue::get_num_physical_cores();
+    }
+
+    void setJobqueThreadsCap ( int32_t cap ) {
+        JobQue::set_default_threads_cap(cap);
+    }
+
     class Module_JobQue : public Module {
     public:
         Module_JobQue() : Module("jobque") {
@@ -1211,6 +1219,11 @@ namespace das {
                     ->args({"context","line"});
             addExtern<DAS_BIND_FUN(getTotalHwThreads)>(*this, lib,  "get_total_hw_threads",
                 SideEffects::accessExternal, "getTotalHwThreads");
+            addExtern<DAS_BIND_FUN(getTotalHwCores)>(*this, lib,  "get_total_hw_cores",
+                SideEffects::accessExternal, "getTotalHwCores");
+            addExtern<DAS_BIND_FUN(setJobqueThreadsCap)>(*this, lib,  "set_jobque_threads_cap",
+                SideEffects::modifyExternal, "setJobqueThreadsCap")
+                    ->args({"cap"});
             addExtern<DAS_BIND_FUN(new_thread_invoke)>(*this, lib,  "new_thread_invoke",
                 SideEffects::modifyExternal, "new_thread_invoke")
                     ->args({"lambda","function","lambdaSize","context","line"});

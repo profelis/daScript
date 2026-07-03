@@ -1,0 +1,336 @@
+# EPYC 9654 — dasLLAMA x64 AVX-matrix measurement log
+
+Rented-box campaign for the AVX kernel matrix (VNNI / AVX-512 tiers) + the #3370 dispatch-lanes
+fix. **This file is the durable record on the Mac** — the rented box is ephemeral. Companion to
+`avx_kernel_matrix.md` (design), `x64_arch.md` (backend registry), `tune_for_this_box.md` (method).
+
+Branch: `bbatkin/dasllama-x64-dispatch-lanes` @ `36d1b5f07`. Started 2026-07-03.
+
+---
+
+## Box
+
+| | |
+|---|---|
+| Provider | Cherry Servers, bare-metal hourly ($2.00/hr) |
+| CPU | AMD EPYC 9654 (Zen 4 Genoa), single socket |
+| Cores / threads | 96 physical / 192 logical (2-way SMT) |
+| RAM | 755 GB |
+| OS | Ubuntu 24.04.4 LTS, kernel 6.8 |
+| Storage | 2×3.5 TB NVMe; root was a tiny 10 GB RAID1, **claimed the free 3.83 TB into `/data`** |
+| Access | SSH host alias `dasbox` (88.216.197.35), passwordless; `dasbox` SSH MCP installed |
+
+### ISA — full matrix coverage (via EVEX)
+Present: `avx2 fma avx512f avx512bw avx512vl avx512dq avx512_vnni`.
+**Absent**: `avx_vnni` (VEX-256 encoding — Genoa only advertises EVEX) and `avx512bf16`.
+Consequence: every matrix gate is satisfied (`x64-vnni256` via the `avx512vnni && avx512vl`
+arm, i.e. EVEX `VPDPBUSD`; `avx512bw`; `avx512vnni`). We **cannot** validate the *VEX*
+`vpdpbusd ymm` encoding here (needs an Intel Alder-Lake-class client chip). `bf16` absent →
+irrelevant to the matrix (only the deferred fp16-scale idea).
+
+### daslang build
+0.6.3, Release + dasLLVM, LLVM **22.1.5** prebuilt (auto-downloaded, `linux_64`). Clean build
+**2m10s** on 96 cores. Configure needed `-DDAS_LLVM_DISABLED=OFF` (JIT is OFF by default!) and
+`-DDAS_GLFW_DISABLED=ON -DDAS_STDDLG_DISABLED=ON -DDAS_HV_DISABLED=ON` (headless, no GL/X11).
+Binary: `/data/daScript/bin/daslang`. `-jit` verified.
+
+### Threads — what daslang sees
+`nproc = 192`, physical = 96. daslang: `get_total_hw_jobs()` = `min(1024, hardware_concurrency−1)`
+and `hardware_concurrency()` returns **logical** → **191 workers, + main-steal = 192 compute
+threads (every SMT lane)** by default. `DAS_JOBQUE_THREADS=N` overrides. The `−1` was tuned for
+Apple P-cores; on x86 SMT it just yields logical−1. `get_dispatch_lanes()` = workers + caller lane
+= 192.
+
+---
+
+## Correctness — ALL GREEN (this box is the first silicon the VNNI/AVX-512 emitters ever ran on)
+
+On the 3990X (Zen2) none of the VNNI/AVX-512 tiers ever executed a real instruction — only their
+delegating AVX2 fallbacks under `_FORCE`. Only `acc8` (plain AVX2) had run. **First real execution
+of `VPDPBUSD` / AVX-512 kernels = here, and they're correct.**
+
+| Check | Result |
+|---|---|
+| `tests/dasLLAMA` suite `-jit` (default backend) | **171/171**, 0 skipped |
+| `avx_matrix_probe` interp (fallback bodies) | ALL OK |
+| `avx_matrix_probe` **-jit** (real VNNI/AVX-512), `AVX_MATRIX=1` no force | ALL OK — every tier bit-exact vs donor over n=64/96/2880 (incl. threaded); intrinsic identity 64/64 blocks; z16 vs portable rel<1e-5 |
+| `mx4x64_probe` -jit (shipped mxfp4 tiers) | ALL OK |
+| `test_mxfp4`/`test_groupn` internal backend sweep w/ `AVX_MATRIX=1` | matrix backends vs scalar leaf ✓ (this is what actually covers them end-to-end in the suite) |
+| **gpt-oss-20B full MoE forward, token-for-token vs golden**, pinned per backend | portable ✓ · x64-avx2 ✓ · **x64-vnni256 ✓** · **x64-avx512vnni ✓** — all MATCH (40 tok, short + window-engaged) |
+
+**Gotcha logged:** `DASLLAMA_PIN_BACKEND` is read only by specific benches/probes
+(`bench_gemm_iso`, `llama3_perf`, `gptoss_parity_probe`), **NOT by `dastest`**. Pinning the suite
+via the env is a no-op — it silently runs the default backend. Matrix coverage in the suite comes
+from `AVX_MATRIX=1` enabling the tests' *internal* `for name in kernel_backend_names()` sweeps.
+
+---
+
+## llama.cpp baseline (`llama-bench`, CPU build `-march=native`, **-t 96**)
+
+The yardstick. Note the thread-count fairness gap: llama-bench here is 96 (physical); dasLLAMA
+defaults to 192 (all SMT). Comparisons must pin both sides to the same count.
+
+| model | size | pp512 (t/s) | tg128 (t/s) |
+|---|---|--:|--:|
+| Llama-3.1-8B Q8_0 | 7.95 GiB | 426.6 | 25.4 |
+| Llama-3.2-1B Q8_0 | 1.22 GiB | 2605.0 | 139.1 |
+| gpt-oss-20B MXFP4 MoE | 11.27 GiB | 509.9 | 54.5 |
+
+---
+
+## Thread-count sweep — isolated GEMM (`bench_gemm_iso`, `matmul_q8q8_batch`, ntok=512)
+
+Real Llama prefill shapes, **GMAC/s total** (single run each; internal warmup+reps).
+
+### Repack tier — `x64-avx2-repack` (the shipped prefill GEMM)
+| shape | T=48 | T=96 | T=144 | T=192 (default) | best |
+|---|--:|--:|--:|--:|:--|
+| kv 2048×512 | **693** | 460 | 357 | 277 | 48 |
+| qo 2048×2048 | 846 | **965** | 921 | 743 | 96 |
+| w13 2048×5632 | 1000 | 1042 | **1255** | 943 | 144 |
+| w2 5632×2048 | 888 | **1211** | 1199 | 977 | 96 |
+| cls 2048×32000 | 1065 | 1379 | 1553 | **1620** | 192 |
+
+### Row-major tier — `x64-avx2` (per-core at T=96 in parens)
+| shape | T=48 | T=96 | T=144 | T=192 |
+|---|--:|--:|--:|--:|
+| kv 2048×512 | 478 | 308 (3.21/c) | 321 | 222 |
+| qo 2048×2048 | — | 671 (6.99/c) | — | — |
+| w13 2048×5632 | 794 | 781 (8.13/c) | 1050 | 743 |
+| w2 5632×2048 | — | 783 (8.15/c) | — | — |
+| cls 2048×32000 | 813 | 836 (8.71/c) | 1215 | 963 |
+
+Repack tier ≫ row-major (e.g. cls@144: 1553 vs 1215; w2@96: 1211 vs 783) — confirms the tiled
+repack kernel is the one to A/B the VNNI tiers against.
+
+### Finding: the sweet spot is **shape-dependent**, and 192 (daslang default) is the *worst*
+choice for 4 of 5 shapes.
+- Small `kv` (d=512) peaks at 48 and **craters 2.5× at 192** (693→277).
+- Mid `qo`/`w2` peak at 96; big dense `w13` at 144; only the giant `cls` (d=32000) wants 192.
+
+---
+
+## Root cause — no minimum chunk size (the real lever)
+
+The quantized matmul dispatch (`dasllama_math.das`):
+```
+maybe_parallel_for(n*d >= g_matmul_par_threshold, 0, int(d), <num_chunks>) $(rb, re) { ... }
+```
+- There is a par-**threshold** (thread or not: `n*d >= g_matmul_par_threshold`) but **no
+  min-chunk-*size***.
+- `num_chunks` = `get_dispatch_lanes()` (≈192) for GEMV, `chunks_per_job × get_dispatch_lanes()`
+  for quantized/batch: **q8 batch = 4 × 192 = 768 chunks over `d` rows**, fixed, independent of `d`.
+- The ×4 oversplit (`g_q8_batch_chunks_per_job`, math.das:154-158) was **deliberate** (idle
+  workers steal a straggler's remaining chunks) and tuned on 3990X @32 workers → 128 chunks. At
+  192 lanes it becomes 768.
+
+Effect: for `kv` d=512, 768 chunks ⇒ **more chunks than rows** (~0.7 row/chunk after clamp = 1
+row/chunk) → the GEMM is shattered into ~512 one-row work items; dispatch overhead + SMT port
+contention dominate. For `cls` d=32000, 768 chunks ⇒ ~42 rows/chunk → healthy, scales to 192.
+
+There IS a min-size clamp already — but only for **tokens** (`effective_token_block`, L2-budget
+arithmetic in the repack kernel), **not for the row-chunk count**.
+
+## How ggml does it (teammate research, `~/Work/llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c`)
+
+ggml's `mul_mat` chunker (`:1388-1442`, MoE mirror `:1652-1666`) is a **two-stage clamp**:
+1. **Min grain floor** (`:1388-1393`): `chunk_size = 16` rows, bumped to **64** for a GEMV
+   (`nr0==1 || nr1==1`). Grid = `ceil(nr0/16) × ceil(nr1/16)`. No chunk is ever finer than 16 rows.
+2. **Anti-fragmentation fallback** (`:1404-1408`): if that grid yields `< nth*4` chunks (or NUMA),
+   scrap it and do a plain **1D split into exactly `nth` chunks** along the longer axis.
+3. **Emergent thread cap** (`:1415-1442`): all `nth` threads are dispatched (`n_tasks=n_threads`,
+   `:2302`), but the loop `while (current_chunk < nchunk0*nchunk1)` + `if (nth >= chunks) break`
+   means **only `min(nth, chunkCount)` threads ever touch data** — surplus fall through the barrier
+   idle. Remaining chunks work-steal via one cache-aligned atomic `current_chunk` (`atomic_fetch_add`).
+4. **Default threads = physical *math* cores, SMT + E-cores excluded** (`common/common.cpp:175-207`,
+   `common_cpu_get_num_math` → `common_cpu_get_num_physical_cores`). Comments: *"efficiency cores
+   harm lockstep threading"*, *"hyperthreading isn't useful for linear algebra."* So ggml sidesteps
+   SMT contention *at the thread-count level*, before chunking runs. (This is why `llama-bench` here
+   defaulted to ~96, not 192.)
+
+### dasLLAMA vs ggml
+| aspect | ggml | dasLLAMA (current) |
+|---|---|---|
+| min chunk grain | **16 rows** (64 for GEMV) | **none** — chunk = `d / (cpj×lanes)`, can be < 1 row |
+| chunk count for small op | capped: `min(nth, ⌈d/16⌉)`, fallback ≤ `nth` | fixed `cpj × lanes` (q8 batch = 4×192 = **768**) |
+| the `×4` factor | a **guard ceiling** (`< nth*4` ⇒ simplify) | a **multiplier floor** (`g_q8_batch_chunks_per_job`, always ×4) |
+| surplus threads on small op | idle (fall through barrier) | each gets a sub-1-row chunk → dispatch + SMT thrash |
+| default threads | physical cores, **no SMT** | all logical (**192, SMT included**) |
+
+Two independent divergences: **(a) no min grain**, and **(b) SMT-inclusive default**. Either alone
+hurts; together they produce the `kv` 2.5× cratering.
+
+### Proposed fix — mirror ggml's grain floor (addresses thread count *via* min-chunk-size)
+Per Boris: fix the **min-chunk-size**, don't change the jobque thread default. With a grain floor,
+daslang's 192 default becomes *harmless* — exactly ggml's emergent capping (surplus threads idle
+on small ops). Concretely, at each dispatch site clamp the requested chunk count:
+```
+let want   = chunks_per_job * get_dispatch_lanes()
+let capped = min(want, max(1, int(d) / MIN_GRAIN))   // MIN_GRAIN ≈ 16 rows (ggml), tune here
+maybe_parallel_for(cond, 0, int(d), capped) $(rb, re) { ... }
+```
+- `MIN_GRAIN = 16` mirrors ggml (start there; sweep 8/16/32/64 on this box). GEMV/decode may want
+  the 64 bump.
+- Keeps the ×4 straggler-steal oversplit for *large* `d`, kills it for *small* `d`.
+- Row-count grain is a first cut; a work-based grain (`d*n` MACs, or `d*n*ntok` for batch) is more
+  principled since a row's cost scales with `n`/`ntok` — decide after the row-grain sweep.
+- Whether `team_parallel_for`/`parallel_for` already clamp `num_jobs` to the range (no empty
+  chunks) is a C++ detail to confirm; irrelevant to the fix (we clamp at the call site regardless).
+
+---
+
+## Min-grain clamp — IMPLEMENTED + measured (2026-07-03)
+
+**Change:** `matmul_chunks(rows, want)` in `dasllama_math.das` (next to `get_dispatch_lanes`):
+`clamp(rows / g_matmul_min_chunk_rows, 1, want)`, default grain **16** (ggml parity), 0 disables,
+knob `set_matmul_min_chunk_rows`. Applied at **all 72 matmul dispatch sites** across
+`dasllama_math{,_default,_x64_avx,_aarch64_neon}.das` — maybe_parallel_for row/group/region
+splits (group ranges pass `groups*4` as rows), the 10 raw group3 `parallel_for` sites
+(`count_parallel_dispatch` kept truthful), and the precomputed `nchunks`/`njobs` strip kernels
+(whose old `clamp(ng/4, lanes, lanes*cpj)` used **lanes as the lower bound** — the exact bug:
+the 16-row grain the author designed was defeated whenever `ng/4 < lanes`).
+Env knob `DASLLAMA_MIN_CHUNK_ROWS` wired into `bench_gemm_iso` + `prefill_perf`.
+Post-change correctness: `avx_matrix_probe` ALL OK, suite 171/171. (Note: editing the core math
+.das files re-keys EVERY dasLLAMA JIT DLL → first run after = full recompile, ~270 s for the
+suite. Expected, not a hang.)
+
+### Grain sweep, repack tier @ T=192 (the clean control — GMAC/s total)
+| shape | g=0 (old) | g=8 | g=16 | g=32 | g=64 |
+|---|--:|--:|--:|--:|--:|
+| kv 2048×512 | 202 | **318** | 258 | 194 | 176 |
+| qo 2048×2048 | 299 | **707** | 618 | 458 | 311 |
+| w13 2048×5632 | 571 | 984 | **1007** | 796 | 668 |
+| w2 5632×2048 | 627 | **962** | 914 | 647 | 370 |
+| cls 2048×32000 | 1262 | **1614** | 1533 | 1593 | 1241 |
+
+**At the 192-lane default the grain floor is a 1.3–2.4× win on every shape** (qo 299→707).
+cls@192 g=8 (1614) matches the old global best (1620). **g=8 > g=16 on this box** everywhere
+except w13 (~2% ≈ noise). Grain is box-dependent: the 3990X kernel-comment measurements favored
+16 (4 groups/chunk); EPYC favors 8 → `box_profile` runtime knob, default stays 16.
+
+### Thread sweep with grain=16 (repack tier)
+| shape | T=48 | T=96 | T=144 | T=192 |
+|---|--:|--:|--:|--:|
+| kv | **479** | 319 | 238 | 258 |
+| qo | 850 | **984** | 749 | 618 |
+| w13 | 1004 | 1129 | **1145** | 1007 |
+| w2 | 892 | **1231** | 984 | 914 |
+| cls | 1068 | 1390 | **1539** | 1533 |
+
+### Measurement-validity caveat (cross-run absolutes are polluted)
+The g=0 control (202/299/571/627/1262) sits far BELOW the pre-change run of the *identical*
+config (277/743/943/977/1620): the grain sweep ran 5th–8th after four back-to-back bench runs
+(hot box), the pre-change sweep ran cold — the sequential-run thermal confound the tuning doc
+warns about, reproduced live. What survives it: **g=8 ran AFTER g=0 on an even hotter box and
+still won 1.6–2.4×** — the grain win is real and under-, not over-stated. What does NOT survive:
+cross-session absolute claims (e.g. "old kv T=48 = 693 vs new 479" — unsettled). A proper
+interleaved same-process grain A/B is the follow-up if we need exact ratios.
+
+### Caveats the sweep exposed (honest)
+1. **kv (small-d) likely still short of its low-thread optimum**: row-only splitting can't feed
+   many lanes for small d at any grain — **ggml chunks the token dimension too** (2D grid:
+   kv-like shapes get 32×32 = 1024 tiles of 16×16). 2D chunking = the structural fix →
+   **perf ledger, not chased now**.
+2. Optimal grain differs per shape and box → runtime knob + per-box tune, not a constant.
+3. Bench runs are sequential per config (no in-process grain interleave yet) — treat all
+   cross-config ratios ≳noise-floor accordingly; the 1.3–2.4× T=192 wins are far above it.
+
+### In-model prefill A/B (Llama-1B, T=192, sequential runs) — the deciding numbers
+prefill tok/s (batched `forward_prefill`) and per-token tok/s (decode-style):
+| N | g=0 | g=16 | g=8 |
+|---|--:|--:|--:|
+| 64 | 134.0 | **194.6 (+45%)** | 161.3 |
+| 256 | 297.7 | **326.9 (+10%)** | 320.8 |
+| 512 | 493.8 | 495.4 | **501.2** (~flat) |
+| per-token (decode-style) | 7.12–7.65 | **7.40–8.05 (+4-5%)** | ≈ g=0 |
+
+**In-model, g=16 wins** (biggest at small batch, where dispatch dominates) — opposite of the
+iso-GEMM bench's g=8 preference (iso = batch kernel only; in-model mixes GEMV+groupn+batch).
+In-model is the truth → **default grain stays 16**.
+
+## Physical-core jobque cap (Boris's design, implemented 2026-07-03)
+
+dasLLAMA-scoped limiter, core daslang default untouched: `JobQue::set_default_threads_cap(n)`
+(C++ — min()'d with the stock rule at queue creation, so it can only lower; env
+`DAS_JOBQUE_THREADS` still beats everything) + `get_total_hw_cores()` physical-core builtin
+(Linux `smt/active`, Windows `RelationProcessorCore` records, mac `hw.physicalcpu`) +
+`[init] dasllama_jobque_threads_cap` in `dasllama_math.das` setting cap = phys−1 → workers
+phys−1 + computing main = **physical cores, ggml's exact `-t` default**. min() semantics keep
+the Apple P−1 rule (cap 9 doesn't raise M1 Max's 7). Files: `job_que.{h,cpp}`, `sysos.cpp`,
+`module_builtin_jobque.cpp`, `aot_builtin_jobque.h`, `dasllama_math.das`.
+PR-time TODO: handmade RST stubs for the two new builtins (doc gate).
+
+## Planned centerpiece — the ISA-yield ladder (Boris, 2026-07-03)
+
+Once grain + threads + tune are settled, pin down the ladder and measure the MARGINAL yield of
+each extension on identical shapes (the matrix cells are same-kernel-one-ISA-step twins by
+construction, bit-exact-verified):
+`portable → x64-avx2 (pmaddubsw+pmaddwd) → x64-vnni256 (vpdpbusd ymm) → x64-avx512bw (zmm pair)
+→ x64-avx512vnni (vpdpbusd zmm)`. In-process interleaved via `DASLLAMA_PIN_BACKEND`; promote/
+delete falls out of the same data. Second axis: whole-program compiler-target downgrade via
+`DAS_JIT_X64_FORCE_FEATURES` minus-tokens (verify the parse accepts `-feat`) → autovectorizer
+width yield on the float kernels. Writeup caveat: Zen 4 double-pumps 512-bit, so width rungs
+underestimate native-512 silicon (SPR / Zen 5); VNNI rungs are clean.
+
+## The dispatch hunt (Boris's "something is very wrong" — confirmed and fixed, 2026-07-03)
+
+**Floor check first** (new standing rule — see memory `sanity-floor-before-sweeps`): SmolLM2-135M
+@ T=1 = 116 t/s decode / 218 prefill — engine + JIT fundamentally sane on this box.
+
+**The signature** (SmolLM ladder, fifo dispatch): decode FLAT 116-128 at any T (below par
+threshold → inline); prefill COLLAPSES 218→190→100→49 t/s as T grows 1→96 (above threshold →
+dispatches). ttft 18→80ms. → the fork/join dispatch itself is the cost.
+
+**Quantified** (`benchmarks/core/jobque/dispatch.das` + new team arm): fifo fork/join ≈ **10 µs
+PER JOB** (alloc+fifo+wake+waitgroup) → 96-chunk dispatch ≈ 1 ms; × ~160 dispatches/decoded
+token ≈ the entire budget → the observed Llama-1B 7.6 t/s vs llama.cpp 139 (18×). On M1 (9
+lanes) this was ~90 µs/dispatch — invisible. ggml pays ~µs spin barriers instead (persistent
+graph lockstep, no per-op posting). Team dispatch (#3368) measures 0.5-5.7 ns/op in the empty
+probe (flattered — caller self-serves; real-work cost higher but orders cheaper than fifo).
+
+**Team mode as runner default (box experiment — sed in setup_dasllama_jobque_):**
+| metric | fifo | team |
+|---|--:|--:|
+| SmolLM prefill @96w | 49 | **250** (ttft 80→16ms) |
+| Llama-1B decode @95w default | 7.6 | **43** (5.7×) |
+| Llama-1B decode knee | — | **97 @ T=24** (70% of lcpp 139) |
+| Llama-1B prefill-512 @default | 495 | **969** (37% of lcpp 2605; N=256: 1120) |
+
+**Decode residual:** lcpp holds 139 at 96 threads via GEMV grain 64 (⇒ ~32 effective threads,
+emergent); our grain-64 env test: decode 43.9→**53.8** t/s at default (+13-15%; grain-32
+measured worse — sequential-run noise/imbalance, treat as unsettled). Full fix needs
+decode-lane limiting or cheaper rendezvous — tuning territory.
+
+**Day total: Llama-1B decode 7.6 → 97 t/s (12.7×) with knee-threads, 43-54 at defaults;
+prefill-512 2×.** Fixes: min-grain clamp + phys-core cap (committed) + team-default (pending
+decision) + decode-lane knob (ledger).
+
+### llama.cpp Llama-1B thread curve (knee-vs-knee, same box)
+| threads | lcpp pp512 | lcpp tg128 | us decode (team) |
+|--:|--:|--:|--:|
+| 6 | 211.5 | 52.1 | — |
+| 8 | 282.3 | 67.6 | **76 (1.12× — we win)** |
+| 24 | 790.4 | 137.6 | 97 (0.70×) |
+| 96 | 2605.0 | 139.1 | 43 (0.31×) |
+
+**The decomposition that matters:** lcpp decode PLATEAUS 24→96 (surplus threads cost nothing —
+spin-barrier lockstep); ours PEAKS at 24 and FALLS (every thread costs a rendezvous share).
+Below the knee we are at parity or better → kernels/memory path fine; the whole remaining gap
+is scheduler-overhead growth. Next levers: decode-lane capping / GEMV grain 64 (+13-15%
+measured), and the non-GEMM loop audit — `dasllama_common.das:2012` forces decode attn parallel
+unconditionally under team mode (M1-tuned), plus M1-tuned per-pass thresholds; instrument =
+`decode_prof.das` per-op attribution at T=24 vs default.
+
+## Open items / next
+- [ ] ggml min-chunk-size comparison (teammate) → pick MIN_ROWS_PER_CHUNK / work metric.
+- [ ] Implement + measure the min-chunk-size clamp; re-run the thread sweep (192 should stop losing).
+- [ ] Per-cell VNNI-vs-donor A/B at a fixed thread count (the promote/delete question). Pin 96 baseline.
+- [ ] #3370 dispatch-lanes utilization delta on 96 cores.
+- [ ] In-model dasLLAMA vs llama.cpp (same thread count both sides), Llama-1B + Llama-8B + gpt-oss.
+- [ ] `tune_kernels` → box_profile.json for the EPYC.
+
+## Campaign method reminders
+- Correctness before speed; real-model tests = **small model, one run at a time** (the oracle
+  path in `gptoss_parity_probe` is deliberately un-vectorized → slow; not a perf tool).
+- Interleaved A/B in one process for cross-backend; absolute numbers need a quiet box.
+- Pin thread count explicitly (`DAS_JOBQUE_THREADS`), same on both sides of any llama.cpp compare.

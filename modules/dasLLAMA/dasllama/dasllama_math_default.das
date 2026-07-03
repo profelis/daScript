@@ -76,7 +76,7 @@ def pf_prof_report() {
 def private q8q8_kernel(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
+    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 myp[i] = dot_q8q8(wp + int64(i) * n, sp + int64(i) * nb, xqp, xsp, n)
@@ -99,7 +99,7 @@ def private q8q8_batch_kernel(var yp : float?; wp : int8 const?; sp : float cons
         let pf0 = ref_time_ticks()
         unsafe {
             let wsbase = addr(g_pf_ws[0])
-            parallel_for(0, int(d), get_dispatch_lanes()) $(rb, re, wg) {
+            parallel_for(0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re, wg) {
                 unsafe {
                     var wsw = reinterpret<int64?>(wsbase)
                     wsw[rb] = ref_time_ticks() - pf0
@@ -130,7 +130,7 @@ def private q8q8_batch_kernel(var yp : float?; wp : int8 const?; sp : float cons
         g_pf_n ++
         return
     }
-    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
+    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n
@@ -150,7 +150,7 @@ def private q8q8_group3_kernel(var y0p : float?; var y1p : float?; var y2p : flo
     var w0 = y0p
     var w1 = y1p
     var w2 = y2p
-    maybe_parallel_for(n * dtot >= g_matmul_par_threshold, 0, int(dtot), get_dispatch_lanes()) $(rb, re) {
+    maybe_parallel_for(n * dtot >= g_matmul_par_threshold, 0, int(dtot), matmul_chunks(int(dtot), get_dispatch_lanes())) $(rb, re) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -203,7 +203,7 @@ def mx4q8_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : in
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     myp[i] = dot_mx4q8_scalar(lutp, wn + int64(i) * (n / 2l), we + int64(i) * nb, xqp, xsp, n)
@@ -224,7 +224,7 @@ def mx4q8_batch_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xq
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wn + int64(i) * (n / 2l)
@@ -247,7 +247,7 @@ def mx4q8_batch_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 con
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), matmul_chunks(int(nregions * d), get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let ii = int64(i)
@@ -274,7 +274,7 @@ def mx4q8_batch_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 con
 def q8q8_groupn_kernel(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_dispatch_lanes()) $(rb, re) {
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), matmul_chunks(int(nregions * d), get_dispatch_lanes())) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let ii = int64(i)
@@ -299,7 +299,7 @@ def mx4q8_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; o
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), matmul_chunks(int(nregions * d), get_dispatch_lanes())) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let ii = int64(i)

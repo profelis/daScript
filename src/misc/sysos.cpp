@@ -54,6 +54,27 @@
             return 0;
         }
 
+        int GetPhysicalCoreCountInWindows() {
+            DWORD returnLength = 0;
+            vector<unsigned char> buffer;
+            PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info = nullptr;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &returnLength);
+            buffer.resize(returnLength);
+            if (GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buffer.data()), &returnLength)) {
+                int coreCount = 0;
+                DWORD offset = 0;
+                while (offset < returnLength) {
+                    info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buffer.data() + offset);
+                    if (info->Relationship == RelationProcessorCore) {
+                        coreCount++;    // one record per physical core, SMT siblings collapsed
+                    }
+                    offset += info->Size;
+                }
+                return coreCount;
+            }
+            return 0;
+        }
+
         bool g_isVHSet = false;
         void ( * g_HwBpHandler ) ( int, void * ) = nullptr;
 

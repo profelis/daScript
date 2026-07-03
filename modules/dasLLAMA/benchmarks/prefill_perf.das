@@ -46,6 +46,12 @@ def main {
             set_jobque_join_spin(join_spin)
             print("join spin override: level {join_spin}\n")
         }
+        // A/B the matmul min-grain (rows per chunk floor); 0 = clamp off (pre-grain behavior)
+        if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS")) {
+            let mg = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS"))
+            set_matmul_min_chunk_rows(mg)
+            print("min chunk rows override: {mg}\n")
+        }
         // warmup — JIT both paths
         let warm <- build_prompt(8l)
         for (p in range64(8l)) {

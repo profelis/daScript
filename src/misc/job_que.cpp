@@ -83,10 +83,44 @@ namespace das {
     static int jobque_thread_count(int hw) {
         static int forced = []{ const char * e = getenv("DAS_JOBQUE_THREADS"); return e ? atoi(e) : 0; }();
         if ( forced > 0 ) return forced;
+        int def = 0;
 #if defined(__APPLE__)
-        if ( int good = apple_perf_core_count() ) return max(1, good - 1);
+        if ( int good = apple_perf_core_count() ) def = max(1, good - 1);
 #endif
-        return max(1, min(DAS_MAX_HW_JOBS, hw - 1));
+        if ( def == 0 ) def = max(1, min(DAS_MAX_HW_JOBS, hw - 1));
+        if ( int cap = JobQue::get_default_threads_cap() ) def = max(1, min(def, cap));
+        return def;
+    }
+
+    // Sticky cap on the DEFAULT worker count of a future JobQue (min with the stock rule, so it
+    // can only lower it; 0 = off). For workloads that want physical cores only — SMT siblings
+    // share the FMA/load ports, so lockstep linear algebra runs slower oversubscribed (dasLLAMA
+    // caps to cores-1 at [init]). DAS_JOBQUE_THREADS still overrides everything.
+    static atomic<int> g_jobqueDefaultThreadsCap{0};
+    void JobQue::set_default_threads_cap(int cap) { g_jobqueDefaultThreadsCap = max(cap, 0); }
+    int JobQue::get_default_threads_cap() { return g_jobqueDefaultThreadsCap.load(); }
+
+#if defined(_MSC_VER) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
+    int GetPhysicalCoreCountInWindows();
+#endif
+
+    int JobQue::get_num_physical_cores() {
+#if defined(__APPLE__)
+        int ncores = 0; size_t len = sizeof(ncores);
+        if ( sysctlbyname("hw.physicalcpu", &ncores, &len, nullptr, 0) == 0 && ncores > 0 ) return ncores;
+#elif defined(_MSC_VER) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
+        if ( int ncores = GetPhysicalCoreCountInWindows() ) return ncores;
+#elif defined(__linux__)
+        // 2-way SMT is the universal x86 layout; smt/active is authoritative and cheap
+        if ( FILE * f = fopen("/sys/devices/system/cpu/smt/active", "r") ) {
+            int active = 0;
+            int got = fscanf(f, "%d", &active);
+            fclose(f);
+            int logical = max(1, (int)thread::hardware_concurrency());
+            if ( got == 1 ) return active ? max(1, logical / 2) : logical;
+        }
+#endif
+        return max(1, (int)thread::hardware_concurrency());
     }
 
 #if defined(_MSC_VER) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)

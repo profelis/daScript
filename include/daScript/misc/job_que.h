@@ -101,6 +101,9 @@ namespace das {
         void parallel_for ( int from, int to, const JobChunk & chunk, JobCategory category, JobPriority priority, int chunk_count = -1, int step = 1 );
         void parallel_for_with_consume (int from, int to, const JobChunk & chunk, const JobChunk & consume, JobCategory category, JobPriority priority, int chunk_count = -1, int step = 1);
         static int get_num_threads();
+        static int get_num_physical_cores();            // physical cores (SMT siblings collapsed); logical count where topology is unknown
+        static void set_default_threads_cap(int cap);   // cap the DEFAULT worker count of a future JobQue (min with the stock rule); 0 = off. DAS_JOBQUE_THREADS still overrides
+        static int get_default_threads_cap();
         void EvalOnMainThread(Job && expr);
         void EvalMainThreadJobs();
         void wait();
