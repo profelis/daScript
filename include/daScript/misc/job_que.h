@@ -111,6 +111,15 @@ namespace das {
         // thread-wake per job — measured ~3-4.5us per notify_one to a PARKED worker vs ~0.1us to a
         // spinning one, paid serially by the DISPATCHING thread. Opt-in: spinning burns idle CPU.
         void setWorkerSpin ( int usec ) { mSpinUs = usec; }
+        // Team mode (opt-in, sticky): workers never park; alongside the fifo they poll a single
+        // published team op and self-serve chunks off one atomic (the ggml threadpool shape).
+        // teamParallelFor replaces the whole per-chunk fifo path — no push, no mutex, no wait
+        // group, no condvar — with one seq bump per dispatch; join is a spin on a remaining
+        // counter. Single dispatcher at a time; spinning burns idle CPU while the flag is on.
+        void setTeamMode ( bool on );
+        bool getTeamMode () const { return mTeamMode.load(std::memory_order_relaxed) != 0; }
+        int getNumWorkers () const { return mThreadCount.load(); }
+        void teamParallelFor ( int numChunks, const JobChunk & work );   // work(chunkIndex, workerSlot); caller participates as slot getNumWorkers()
     protected:
         struct JobEntry {
             JobEntry( Job&& _function, JobCategory _category, JobPriority _priority) {
@@ -135,6 +144,7 @@ namespace das {
         void join();
         void job(int threadIndex);
         void submit(Job && job, JobCategory category, JobPriority priority);
+        bool runTeamChunks(int threadIndex, uint32_t & seqSeen);
     protected:
         condition_variable mCond;
         int mSleepMs;
@@ -148,6 +158,17 @@ namespace das {
         atomic<int> mJobsRunning{0};
         atomic<int32_t> mSpinUs{0};
         atomic<int32_t> mFifoCount{0};  // lock-free mirror of mFifo.size() for the spin poll
+    protected:
+        // team-mode publish slot. Publish order: work/numChunks/remaining, then chunkNext release-
+        // store(0), then seq release-bump — a worker entering via either the seq acquire-load or the
+        // chunkNext acq_rel fetch_add is guaranteed to see the whole op. mTeamWork points at the
+        // dispatcher's stack; valid because teamParallelFor doesn't return until remaining hits 0.
+        atomic<int32_t>  mTeamMode{0};
+        atomic<uint32_t> mTeamSeq{0};
+        atomic<int32_t>  mTeamChunkNext{0};
+        atomic<int32_t>  mTeamRemaining{0};
+        int              mTeamNumChunks = 0;
+        const JobChunk * mTeamWork = nullptr;
     protected:
         mutex mEvalMainThreadMutex;
         vector<Job> mEvalMainThread;

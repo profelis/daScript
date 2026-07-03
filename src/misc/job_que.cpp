@@ -262,6 +262,7 @@ namespace das {
     }
 
     void JobQue::job(int threadIndex) {
+        uint32_t teamSeqSeen = mTeamSeq.load(std::memory_order_relaxed);
         while (!mShutdown) {
             Job job;
             bool gotJob = false;
@@ -272,11 +273,16 @@ namespace das {
             // a spinning worker it's a ~0.1us no-waiter check. A fork/join burst (LLM decode token =
             // dozens of back-to-back parallel_for matmuls) keeps workers in the spin window the whole
             // time, so only the burst's first dispatch pays the wakes.
+            // Team mode extends the same window: poll the team slot too, and never let the deadline
+            // expire while the flag stays on (team publishes don't notify — a parked worker would
+            // sleep through them).
             int spinUs = mSpinUs.load(std::memory_order_relaxed);
-            if ( spinUs > 0 && !mShutdown.load(std::memory_order_relaxed) ) {
+            bool teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
+            if ( (spinUs > 0 || teamMode) && !mShutdown.load(std::memory_order_relaxed) ) {
                 auto deadline = chrono::steady_clock::now() + chrono::microseconds(spinUs);
                 for (;;) {
                     if ( mShutdown.load(std::memory_order_relaxed) ) break;
+                    if ( teamMode ) runTeamChunks(threadIndex, teamSeqSeen);
                     // try_lock, NOT lock: every spinner that sees the same count blip races here, and
                     // blocking losers would queue on the mutex — a convoy the dispatcher's next push
                     // waits behind (measured 45us push stalls). try_lock losers just keep spinning,
@@ -299,7 +305,10 @@ namespace das {
                         if ( gotJob ) break;
                     }
                     jobque_spin_pause();
-                    if ( chrono::steady_clock::now() >= deadline ) break;
+                    if ( chrono::steady_clock::now() >= deadline ) {
+                        teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
+                        if ( !teamMode ) break;     // flag went off mid-window → allow the park below
+                    }
                 }
             }
             if ( !gotJob ) {
@@ -310,9 +319,11 @@ namespace das {
                 // dispatch path needs, throttling parallel_for when most workers are idle between
                 // a token's many small matmuls. push()/parallel_for already notify, so latency is
                 // unaffected; join() sets mShutdown under the lock and notifies to wake all workers.
-                mCond.wait(lock, [&]() { return mFifo.size() != 0 || mShutdown.load(); });
+                // setTeamMode(true) also notifies: parked workers must re-enter the spin loop to see
+                // team publishes, hence the empty-fifo continue.
+                mCond.wait(lock, [&]() { return mFifo.size() != 0 || mShutdown.load() || mTeamMode.load(std::memory_order_relaxed) != 0; });
                 if ( mShutdown ) break;
-                DAS_VERIFYF(mFifo.size() > 0, "There must be at least one job available");
+                if ( mFifo.empty() ) continue;      // team-mode wake, no fifo work → back to the spin/team poll
                 job = das::move(mFifo.front().function);
                 mThreads[threadIndex].currentPriority = mFifo.front().priority;
                 mThreads[threadIndex].currentCategory = mFifo.front().category;
@@ -345,6 +356,56 @@ namespace das {
             }
         }
         mThreadCount--;
+    }
+
+    void JobQue::setTeamMode ( bool on ) {
+        mTeamMode.store(on ? 1 : 0, std::memory_order_relaxed);
+        if ( on ) {
+            // parked workers must move to the spin loop — team publishes don't notify
+            lock_guard<mutex> lock(mFifoMutex);
+            mCond.notify_all();
+        }
+    }
+
+    bool JobQue::runTeamChunks ( int threadIndex, uint32_t & seqSeen ) {
+        uint32_t seq = mTeamSeq.load(std::memory_order_acquire);
+        if ( seq == seqSeen ) return false;
+        seqSeen = seq;
+        bool ran = false;
+        for (;;) {
+            // acq_rel pairs with the publisher's release-store(0): a straggler still in this loop
+            // when the NEXT op publishes crosses over cleanly — it claims a fresh chunk index and
+            // sees that op's work/numChunks. Every chunk of every op runs exactly once regardless.
+            int c = mTeamChunkNext.fetch_add(1, std::memory_order_acq_rel);
+            if ( c >= mTeamNumChunks ) break;
+            (*mTeamWork)(c, threadIndex);
+            mTeamRemaining.fetch_sub(1, std::memory_order_release);
+            ran = true;
+        }
+        return ran;
+    }
+
+    void JobQue::teamParallelFor ( int numChunks, const JobChunk & work ) {
+        int nW = mThreadCount.load();
+        if ( numChunks <= 1 || nW == 0 || !getTeamMode() ) {
+            for ( int c = 0; c != numChunks; ++c ) work(c, nW);
+            return;
+        }
+        mTeamWork = &work;
+        mTeamNumChunks = numChunks;
+        mTeamRemaining.store(numChunks, std::memory_order_relaxed);
+        mTeamChunkNext.store(0, std::memory_order_release);
+        mTeamSeq.fetch_add(1, std::memory_order_release);
+        for (;;) {
+            int c = mTeamChunkNext.fetch_add(1, std::memory_order_acq_rel);
+            if ( c >= numChunks ) break;
+            work(c, nW);
+            mTeamRemaining.fetch_sub(1, std::memory_order_release);
+        }
+        // join: acquire pairs with the workers' release decrements, so their chunk writes are
+        // visible here. Unbounded spin — the tail is at most one chunk per worker.
+        while ( mTeamRemaining.load(std::memory_order_acquire) != 0 ) jobque_spin_relax();
+        mTeamWork = nullptr;
     }
 
     void JobQue::parallel_for ( JobStatus & status, int from, int to, const JobChunk & chunk,

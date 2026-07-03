@@ -43,6 +43,9 @@ struct Args {
     @clarg_doc = "top-k sampling instead of greedy (0 = greedy; e.g. 40)"
     topk : int = 0
 
+    @clarg_doc = "Team dispatch: workers self-serve chunks off one published atomic instead of per-chunk fifo jobs"
+    team : bool
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -99,6 +102,10 @@ def main() {
     }
     with_job_que() {
         setup_dasllama_jobque_()
+        if (cfg.team) {
+            set_jobque_team_mode(true)
+            print("team dispatch: on\n")
+        }
         // one throwaway warmup prompt: JIT compilation + first-touch paging stay out of prompt 0
         {
             var s <- make_run_state(c)

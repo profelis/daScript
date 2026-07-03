@@ -30,18 +30,28 @@ class private MaybeParallelForMacro : AstFunctionAnnotation {
         macro_verify(li == 4 && call.arguments[li] is ExprMakeBlock, compiling_program(), call.at,
             "maybe_parallel_for expects (parallel, range_begin, range_end, num_jobs) and a $(rb, re) block")
         // args: 0=parallel, 1=range_begin, 2=range_end, 3=num_jobs, 4=block.
-        // parallel: parallel_for threads the block (its macro wraps the body in new_job); the block
-        //   is invoked per chunk and we add the wait-group notify. single: invoke the block inline.
-        // Synthesize the wrapper-block param names so they can't shadow the user block's own params.
+        // parallel: team mode on → team_parallel_for (workers self-serve chunks off one atomic, one
+        //   lambda clone per worker); off → parallel_for (its macro wraps the body in new_job, one
+        //   fifo job per chunk + wait-group notify). single: invoke the block inline. The user block
+        //   body is instantiated in each arm; only one arm runs.
+        // Synthesize the wrapper param names so they can't shadow the user block's own params.
         let rbN = make_unique_private_name("mpf_rb", call.at)
         let reN = make_unique_private_name("mpf_re", call.at)
         let wgN = make_unique_private_name("mpf_wg", call.at)
+        let rbT = make_unique_private_name("mpf_trb", call.at)
+        let reT = make_unique_private_name("mpf_tre", call.at)
         var qb = qmacro_block() {
             if ($e(call.arguments[0])) {
                 count_parallel_dispatch($e(call.arguments[3]))   // dispatch observability (dasllama_math)
-                parallel_for($e(call.arguments[1]), $e(call.arguments[2]), $e(call.arguments[3])) <| $($i(rbN), $i(reN), $i(wgN)) {
-                    invoke($e(call.arguments[4]), $i(rbN), $i(reN))
-                    $i(wgN) |> notify_and_release
+                if (get_jobque_team_mode()) {
+                    team_parallel_for($e(call.arguments[1]), $e(call.arguments[2]), $e(call.arguments[3])) <| @($i(rbT) : int; $i(reT) : int) {
+                        invoke($e(call.arguments[4]), $i(rbT), $i(reT))
+                    }
+                } else {
+                    parallel_for($e(call.arguments[1]), $e(call.arguments[2]), $e(call.arguments[3])) <| $($i(rbN), $i(reN), $i(wgN)) {
+                        invoke($e(call.arguments[4]), $i(rbN), $i(reN))
+                        $i(wgN) |> notify_and_release
+                    }
                 }
             } else {
                 count_inline_run()
