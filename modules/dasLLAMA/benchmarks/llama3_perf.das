@@ -49,6 +49,9 @@ def main {
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
         pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
     }
+    if (has_env_variable("DASLLAMA_PIN_BATCH_BACKEND")) {
+        select_batch_backend(get_env_variable("DASLLAMA_PIN_BATCH_BACKEND"))
+    }
     print("loading {path}\n")
     let t <- load_gguf(path, QuantMode.q8)
     let c = t.config

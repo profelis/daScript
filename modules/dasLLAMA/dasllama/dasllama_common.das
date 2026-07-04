@@ -1397,6 +1397,13 @@ def apply_box_profile_runtime(path : string = "") {
         pin_kernel_backend(be)   // warns and keeps the current backend if the name is unknown
         to_log(LOG_INFO, "dasLLAMA: box profile runtime: backend = {active_kernel_backend()} (profile pin '{be}')\n")
     }
+    let bbe = read_json_field(rt, "batch_backend", "")
+    if (bbe != "") {
+        // sticky through the load-time (re)select — activate() re-applies it; warns and keeps the
+        // active backend's batch slots if the donor is unknown or reads a different weight layout
+        select_batch_backend(bbe)
+        to_log(LOG_INFO, "dasLLAMA: box profile runtime: batch_backend = {active_batch_backend()} (profile pin '{bbe}')\n")
+    }
     // "threads" is advisory — the worker count is fixed at jobque creation, controlled by the
     // DAS_JOBQUE_THREADS env (see tune_for_this_box.md); a profile can only recommend it. No live
     // comparison here: get_dispatch_lanes() throws outside a job queue, and load_model may run there.

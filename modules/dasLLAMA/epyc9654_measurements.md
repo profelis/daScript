@@ -539,6 +539,21 @@ best batch slot) is x64-only in practice today — on M1 the GEMV delta is ~0, k
 NB portable-GEMV + repack-batch is NOT directly composable: repack interleaves planes
 in place (see the tied-cls dual-copy precedent); the row-major hybrid avoids this entirely.
 
+### Session 3e: HYBRID SHIPPED (Boris call) — per-slot batch pin, box profile complete
+`select_batch_backend(name)` / profile `runtime.batch_backend` / env `DASLLAMA_PIN_BATCH_BACKEND`:
+overrides only the batch-shaped slots (batch, mx4_batch, mx4_batch_groupn, mx4_native_batch flag)
+from a layout-compatible donor; sticky across re-activation (activate() re-applies the pin, so
+the load-time repack select can't clobber it); layout guard rejects repack↔row-major mixes and
+different repack layouts. Covered by test_kernel_backend (6/6).
+**Measured (1B):** prefill @512 hybrid **1044** ≈ acc8 1047 (portable-alone 871, auto 1016);
+decode T=24 hybrid 98.0 ≈ portable ctrl 102.2 (bracket noise — decode never calls batch slots);
+defaults per-token 71.0 vs auto 60.2. EPYC box_profile.json final: backend=portable +
+batch_backend=x64-avx2-acc8 + gemv grain 128 + tuned perms = best measured decode AND prefill.
+**The "25 chunks on 24 cores" question (Boris): by design, not a bug** — get_dispatch_lanes() =
+workers + the caller, which serves a chunk too (workers-only split measured −8% on M1);
+matmul_chunks_gemv already is `min(lanes, rows/N)` with balanced sizes = the asked-for rule;
+the open knob is only N per shape.
+
 ### AVX_MATRIX master switch REMOVED (Boris, post-validation)
 Correctness held on real silicon (probe + gpt-oss token-for-token, 4 backends) → the
 `DASLLAMA_AVX_MATRIX=1` env gate is redundant. Matrix tiers now register unconditionally

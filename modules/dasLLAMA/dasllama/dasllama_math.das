@@ -551,6 +551,8 @@ var g_active_needs_repack = false   // does the active backend need repacked wei
 var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
 var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
+var g_batch_pin = ""                // hybrid: donor backend for the BATCH-shaped slots; "" = whole-backend
+var g_active_batch_backend = ""     // == g_active_backend unless a batch pin overrode the batch slots
 
 //! Default repack: no-op — weights stay row-major for the portable / sdot4x4 kernels.
 [unused_argument(wp, sp, n, d)]
@@ -601,6 +603,32 @@ def private activate(be : KernelBackend) {
     g_active_needs_repack = be.needs_repack
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
     g_active_mx4_native_batch = be.mx4_native_batch
+    g_active_batch_backend = be.name
+    // a standing batch pin survives re-activation (auto-select, load-time select, explicit select)
+    if (g_batch_pin != "") {
+        apply_batch_override(g_batch_pin)
+    }
+}
+
+// The batch half of a hybrid: overwrite only the BATCH-shaped slots (prefill GEMM + mx4 batch)
+// from the donor. GEMV-shaped slots (mm / group3 / groupn) stay with the active backend. The
+// donor must read the same weight layout: same needs_repack, and for repack backends the same
+// repack fn (laneq vs grp4 are both "repacked" but mutually unreadable).
+def private apply_batch_override(name : string) {
+    if (!key_exists(g_kernel_backends, name)) {
+        to_log(LOG_WARNING, "dasLLAMA: batch backend '{name}' — no such backend registered; keeping '{g_active_backend}' batch kernels\n")
+        return
+    }
+    let be = g_kernel_backends[name]
+    if (be.needs_repack != g_active_needs_repack || (g_active_needs_repack && !(be.repack == g_repack_q8q8))) {
+        to_log(LOG_WARNING, "dasLLAMA: batch backend '{name}' reads a different weight layout than active '{g_active_backend}'; keeping '{g_active_backend}' batch kernels\n")
+        return
+    }
+    g_mm_q8q8_batch = be.batch
+    g_mm_mx4q8_batch = be.mx4_batch
+    g_mm_mx4q8_batch_groupn = be.mx4_batch_groupn
+    g_active_mx4_native_batch = be.mx4_native_batch
+    g_active_batch_backend = be.name
 }
 
 //! Register a kernel backend under its name. Auto-activates it as the row-major default when it is the
@@ -636,6 +664,25 @@ def pin_kernel_backend(name : string) {
 }
 def clear_kernel_backend_pin() {
     g_backend_pin = ""
+}
+
+//! Pin the BATCH-shaped kernel slots (prefill GEMM + mx4 batch) to backend `name`, keeping the
+//! active backend's GEMV slots — the hybrid for boxes where decode and prefill prefer different
+//! backends (EPYC 9654: portable GEMV + x64-avx2-acc8 batch). The pin survives later backend
+//! (re)selection, including select_matmul_backend_for_load. `""` clears it (next activation
+//! restores whole-backend slots). The donor must read the active backend's weight layout —
+//! a layout-incompatible or unknown donor logs a warning and leaves the batch slots alone.
+def select_batch_backend(name : string) {
+    g_batch_pin = name
+    if (name != "") {
+        apply_batch_override(name)
+    }
+}
+
+//! The backend serving the BATCH-shaped slots (== active_kernel_backend() unless a batch pin
+//! overrode them — diagnostics / tests).
+def active_batch_backend() : string {
+    return g_active_batch_backend
 }
 
 //! Select the best backend for a model load — INCLUDING repack backends (arm64 laneq). Honors a pin.

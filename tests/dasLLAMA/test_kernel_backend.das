@@ -57,3 +57,39 @@ def test_select_and_pin(t : T?) {
         }
     }
 }
+
+[test]
+def test_batch_backend_pin(t : T?) {
+    t |> run("batch pin overrides the batch slots, survives re-select, guards layout") @(t : T?) {
+        let saved = active_kernel_backend()
+        select_kernel_backend("portable")
+        // no pin: batch backend follows the active backend
+        t |> equal(active_batch_backend(), "portable", "batch backend defaults to the active one")
+        // an unknown donor warns and keeps the active backend's batch slots
+        select_batch_backend("no-such-backend")
+        t |> equal(active_batch_backend(), "portable", "unknown batch donor keeps active batch slots")
+        // a repack donor on a row-major active backend is layout-incompatible: warn + keep
+        for (n in kernel_backend_names()) {
+            if (n == "arm64-laneq" || n == "x64-avx2-repack") {
+                select_batch_backend(n)
+                t |> equal(active_batch_backend(), "portable", "repack donor rejected on row-major active")
+            }
+        }
+        // a row-major donor takes the batch slots and survives re-activation
+        for (n in kernel_backend_names()) {
+            if (n == "arm64-sdot" || n == "x64-avx2-acc8") {
+                select_batch_backend(n)
+                t |> equal(active_batch_backend(), n, "row-major donor takes the batch slots")
+                select_kernel_backend("portable")   // re-activate: the standing pin must re-apply
+                t |> equal(active_batch_backend(), n, "batch pin survives re-selection")
+            }
+        }
+        // clearing the pin restores whole-backend slots on the next activation
+        select_batch_backend("")
+        select_kernel_backend("portable")
+        t |> equal(active_batch_backend(), "portable", "cleared pin restores whole-backend slots")
+        if (saved != "") {
+            select_kernel_backend(saved)
+        }
+    }
+}

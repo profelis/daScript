@@ -139,6 +139,13 @@ slow) and keeps `portable` selected. The same rail answers the higher ISA tiers:
 kernel matrix below gates on `cpu_supports("avxvnni"/"avx512f"/"avx512bw"/"avx512vl"/
 "avx512vnni")` — the builtin knows the leaf-7 map, and unknown names fail closed.
 
+**Hybrid backend (per-slot pin):** decode (GEMV) and prefill (batch GEMM) can prefer different
+backends — on the EPYC 9654, `[tuned]` portable wins decode (+15% over every intrinsic backend)
+while row-major acc8 wins batch. `select_batch_backend(name)` (profile `runtime.batch_backend`)
+overrides only the batch-shaped slots from a layout-compatible donor; the pin is sticky across
+later (re)selection. A repack donor on a row-major active backend (or vice versa, or a different
+repack layout) is rejected with a warning — the planes are physically one layout.
+
 **The AVX kernel matrix (2026-07, correctness-proven on EPYC 9654):** VNNI / AVX-512 twins of
 the shipped kernels, built to be measured on bare metal (the 3990X has none of the tiers).
 Registration is unconditional per-tier (cpuid-gated, no master switch); priorities all sit
