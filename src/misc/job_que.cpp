@@ -101,15 +101,15 @@ namespace das {
     void JobQue::set_default_threads_cap(int cap) { g_jobqueDefaultThreadsCap = max(cap, 0); }
     int JobQue::get_default_threads_cap() { return g_jobqueDefaultThreadsCap.load(); }
 
-#if defined(_MSC_VER) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
-    int GetPhysicalCoreCountInWindows();
+#if defined(_WIN32) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
+    int GetPhysicalCoreCountInWindows();   // defined in sysos.cpp under the same _WIN32 gate (incl. mingw)
 #endif
 
     int JobQue::get_num_physical_cores() {
 #if defined(__APPLE__)
         int ncores = 0; size_t len = sizeof(ncores);
         if ( sysctlbyname("hw.physicalcpu", &ncores, &len, nullptr, 0) == 0 && ncores > 0 ) return ncores;
-#elif defined(_MSC_VER) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
+#elif defined(_WIN32) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
         if ( int ncores = GetPhysicalCoreCountInWindows() ) return ncores;
 #elif defined(__linux__)
         // 2-way SMT is the universal x86 layout; smt/active is authoritative and cheap
