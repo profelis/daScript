@@ -288,6 +288,65 @@ create all phis before any other instruction. The `llvm_user_modules.das` daslla
 branch-local wiring (dasLLVM-without-dasLLAMA builds need the planned `require ?` gate before
 this can merge).
 
+## M3 result (2026-07-04, M1 Max) — tune framework + perm-parameterized family shipped
+
+**Part 2 shipped** as `modules/dasLLVM/daslib/llvm_tune.das`: `[tune_perm(...)]` grid rows + a
+trailing `[tune(gen = "generator_key", fallback = "suffix")]` on the reference function.
+`DAS_TUNE_MODE` picks the mode — normal stamps exactly one winner's `[llvm_code]` onto the
+function itself (manifest authoritative when present: no entry ⇒ reference body; else
+`fallback=`; else reference); tune/test stamp the full grid as `<name>__<suffix>` clones plus
+a `<name>_variants()` registry (emitted reference-row-only in normal mode too, so harnesses
+compile/lint everywhere). Manifest = flat `{ "fn name": "perm suffix" }` JSON at
+`DAS_TUNE_MANIFEST` else `<das_root>/tune_manifest.json` (box_profile precedent; the plan's
+"next to the app" placement stays open — the env override covers it). The two APIs:
+`tune_manifest_get` (the macro's stamp-time read) and `tune_manifest_set` (the harness write).
+Framework worked example: `llvm_code_selftest::add_plus_k` (emits `a+b+k` from the perm arg +
+a `decline=true` rail); suite test `tests/jit_tests/llvm_code`/`llvm_tune`; CLI gates green
+(grid rows 5/6/7 with declined→5, set-API → normal-run consume, authoritative-absence).
+
+**Part 3 (M3 slice): the M2 generator is now the perm-parameterized family**
+(`dasllama_gemm_gen::q8q8_tile`; stub renamed `q8q8_tile_gen`, a `[tune]` client with grid
+kstep 1|2|4, kstep2+nrsplit2, and three deliberate decline rows). Knobs: `kstep` (blocks per
+main-loop iteration; remainder emitted as a chain of conditional single blocks so kstep=2 IS
+the M2 CFG), `nrsplit` (tokens per accumulator slice — the 4-token call contract is fixed;
+nrsplit=2 runs the k-loop twice at half register pressure), `mr` + `dot`. Strides derive from
+`q8q8_repack_type(mr)` in `dasllama_gemm_schema.das` — one function read by the generator at
+emit time and by the runtime repack side, so layout and kernel cannot desync (`get_repack_type`
+delivered as this shared derivation rather than a second generated function; revisit the
+two-function form when repack generation lands). Decline rails in order: no per-ISA dot
+emitter (`dot != "sdot"` on this leg), illegal perm values, q-reg budget
+(`2·mr + nrsplit·mr/4 + 2·nrsplit + 2 > 32`), layout contract (`mr != 4` until M4 — the
+reference body's grp4 semantics ARE the stub contract).
+
+**Gates, all green:**
+- *Generated == hand-emitted for the M2 perm:* disasm of the kstep2 tile vs the M2 baseline —
+  291/291 instructions identical (only objdump symbol-name annotations differ, from the stub
+  rename); 96 sdot / 0 dup preserved.
+- *Neighbors bit-exact + genuinely generated:* test mode = all 8 rows exact vs the hand-laneq
+  oracle on nb-even, nb-odd, production slice; per-variant disasm proves distinct shapes —
+  kstep1/2/4 = 32/96/224 sdots, nrsplit2 = 96 sdots across two loop skeletons, and all three
+  decline rows instruction-identical to the reference body (the rejection rail, machine-code
+  proven).
+- *Manifest round-trip:* tune run (2048×512×64 iso, interleaved best-of-6) — kstep2 **133.9**
+  GMAC/s > kstep4 133.4 > kstep1 126.9 > kstep2_nrsplit2 119.6 > declined/reference ~85; the
+  M2 perm wins on this box, consistent with the hand tier's shipped u2. Winner written via
+  `tune_manifest_set`; the normal run stamps kstep2 *from the manifest* (log rail) and parity
+  stays exact. Probes: `harness/gen_parity_probe.das` (normal mode), `gen_tune_probe.das`
+  (DAS_TUNE_MODE=test|tune).
+
+**Framework mechanics learned (load-bearing):** a function's annotations attach only AFTER
+every apply runs — `[tune]` cannot read `[tune_perm]` siblings off `func.annotations`, so rows
+route through a macro-context registry and *must be listed before* `tune(...)` in the bracket
+(loud error otherwise); grid clones are annotation-free for the same reason. `generator` and
+`default` are grammar keywords — annotation args are `gen=` / `fallback=`. Tuned functions
+need an explicit return type (`function_to_type` runs pre-infer; an implicit result reaches
+the registry as `auto`). Stamped declarations don't get their own `apply`, so `[tune]` forces
+`sideEffectFlags.userScenario` itself (the P1 const-fold lesson).
+
+**Deferred to M4:** loop-hint manifest kind (subsuming `[tuned]`/box_profile — dasllama_tune
+stays untouched and shipped this milestone), `grp<mr≠4>` repack generation + the two-function
+stamp, per-regime/per-slot perms, Zen2/EPYC legs, manifest placement.
+
 ## Pointers
 
 - Rails: `modules/dasLLVM/daslib/llvm_jit_intrin.das` (emitter tables + `build_vector_expf`

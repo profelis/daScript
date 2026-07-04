@@ -4,25 +4,33 @@ module dasllama_math_gen shared public
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_aarch64_neon
-require llvm/daslib/llvm_code  // the [llvm_code] annotation
+require llvm/daslib/llvm_tune  // [tune]/[tune_perm] + the [llvm_code] annotation it re-exports
 require daslib/jobque_boost public
 require dasllama/dasllama_par
 require math
 
-// The M2 GO/NO-GO experiment (gemm_generator_plan.md): the laneq 4x4 batch tile generated as LLVM
-// IR through the [llvm_code] hook instead of compiled from the das template. This module registers
-// "arm64-laneq-gen" — the arm64-laneq backend with ONLY the batch tile swapped for the generated
-// stub below — so gemm_1core_probe A/Bs hand vs generated on identical traversal, repack and
-// dispatch. The generator lives in dasllama/dasllama_gemm_gen.das (llvm-jit context, wired via
+// The GEMM tile as a [tune] client (gemm_generator_plan.md part 3; promoted from the M2 GO/NO-GO
+// experiment): the perm grid below stamps dasllama_gemm_gen::q8q8_tile perms through [llvm_code].
+// Normal runs stamp exactly one winner (manifest > fallback kstep2 = the M2 perm) onto
+// q8q8_tile_gen; DAS_TUNE_MODE=tune/test stamps the grid + the q8q8_tile_gen_variants()
+// registry for the harness (gen_parity_probe / gen_tune_probe). This module also registers
+// "arm64-laneq-gen" — the arm64-laneq backend with ONLY the batch tile swapped for the stub —
+// so gemm_1core_probe A/Bs hand vs generated on identical traversal, repack and dispatch.
+// The generator lives in dasllama/dasllama_gemm_gen.das (llvm-jit context, wired via
 // llvm/daslib/llvm_user_modules.das). NOT in the production require chain: only probes/tests
 // require this module.
 
-//! The generated tile: 4 interleaved rows x 4 tokens, one [llvm_code] stub. The reference body —
-//! 4 single-token laneq4 dots with the same per-block fold order as the tile — runs on interp, AOT,
-//! non-arm64 JIT, and whenever the generator declines. Not `private`: called from inside the lifted
-//! parallel_for worker lambda below.
-[llvm_code(name = "dasllama_gemm_gen::tile4x4"), hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xqp, noalias = xsp)]
-def q8q8_tile4x4_gen(var yp : float?; wg : int8 const?; sg : float const?; xqp : int8 const?; xsp : float const?; n, d, g, t0 : int64) {
+//! The generated tile: 4 interleaved rows x 4 tokens (the q8q8_repack_type(4) layout — see
+//! dasllama_gemm_schema). The reference body — 4 single-token laneq4 dots with the same
+//! per-block fold order as the tile — runs on interp, AOT, non-arm64 JIT, and whenever the
+//! generator declines; the last three grid rows decline by design (vreg budget, layout
+//! contract, no per-ISA dot emitter) and pin that rail in test mode. Not `private`: called
+//! from inside the lifted parallel_for worker lambda below.
+[tune_perm(kstep = 1), tune_perm(kstep = 2), tune_perm(kstep = 4), tune_perm(kstep = 2, nrsplit = 2),
+ tune_perm(suffix = "mr8_budget", mr = 8), tune_perm(suffix = "mr2_layout", mr = 2), tune_perm(dot = "vpdpbusd"),
+ tune(gen = "dasllama_gemm_gen::q8q8_tile", fallback = "kstep2"),
+ hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xqp, noalias = xsp)]
+def q8q8_tile_gen(var yp : float?; wg : int8 const?; sg : float const?; xqp : int8 const?; xsp : float const?; n, d, g, t0 : int64) : void {
     let nb = n / 32l
     unsafe {
         for (t in range64(4l)) {
@@ -55,7 +63,7 @@ def private q8q8_batch_kernel_neon_laneq_gen(var yp : float?; wp : int8 const?; 
                     let sgp = sp + g * 4l * nb
                     var tk = tb
                     while (tk < tb4) {
-                        q8q8_tile4x4_gen(myp, wgp, sgp, xqp, xsp, n, d, g, tk)
+                        q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, n, d, g, tk)
                         tk += 4l
                     }
                     while (tk < tbe) {

@@ -19,7 +19,9 @@ require llvm/daslib/llvm_code public
 //! mode:
 //!  - normal (default): stamp exactly one winner onto the function itself — the manifest entry
 //!    when a manifest exists (authoritative: no entry means reference body), else the
-//!    `fallback=` perm, else the reference body. No other variants are emitted.
+//!    `fallback=` perm, else the reference body. No variant stubs are emitted; the
+//!    `<name>_variants()` registry still exists (reference row only) so harness code
+//!    compiles in every mode.
 //!  - tune / test: stamp the full grid as `<name>__<suffix>` clones plus a `<name>_variants()`
 //!    registry; a harness benches them (tune, then `tune_manifest_set` the winner) or
 //!    bit-exact-gates every variant against the reference row (test).
@@ -249,6 +251,13 @@ class private TuneAnnotation : AstFunctionAnnotation {
             delete perms
             return false
         }
+        if (func.result.baseType == Type.autoinfer) {
+            // function_to_type runs pre-infer: an implicit result type reaches the
+            // variants registry as `auto` and its rows fail to unify
+            errors := "[tune] on {func.name}: an explicit return type is required (add ': void' or the real type)"
+            delete perms
+            return false
+        }
         let mode = tune_mode()
         if (mode == "tune" || mode == "test") {
             let ok = stamp_grid(func, genKey, perms, errors)
@@ -286,6 +295,12 @@ class private TuneAnnotation : AstFunctionAnnotation {
             if (!ok) {
                 errors := "[tune] on {func.name}: perm '{suffix}' is not in the [tune_perm] grid"
             }
+        }
+        // reference-row-only registry, so harness code referencing <name>_variants() compiles
+        // (and lints) in every mode — the perm stubs themselves exist only in tune/test runs
+        if (ok) {
+            let noPerms : array<TunePerm>
+            ok = emit_registry(compiling_module(), func, noPerms, errors)
         }
         delete perms
         return ok

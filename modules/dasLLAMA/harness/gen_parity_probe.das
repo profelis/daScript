@@ -3,7 +3,7 @@ options persistent_heap
 options _jit_fast_math = true   // match gemm_1core_probe / the end-to-end config
 
 // M2 bit-exact gate (gemm_generator_plan.md): the [llvm_code]-generated 4x4 tile
-// (q8q8_tile4x4_gen) vs the hand laneq semantics (dot_q8q8_laneq4) on the same repacked
+// (q8q8_tile_gen) vs the hand laneq semantics (dot_q8q8_laneq4) on the same repacked
 // buffers. The generated tile mirrors the hand fold order exactly, so the comparison is EXACT
 // float equality, not a tolerance. Shapes cover the paired-block loop (nb even), the odd-block
 // tail (nb odd), and a production-ish slice. Run: daslang -jit gen_parity_probe.das
@@ -68,7 +68,7 @@ def test_shape(n, d, ntok : int64) : bool {
             let sgp = sp + g * 4l * nb
             var t0 = 0l
             while (t0 < ntok) {
-                q8q8_tile4x4_gen(ygp, wgp, sgp, xqp, xsp, n, d, g, t0)
+                q8q8_tile_gen(ygp, wgp, sgp, xqp, xsp, n, d, g, t0)
                 t0 += 4l
             }
             for (tk in range64(ntok)) {
