@@ -1,0 +1,1 @@
+Caps the default worker count of job queues created afterwards: the effective default becomes the minimum of the stock rule and the cap. A cap of 0 turns the cap off, and the DAS_JOBQUE_THREADS environment variable still overrides everything.
