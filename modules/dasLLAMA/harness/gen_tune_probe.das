@@ -31,6 +31,7 @@ require dasllama/dasllama_math_aarch64_neon
 require dasllama/dasllama_math_gen
 require dasllama/dasllama_quant
 require llvm/daslib/llvm_tune
+require daslib/random
 require math
 require strings
 
@@ -163,6 +164,84 @@ def tile_key(suffix : string) : string {
     return i < 0 ? suffix : slice(suffix, 0, i)
 }
 
+// ===== the mx4 gemv companion (slice E) =====
+
+typedef Mx4RowsFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n : int64; rb : int64; re : int64) : void>
+
+struct Mx4Fixture {
+    n, d, nb : int64
+    wn : array<uint8>     // row-major nibble plane master — repacked per variant into a copy
+    we : array<uint8>     // row-major E8M0 exponent plane master
+    xq : array<int8>
+    xs : array<float>
+    yref : array<float>
+}
+
+def build_mx4_fixture(n, d : int64) : Mx4Fixture {
+    var fx = Mx4Fixture(n = n, d = d, nb = n / 32l)
+    var seed = int4(20260704, 5, 9, 2)
+    fx.wn <- [for (_i in range64(d * n / 2l)); uint8(random_int(seed) % 256)]
+    fx.we <- [for (_i in range64(d * fx.nb)); uint8(118 + random_int(seed) % 14)]
+    var xrow : array<float>
+    xrow |> resize(int(n))
+    fx.xq |> resize(int(n))
+    fx.xs |> resize(int(fx.nb))
+    for (i in range64(n)) {
+        xrow[i] = float(i % 23l) * 0.07 - 0.8
+    }
+    quantize_q8_0_into(xrow, n, fx.xq, fx.xs, 0l, 0l)
+    // the oracle: hand interleaved-mx4 semantics off a grp4 plane copy (fold order is
+    // layout-independent, like the Q8 oracle)
+    fx.yref |> resize(int(d))
+    var n4 := fx.wn
+    var e4 := fx.we
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        repack_mx4_grp(addr(n4[0]), addr(e4[0]), n, d, 4l)
+        let lutp = addr(lut[0])
+        let np = addr(n4[0])
+        let ep = addr(e4[0])
+        var yrp = addr(fx.yref[0])
+        for (g in range64(d / 4l)) {
+            let f = dot_mx4q8_laneq4(lutp, np + g * 4l * (n / 2l), ep + g * 4l * fx.nb, addr(fx.xq[0]), addr(fx.xs[0]), n)
+            yrp[g * 4l + 0l] = f.x
+            yrp[g * 4l + 1l] = f.y
+            yrp[g * 4l + 2l] = f.z
+            yrp[g * 4l + 3l] = f.w
+        }
+    }
+    delete n4
+    delete e4
+    return <- fx
+}
+
+def mx4_variants_by_suffix() : table<string; Mx4RowsFn> {
+    var tab : table<string; Mx4RowsFn>
+    var gvs <- mx4q8_gemv_gen_variants()
+    for (v in gvs) {
+        tab[v._0] = v._1
+    }
+    delete gvs
+    return <- tab
+}
+
+def run_mx4_gemv(gemv; fx : Mx4Fixture; wn : array<uint8>; we : array<uint8>; mr : int64; var y : array<float>) {
+    unsafe {
+        invoke(gemv, addr(y[0]), addr(wn[0]), addr(we[0]), addr(fx.xq[0]), addr(fx.xs[0]), fx.n, 0l, (fx.d / mr) * mr)
+    }
+}
+
+def close_to_mx4_ref(fx : Mx4Fixture; y : array<float>; var maxdiff : float&) : bool {
+    var ok = true
+    for (i in range(length(y))) {
+        let d = abs(y[i] - fx.yref[i])
+        maxdiff = max(maxdiff, d)
+        ok &&= d <= max(CLOSE_ABS, CLOSE_REL * abs(fx.yref[i]))
+    }
+    return ok
+}
+
 let CLOSE_REL = 1e-4
 let CLOSE_ABS = 1e-5
 
@@ -180,13 +259,16 @@ def test_mode : bool {
     // nb=2 (even main loop), nb=3 (remainder path), production-ish slice — d divides every
     // grid mr (4 and 8)
     var fxs <- [ <- build_fixture(64l, 8l, 4l), <- build_fixture(96l, 8l, 4l), <- build_fixture(2048l, 64l, 8l)]
+    var mfxs <- [ <- build_mx4_fixture(96l, 8l), <- build_mx4_fixture(2048l, 64l)]
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
     var gtab <- gemv_variants_by_suffix()
+    var mtab <- mx4_variants_by_suffix()
     var allok = true
     for (v in vs) {
         let mr = int64(mrs?[v._0] ?? 4)
         verify(gtab |> key_exists(v._0))
+        verify(mtab |> key_exists(v._0))
         var ok = true
         var gok = true
         var maxdiff = 0.0
@@ -231,12 +313,41 @@ def test_mode : bool {
             delete qv
             delete sv
         }
-        print("{v._0} (mr={mr}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff})\n")
-        allok = allok && ok && gok
+        // the mx4 gemv companion on its own plane fixtures (repacked per variant)
+        var mok = true
+        var mmaxdiff = 0.0
+        for (mfx in mfxs) {
+            var nv := mfx.wn
+            var ev := mfx.we
+            unsafe {
+                repack_mx4_grp(addr(nv[0]), addr(ev[0]), mfx.n, mfx.d, mr)
+            }
+            var ym : array<float>
+            ym |> resize(int(mfx.d))
+            run_mx4_gemv(mtab[v._0], mfx, nv, ev, mr, ym)
+            let mfxok = close_to_mx4_ref(mfx, ym, mmaxdiff)
+            if (!mfxok) {
+                var shown = 0
+                for (i in range(length(ym))) {
+                    if (abs(ym[i] - mfx.yref[i]) > max(CLOSE_ABS, CLOSE_REL * abs(mfx.yref[i])) && shown < 6) {
+                        print("  DBG mx4 {v._0} n={mfx.n}: y[{i}] = {ym[i]} want {mfx.yref[i]}\n")
+                        shown++
+                    }
+                }
+            }
+            mok = mok && mfxok
+            delete ym
+            delete nv
+            delete ev
+        }
+        print("{v._0} (mr={mr}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
+        allok = allok && ok && gok && mok
     }
+    delete mtab
     delete gtab
     delete mrs
     delete vs
+    delete mfxs
     delete fxs
     return allok
 }
@@ -391,13 +502,13 @@ def main {
     }
     var found = false
     for (nm in kernel_backend_names()) {
-        found ||= nm == "arm64-laneq-gen"
+        found ||= nm == "arm64-gen"
     }
     if (!found) {
-        print("arm64-laneq-gen not registered (non-arm64 host?) — nothing to test\n")
+        print("arm64-gen not registered (non-arm64 host?) — nothing to test\n")
         return
     }
-    select_kernel_backend("arm64-laneq-gen")
+    select_kernel_backend("arm64-gen")
     let mode = tune_mode()
     if (mode == "test") {
         print(test_mode() ? "GEN TUNE TEST OK\n" : "GEN TUNE TEST FAIL\n")

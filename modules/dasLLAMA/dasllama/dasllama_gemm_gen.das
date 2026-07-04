@@ -27,10 +27,11 @@ require dasllama/dasllama_gemm_schema
 //           chain lacks; the tile ignores it (its K knob is kstep)
 //   dot     dot primitive; only "sdot" has an emitter on this (NEON) leg
 // Illegal perms decline (return false) and the reference body compiles instead — the decline
-// path is the fallback tier; the layout companion declines in LOCKSTEP (shared perm_declines),
-// so repack and kernel fall back to the grp4 reference pair together. Runs in the llvm-jit
-// context; wired via llvm_user_modules.das. The stubs it generates for are
-// dasllama/dasllama_math_gen.das::q8q8_tile_gen and ::q8q8_layout_gen.
+// path is the fallback tier; every companion declines in LOCKSTEP (the one shared
+// perm_declines), so repacks and kernels fall back to the grp4 reference family together.
+// Runs in the llvm-jit context; wired via llvm_user_modules.das. The stubs it generates for
+// are dasllama/dasllama_math_gen.das::q8q8_tile_gen, ::q8q8_layout_gen, ::q8q8_gemv_gen and
+// ::mx4q8_gemv_gen.
 
 // the perm vector both generators read off the [llvm_code] annotation args
 struct private TilePerm {
@@ -72,9 +73,15 @@ def private perm_declines(var gc : LlvmCodeCtx; p : TilePerm) : bool {
     let rt = q8q8_repack_type(p.mr)
     if (rt.interleave != p.mr || !rt.f32_scales) return true
     let mod = LLVMGetGlobalParent(gc.impl)
+    var v16i8 = LLVMVectorType(gc.jit.types.t_int8, 16u)
     let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.sdot")
-    var declTypes <- [gc.jit.types->LLVMInt4Type(), LLVMVectorType(gc.jit.types.t_int8, 16u)]
-    return LLVMGetIntrinsicDeclaration(mod, id, declTypes) == null
+    var declTypes <- [gc.jit.types->LLVMInt4Type(), v16i8]
+    if (LLVMGetIntrinsicDeclaration(mod, id, declTypes) == null) return true
+    // the mx4 companion's dequant primitive — part of the shared predicate so the mx4 gemv
+    // can never fall to its grp4 reference body while the layout stamps a different mr
+    let tblId = LLVMLookupIntrinsicID("llvm.aarch64.neon.tbl1")
+    var tblTypes <- [v16i8]
+    return LLVMGetIntrinsicDeclaration(mod, tblId, tblTypes) == null
 }
 
 // emission context threaded through the helpers: builder/types + the per-function value handles
@@ -88,10 +95,14 @@ struct private TileEmit {
     sdot_ty : LLVMOpaqueType?
     interleave : int                     // rows per group (q8q8_repack_type(mr).interleave)
     rq : int                             // row quads per group (mr / 4): accumulators per token
-    wg : LLVMOpaqueValue?                // interleaved mr-row weight group base
-    sg : LLVMOpaqueValue?                // group scales (float x interleave per block)
+    wg : LLVMOpaqueValue?                // interleaved mr-row weight group base (mx4: nibble plane)
+    sg : LLVMOpaqueValue?                // group scales (float x interleave per block; mx4: E8M0 bytes)
     x : LLVMOpaqueValue? [4]             // per-token activation base pointers
     xs : LLVMOpaqueValue? [4]            // per-token activation scale base pointers
+    mx4 : bool                           // block emitter: mx4 tbl-dequant instead of Q8 loads
+    tbl_decl : LLVMOpaqueValue?          // llvm.aarch64.neon.tbl1 (mx4 only)
+    tbl_ty : LLVMOpaqueType?
+    lut : LLVMOpaqueValue?               // the doubled-e2m1 LUT as a constant v16i8 (mx4 only)
 }
 
 // one indexed sdot: acc += w · (dword-group `lane` of x, splatted). The bitcast-to-v4i32 lane
@@ -181,6 +192,112 @@ def private emit_block(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLV
     }
 }
 
+def private splat16_i8(te : TileEmit; v : int) : LLVMOpaqueValue? {
+    var elems <- [for (_i in range(16)); LLVMConstInt(te.types.t_int8, uint64(v & 255), 0)]
+    return LLVMConstVector(array_data_ptr(elems), 16u)
+}
+
+def private splat4_i32(te : TileEmit; v : int) : LLVMOpaqueValue? {
+    var elems <- [for (_i in range(4)); LLVMConstInt(te.types.t_int32, uint64(v), 0)]
+    return LLVMConstVector(array_data_ptr(elems), 4u)
+}
+
+// one 32-k block, MXFP4 form (dot=mx4): per row quad per dword-group j, ONE v16i8 nibble load
+// feeds tbl-lo (k j*4..j*4+3, the LUT baked as a constant vector) and tbl-hi (k j*4+16..+19) —
+// 4*rq loads + 8*rq tbl replace the Q8 block's 8*rq weight loads; the sdot lattice and the
+// per-block fold are the Q8 emitter's, with the scale computed in-register from mr E8M0 bytes:
+// bits = e < 2 ? 0x00200000 << e : (e - 1) << 23 (e8m0_half's exact bit trick, vectorized per
+// quad; the not-taken shl-by-(e-1) arm at e=0 is poison LLVM's select never selects).
+// one 32-k block, MXFP4 form (dot=mx4): per row quad per dword-group j, ONE v16i8 nibble load
+// feeds tbl-lo (k j*4..j*4+3, the LUT baked as a constant vector) and tbl-hi (k j*4+16..+19) —
+// 4*rq loads + 8*rq tbl replace the Q8 block's 8*rq weight loads; the sdot lattice and the
+// per-block fold are the Q8 emitter's, with the scale computed in-register from mr E8M0 bytes:
+// bits = e < 2 ? 0x00200000 << e : (e - 1) << 23 (e8m0_half's exact bit trick, vectorized per
+// quad; the not-taken shl-by-(e-1) arm at e=0 is poison LLVM's select never selects).
+def private emit_block_mx4(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLVMOpaqueValue? [8]; tokBase, tokCount : int) {
+    let b = te.builder
+    let rq = te.rq
+    var wb = LLVMBuildMul(b, bi, te.types->ConstI64(uint64(te.interleave * 16)), "wb")
+    var xb = LLVMBuildMul(b, bi, te.types->ConstI64(0x20ul), "xb")
+    var wlo : LLVMOpaqueValue? [8]
+    var whi : LLVMOpaqueValue? [8]
+    for (j in range(4)) {
+        for (qd in range(rq)) {
+            let boff = j * 4 * te.interleave + qd * 16
+            var off = boff == 0 ? wb : LLVMBuildAdd(b, wb, te.types->ConstI64(uint64(boff)), "")
+            var nv = load_v16i8(te, te.wg, off, "nv{j * rq + qd}")
+            var loIdx = LLVMBuildAnd(b, nv, splat16_i8(te, 15), "nib.lo")
+            var hiIdx = LLVMBuildLShr(b, nv, splat16_i8(te, 4), "nib.hi")
+            var loArgs <- [te.lut, loIdx]
+            wlo[j * rq + qd] = LLVMBuildCall2(b, te.tbl_ty, te.tbl_decl, loArgs, "wlo{j * rq + qd}")
+            var hiArgs <- [te.lut, hiIdx]
+            whi[j * rq + qd] = LLVMBuildCall2(b, te.tbl_ty, te.tbl_decl, hiArgs, "whi{j * rq + qd}")
+        }
+    }
+    var xv0 : LLVMOpaqueValue? [4]
+    var xv1 : LLVMOpaqueValue? [4]
+    var xb1 = LLVMBuildAdd(b, xb, te.types->ConstI64(16ul), "")
+    for (i in range(tokCount)) {
+        xv0[i] = load_v16i8(te, te.x[tokBase + i], xb, "x{tokBase + i}lo")
+        xv1[i] = load_v16i8(te, te.x[tokBase + i], xb1, "x{tokBase + i}hi")
+    }
+    var a : LLVMOpaqueValue? [8]
+    for (i in range(tokCount * rq)) {
+        a[i] = LLVMConstNull(te.v4i32)
+    }
+    for (l in range(4)) {           // chunk 0 (k 0..15): low-nibble weights
+        for (i in range(tokCount)) {
+            for (qd in range(rq)) {
+                a[i * rq + qd] = sdot_lane(te, a[i * rq + qd], wlo[l * rq + qd], xv0[i], l)
+            }
+        }
+    }
+    for (l in range(4)) {           // chunk 1 (k 16..31): high-nibble weights
+        for (i in range(tokCount)) {
+            for (qd in range(rq)) {
+                a[i * rq + qd] = sdot_lane(te, a[i * rq + qd], whi[l * rq + qd], xv1[i], l)
+            }
+        }
+    }
+    var v4i8 = LLVMVectorType(te.types.t_int8, 4u)
+    var s4 : LLVMOpaqueValue? [4]
+    var sgIdx0 = LLVMBuildMul(b, bi, te.types->ConstI64(uint64(te.interleave)), "")
+    for (qd in range(rq)) {
+        var idx = qd == 0 ? sgIdx0 : LLVMBuildAdd(b, sgIdx0, te.types->ConstI64(uint64(qd * 4)), "")
+        var egp = LLVMBuildGEP2(b, te.types.t_int8, te.sg, idx, qd == 0 ? "egp" : "egp{qd}")
+        var ev = LLVMBuildLoad2Aligned(b, v4i8, egp, 1u, qd == 0 ? "e4" : "e4{qd}")
+        var e32 = LLVMBuildZExt(b, ev, te.v4i32, "")
+        var lt2 = LLVMBuildICmp(b, LLVMIntPredicate.LLVMIntULT, e32, splat4_i32(te, 2), "")
+        var loBits = LLVMBuildShl(b, splat4_i32(te, int(0x00200000)), e32, "")
+        var hiBits = LLVMBuildShl(b, LLVMBuildSub(b, e32, splat4_i32(te, 1), ""), splat4_i32(te, 23), "")
+        var bits = LLVMBuildSelect(b, lt2, loBits, hiBits, "")
+        // NOTE: the name is hoisted — a TERNARY string fed straight to a raw extern's
+        // `string implicit` param SIGSEGVs the compiler (plain das wrappers are fine)
+        let s4name = qd == 0 ? "s4" : "s4{qd}"
+        s4[qd] = LLVMBuildBitCast(b, bits, te.v4f32, s4name)
+    }
+    for (i in range(tokCount)) {
+        let tk = tokBase + i
+        var qp = LLVMBuildGEP2(b, te.types.t_float, te.xs[tk], bi, "qp{tk}")
+        var q = LLVMBuildLoad2Aligned(b, te.types.t_float, qp, 4u, "q{tk}")
+        for (qd in range(rq)) {
+            var af = LLVMBuildSIToFP(b, a[i * rq + qd], te.v4f32, "af{tk}")
+            var m = LLVMBuildFMul(b, af, s4[qd], "")
+            m = LLVMBuildFMul(b, m, splat_f32(te, q, "qs{tk}"), "")
+            f[i * rq + qd] = LLVMBuildFAdd(b, f[i * rq + qd], m, "f{tk}")
+        }
+    }
+}
+
+// block-emitter dispatch: the slice/loop machinery is quant-agnostic
+def private emit_one_block(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLVMOpaqueValue? [8]; tokBase, tokCount : int) {
+    if (te.mx4) {
+        emit_block_mx4(te, bi, f, tokBase, tokCount)
+    } else {
+        emit_block(te, bi, f, tokBase, tokCount)
+    }
+}
+
 def private is_tile_signature(fn : Function const?) : bool {
     if (length(fn.arguments) != 9 || fn.result.baseType != Type.tVoid) return false
     for (i in range(5)) {
@@ -255,10 +372,10 @@ def private emit_slice(var te : TileEmit; var sa : SliceArgs; var pred : LLVMOpa
     for (i in range(nacc)) {
         fCur[i] = fPhi[i]
     }
-    emit_block(te, biPhi, fCur, tokBase, tokCount)
+    emit_one_block(te, biPhi, fCur, tokBase, tokCount)
     for (j in range(1, K)) {
         var bij = LLVMBuildAdd(b, biPhi, te.types->ConstI64(uint64(j)), "")
-        emit_block(te, bij, fCur, tokBase, tokCount)
+        emit_one_block(te, bij, fCur, tokBase, tokCount)
     }
     LLVMBuildBr(b, head)
     var bodyValsBi <- [biPK]
@@ -292,7 +409,7 @@ def private emit_slice(var te : TileEmit; var sa : SliceArgs; var pred : LLVMOpa
         mergeBlocks |> push(checks[j])
         mergeF |> push(chainF)
         LLVMPositionBuilderAtEnd(b, tails[j])
-        emit_block(te, chainBi, chainF, tokBase, tokCount)
+        emit_one_block(te, chainBi, chainF, tokBase, tokCount)
         if (j + 1 < K - 1) {
             chainBi = LLVMBuildAdd(b, chainBi, te.types->ConstI64(1ul), "")
             LLVMBuildBr(b, checks[j + 1])
@@ -491,6 +608,96 @@ def private gemv_gen(var gc : LlvmCodeCtx) : bool {
     return true
 }
 
+// The MXFP4 quarter of the stamp (dot=mx4): the same rows-range GEMV as gemv_gen over the
+// grp<mr>-interleaved nibble/exponent planes — emit_block_mx4 swaps the weight-load stage for
+// tbl dequant (constant LUT) and the scale loads for the in-register e8m0 fold; the loop
+// machinery, gkstep knob, and decline rails are shared.
+// The MXFP4 quarter of the stamp (dot=mx4): the same rows-range GEMV as gemv_gen over the
+// grp<mr>-interleaved nibble/exponent planes — emit_block_mx4 swaps the weight-load stage for
+// tbl dequant (constant LUT) and the scale loads for the in-register e8m0 fold; the loop
+// machinery, gkstep knob, and decline rails are shared.
+def private mx4_gemv_gen(var gc : LlvmCodeCtx) : bool {
+    if (!is_gemv_signature(gc.fn)) return false
+    let p = parse_perm(gc)
+    if (perm_declines(gc, p)) return false
+
+    let rt = q8q8_repack_type(p.mr)
+    let mod = LLVMGetGlobalParent(gc.impl)
+    var te = TileEmit(builder = gc.jit.builder, types = gc.jit.types, interleave = rt.interleave, rq = rt.interleave / 4, mx4 = true)
+    te.v16i8 = LLVMVectorType(te.types.t_int8, 16u)
+    te.v4i32 = te.types->LLVMInt4Type()
+    te.v4f32 = te.types->LLVMFloat4Type()
+    let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.sdot")
+    var declTypes <- [te.v4i32, te.v16i8]
+    te.sdot_decl = LLVMGetIntrinsicDeclaration(mod, id, declTypes)
+    if (te.sdot_decl == null) return false      // no NEON dotprod on this target: decline
+    var fnArgTypes <- [te.v4i32, te.v16i8, te.v16i8]
+    te.sdot_ty = LLVMFunctionType(te.v4i32, fnArgTypes)
+    let tblId = LLVMLookupIntrinsicID("llvm.aarch64.neon.tbl1")
+    var tblDeclTypes <- [te.v16i8]
+    te.tbl_decl = LLVMGetIntrinsicDeclaration(mod, tblId, tblDeclTypes)
+    if (te.tbl_decl == null) return false       // lockstep with perm_declines' tbl rail
+    var tblArgTypes <- [te.v16i8, te.v16i8]
+    te.tbl_ty = LLVMFunctionType(te.v16i8, tblArgTypes)
+    // the doubled-e2m1 LUT (mxfp4_fill_lut) as a constant vector — no table pointer at runtime
+    let kv = fixed_array(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
+    var lutElems : array<LLVMOpaqueValue?>
+    lutElems |> reserve(16)
+    for (v in kv) {
+        lutElems |> push(LLVMConstInt(te.types.t_int8, uint64(v & 255), 0))
+    }
+    te.lut = LLVMConstVector(array_data_ptr(lutElems), 16u)
+
+    let b = gc.jit.builder
+    var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
+    var ghead = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "ghead")
+    var gexit = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "gexit")
+
+    // entry: group range off the row range; plane strides are nibble n/2 and exponent n/32
+    LLVMPositionBuilderAtEnd(b, entry)
+    var sa = SliceArgs(gc_impl = gc.impl, ctx = gc.jit.ctx, kstep = p.gkstep)
+    sa.yp = LLVMGetParam(gc.impl, 0u)
+    let wn = LLVMGetParam(gc.impl, 1u)
+    let we = LLVMGetParam(gc.impl, 2u)
+    te.x[0] = LLVMGetParam(gc.impl, 3u)
+    te.xs[0] = LLVMGetParam(gc.impl, 4u)
+    let n = LLVMGetParam(gc.impl, 5u)
+    let rbv = LLVMGetParam(gc.impl, 6u)
+    let rev = LLVMGetParam(gc.impl, 7u)
+    sa.nb = LLVMBuildSDiv(b, n, te.types->ConstI64(32ul), "nb")
+    var nrow = LLVMBuildSDiv(b, n, te.types->ConstI64(2ul), "nrow")
+    sa.d = te.types->ConstI64(0ul)
+    sa.t0 = te.types->ConstI64(0ul)
+    let mrC = te.types->ConstI64(uint64(te.interleave))
+    var g0 = LLVMBuildSDiv(b, rbv, mrC, "g0")
+    var g1 = LLVMBuildSDiv(b, rev, mrC, "g1")
+    var nonempty = LLVMBuildICmp(b, LLVMIntPredicate.LLVMIntSLT, g0, g1, "any")
+    LLVMBuildCondBr(b, nonempty, ghead, gexit)
+
+    LLVMPositionBuilderAtEnd(b, ghead)
+    var gPhi = LLVMBuildPhi(b, te.types.t_int64, "g")
+    var gEntryVals <- [g0]
+    var gEntryBlocks <- [entry]
+    LLVMAddIncoming(gPhi, gEntryVals, gEntryBlocks)
+    sa.g = gPhi
+    var gRow = LLVMBuildMul(b, gPhi, mrC, "grow")
+    te.wg = LLVMBuildGEP2(b, te.types.t_int8, wn, LLVMBuildMul(b, gRow, nrow, ""), "wg")
+    te.sg = LLVMBuildGEP2(b, te.types.t_int8, we, LLVMBuildMul(b, gRow, sa.nb, ""), "eg")
+
+    var after = emit_slice(te, sa, ghead, 0, 1, "")
+    LLVMPositionBuilderAtEnd(b, after)
+    var gNext = LLVMBuildAdd(b, gPhi, te.types->ConstI64(1ul), "gnext")
+    var more = LLVMBuildICmp(b, LLVMIntPredicate.LLVMIntSLT, gNext, g1, "more")
+    LLVMBuildCondBr(b, more, ghead, gexit)
+    var gLoopVals <- [gNext]
+    var gLoopBlocks <- [after]
+    LLVMAddIncoming(gPhi, gLoopVals, gLoopBlocks)
+
+    LLVMPositionBuilderAtEnd(b, gexit)
+    LLVMBuildRetVoid(b)
+    return true
+}
+
 // Called from llvm_user_modules::register_user_llvm_code_generators — the JIT invokes that in the
 // context that reads the registry, so the direct call lands in the right table copy.
 [macro_function]
@@ -498,4 +705,5 @@ def public register_dasllama_gemm_generators {
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_tile", @@tile_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_layout", @@layout_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_gemv", @@gemv_gen)
+    register_llvm_code_generator("dasllama_gemm_gen::mx4_gemv", @@mx4_gemv_gen)
 }

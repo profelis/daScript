@@ -1,7 +1,7 @@
 options gen2
 options persistent_heap = true
 
-// Production-SLOT parity for the arm64-laneq-gen backend: portable reference vs the gen
+// Production-SLOT parity for the arm64-gen backend: portable reference vs the gen
 // backend through the real dispatch rail — pin_kernel_backend + repack_q8q8_weight (the
 // backend's own repack, layout from the stamped q8q8_layout_gen) + the matmul_q8q8 /
 // matmul_q8q8_batch / matmul_q8q8_group3 wrappers. This is the layer the kernel-level
@@ -62,7 +62,7 @@ def private compare(tag : string; y : array<float>; yref : array<float>; var fai
 [export]
 def main {
     if (!(get_architecture_name() == "arm64" && jit_enabled())) {
-        print("SKIP: arm64 + -jit only (the arm64-laneq-gen backend is not registered here)\n")
+        print("SKIP: arm64 + -jit only (the arm64-gen backend is not registered here)\n")
         return
     }
     with_job_que() {
@@ -99,9 +99,8 @@ def main {
         yref_b |> resize(int(ntok * d0))
         matmul_q8q8_batch(yref_b, wq, ws, xq, xs, n, d0, ntok)
 
-        // gen backend: the flavor matching the stamped layout (the other reports itself
-        // unavailable — pin would warn and keep portable, a false pass)
-        pin_kernel_backend(mr == 4l ? "arm64-laneq-gen" : "arm64-grp-gen")
+        // the gen backend: one flavor since slice E — every slot reads the stamped layout
+        pin_kernel_backend("arm64-gen")
         repack_q8q8_weight(wq, ws, woff0, n, d0)
         repack_q8q8_weight(wq, ws, woff1, n, d1)
         repack_q8q8_weight(wq, ws, woff2, n, d2)
@@ -127,6 +126,51 @@ def main {
         compare("group3 d0={d0}", y0, yref0, fails)
         compare("group3 d1={d1}", y1, yref1, fails)
         compare("group3 d2={d2} (row tail)", y2, yref2, fails)
+
+        // mx4 slots (slice E): random nibble/exponent planes — portable row-major reference
+        // vs the gen backend's interleaved planes (repack_mx4_weight -> mm_mx4 / groupn_mx4
+        // traversals over the generated mx4 core). Two-region blob for groupn, both regions
+        // repacked independently per the loader's per-expert shape (d2 rows each — the
+        // row-major row tail at mr 8).
+        var mxq <- [for (_i in range64(d0 * n / 2l)); uint8(random_int(g_seed) % 256)]
+        var mxs <- [for (_i in range64(d0 * n / 32l)); uint8(120 + random_int(g_seed) % 12)]
+        var gxq <- [for (_i in range64(2l * d2 * n / 2l)); uint8(random_int(g_seed) % 256)]
+        var gxs <- [for (_i in range64(2l * d2 * n / 32l)); uint8(120 + random_int(g_seed) % 12)]
+        var moffs <- [0l, 0l, d2 * n, 0l]
+        var mboffs <- [0l, d2]
+        var bias <- rand_scales(d2 * 2l)
+
+        pin_kernel_backend("portable")
+        var mref : array<float>
+        mref |> resize(int(d0))
+        matmul_mx4q8(mref, mxq, mxs, xq, xs, n, d0)
+        var mgref : array<float>
+        mgref |> resize(int(d2 * 2l))
+        matmul_mx4q8_groupn(mgref, gxq, gxs, moffs, 2l, xq, xs, bias, mboffs, n, d2)
+
+        pin_kernel_backend("arm64-gen")
+        repack_mx4_weight(mxq, mxs, 0l, n, d0)
+        repack_mx4_weight(gxq, gxs, 0l, n, d2)
+        repack_mx4_weight(gxq, gxs, d2 * n, n, d2)
+        var my : array<float>
+        my |> resize(int(d0))
+        matmul_mx4q8(my, mxq, mxs, xq, xs, n, d0)
+        compare("mm_mx4 d={d0}", my, mref, fails)
+        var mgy : array<float>
+        mgy |> resize(int(d2 * 2l))
+        matmul_mx4q8_groupn(mgy, gxq, gxs, moffs, 2l, xq, xs, bias, mboffs, n, d2)
+        compare("groupn_mx4 2x d={d2} (+bias, row tail)", mgy, mgref, fails)
+        delete mxq
+        delete mxs
+        delete gxq
+        delete gxs
+        delete moffs
+        delete mboffs
+        delete bias
+        delete mref
+        delete mgref
+        delete my
+        delete mgy
 
         delete wq
         delete ws

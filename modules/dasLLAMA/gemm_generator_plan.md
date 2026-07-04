@@ -633,6 +633,50 @@ regimes, loses only gpt-oss (0.49 pp — the row-major mx4 family, exactly the n
 item). The mr8 manifest is no longer a prefill-experiment config on Q8 models; a generated
 mx4 family is what's left before it's the unconditional daily driver.
 
+## M4 slice E (2026-07-04, M1 Max) — the mx4 family: one backend, one layout, four functions
+
+**MXFP4 joins the stamp (the second quant family) and the two backend flavors merge into ONE
+`arm64-gen`.** `mx4q8_gemv_gen` is the fourth companion in the same bracket — the mx4 twin of
+the Q8 rows core over grp<mr>-interleaved nibble/exponent planes (`repack_mx4_grp`, the SAME
+mr as the Q8 layout: one layout companion drives both repacks). The generator reuses the
+whole slice-D loop machinery: `emit_block_mx4` swaps the weight-load stage for `tbl`
+LUT-dequant (the doubled-e2m1 LUT baked as a constant vector — no table pointer at runtime;
+one v16i8 nibble load per quad per dword-group feeds tbl-lo/tbl-hi + the same indexed-sdot
+lattice) and the scale loads for an in-register vectorized `e8m0_half` (zext + the
+denormal-select bit trick). `perm_declines` grew the tbl rail — four generators, still ONE
+lockstep predicate. mm_mx4/groupn_mx4 are das traversals over the core (region-splitting,
+bias post-add, row-major row tails); the mx4 expand's byte-for-byte positional map
+generalized to any mr (nibble byte `off` of block-group bg -> q8[bg*32*mr + off] low /
++16*mr high; scale bytes 1:1), reading a new activation-time layout cache
+(`KernelBackend.q8_layout` -> `active_q8_layout_mr()`, evaluated at selection time per the
+slice C rule). The x64-style expand-row-major-then-repack double pass is arm64-history: the
+expand writes the stamped layout directly at every mr.
+
+**The two-flavor split dissolves.** After slice D (Q8 slots layout-driven) + this slice
+(mx4 slots layout-driven), arm64-laneq-gen and arm64-grp-gen differed in nothing — merged
+into `arm64-gen` (priority 25, no `available` predicate needed), the laneq mx4 borrow and
+`repack_mx4_identity` wiring gone. Probes updated to the one name.
+
+**Gates:** grid test 17/17 x THREE kernels (tile, Q8 gemv, mx4 gemv — mx4 bit-exact vs the
+hand interleaved walk at mr4, ~6e-5 fast-math drift at mr8, within tolerance);
+gen_slot_parity_probe grew mm_mx4 + groupn_mx4 legs (portable reference vs the real rail:
+plane repack -> traversals over the generated core) — ALL slots maxdiff 0 at mr4 and mx4
+maxdiff 0 at mr8; parity.das gpt-oss GEN_IDS **token-for-token identical default-vs-mr8**
+(24 greedy tokens through the full rail: grp8 plane repack -> positional expand -> generated
+grp8 mx4 GEMVs -> MoE decode groupn); dasLLAMA suite 179/179.
+
+**gpt-oss fleet check (emission_bench -p 512 -n 64 --nprompts 2, back-to-back):** B (default
+grp4) pp 137 t/s / emit 33.0; C (mr8 manifest) pp 145 / emit 35.7 — **the slice C mr8
+gpt-oss loss (pp 0.49, the expand double pass + row-major mx4 family) is GONE; mr8 now
+matches-or-beats grp4 on gpt-oss too.** With slice D's Q8 GEMV recovery, NO model loses at
+mr8 anymore: the mr8 manifest is a legitimate daily driver on this box (+12–25% prefill in
+the 1.5B–4B dense band, neutral-or-better everywhere else).
+
+**Found compiler bug (repro'd, not fixed here):** a TERNARY string result passed directly to
+an extern's `string implicit` parameter SIGSEGVs the compiler (plain interpolation is fine,
+das-wrapper callees are fine, hoisting to a `let` is the dodge). Minimal 10-line repro
+against llvm_boost's raw `LLVMBuildBitCast` binding; hit inside emit_block_mx4's s4 naming.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /

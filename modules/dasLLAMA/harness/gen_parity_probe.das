@@ -86,7 +86,7 @@ def test_shape(n, d, ntok : int64) : bool {
     delete s4
 
     // the working buffers: the backend repack — grp<mr> per the layout companion
-    select_kernel_backend("arm64-laneq-gen")
+    select_kernel_backend("arm64-gen")
     repack_q8q8_weight(q, s, 0l, n, d)
     let mr = int64(q8q8_layout_gen())
     let ng = d / mr
@@ -146,10 +146,10 @@ def main {
     }
     var found = false
     for (nm in kernel_backend_names()) {
-        found ||= nm == "arm64-laneq-gen"
+        found ||= nm == "arm64-gen"
     }
     if (!found) {
-        print("arm64-laneq-gen not registered (non-arm64 host?) — nothing to test\n")
+        print("arm64-gen not registered (non-arm64 host?) — nothing to test\n")
         return
     }
     var ok = test_shape(64l, 8l, 4l)      // nb=2: paired-block loop only

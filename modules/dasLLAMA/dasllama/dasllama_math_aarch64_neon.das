@@ -533,7 +533,7 @@ def dot_q8q8_laneq4x4(var yp : float?; wg : int8 const?; sg : float const?; xqp 
 // In-place repack of one Q8 weight region [d x n] into 4-row-interleaved groups (+ float4-per-block
 // scales). Copies the region to a scratch, then writes the interleaved layout back; tail rows (d % 4)
 // stay row-major. Runs once per weight tensor at load, on the main context.
-// not private: the arm64-laneq-gen backend (dasllama_math_gen) shares this layout contract
+// not private: dasllama_math_gen shares this layout contract (probe oracles, reference bodies)
 def repack_q8q8_neon(var wp : int8?; var sp : float?; n, d : int64) {
     let nb = n / 32l
     let ng = d / 4l
@@ -575,7 +575,7 @@ def repack_q8q8_neon(var wp : int8?; var sp : float?; n, d : int64) {
     delete ts
 }
 
-// not private: the arm64-laneq-gen backend (dasllama_math_gen) borrows this slot
+// not private: dasllama_math_gen references this (reference bodies / probe oracles)
 def q8q8_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     let ng = d / 4l
@@ -648,7 +648,7 @@ def private q8q8_batch_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp :
     }
 }
 
-// not private: the arm64-laneq-gen backend (dasllama_math_gen) borrows this slot
+// not private: dasllama_math_gen references this (reference bodies / probe oracles)
 def q8q8_group3_kernel_neon_laneq(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?;
                                   woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) {
     let nb = n / 32l

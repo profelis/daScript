@@ -8,7 +8,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_math_default  // registers the portable Q8·Q8 backend at [init] (the fallback everywhere)
 require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backends at [init]; no-op off-ARM
 require dasllama/dasllama_math_x64_avx  // registers the x86-64 dot4 Q8·Q8 backend at [init]; no-op off-x64
-require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-laneq-gen" (the generated GEMM tile, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
+require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
 require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
@@ -3445,14 +3445,15 @@ def private moe_gather_rows(var s : Session; b0, cnt, dim, k : int64) {
 // into EXACT Q8 blocks in the given scratch: q[j] = the doubled-e2m1 LUT value (already an int8),
 // scale = e8m0_half(e) — no requantization error, every value representable. Grouped prefill runs
 // the proven Q8 batch GEMM off this scratch (one expansion per touched expert amortizes over the
-// whole bucket). On a backend with mx4_expand_interleaved (arm64-laneq) the mx planes are ALREADY
-// interleaved (repack_mx4_stacks), and the interleaved nibble order maps byte-for-byte onto the
-// interleaved Q8 order — nibble byte `off` (0..63) of block-group bg lands at q8[bg*128 + off]
-// (low nibbles, k-chunk 0..15) and q8[bg*128 + 64 + off] (high, k 16..31), with the scale bytes
-// 1:1 positional in BOTH layouts — so the expansion writes the repacked form directly, no separate
-// repack pass. A repack backend WITHOUT that map (x64 grp4: repack_mx4 is identity, so the planes
-// are row-major, and the Q8 interleave is block-granular) expands row-major here and repacks the
-// scratch through the backend's own repack below.
+// whole bucket). On a backend with mx4_expand_interleaved (arm64-laneq, arm64-gen) the mx planes
+// are ALREADY interleaved at the backend's mr (repack_mx4_stacks), and the interleaved nibble
+// order maps byte-for-byte onto the interleaved Q8 order — nibble byte `off` (0..16*mr) of
+// block-group bg lands at q8[bg*32*mr + off] (low nibbles, k-chunk 0..15) and
+// q8[bg*32*mr + 16*mr + off] (high, k 16..31), with the scale bytes 1:1 positional in BOTH
+// layouts — so the expansion writes the repacked form directly, no separate repack pass. A repack
+// backend WITHOUT that map (x64 grp4: repack_mx4 is identity, so the planes are row-major, and
+// the Q8 interleave is block-granular) expands row-major here and repacks the scratch through the
+// backend's own repack below.
 def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<int8>; var ws : array<float>) {
     let total = n * d
     wq |> resize(total)
@@ -3475,23 +3476,28 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
             }
         }
         if (g_active_mx4_expand_interleaved) {
-            // interleaved: whole 4-row block-groups first, then the row-major tail rows
-            let ngrp = (d / 4l) * (n / 32l)
+            // interleaved: whole mr-row block-groups first, then the row-major tail rows. The
+            // positional map holds at ANY interleave mr (nibble byte off of block-group bg ->
+            // q8[bg*32*mr + off] low / +16*mr high); mr comes off the activation-time layout cache.
+            let mr = active_q8_layout_mr()
+            let nbyt = 16l * mr    // nibble bytes per block-group
+            let qbyt = 32l * mr    // q8 bytes per block-group
+            let ngrp = (d / mr) * (n / 32l)
             maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_dispatch_lanes()) $(gb, ge) {
                 unsafe {
                     for (bg0 in range(gb, ge)) {
                         let bg = int64(bg0)
-                        let nb = bg * 64l
-                        let qb = bg * 128l
-                        for (off in range64(64l)) {
+                        let nb = bg * nbyt
+                        let qb = bg * qbyt
+                        for (off in range64(nbyt)) {
                             let b = int(np[nb + off])
                             qp[qb + off] = lutp[b & 15]
-                            qp[qb + 64l + off] = lutp[b >> 4]
+                            qp[qb + nbyt + off] = lutp[b >> 4]
                         }
                     }
                 }
             }
-            for (bi in range64(ngrp * 4l, nblk)) {   // row tail (d % 4): row-major from here on
+            for (bi in range64(ngrp * mr, nblk)) {   // row tail (d % mr): row-major from here on
                 let nb16 = bi * 16l
                 let qb = bi * 32l
                 for (j in range64(16l)) {

@@ -579,6 +579,11 @@ struct KernelBackend {
     priority : int
     // see BackendAvailableFn — selection-time availability; default = always selectable
     available : BackendAvailableFn = @@backend_always_available
+    // The Q8 interleave (mr) the backend's repack writes and its kernels read. Evaluated at
+    // ACTIVATION time — selection-time truthful like `available`, never at [init] (a JIT-stamped
+    // layout still answers with its reference tier there). The mx4 expand's positional map and
+    // the probes read the cached value via active_q8_layout_mr().
+    q8_layout : function<() : int> = @@q8_layout_grp4
 }
 
 // Active kernels — the hot path reads these directly. A backend must register before any Q8·Q8 matmul
@@ -602,6 +607,7 @@ var g_active_priority = -1          // priority of the active row-major default 
 var g_active_needs_repack = false   // does the active backend need repacked weights?
 var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
 var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
+var g_active_q8_layout_mr = 4l                // see KernelBackend.q8_layout (activation-time cache)
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
 var g_batch_pin = ""                // hybrid: donor backend for the BATCH-shaped slots; "" = whole-backend
 var g_active_batch_backend = ""     // == g_active_backend unless a batch pin overrode the batch slots
@@ -618,6 +624,11 @@ def private no_backend() {
     panic("dasLLAMA: no Q8·Q8 kernel backend registered — require dasllama/dasllama_math_default")
 }
 def private backend_always_available() : bool => true
+def private q8_layout_grp4() : int => 4
+
+//! The Q8 interleave (mr) of the ACTIVE backend's weight layout — cached at activation from
+//! KernelBackend.q8_layout (4 for every hand tier; the stamped mr on the gen backend).
+def active_q8_layout_mr() : int64 => g_active_q8_layout_mr
 [unused_argument(yp, wp, sp, xqp, xsp, n, d)]
 def private q8q8_unset_kernel(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
 [unused_argument(yp, wp, sp, xqp, xsp, n, d, ntok)]
@@ -663,6 +674,7 @@ def private activate(be : KernelBackend) {
     g_active_needs_repack = be.needs_repack
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
     g_active_mx4_native_batch = be.mx4_native_batch
+    g_active_q8_layout_mr = int64(invoke(be.q8_layout))
     g_active_batch_backend = be.name
     // a standing batch pin survives re-activation (auto-select, load-time select, explicit select)
     if (g_batch_pin != "") {
