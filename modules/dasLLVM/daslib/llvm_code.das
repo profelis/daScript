@@ -24,6 +24,9 @@ class private LlvmCodeAnnotation : AstFunctionAnnotation {
                     errors := "[llvm_code] on {func.name}: `name` must be a non-empty string (the generator key)"
                     return false
                 }
+                // force side effects: without this the front-end const-folds calls with
+                // constant arguments and the function never reaches the JIT/generator
+                func.sideEffectFlags.userScenario = true
                 return true
             }
         }
