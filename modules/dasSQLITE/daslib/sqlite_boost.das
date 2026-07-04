@@ -10,6 +10,7 @@ options _comment_hygiene = true
 module sqlite_boost shared public
 
 require sqlite public
+require sqlite/sql_provider public
 
 require strings public
 require daslib/fio                  // [sql_table(schema_from=...)] uses is_absolute / path_join at macro time
@@ -102,6 +103,46 @@ struct SqlRunner {
 }
 
 typedef SqlError = Option<string>
+
+// ===== SQL provider registration (see modules/dasSQLITE/PROVIDER_CONTRACT.md) =====
+
+def private _sqlite_make_stmt_type() : TypeDeclPtr => qmacro_type(type<sqlite3_stmt?>)
+
+def private _sqlite_make_stmt_type_const() : TypeDeclPtr => qmacro_type(type<sqlite3_stmt? const>)
+
+[unused_argument(ordinal)]
+def private _sqlite_render_placeholder(ordinal : int) : string => "?"
+
+def private _sqlite_render_json_extract(target : string; jsonPath : string) : string => "json_extract({target}, {jsonPath})"
+
+def private _sqlite_quote_id(id : string) : string => sql_quote_id(id)
+
+def register_sqlite_provider {
+    //! Registers the sqlite `SqlProviderInfo` entry in the CURRENT macro context. Only a
+    //! module's own `[_macro]`s run at its macro build (linq_fold.das:123 pattern), so each
+    //! consulting module calls this from its own `[_macro]` — here and in sqlite_linq.das.
+    var info = SqlProviderInfo(
+        name = "sqlite",
+        runnerModule = "sqlite_boost",
+        runnerStruct = "SqlRunner",
+        makeStmtType = @@_sqlite_make_stmt_type,
+        makeStmtTypeConst = @@_sqlite_make_stmt_type_const,
+        renderPlaceholder = @@_sqlite_render_placeholder,
+        noLimitSpelling = "LIMIT -1",
+        renderJsonExtract = @@_sqlite_render_json_extract,
+        quoteId = @@_sqlite_quote_id,
+        sqlTypeFor = @@sqlite_sql_type,
+        identityDdl = "PRIMARY KEY",
+        caps = SqlProviderCaps.fts5 | SqlProviderCaps.client_udfs | SqlProviderCaps.returning,
+        pkReport = SqlPkReport.LastInsertRowid)
+    register_sql_provider(info)
+}
+
+[_macro]
+def private _boost_register_sqlite_provider {
+    if (!is_compiling_macros_in_module("sqlite_boost")) return
+    register_sqlite_provider()
+}
 
 def finalize(var db : SqlRunner) {
     //! Closes the underlying SQLite connection. Triggered automatically by `var inscope db`.
@@ -2537,7 +2578,7 @@ class SqlTableMacro : AstStructureAnnotation {
         var fn_select_all = make_select_all_sql_fn(st, table_name, fields)
         compiling_module() |> add_function(fn_select_all)
         var fn_read = make_read_row_fn(st, fields)
-        compiling_module() |> add_function(fn_read)
+        compiling_module() |> add_generic(fn_read)
         var fn_col_info = make_column_info_fn(st, fields)
         compiling_module() |> add_function(fn_col_info)
 
@@ -2565,7 +2606,7 @@ class SqlTableMacro : AstStructureAnnotation {
             var fn_pk_unset = make_pk_is_unset_fn(st, fields)
             compiling_module() |> add_function(fn_pk_unset)
             var fn_bind = make_bind_row_fn(st, fields)
-            compiling_module() |> add_function(fn_bind)
+            compiling_module() |> add_generic(fn_bind)
             var fn_upd_pk_named = make_update_by_pk_sql_named_fn(st, fields)
             compiling_module() |> add_function(fn_upd_pk_named)
             var fn_upd_pk = make_update_by_pk_sql_fn(st, table_name, fields)
@@ -2975,7 +3016,9 @@ class SqlTableMacro : AstStructureAnnotation {
             }))
         }
 
-        var fn = qmacro_function("_sql_bind_row") $(var stmt : sqlite3_stmt?; row : $t(st); include_pk : bool) : void {
+        // stmt is untyped (generic): monomorphizes per provider stmt type; the interior
+        // sql_bind_to_stmt overloads dispatch on whichever concrete stmt instantiated it.
+        var fn = qmacro_function("_sql_bind_row") $(var stmt; row : $t(st); include_pk : bool) : void {
             if (include_pk) {
                 $b(with_pk_exprs)
             } else {
@@ -3037,7 +3080,8 @@ class SqlTableMacro : AstStructureAnnotation {
         }
 
         // Explicit default<>: Option<T> fields don't satisfy strict_smart_pointers' uninit check otherwise.
-        var fn = qmacro_function("_sql_read_row") $(stmt : sqlite3_stmt?; typ : $t(st)) : $t(st) {
+        // stmt untyped (generic over provider stmt type) — same rationale as make_bind_row_fn.
+        var fn = qmacro_function("_sql_read_row") $(stmt; typ : $t(st)) : $t(st) {
             var row = default<$t(st)>
             $b(assign_exprs)
             return <- row
@@ -3459,7 +3503,7 @@ class private SqlViewMacro : AstStructureAnnotation {
         var fn_select_all = make_view_select_all_sql_fn(st, view_name, fields)
         compiling_module() |> add_function(fn_select_all)
         var fn_read = make_read_row_helper_fn(st, fields)
-        compiling_module() |> add_function(fn_read)
+        compiling_module() |> add_generic(fn_read)
         var fn_col_info = make_view_column_info_fn(st, fields)
         compiling_module() |> add_function(fn_col_info)
         // ---- mutation stubs (panic at runtime with a clear message) ----
@@ -3580,7 +3624,8 @@ def private make_read_row_helper_fn(var st : StructurePtr; fields : array<FieldI
             }
         }))
     }
-    var fn = qmacro_function("_sql_read_row") $(stmt : sqlite3_stmt?; typ : $t(st)) : $t(st) {
+    // stmt untyped (generic over provider stmt type) — same rationale as make_read_row_fn.
+    var fn = qmacro_function("_sql_read_row") $(stmt; typ : $t(st)) : $t(st) {
         var row = default<$t(st)>
         $b(assign_exprs)
         return <- row
@@ -3810,7 +3855,7 @@ class private SqlFts5Macro : AstStructureAnnotation {
         var fn_select_all = make_const_string_helper_fn(st, "_sql_select_all_sql", select_all_sql)
         compiling_module() |> add_function(fn_select_all)
         var fn_read = make_read_row_helper_fn(st, fields)
-        compiling_module() |> add_function(fn_read)
+        compiling_module() |> add_generic(fn_read)
         // FTS5 has no daslang-side PK; both insert helper variants emit the same SQL.
         var fn_ins_pk = make_const_string_helper_fn(st, "_sql_insert_with_pk_sql", insert_sql)
         compiling_module() |> add_function(fn_ins_pk)
