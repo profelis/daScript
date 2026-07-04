@@ -1,16 +1,18 @@
-# GEMM kernel generator — plan
+# Kernel generation — `[llvm_code]`, the tune framework, and GEMM — plan
 
-**Status: plan, pre-implementation.** This is the design + session runbook for generating
-Q8·Q8 (and later MXFP4) GEMM microkernels at the LLVM-IR layer instead of hand-writing them
-in das. Written at the close of the EPYC 9654 campaign (`epyc9654_measurements.md`); the
-campaign's fleet sweep is the motivating evidence. Companion docs: `x64_arch.md` (the two
-seams this plugs into), `avx_kernel_matrix.md` (the hand-written tier matrix this replaces),
-`tune_for_this_box.md` (the tuner rail this extends).
+**Status: architecture settled (2026-07-04 discussion), pre-implementation.** This supersedes
+the GEMM-only first draft of this document. The GEMM generator is now the flagship *client*
+of two generic dasLLVM capabilities — an external-codegen hook (`[llvm_code]`, part 1) and a
+generalized tune framework (part 2) — with GEMM as part 3. Work order: **part 1 minimal →
+M0–M2 evidence on the M1 Mac → parts 2–3 built on that evidence.** Companion docs:
+`x64_arch.md` (the two x64 seams), `avx_kernel_matrix.md` (the hand-written tier matrix this
+eventually deletes), `tune_for_this_box.md` (the tuner rail being generalized),
+`epyc9654_measurements.md` (the motivating fleet evidence).
 
-**Hardware prereq:** execution measurements need real VNNI/AVX-512 silicon — the rented EPYC
-is parked/off; either rent again (Cherry Servers hourly, setup recipe in
-`epyc9654_measurements.md`) or note that Boris's Zen2 desktop only exercises the avx2 tiers.
-M0/M1 emission-only work runs fine on the arm64 box via `DAS_JIT_X64_FORCE_FEATURES` + `llc`
+**Hardware plan (settled):** the M1 Mac first — this box's **sdot kernels** are the M0–M2
+vehicle. Zen2 desktop after (avx2/maddubs perms; no VNNI). The EPYC 9654 is parked but
+configured — wake it up only when everything is a win and there's a reason (zvnni perms,
+fleet re-score). x64 emission work runs on the Mac via `DAS_JIT_X64_FORCE_FEATURES` + `llc`
 disasm (never execute forced artifacts).
 
 ---
@@ -22,180 +24,200 @@ kernels (~1000 ISA paths across 7 architectures, `arch/*/repack.cpp` + `ggml-cpu
 and every one of them is the same loop nest with different constants — tile shape, vector
 width, dot primitive, repack layout, scale fold. That's not 390 kernels; it's **one
 parametric family** and a maintenance moat. We stop digging our own copy of that moat:
+generate the loop nest as LLVM IR, tune by sweeping the parameter space, and let per-ISA
+support collapse to a per-ISA dot-primitive emitter.
 
-- **Generate** the microkernel loop nest as LLVM IR, parameterized by a perm vector,
-  via the JIT-intrinsic emitter rail that already exists in dasLLVM.
-- **Tune** by sweeping the perm space with the existing tuner machinery — `[tuned]` one
-  level down: instead of permuting loop *hints* on a das body, permute the *kernel itself*.
-- Per-ISA support becomes a per-ISA **dot-primitive emitter** (vpdpbusd / maddubs pair /
-  sdot / …), and NEON/SVE/RVV fall out of the same generator instead of new hand files.
+**The gap it chases:** fleet prefill is uniformly ~0.73–0.86× of llama.cpp on Genoa
+(gpt-oss 0.61×) after the zvnni batch pin; on M1 prefill median is 0.92× (their engine
+there is Accelerate/AMX). Decode at ≥1B is already near-parity — this is a **batch-GEMM
+(prefill) program** first.
 
-**The gap it chases:** fleet prefill is uniformly ~0.73–0.86× of llama.cpp (gpt-oss 0.61×)
-after the zvnni batch pin; on Genoa their engine is the AVX512-VNNI **zmm repack GEMM**
-(pp512 T=32: 1072 vs our 565 before the pin). Decode at ≥1B is already near-parity — this
-is a **batch-GEMM (prefill) program** first.
-
-**Method rule (standing):** profile hand-coded before building the macro. The generator gets
-built only after ONE hand-emitted perm proves the ceiling is reachable (M2 gate below).
+**Risk framing (Boris):** generation-via-LLVM on the box you're sitting at is expected to
+just work — IR is IR. The *cross-platform* portion (emitting for targets you can't execute)
+is where the annoyance lives. So the GO/NO-GO is less "can it work" and more "does one
+generated perm beat our best hand kernel on real silicon" (M2 below).
 
 ---
 
-## The rail that exists (what we build on, not build)
+## The architecture — three parts
 
-- **Emitter surface** (`modules/dasLLVM/daslib/llvm_jit_intrin.das`): name-keyed tables
-  (`g_intrin_lookup`, `g_aarch64_intrin_lookup`, `g_x64_intrin_lookup`) mapping a qualified
-  das call name to an emitter `(var ctx : JitCtx; expr : ExprCallFunc?; arguments :
-  array<LLVMOpaqueValue?>) : LLVMOpaqueValue?` that builds IR with `LLVMBuild*` /
-  `LLVMGetIntrinsicDeclaration`. `x64_avx.das` / `aarch64_neon.das` are the worked examples:
-  das function with a portable scalar fallback body, emitter fires only on the matching
-  target. The vector-expf emitter (`build_vector_expf`) is the existing proof that a
-  *multi-instruction computation* (not just one intrinsic) can be composed this way.
-- **Cross-context reality (why the schema is an annotation):** the JIT is a das program in
-  its own context compiling the *user* program's AST. A user-module `[init]` cannot reach
-  the JIT's lookup tables — the only channels the JIT already reads are the AST itself and
-  **annotations on user functions** (`fold_loop_hints` reads loop hints; the DLL cache key
-  folds them). So the generator lives in dasLLVM's daslib, and the perm travels as
-  annotation arguments (ints/strings/bools) on a user-side stub.
-- **Correctness tiers for free:** the stub carries a reference das body — interpreter, AOT,
-  and non-matching JIT targets compile it verbatim. That is the AOT gate and the bit-exact
-  oracle in one move (same rule as every intrinsic today: correct everywhere, fast where the
-  emitter fires).
-- **Cache keying:** the JIT DLL cache key folds per-function AOT hashes + loop-hint
-  annotations. The perm annotation must fold the same way (extend `fold_loop_hints`'s
-  pattern in `llvm_jit_run.das`) so a re-tune re-keys the DLL automatically; bump
-  `LLVM_JIT_CODEGEN_VERSION` when the generator's emission changes for a fixed perm.
-- **Backend registry** (`dasllama_math.das`): generated kernels register as ordinary
-  pin-only `KernelBackend` tiers (exactly like the AVX matrix — priorities below shipped,
-  `cpu_supports` gates). The whole existing selection/pin/hybrid/profile/A-B rail then
-  applies to generated kernels **unchanged**.
+### Part 1 — `[llvm_code(...)]`: external codegen hook (dasLLVM core)
 
-## The unit of generation
-
-A das stub function per (kernel-shape × perm):
+The generic extension point. An annotation on an ordinary das function:
 
 ```
-[gemm_kernel(mr = 8, nr = 4, width = 512, dot = "vpdpbusd", kstep = 2, repack = "grp8",
-             acc = "i32reg", scale = "block_fold", prefetch = 256)]
-def q8q8_batch_gen_8x4_z(w : uint8 const?; ws : float const?; x : uint8 const?;
-                         xs : float const?; var y : float?; n, d, ntok : int) {
-    // reference body: the portable batch kernel — bit-exact semantics, runs on
-    // interp/AOT/off-target JIT; the emitter replaces it wholesale on-target
+[llvm_code(name = "module_name::generator_function", anyarg = anyvalue, other = whatever)]
+def q8q8_batch_8x4(w : uint8 const?; ws : float const?; ...) {
+    // reference body — bit-exact semantics; interp, AOT, and non-matching
+    // JIT targets compile this verbatim
 }
 ```
 
-The JIT recognizes the annotation, ignores the body, and emits the whole loop nest from the
-perm. (Alternative considered: a callmacro generating das *source* — rejected as the primary
-path: source-level permutation is what `[tuned]` already does, and the loop-hint ceiling is
-measured; the wins left are instruction-selection-level — exact dot ops, register-tile
-layout, fold points — which das source cannot express.) `[tuned]` stays for float
-elementwise kernels; the generator owns the integer GEMM/GEMV family.
+- **At JIT time**, instead of compiling the body, the JIT calls the named das **generator
+  function**, passing the annotation arguments, the name of the function to generate, and
+  the AST (the generator gets the `Function` — signature, types, everything it needs).
+- **The generator lives in the llvm-jit context** (the JIT is a das program in its own
+  context; a user-module `[init]` can't reach it — the annotation IS the channel). Module
+  wiring for now: **`llvm_user_modules.das`** — a user-edited extra-require list in dasLLVM
+  daslib. End state: `require ?gemm_kernels` optional-require, the linq-adapter pattern.
+  No stronger machinery for now; fine as-is.
+- **ABI via helper function**: the generator calls a helper to create the LLVM function
+  declaration with the das JIT calling convention (lean: helper the generator opts into,
+  not JIT-pre-created). This also gives the **decline path** — the generator returns false
+  (wrong ISA, illegal perm) and the JIT compiles the reference body normally.
+- **Correctness tiers for free:** the reference body is the AOT gate and the bit-exact
+  oracle in one move — same rule as every intrinsic today (correct everywhere, fast where
+  the emitter fires).
+- **Cache keying: MANUAL for now** (`LLVM_JIT_CODEGEN_VERSION` bump discipline). Folding
+  the generator function's hash + its dependency closure into the DLL key gets too big;
+  revisit when it bites.
+- Known-missing mechanics are accepted: make it work first; the shapes of the missing
+  pieces become obvious in the process.
+
+### Part 2 — the tune framework moves into dasLLVM (and generalizes)
+
+The tune machinery (`dasllama_tune.das` — `[tuned]`/`[dasllama_grid]`) migrates to dasLLVM
+and becomes the stub factory. Example: given `add(a?, b?, count)`, a **tune macro**
+generates a family of named stubs — `add_vector`, `add_unroll`, `add_vec4_unroll2`, … —
+each carrying `[llvm_code(name = "addunroller", ...)]` with different arguments.
+
+**Three modes:**
+
+| Mode | Stamping | What runs |
+|---|---|---|
+| **normal run** | manifest read; **exactly the winner** is stamped — one body per function, no runtime variant dispatch at all | the app |
+| **tune run** | full grid stamped | profile all stubs (interleaved ABBA is native — all variants in one process beats the env-var A/B rail), write winners to the manifest |
+| **test run** | full grid stamped | **bit-exact gate**: every stub vs the reference body, no timing — generator bugs die here, never in production |
+
+**The manifest:**
+
+- JSON, sits **next to the app**. No manifest → default stamping everywhere. Manifest
+  present → authoritative, no defaults.
+- Keys are **function names** — the best persistent ID the language has (no GUIDs
+  embeddable; "function's loop N" by index is fragile under edits but accepted).
+- Values are stamping instructions: *"stamp this function with this macro with these
+  arguments"* and *"stamp this function's loop N with these values"* — the second kind
+  **subsumes today's `[tuned]` loop-hint rail**.
+- APIs: set-a-value-to-manifest (used during tuning) and read-your-own-tune-value (used by
+  the macro at stamp time).
+
+**Client contract per kernel family:** the reference function, the perm grid, the generator
+name, and a probe (representative shapes to bench and compare against the reference).
+
+### Part 3 — GEMM kernels become tune-macro clients
+
+The original plan's kernels, re-expressed: the GEMM family is a tune macro whose stubs
+carry `[llvm_code]` perms. Per perm the generator targets **two functions** — the kernel
+itself and **`get_repack_type`** — stamped from the same schema, so layout and kernel can
+never desync (`needs_repack`/interleave factor derive from `mr`). Load-time repack just
+calls the generated `get_repack_type`.
+
+**End state:** delete every hand-written platform-specific kernel we've built so far (the
+x64 AVX matrix tiers, the arm64 laneq/sdot tiers), `[tune]` the **big GEMM** and the
+**small GEMM**, and live happily ever after. The `KernelBackend` registry shrinks to
+slot-shaped call-site selection — decode-vs-batch per-slot hybrid still means distinct stub
+functions per regime, but that's plain das call sites, not a runtime tier registry.
+
+---
+
+## Settled / deferred (the first draft's open questions)
+
+1. **Schema surface — settled:** annotation-on-stub via the generic `[llvm_code]`; the
+   *tune macro* stamps stubs (the callmacro idea landed at the tune layer, not the
+   generator layer — the annotation stays the JIT surface).
+2. **Sweep mechanics — settled:** all-stubs-in-one-tune-binary (one JIT compile sweeps the
+   family); winners live in the JSON manifest; DLL cache keying manual for now.
+3. **Per-model winners — DEFERRED.** Per-model may not make the cut at all; `bake = k` and
+   per-slot perm pins get decided only after M2 numbers say whether baking shapes matters.
+4. **Registration locality — settled:** `llvm_user_modules.das` user-edited require list
+   now, `require ?module` optional-require later. Generators run in the llvm-jit context.
+5. **Hardware — settled:** M1 first (sdot), Zen2 after (avx2/maddubs), EPYC wake-up when
+   everything wins.
+
+---
 
 ## The perm vector (the knobs)
 
-The parameter space the generator must span — write the M2 kernel against these names so
-the schema is validated by use:
+The parameter space the generator must span — the M2 kernel is written against these names
+so the schema is validated by use. The generator rejects illegal perms at emit time (vreg
+budget AND per-ISA legality), which in tune terms means those stubs decline and are skipped.
 
 | Knob | Values (initial) | Notes |
 |---|---|---|
-| `dot` | `vpdpbusd` (u8·s8 + sign trick), `maddubs` (VPMADDUBSW+VPMADDWD pair), `vpdpbssd` (VNNI-INT8, s8·s8 native), `sdot` (NEON), `mx4` (VPSHUFB dequant + dot) | per-ISA emitter; the sign-trick identity and its `|a|`-on-unsigned rule are in `x64_arch.md` |
-| `width` | 256 (ymm), 512 (zmm) | zmm halves instruction count but watch frequency/port behavior per box — a *tuned* knob, not a derived one |
-| `mr × nr` | e.g. 4×4, 8×4, 8×8, 16×4 (rows × tokens) | register-tile shape. Hard constraint: `mr·nr` accumulators + row loads + broadcast ≤ 32 vregs (16 for ymm) — generator rejects illegal perms at emit time |
-| `kstep` | 1, 2, 4 blocks (32 int8 = 1 block) per K-iteration | interacts with `acc` promotion; full unroll when K is baked (per-model) |
-| `repack` | `none` (row-major), `grp<mr>` (mr-row block interleave, scales float<mr>-interleaved) | **interleave factor is derived from `mr`** — repack is *generated from the same schema* so layout and kernel can never desync; `needs_repack` flows to the registry as today |
-| `acc` | `i32reg` (mr·nr i32 vreg tile, scale-fold at block boundary), `f32mem` (acc8-style memory accumulator, LICM-promoted) | acc8's low-thread win vs wash-at-32T says this is box-dependent — keep both |
+| `dot` | `sdot` (NEON — **first**, the M1 leg), `vpdpbusd` (u8·s8 + sign trick), `maddubs` (VPMADDUBSW+VPMADDWD pair), `vpdpbssd` (VNNI-INT8, s8·s8 native), `mx4` (shuffle-dequant + dot) | per-ISA emitter; the sign-trick identity and its `|a|`-on-unsigned rule are in `x64_arch.md` |
+| `width` | 128 (NEON q-regs), 256 (ymm), 512 (zmm) | zmm halves instruction count but watch frequency/port behavior per box — a *tuned* knob, not a derived one |
+| `mr × nr` | e.g. 4×4, 8×4, 8×8, 16×4 (rows × tokens) | register-tile shape. Hard constraint: `mr·nr` accumulators + row loads + broadcast ≤ 32 vregs (16 for ymm) |
+| `kstep` | 1, 2, 4 blocks (32 int8 = 1 block) per K-iteration | interacts with `acc` promotion; full unroll when K is baked (per-model — deferred) |
+| `repack` | `none` (row-major), `grp<mr>` (mr-row block interleave, scales interleaved) | **interleave factor derives from `mr`** — `get_repack_type` is generated from the same perm |
+| `acc` | `i32reg` (mr·nr i32 vreg tile, scale-fold at block boundary), `f32mem` (acc8-style memory accumulator) | acc8's low-thread win vs wash-at-32T says this is box-dependent — keep both |
 | `scale` | `block_fold` (float(blocksum)·ws·xs per block), `late` (accumulate i32 across kstep, fold once) | `late` is only exact within the no-overflow window — generator computes the window from kstep and refuses invalid combos |
-| `load` | `bcast_x` (broadcast activation dword-group × row-vector loads — the repack shape), `bcast_w` | M0 disasm decides which family ggml's winner actually is — don't cargo-cult |
-| `prefetch` | off, N bytes ahead (weights) | NT/streaming loads for fat w13/w2 streams is a candidate value here (mm_ffn 1.42× is fat-stream territory) |
-| `epilogue` | store, `+bias`, `+residual`, `+requant` | fused-chain epilogues (see `a8aee5c4b`) become perm values instead of hand variants |
-| `tail` | masked (zmm k-masks), padded, scalar | d-tail and ntok-tail handling |
-| `bake` | none, `k` (n and nblocks become IR constants) | the per-model axis — see below |
+| `load` | `bcast_x` (broadcast activation dword-group × row-vector loads — the repack shape), `bcast_w` | M0 disasm decides which family the winners actually use — don't cargo-cult |
+| `prefetch` | off, N bytes ahead (weights) | NT/streaming loads for fat w13/w2 streams is a candidate value (mm_ffn 1.42× is fat-stream territory) |
+| `epilogue` | store, `+bias`, `+residual`, `+requant` | fused-chain epilogues become perm values instead of hand variants |
+| `tail` | masked (zmm k-masks only), padded, scalar | d-tail and ntok-tail handling; per-ISA legality applies |
+| `bake` | none, `k` (n and nblocks become IR constants) | the per-model axis — **deferred** |
 
-## Tuning axes — per-ISA × per-box × per-model × per-regime
+## Tuning axes
 
-The perm space factors cleanly, and each factor already has a rail:
+- **Per-ISA:** which dot primitives exist at all — `cpu_supports` gating, as today.
+- **Per-box:** the manifest. Tune run on the box writes it; normal runs stamp from it.
+- **Per-model:** deferred (see settled/deferred #3).
+- **Per-regime:** decode GEMV vs batch GEMM — GEMV perms are a sub-family (`nr = 1`,
+  latency-shaped) swept separately; regime selection is distinct stub functions at the
+  call site.
 
-- **Per-ISA:** registration gates (`cpu_supports`, `g_target_x64_*`) pick which dot
-  primitives exist at all. Same as the AVX matrix today.
-- **Per-box:** cache sizes, bandwidth, SMT behavior, zmm frequency response → tuner sweeps
-  the perm grid on the box, winners land in `box_profile.json` (the grain knobs already ride
-  this rail; `tune_for_this_box.md` step 2's with-profile rule applies).
-- **Per-model (the new axis):** a model is a fixed set of GEMM shapes — one per slot
-  (kv/qo/w13/w2/cls), known at load time, plus its quant mix (q8/q4/mx4 per tensor) and
-  dense-vs-MoE structure. The generator makes per-model kernels *cheap*: `bake = k` turns
-  n/nblocks into IR constants (full K-unroll, no tail code, exact tiling for d=2048 vs
-  3072), and per-slot perm pins reuse the hybrid-backend machinery (`select_batch_backend`
-  precedent — extend the pin from "backend per slot-shape" to "perm per slot"). The tune
-  artifact becomes `(box, model) → per-slot perm table`; where it lives (a `models` section
-  in `box_profile.json` keyed by shape-signature vs a sidecar per-model file) is an open Q.
-- **Per-regime:** decode GEMV vs batch GEMM already diverge (hybrid pin) — GEMV perms are a
-  sub-family (nr = 1, latency-shaped) swept separately.
+Sweep cost stays sane because the sweep unit is a kernel-level iso bench (the
+`bench_gemm_iso.das` / `gemm_1core_probe.das` pattern) on real slot shapes, not end-to-end
+decode — the tune_kernels sweep is ~1 min today; the perm sweep targets the same order.
 
-Sweep cost stays sane because the sweep unit is a **kernel-level iso bench** (the
-`bench_gemm_iso.das` / `gemm_1core_probe.das` pattern) on the model's actual slot shapes,
-not end-to-end decode — the tune_kernels sweep is ~1 min today; a per-model perm sweep
-should target the same order.
+## Milestones
 
-## Session plan (milestones, each with a gate)
+**P1 — `[llvm_code]` minimal (the vehicle — START HERE).**
+Annotation recognized by the JIT; generator-call machinery; ABI helper; decline path;
+`llvm_user_modules.das` wiring. Hard-coded toy generator (e.g. a vector `add`) to prove the
+loop: **gate — generated function bit-exact vs its reference body on this Mac, IR visible
+via `--jit-dump`, decline falls back to the body cleanly.**
 
-**M0 — reference ceiling (position 0: build the instrument first).**
-Extend `harness/oracle/kernel_bench.cpp` to call llama.cpp's *repack GEMM family* (the
-`arch/x86/repack.cpp` q8_0 8×8 path that wins on Genoa), not just `vec_dot`; wiring note in
-the file header (examples/kernel-bench, same as simple-ids). Disassemble their winning
-kernel (objdump on the built lcpp, or perf-annotate during a pp512 run) and write down: the
-actual tile shape, dot sequence, scale-fold point, load family, prefetch pattern. Dump OUR
-current best (`--jit-dump` rail) for the same shape as the baseline IR. **Gate: a table —
-their GMAC/s ceiling per slot shape vs our zvnni-batch numbers — plus the target IR shape
-on paper.** Runs partly on arm64 (disasm/IR reading); GMAC/s numbers need the x64 box.
+**M0 — reference ceiling (Mac edition; position 0: build the instrument first).**
+Extend `harness/oracle/kernel_bench.cpp` to call llama.cpp's arm repack GEMM family
+(`arch/arm/repack.cpp` q8_0 path) and disasm their winning NEON kernel: actual tile shape,
+dot sequence, scale-fold point, load family. Dump OUR laneq tier (`--jit-dump` rail) for
+the same shapes. **Note:** lcpp's Mac *prefill* number rides Accelerate/AMX (`-ngl 0` still
+uses BLAS for pp) — so the honest M2 comparator on this box is **our arm64-laneq tier**
+(approach validation: can generated IR beat our best hand kernel), with lcpp CPU columns as
+reference. The absolute lcpp-parity chase stays x64 territory. **Gate: ceiling table per
+slot shape + target IR shape on paper.**
 
 **M1 — raw primitive emitters.**
-The current intrinsics (`dot32_vnni`, `dot64_acc16` …) wrap *whole dots*; the generator
-needs the primitives one level down: vpdpbusd-accumulate on given vreg values, dword-group
-broadcast, sign-apply (compare+negate or VPSIGNB by width), k-masked loads, NT loads. Add
-them as plain emitter helpers inside dasLLVM (they compose IR values — they need no das-side
-fallback of their own). Emission-only validation via `DAS_JIT_X64_FORCE_FEATURES` + `llc`
-disasm on arm64. **Gate: disasm of each helper's output matches the hand-expected
-instruction, no verifier errors.**
+The primitives one level down from today's whole-dot intrinsics: sdot-accumulate on given
+vreg values, dword-group/lane broadcast, interleaved q-reg loads (NEON leg first); then
+vpdpbusd-accumulate, sign-apply, k-masked loads, NT loads (x64 leg, emission-only via
+`DAS_JIT_X64_FORCE_FEATURES` + `llc`). Plain emitter helpers inside dasLLVM — they compose
+IR values, no das-side fallback of their own. **Gate: disasm of each helper matches the
+hand-expected instruction, no verifier errors.**
 
-**M2 — ONE hand-composed perm (the GO/NO-GO for the whole idea).**
-Hand-emit the 8×4 zmm vpdpbusd tile (the M0-informed guess; adjust to what M0's disasm
-says) as a single `[gemm_kernel(...)]` stub + hard-coded emitter — no generator yet, the
-emitter IS what the generator would produce for that one perm. Bit-exact vs the reference
-body (avx_matrix_probe exactness-gate pattern); iso A/B on kv/qo/w13/w2/cls shapes at
-1-core and T=8/32 vs the zvnni-batch baseline (`matmul_variants`/`bench_gemm_iso` probe
-pattern, interleaved ABBA only). **Gate: the hand perm closes a meaningful fraction of the
-M0 gap on ≥1 slot shape. If it doesn't, stop — the moat isn't where we thought, and we've
-spent one kernel, not a generator.**
+**M2 — ONE hand-composed perm (the GO/NO-GO).**
+Hand-emit one sdot register tile (M0-informed shape) as a single `[llvm_code]` stub +
+hard-coded generator — no tune framework yet; the generator IS what the real generator
+would produce for that one perm. Bit-exact vs the reference body; iso ABBA on kv/qo/w13/w2/cls
+shapes at 1-core and multi-thread vs the laneq batch baseline. **Gate: the hand perm beats
+or matches laneq on ≥1 slot shape. If it can't even match a hand kernel, stop and rethink —
+we've spent one kernel, not a framework.**
 
-**M3 — the generator + schema.**
-Promote the M2 emitter into the perm-parameterized generator; validate the schema by
-re-expressing M2's kernel as its perm vector plus 2–3 neighbors (4×4 ymm maddubs ≈ the
-existing avx2 tier as a self-check; an 8×8; a vpdpbssd twin if silicon allows). Bit-exact
-gates on every emitted perm; vreg-budget rejection tested. Registry integration: perms
-register as pin-only backends. Cache-key folding for the annotation. **Gate: generated
-== hand-emitted for the M2 perm (same disasm), neighbors bit-exact.**
+**M3 — parts 2 + 3 proper.**
+Tune-framework migration to dasLLVM (tune macro, three modes, manifest + its two APIs);
+promote the M2 generator into the perm-parameterized family; `get_repack_type` generation;
+2–3 neighbor perms bit-exact (a laneq-equivalent perm as self-check); vreg-budget/ISA
+rejection tested; test-run mode gates everything. **Gate: generated == hand-emitted for the
+M2 perm (same disasm); neighbors bit-exact; manifest round-trip (tune → write → normal run
+stamps the winner).**
 
-**M4 — tune + per-model + fleet.**
-Perm sweep on the box (all-perms-in-one-probe à la `tune_kernels` — every perm is just a
-differently-annotated stub in one binary, so one probe run sweeps the family); per-slot ×
-per-model winners into the profile rail; `bake = k` A/B; then the fleet re-sweep
-(`emission_bench` pp512 method from session 5) to re-score the 0.73–0.86× column. Repack
-generation from the schema lands here (needed as soon as a `grp<mr>` perm wins somewhere).
-
-## Open questions (Boris)
-
-1. **Schema surface:** annotation-on-stub with reference body (recommended above — free
-   AOT/oracle gate, cross-context-correct) vs a callmacro that stamps stubs. Settle before M2.
-2. **Sweep mechanics:** all-perms-in-one-probe (one JIT compile of N stubs, tune_kernels
-   style) vs recompile-per-perm; how the perm folds into the DLL cache key (annotation-fold
-   like loop hints — automatic re-key on re-tune — vs explicit version bump discipline).
-3. **Where per-model winners live:** `box_profile.json` `models` section keyed by
-   shape-signature, or per-model sidecar next to the GGUF. (Shape-signature keying also
-   answers "same shapes, different fine-tune" for free.)
-4. **Registration locality:** generator + emitters live in dasLLVM daslib (like x64_avx) —
-   fine forever, or do we eventually want a public `register_jit_intrinsic` rail so modules
-   outside dasLLVM can contribute emitters? Not needed for M0–M4.
-5. **Hardware:** re-rent the EPYC for M2/M4, or is the Zen2 desktop (avx2/maddubs perms
-   only, no VNNI) enough to de-risk M2 before renting?
+**M4 — tune + fleet + the deletion.**
+Perm sweep on the Mac → manifest; Mac fleet re-sweep (`emission_bench` pp512 method);
+Zen2 leg (avx2/maddubs perms); wake the EPYC for the zvnni leg + Genoa fleet re-score of
+the 0.73–0.86× column. Hand-written kernel tiers get deleted only when the scoreboard says
+the generated family covers them. Repack generation lands here (needed as soon as a
+`grp<mr>` perm wins somewhere).
 
 ## Pointers
 
@@ -203,10 +225,12 @@ generation from the schema lands here (needed as soon as a `grp<mr>` perm wins s
   composition example), `x64_avx.das` / `aarch64_neon.das` (stub+emitter pattern),
   `llvm_jit_run.das` (cache key, `fold_loop_hints`, `LLVM_JIT_CODEGEN_VERSION`),
   `dasllama_math.das` (KernelBackend registry, hybrid per-slot pin),
-  `dasllama_tune.das` (`[tuned]`/`[dasllama_grid]` — the machinery being generalized).
+  `dasllama_tune.das` (`[tuned]`/`[dasllama_grid]` — the machinery being generalized),
+  linq adapters (the `require ?module` optional-require precedent).
 - Benches/probes: `harness/oracle/kernel_bench.cpp` (lcpp kernel iso),
   `benchmarks/matmul/bench_gemm_iso.das`, `harness/gemm_1core_probe.das`,
   `harness/avx_matrix_probe.das` (exactness gates), `benchmarks/emission_bench.das`
   (fleet pp512 method).
 - Evidence: `epyc9654_measurements.md` (sessions 3b–5: why portable+pin wins today, the
-  0.73–0.86× fleet column, the Genoa zmm-engine finding).
+  0.73–0.86× fleet column, the Genoa zmm-engine finding); `~/Downloads/M1_results.md`
+  (M1 baseline: prefill 0.92×, decode 0.84× median — local, not committed).
