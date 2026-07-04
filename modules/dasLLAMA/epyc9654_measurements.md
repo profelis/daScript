@@ -521,6 +521,24 @@ Standing decision fork (Boris): backend pin = portable (decode-max, campaign met
 both row-major so trivially registrable per the matrix slot-mixing design; proper rail would
 be per-slot pins in box_profile runtime (e.g. `"batch_backend"`), not a hardcoded mix.
 
+### Session 3d: the M1 cross-check — the picture is coherent across µarchs
+Same ladder-lite on the M1 Max dev box (worktree binary rebuilt, tuner re-run, defaults =
+9 workers, 1B decode): auto=arm64-laneq controls 79.7/75.5, arm64-sdot 78.0, portable-tuned
+77.8, portable-untuned 76.9 — **all inside the control bracket; decode is backend-invariant
+on M1** (bandwidth saturates; machine was in interactive use, hence the 5% control swing —
+deltas only). Tuned≈untuned on M1 (~1%): the shipped fallbacks WERE the M1 hand-tune — except
+rmsnorm, where `plain` was wrong on both platforms (M1 sweep: vec8 +89%, mirroring EPYC).
+M1 tuner's other finds: dot_mx4q8 u8 +10.3%, rope vec4_u4 +5.3%; dot_q8q8 HOLDS vec16
+(the u2 win was Zen4-specific).
+
+**The unified story:** decode = bandwidth-bound GEMV → tuned-portable ≥ hand kernels
+everywhere (equal on M1, +15% on Genoa where the intrinsic shapes were tuned for other
+µarchs); batch/prefill = compute-bound GEMM → hand/batch tiers win (laneq on M1; row-major
+acc8 suffices on Genoa, grp4 repack worthless there). The hybrid (portable GEMV slots +
+best batch slot) is x64-only in practice today — on M1 the GEMV delta is ~0, keep laneq whole.
+NB portable-GEMV + repack-batch is NOT directly composable: repack interleaves planes
+in place (see the tied-cls dual-copy precedent); the row-major hybrid avoids this entirely.
+
 ### AVX_MATRIX master switch REMOVED (Boris, post-validation)
 Correctness held on real silicon (probe + gpt-oss token-for-token, 4 backends) → the
 `DASLLAMA_AVX_MATRIX=1` env gate is redundant. Matrix tiers now register unconditionally
