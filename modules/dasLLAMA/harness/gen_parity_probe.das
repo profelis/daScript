@@ -2,12 +2,17 @@ options gen2
 options persistent_heap
 options _jit_fast_math = true   // match gemm_1core_probe / the end-to-end config
 
-// M2 bit-exact gate (gemm_generator_plan.md): the [llvm_code]-generated 4x4 tile
-// (q8q8_tile_gen) vs the hand laneq semantics (dot_q8q8_laneq4) on the same repacked
-// buffers. The generated tile mirrors the hand fold order exactly, so the comparison is EXACT
-// float equality, not a tolerance. Shapes cover the paired-block loop (nb even), the odd-block
-// tail (nb odd), and a production-ish slice. Run: daslang -jit gen_parity_probe.das
-// (--jit-dump to eyeball the generated IR — look for the "sdot" calls + "wv0".."wv7" loads)
+// M2/M4 bit-exact gate (gemm_generator_plan.md): the [llvm_code]-generated tile
+// (q8q8_tile_gen, whatever perm is stamped — fallback or manifest) vs the hand laneq
+// semantics. The oracle is computed ONCE from a grp4 copy via dot_q8q8_laneq4 — the per-block
+// fold order is layout-independent, so the same oracle serves every stamped mr (the generic
+// grp<mr> scalar dot is NOT used as a reference: full fast-math may reassociate ITS fold).
+// The working buffers go through the backend repack, which reads the q8q8_layout_gen
+// companion — so this probe exercises the production two-function coherence: manifest stamp
+// -> layout report -> grp<mr> repack -> generated tile, EXACT float equality, not a
+// tolerance. Shapes cover the paired-block loop (nb even), the odd-block tail (nb odd), and
+// a production-ish slice. Run: daslang -jit gen_parity_probe.das
+// (--jit-dump to eyeball the generated IR — look for the "sdot" calls + "wv0..." loads)
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default
@@ -18,7 +23,6 @@ require math
 
 def test_shape(n, d, ntok : int64) : bool {
     let nb = n / 32l
-    let ng = d / 4l
     var w : array<float>
     w |> resize(int(n * d))
     for (i in range64(n * d)) {
@@ -35,8 +39,6 @@ def test_shape(n, d, ntok : int64) : bool {
     for (i in range64(d * nb)) {
         s[i] = qt.scales[i]
     }
-    select_kernel_backend("arm64-laneq-gen")
-    repack_q8q8_weight(q, s, 0l, n, d)
 
     // distinct per-token activations
     var xrow : array<float>
@@ -52,31 +54,54 @@ def test_shape(n, d, ntok : int64) : bool {
         quantize_q8_0_into(xrow, n, xq, xs, tk * n, tk * nb)
     }
 
-    var ygen : array<float>
+    // the oracle: hand laneq semantics off a grp4 copy of the row-major master
     var yref : array<float>
-    ygen |> resize(int(ntok * d))
     yref |> resize(int(ntok * d))
+    var q4 := q
+    var s4 := s
     unsafe {
-        let wp = addr(q[0])
-        let sp = addr(s[0])
+        repack_q8q8_grp(addr(q4[0]), addr(s4[0]), n, d, 4l)
+        let wp = addr(q4[0])
+        let sp = addr(s4[0])
         let xqp = addr(xq[0])
         let xsp = addr(xs[0])
-        var ygp = addr(ygen[0])
         var yrp = addr(yref[0])
-        for (g in range64(ng)) {
+        for (g in range64(d / 4l)) {
             let wgp = wp + g * 4l * n
             let sgp = sp + g * 4l * nb
-            var t0 = 0l
-            while (t0 < ntok) {
-                q8q8_tile_gen(ygp, wgp, sgp, xqp, xsp, n, d, g, t0)
-                t0 += 4l
-            }
             for (tk in range64(ntok)) {
                 let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * nb, n)
                 yrp[tk * d + g * 4l + 0l] = f.x
                 yrp[tk * d + g * 4l + 1l] = f.y
                 yrp[tk * d + g * 4l + 2l] = f.z
                 yrp[tk * d + g * 4l + 3l] = f.w
+            }
+        }
+    }
+    delete q4
+    delete s4
+
+    // the working buffers: the backend repack — grp<mr> per the layout companion
+    select_kernel_backend("arm64-laneq-gen")
+    repack_q8q8_weight(q, s, 0l, n, d)
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+
+    var ygen : array<float>
+    ygen |> resize(int(ntok * d))
+    unsafe {
+        let wp = addr(q[0])
+        let sp = addr(s[0])
+        let xqp = addr(xq[0])
+        let xsp = addr(xs[0])
+        var ygp = addr(ygen[0])
+        for (g in range64(ng)) {
+            let wgp = wp + g * mr * n
+            let sgp = sp + g * mr * nb
+            var t0 = 0l
+            while (t0 < ntok) {
+                q8q8_tile_gen(ygp, wgp, sgp, xqp, xsp, n, d, g, t0)
+                t0 += 4l
             }
         }
     }
@@ -89,7 +114,7 @@ def test_shape(n, d, ntok : int64) : bool {
         md = max(md, abs(ygen[i] - yref[i]))
     }
     let ok = exact == length(ygen)
-    print("n={n} d={d} ntok={ntok}: {exact}/{length(ygen)} exact, maxdiff {md} — {ok ? "OK" : "MISMATCH"}\n")
+    print("n={n} d={d} ntok={ntok} mr={mr}: {exact}/{length(ygen)} exact, maxdiff {md} — {ok ? "OK" : "MISMATCH"}\n")
     return ok
 }
 

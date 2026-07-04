@@ -376,6 +376,76 @@ daslang with `DAS_TUNE_MODE=test` and asserts every grid row's runtime value (5/
 stays untouched and shipped this milestone), `grp<mr≠4>` repack generation + the two-function
 stamp, per-regime/per-slot perms, Zen2/EPYC legs.
 
+## M4 slice A (2026-07-04, M1 Max) — the two-function stamp + grp<mr> unlock
+
+**Framework: `[tune_companion(fn=, gen=)]`** rows in a `[tune]` bracket (after the perm rows,
+before `tune(...)` — the perm bank doubles as the order guard) stamp sibling functions with
+the SAME perm from the same manifest entry, in all three modes: normal stamps the winner onto
+main + companions; grid modes clone `<companion>__<suffix>` per perm and emit a
+`<companion>_variants()` registry; the `[tune_manifest]` re-stamp reaches companions too. One
+manifest entry = one perm decision across N functions — manifest-level desync is impossible,
+and JIT-time decline coherence comes from the dasllama side sharing ONE decline predicate
+between the generators. Selftest generator `llvm_code_selftest::k_value` (emits `return k`
+for a `() : int` companion, honors the decline rail); jit_tests assert companion-follows-stamp
+on the normal/grid/manifest rails; cant_tune_bad_grids pins 6 new validation branches.
+
+**dasLLAMA: mr is a live axis.** The tile generator is generalized over row quads (rq = mr/4:
+weight vectors 2·mr per block at `kg·4·mr + qd·16`, accumulators token×quad, per-quad scale
+loads/folds/stores; mr=4 emission is instruction-identical to M2 by construction). The layout
+companion `q8q8_layout_gen() : int` (generator emits `ret i32 mr`, reference body returns
+grp4's 4) is what the runtime asks: the backend repack slot, the batch traversal strides, and
+the mm/group3 slot choice at [init] all read it — `repack_q8q8_grp(mr)` is the one
+mr-parameterized executor (byte-identical to repack_q8q8_neon at 4), and mr≠4 token tails /
+GEMV / group3 fall to a generic scalar grp<mr> dot (same fold order — the GEMV perm
+sub-family stays future work). Grid now: kstep 1|2|4 × nrsplit 4|2 at mr4, kstep 1|2|4 at
+nrsplit2+mr8, plus three decline rows (`mr8_budget` = 34 q-regs at nrsplit4, `mr2_lanes` =
+mr%4, `dot_vpdpbusd`). Probes are per-variant: the layout variants registry gives each tile
+variant its mr, the tune/parity probes repack a fresh copy of the row-major master per
+variant, and the oracle is computed ONCE from a grp4 copy (fold order is layout-independent).
+
+**The FMF lesson (load-bearing).** First test run: mr8 × kstep1/kstep4 mismatched by last-ulp
+while kstep2 was exact — the AArch64 machine combiner had regrouped the fold's
+`(af·s4)·qs` into `af·(s4·qs)` in those loop shapes, licensed by the blanket `fast` flags
+(`_jit_fast_math` stamps 0x7f on every FP instruction pre-opt). Fix in two halves:
+`apply_fast_math_to_module` now fills ONLY instructions with unset flags (authored FMF wins),
+and the generator authors `0x7e` (contract kept, reassoc cleared) on the fold's fmul/fadd —
+the fold order is the exactness contract, so it lives in the IR flags, not in optimizer luck.
+fmla fusion is untouched (contract), and the shipped kstep2 machine code is bit-identical
+before/after (289/289 disasm gate below).
+
+**Gates, all green:**
+- *Grid test mode:* 13/13 rows bit-exact vs the hand-laneq oracle (incl. all three mr8 rows on
+  their own grp8 repack, and the three decline rows on grp4 — the lockstep rail proven by the
+  layout variants reporting 4 for declined perms).
+- *Disasm invariance:* normal-mode kstep2 (the M2 perm) — 289/289 instructions identical to
+  the pre-slice generator (only absolute DLL base addresses differ).
+- *mr8 structure:* kstep2_nrsplit2_mr8 = 192 sdot / 0 dup (2 slices × 3 blocks × 32), all 24
+  folds fmul+fmla-fused; kstep1_nrsplit2_mr8 = 64 sdot / 0 dup — genuinely distinct shapes.
+- *Parity probe:* bit-exact on all three shapes under BOTH the fallback (mr4) and a manifest
+  mr8 stamp — the production two-function round-trip (manifest → layout report → grp8 backend
+  repack → generated tile). The oracle is always a grp4-copy laneq4 pass: the fold order is
+  layout-independent, and the generic scalar dot must NOT be an oracle — full fast-math may
+  reassociate ITS fold (first probe draft tripped exactly that, maxdiff ~5e-7). Corollary
+  worth remembering: mr≠4 token tails / generic GEMV are correct but not bit-stable vs the
+  vector tiers under fast-math — the exactness gates pin the TILE, which does the bulk.
+- `LLVM_JIT_CODEGEN_VERSION` 0x37 → 0x38 (generator emission changed for fixed args).
+
+## M4 slice B (2026-07-04, M1 Max) — the sweep: a perm the hand tier never had wins
+
+`DAS_TUNE_MODE=tune` gen_tune_probe, kv-shape iso (2048×512×64, interleaved best-of-6,
+GMAC/s): **kstep2_nrsplit2_mr8 wins at 135.0** — kstep4_nrsplit2_mr8 133.4 > kstep2 132.4
+(the hand-tier-equivalent M2 perm) > kstep4 131.6 > kstep1 124.5 > kstep4_nrsplit2 120.1 >
+kstep2_nrsplit2 119.2 > kstep1_nrsplit2 116.9 > kstep1_nrsplit2_mr8 115.9 > declined/reference
+~85. The 8-row × 2-slice tile (16 weight vectors per block, 26 q-regs) did not exist in the
+hand tier — the generator+sweep found a shape hand-writing never tried, worth ~+2% over the
+shipped hand kernel on this box. Manifest round-trip green (winner written via
+tune_manifest_set → normal run stamps tile+layout from it → parity exact on grp8).
+
+**Still open in M4:** fleet re-sweep with the mr8 winner (slice C — needs the gen backend
+reachable from app runs: pin rail or require-chain decision), loop-hint manifest kind,
+per-regime/per-slot perms (GEMV sub-family unlocks deleting the hand mm tiers), Zen2/EPYC
+legs, hand-tier deletion.
+
 ## Pointers
 
 - Rails: `modules/dasLLVM/daslib/llvm_jit_intrin.das` (emitter tables + `build_vector_expf`

@@ -22,7 +22,8 @@ def q8q8_repack_type(mr : int) : Q8RepackType {
     return Q8RepackType(interleave = mr, f32_scales = true)
 }
 
-//! The mr the shipped repack executor implements (repack_q8q8_neon = the
-//! q8q8_repack_type(4) layout). Tile perms with any other mr decline until repack
-//! generation lands (M4) — the reference stub's semantics fix the layout to this one.
-let GEMM_GEN_MR = 4
+//! The mr of the REFERENCE tier's layout (repack_q8q8_neon = the q8q8_repack_type(4)
+//! layout the reference stub bodies read). Non-reference mr runs on the generated pair:
+//! the tile generator emits the grp<mr> kernel and the layout companion reports mr to the
+//! runtime repack — stamped from one manifest entry, declining in lockstep (M4).
+let GEMM_REFERENCE_MR = 4

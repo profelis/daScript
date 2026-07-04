@@ -2,14 +2,17 @@ options gen2
 options persistent_heap
 options _jit_fast_math = true   // match gemm_1core_probe / the end-to-end config
 
-// M3 grid gates (gemm_generator_plan.md): run with DAS_TUNE_MODE=test or =tune, -jit.
+// M3/M4 grid gates (gemm_generator_plan.md): run with DAS_TUNE_MODE=test or =tune, -jit.
+// Layout is per-variant: each tile variant's mr comes off its q8q8_layout_gen__<suffix>
+// companion (declined perms report the reference grp4 — the lockstep rail), and the probe
+// repacks a fresh copy of the row-major master into that variant's grp<mr> before running it.
 //   test: every [tune_perm] variant of q8q8_tile_gen (dasllama_math_gen) must be bit-exact vs
-//         the hand laneq semantics on nb-even, nb-odd and a production-ish slice. Declining
-//         perms (mr8_budget / mr2_layout / dot_vpdpbusd) run the reference body — also exact,
-//         which pins the rejection rail.
-//   tune: iso-bench every variant (interleaved best-of), print the table, and
-//         tune_manifest_set the winner — a following normal run stamps it (the round-trip;
-//         point DAS_TUNE_MANIFEST somewhere writable first).
+//         the hand laneq semantics (computed once, from a grp4 copy — the fold order is
+//         layout-independent) on nb-even, nb-odd and a production-ish slice. Declining perms
+//         (mr8_budget / mr2_lanes / dot_vpdpbusd) run the reference body — also exact.
+//   tune: iso-bench every variant (interleaved best-of) on its own repacked buffers, print
+//         the table, and tune_manifest_set the winner — a following normal run stamps it
+//         (the round-trip; point DAS_TUNE_MANIFEST somewhere writable first).
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default
@@ -22,8 +25,8 @@ require math
 let ROUNDS = 6
 
 struct Fixture {
-    n, d, ntok, nb, ng : int64
-    q : array<int8>
+    n, d, ntok, nb : int64
+    q : array<int8>       // row-major master — repacked per variant into a copy
     s : array<float>
     xq : array<int8>
     xs : array<float>
@@ -31,7 +34,7 @@ struct Fixture {
 }
 
 def build_fixture(n, d, ntok : int64) : Fixture {
-    var fx = Fixture(n = n, d = d, ntok = ntok, nb = n / 32l, ng = d / 4l)
+    var fx = Fixture(n = n, d = d, ntok = ntok, nb = n / 32l)
     var w : array<float>
     w |> resize(int(n * d))
     for (i in range64(n * d)) {
@@ -46,7 +49,6 @@ def build_fixture(n, d, ntok : int64) : Fixture {
     for (i in range64(d * fx.nb)) {
         fx.s[i] = qt.scales[i]
     }
-    repack_q8q8_weight(fx.q, fx.s, 0l, n, d)
 
     var xrow : array<float>
     xrow |> resize(int(n))
@@ -59,15 +61,19 @@ def build_fixture(n, d, ntok : int64) : Fixture {
         quantize_q8_0_into(xrow, n, fx.xq, fx.xs, tk * n, tk * fx.nb)
     }
 
-    // the oracle: hand laneq semantics, same fold order as the generated tile
+    // the oracle: hand laneq semantics off a grp4 copy — the per-block fold order is the same
+    // in every variant, so one oracle serves all layouts
     fx.yref |> resize(int(ntok * d))
+    var q4 := fx.q
+    var s4 := fx.s
     unsafe {
-        let wp = addr(fx.q[0])
-        let sp = addr(fx.s[0])
+        repack_q8q8_grp(addr(q4[0]), addr(s4[0]), n, d, 4l)
+        let wp = addr(q4[0])
+        let sp = addr(s4[0])
         let xqp = addr(fx.xq[0])
         let xsp = addr(fx.xs[0])
         var yrp = addr(fx.yref[0])
-        for (g in range64(fx.ng)) {
+        for (g in range64(d / 4l)) {
             let wgp = wp + g * 4l * n
             let sgp = sp + g * 4l * fx.nb
             for (tk in range64(ntok)) {
@@ -79,20 +85,36 @@ def build_fixture(n, d, ntok : int64) : Fixture {
             }
         }
     }
+    delete q4
+    delete s4
     return <- fx
 }
 
-// one full tile sweep: every group x every 4-token block through `tile`
-def run_tile(tile; fx : Fixture; var y : array<float>) {
+// suffix -> repack interleave, off the layout companion's variants registry (lockstep with
+// the tile variants by construction — same suffixes, same decline predicate)
+def variant_mrs() : table<string; int> {
+    var mrs : table<string; int>
+    var lvs <- q8q8_layout_gen_variants()
+    for (v in lvs) {
+        mrs[v._0] = invoke(v._1)
+    }
+    delete lvs
+    return <- mrs
+}
+
+// one full tile sweep: every group x every 4-token block through `tile`, on the variant's
+// own repacked buffers (q/s), walking mr-row groups
+def run_tile(tile; fx : Fixture; q : array<int8>; s : array<float>; mr : int64; var y : array<float>) {
+    let ng = fx.d / mr
     unsafe {
-        let wp = addr(fx.q[0])
-        let sp = addr(fx.s[0])
+        let wp = addr(q[0])
+        let sp = addr(s[0])
         let xqp = addr(fx.xq[0])
         let xsp = addr(fx.xs[0])
         var yp = addr(y[0])
-        for (g in range64(fx.ng)) {
-            let wgp = wp + g * 4l * fx.n
-            let sgp = sp + g * 4l * fx.nb
+        for (g in range64(ng)) {
+            let wgp = wp + g * mr * fx.n
+            let sgp = sp + g * mr * fx.nb
             var t0 = 0l
             while (t0 < fx.ntok) {
                 invoke(tile, yp, wgp, sgp, xqp, xsp, fx.n, fx.d, g, t0)
@@ -110,31 +132,71 @@ def exact_vs_ref(fx : Fixture; y : array<float>) : bool {
 }
 
 def test_mode : bool {
-    // nb=2 (even main loop), nb=3 (remainder path), production-ish slice
+    // nb=2 (even main loop), nb=3 (remainder path), production-ish slice — d divides every
+    // grid mr (4 and 8)
     var fxs <- [ <- build_fixture(64l, 8l, 4l), <- build_fixture(96l, 8l, 4l), <- build_fixture(2048l, 64l, 8l)]
     var vs <- q8q8_tile_gen_variants()
+    var mrs <- variant_mrs()
     var allok = true
     for (v in vs) {
+        let mr = int64(mrs?[v._0] ?? 4)
         var ok = true
         for (fx in fxs) {
+            var qv := fx.q
+            var sv := fx.s
+            unsafe {
+                repack_q8q8_grp(addr(qv[0]), addr(sv[0]), fx.n, fx.d, mr)
+            }
             var y : array<float>
             y |> resize(int(fx.ntok * fx.d))
-            run_tile(v._1, fx, y)
-            ok = ok && exact_vs_ref(fx, y)
+            run_tile(v._1, fx, qv, sv, mr, y)
+            let fxok = exact_vs_ref(fx, y)
+            if (!fxok) {   // DEBUG
+                var shown = 0
+                for (i in range(length(y))) {
+                    if (y[i] != fx.yref[i] && shown < 6) {
+                        print("  DBG {v._0} n={fx.n}: y[{i}] (tok {i / int(fx.d)} col {i % int(fx.d)}) = {y[i]} want {fx.yref[i]}\n")
+                        shown++
+                    }
+                }
+            }
+            ok = ok && fxok
             delete y
+            delete qv
+            delete sv
         }
-        print("{v._0}: {ok ? "bit-exact" : "MISMATCH"}\n")
+        print("{v._0} (mr={mr}): {ok ? "bit-exact" : "MISMATCH"}\n")
         allok = allok && ok
     }
+    delete mrs
     delete vs
     delete fxs
     return allok
 }
 
+struct VBuf {
+    q : array<int8>
+    s : array<float>
+}
+
 def tune_mode_run : bool {
     var fx <- build_fixture(2048l, 512l, 64l)
     var vs <- q8q8_tile_gen_variants()
+    var mrs <- variant_mrs()
     let nv = length(vs)
+    // per-variant repacked buffers, built once outside the timing loop
+    var bufs : array<VBuf>
+    bufs |> resize(nv)
+    var vmr : array<int64>
+    vmr |> resize(nv)
+    for (vi in range(nv)) {
+        vmr[vi] = int64(mrs?[vs[vi]._0] ?? 4)
+        bufs[vi].q := fx.q
+        bufs[vi].s := fx.s
+        unsafe {
+            repack_q8q8_grp(addr(bufs[vi].q[0]), addr(bufs[vi].s[0]), fx.n, fx.d, vmr[vi])
+        }
+    }
     var best : array<double>
     best |> resize(nv)
     for (i in range(nv)) {
@@ -143,17 +205,17 @@ def tune_mode_run : bool {
     var y : array<float>
     y |> resize(int(fx.ntok * fx.d))
     // correctness first — a tune run must never crown a broken variant
-    for (v in vs) {
-        run_tile(v._1, fx, y)
+    for (vi in range(nv)) {
+        run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], y)
         if (!exact_vs_ref(fx, y)) {
-            print("{v._0}: MISMATCH — aborting tune\n")
+            print("{vs[vi]._0}: MISMATCH — aborting tune\n")
             return false
         }
     }
     for (_r in range(ROUNDS)) {   // interleaved best-of: variant order inside each round
         for (vi in range(nv)) {
             let t0 = ref_time_ticks()
-            run_tile(vs[vi]._1, fx, y)
+            run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], y)
             let us = double(get_time_usec(t0))
             if (us < best[vi]) {
                 best[vi] = us
@@ -166,11 +228,15 @@ def tune_mode_run : bool {
         if (best[vi] < best[winner]) {
             winner = vi
         }
-        print("{vs[vi]._0}: {macs / best[vi] / 1000.0lf} GMAC/s (best of {ROUNDS})\n")
+        print("{vs[vi]._0} (mr={vmr[vi]}): {macs / best[vi] / 1000.0lf} GMAC/s (best of {ROUNDS})\n")
     }
     let ok = tune_manifest_set("q8q8_tile_gen", vs[winner]._0)
     print("winner: {vs[winner]._0} {ok ? "->" : "-> FAILED TO WRITE"} {tune_manifest_path()}\n")
     delete y
+    delete bufs
+    delete vmr
+    delete best
+    delete mrs
     delete vs
     delete fx
     return ok
