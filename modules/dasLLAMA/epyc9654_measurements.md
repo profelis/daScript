@@ -576,6 +576,16 @@ on capable hardware.
 - [ ] **ISA-yield ladder** (portable→avx2→vnni256→avx512bw→avx512vnni, pin-interleaved) with the
       target metric GB/s per decoded token at T=24 (113 now, lcpp 164) — THE open perf lever.
 
+### DAS_JOBQUE_THREADS semantics — the off-by-one Boris caught (session 3e)
+`DAS_JOBQUE_THREADS=N` spawns **N WORKERS**; the caller computes too ⇒ **N+1 execution lanes**
+(job_que.cpp:85 raw override; getTotalHwJobs()==worker count; get_dispatch_lanes()=workers+1).
+Only the DEFAULT path is total-lane-shaped (cores−1 workers + caller = cores). ggml `-t N` = N
+TOTAL threads. So every "T=24" compare above ran ours on 25 lanes vs lcpp's 24. Re-measured
+fair: 23w+caller (24 lanes) = **100.6** vs 24w+caller (25 lanes) = 95.5, same bracket — knee is
+bandwidth-bound, the extra lane is worthless; the 75%-of-lcpp headline HOLDS at true parity.
+**RULE: fair vs `llama-bench -t N` = `DAS_JOBQUE_THREADS=N−1`.** (Env semantics left as-is —
+too much measurement history keyed to it; flag if we ever want env = total lanes.)
+
 ## Campaign method reminders
 - Correctness before speed; real-model tests = **small model, one run at a time** (the oracle
   path in `gptoss_parity_probe` is deliberately un-vectorized → slow; not a perf tool).
