@@ -500,15 +500,14 @@ def main {
         print("run with -jit — the generator only fires under the LLVM JIT\n")
         return
     }
-    var found = false
+    // select the gen backend where it exists (arm64) — test/tune drive the variant
+    // registries directly, so an x64 box runs fine with no gen backend registered
+    // (slice F: the x64 grid rows light per cpuid; x64-gen registration is queued)
     for (nm in kernel_backend_names()) {
-        found ||= nm == "arm64-gen"
+        if (nm == "arm64-gen") {
+            select_kernel_backend("arm64-gen")
+        }
     }
-    if (!found) {
-        print("arm64-gen not registered (non-arm64 host?) — nothing to test\n")
-        return
-    }
-    select_kernel_backend("arm64-gen")
     let mode = tune_mode()
     if (mode == "test") {
         print(test_mode() ? "GEN TUNE TEST OK\n" : "GEN TUNE TEST FAIL\n")
