@@ -261,6 +261,33 @@ x64 per-ISA dot emitters were already mandatory (no generic form selects a dot).
 no dot emitter = generator declines = reference body — the decline path IS the fallback tier.
 This validates the perm vector: `dot` is the only per-ISA knob; everything else is generic IR.
 
+## M2 result (2026-07-04, M1 Max) — GO
+
+The hand-composed perm shipped as `[llvm_code]` end to end: `dasllama/dasllama_gemm_gen.das`
+(the generator — emits the laneq 4×4 tile as IR: byte-GEP loads, phi loop with kstep=2 paired
+blocks + odd-block tail, indexed sdot via intrinsic+shuffle, f32-scale block fold, v4f32
+stores; runs in the llvm-jit context, wired via `llvm_user_modules.das`),
+`dasllama/dasllama_math_gen.das` (the `[llvm_code]` stub — reference body = 4 single-token
+laneq4 dots — plus the `arm64-laneq-gen` backend: arm64-laneq with only the batch tile
+swapped), `harness/gen_parity_probe.das` (the exactness gate).
+
+- **Bit-exact:** maxdiff **0** vs the hand laneq semantics on nb-even, nb-odd (tail path) and
+  a production slice — identical fold order ⇒ identical bits, not a tolerance pass.
+- **Machine code:** 96 sdot / **0 dup** in the tile loop — the indexed-sdot fold held in
+  production; firing proven by the generator's named blocks in `--jit-dump`.
+- **Iso (gemm_1core_probe, interleaved best-of-6, GMAC/s):** generated vs hand laneq batch —
+  kv 130.4 vs 131.2 (−0.6%), qo **129.4 vs 126.8 (+2.1%)**, w13 **129.9 vs 128.8 (+0.9%)**,
+  w2 **133.7 vs 131.7 (+1.5%)**. Matches-or-beats on all four shapes; all above lcpp's
+  118–122. Gate ("beat or match laneq on ≥1 shape") passed with margin — **M3 is a go.**
+
+Notes for M3: the impl inlines into its public wrapper (and the batch worker) for free; the
+das-side const model wants IR-handle helper params spelled `var` (`LLVMOpaqueValue?` non-var
+constifies the whole value chain — llvm_boost's `*Aligned` wrappers were fixed to return
+non-const for the same reason); LLVM's verifier enforces phi-grouping in merge blocks —
+create all phis before any other instruction. The `llvm_user_modules.das` dasllama require is
+branch-local wiring (dasLLVM-without-dasLLAMA builds need the planned `require ?` gate before
+this can merge).
+
 ## Pointers
 
 - Rails: `modules/dasLLVM/daslib/llvm_jit_intrin.das` (emitter tables + `build_vector_expf`
