@@ -27,8 +27,8 @@ enum public SqlPkReport {
 }
 
 bitfield public SqlProviderCaps {
-    //! Feature gates consulted by the macros; a missing capability is a
-    //! compile-time `macro_error` naming the provider and the feature.
+    //! Feature gates for the macros' capability checks (wired as providers land);
+    //! a missing capability is a compile-time `macro_error` naming the provider.
     fts5
     client_udfs
     returning

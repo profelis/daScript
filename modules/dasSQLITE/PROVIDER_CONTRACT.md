@@ -4,7 +4,8 @@ What a database provider implements to plug into the `_sql` LINQ-to-SQL machiner
 (`sqlite_linq.das`, migrating to `daslib/sql_linq` in a follow-up). SQLite
 (`sqlite_boost.das`) is the reference implementation; DuckDB and PostgreSQL are the
 planned consumers. This document is the contract; the registry in
-`daslib/sql_provider.das` is its executable form.
+`modules/dasSQLITE/daslib/sql_provider.das` (required as `sqlite/sql_provider`;
+moves to root `daslib/` with the sql_linq promotion) is its executable form.
 
 ## Architecture in one paragraph
 
@@ -55,14 +56,15 @@ overload-resolve against whichever provider's stmt type instantiated them.
 
 ### 3. Registry entry (compile-time)
 
-Registered in `daslib/sql_provider.das` (the provider's registration code must be
-in the `require` closure of the macro module — consumer-requires-contributor; see
-skills/das_macros.md "Macro modules each compile into their own context"):
+Registered via `sqlite/sql_provider`'s `register_sql_provider` (the provider's
+registration code must be in the `require` closure of the macro module —
+consumer-requires-contributor; see skills/das_macros.md "Macro modules each
+compile into their own context"):
 
 | Field | SQLite value | Consulted by |
 |---|---|---|
 | `name` | `"sqlite"` | diagnostics |
-| `runnerTypeName` | `SqlRunner` (qualified) | registry lookup from `q.dbExpr._type` |
+| `runnerModule` + `runnerStruct` | `"sqlite_boost"` + `"SqlRunner"` | registry lookup key, matched against `q.dbExpr._type`'s struct + owning module |
 | `makeStmtType` | `qmacro_type(type<sqlite3_stmt?>)` | bind-block parameter splices (mutable flavor) |
 | `makeStmtTypeConst` | `qmacro_type(type<sqlite3_stmt? const>)` | row-reader block/lambda parameter splices — qualifiers are spelled in the type expression; `$t` substitution replaces the placeholder type wholesale, so the parser's const-append on non-`var` params does not apply to spliced types |
 | `renderPlaceholder(ordinal)` | `"?"` | `fold_to_builder` — the single render point for bind frags (`?` inside `build_sql_string` output is internal IR that `sql_to_frags` re-splits). Ordinal is 1-based among macro-enumerated binds; upsert row-binds are emitted as literal `?` text (bound by the generated `_sql_bind_row`, not enumerated), so a numbered-placeholder provider must also handle row-binder placeholders at port time |
@@ -73,14 +75,17 @@ skills/das_macros.md "Macro modules each compile into their own context"):
 | `identityDdl` | `PRIMARY KEY` (INTEGER PK aliases rowid) | registered, NOT yet routed — same story as `sqlTypeFor` |
 | capability flags | see below | macro_error gates |
 
-### 4. Capability flags
+### 4. Capability flags — `SqlProviderCaps` bitfield + `pkReport`
 
-| Flag | SQLite | Gate |
+| Field | SQLite | Gate |
 |---|---|---|
-| `has_fts5` | yes | `[sql_fts5]` / `text_match` → compile error when absent |
-| `has_client_udfs` | yes | `[sql_function]` → compile error when absent (PG has no client-side UDFs) |
-| `returning_style` | `RETURNING` | `_sql_*_returning` |
-| `insert_pk_report` | `last_insert_rowid` | `insert(...) : id` — RETURNING-pk contract for providers without rowid |
+| `caps.fts5` | set | `[sql_fts5]` / `text_match` → compile error when absent |
+| `caps.client_udfs` | set | `[sql_function]` → compile error when absent (PG has no client-side UDFs) |
+| `caps.returning` | set | `_sql_*_returning` |
+| `pkReport : SqlPkReport` | `LastInsertRowid` | `insert(...) : id` — `ReturningPk` for providers without rowid |
+
+The gates wire up as the second provider lands; in this PR the flags are
+registered data only.
 
 A missing capability is a **compile-time** `macro_error` naming the provider and the
 feature — never a runtime failure.
