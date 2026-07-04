@@ -219,6 +219,48 @@ the 0.73–0.86× column. Hand-written kernel tiers get deleted only when the sc
 the generated family covers them. Repack generation lands here (needed as soon as a
 `grp<mr>` perm wins somewhere).
 
+## M0/M1 results (2026-07-04, M1 Max, LLVM 22.1.5)
+
+**M0 ceiling table** — single-thread, best-of-6, ntok=128, GMAC/s. lcpp = `kernel_bench`
+(direct `ggml_gemm_q8_0_4x4_q8_0` / `ggml_gemv_q8_0_4x4_q8_0` calls, repacked, dotprod tier —
+what the repack traits select on M1); ours = `gemm_1core_probe` (now platform-aware: enumerates
+registered backends, per-backend repack copies, gemv column).
+
+| shape | lcpp gemm 4x4 | **ours laneq batch** | ratio | lcpp gemv | ours laneq gemv |
+|---|---|---|---|---|---|
+| kv 2048×512 | 122.4 | **131.0** | 1.07× | 65.1 | 62.5 |
+| qo 2048×2048 | 120.8 | **128.1** | 1.06× | 64.2 | 61.2 |
+| w13 2048×5632 | 118.3 | **128.9** | 1.09× | 55.9 | 53.3 |
+| w2 5632×2048 | 119.1 | **132.2** | 1.11× | 56.1 | 53.4 |
+
+**Our hand laneq tier already beats lcpp's arm repack GEMM kernel-to-kernel on every shape.**
+Disasm (their dylib vs our cached JIT DLL): identical 32-sdot lane-indexed core + 16 q-reg
+loads per 32-k block on both sides; our edge = f32 scales pre-converted at repack (no
+per-block `fcvtl`, one `ldp q` per 2 blocks), token-scale folded into lane-indexed `fmla`,
+u2 block unroll. Their traversal re-streams weights ntok/4 times (4-token groups outer);
+ours streams weights once per token-block (TB=128). row-major vec_dot 37 / portable 33 /
+row-major sdot4x4 44 — repack tier ≈ 3× row-major on both engines. **M2 bar: ≥ ~130 GMAC/s.**
+
+**M1 platform-independent-reduce experiment** (`harness/oracle/reduce_experiment.ll`,
+`opt -O3 | llc -mcpu=apple-m1`, same LLVM 22.1.5 the JIT pins):
+
+| generic IR form | arm64 | x64 znver4 |
+|---|---|---|
+| `vecreduce.add(mul(sext,sext))` → scalar | `sdot` + `addv` ✓ | `vpmovsxbw`+`vpmaddwd`+hadd (sane, no VNNI) |
+| `partial.reduce.add(v4i32, mul(sext,sext))` | **single `sdot`** ✓ | zmm widening + `vpmulld` + extracts — garbage |
+| lane-splat shuffle + partial.reduce | `dup` + plain sdot (lane NOT folded) | — |
+| full block loop, generic IR only | tight hand-shaped loop, 8 dup + 8 sdot, zero spills ✓ | — |
+| `@llvm.aarch64.neon.sdot` + shuffle | **indexed `sdot v,v,v[lane]`, zero dups** | n/a |
+
+**Design conclusion:** the generator emits platform-independent IR for everything structural
+(loop nest, interleaved loads, accumulators, scale folds, epilogues — all proven to lower
+hand-shaped on arm64), and keeps a per-ISA emitter ONLY for the dot primitive — on arm64 a
+~3-op emitter (`shufflevector` + `aarch64.neon.sdot`) that buys the indexed form (generic
+partial.reduce leaves one `dup` per sdot: +100% vector µops on the 4×4 tile's dot core); on
+x64 per-ISA dot emitters were already mandatory (no generic form selects a dot). An ISA with
+no dot emitter = generator declines = reference body — the decline path IS the fallback tier.
+This validates the perm vector: `dot` is the only per-ISA knob; everything else is generic IR.
+
 ## Pointers
 
 - Rails: `modules/dasLLVM/daslib/llvm_jit_intrin.das` (emitter tables + `build_vector_expf`

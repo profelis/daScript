@@ -12,6 +12,7 @@ options _jit_fast_math = true   // match the end-to-end config AND ggml's -O3 FP
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default
 require dasllama/dasllama_math_x64_avx
+require dasllama/dasllama_math_aarch64_neon
 require dasllama/dasllama_quant
 require daslib/jobque_boost
 require daslib/fio
@@ -57,12 +58,6 @@ def bench_shape(name : string; n, d : int64; reps : int) {
     for (i in range64(d * nb)) {
         s[i] = qt.scales[i]
     }
-    // separate weight copy for the repack tier (repacks in place)
-    var qr := q
-    var sr := s
-    select_kernel_backend("x64-avx2-repack")
-    repack_q8q8_weight(qr, sr, 0l, n, d)
-
     var x : array<float>
     fillf(x, n)
     var xq : array<int8>
@@ -83,11 +78,33 @@ def bench_shape(name : string; n, d : int64; reps : int) {
         }
     }
 
-    let cands <- [Cand(name = "portable", repacked = false),
-        Cand(name = "x64-avx2", repacked = false),
-        Cand(name = "x64-avx2-acc8", repacked = false),
-        Cand(name = "x64-avx2-repack", repacked = true)]
+    // every backend registered on THIS host (x64 and arm64 tiers register platform-gated),
+    // portable first (it is the correctness reference below)
+    var names <- kernel_backend_names()
+    names |> sort()
+    var cands : array<Cand>
+    cands |> push(Cand(name = "portable", repacked = false))
+    for (nm in names) {
+        if (nm != "portable") {
+            cands |> push(Cand(name = nm, repacked = kernel_backend_needs_repack(nm)))
+        }
+    }
     let nc = length(cands)
+
+    // per-backend repacked weight copies (repack layouts differ across backends; repack is in place
+    // under the SELECTED backend's repack fn)
+    var qr : array<array<int8>>
+    var sr : array<array<float>>
+    qr |> resize(nc)
+    sr |> resize(nc)
+    for (ci in range(nc)) {
+        if (cands[ci].repacked) {
+            qr[ci] := q
+            sr[ci] := s
+            select_kernel_backend(cands[ci].name)
+            repack_q8q8_weight(qr[ci], sr[ci], 0l, n, d)
+        }
+    }
 
     var y : array<float>
     var yref : array<float>
@@ -102,7 +119,7 @@ def bench_shape(name : string; n, d : int64; reps : int) {
     for (ci in range(nc)) {
         select_kernel_backend(cands[ci].name)
         if (cands[ci].repacked) {
-            matmul_q8q8_batch(y, qr, sr, xqb, xsb, n, d, NTOK)
+            matmul_q8q8_batch(y, qr[ci], sr[ci], xqb, xsb, n, d, NTOK)
         } else {
             matmul_q8q8_batch(y, q, s, xqb, xsb, n, d, NTOK)
         }
@@ -113,10 +130,14 @@ def bench_shape(name : string; n, d : int64; reps : int) {
         }
     }
 
+    let gemv_reps = reps * int(NTOK) / 4
     var best : array<double>
+    var bestv : array<double>
     best |> resize(nc)
+    bestv |> resize(nc)
     for (ci in range(nc)) {
         best[ci] = 1.0e30lf
+        bestv[ci] = 1.0e30lf
     }
     for (_round in range(ROUNDS)) {
         for (ci in range(nc)) {
@@ -127,7 +148,7 @@ def bench_shape(name : string; n, d : int64; reps : int) {
             let t0 = ref_time_ticks()
             for (_rep in range(reps)) {
                 if (cands[ci].repacked) {
-                    matmul_q8q8_batch(y, qr, sr, xqb, xsb, n, d, NTOK)
+                    matmul_q8q8_batch(y, qr[ci], sr[ci], xqb, xsb, n, d, NTOK)
                 } else {
                     matmul_q8q8_batch(y, q, s, xqb, xsb, n, d, NTOK)
                 }
@@ -136,17 +157,31 @@ def bench_shape(name : string; n, d : int64; reps : int) {
             if (us < best[ci]) {
                 best[ci] = us
             }
+            let t1 = ref_time_ticks()
+            for (_rep in range(gemv_reps)) {
+                if (cands[ci].repacked) {
+                    matmul_q8q8(y, qr[ci], sr[ci], xq, xs, n, d)
+                } else {
+                    matmul_q8q8(y, q, s, xq, xs, n, d)
+                }
+            }
+            let usv = double(get_time_usec(t1))
+            if (usv < bestv[ci]) {
+                bestv[ci] = usv
+            }
         }
     }
 
     print("--- {name}  (n={n} d={d} ntok={NTOK}, x{reps}) ---\n")
     let macs = double(n * d * NTOK) * double(reps)
+    let macsv = double(n * d) * double(gemv_reps)
     for (ci in range(nc)) {
         if (!ok[ci]) {
             continue
         }
         let gmacs = macs / (best[ci] * 1000.0lf)
-        print("  {cands[ci].name}: {gmacs} GMAC/s  ({best[ci]} us best-of-{ROUNDS})\n")
+        let gmacsv = macsv / (bestv[ci] * 1000.0lf)
+        print("  {cands[ci].name}: batch {gmacs} GMAC/s  ({best[ci]} us best-of-{ROUNDS})   gemv {gmacsv} GMAC/s  ({bestv[ci]} us, x{gemv_reps})\n")
     }
 
     delete w
@@ -187,7 +222,7 @@ def focus_bench(be : string; shape : string; n, d, ntok : int64; forked : bool) 
         s[i] = qt.scales[i]
     }
     select_kernel_backend(be)
-    if (be == "x64-avx2-repack") {
+    if (kernel_backend_needs_repack(be)) {
         repack_q8q8_weight(q, s, 0l, n, d)
     }
     var x : array<float>
