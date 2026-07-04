@@ -158,7 +158,8 @@ namespace das {
         , mThreadCount( 0 )
         , mJobsRunning(0) {
         mThreadCount = get_num_threads();
-        mTeamProf = getenv("DAS_TEAM_PROF") != nullptr;
+        const char * teamProfEnv = getenv("DAS_TEAM_PROF");   // =0 / empty is off, matching the documented =1 contract
+        mTeamProf = teamProfEnv != nullptr && atoi(teamProfEnv) != 0;
         SetCurrentThreadPriority(JobPriority::High);
         for (int j = 0, js = mThreadCount; j < js; j++) {
             mThreads.emplace_back(make_unique<thread>([this, j]() {
