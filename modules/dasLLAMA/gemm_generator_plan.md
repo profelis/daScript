@@ -520,10 +520,55 @@ select, refused by pin).
 repack function POINTERS, so laneq⇄gen cross-pins are rejected even at byte-identical mr=4 —
 no current config needs them; revisit if a real pin does.
 
-**Gates:** language 1087/1087 (+2 path-guard rows), jit 305/305, dasLLAMA suite green (under
+**Gates:** language 1087/1087 (+2 path-guard rows), jit 305/305, dasLLAMA suite 179/179 (under
 the promoted backend — the whole suite now loads models through the gen tile), gen_parity_probe
 exact, grid test 13/13, gen_slot_parity_probe both layouts, parity.das token checks both
-stamps. Fleet re-sweep below.
+stamps.
+
+### Slice C fleet re-sweep (M1 Max, 8 lanes, emission_bench -p 512 -n 64 --nprompts 3)
+
+A = `DASLLAMA_PIN_BACKEND=arm64-laneq` (pre-slice hand tier), B = default (arm64-laneq-gen,
+kstep2 fallback), back-to-back per model + ABBA anchors (1B/8B — run-to-run drift ±6%, so
+±5% is noise). C = mr8 manifest (arm64-grp-gen, `kstep4_nrsplit2_mr8`), `-n 16 --nprompts 2`,
+POST-fix (the pre-fix C numbers were garbage-but-fast and are not reported). pp = 512000/ttft.
+
+| model | A pp | B pp | B/A | C pp | C/A | A emit | B emit | B/A | C emit | C/A |
+|---|--:|--:|:--:|--:|:--:|--:|--:|:--:|--:|:--:|
+| SmolLM2-135M | 4535 | 4553 | 1.00 | 4457 | 0.98 | 214.4 | 214.4 | 1.00 | 136.3 | 0.64 |
+| Qwen2.5-0.5B | 2014 | 2005 | 1.00 | 1427 | 0.71 | 145.7 | 146.0 | 1.00 | 78.2 | 0.54 |
+| Qwen3-0.6B | 1496 | 1471 | 0.98 | 1242 | 0.83 | 100.7 | 98.9 | 0.98 | 59.4 | 0.59 |
+| gemma-3-1b | 1047 | 1044 | 1.00 | 1025 | 0.98 | 80.4 | 78.7 | 0.98 | 67.6 | 0.84 |
+| TinyLlama-1.1B | 817 | 825 | 1.01 | 850 | 1.04 | 79.9 | 80.7 | 1.01 | 73.1 | 0.92 |
+| Llama-3.2-1B | 801 | 809 | 1.01 | 866 | 1.08 | 68.8 | 69.9 | 1.02 | 60.7 | 0.88 |
+| Qwen2.5-1.5B | 580 | 573 | 0.99 | 626 | 1.08 | 56.5 | 56.7 | 1.01 | 53.6 | 0.95 |
+| SmolLM2-1.7B | 473 | 474 | 1.00 | 528 | 1.12 | 45.3 | 44.5 | 0.98 | 44.6 | 0.98 |
+| gemma-2-2b | 380 | 384 | 1.01 | 429 | 1.13 | 29.9 | 29.8 | 1.00 | 31.3 | 1.05 |
+| Phi-3.5-mini | 212 | 218 | 1.03 | 245 | 1.16 | 19.6 | 19.8 | 1.01 | 19.2 | 0.98 |
+| gemma-3-4b | 220 | 245 | 1.11 | 276 | 1.25 | 20.5 | 21.1 | 1.03 | 21.0 | 1.02 |
+| Qwen3-4B | 188 | 198 | 1.05 | 234 | 1.25 | 20.5 | 19.8 | 0.96 | 21.3 | 1.04 |
+| Qwen1.5-MoE | 312 | 323 | 1.04 | 314 | 1.01 | 31.9 | 31.8 | 1.00 | 33.0 | 1.04 |
+| Mistral-7B | 123 | 120 | 0.97 | 123 | 1.00 | 12.8 | 12.8 | 1.00 | 12.8 | 1.00 |
+| Llama-3.1-8B | 119 | 117 | 0.98 | 118 | 1.00 | 12.2 | 12.0 | 0.99 | 12.7 | 1.05 |
+| gemma-4-12B | 74 | 75 | 1.01 | 75 | 1.01 | 7.2 | 7.2 | 0.99 | 7.3 | 1.01 |
+| gpt-oss-20b (mx4) | 155 | 158 | 1.01 | 77 | 0.49 | 35.1 | 36.3 | 1.03 | 33.1 | 0.94 |
+
+Ratios: **B/A pp median 1.01 (0.97–1.11), B/A emit median 1.00 (0.96–1.03)** —
+**the promotion is perf-neutral; the gen backend supersedes arm64-laneq as the load-select
+tier at zero cost.** C/A pp median 1.01 (0.49–1.25), C/A emit median 0.98 (0.54–1.05).
+
+What the honest C column says:
+- **The mr8 prefill win is real and fleet-visible in the 1.5B–4B dense band:** Qwen3-4B and
+  gemma-3-4b +25%, Phi-3.5 +16%, gemma-2-2b +13%, SmolLM2-1.7B +12%, the 1B–1.5B cluster
+  +4–8%. Large dense (7B/8B/12B) sits at 1.00 — DRAM-bound, tile shape can't matter.
+- **Decode at mr8 (generic grp<mr> GEMV, LLVM-auto-vectorized) is far better than "scalar
+  stopgap" suggests:** ≥1.5B models run 0.88–1.05 of the hand laneq GEMV — bandwidth-bound
+  decode forgives compute inefficiency. Small models pay hard (135M 0.64, 0.5–0.6B ~0.55).
+- **The two mr8 losers are GEMV-shaped, not batch-shaped:** vocab-heavy small models lose
+  ttft to the cls GEMV (Qwen2.5-0.5B 0.71 pp, 152k-row cls at scalar), and gpt-oss loses
+  half its prefill (0.49) to the row-major mx4 family + row-major-expand-then-repack path.
+- **Verdict: mr8 stays a per-app manifest experiment** — the GEMV perm sub-family (grp8-
+  reading generated GEMV, next coverage item) and a generated mx4 family are exactly what
+  gates flipping it on; the batch-side win it buys is already measured and waiting.
 
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
