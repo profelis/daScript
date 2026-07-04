@@ -10,7 +10,14 @@ require llvm/daslib/llvm_tune
 // (the harness write API); spawned again without, the fresh compile re-stamps man_add from
 // the manifest and RESULT reports the k2 tier.
 
-[tune_perm(k = 0), tune_perm(k = 1), tune_perm(k = 2), tune(gen = "llvm_code_selftest::add_plus_k", fallback = "k1")]
+// companion sibling: the declaration-driven re-stamp must reach it from man_add's entry
+def man_kv() : int {
+    return -1  // reference tier sentinel
+}
+
+[tune_perm(k = 0), tune_perm(k = 1), tune_perm(k = 2),
+ tune_companion(fn = "man_kv", gen = "llvm_code_selftest::k_value"),
+ tune(gen = "llvm_code_selftest::add_plus_k", fallback = "k1")]
 def man_add(a, b : int) : int {
     return a + b
 }
@@ -28,5 +35,6 @@ def main {
         print("WRITE {ok ? "ok" : "FAILED"} -> {tune_manifest_path()}\n")
     } else {
         print("RESULT {man_add(n, 3)}\n")
+        print("KV {man_kv()}\n")
     }
 }

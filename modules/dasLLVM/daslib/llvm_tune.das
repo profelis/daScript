@@ -15,8 +15,10 @@ require llvm/daslib/llvm_code public
 
 //! Generalized tune framework (gemm_generator_plan.md part 2). `[tune_perm(...), ...,
 //! tune(gen="key", fallback="suffix")]` — perm rows first, `tune` last — turns one reference
-//! function into a tuned `[llvm_code]` kernel family. `DAS_TUNE_MODE` selects the compile-time
-//! mode:
+//! function into a tuned `[llvm_code]` kernel family. `[tune_companion(fn=, gen=)]` rows
+//! (between the perm rows and `tune`) stamp sibling functions with the SAME perm from the same
+//! manifest entry — the two-function stamp (a kernel and its repack-layout query can never
+//! desync). `DAS_TUNE_MODE` selects the compile-time mode:
 //!  - normal (default): stamp exactly one winner onto the function itself — the manifest entry
 //!    when a manifest exists (authoritative: no entry means reference body), else the
 //!    `fallback=` perm, else the reference body. No variant stubs are emitted; the
@@ -134,6 +136,46 @@ def private build_perm_row(args : AnnotationArgumentList) : TunePerm {
     return <- row
 }
 
+// one companion row: a sibling function stamped with the same perm as the tuned function
+struct private TuneCompanion {
+    fnname : string
+    genkey : string
+    @do_not_delete fn : FunctionPtr   // gc_node-owned by the module, not this row
+}
+
+var private g_companion_rows : table<string; array<TuneCompanion>>
+
+// pull the banked companion rows for `func` and resolve each sibling function
+def private take_companions(func : FunctionPtr; var errors : das_string) : array<TuneCompanion> {
+    var comps : array<TuneCompanion>
+    let key = perm_key(func)
+    if (g_companion_rows |> key_exists(key)) {
+        comps <- g_companion_rows[key]
+        g_companion_rows |> erase(key)
+    }
+    var seen : table<string>
+    for (c in comps) {
+        if (seen |> key_exists(c.fnname)) {
+            errors := "[tune] on {func.name}: duplicate companion '{c.fnname}'"
+        } elif (c.fnname == func.name) {
+            errors := "[tune] on {func.name}: a companion can't be the tuned function itself"
+        } else {
+            c.fn = compiling_module() |> find_unique_function(c.fnname, true)
+            if (c.fn == null) {
+                errors := "[tune] on {func.name}: companion function '{c.fnname}' not found — declare exactly one, before the tuned function, in the same module"
+            } elif (c.fn.result.baseType == Type.autoinfer) {
+                errors := "[tune] on {func.name}: companion {c.fnname} needs an explicit return type"
+            }
+        }
+        if (!empty(errors)) {
+            break
+        }
+        seen |> insert(c.fnname)
+    }
+    delete seen
+    return <- comps
+}
+
 // pull the banked rows for `func` (moving them out of the registry) and validate the set
 def private take_perms(func : FunctionPtr; var errors : das_string) : array<TunePerm> {
     var perms : array<TunePerm>
@@ -178,10 +220,12 @@ def private stamp_llvm_code(var fn : FunctionPtr; genKey : string; perm : TunePe
 }
 
 // tune/test modes: one `<base>__<suffix>` clone per perm, each carrying its [llvm_code] stamp,
-// plus the `<base>_variants()` registry. The base function keeps its reference body — it is
-// the oracle row. (Clones are annotation-free: the parsed declarations attach to the base
-// only after every apply has run, which is after the clones are made.)
-def private stamp_grid(var func : FunctionPtr; genKey : string; perms : array<TunePerm>; var errors : das_string) : bool {
+// plus the `<base>_variants()` registry — and the same treatment for every companion (its
+// clones carry the companion's generator key with the same perm args/suffixes). The base
+// functions keep their reference bodies — they are the oracle rows. (Clones are
+// annotation-free: the parsed declarations attach to the base only after every apply has run,
+// which is after the clones are made.)
+def private stamp_grid(var func : FunctionPtr; genKey : string; perms : array<TunePerm>; comps : array<TuneCompanion>; var errors : das_string) : bool {
     var mod = compiling_module()
     for (p in perms) {
         var fclone = clone_function(func)
@@ -193,7 +237,25 @@ def private stamp_grid(var func : FunctionPtr; genKey : string; perms : array<Tu
             return false
         }
     }
-    return emit_registry(mod, func, perms, errors)
+    if (!emit_registry(mod, func, perms, errors)) {
+        return false
+    }
+    for (c in comps) {
+        for (p in perms) {
+            var cclone = clone_function(c.fn)
+            cclone.name := "{c.fnname}__{p.suffix}"
+            stamp_llvm_code(cclone, c.genkey, p)
+            cclone.flags.generated = true
+            if (!(mod |> add_function(cclone))) {
+                errors := "[tune] on {func.name}: failed to add companion variant {cclone.name}"
+                return false
+            }
+        }
+        if (!emit_registry(mod, c.fn, perms, errors)) {
+            return false
+        }
+    }
+    return true
 }
 
 // `<base>_variants() : array<tuple<string; <sig>>>` — ("reference", @@base) first, then one row
@@ -244,6 +306,36 @@ class private TunePermAnnotation : AstFunctionAnnotation {
     }
 }
 
+//! `[tune_companion(fn = "sibling", gen = "generator_key")]` — stamps `sibling` with the SAME
+//! perm as the tuned function, from the same manifest entry: the two-function stamp (e.g. a
+//! GEMM kernel and its repack-layout query can never desync — including on JIT-time declines,
+//! when both generators fall back to their reference bodies together). List companion rows
+//! AFTER the [tune_perm] grid and BEFORE tune(...); the sibling is a plain function (no [tune]
+//! of its own) declared earlier in the same module, with an explicit return type.
+[function_macro(name = "tune_companion")]
+class private TuneCompanionAnnotation : AstFunctionAnnotation {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup;
+                       args : AnnotationArgumentList; var errors : das_string) : bool {
+        // the perm bank doubles as the order guard: rows placed after tune(...) (bank already
+        // consumed) or before any [tune_perm] would be silently ignored otherwise
+        if (!(g_perm_rows |> key_exists(perm_key(func)))) {
+            errors := "[tune_companion] on {func.name}: list it AFTER the [tune_perm] rows and BEFORE tune(...) in the same bracket"
+            return false
+        }
+        var row : TuneCompanion
+        let fv = find_arg(args, "fn")
+        if (fv is tString) { row.fnname = fv as tString }
+        let gv = find_arg(args, "gen")
+        if (gv is tString) { row.genkey = gv as tString }
+        if (empty(row.fnname) || empty(row.genkey)) {
+            errors := "[tune_companion] on {func.name}: fn=\"<function>\" and gen=\"<generator key>\" are both required"
+            return false
+        }
+        g_companion_rows[perm_key(func)] |> emplace(row)
+        return true
+    }
+}
+
 //! `[tune(gen="key", fallback="suffix")]` — LAST in a bracket of `[tune_perm]` rows (applies
 //! run in declaration order; `tune` consumes the rows banked before it). Normal runs stamp
 //! exactly one winner (manifest > fallback > reference); tune/test runs stamp the whole grid
@@ -263,8 +355,10 @@ class private TuneAnnotation : AstFunctionAnnotation {
         if (empty(errors) && empty(perms)) {
             errors := "[tune] on {func.name}: no [tune_perm(...)] rows — list them BEFORE tune(...) in the same annotation bracket"
         }
+        var comps <- take_companions(func, errors)
         if (!empty(errors)) {
             delete perms
+            delete comps
             return false
         }
         if (func.result.baseType == Type.autoinfer) {
@@ -272,17 +366,20 @@ class private TuneAnnotation : AstFunctionAnnotation {
             // variants registry as `auto` and its rows fail to unify
             errors := "[tune] on {func.name}: an explicit return type is required (add ': void' or the real type)"
             delete perms
+            delete comps
             return false
         }
         let mode = tune_mode()
         if (mode == "tune" || mode == "test") {
-            let ok = stamp_grid(func, genKey, perms, errors)
+            let ok = stamp_grid(func, genKey, perms, comps, errors)
             delete perms
+            delete comps
             return ok
         }
         if (mode != "normal") {
             errors := "[tune] on {func.name}: unknown DAS_TUNE_MODE '{mode}' (normal | tune | test)"
             delete perms
+            delete comps
             return false
         }
         // normal: an env-pinned manifest is authoritative when present; else fallback=.
@@ -306,6 +403,9 @@ class private TuneAnnotation : AstFunctionAnnotation {
             for (p in perms) {
                 if (p.suffix == suffix) {
                     stamp_llvm_code(func, genKey, p)
+                    for (c in comps) {
+                        stamp_llvm_code(c.fn, c.genkey, p)
+                    }
                     print("llvm_tune: {fname} <- {suffix} ({manifestFound ? tune_manifest_path() : "fallback"})\n")
                     ok = true
                     break
@@ -315,13 +415,20 @@ class private TuneAnnotation : AstFunctionAnnotation {
                 errors := "[tune] on {func.name}: perm '{suffix}' is not in the [tune_perm] grid"
             }
         }
-        // reference-row-only registry, so harness code referencing <name>_variants() compiles
-        // (and lints) in every mode — the perm stubs themselves exist only in tune/test runs
+        // reference-row-only registries (base + companions), so harness code referencing
+        // <name>_variants() compiles (and lints) in every mode — the perm stubs themselves
+        // exist only in tune/test runs
         if (ok) {
             let noPerms : array<TunePerm>
             ok = emit_registry(compiling_module(), func, noPerms, errors)
+            for (c in comps) {
+                if (ok) {
+                    ok = emit_registry(compiling_module(), c.fn, noPerms, errors)
+                }
+            }
         }
         delete perms
+        delete comps
         return ok
     }
 }
@@ -342,26 +449,45 @@ def private inject_runtime_path_init(mpath : string; var errors : das_string) : 
     return true
 }
 
-// re-stamp one tuned function from the declared manifest: the grid and generator key are
-// re-read from its attached [tune]/[tune_perm] declarations, the fallback [llvm_code] stamp
-// is dropped, and the manifest entry — authoritative while the manifest exists — is stamped
-def private restamp_fn(var fn : FunctionPtr; manifest : table<string; string>; mpath : string; var errors : das_string) {
-    var genKey = ""
-    var rows : array<TunePerm>
-    for (ann in fn.annotations) {
-        if (ann.annotation.name == "tune") {
-            let gv = find_arg(ann.arguments, "gen")
-            if (gv is tString) { genKey = gv as tString }
-        } elif (ann.annotation.name == "tune_perm") {
-            rows |> emplace(build_perm_row(ann.arguments))
-        }
-    }
+def private strip_llvm_code(var fn : FunctionPtr) {
     var i = length(fn.annotations) - 1
     while (i >= 0) {
         if (fn.annotations[i].annotation.name == "llvm_code") {
             fn.annotations |> erase(i)
         }
         i--
+    }
+}
+
+// re-stamp one tuned function from the declared manifest: the grid, generator key and
+// companions are re-read from its attached [tune]/[tune_perm]/[tune_companion] declarations,
+// the fallback [llvm_code] stamps are dropped (companions included), and the manifest entry —
+// authoritative while the manifest exists — is stamped onto the function and its companions
+def private restamp_fn(var fn : FunctionPtr; mod : Module?; manifest : table<string; string>; mpath : string; var errors : das_string) {
+    var genKey = ""
+    var rows : array<TunePerm>
+    var comps : array<TuneCompanion>
+    for (ann in fn.annotations) {
+        if (ann.annotation.name == "tune") {
+            let gv = find_arg(ann.arguments, "gen")
+            if (gv is tString) { genKey = gv as tString }
+        } elif (ann.annotation.name == "tune_perm") {
+            rows |> emplace(build_perm_row(ann.arguments))
+        } elif (ann.annotation.name == "tune_companion") {
+            var c : TuneCompanion
+            let fv = find_arg(ann.arguments, "fn")
+            if (fv is tString) { c.fnname = fv as tString }
+            let gv = find_arg(ann.arguments, "gen")
+            if (gv is tString) { c.genkey = gv as tString }
+            c.fn = mod |> find_unique_function(c.fnname, true)  // validated at the [tune] apply
+            if (c.fn != null) {
+                comps |> emplace(c)
+            }
+        }
+    }
+    strip_llvm_code(fn)
+    for (c in comps) {
+        strip_llvm_code(c.fn)
     }
     let fname = "{fn.name}"
     let suffix = manifest?[fname] ?? ""
@@ -370,6 +496,9 @@ def private restamp_fn(var fn : FunctionPtr; manifest : table<string; string>; m
         for (p in rows) {
             if (p.suffix == suffix) {
                 stamp_llvm_code(fn, genKey, p)
+                for (c in comps) {
+                    stamp_llvm_code(c.fn, c.genkey, p)
+                }
                 print("llvm_tune: {fname} <- {suffix} ({mpath})\n")
                 stamped = true
                 break
@@ -380,6 +509,7 @@ def private restamp_fn(var fn : FunctionPtr; manifest : table<string; string>; m
         }
     }
     delete rows
+    delete comps
 }
 
 def private restamp_program(manifest : table<string; string>; mpath : string; var errors : das_string) {
@@ -394,7 +524,7 @@ def private restamp_program(manifest : table<string; string>; mpath : string; va
             }
         }
         for (fn in tuned) {
-            restamp_fn(fn, manifest, mpath, errors)
+            restamp_fn(fn, mod, manifest, mpath, errors)
         }
     }
 }

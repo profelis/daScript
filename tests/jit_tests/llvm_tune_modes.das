@@ -36,7 +36,7 @@ def test_llvm_tune_grid_mode(t : T?) {
             }
             while (!feof(f)) {
                 let ln = fgets(f)
-                if (ln |> starts_with("VARIANT ")) {
+                if (ln |> starts_with("VARIANT ") || ln |> starts_with("KVARIANT ")) {
                     lines |> push("{ln}")
                 }
             }
@@ -52,6 +52,13 @@ def test_llvm_tune_grid_mode(t : T?) {
     t |> success(seen |> key_exists("VARIANT k1 -> 6"))
     t |> success(seen |> key_exists("VARIANT k2 -> 7"))
     t |> success(seen |> key_exists("VARIANT declined -> 5"))
+    // the [tune_companion] grid: per-perm args reach the companion generator, and the
+    // declined row's companion falls back to its reference body in lockstep
+    t |> success(seen |> key_exists("KVARIANT reference -> -1"))
+    t |> success(seen |> key_exists("KVARIANT k0 -> 0"))
+    t |> success(seen |> key_exists("KVARIANT k1 -> 1"))
+    t |> success(seen |> key_exists("KVARIANT k2 -> 2"))
+    t |> success(seen |> key_exists("KVARIANT declined -> -1"))
     delete seen
     delete lines
 }

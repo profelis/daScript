@@ -11,7 +11,16 @@ require llvm/daslib/llvm_tune
 // the manifest round-trip are compile-time-env driven (DAS_TUNE_MODE / DAS_TUNE_MANIFEST) and
 // are gated by the CLI probes instead — see gemm_generator_plan.md M3.
 
-[tune_perm(k = 0), tune_perm(k = 2), tune_perm(suffix = "declined", decline = true), tune(gen = "llvm_code_selftest::add_plus_k", fallback = "k2")]
+// companion sibling (the two-function stamp): stamped with tadd_tuned's winner from the same
+// entry — k_value emits `return k`, so the stamped perm is observable on the sibling too.
+// Declared before the tuned function (the [tune_companion] declare-before rule).
+def tadd_kv() : int {
+    return -1  // reference tier sentinel
+}
+
+[tune_perm(k = 0), tune_perm(k = 2), tune_perm(suffix = "declined", decline = true),
+ tune_companion(fn = "tadd_kv", gen = "llvm_code_selftest::k_value"),
+ tune(gen = "llvm_code_selftest::add_plus_k", fallback = "k2")]
 def tadd_tuned(a, b : int) : int {
     return a + b
 }
@@ -26,8 +35,11 @@ def test_llvm_tune(t : T?) {
     var n = 2  // nolint:LINT003 — var defeats const-fold so the calls survive to codegen
     let r = tadd_tuned(n, 3)
     t |> success(r == 7 || r == 5)  // stamped k2 tier (jit) or reference tier — never anything else
+    let kv = tadd_kv()
+    t |> success(kv == 2 || kv == -1)  // the companion carries the same winner perm (k2) or reference
     if (!jit_enabled()) {
-        t |> equal(r, 5)  // interpreted lane always runs the reference body
+        t |> equal(r, 5)   // interpreted lane always runs the reference body
+        t |> equal(kv, -1)
     }
     t |> equal(tadd_reference(n, 3), 5)  // no manifest + no fallback = reference body everywhere
 }

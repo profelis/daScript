@@ -22,7 +22,7 @@ def private spawn_client(cmd : string; var lines : array<string>) : int {
             }
             while (!feof(f)) {
                 let ln = fgets(f)
-                if (ln |> starts_with("WRITE ") || ln |> starts_with("RESULT ") || ln |> starts_with("llvm_tune:")) {
+                if (ln |> starts_with("WRITE ") || ln |> starts_with("RESULT ") || ln |> starts_with("KV ") || ln |> starts_with("llvm_tune:")) {
                     lines |> push(strip("{ln}"))
                 }
             }
@@ -66,12 +66,15 @@ def test_llvm_tune_manifest_roundtrip(t : T?) {
     t |> equal(rcr, 0)
     var stamped = false
     var result7 = false
+    var kv2 = false
     for (ln in rlines) {
         stamped ||= ln |> starts_with("llvm_tune: man_add <- k2")
         result7 ||= ln == "RESULT 7"
+        kv2 ||= ln == "KV 2"
     }
     t |> success(stamped)  // the declaration's re-stamp consumed the manifest
     t |> success(result7)  // and the k2 tier actually ran
+    t |> success(kv2)      // and the companion was re-stamped from the same entry
 
     remove(manifestPath)
     remove(clientPath)
