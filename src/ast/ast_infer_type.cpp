@@ -2666,7 +2666,9 @@ namespace das {
                 } else {
                     if (expr->subexpr->rtti_isVar()) {
                         auto evar = static_cast<ExprVar*>(expr->subexpr);
-                        auto mod = Module::requireEx(evar->name, false);
+                        // allowPromoted: pairs with the `require ?guard` check (ast_parse.cpp), which
+                        // also accepts shared das modules compiled earlier in the process
+                        auto mod = Module::requireEx(evar->name, true);
                         reportAstChanged();
                         return new ExprConstBool(mod != nullptr);
                     } else {

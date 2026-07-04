@@ -1175,10 +1175,17 @@ namespace das {
     }
 
     void ast_requireModule ( yyscan_t scanner, string * name, string * modalias, bool pub, const LineInfo & atName, string * guard ) {
+        auto info = yyextra->g_Access->getModuleInfo(*name, yyextra->g_FileAccessStack.back()->name);
         // Optional require `require ?guard target`: when the guard module is not available, skip the
         // require entirely (no error). A present guard with a missing target still errors below.
         if ( guard ) {
+            // guard registered (a linked C++ module), or the target's own file resolves (a mounted
+            // das package — pure-das packages have no C++ module to guard on). Must match the
+            // require collector's rule (ast_parse.cpp getAllRequireReq).
             bool guardAvailable = Module::requireEx(*guard, false) != nullptr;
+            if ( !guardAvailable && !info.fileName.empty() ) {
+                guardAvailable = yyextra->g_Access->getFileInfo(info.fileName) != nullptr;
+            }
             delete guard;
             if ( !guardAvailable ) {
                 delete name;
@@ -1186,7 +1193,6 @@ namespace das {
                 return;
             }
         }
-        auto info = yyextra->g_Access->getModuleInfo(*name, yyextra->g_FileAccessStack.back()->name);
         if ( auto mod = yyextra->g_Program->addModule(info.moduleName) ) {
             yyextra->g_Program->allRequireDecl.push_back(make_tuple(mod,*name,info.fileName,pub,atName));
             yyextra->g_Program->thisModule->addDependency(mod, pub);

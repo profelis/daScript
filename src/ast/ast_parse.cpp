@@ -227,9 +227,15 @@ namespace das {
                                     mod += *src ++;
                                 }
                                 if ( isReq ) {
-                                    // guarded optional require whose guard module is absent — skip
+                                    // guarded optional require: proceed when the guard module is registered
+                                    // (a linked C++ module), or when the target's own file resolves (a mounted
+                                    // das package — pure-das module directories have no C++ module to guard on).
+                                    // Unregistered guard + unresolvable target — skip silently.
                                     if ( hasReqGuard && Module::requireEx(reqGuard, false)==nullptr ) {
-                                        continue;
+                                        auto ginfo = access->getModuleInfo(mod, fi->name);
+                                        if ( ginfo.fileName.empty() || !access->getFileInfo(ginfo.fileName) ) {
+                                            continue;
+                                        }
                                     }
                                     bool isPublic = false;
                                     while ( src < src_end && src[0] == ' ' ) {

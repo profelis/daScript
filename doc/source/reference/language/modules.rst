@@ -88,6 +88,16 @@ to load (``pugixml`` — the C++ module that makes the path resolvable) is disti
 from what is loaded (``pugixml/PUGIXML_boost``, whose own module name is
 ``PUGIXML_boost``).
 
+The guard also works for targets inside a **pure-das package** (one with no C++
+module to guard on): when the guard module is not registered, the require still
+proceeds if the target's own file resolves — i.e. the package is mounted. When
+neither holds, the require is skipped silently. This enables the contributor
+pattern in ``llvm/daslib/llvm_user_modules.das``: a ``require ?<impl>
+<registration>`` line pulls a das package's registration glue exactly when that
+package is present in the build. ``typeinfo builtin_module_exists`` additionally
+sees **shared das modules** (``module X shared``) compiled earlier in the
+program, so the usual ``static_if`` guard works for das-module contributors too.
+
 Pair it with :ref:`typeinfo builtin_module_exists <generic_programming>` to guard
 code that uses the optional target's symbols — ``static_if`` drops the untaken
 branch before name resolution, so the symbols are referenced only when present:
