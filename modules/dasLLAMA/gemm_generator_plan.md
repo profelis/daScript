@@ -464,10 +464,27 @@ functions without an entry untouched instead of stripping them to reference). `"
 stays expressible as an explicit entry. Pinned by llvm_tune_manifest's OTHER/REF assertions
 and a GEMM-client env-path check (missing entry → `kstep2 (fallback)` in the stamp log).
 
-**Still open in M4:** fleet re-sweep with the mr8 winner (slice C — wire emission_bench to
-require dasllama_math_gen + pin_kernel_backend), loop-hint manifest kind, per-regime/per-slot
-perms (GEMV sub-family unlocks deleting the hand mm tiers), Zen2/EPYC legs, hand-tier
-deletion.
+## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
+
+Get rid of the hand-written kernels **apart from the default ones** (the portable /
+row-major auto-select tiers stay as the correct-everywhere floor), and work on the tune
+kernels **until everything is wonderful on all supported architectures**. The generated
+`[tune]` family is THE path — hand tiers don't wait for a per-tier scoreboard verdict; they
+get replaced as family coverage lands. What that implies, in order:
+
+1. **Slice C — promote the gen backend on arm64**: the generated family stops being
+   probe-only; fleet re-sweep (emission_bench pp512) with the mr8 winner stamped, then the
+   gen backend supersedes arm64-laneq as the load-select tier.
+2. **Coverage the deletion needs** (each a [tune] family or a layout-driven das traversal
+   over generated cores): GEMV sub-family (nr=1, latency-shaped — replaces laneq mm/mm_rows),
+   group3/groupN traversals, the mx4 family (MXFP4 kernels — the second quant family), token
+   tails.
+3. **x64 legs**: vpdpbusd/maddubs/vpdpbssd dot emitters + width/tail perms — replaces the
+   whole AVX kernel matrix (avx_kernel_matrix.md). Zen2 desktop first, EPYC for zvnni.
+4. **Delete**: arm64-laneq tier, x64 AVX matrix tiers, dasllama_tune's [tuned]/box_profile
+   rail (subsumed by the loop-hint manifest kind), keeping portable/default backends only.
+
+**Still open in M4 proper:** slice C as above; loop-hint manifest kind; per-slot perms.
 
 ## Pointers
 
