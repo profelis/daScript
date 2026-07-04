@@ -2,9 +2,10 @@ options gen2
 options persistent_heap
 options _jit_fast_math = true   // match the end-to-end config AND ggml's -O3 FP laxity (kernel-to-kernel fairness)
 
-// RAW single-core kernel throughput — no jobque, no threading, no pipeline. The production
+// RAW single-core kernel throughput — no threading, no pipeline. The production
 // matmul_q8q8_batch runs INLINE on the calling thread: matmul_par_threshold is pushed to infinity,
-// so maybe_parallel_for compiles to a plain invoke (no with_job_que anywhere in this file). This is
+// so maybe_parallel_for compiles to a plain invoke; the que merely exists, idle (the dispatch
+// sites' chunk-count args read get_dispatch_lanes() eagerly, que-less boxes throw). This is
 // the kernel-to-kernel denominator against llama.cpp's ggml_vec_dot_q8_0_q8_0 measured the same way
 // (examples/kernel-bench in the llama.cpp tree). Interleaved best-of across backends per shape,
 // tolerance-gated vs portable. Run: daslang -jit gemm_1core_probe.das
@@ -332,7 +333,10 @@ def focus_main {
         }
     } else {
         set_matmul_par_threshold(1l << 62l)
-        focus_bench(be, shape, n, d, ntok, false)
+        // the que must still EXIST (see main) — nothing dispatches at this threshold
+        with_job_que() {
+            focus_bench(be, shape, n, d, ntok, false)
+        }
     }
 }
 
@@ -347,9 +351,14 @@ def main {
         return
     }
     set_matmul_par_threshold(1l << 62l)   // never parallel: maybe_parallel_for runs the kernel inline, single core
-    print("single-core raw kernel throughput (inline, no jobque), ntok={NTOK}, best-of-{ROUNDS} interleaved\n\n")
-    bench_shape("kv  2048x512  ", 2048l, 512l, 8)
-    bench_shape("qo  2048x2048 ", 2048l, 2048l, 3)
-    bench_shape("w13 2048x5632 ", 2048l, 5632l, 1)
-    bench_shape("w2  5632x2048 ", 5632l, 2048l, 1)
+    // a que must still EXIST: the chunk-count args at the dispatch sites (get_dispatch_lanes())
+    // evaluate eagerly even when maybe_parallel_for stays inline — production always has a que.
+    // Workers sit idle (nothing dispatches at this threshold), so the measurement stays 1-core.
+    with_job_que() {
+        print("single-core raw kernel throughput (inline, idle jobque), ntok={NTOK}, best-of-{ROUNDS} interleaved\n\n")
+        bench_shape("kv  2048x512  ", 2048l, 512l, 8)
+        bench_shape("qo  2048x2048 ", 2048l, 2048l, 3)
+        bench_shape("w13 2048x5632 ", 2048l, 5632l, 1)
+        bench_shape("w2  5632x2048 ", 5632l, 2048l, 1)
+    }
 }
