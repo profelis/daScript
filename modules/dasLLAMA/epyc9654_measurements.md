@@ -672,6 +672,30 @@ The zmm acc16 GEMM loses decode (84.2 in the s3b ladder) but wins batch — comp
 split, exactly the hybrid design's use case. Gap after pin: 0.77×/0.71×/0.64× @T=8/16/32.
 Fleet sweep restarted from T=8 under this config.
 
+### Final fleet tables (zvnni pin, lcpp -r 1; ratio = ours/lcpp; pp derived from emission ttft, spot-validated)
+| model | T8 pp | T8 emit | T48 pp | T48 emit |
+|---|--:|--:|--:|--:|
+| SmolLM2-135M | 0.86 | 0.25 | 0.47 | 0.28 |
+| Qwen2.5-0.5B | 0.78 | 0.58 | 0.44 | 0.36 |
+| Qwen3-0.6B | 0.85 | 0.66 | 0.57 | 0.40 |
+| Gemma-3-1B | 0.73 | 0.70 | 0.53 | 0.46 |
+| Llama-3.2-1B | 0.77 | 0.92 | 0.58 | 0.50 |
+| Qwen2.5-1.5B | 0.77 | 0.76 | 0.54 | 0.49 |
+| SmolLM2-1.7B | 0.81 | 0.88 | 0.62 | 0.54 |
+| Gemma-2-2B | 0.81 | 0.87 | 0.62 | 0.61 |
+| Phi-3.5-mini | 0.83 | 0.99 | 0.67 | 0.64 |
+| Gemma-3-4B | 0.81 | 0.89 | 0.61 | 0.62 |
+| Qwen3-4B | 0.81 | 0.97 | 0.66 | 0.60 |
+| Mistral-7B | 0.82 | 0.90 | 0.69 | 0.75 |
+| Llama-3.1-8B | 0.80 | 0.95 | 0.70 | 0.75 |
+| gpt-oss-20B-MoE | 0.61 | 0.23 | 0.27 | 0.40 |
+
+zvnni-pin before/after @T8 pp (acc8→zvnni): dense +15-27% (mean ~+21%), gptoss +56% (0.39→0.61).
+Absolutes: 1B T48 pp 857 (lcpp 1472), 8B T48 emit 19.8 (lcpp 26.4) — ours still climbs 8→48
+everywhere ≥4B; lcpp climbs harder (zmm GEMM + bandwidth on pp; decode plateau vs our falloff).
+Boris's verdict: box work complete — parked. EPYC profile preserved as
+`modules/dasLLAMA/box_profile.epyc9654.json`; raw logs were /data/sweep (ephemeral).
+
 **Open questions sharpened by the sweep:** (1) portable GEMV pin costs at low T (1B emit 61 @T8
 vs day-1 auto 76; SmolLM T=1 floor 73 vs 116) — per-lane-regime backend pin candidate; (2) the
 fifo-era par thresholds (2M) strangle ≤1B models at every T (135M emit flat 84 vs lcpp ~350);
