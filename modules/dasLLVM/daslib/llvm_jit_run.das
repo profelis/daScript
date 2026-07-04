@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x37ul   // x64_avx AVX kernel-matrix tiers (dot32*_vnni, dot64_acc16(_vnni), mx4_dequant64)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x38ul   // dasllama_gemm_gen mr generalization + q8q8_layout companion generator
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -54,7 +54,10 @@ def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
         while (bb != null) {
             var inst = LLVMGetFirstInstruction(bb)
             while (inst != null) {
-                if (LLVMCanValueUseFastMathFlags(inst) != 0) {
+                // authored flags win: an [llvm_code] generator that sets explicit FMF (e.g.
+                // the GEMM fold's contract-without-reassoc, pinning its fold order across
+                // loop shapes) keeps them; the blanket stamp only fills unset instructions
+                if (LLVMCanValueUseFastMathFlags(inst) != 0 && LLVMGetFastMathFlags(inst) == 0u) {
                     LLVMSetFastMathFlags(inst, 0x7fu)   // reassoc|nnan|ninf|nsz|arcp|contract|afn
                 }
                 inst = LLVMGetNextInstruction(inst)

@@ -165,6 +165,13 @@ def private take_companions(func : FunctionPtr; var errors : das_string) : array
                 errors := "[tune] on {func.name}: companion function '{c.fnname}' not found — declare exactly one, before the tuned function, in the same module"
             } elif (c.fn.result.baseType == Type.autoinfer) {
                 errors := "[tune] on {func.name}: companion {c.fnname} needs an explicit return type"
+            } else {
+                // even when this compile leaves the companion unstamped (no fallback, no env
+                // manifest), a root-module [tune_manifest] may re-stamp it later — a pure
+                // zero-arg companion const-folded at ITS module's compile would leave stale
+                // reference values at call sites while the main function moves to the
+                // manifest perm. Force the side effect up front, not just at stamp time.
+                c.fn.sideEffectFlags.userScenario = true
             }
         }
         if (!empty(errors)) {
