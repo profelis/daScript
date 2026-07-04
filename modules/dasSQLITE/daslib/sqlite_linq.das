@@ -13,6 +13,7 @@ options _comment_hygiene = true
 module sqlite_linq shared public
 
 require sqlite/sqlite_boost public
+require sqlite/sql_provider
 require daslib/sql public
 require daslib/linq_boost public
 
@@ -25,6 +26,14 @@ require daslib/macro_boost
 require daslib/rtti
 require strings public
 require daslib/strings_convert
+
+// Twin of sqlite_boost's [_macro] wrapper — this module's chain emitters consult the
+// provider registry, and only a module's own [_macro] functions run at its macro build.
+[_macro]
+def private _linq_register_sqlite_provider {
+    if (!is_compiling_macros_in_module("sqlite_linq")) return
+    register_sqlite_provider()
+}
 
 [unused_argument(arr)]
 def _to_array(var arr : array<auto(TT)>) : array<TT -const -#> {
@@ -207,6 +216,7 @@ struct private SqlQuery {
     argSourceIdx : array<int>
     dbExpr      : ExpressionPtr
     upsertMode  : bool
+    providerIdx : int = -1              // sql_provider registry index; set where dbExpr binds (chain root / subquery propagation)
     inView      : bool
     hadError    : bool
     lastError   : string
@@ -302,9 +312,10 @@ def private fold_to_string(var frags : array<SqlFrag>; var hadError : bool&; pro
 }
 
 [macro_function]
-def private fold_to_builder(var frags : array<SqlFrag>; at : LineInfo;
+def private fold_to_builder(var frags : array<SqlFrag>; providerIdx : int; at : LineInfo;
                             var sqlExpr : ExpressionPtr&;
                             var bindExprs : array<ExpressionPtr>) {
+    let prov = sql_provider_at(providerIdx)
     var sb = new ExprStringBuilder(at = at)
     var pending = ""
     // macro-function: short-burst string accumulation, flushed into ExprConstString nodes
@@ -312,7 +323,7 @@ def private fold_to_builder(var frags : array<SqlFrag>; at : LineInfo;
         if (f is text) {
             pending += f as text // nolint:PERF001
         } elif (f is bind) {
-            pending += "?" // nolint:PERF001
+            pending += invoke(prov.renderPlaceholder, length(bindExprs) + 1) // nolint:PERF001
             var be : ExpressionPtr = f as bind
             bindExprs |> push(be)
         } elif (f is inline_id) {
@@ -453,7 +464,7 @@ def private is_fts_rank_field(rootT : TypeDeclPtr; fieldName : string) : bool {
 }
 
 [macro_function]
-def private render_json_extract(rootT : TypeDeclPtr; alias : string; col : string; path : array<string>) : string {
+def private render_json_extract(providerIdx : int; rootT : TypeDeclPtr; alias : string; col : string; path : array<string>) : string {
     let p = build_string() $(var w) {
         w |> write("'$")
         for (s in path) {
@@ -463,7 +474,7 @@ def private render_json_extract(rootT : TypeDeclPtr; alias : string; col : strin
         w |> write("'")
     }
     let target = column_sql_for_alias(alias, rootT, col)
-    return "json_extract({target}, {p})"
+    return invoke(sql_provider_at(providerIdx).renderJsonExtract, target, p)
 }
 
 [macro_function]
@@ -600,7 +611,7 @@ def private is_nullable_column_ref(var node : ExpressionPtr; var q : SqlQuery&) 
 
 // nolint:STYLE015 Shared subquery-wrap: SQLite's bare-aggregate optimization — `SELECT *, MIN/MAX(pk) FROM t GROUP BY K` picks the row with the min (useMax=false) or max (useMax=true) pk per K, preserving all `*` columns at those values. MIN matches linq `_distinct_by`'s "first row per K" semantics; MAX matches `reverse() |> _distinct_by(K)` "last row per K" — both when pk is monotonic with insertion order.
 [macro_function]
-def private build_distinct_by_inner_subquery(var q : SqlQuery&; pkField : string; useMax : bool) : string {
+def private build_distinct_by_inner_subquery(q : SqlQuery; pkField : string; useMax : bool) : string {
     let sqlK = field_to_column_name(q.rootType, q.distinctByCol)
     let pkCol = field_to_column_name(q.rootType, pkField)
     let aggOp = useMax ? "MAX" : "MIN"
@@ -1433,7 +1444,7 @@ def private collect_query_binds(var q : SqlQuery&; var out : array<ExpressionPtr
     for (j in q.joins) {
         out |> push_from(j.rightOnBindExprs)
     }
-    out |> push_from(q.bindExprs)
+    out |> push_from(q.bindExprs)   // nolint:STYLE033 — variadic push_from forwards ==const; array<Expression?> sources fail 31400
     out |> push_from(q.havingBindExprs)
     out |> push_from(q.setOpRhsBinds)
     let forced_one_row = ((q.matr == Materializer.One || q.matr == Materializer.OneOpt)
@@ -1560,6 +1571,7 @@ def private divert_to_inner(var node : ExpressionPtr; var q : SqlQuery&;
     }
     if (q.dbExpr == null) {
         q.dbExpr = subQ.dbExpr
+        q.providerIdx = subQ.providerIdx
     }
     if (subQ.proj == ProjectionShape.FullRow) {
         // FullRow inner: outer treats wrapped subquery as the original table; v1 path — unchanged.
@@ -2095,6 +2107,11 @@ def private analyze_chain(var node : ExpressionPtr; var q : SqlQuery&; prog : Pr
         if (qmatch(node, select_from($e(dbE), type<$t(rootT)>)).matched) {
             q.dbExpr = dbE
             q.rootType = rootT
+            q.providerIdx = find_sql_provider_by_runner(dbE._type)
+            if (q.providerIdx < 0) {
+                macro_error(prog, at, "_sql: no SQL provider registered for runner type {describe(dbE._type)} (registered: {sql_provider_names()})")
+                return false
+            }
             // Default projection if no _select was seen above
             if (!q.seenSelect && q.proj != ProjectionShape.Aggregate) {
                 fill_default_columns(q, rootT, prog, at)
@@ -2203,7 +2220,7 @@ def private try_recognize_json_path_proj(val : ExpressionPtr; var q : SqlQuery&;
         macro_error(prog, at, "_sql: JSON path on @sql_json column '{colName}' walks into a field that isn't a struct/tuple member at depth {length(jsonPath)}")
         return -1
     }
-    outFrag = render_json_extract(srcType, source_alias_for_idx(q, srcIdx), colName, jsonPath)
+    outFrag = render_json_extract(q.providerIdx, srcType, source_alias_for_idx(q, srcIdx), colName, jsonPath)
     outLeafType = leaf
     return 1
 }
@@ -3198,7 +3215,7 @@ def private pred_to_sql(var node : ExpressionPtr; var q : SqlQuery&; prog : Prog
                         // Validate every path segment — the typer never sees `_where`'s lambda body so silent NULL-on-typo is the failure mode.
                         let leaf = resolve_nested_field_type(srcType, colName, jsonPath)
                         if (leaf == null) return pred_fail(q, prog, at, "_sql: JSON path on @sql_json column '{colName}' walks into a field that isn't a struct/tuple member at depth {length(jsonPath)}")
-                        return render_json_extract(srcType, source_alias_for_idx(q, srcIdx), colName, jsonPath)
+                        return render_json_extract(q.providerIdx, srcType, source_alias_for_idx(q, srcIdx), colName, jsonPath)
                     }
                 }
             }
@@ -4061,7 +4078,7 @@ def private build_sql_select(var q : SqlQuery&; force_aliases : bool = false) : 
         } elif (q.limitBindExpr != null) {
             w |> write(" LIMIT ?")
         } elif (q.offsetBindExpr != null) {
-            w |> write(" LIMIT -1")
+            w |> write(" {sql_provider_at(q.providerIdx).noLimitSpelling}")
         }
         if (!forced_one_row && q.offsetBindExpr != null) {
             w |> write(" OFFSET ?")
@@ -4086,7 +4103,7 @@ class private SqlTextMacro : AstCallMacro {
         sql_to_frags_ex(sql, noBinds, q.orderByInlineExprs, frags)
         var sqlExpr : ExpressionPtr
         var bindExprs : array<ExpressionPtr>
-        fold_to_builder(frags, call.at, sqlExpr, bindExprs)
+        fold_to_builder(frags, q.providerIdx, call.at, sqlExpr, bindExprs)
         sqlExpr.force_at(call.at)
         return sqlExpr
     }
@@ -4283,9 +4300,14 @@ def private emit_pragma_or_vacuum(prog : ProgramPtr; var call : ExprCallMacro?;
         frags |> push_text("VACUUM INTO ")
         frags |> push_inline_lit(call.arguments[1])
     }
+    let provIdx = find_sql_provider_by_runner(call.arguments[0]._type)
+    if (provIdx < 0) {
+        macro_error(prog, call.at, "{macroName}: no SQL provider registered for runner type {describe(call.arguments[0]._type)} (registered: {sql_provider_names()})")
+        return null
+    }
     var sqlExpr : ExpressionPtr
     var bindExprs : array<ExpressionPtr>
-    fold_to_builder(frags, call.at, sqlExpr, bindExprs)
+    fold_to_builder(frags, provIdx, call.at, sqlExpr, bindExprs)
     var res = qmacro(_::try_exec($e(call.arguments[0]), $e(sqlExpr)))
     res.force_at(call.at)
     return res
@@ -4604,7 +4626,7 @@ def private emit_sql_macro_body(prog : ProgramPtr; var call : ExprCallMacro?; is
     sql_to_frags_ex(sql, allBinds, q.orderByInlineExprs, frags)
     var sqlExpr : ExpressionPtr
     var bindExprs : array<ExpressionPtr>
-    fold_to_builder(frags, call.at, sqlExpr, bindExprs)
+    fold_to_builder(frags, q.providerIdx, call.at, sqlExpr, bindExprs)
     // Build bind statements: sql_bind_to_stmt(stmt, i+1, $e(boundExpr))
     var bind_stmts : array<ExpressionPtr>
     bind_stmts |> reserve(length(bindExprs))
@@ -4618,14 +4640,17 @@ def private emit_sql_macro_body(prog : ProgramPtr; var call : ExprCallMacro?; is
     var rowBuilder = build_row_builder(q, prog, call.at)
     if (rowBuilder == null) return null
     var dbExpr = q.dbExpr
+    let prov = sql_provider_at(q.providerIdx)
+    var stmtT = invoke(prov.makeStmtType)
+    var stmtTC = invoke(prov.makeStmtTypeConst)
     let suffix = (q.matr == Materializer.One ? "_one"
                   : (q.matr == Materializer.OneOpt ? "_one_opt" : ""))
     let fname = (isTry ? "try_run_select" : "run_select") + suffix
     var res = qmacro($c(fname)($e(dbExpr), $e(sqlExpr),
-        $(var _sql_stmt : sqlite3_stmt?) {
+        $(var _sql_stmt : $t(stmtT)) {
             $b(bind_stmts)
         },
-        $(_sql_stmt : sqlite3_stmt?) => $e(rowBuilder)))
+        $(_sql_stmt : $t(stmtTC)) => $e(rowBuilder)))
     res.force_at(call.at)
     return res
 }
@@ -4677,7 +4702,7 @@ def private emit_each_sql_macro_body(prog : ProgramPtr; var call : ExprCallMacro
     sql_to_frags_ex(sql, allBinds, q.orderByInlineExprs, frags)
     var sqlExpr : ExpressionPtr
     var bindExprs : array<ExpressionPtr>
-    fold_to_builder(frags, call.at, sqlExpr, bindExprs)
+    fold_to_builder(frags, q.providerIdx, call.at, sqlExpr, bindExprs)
     var bind_stmts : array<ExpressionPtr>
     bind_stmts |> reserve(length(bindExprs))
     for (i in range(length(bindExprs))) {
@@ -4690,12 +4715,15 @@ def private emit_each_sql_macro_body(prog : ProgramPtr; var call : ExprCallMacro
     var rowBuilder = build_row_builder(q, prog, call.at)
     if (rowBuilder == null) return null
     var dbExpr = q.dbExpr
+    let prov = sql_provider_at(q.providerIdx)
+    var stmtT = invoke(prov.makeStmtType)
+    var stmtTC = invoke(prov.makeStmtTypeConst)
     // bind_blk = block (one-shot, before the generator); row_blk = capturing lambda (outlives run_each_select).
     var res = qmacro(_::run_each_select($e(dbExpr), $e(sqlExpr),
-        $(var _sql_stmt : sqlite3_stmt?) {
+        $(var _sql_stmt : $t(stmtT)) {
             $b(bind_stmts)
         },
-        @(_sql_stmt : sqlite3_stmt?) => $e(rowBuilder)))
+        @(_sql_stmt : $t(stmtTC)) => $e(rowBuilder)))
     res.force_at(call.at)
     return res
 }
@@ -4783,6 +4811,7 @@ def private analyze_set_clause(var setExpr : ExpressionPtr; var q : SqlQuery&;
     var setQ = SqlQuery(
         rootType = q.rootType,
         tableName = q.tableName,
+        providerIdx = q.providerIdx,
         argNames <- ["_"],
         argSourceIdx <- [0]
     )
@@ -4823,14 +4852,17 @@ def private build_returning_clause(rootT : TypeDeclPtr) : string {
 def private emit_dml_call(var dbE : ExpressionPtr; var sqlExpr : ExpressionPtr;
                           var bindStmts : array<ExpressionPtr>;
                           isTry : bool; isReturning : bool;
-                          rootT : TypeDeclPtr; at : LineInfo) : ExpressionPtr {
-    var bindLambda = qmacro($(var _sql_stmt : sqlite3_stmt?) {
+                          rootT : TypeDeclPtr; provIdx : int; at : LineInfo) : ExpressionPtr {
+    let prov = sql_provider_at(provIdx)
+    var stmtT = invoke(prov.makeStmtType)
+    var bindLambda = qmacro($(var _sql_stmt : $t(stmtT)) {
         $b(bindStmts)
     })
     var res : ExpressionPtr
     if (isReturning) {
         var rootClone = clone_type(rootT)
-        var readerLambda = qmacro($(_sql_stmt : sqlite3_stmt?) => _::_sql_read_row(_sql_stmt, type<$t(rootClone)>))
+        var stmtTC = invoke(prov.makeStmtTypeConst)
+        var readerLambda = qmacro($(_sql_stmt : $t(stmtTC)) => _::_sql_read_row(_sql_stmt, type<$t(rootClone)>))
         let fname = (isTry ? "try_run_dml_returning" : "run_dml_returning")
         res = qmacro($c(fname)($e(dbE), $e(sqlExpr), $e(bindLambda), $e(readerLambda)))
     } else {
@@ -4859,6 +4891,11 @@ def private emit_update_body(prog : ProgramPtr; var call : ExprCallMacro?;
         argNames <- ["_"],
         argSourceIdx <- [0]
     )
+    q.providerIdx = find_sql_provider_by_runner(dbE._type)
+    if (q.providerIdx < 0) {
+        macro_error(prog, call.at, "_sql_update: no SQL provider registered for runner type {describe(dbE._type)} (registered: {sql_provider_names()})")
+        return null
+    }
     // Translate WHERE — raw AST. pred_to_sql emitted macro_error, OR returned "" without setting hadError.
     let whereSql = pred_to_sql(whereE, q, prog, call.at)
     if (q.hadError || empty(whereSql)) return null
@@ -4886,13 +4923,13 @@ def private emit_update_body(prog : ProgramPtr; var call : ExprCallMacro?;
     // Combine binds: SET first, then WHERE.
     var allBinds : array<ExpressionPtr>
     allBinds |> reserve(length(setBindExprs) + length(q.bindExprs))
-    allBinds |> push_from(setBindExprs)
+    allBinds |> push_from(setBindExprs)   // nolint:STYLE033 — same 31400 as collect_query_binds
     allBinds |> push_from(q.bindExprs)
     var frags : array<SqlFrag>
     sql_to_frags(sql, allBinds, frags)
     var sqlExpr : ExpressionPtr
     var bindExprs : array<ExpressionPtr>
-    fold_to_builder(frags, call.at, sqlExpr, bindExprs)
+    fold_to_builder(frags, q.providerIdx, call.at, sqlExpr, bindExprs)
     var bindStmts : array<ExpressionPtr>
     bindStmts |> reserve(length(bindExprs))
     for (i in range(length(bindExprs))) {
@@ -4902,7 +4939,7 @@ def private emit_update_body(prog : ProgramPtr; var call : ExprCallMacro?;
             sql_bind_to_stmt(_sql_stmt, $v(bindIdx), $e(be));
         })
     }
-    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, call.at)
+    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, q.providerIdx, call.at)
 }
 
 [macro_function]
@@ -4922,6 +4959,11 @@ def private emit_delete_body(prog : ProgramPtr; var call : ExprCallMacro?;
         argNames <- ["_"],
         argSourceIdx <- [0]
     )
+    q.providerIdx = find_sql_provider_by_runner(dbE._type)
+    if (q.providerIdx < 0) {
+        macro_error(prog, call.at, "_sql_delete: no SQL provider registered for runner type {describe(dbE._type)} (registered: {sql_provider_names()})")
+        return null
+    }
     // pred_to_sql emitted macro_error, OR returned "" without setting hadError.
     let whereSql = pred_to_sql(whereE, q, prog, call.at)
     if (q.hadError || empty(whereSql)) return null
@@ -4933,7 +4975,7 @@ def private emit_delete_body(prog : ProgramPtr; var call : ExprCallMacro?;
     sql_to_frags(sql, q.bindExprs, frags)
     var sqlExpr : ExpressionPtr
     var bindExprs : array<ExpressionPtr>
-    fold_to_builder(frags, call.at, sqlExpr, bindExprs)
+    fold_to_builder(frags, q.providerIdx, call.at, sqlExpr, bindExprs)
     var bindStmts : array<ExpressionPtr>
     bindStmts |> reserve(length(bindExprs))
     for (i in range(length(bindExprs))) {
@@ -4943,7 +4985,7 @@ def private emit_delete_body(prog : ProgramPtr; var call : ExprCallMacro?;
             sql_bind_to_stmt(_sql_stmt, $v(bindIdx), $e(be));
         })
     }
-    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, call.at)
+    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, q.providerIdx, call.at)
 }
 
 // ----------------------------------------------------------------------------
@@ -5165,6 +5207,7 @@ def private validate_conflict_cols(rootT : TypeDeclPtr; conflictCols : array<str
 
 [macro_function]
 def private analyze_upsert_set_clause(var setExpr : ExpressionPtr; var rootT : TypeDeclPtr; tableName : string;
+                                      providerIdx : int;
                                       var setSqlClauses : array<string>&;
                                       var setBindExprs : array<ExpressionPtr>&;
                                       prog : ProgramPtr; at : LineInfo) : bool {
@@ -5235,6 +5278,7 @@ def private analyze_upsert_set_clause(var setExpr : ExpressionPtr; var rootT : T
     var setQ = SqlQuery(
         rootType = rootT,
         tableName = tableName,
+        providerIdx = providerIdx,
         argNames <- ["_"],
         argSourceIdx <- [0],
         upsertMode = true
@@ -5267,13 +5311,18 @@ def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
     var conflictE = call.arguments[2]
     var doUpdateE = call.arguments[3]
     let tableName = sql_table_name_from_type(rootT)
+    let provIdx = find_sql_provider_by_runner(dbE._type)
+    if (provIdx < 0) {
+        macro_error(prog, call.at, "_sql_upsert: no SQL provider registered for runner type {describe(dbE._type)} (registered: {sql_provider_names()})")
+        return null
+    }
     // 1) on_conflict columns
     var conflictCols : array<string>
     if (!analyze_upsert_conflict_inner(conflictE, rootT, conflictCols, prog, call.at)) return null
     // 2) do_update SET clauses (with upsertMode=true so `_excluded.Col` resolves)
     var setSqlClauses : array<string>
     var setBindExprs : array<ExpressionPtr>
-    if (!analyze_upsert_set_clause(doUpdateE, rootT, tableName, setSqlClauses, setBindExprs, prog, call.at)) return null
+    if (!analyze_upsert_set_clause(doUpdateE, rootT, tableName, provIdx, setSqlClauses, setBindExprs, prog, call.at)) return null
     // 3) INSERT column list (non-computed only) — SQL-side names, positional bind indices.
     var nonComputedCols : array<string>
     var nRowBinds = 0
@@ -5336,8 +5385,8 @@ def private emit_upsert_body(prog : ProgramPtr; var call : ExprCallMacro?;
     sql_to_frags(sql, noBinds, frags)
     var sqlExpr : ExpressionPtr
     var bindExprs : array<ExpressionPtr>
-    fold_to_builder(frags, call.at, sqlExpr, bindExprs)
-    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, call.at)
+    fold_to_builder(frags, provIdx, call.at, sqlExpr, bindExprs)
+    return emit_dml_call(dbE, sqlExpr, bindStmts, isTry, isReturning, rootT, provIdx, call.at)
 }
 
 [call_macro(name="_sql_upsert")]
