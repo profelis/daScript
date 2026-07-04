@@ -284,9 +284,9 @@ Notes for M3: the impl inlines into its public wrapper (and the batch worker) fo
 das-side const model wants IR-handle helper params spelled `var` (`LLVMOpaqueValue?` non-var
 constifies the whole value chain — llvm_boost's `*Aligned` wrappers were fixed to return
 non-const for the same reason); LLVM's verifier enforces phi-grouping in merge blocks —
-create all phis before any other instruction. The `llvm_user_modules.das` dasllama require is
-branch-local wiring (dasLLVM-without-dasLLAMA builds need the planned `require ?` gate before
-this can merge).
+create all phis before any other instruction. The `llvm_user_modules.das` dasllama require was
+branch-local wiring at M2; the `require ?` gate landed with M3 (see below) — dasLLVM no longer
+hard-depends on dasLLAMA.
 
 ## M3 result (2026-07-04, M1 Max) — tune framework + perm-parameterized family shipped
 
@@ -296,10 +296,22 @@ trailing `[tune(gen = "generator_key", fallback = "suffix")]` on the reference f
 function itself (manifest authoritative when present: no entry ⇒ reference body; else
 `fallback=`; else reference); tune/test stamp the full grid as `<name>__<suffix>` clones plus
 a `<name>_variants()` registry (emitted reference-row-only in normal mode too, so harnesses
-compile/lint everywhere). Manifest = flat `{ "fn name": "perm suffix" }` JSON at
-`DAS_TUNE_MANIFEST` else `<das_root>/tune_manifest.json` (box_profile precedent; the plan's
-"next to the app" placement stays open — the env override covers it). The two APIs:
-`tune_manifest_get` (the macro's stamp-time read) and `tune_manifest_set` (the harness write).
+compile/lint everywhere). Manifest = flat `{ "fn name": "perm suffix" }` JSON, **per-app by
+opt-in** (Boris: a shared default is a non-starter — two apps stomp): the app declares
+`[tune_manifest(name = "myapp", dir = "...")]` on `main`, and the manifest lives at
+`<dir>/<name>.tune.json` resolved against the declaring file's directory (the
+`get_this_module_dir` pattern — distinct names disambiguate apps sharing a folder).
+`DAS_TUNE_MANIFEST` env overrides the declaration; neither ⇒ no manifest (fallback perms).
+Because the root module compiles last, the declaration cannot feed the library `[tune]`
+applies — instead its own apply **re-stamps** every `[tune]`-annotated function in the
+program from the declared manifest (grids re-read from the by-then-attached annotations),
+and injects an `[init]` so the runtime write API targets the same file. The two APIs:
+`tune_manifest_get` (read-your-own-value) and `tune_manifest_set` (the harness write).
+Known edges: constant-arg call sites compiled before a late re-stamp may stay on the
+reference tier (bit-exact by contract; pointer-shaped kernels unaffected), and in
+multi-program processes a shared library module keeps the stamps of the first program that
+compiled it. Round-trip test: `tests/jit_tests/llvm_tune_manifest.das` (temp-copied client,
+declaration-driven write → re-stamp → k2 tier observed).
 Framework worked example: `llvm_code_selftest::add_plus_k` (emits `a+b+k` from the perm arg +
 a `decline=true` rail); suite test `tests/jit_tests/llvm_code`/`llvm_tune`; CLI gates green
 (grid rows 5/6/7 with declined→5, set-API → normal-run consume, authoritative-absence).
@@ -343,9 +355,26 @@ need an explicit return type (`function_to_type` runs pre-infer; an implicit res
 the registry as `auto`). Stamped declarations don't get their own `apply`, so `[tune]` forces
 `sideEffectFlags.userScenario` itself (the P1 const-fold lesson).
 
+**Generator wiring decoupled (post-M3 follow-up, same day):** `llvm_user_modules` now does
+`require ?dasllama_gemm_gen dasllama/dasllama_gemm_register` (a new registration shim that
+requires the generator implementation). The optional-require guard grew a **target-file
+resolvability fallback** (C++: the collector in `ast_parse.cpp` + the parser statement in
+`parser_impl.cpp`): a guarded require also loads when the target's own file resolves — i.e.
+the das package is mounted — because pure-das packages have no C++ module to guard on. The
+original "app requires the implementation first" two-file idea cannot work on the `-jit`
+rail: the LLVM chain is injected as an *extra module* and is collected + compiled before the
+app root's requires are even scanned. So the opt-in unit is the build/mount, not the app;
+registered generators are name-keyed and inert for programs that never `[llvm_code]`-name
+them. `typeinfo builtin_module_exists` additionally sees promoted (shared das) modules now,
+so the `static_if` guard around the registration call works for das contributors. Tests:
+`tests/language/optional_require.das` (+ fixture) pins the resolvability fallback and the
+das-module `builtin_module_exists`; `tests/jit_tests/llvm_tune_modes.das` spawns a child
+daslang with `DAS_TUNE_MODE=test` and asserts every grid row's runtime value (5/5/6/7/5);
+`cant_tune_bad_grids.das` pins all six `[tune]` validation errors.
+
 **Deferred to M4:** loop-hint manifest kind (subsuming `[tuned]`/box_profile — dasllama_tune
 stays untouched and shipped this milestone), `grp<mr≠4>` repack generation + the two-function
-stamp, per-regime/per-slot perms, Zen2/EPYC legs, manifest placement.
+stamp, per-regime/per-slot perms, Zen2/EPYC legs.
 
 ## Pointers
 

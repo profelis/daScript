@@ -34,43 +34,59 @@ def tune_mode() : string {
     return empty(m) ? "normal" : m
 }
 
-//! The tune manifest location, shared by the `[tune]` compile-time read and the harness write:
-//! `DAS_TUNE_MANIFEST` env override, else `<das_root>/tune_manifest.json` — per-install ==
-//! per-box, independent of the compile cwd.
+// runtime copy of the app's [tune_manifest] declaration, set by the injected [init]
+var private g_runtime_manifest = ""
+
+//! Runtime hook the `[tune_manifest]`-injected [init] calls; harnesses that manage their own
+//! manifest location can also call it directly before using the get/set APIs.
+def set_tune_manifest_runtime_path(p : string) {
+    g_runtime_manifest = p
+}
+
+//! The tune manifest location: `DAS_TUNE_MANIFEST` env override, else the app's
+//! `[tune_manifest]` declaration, else "" — no manifest. Per-app opt-in by design: a shared
+//! default file would let unrelated apps stomp each other's winners.
 def tune_manifest_path() : string {
     let env = get_env_variable("DAS_TUNE_MANIFEST")
     if (!empty(env)) return env
-    return path_join(get_das_root(), "tune_manifest.json")
+    return g_runtime_manifest
 }
 
 // flat { "function name" : "perm suffix" } map; found = the file existed and parsed
-def private read_manifest(var found : bool&) : table<string; string> {
+def private read_manifest(path : string; var found : bool&) : table<string; string> {
     found = false
     var tab : table<string; string>
-    let text = fread(tune_manifest_path())
-    if (!empty(text)) {
-        found = sscan_json(text, tab)
+    if (!empty(path)) {
+        let text = fread(path)
+        if (!empty(text)) {
+            found = sscan_json(text, tab)
+        }
     }
     return <- tab
 }
 
 //! The winning perm suffix recorded for `fname`, or "" when the manifest is absent or has no
-//! entry — the read-your-own-tune-value API (the `[tune]` macro reads this at stamp time).
+//! entry — the read-your-own-tune-value API.
 def tune_manifest_get(fname : string) : string {
     var found = false
-    var tab <- read_manifest(found)
+    var tab <- read_manifest(tune_manifest_path(), found)
     let r = tab?[fname] ?? ""
     delete tab
     return r
 }
 
 //! Upsert `fname -> suffix` into the manifest and save it — the set-a-value API the tune
-//! harness calls after picking a winner. Returns false when the file can't be written.
+//! harness calls after picking a winner. Returns false when no manifest location is
+//! configured (env or `[tune_manifest]`) or the file can't be written.
 def tune_manifest_set(fname : string; suffix : string) : bool {
+    let path = tune_manifest_path()
+    if (empty(path)) {
+        return false
+    }
     var found = false
-    var tab <- read_manifest(found)
+    var tab <- read_manifest(path, found)
     tab[fname] = suffix
-    let ok = fwrite(tune_manifest_path(), sprint_json(tab, true))
+    let ok = fwrite(path, sprint_json(tab, true))
     delete tab
     return ok
 }
@@ -269,10 +285,13 @@ class private TuneAnnotation : AstFunctionAnnotation {
             delete perms
             return false
         }
-        // normal: manifest is authoritative when present; else fallback=; else reference body
+        // normal: an env-pinned manifest is authoritative when present; else fallback=.
+        // An app's [tune_manifest] declaration lives in the root module, which compiles after
+        // every library [tune] — its apply re-stamps the tuned functions from the declared
+        // manifest (see TuneManifestAnnotation below).
         let fname = "{func.name}"
         var manifestFound = false
-        var manifest <- read_manifest(manifestFound)
+        var manifest <- read_manifest(get_env_variable("DAS_TUNE_MANIFEST"), manifestFound)
         var suffix = ""
         if (manifestFound) {
             suffix = manifest?[fname] ?? ""
@@ -304,5 +323,119 @@ class private TuneAnnotation : AstFunctionAnnotation {
         }
         delete perms
         return ok
+    }
+}
+
+// ===== [tune_manifest] — the app's per-app manifest declaration =====
+
+// [init] in the declaring module so the runtime write API targets the declared file
+def private inject_runtime_path_init(mpath : string; var errors : das_string) : bool {
+    var fn = qmacro_function("`tune`manifest`runtime`init") $() : void {
+        set_tune_manifest_runtime_path($v(mpath))
+    }
+    fn |> append_annotation("$", "init")
+    fn.flags.generated = true
+    if (!(compiling_module() |> add_function(fn))) {
+        errors := "[tune_manifest]: duplicate declaration (only one per program)"
+        return false
+    }
+    return true
+}
+
+// re-stamp one tuned function from the declared manifest: the grid and generator key are
+// re-read from its attached [tune]/[tune_perm] declarations, the fallback [llvm_code] stamp
+// is dropped, and the manifest entry — authoritative while the manifest exists — is stamped
+def private restamp_fn(var fn : FunctionPtr; manifest : table<string; string>; mpath : string; var errors : das_string) {
+    var genKey = ""
+    var rows : array<TunePerm>
+    for (ann in fn.annotations) {
+        if (ann.annotation.name == "tune") {
+            let gv = find_arg(ann.arguments, "gen")
+            if (gv is tString) { genKey = gv as tString }
+        } elif (ann.annotation.name == "tune_perm") {
+            rows |> emplace(build_perm_row(ann.arguments))
+        }
+    }
+    var i = length(fn.annotations) - 1
+    while (i >= 0) {
+        if (fn.annotations[i].annotation.name == "llvm_code") {
+            fn.annotations |> erase(i)
+        }
+        i--
+    }
+    let fname = "{fn.name}"
+    let suffix = manifest?[fname] ?? ""
+    if (!empty(suffix) && suffix != "reference") {
+        var stamped = false
+        for (p in rows) {
+            if (p.suffix == suffix) {
+                stamp_llvm_code(fn, genKey, p)
+                print("llvm_tune: {fname} <- {suffix} ({mpath})\n")
+                stamped = true
+                break
+            }
+        }
+        if (!stamped) {
+            errors := "[tune_manifest]: perm '{suffix}' for {fname} is not in its [tune_perm] grid"
+        }
+    }
+    delete rows
+}
+
+def private restamp_program(manifest : table<string; string>; mpath : string; var errors : das_string) {
+    program_for_each_module(compiling_program()) $(mod) {
+        var tuned : array<FunctionPtr>
+        for_each_function(mod, "") $(fn) {
+            for (ann in fn.annotations) {
+                if (ann.annotation.name == "tune") {
+                    tuned |> push(fn)
+                    break
+                }
+            }
+        }
+        for (fn in tuned) {
+            restamp_fn(fn, manifest, mpath, errors)
+        }
+    }
+}
+
+//! `[tune_manifest(name = "myapp", dir = "...")]` on the app's `main` (any function in the
+//! root file): opts the app into a tune manifest at `<dir>/<name>.tune.json`. `dir` resolves
+//! against the declaring file's directory (absolute dirs pass through; omitted dir = the
+//! declaring file's directory), so two apps sharing a folder pick distinct names. The root
+//! module compiles after every library `[tune]`, so in normal mode this apply re-stamps the
+//! tuned functions from the declared manifest — authoritative while the file exists (no entry
+//! means reference body); without the file the `fallback=` stamps stand. `DAS_TUNE_MANIFEST`
+//! overrides the declaration entirely. Also injects an [init] pointing the runtime write API
+//! (`tune_manifest_set`) at the same file.
+[function_macro(name = "tune_manifest")]
+class private TuneManifestAnnotation : AstFunctionAnnotation {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup;
+                       args : AnnotationArgumentList; var errors : das_string) : bool {
+        let nv = find_arg(args, "name")
+        if (!(nv is tString) || empty(nv as tString)) {
+            errors := "[tune_manifest] on {func.name}: name=\"<app name>\" is required"
+            return false
+        }
+        let declDir = dir_name(string(func.at.fileInfo.name))
+        var dir = declDir
+        let dv = find_arg(args, "dir")
+        if (dv is tString) {
+            let d = dv as tString
+            dir = is_absolute(d) ? d : path_join(declDir, d)
+        }
+        let mpath = path_join(dir, "{nv as tString}.tune.json")
+        if (!inject_runtime_path_init(mpath, errors)) {
+            return false
+        }
+        // env override: every [tune] already stamped from it; grid modes stamp every perm
+        if (!empty(get_env_variable("DAS_TUNE_MANIFEST")) || tune_mode() != "normal") return true
+        var found = false
+        var manifest <- read_manifest(mpath, found)
+        if (found) {
+            restamp_program(manifest, mpath, errors)
+        }
+        delete manifest
+        return empty(errors)
     }
 }
