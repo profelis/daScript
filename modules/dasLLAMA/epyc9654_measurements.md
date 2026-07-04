@@ -600,6 +600,43 @@ avg ~112 = 81% (campaign start: 64%).** Suite 173/173, lint 0.
 NB tonight's drift is large (±10% across brackets after hours of load) — the ON-vs-OFF margin
 exceeds it in both orderings, but absolutes need a fresh-boot confirm.
 
+### Session 4 (2026-07-04): FUSED DISPATCH CHAINS — 81 → 33 disp/tok, +7.6% at the knee (all pairs)
+The join-tail attack Boris chose (session 3f next-steps #1), built as general machinery:
+- **jobque `teamParallelForStages`** (+ das `team_parallel_stages` in jobque_boost): one team
+  rendezvous runs N dependent stages with worker-side barriers between them. Seqlock publish
+  (odd seq = "publishing") + an in-flight entrant gate close the cross-chain stage-order race by
+  construction (a straggler can never hold a stage claim word across a republish); per-stage
+  claim words keep the packed {K|ctr} epoch-race fix. Single-op teamParallelFor is now
+  stages(1) — one protocol. tests/jobque 200/200 on both boxes; TSAN 25x0 on the new storm test.
+- **dasLLAMA fused decode chains** (knob `set_fused_decode`, default ON; env
+  `DASLLAMA_FUSED_DECODE`, profile `fused_decode`): attention block = ONE 3-stage chain
+  [qkv rows + bias/qk-norm/rope/kv-store per head slot] -> [attn heads + per-head wo-input
+  requant] -> [wo rows + bias + residual add]; dense FFN = ONE 2-stage chain [paired w1/w3 rows +
+  act + requant into new xq2/xs2 scratch] -> [w2 rows + residual add]. All the old serial glue
+  rides inside chunk epilogues. Backends need the new `mm_rows` row-range core (portable + both
+  arm64; x64 intrinsic tiers ledgered) — `kernel_backend_has_rows()` gates, per-layer fallback
+  to the per-op path (also: non-q8, pre_post_norm arches, head_size % 32 != 0, MoE FFN).
+- **Bit-exactness proven, not assumed:** test_fused_decode (new) compares 24 greedy steps
+  fused-vs-per-op — ids AND logits EXACTLY equal — on stories15M (FFN chain) and SmolLM2-135M
+  (both chains), under the auto backend on M1 (laneq rows core) AND under a pinned-portable
+  fresh load (the EPYC decode config, verified on the box). The hs=48 requant mis-slice the
+  first run caught -> the head_size % 32 gate. Suite 177/177 local AND box (NB the box suite's
+  gguf tests auto-select an x64 tier with no rows core, so suite-on-box exercises the FALLBACK;
+  the pinned-portable test run is the box's fused proof).
+- **Measured (1B, 24 lanes = 23w, portable-hybrid, gemv 128):** dispatches 81 -> **33/tok**
+  (16 attn_chain + 16 ffn_chain + cls). In-process interleaved A/B (new `DASLLAMA_FUSED_AB=N`
+  rail in llama3_perf — ABBA window order cancels KV-depth drift): **fused wins ALL 6 pairs,
+  mean +7.6%** (per-pair +1.8..+24%, median ~+5). Fresh-process bracket peak **124.0 t/s =
+  89% of lcpp 138.7** (campaign start 64%, session 3f 85%).
+- **WARNING: 96-lane defaults REGRESS under full fused: -9.2%** (4-pair in-process A/B, ON 63.0
+  vs OFF 69.4). Suspected: the attn chain's narrow stages (48 slots / 32 heads) leave most of 96
+  lanes at stage barriers where the per-op path lets them idle differently; ffn-only probe was
+  confounded (the 10M threshold un-threaded small ops in both arms; +1.8% under that config).
+  Default stays ON (knee = the campaign metric + every <=32-lane box wins); the defaults auto-
+  gate (e.g. lanes <= 2 x n_heads — the whole-wave rule extended to chains) is Boris's call.
+- Fresh-boot confirm of absolutes still pending (drift tonight as usual; in-process pairs are
+  the trustworthy numbers).
+
 ## Campaign method reminders
 - Correctness before speed; real-model tests = **small model, one run at a time** (the oracle
   path in `gptoss_parity_probe` is deliberately un-vectorized → slow; not a perf tool).

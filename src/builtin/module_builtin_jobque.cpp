@@ -800,6 +800,94 @@ namespace das {
         das_delete<Lambda>::clear(context, lambda);
     }
 
+    void team_parallel_stages_invoke ( const TArray<int3> & stages, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
+        // Multi-stage team dispatch (see JobQue::teamParallelForStages): one rendezvous, one join,
+        // internal barriers between stages. Each stage s of the array is int3(range_begin,
+        // range_end, num_chunks); the lambda is invoked as lambda(stage, job_begin, job_end) with
+        // the same chunk split as team_parallel_for. One lambda clone per worker for the WHOLE
+        // chain (the single-op path clones per op).
+        if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        int numStages = int(stages.size);
+        if ( numStages <= 0 ) {
+            das_delete<Lambda>::clear(context, lambda);
+            return;
+        }
+        if ( numStages > JobQue::MAX_TEAM_STAGES ) context->throw_error_at(lineinfo, "team_parallel_stages: at most %i stages", JobQue::MAX_TEAM_STAGES);
+        auto stageDef = (const int3 *)stages.data;
+        int actualChunks[JobQue::MAX_TEAM_STAGES];
+        int maxChunks = 0;
+        for ( int s = 0; s != numStages; ++s ) {
+            int total = stageDef[s].y - stageDef[s].x;
+            int want = stageDef[s].z;
+            actualChunks[s] = total <= 0 ? 0 : (want < 1 ? 1 : (want < total ? want : total));
+            maxChunks = actualChunks[s] > maxChunks ? actualChunks[s] : maxChunks;
+        }
+        int nW = g_jobQue->getNumWorkers();
+        if ( maxChunks <= 1 || nW == 0 || !g_jobQue->getTeamMode() ) {
+            // trivial/off: stages in order, one inline invoke per non-empty stage
+            for ( int s = 0; s != numStages; ++s ) {
+                if ( actualChunks[s] > 0 ) {
+                    das_invoke_lambda<void>::invoke(context, lineinfo, lambda, s, stageDef[s].x, stageDef[s].y);
+                }
+            }
+            das_delete<Lambda>::clear(context, lambda);
+            return;
+        }
+        // one lambda clone per WORKER, shared across all stages
+        vector<Context *> forkCtx(nW);
+        vector<char *> clonePtr(nW);
+        vector<shared_ptr<Context>> ownedCtx;   // non-pooled path: keep clones alive till the join
+        bool pooled = context->keepForkContexts.load(std::memory_order_relaxed);
+        if ( !pooled ) ownedCtx.resize(nW);
+        for ( int w = 0; w != nW; ++w ) {
+            Context * fc;
+            if ( pooled ) {
+                fc = context->acquireForkContext(uint32_t(ContextCategory::job_clone));
+            } else {
+                ownedCtx[w].reset(get_clone_context(context, uint32_t(ContextCategory::job_clone)));
+                ownedCtx[w]->sharedPtrContext = true;
+                fc = ownedCtx[w].get();
+            }
+            auto ptr = fc->allocate(lambdaSize + 16, lineinfo);
+            fc->heap->mark_comment(ptr, "new [[ ]] in team_parallel_stages");
+            memset(ptr, 0, lambdaSize + 16);
+            ptr += 16;
+            das_invoke_function<void>::invoke(fc, lineinfo, fn, ptr, lambda.capture);
+            forkCtx[w] = fc;
+            clonePtr[w] = ptr;
+        }
+        auto bound = daScriptEnvironment::getBound();
+        JobChunk works[JobQue::MAX_TEAM_STAGES];
+        JobQue::TeamStage teamStages[JobQue::MAX_TEAM_STAGES];
+        for ( int s = 0; s != numStages; ++s ) {
+            int rangeBegin = stageDef[s].x;
+            int total = stageDef[s].y - stageDef[s].x;
+            int nCh = actualChunks[s];
+            int chunkSz = nCh > 0 ? total / nCh : 0;
+            int rem = nCh > 0 ? total % nCh : 0;
+            works[s] = [&, s, rangeBegin, chunkSz, rem](int chunkIdx, int slot) {
+                int rb = rangeBegin + chunkIdx * chunkSz + (chunkIdx < rem ? chunkIdx : rem);
+                int re = rb + chunkSz + (chunkIdx < rem ? 1 : 0);
+                if ( slot == nW ) {
+                    das_invoke_lambda<void>::invoke(context, lineinfo, lambda, s, rb, re);
+                } else {
+                    daScriptEnvironment::setBound(bound);
+                    Lambda flambda(clonePtr[slot]);
+                    das_invoke_lambda<void>::invoke(forkCtx[slot], lineinfo, flambda, s, rb, re);
+                }
+            };
+            teamStages[s].work = &works[s];
+            teamStages[s].numChunks = nCh;
+        }
+        g_jobQue->teamParallelForStages(teamStages, numStages);
+        for ( int w = 0; w != nW; ++w ) {
+            Lambda flambda(clonePtr[w]);
+            das_delete<Lambda>::clear(forkCtx[w], flambda);
+            if ( pooled ) context->releaseForkContext(forkCtx[w]);
+        }
+        das_delete<Lambda>::clear(context, lambda);
+    }
+
     static atomic<int32_t> g_jobQueAvailable{0};
     static atomic<int32_t> g_jobQueTotalThreads{0};
 
@@ -1205,6 +1293,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(team_parallel_for_invoke)>(*this, lib,  "team_parallel_for_invoke",
                 SideEffects::modifyExternal, "team_parallel_for_invoke")
                     ->args({"range_begin","range_end","num_chunks","lambda","function","lambdaSize","context","line"});
+            addExtern<DAS_BIND_FUN(team_parallel_stages_invoke)>(*this, lib,  "team_parallel_stages_invoke",
+                SideEffects::modifyExternal, "team_parallel_stages_invoke")
+                    ->args({"stages","lambda","function","lambdaSize","context","line"});
             addExtern<DAS_BIND_FUN(withJobQue)>(*this, lib,  "with_job_que",
                 SideEffects::modifyExternal, "withJobQue")
                     ->args({"block","context","line"});

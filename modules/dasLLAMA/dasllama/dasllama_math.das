@@ -494,6 +494,12 @@ typedef RepackMx4Fn = function<(var np : uint8?; var ep : uint8?; n : int64; d :
 // to add-after (same add, same chain point). Bit-exact vs the per-region loop: the same per-row
 // dots, only scheduled in one parallel_for.
 typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// Row-range GEMV core: compute y rows [rb,re) of ONE [d x n] region (wp/sp at the region base,
+// like the mm slot) with NO internal dispatch — the caller owns the threading. This is what lets a
+// fused multi-stage decode chain (team_parallel_stages) serve matmul rows from inside its own
+// stage lambdas. Contract: rb/re are multiples of 32 (so interleaved 4-row-group layouts divide
+// evenly and Q8 block epilogues stay aligned); same per-row dots as the mm slot — bit-identical.
+typedef MatmulQ8Q8RowsFn = function<(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n : int64; rb : int64; re : int64) : void>
 typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
 // Region-list batched MXFP4·Q8 GEMM — the batch analog of MatmulMx4GroupNFn and the llama.cpp
 // mul_mat_id shape: ONE dispatch runs every routed expert's same-shape [d x n] GEMM over its own
@@ -527,6 +533,9 @@ struct KernelBackend {
     repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
     groupn : MatmulQ8Q8GroupNFn = @@q8q8_unset_groupn
     groupn_mx4 : MatmulMx4GroupNFn = @@mx4q8_unset_groupn
+    // Optional row-range GEMV core (see MatmulQ8Q8RowsFn) — backends without one keep the panic
+    // stub, and the fused multi-stage decode falls back to the per-op dispatch path.
+    mm_rows : MatmulQ8Q8RowsFn = @@q8q8_unset_rows
     needs_repack : bool
     // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the laneq byte-for-byte
     // expand map (expand_mx4_region_q8's direct-interleave branch): nibble byte `off` of block-
@@ -553,6 +562,8 @@ var g_mm_mx4q8_batch = @@mx4q8_unset_batch
 var g_mm_mx4q8_batch_groupn = @@mx4q8_unset_batch_groupn
 var g_mm_q8q8_groupn = @@q8q8_unset_groupn
 var g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
+var g_mm_q8q8_rows = @@q8q8_unset_rows
+var g_active_has_rows = false       // does the active backend carry a row-range GEMV core?
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 
@@ -597,6 +608,11 @@ def private mx4q8_unset_batch_groupn(var yp : float?; wn : uint8 const?; we : ui
 }
 [unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, bp, boffs, n, d)]
 def private q8q8_unset_groupn(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
+[unused_argument(yp, wp, sp, xqp, xsp, n, rb, re)]
+def private q8q8_unset_rows(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
+    // reachable with a registered backend: the slot is optional — gate on kernel_backend_has_rows()
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' provides no row-range GEMV core (mm_rows)")
+}
 [unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
 def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
 
@@ -609,6 +625,8 @@ def private activate(be : KernelBackend) {
     g_mm_mx4q8_batch_groupn = be.mx4_batch_groupn
     g_mm_q8q8_groupn = be.groupn
     g_mm_mx4q8_groupn = be.groupn_mx4
+    g_mm_q8q8_rows = be.mm_rows
+    g_active_has_rows = !(be.mm_rows == @@q8q8_unset_rows)
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
@@ -722,6 +740,18 @@ def select_matmul_backend_for_load() : bool {
 //! The active backend's name (diagnostics / tests). "" until a backend registers.
 def active_kernel_backend() : string {
     return g_active_backend
+}
+
+//! Does the active backend carry a row-range GEMV core (mm_rows)? The fused multi-stage decode
+//! chains gate on this and fall back to the per-op dispatch path when false.
+def kernel_backend_has_rows() : bool {
+    return g_active_has_rows
+}
+
+//! The active backend's row-range GEMV core (see MatmulQ8Q8RowsFn). Read it into a local in the
+//! MAIN context and capture that in worker lambdas — same rule as every kernel-pointer read.
+def mm_q8q8_rows_fn() : MatmulQ8Q8RowsFn {
+    return g_mm_q8q8_rows
 }
 
 //! Registered backend names (diagnostics / tests).

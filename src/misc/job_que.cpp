@@ -419,77 +419,117 @@ namespace das {
 
     bool JobQue::runTeamChunks ( int threadIndex, uint32_t & seqSeen ) {
         uint32_t seq = mTeamSeq.load(std::memory_order_acquire);
-        if ( seq == seqSeen ) return false;
+        if ( seq == seqSeen || (seq & 1) ) return false;   // nothing new, or publish in progress
+        // entrant gate (Dekker with the publisher): declare in-flight, then re-verify the seq.
+        // Publisher: bump seq to odd (seq_cst store), then read mTeamInFlight. Us: bump
+        // mTeamInFlight (seq_cst store), then read seq. Either the publisher sees us in-flight
+        // and waits, or we see its odd/new seq and back out — so the stage words can never be
+        // rewritten while any lane is inside the chain loop. That is the inter-chain stage-order
+        // guarantee: a straggler cannot claim a NEWER chain's stage-s chunk (whose stage s-1 it
+        // never synchronized with), because it cannot still be here when that chain publishes.
+        mTeamInFlight.fetch_add(1, std::memory_order_seq_cst);
+        uint32_t seq2 = mTeamSeq.load(std::memory_order_seq_cst);
+        if ( seq2 != seq ) {
+            mTeamInFlight.fetch_sub(1, std::memory_order_release);
+            return false;                                  // raced a publish — retry next poll
+        }
         seqSeen = seq;
         bool ran = false;
-        for (;;) {
-            // one fetch_add returns {numChunks, index} as a unit, so overflow (c >= K) self-
-            // describes — a straggler racing the next publish either gets {K_old, c >= K_old}
-            // (break) or a genuinely valid chunk of the new op (serve it; the acquire pairs with
-            // the publish store, so mTeamWork/mTeamRemaining are that op's). A valid claim's
-            // pending decrement blocks that op's join, which is what keeps mTeamWork stable
-            // (it points at the dispatcher's stack) for exactly as long as we can dereference it.
-            uint64_t claim = mTeamOp.fetch_add(1, std::memory_order_acq_rel);
-            uint32_t c = uint32_t(claim);
-            if ( c >= uint32_t(claim >> 32) ) break;
-            if ( mTeamProf ) {   // anatomy profiler: stamp this op's first/last worker claim
-                uint64_t t = uint64_t(ref_time_ticks());
-                uint64_t z = 0;
-                mTeamFirstClaimT.compare_exchange_strong(z, t, std::memory_order_relaxed);
-                mTeamLastClaimT.store(t, std::memory_order_relaxed);
+        int nStages = mTeamStageCount;
+        for ( int s = 0; s != nStages; ++s ) {
+            for (;;) {
+                // one fetch_add returns {numChunks, index} as a unit, so overflow (c >= K)
+                // self-describes and an index can never pair with another stage's count. A valid
+                // claim's pending decrement blocks this stage's barrier, which is what keeps
+                // mTeamWorkS (the dispatcher's stack) alive for exactly as long as we dereference it.
+                uint64_t claim = mTeamOpS[s].fetch_add(1, std::memory_order_acq_rel);
+                uint32_t c = uint32_t(claim);
+                if ( c >= uint32_t(claim >> 32) ) break;
+                if ( mTeamProf ) {   // anatomy profiler: stamp this chain's first/last worker claim
+                    uint64_t t = uint64_t(ref_time_ticks());
+                    uint64_t z = 0;
+                    mTeamFirstClaimT.compare_exchange_strong(z, t, std::memory_order_relaxed);
+                    mTeamLastClaimT.store(t, std::memory_order_relaxed);
+                }
+                (*mTeamWorkS[s])(int(c), threadIndex);
+                mTeamRemainingS[s].fetch_sub(1, std::memory_order_release);
+                ran = true;
             }
-            (*mTeamWork)(int(c), threadIndex);
-            mTeamRemaining.fetch_sub(1, std::memory_order_release);
-            ran = true;
+            // stage barrier: stage s+1 reads what stage s wrote, so wait for ALL of stage s —
+            // the acquire pairs with every serving lane's release decrement.
+            while ( mTeamRemainingS[s].load(std::memory_order_acquire) != 0 ) {
+                if ( mShutdown.load(std::memory_order_relaxed) ) { s = nStages - 1; break; }
+                jobque_spin_relax();
+            }
         }
+        mTeamInFlight.fetch_sub(1, std::memory_order_release);
         return ran;
     }
 
     void JobQue::teamParallelFor ( int numChunks, const JobChunk & work ) {
+        TeamStage stage = { &work, numChunks };
+        teamParallelForStages(&stage, 1);
+    }
+
+    void JobQue::teamParallelForStages ( const TeamStage * stages, int numStages ) {
+        DAS_ASSERT(numStages >= 1 && numStages <= MAX_TEAM_STAGES);
         int nW = mThreadCount.load();
-        if ( numChunks <= 1 || nW == 0 || !getTeamMode() ) {
-            for ( int c = 0; c != numChunks; ++c ) work(c, nW);
+        int maxChunks = 0;
+        for ( int s = 0; s != numStages; ++s ) maxChunks = das::max(maxChunks, stages[s].numChunks);
+        if ( maxChunks <= 1 || nW == 0 || !getTeamMode() ) {
+            // trivial/off: run the stages in order on the calling thread — same stage semantics
+            for ( int s = 0; s != numStages; ++s )
+                for ( int c = 0; c != stages[s].numChunks; ++c ) (*stages[s].work)(c, nW);
             return;
         }
         uint64_t t0 = 0, tp = 0, tc = 0;
         int callerChunks = 0;
+        int totalChunks = 0;
         if ( mTeamProf ) {
             t0 = uint64_t(ref_time_ticks());
             mTeamFirstClaimT.store(0, std::memory_order_relaxed);
             mTeamLastClaimT.store(0, std::memory_order_relaxed);
         }
-        mTeamWork = &work;
-        mTeamRemaining.store(numChunks, std::memory_order_relaxed);
-        // single-word publish: {numChunks, counter=0}. Claimers fetch_add this word, so an index
-        // can never pair with another op's chunk count — the straggler epoch race a separate
-        // counter + plain count field had (double-served chunk, lost decrement, dangling work).
-        mTeamOp.store(uint64_t(uint32_t(numChunks)) << 32, std::memory_order_seq_cst);
-        // seq_cst bump + parked check: the Dekker pair with the worker's parked++ / seq-check —
-        // either the parking worker sees this op, or we see it parked and pay the wake. No mutex
-        // touched while everyone spins (ggml's kickoff locks unconditionally; it can afford to at
-        // one publish per graph — we publish per op).
+        // publish, phase 1 (seqlock): odd seq = "publishing", then wait out in-flight stragglers
+        // of prior chains (normally none by join time — a lane lingers only for the tail of an
+        // overflow walk). Only after mTeamInFlight drains is it safe to rewrite the stage words.
+        mTeamSeq.fetch_add(1, std::memory_order_seq_cst);
+        while ( mTeamInFlight.load(std::memory_order_seq_cst) != 0 ) jobque_spin_relax();
+        mTeamStageCount = numStages;
+        for ( int s = 0; s != numStages; ++s ) {
+            mTeamWorkS[s] = stages[s].work;
+            mTeamRemainingS[s].store(stages[s].numChunks, std::memory_order_relaxed);
+            // {numChunks, counter=0} in one word — see runTeamChunks
+            mTeamOpS[s].store(uint64_t(uint32_t(stages[s].numChunks)) << 32, std::memory_order_relaxed);
+            totalChunks += stages[s].numChunks;
+        }
+        // publish, phase 2: even seq = "published". seq_cst bump + parked check: the Dekker pair
+        // with the worker's parked++ / seq-check — either the parking worker sees this chain, or
+        // we see it parked and pay the wake. No mutex touched while everyone spins.
         mTeamSeq.fetch_add(1, std::memory_order_seq_cst);
         if ( mParkedWorkers.load(std::memory_order_seq_cst) > 0 ) {
             lock_guard<mutex> lock(mFifoMutex);
             mCond.notify_all();
         }
         if ( mTeamProf ) tp = uint64_t(ref_time_ticks());
-        for (;;) {
-            uint64_t claim = mTeamOp.fetch_add(1, std::memory_order_acq_rel);
-            uint32_t c = uint32_t(claim);
-            if ( c >= uint32_t(claim >> 32) ) break;
-            work(int(c), nW);
-            mTeamRemaining.fetch_sub(1, std::memory_order_release);
-            ++callerChunks;
+        // caller serves every stage and participates in every barrier (slot nW)
+        for ( int s = 0; s != numStages; ++s ) {
+            for (;;) {
+                uint64_t claim = mTeamOpS[s].fetch_add(1, std::memory_order_acq_rel);
+                uint32_t c = uint32_t(claim);
+                if ( c >= uint32_t(claim >> 32) ) break;
+                (*stages[s].work)(int(c), nW);
+                mTeamRemainingS[s].fetch_sub(1, std::memory_order_release);
+                ++callerChunks;
+            }
+            if ( mTeamProf && s == numStages - 1 ) tc = uint64_t(ref_time_ticks());
+            // stage barrier / final join: acquire pairs with the workers' release decrements, so
+            // their chunk writes are visible. Unbounded spin — the tail is at most one chunk per lane.
+            while ( mTeamRemainingS[s].load(std::memory_order_acquire) != 0 ) jobque_spin_relax();
         }
-        if ( mTeamProf ) tc = uint64_t(ref_time_ticks());
-        // join: acquire pairs with the workers' release decrements, so their chunk writes are
-        // visible here. Unbounded spin — the tail is at most one chunk per worker.
-        while ( mTeamRemaining.load(std::memory_order_acquire) != 0 ) jobque_spin_relax();
-        mTeamWork = nullptr;
         if ( mTeamProf ) {
             uint64_t tj = uint64_t(ref_time_ticks());
-            mTPn++; mTPchunks += uint64_t(numChunks); mTPcallerChunks += uint64_t(callerChunks);
+            mTPn++; mTPchunks += uint64_t(totalChunks); mTPcallerChunks += uint64_t(callerChunks);
             mTPpub += tp - t0; mTPserve += tc - tp; mTPtail += tj - tc; mTPtotal += tj - t0;
             uint64_t fc = mTeamFirstClaimT.load(std::memory_order_relaxed);
             if ( fc ) { mTPreact += fc > tp ? fc - tp : 0; mTPreactN++; } else { mTPsolo++; }

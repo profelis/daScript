@@ -126,6 +126,17 @@ namespace das {
         bool getTeamMode () const { return mTeamMode.load(std::memory_order_relaxed) != 0; }
         int getNumWorkers () const { return mThreadCount.load(); }
         void teamParallelFor ( int numChunks, const JobChunk & work );   // work(chunkIndex, workerSlot); caller participates as slot getNumWorkers()
+        // Multi-stage team dispatch: one rendezvous, numStages dependent phases. Every lane
+        // (workers + caller) serves stage s chunks, then waits on that stage's remaining counter
+        // before advancing — stage s+1 may read anything stage s wrote. One publish + one join
+        // for the whole chain; the inter-stage barriers are worker-side spins, so a fused
+        // norm→matmul→matmul chain pays the dispatch rendezvous once instead of per op.
+        static constexpr int MAX_TEAM_STAGES = 4;
+        struct TeamStage {
+            const JobChunk * work;      // work(chunkIndex, workerSlot)
+            int numChunks;
+        };
+        void teamParallelForStages ( const TeamStage * stages, int numStages );
     protected:
         struct JobEntry {
             JobEntry( Job&& _function, JobCategory _category, JobPriority _priority) {
@@ -165,19 +176,26 @@ namespace das {
         atomic<int32_t> mSpinUs{0};
         atomic<int32_t> mFifoCount{0};  // lock-free mirror of mFifo.size() for the spin poll
     protected:
-        // team-mode publish slot. Publish order: work/remaining, then the mTeamOp single-word
-        // store {numChunks:32 | counter:32}, then the seq bump. Claimers fetch_add mTeamOp, so a
-        // claim carries its op's chunk count with the index — overflow (c >= K) self-describes,
-        // and an index can never pair with another op's count (the straggler epoch race a split
-        // counter + plain count field allowed). A valid claim's pending remaining-decrement blocks
-        // that op's join, which keeps mTeamWork (the dispatcher's stack) alive while dereferenced.
-        // mTeamSeq is only the publish generation: the park predicate + the workers' "anything
-        // new?" fast-path (so idle spinners don't touch mTeamOp).
+        // team-mode publish slots, one per stage. Publish protocol (seqlock + entrant gate):
+        // the dispatcher bumps mTeamSeq to ODD ("publishing"), waits for mTeamInFlight == 0,
+        // writes work/remaining/op words for every stage, then bumps mTeamSeq to EVEN. Workers
+        // enter with mTeamInFlight++ then re-verify the (even) seq — the seq_cst store/load pairs
+        // on both sides make it a Dekker: either the publisher sees the entrant and waits, or the
+        // entrant sees the odd/new seq and backs out. So no lane can hold a stage claim word
+        // while it is rewritten — which is what makes the INTER-CHAIN stage-order invariant hold
+        // (a straggler can never claim a later chain's stage-s chunk before that chain's stage
+        // s-1 completed, because it can't be inside the chain loop across a publish at all).
+        // Claim words still pack {numChunks:32 | counter:32} so a claim carries its stage's chunk
+        // count with the index (overflow self-describes, the single-op epoch-race fix). A valid
+        // claim's pending remaining-decrement blocks that stage's barrier, which keeps
+        // mTeamWorkS (the dispatcher's stack) alive while dereferenced.
         atomic<int32_t>  mTeamMode{0};
         atomic<uint32_t> mTeamSeq{0};
-        atomic<uint64_t> mTeamOp{0};
-        atomic<int32_t>  mTeamRemaining{0};
-        const JobChunk * mTeamWork = nullptr;
+        atomic<int32_t>  mTeamInFlight{0};
+        int              mTeamStageCount = 0;
+        atomic<uint64_t> mTeamOpS[MAX_TEAM_STAGES] = {};
+        atomic<int32_t>  mTeamRemainingS[MAX_TEAM_STAGES] = {};
+        const JobChunk * mTeamWorkS[MAX_TEAM_STAGES] = {};
         // workers currently in cond_wait — the publish-side wake gate. Dekker pair with mTeamSeq
         // (worker: parked++ then read seq; publisher: bump seq then read parked — all four seq_cst),
         // so either the worker sees the new op before sleeping or the publisher sees it parked.

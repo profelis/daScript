@@ -339,6 +339,23 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **x64 intrinsic backends lack the `mm_rows` row-range GEMV core (fused-chain fallback).** The
+  fused decode chains (team_parallel_stages, 2026-07-03) gate on `kernel_backend_has_rows()`;
+  portable + both arm64 backends carry the core, so the EPYC (profile-pinned portable) and M1
+  get the fused path — but an x64 box on auto-select (avx2-repack / acc8 / vnni tiers) falls
+  back to per-op dispatches. Fix = extract each x64 family's GEMV inner loop into a
+  `q8q8_rows_kernel_*` (mechanical, mirrors the arm64 extraction); worth ~the same join-tail
+  savings wherever an intrinsic tier ever beats tuned-portable at decode. Cost today: none on
+  the campaign boxes (both run backends that carry the core). (Spotted during the fused-dispatch
+  work, 2026-07-03.)
+- **Fused-chain follow-ups: MoE FFN chain + norm/quantize as a stage.** The 2026-07-03 fused
+  decode covers the attention block (all q8 arches, head_size %% 32 == 0) and the DENSE FFN;
+  gpt-oss's routed-expert FFN keeps its per-op groupn dispatches (3/layer) — a 2-stage MoE chain
+  (router serial, [experts' gate+up + act + requant] -> [downs + weighted reduce]) is the same
+  shape one level up. And each chain still has a serial ~3-6us norm+quantize prologue per block;
+  folding it in as a tiny stage-0 (chunked scale+quantize after a serial sum-of-squares) or
+  fusing norm INTO the quantize pass is the last serial glue. Sized: MoE chain ~= the dense win
+  for gpt-oss decode; norm-stage ~1%% at 1B. (Spotted during the fused-dispatch work, 2026-07-03.)
 - **DONE (perf pass, 2026-07-02): tied classifier matmuls the Q8 disk quants (`Model.cls_q8`).**
   Tied Q8 loads of a Q8_0 embedding (every tied model we run — probed all 11) transcode
   `token_embd` twice into qblob — a classifier copy at wcls_off (repacked with the other 2D

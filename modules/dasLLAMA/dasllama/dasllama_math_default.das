@@ -143,6 +143,18 @@ def private q8q8_batch_kernel(var yp : float?; wp : int8 const?; sp : float cons
     }
 }
 
+// Row-range core (mm_rows slot): rows [rb,re) of one region, no dispatch — the fused decode
+// chains thread it from their own stage lambdas. Same dot_q8q8 rows as q8q8_kernel. Not `private`:
+// invoked through the kernel pointer from lifted worker lambdas.
+def q8q8_rows_kernel(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
+    let nb = n / 32l
+    unsafe {
+        for (i in range64(rb, re)) {
+            yp[i] = dot_q8q8(wp + i * n, sp + i * nb, xqp, xsp, n)
+        }
+    }
+}
+
 def private q8q8_group3_kernel(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?;
                                woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) {
     let nb = n / 32l
@@ -327,5 +339,6 @@ def dasllama_math_default_register() {
         group3 = @@q8q8_group3_kernel, repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel,
         mx4_batch = @@mx4q8_batch_kernel, mx4_batch_groupn = @@mx4q8_batch_groupn_kernel,
         groupn = @@q8q8_groupn_kernel, groupn_mx4 = @@mx4q8_groupn_kernel,
+        mm_rows = @@q8q8_rows_kernel,
         needs_repack = false, priority = 0))
 }

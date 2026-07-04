@@ -1213,6 +1213,12 @@ struct Session {
     logits : array<float>     // output logits (vocab_size)
     xq : array<int8>          // activation quantized to Q8 (sized max(dim, hidden_dim)) for the Q8·Q8 kernel
     xs : array<float>         // per-block activation scales (sized max(dim, hidden_dim) / 32)
+    // fused decode-chain scratch (team_parallel_stages): the FFN chain's stage-0 workers requant
+    // their activated-hidden rows while OTHER chunks still read the input quants in xq/xs, so the
+    // requant needs its own buffers; chain_stages is the reused stage-def array (no per-layer alloc)
+    xq2 : array<int8>         // activated-hidden requant quants (ffn width)
+    xs2 : array<float>        // ... and their scales (ffn width / 32)
+    chain_stages : array<int3>  // stage defs, int3(range_begin, range_end, num_chunks)
     key_cache : array<float>  // (n_layers * seq_len * kv_dim)
     value_cache : array<float>
     // batched prefill scratch — empty until forward_prefill sizes them to npos × ... (see forward_prefill)
@@ -1323,6 +1329,9 @@ def make_run_state(c : Config) : Session {
     let maxn = max(xdim, ffw)   // the Q8·Q8 path quantizes whichever activation feeds a matmul
     s.xq |> resize(maxn)
     s.xs |> resize(maxn / 32l)
+    s.xq2 |> resize(ffw)        // fused-FFN chain requant (see the Session field comment)
+    s.xs2 |> resize(ffw / 32l)
+    s.chain_stages |> resize(3)
     s.key_cache |> resize(c.seq_len * kv_row_total(c))
     s.value_cache |> resize(c.seq_len * kv_row_total(c))
     s.sample_scratch |> resize(c.vocab_size)
@@ -1390,6 +1399,7 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "matmul_min_chunk_rows") $(v) { set_matmul_min_chunk_rows(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "matmul_min_chunk_rows_gemv") $(v) { set_matmul_min_chunk_rows_gemv(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "gemv_wave_fill") $(v) { set_gemv_wave_fill(v != 0l) }
+    apply_i64_knob(rt, "fused_decode") $(v) { set_fused_decode(v != 0l) }
     // stored only — the queue may not exist yet; setup_dasllama_jobque applies these inside with_job_que
     apply_i64_knob(rt, "jobque_spin_us") $(v) { set_jobque_spin_us(v) }
     apply_i64_knob(rt, "jobque_join_poll") $(v) { set_jobque_join_poll(v) }
@@ -1935,7 +1945,309 @@ def has_dual_rope(c : Config) : bool => (c.sliding_window > 0l
 // here without touching forward(). Bit-identical to the inlined form.
 
 // attn-norm → QKV(+bias) → RoPE → KV-store → GQA multi-head attention → out-proj(+post-norm) → residual.
+// Can layer l's attention run as the fused 3-stage chain? Std shape only: Q8 weights, group3
+// layout (no V-from-K), no post-block norm, table rope. Also needs team mode, a backend row core,
+// and the same size threshold the group3 fuse gates on.
+def private fused_attn_ok(t : Model; l : int64) : bool {
+    let c = t.config
+    // head_size % 32: the per-head epilogues slice on head boundaries, and the wo-input requant
+    // needs whole 32-quant groups per head (real targets are 64/128/256; stories15M's 48 falls back)
+    return (g_fused_decode && t.quant == QuantMode.q8 && !c.pre_post_norm && g_use_rope_table
+        && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
+        && get_jobque_team_mode() && kernel_backend_has_rows()
+        && c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)) >= g_matmul_par_threshold)
+}
+
+// Fused attention block: ONE team rendezvous runs [qkv rows + bias/qk-norm/rope/kv-store] →
+// [attn heads + per-head wo-input requant] → [wo rows + bias + residual add] as three stages
+// (team_parallel_stages). Bit-identical to attention_std_decode — the same backend row dots, the
+// same per-head norm/rope/store/softmax order, the same adds — only the scheduling changes: the
+// per-op fork/joins collapse into worker-side stage barriers, and every piece of serial glue
+// between the old dispatches becomes a chunk-local epilogue. Stage geometry: stage 0 splits over
+// HEAD slots (q heads, then k heads, then v heads — each head_size rows, so rope/norm/store are
+// chunk-local), stage 1 over query heads, stage 2 over 32-row output groups.
+def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let kv_dim = layer_kv_dim(c, l)
+    let head_size = layer_head_size(c, l)
+    let n_heads = c.n_heads
+    let n_kv_heads = layer_n_kv_heads(c, l)
+    let qd = n_heads * head_size
+    let kv_mul = n_heads / n_kv_heads
+    let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
+    let loff = kv_cache_off(t, l)
+    let is_sliding = layer_is_sliding(c, l)
+    let kstart = (is_sliding && pos + 1l > c.sliding_window) ? (pos + 1l - c.sliding_window) : 0l
+    let cnt = pos + 1l - kstart
+    // attention rmsnorm + input quantize (serial — dim-sized, microseconds)
+    let ts_norm0 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
+    quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+    prof_add("norm", ts_norm0)
+    let ts_chain = ref_time_ticks()
+    // stage geometry (same grain math as the per-op dispatches; the C++ side clamps chunks <= range)
+    let nslots = int(n_heads + 2l * n_kv_heads)
+    let n0 = matmul_chunks_gemv(int(qd + 2l * kv_dim), get_dispatch_lanes())
+    let n1 = get_dispatch_lanes()
+    let ngrp = int(dim / 32l)
+    let n2 = matmul_chunks_gemv(int(dim), get_dispatch_lanes())
+    s.chain_stages |> resize(3)
+    s.chain_stages[0] = int3(0, nslots, n0)
+    s.chain_stages[1] = int3(0, int(n_heads), n1)
+    s.chain_stages[2] = int3(0, ngrp, n2)
+    count_parallel_dispatch(min(n0, nslots) + min(n1, int(n_heads)) + min(n2, ngrp))
+    let mmrows = mm_q8q8_rows_fn()
+    let neox = c.rope_neox
+    let eps = c.norm_eps
+    let seq_len = c.seq_len
+    let attn_softcap = c.attn_logit_softcap
+    let kvoff = loff + pos * kv_dim
+    unsafe {
+        // activations / scratch — raw pointers only (the stage lambda runs in fork contexts)
+        var qp = addr(s.q[0])
+        var kp = addr(s.k[0])
+        var vp = addr(s.v[0])
+        var xbp = addr(s.xb[0])
+        var xb2p = addr(s.xb2[0])
+        var xp = addr(s.x[0])
+        var attp = addr(s.att[0])
+        var xqp = addr(s.xq[0])
+        var xsp = addr(s.xs[0])
+        var kcp = addr(s.key_cache[0])
+        var vcp = addr(s.value_cache[0])
+        // weight region bases (element offsets into the Q8 blob, scales at /32)
+        let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
+        let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        let wpq = wqb + t.wq_offs[l]
+        let wsq = wsb + t.wq_offs[l] / 32l
+        let wpk = wqb + t.wk_offs[l]
+        let wsk = wsb + t.wk_offs[l] / 32l
+        let wpv = wqb + t.wv_offs[l]
+        let wsv = wsb + t.wv_offs[l] / 32l
+        let wpo = wqb + t.wo_offs[l]
+        let wso = wsb + t.wo_offs[l] / 32l
+        // this position's rope table row (dual-rope arches: the sliding class's row)
+        let swa_row = is_sliding && has_dual_rope(c)
+        let crow = swa_row ? reinterpret<float const?>(addr(s.rope_cos_swa[0])) : reinterpret<float const?>(addr(s.rope_cos[0]))
+        let srow = swa_row ? reinterpret<float const?>(addr(s.rope_sin_swa[0])) : reinterpret<float const?>(addr(s.rope_sin[0]))
+        // optional per-arch epilogues (null = off): qkv bias, per-head q/k norm, weightless v norm,
+        // attention sinks, wo bias
+        let bqp = c.attn_qkv_bias ? reinterpret<float const?>(addr(t.bq[0])) : null
+        let bkp = c.attn_qkv_bias ? reinterpret<float const?>(addr(t.bk[0])) : null
+        let bvp = c.attn_qkv_bias ? reinterpret<float const?>(addr(t.bv[0])) : null
+        let rqp = c.qk_norm ? reinterpret<float const?>(addr(t.fblob[t.rms_q_offs[l]])) : null
+        let rkp = c.qk_norm ? reinterpret<float const?>(addr(t.fblob[t.rms_k_offs[l]])) : null
+        let rvp = c.v_norm ? reinterpret<float const?>(addr(t.fblob[t.rms_ones_off])) : null
+        let sinksp = c.attn_sinks ? reinterpret<float const?>(addr(t.fblob[t.sinks_off + l * n_heads])) : null
+        let bop = c.attn_out_bias ? reinterpret<float const?>(addr(t.bo[0])) : null
+        let bqoff = l * qd
+        let bkvoff = l * kv_dim
+        let booff = l * dim
+        team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
+            if (stage == 0) {
+                // qkv rows by head slot; per-slot epilogue = bias → norm → rope → cache store
+                unsafe {
+                    for (slot in range(jb, je)) {
+                        let sl = int64(slot)
+                        if (sl < n_heads) {
+                            let r0 = sl * head_size
+                            invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r0, r0 + head_size)
+                            if (bqp != null) {
+                                for (i in range64(r0, r0 + head_size)) {
+                                    qp[i] += bqp[bqoff + i]
+                                }
+                            }
+                            if (rqp != null) {
+                                rmsnorm(qp + r0, qp + r0, rqp, head_size, eps)
+                            }
+                            if (neox) {
+                                rope_scaled_neox_tab(qp + r0, head_size, head_size, crow, srow)
+                            } else {
+                                rope_scaled_tab(qp + r0, head_size, head_size, crow, srow)
+                            }
+                        } elif (sl < n_heads + n_kv_heads) {
+                            let r0 = (sl - n_heads) * head_size
+                            invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r0 + head_size)
+                            if (bkp != null) {
+                                for (i in range64(r0, r0 + head_size)) {
+                                    kp[i] += bkp[bkvoff + i]
+                                }
+                            }
+                            if (rkp != null) {
+                                rmsnorm(kp + r0, kp + r0, rkp, head_size, eps)
+                            }
+                            if (neox) {
+                                rope_scaled_neox_tab(kp + r0, head_size, head_size, crow, srow)
+                            } else {
+                                rope_scaled_tab(kp + r0, head_size, head_size, crow, srow)
+                            }
+                            copy_floats(kcp + kvoff + r0, kp + r0, head_size)
+                        } else {
+                            let r0 = (sl - n_heads - n_kv_heads) * head_size
+                            invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r0 + head_size)
+                            if (bvp != null) {
+                                for (i in range64(r0, r0 + head_size)) {
+                                    vp[i] += bvp[bkvoff + i]
+                                }
+                            }
+                            if (rvp != null) {
+                                rmsnorm(vp + r0, vp + r0, rvp, head_size, eps)
+                            }
+                            copy_floats(vcp + kvoff + r0, vp + r0, head_size)
+                        }
+                    }
+                }
+            } elif (stage == 1) {
+                // multi-head attention (the attention_std_decode worker body) + per-head requant of
+                // the wo input — each head's xb slice is final here, and head_size % 32 == 0, so the
+                // quant groups are chunk-local. Overwrites xq/xs; stage 0 (the only reader of the
+                // input quants) is complete by the stage barrier.
+                unsafe {
+                    for (h in range(jb, je)) {
+                        let hh = int64(h)
+                        let qoff = hh * head_size
+                        let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
+                        var arow = attp + hh * seq_len          // scores for keys kstart..pos
+                        for (j in range64(cnt)) {
+                            let koff = loff + (kstart + j) * kv_dim + kvhoff
+                            arow[j] = dot(qp + qoff, kcp + koff, head_size) * scale
+                        }
+                        if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
+                            softcap(arow, cnt, attn_softcap)
+                        }
+                        if (sinksp != null) {  // gpt-oss: this head's sink logit joins the softmax denominator
+                            softmax_sink(arow, cnt, sinksp[hh])
+                        } else {
+                            softmax(arow, cnt)
+                        }
+                        // weighted sum of values into xb[qoff..]
+                        for (i in range64(head_size)) {
+                            xbp[qoff + i] = 0.0
+                        }
+                        for (j in range64(cnt)) {
+                            let voff = loff + (kstart + j) * kv_dim + kvhoff
+                            axpy(xbp + qoff, vcp + voff, arow[j], head_size)
+                        }
+                        quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
+                    }
+                }
+            } else {
+                // output projection rows + optional bias + residual add, all chunk-local
+                unsafe {
+                    let r0 = int64(jb) * 32l
+                    let r1 = int64(je) * 32l
+                    invoke(mmrows, xb2p, wpo, wso, xqp, xsp, qd, r0, r1)
+                    if (bop != null) {
+                        for (i in range64(r0, r1)) {
+                            xb2p[i] += bop[booff + i]
+                        }
+                    }
+                    add_inplace(xp + r0, xb2p + r0, r1 - r0)
+                }
+            }
+        }
+    }
+    prof_add("attn_chain", ts_chain)
+}
+
+// Can the dense FFN run as the fused 2-stage chain? Q8, no post-block norm/scale, team mode +
+// a backend row core, and the size threshold.
+def private fused_ffn_ok(t : Model) : bool {
+    let c = t.config
+    return (g_fused_decode && t.quant == QuantMode.q8 && !c.pre_post_norm && !c.layer_out_scale
+        && get_jobque_team_mode() && kernel_backend_has_rows()
+        && c.dim * c.hidden_dim >= g_matmul_par_threshold)
+}
+
+// Fused dense FFN block: ONE team rendezvous runs [w1+w3 rows + act + requant] → [w2 rows +
+// residual add] as two stages. Stage 0 splits over 32-row groups of the hidden dim with gate and
+// up rows PAIRED per chunk, so the act(g)*u epilogue and the w2-input requant are chunk-local;
+// the requant lands in xq2/xs2 (NOT xq/xs — other stage-0 chunks are still reading the input
+// quants). Bit-identical to ffn_dense_decode's Q8 path — same dots, same act formula, same
+// quant groups, same adds.
+def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let hidden = c.hidden_dim
+    let ts_norm1 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
+    quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+    prof_add("norm", ts_norm1)
+    let ts_chain = ref_time_ticks()
+    let mmrows = mm_q8q8_rows_fn()
+    let is_gelu = c.ffn_act == FfnAct.gelu
+    let is_oai = c.ffn_act == FfnAct.swiglu_oai
+    let vec = g_act_vec
+    let ngrp0 = int(hidden / 32l)
+    let ngrp1 = int(dim / 32l)
+    let n0 = matmul_chunks_gemv(int(hidden), get_dispatch_lanes())
+    let n1 = matmul_chunks_gemv(int(dim), get_dispatch_lanes())
+    s.chain_stages |> resize(2)
+    s.chain_stages[0] = int3(0, ngrp0, n0)
+    s.chain_stages[1] = int3(0, ngrp1, n1)
+    count_parallel_dispatch(min(n0, ngrp0) + min(n1, ngrp1))
+    unsafe {
+        var xp = addr(s.x[0])
+        var xbp = addr(s.xb[0])
+        var gup = addr(s.ffn_gu[0])
+        var xqp = addr(s.xq[0])
+        var xsp = addr(s.xs[0])
+        var xq2p = addr(s.xq2[0])
+        var xs2p = addr(s.xs2[0])
+        let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
+        let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        let w1o = t.w1_off + l * dim * hidden
+        let w3o = t.w3_off + l * dim * hidden
+        let w2o = t.w2_off + l * hidden * dim
+        let wp1 = wqb + w1o
+        let ws1 = wsb + w1o / 32l
+        let wp3 = wqb + w3o
+        let ws3 = wsb + w3o / 32l
+        let wp2 = wqb + w2o
+        let ws2 = wsb + w2o / 32l
+        team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
+            unsafe {
+                let r0 = int64(jb) * 32l
+                let r1 = int64(je) * 32l
+                if (stage == 0) {
+                    // paired gate/up rows, then act + requant on exactly these rows
+                    invoke(mmrows, gup, wp1, ws1, xqp, xsp, dim, r0, r1)
+                    invoke(mmrows, gup + hidden, wp3, ws3, xqp, xsp, dim, r0, r1)
+                    if (vec) {
+                        if (is_gelu) {
+                            geglu4(gup + r0, gup + hidden + r0, r1 - r0)
+                        } elif (is_oai) {
+                            swiglu_oai4(gup + r0, gup + hidden + r0, r1 - r0)
+                        } else {
+                            swiglu4(gup + r0, gup + hidden + r0, r1 - r0)
+                        }
+                    } else {
+                        if (is_gelu) {
+                            geglu(gup + r0, gup + hidden + r0, r1 - r0)
+                        } elif (is_oai) {
+                            swiglu_oai(gup + r0, gup + hidden + r0, r1 - r0)
+                        } else {
+                            swiglu(gup + r0, gup + hidden + r0, r1 - r0)
+                        }
+                    }
+                    quantize_q8_0_into_ptr(gup + r0, r1 - r0, xq2p, xs2p, r0, r0 / 32l)
+                } else {
+                    // down-projection rows + residual add
+                    invoke(mmrows, xbp, wp2, ws2, xq2p, xs2p, hidden, r0, r1)
+                    add_inplace(xp + r0, xbp + r0, r1 - r0)
+                }
+            }
+        }
+    }
+    prof_add("ffn_chain", ts_chain)
+}
+
 def private attention_std_decode(t : Model; var s : Session; l : int64; pos : int64) {
+    if (fused_attn_ok(t, l)) {
+        attention_chain_decode(t, s, l, pos)
+        return
+    }
     let c = t.config
     let dim = c.dim
     let kv_dim = layer_kv_dim(c, l)
@@ -2078,6 +2390,10 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
 
 // ffn-norm → gated FFN (act(W1·x) * (W3·x)) → down-proj(+post-norm) → residual.
 def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
+    if (fused_ffn_ok(t)) {
+        ffn_chain_decode(t, s, l)
+        return
+    }
     let c = t.config
     let dim = c.dim
     let hidden = c.hidden_dim
@@ -2532,6 +2848,25 @@ def set_prefill_attn_mode(m : AttnPrefillMode) {
 //! The prefill attention algorithm currently selected.
 def get_prefill_attn_mode() : AttnPrefillMode {
     return g_attn_prefill_mode
+}
+
+// Fused decode chains: ONE multi-stage team dispatch per attention block (qkv→attn→wo) and per
+// dense-FFN block (w1/w3→w2) instead of one per matmul — team_parallel_stages replaces the per-op
+// rendezvous with worker-side stage barriers, and the serial glue (rope, kv store, activation,
+// requant, residual adds) rides inside the stages' chunk epilogues. Bit-identical to the per-op
+// path (same row dots, same per-element order); requires team mode + a backend row core
+// (kernel_backend_has_rows) — per-layer gates fall back to the std path otherwise.
+var g_fused_decode = true
+
+//! Select the decode dispatch shape: fused per-block stage chains (default true) vs one dispatch
+//! per matmul. Bit-identical either way — A/B benchmarking toggle.
+def set_fused_decode(on : bool) {
+    g_fused_decode = on
+}
+
+//! Whether decode uses the fused per-block stage chains.
+def get_fused_decode() : bool {
+    return g_fused_decode
 }
 
 // Prefill RoPE: when true (default) precompute the cos/sin table once per prefill and look it up;

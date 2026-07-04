@@ -698,6 +698,32 @@ def private q8q8_group3_kernel_neon_laneq(var y0p : float?; var y1p : float?; va
     }
 }
 
+// Row-range cores (mm_rows slot): rows [rb,re) of one region, no dispatch — the fused decode
+// chains thread these from their own stage lambdas. Same dots as the mm kernels. Not `private`:
+// invoked through the kernel pointer from lifted worker lambdas. rb/re are multiples of 32 (the
+// slot contract), so the laneq form's 4-row groups divide evenly.
+def q8q8_rows_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
+    let nb = n / 32l
+    unsafe {
+        for (i in range64(rb, re)) {
+            yp[i] = dot_q8q8_sdot4x4(wp + i * n, sp + i * nb, xqp, xsp, n)
+        }
+    }
+}
+
+def q8q8_rows_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
+    let nb = n / 32l
+    unsafe {
+        for (g in range64(rb / 4l, re / 4l)) {
+            let f = dot_q8q8_laneq4(wp + g * 4l * n, sp + g * 4l * nb, xqp, xsp, n)
+            yp[g * 4l + 0l] = f.x
+            yp[g * 4l + 1l] = f.y
+            yp[g * 4l + 2l] = f.z
+            yp[g * 4l + 3l] = f.w
+        }
+    }
+}
+
 [init]
 def dasllama_math_aarch64_neon_register() {
     // Only register the SDOT backends under JIT on arm64. Off-JIT (interpreter or AOT) sdot4/sdot4_laneq
@@ -710,6 +736,7 @@ def dasllama_math_aarch64_neon_register() {
             batch = @@q8q8_batch_kernel_neon_sdot4x4, group3 = @@q8q8_group3_kernel_neon_sdot4x4,
             repack = @@repack_q8q8_identity, mm_mx4 = @@mx4q8_kernel_neon,
             groupn = @@q8q8_groupn_kernel_neon_sdot4x4, groupn_mx4 = @@mx4q8_groupn_kernel_neon,
+            mm_rows = @@q8q8_rows_kernel_neon_sdot4x4,
             needs_repack = false, priority = 10))
         // arm64-laneq: laneq + interleaved repack — the highest priority (20), but needs_repack, so only
         // select_matmul_backend_for_load (at Q8 model load, which then repacks) activates it. Its mx4
@@ -718,6 +745,7 @@ def dasllama_math_aarch64_neon_register() {
             batch = @@q8q8_batch_kernel_neon_laneq, group3 = @@q8q8_group3_kernel_neon_laneq,
             repack = @@repack_q8q8_neon, mm_mx4 = @@mx4q8_kernel_neon_laneq, repack_mx4 = @@repack_mx4_neon,
             groupn = @@q8q8_groupn_kernel_neon_laneq, groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq,
+            mm_rows = @@q8q8_rows_kernel_neon_laneq,
             needs_repack = true, mx4_expand_interleaved = true, priority = 20))
     }
 }

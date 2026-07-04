@@ -186,6 +186,7 @@ namespace das {
     DAS_API void set_jobque_team_mode ( bool on, Context * context, LineInfoArg * at );
     DAS_API bool get_jobque_team_mode ( Context * context, LineInfoArg * at );
     DAS_API void team_parallel_for_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );
+    DAS_API void team_parallel_stages_invoke ( const TArray<int3> & stages, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );
     DAS_API bool jobque_try_run_one ( Context * context, LineInfoArg * at );
     DAS_API void new_thread_invoke ( Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );
     DAS_API void withJobQue ( const TBlock<void> & block, Context * context, LineInfoArg * lineInfo );
