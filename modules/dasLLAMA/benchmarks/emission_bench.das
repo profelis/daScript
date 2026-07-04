@@ -90,6 +90,7 @@ def main() {
     let np = max(cfg.nprompts, 1)
     let plen = max(int64(cfg.plen), 1l)
     let ngen = max(int64(cfg.ngen), 2l)
+    apply_box_profile_runtime()   // the tuned per-box stack (backend/batch pins, grains) — what load_model users get
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)
     t.config.seq_len = min(t.config.seq_len, plen + ngen + 8l)   // cap the KV allocation

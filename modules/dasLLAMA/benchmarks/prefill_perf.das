@@ -30,6 +30,7 @@ def main {
     if (!empty(args) && ends_with(args[length(args) - 1], ".gguf")) {
         path = args[length(args) - 1]
     }
+    apply_box_profile_runtime()   // the tuned per-box stack first; the env pins below override it
     // backend pin for A/B on one binary — must land BEFORE load_gguf:
     // select_matmul_backend_for_load honors the pin at load, which decides repack
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
