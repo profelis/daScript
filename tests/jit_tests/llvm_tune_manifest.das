@@ -22,7 +22,8 @@ def private spawn_client(cmd : string; var lines : array<string>) : int {
             }
             while (!feof(f)) {
                 let ln = fgets(f)
-                if (ln |> starts_with("WRITE ") || ln |> starts_with("RESULT ") || ln |> starts_with("KV ") || ln |> starts_with("llvm_tune:")) {
+                if (ln |> starts_with("WRITE ") || ln |> starts_with("RESULT ") || ln |> starts_with("KV ")
+                        || ln |> starts_with("OTHER ") || ln |> starts_with("REF ") || ln |> starts_with("llvm_tune:")) {
                     lines |> push(strip("{ln}"))
                 }
             }
@@ -67,14 +68,20 @@ def test_llvm_tune_manifest_roundtrip(t : T?) {
     var stamped = false
     var result7 = false
     var kv2 = false
+    var other6 = false
+    var ref5 = false
     for (ln in rlines) {
         stamped ||= ln |> starts_with("llvm_tune: man_add <- k2")
         result7 ||= ln == "RESULT 7"
         kv2 ||= ln == "KV 2"
+        other6 ||= ln == "OTHER 6"
+        ref5 ||= ln == "REF 5"
     }
     t |> success(stamped)  // the declaration's re-stamp consumed the manifest
     t |> success(result7)  // and the k2 tier actually ran
     t |> success(kv2)      // and the companion was re-stamped from the same entry
+    t |> success(other6)   // no manifest entry -> the fallback stamp (k1) stands
+    t |> success(ref5)     // explicit "reference" entry -> the original body despite fallback
 
     remove(manifestPath)
     remove(clientPath)

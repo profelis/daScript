@@ -91,8 +91,11 @@ each carrying `[llvm_code(name = "addunroller", ...)]` with different arguments.
 
 **The manifest:**
 
-- JSON, sits **next to the app**. No manifest → default stamping everywhere. Manifest
-  present → authoritative, no defaults.
+- JSON, sits **next to the app**. Resolution per function: manifest entry > the annotation's
+  `fallback=` perm > reference body — a manifest with no entry for a function falls through
+  to its fallback (M4, Boris: a stale manifest written before a kernel family landed must not
+  silently drop it to the reference tier); an explicit `"reference"` entry forces the
+  original body.
 - Keys are **function names** — the best persistent ID the language has (no GUIDs
   embeddable; "function's loop N" by index is fragile under edits but accepted).
 - Values are stamping instructions: *"stamp this function with this macro with these
@@ -455,10 +458,16 @@ repack → parity within tolerance; nb-even/odd small shapes exact — kstep4's 
 is straight-line, the regroup only fires in the 4-block main loop). The kstep2-mr4 fallback's
 machine code stays 289/289 identical to the M2 baseline.
 
-**Still open in M4:** fleet re-sweep with the mr8 winner (slice C — needs the gen backend
-reachable from app runs: pin rail or require-chain decision), loop-hint manifest kind,
-per-regime/per-slot perms (GEMV sub-family unlocks deleting the hand mm tiers), Zen2/EPYC
-legs, hand-tier deletion.
+**Manifest missing-entry semantics flipped (same day, Boris):** entry > `fallback=` >
+reference, on both the env path and the `[tune_manifest]` re-stamp (which now leaves
+functions without an entry untouched instead of stripping them to reference). `"reference"`
+stays expressible as an explicit entry. Pinned by llvm_tune_manifest's OTHER/REF assertions
+and a GEMM-client env-path check (missing entry → `kstep2 (fallback)` in the stamp log).
+
+**Still open in M4:** fleet re-sweep with the mr8 winner (slice C — wire emission_bench to
+require dasllama_math_gen + pin_kernel_backend), loop-hint manifest kind, per-regime/per-slot
+perms (GEMV sub-family unlocks deleting the hand mm tiers), Zen2/EPYC legs, hand-tier
+deletion.
 
 ## Pointers
 

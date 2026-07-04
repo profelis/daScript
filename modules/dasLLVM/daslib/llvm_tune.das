@@ -19,11 +19,12 @@ require llvm/daslib/llvm_code public
 //! (between the perm rows and `tune`) stamp sibling functions with the SAME perm from the same
 //! manifest entry — the two-function stamp (a kernel and its repack-layout query can never
 //! desync). `DAS_TUNE_MODE` selects the compile-time mode:
-//!  - normal (default): stamp exactly one winner onto the function itself — the manifest entry
-//!    when a manifest exists (authoritative: no entry means reference body), else the
-//!    `fallback=` perm, else the reference body. No variant stubs are emitted; the
-//!    `<name>_variants()` registry still exists (reference row only) so harness code
-//!    compiles in every mode.
+//!  - normal (default): stamp exactly one winner onto the function itself — the manifest
+//!    entry when one exists, else the `fallback=` perm, else the reference body (a manifest
+//!    with no entry for a function falls through to its fallback — new kernel families must
+//!    not be dropped to the reference tier by a stale manifest; an explicit "reference"
+//!    entry forces the original body). No variant stubs are emitted; the `<name>_variants()`
+//!    registry still exists (reference row only) so harness code compiles in every mode.
 //!  - tune / test: stamp the full grid as `<name>__<suffix>` clones plus a `<name>_variants()`
 //!    registry; a harness benches them (tune, then `tune_manifest_set` the winner) or
 //!    bit-exact-gates every variant against the reference row (test).
@@ -389,17 +390,22 @@ class private TuneAnnotation : AstFunctionAnnotation {
             delete comps
             return false
         }
-        // normal: an env-pinned manifest is authoritative when present; else fallback=.
-        // An app's [tune_manifest] declaration lives in the root module, which compiles after
-        // every library [tune] — its apply re-stamps the tuned functions from the declared
-        // manifest (see TuneManifestAnnotation below).
+        // normal: manifest entry > fallback= > reference. A manifest with no entry for this
+        // function falls back to the declared fallback= (a manifest written before a kernel
+        // family landed must not silently drop that family to the reference tier); an
+        // explicit "reference" entry forces the original body. An app's [tune_manifest]
+        // declaration lives in the root module, which compiles after every library [tune] —
+        // its apply re-stamps the tuned functions from the declared manifest (see
+        // TuneManifestAnnotation below).
         let fname = "{func.name}"
         var manifestFound = false
         var manifest <- read_manifest(get_env_variable("DAS_TUNE_MANIFEST"), manifestFound)
         var suffix = ""
         if (manifestFound) {
             suffix = manifest?[fname] ?? ""
-        } else {
+        }
+        let fromManifest = !empty(suffix)
+        if (empty(suffix)) {
             let fv = find_arg(args, "fallback")
             if (fv is tString) { suffix = fv as tString }
         }
@@ -413,7 +419,7 @@ class private TuneAnnotation : AstFunctionAnnotation {
                     for (c in comps) {
                         stamp_llvm_code(c.fn, c.genkey, p)
                     }
-                    print("llvm_tune: {fname} <- {suffix} ({manifestFound ? tune_manifest_path() : "fallback"})\n")
+                    print("llvm_tune: {fname} <- {suffix} ({fromManifest ? tune_manifest_path() : "fallback"})\n")
                     ok = true
                     break
                 }
@@ -468,9 +474,17 @@ def private strip_llvm_code(var fn : FunctionPtr) {
 
 // re-stamp one tuned function from the declared manifest: the grid, generator key and
 // companions are re-read from its attached [tune]/[tune_perm]/[tune_companion] declarations,
-// the fallback [llvm_code] stamps are dropped (companions included), and the manifest entry —
-// authoritative while the manifest exists — is stamped onto the function and its companions
+// the fallback [llvm_code] stamps are dropped (companions included), and the manifest entry
+// is stamped onto the function and its companions. NO entry keeps the [tune]-time stamps
+// (fallback= or reference) untouched — a manifest written before this kernel family landed
+// must not silently drop it to the reference tier; an explicit "reference" entry forces the
+// original body.
 def private restamp_fn(var fn : FunctionPtr; mod : Module?; manifest : table<string; string>; mpath : string; var errors : das_string) {
+    let fname = "{fn.name}"
+    let suffix = manifest?[fname] ?? ""
+    if (empty(suffix)) {
+        return
+    }
     var genKey = ""
     var rows : array<TunePerm>
     var comps : array<TuneCompanion>
@@ -496,9 +510,7 @@ def private restamp_fn(var fn : FunctionPtr; mod : Module?; manifest : table<str
     for (c in comps) {
         strip_llvm_code(c.fn)
     }
-    let fname = "{fn.name}"
-    let suffix = manifest?[fname] ?? ""
-    if (!empty(suffix) && suffix != "reference") {
+    if (suffix != "reference") {
         var stamped = false
         for (p in rows) {
             if (p.suffix == suffix) {
@@ -541,9 +553,11 @@ def private restamp_program(manifest : table<string; string>; mpath : string; va
 //! against the declaring file's directory (absolute dirs pass through; omitted dir = the
 //! declaring file's directory), so two apps sharing a folder pick distinct names. The root
 //! module compiles after every library `[tune]`, so in normal mode this apply re-stamps the
-//! tuned functions from the declared manifest — authoritative while the file exists (no entry
-//! means reference body); without the file the `fallback=` stamps stand. `DAS_TUNE_MANIFEST`
-//! overrides the declaration entirely. Also injects an [init] pointing the runtime write API
+//! tuned functions from the declared manifest. No entry for a function keeps its
+//! `[tune]`-time stamp (fallback= or reference) — a stale manifest must not drop a new
+//! kernel family to the reference tier; an explicit "reference" entry forces the original
+//! body. Without the file the `fallback=` stamps stand. `DAS_TUNE_MANIFEST` overrides the
+//! declaration entirely. Also injects an [init] pointing the runtime write API
 //! (`tune_manifest_set`) at the same file.
 [function_macro(name = "tune_manifest")]
 class private TuneManifestAnnotation : AstFunctionAnnotation {

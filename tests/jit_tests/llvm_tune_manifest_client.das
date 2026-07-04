@@ -22,6 +22,19 @@ def man_add(a, b : int) : int {
     return a + b
 }
 
+// NO manifest entry: the fallback stamp must stand (a stale manifest must not drop a new
+// kernel family to the reference tier)
+[tune_perm(k = 0), tune_perm(k = 1), tune(gen = "llvm_code_selftest::add_plus_k", fallback = "k1")]
+def man_other(a, b : int) : int {
+    return a + b
+}
+
+// explicit "reference" manifest entry: the original body must run despite the fallback
+[tune_perm(k = 0), tune_perm(k = 1), tune(gen = "llvm_code_selftest::add_plus_k", fallback = "k1")]
+def man_ref(a, b : int) : int {
+    return a + b
+}
+
 [export, tune_manifest(name = "llvm_tune_manifest_probe")]
 def main {
     var n = 2  // nolint:LINT003 — var defeats const-fold so the calls survive to codegen
@@ -31,10 +44,12 @@ def main {
         doWrite ||= a == "write"
     }
     if (doWrite) {
-        let ok = tune_manifest_set("man_add", "k2")
+        let ok = tune_manifest_set("man_add", "k2") && tune_manifest_set("man_ref", "reference")
         print("WRITE {ok ? "ok" : "FAILED"} -> {tune_manifest_path()}\n")
     } else {
         print("RESULT {man_add(n, 3)}\n")
         print("KV {man_kv()}\n")
+        print("OTHER {man_other(n, 3)}\n")
+        print("REF {man_ref(n, 3)}\n")
     }
 }
