@@ -191,7 +191,13 @@ other models. This is the kernel scoreboard; `prefill_perf.das` is the end-to-en
    recommendation when the live count differs).
 2. `tune_kernels.das` → the complete `box_profile.json` (kernel perms + runtime snapshot) →
    recompile a consumer and confirm the `dasllama_tune:` log lines → re-run an end-to-end
-   bench to see if it moved anything.
+   bench to see if it moved anything. **A "neutral" verdict here is only valid per-backend:
+   `[tuned]` perms bite ONLY on the portable-tier kernels, so an intrinsic auto-backend
+   (e.g. `x64-avx2-repack`) masks the profile entirely. Run the backend ladder
+   (`DASLLAMA_PIN_BACKEND` per rung, profile ON, bracketed controls) before concluding —
+   on the EPYC 9654 the profile was "neutral" under auto but +34% on portable
+   (77→104 t/s), flipping portable from worst backend to best and beating auto by ~15%.
+   Record the in-model winner in the profile's `runtime.backend` pin.
 3. If a token-blocked (repack) kernel exists: `tune_tb.das` raw curve → hand-edit
    `runtime.q8_l2_budget` under the cliff; leave `q8_token_block` at 128 unless the curve
    says otherwise.

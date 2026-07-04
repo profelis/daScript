@@ -459,6 +459,68 @@ now snapshots both grain knobs (was missing — predates session 2).
 **Note absolute drift again:** T=24 ~89 t/s tonight vs 94-96 this afternoon, same code —
 cross-session absolutes remain polluted; only in-bracket deltas count.
 
+### Session 3b: per-op breakdown vs instrumented llama.cpp + THE ISA LADDER — portable+tuned WINS
+**Instrumented lcpp on box:** `ggml_op_profile.patch` applied to `/data/llama.cpp` (git tree
+left patched, runtime-gated on `GGML_OP_PROFILE=1`), rebuilt. Decode table = `llama-bench
+-p 0 -n 64 -t 24`, divide bucket totals by mm_cls nodes (=tokens, 321).
+
+Per-token µs @ T=24, Llama-1B Q8 (lcpp 138.7 t/s; ours under each backend):
+| bucket | lcpp | auto=avx2-repack | portable+tuned | port/lcpp |
+|---|--:|--:|--:|--:|
+| mm_ffn | 3884 | 5873 | 5535 | 1.42× |
+| mm_qkv | 664 | 1969 | **877** | 1.32× (was 2.96×) |
+| final/cls | 1243 | 1563 | 1490 | 1.20× |
+| mm_wo | 348 | 739 | **736 (unmoved)** | 2.11× |
+| attn | 173 | 464 | 333 | 1.93× |
+| rope+kv | 181 | 82 | 99 | we win |
+| TOTAL | 7083 | 10970 | 9337 | 1.32× |
+
+**ISA ladder** (T=24, gemv 128, box profile ON, one process per rung, 3 auto controls):
+| rung | t/s |
+|---|--:|
+| **portable (tuned perms)** | **103.7** |
+| x64-avx2-acc8 | 98.0 |
+| x64-vnni256-acc8 | 94.8 |
+| auto = x64-avx2-repack (controls) | 88.3 / 92.7 / 90.4 |
+| x64-avx2 | 91.1 |
+| x64-vnni256 | 90.9 |
+| x64-avx512bw | 90.0 |
+| x64-vnni256-repack | 89.8 |
+| x64-avx512vnni | 84.2 |
+| portable UNTUNED (attribution follow-up) | 77.1 |
+
+Four readings:
+1. **The tuner was NOT end-to-end neutral — it flipped the backend ranking.** Profile is worth
+   +34% on portable (77.1→103.7); tuned-portable beats the shipped auto default by ~+15%.
+   The session-3a "neutral" verdict was an artifact: `[tuned]` hints only bite on the
+   portable-tier kernels; the intrinsic auto-backend masks the profile entirely. **Lesson:
+   run the ISA ladder WITH the profile on before calling a profile neutral.**
+2. acc8 (lcpp's per-block accumulator shape) beats its dot4x4 sibling on Zen4 GEMV decode
+   (98.0 vs 91.1 avx2; 94.8 vs 90.9 vnni256) — best intrinsic family, still below tuned-portable.
+3. VNNI buys ~nothing at decode (bandwidth-bound; 90.9≈91.1, 94.8<98.0); zmm tiers LOSE
+   (84-90 — double-pumped 512 + z16 shape overhead). The matrix's decode promotion answer on
+   Genoa: none — delete-side evidence for the promote/delete question (prefill still open).
+4. Remaining vs lcpp at tuned-portable: ffn 1.42×, wo 2.11× (the one unmoved bucket — small-d
+   GEMV, suspect per-op fixed cost: requant + entry), cls 1.20×, attn 1.93× (team-gated
+   dispatch, known). 103.7/138.7 = 75% of lcpp (was 64%).
+
+**Promotion (the designed rail):** `box_profile.json` runtime now pins `"backend": "portable"`
+— verified end-to-end via `load_model`: logs `backend = portable (profile pin 'portable')`,
+`active_kernel_backend()` == portable, grain knobs applied. prefill_perf gained
+`DASLLAMA_PIN_BACKEND` support (mirrors llama3_perf) for the prefill-side validation of the pin.
+
+### Session 3c: the pin's prefill cost + the strictly-dominant hybrid candidate
+prefill_perf ABBA @512 (defaults threads): auto=repack 1009/1003 vs portable 871/865 —
+**portable pays −14% prefill** (repack's batch tier earns its keep... or so it seemed).
+Follow-up point: **x64-avx2-acc8 prefill 1047 vs auto ctrl 1018** — the ROW-MAJOR acc8 batch
+matches/beats the grp4 repack tier on Genoa (repack = no value on this box, delete-side
+evidence #2). Bonus from the same log: at 96-lane defaults portable decode = 75.2 t/s
+per-token vs auto 49-53 (**+45%** — the tuned-portable defaults win is bigger than the knee win).
+Standing decision fork (Boris): backend pin = portable (decode-max, campaign metric) vs acc8
+(strictly dominates auto both axes) vs a **hybrid** — portable mm/group3/groupn + acc8 batch,
+both row-major so trivially registrable per the matrix slot-mixing design; proper rail would
+be per-slot pins in box_profile runtime (e.g. `"batch_backend"`), not a hardcoded mix.
+
 ### AVX_MATRIX master switch REMOVED (Boris, post-validation)
 Correctness held on real silicon (probe + gpt-oss token-for-token, 4 backends) → the
 `DASLLAMA_AVX_MATRIX=1` env gate is redundant. Matrix tiers now register unconditionally

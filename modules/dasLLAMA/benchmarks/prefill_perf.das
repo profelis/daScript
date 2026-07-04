@@ -30,11 +30,17 @@ def main {
     if (!empty(args) && ends_with(args[length(args) - 1], ".gguf")) {
         path = args[length(args) - 1]
     }
+    // backend pin for A/B on one binary — must land BEFORE load_gguf:
+    // select_matmul_backend_for_load honors the pin at load, which decides repack
+    if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
+        pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
+    }
     print("loading {path}\n")
     var t <- load_gguf(path, QuantMode.q8)
     t.config.seq_len = min(t.config.seq_len, 8192l)   // cap KV cache (Llama-3 context length is 131072)
     let c = t.config
     print("config: dim={c.dim} hidden={c.hidden_dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size}\n")
+    print("active backend: {active_kernel_backend()}\n")
     print("prompt processing: per-token forward (decode-style) vs one batched forward_prefill\n\n")
 
     var s <- make_run_state(c)
