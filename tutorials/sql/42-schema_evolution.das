@@ -15,7 +15,7 @@ options gen2
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // One struct per known historical shape. Both name="Logs" — they describe the
 // same logical table at different points in its history.

@@ -2,7 +2,6 @@ options gen2
 
 require dastest/testing_boost public
 
-require daslib/sql
 require sqlite/sqlite_boost
 require daslib/result
 

@@ -2,7 +2,7 @@ options gen2
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Tutorial 28 — JSON and BLOB columns: structured-but-not-columnar data.
 //

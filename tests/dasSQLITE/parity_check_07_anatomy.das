@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/linq_boost
 require daslib/strings_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 07 — `_where` mechanics introduced beyond
 // tut 04: symmetric column-vs-bind sides (`_.Price > cutoff` ≡ `cutoff < _.Price`),
@@ -31,11 +31,11 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Car> {
-    var arr : array<Car>
-    arr |> emplace(Car(Id = 1, Name = "BMW",   Price = 100))
-    arr |> emplace(Car(Id = 2, Name = "Audi",  Price = 200))
-    arr |> emplace(Car(Id = 3, Name = "Tesla", Price = 300))
-    return <- arr
+    return <- [
+        Car(Id = 1, Name = "BMW",   Price = 100),
+        Car(Id = 2, Name = "Audi",  Price = 200),
+        Car(Id = 3, Name = "Tesla", Price = 300)
+    ]
 }
 
 def cars_equal(a : array<Car>; b : array<Car>) : bool {

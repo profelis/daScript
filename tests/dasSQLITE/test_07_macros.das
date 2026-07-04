@@ -22,7 +22,7 @@ require daslib/macro_boost
 require daslib/templates_boost
 
 require daslib/linq_boost public
-require sqlite/sqlite_linq public
+require daslib/sql_linq public
 
 // ──────────────────────────────────────────────────────────────────────────
 // Baked-field form: when_price_lt(it, value) → _where(it, _.Price < value)

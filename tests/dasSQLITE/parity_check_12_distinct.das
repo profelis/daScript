@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/linq
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 12 — `distinct()` row dedupe.
 //
@@ -37,13 +37,13 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Car> {
-    var arr : array<Car>
-    arr |> emplace(Car(Id = 1, Name = "BMW",   Price = 100))
-    arr |> emplace(Car(Id = 2, Name = "Audi",  Price = 200))
-    arr |> emplace(Car(Id = 3, Name = "BMW",   Price = 150))
-    arr |> emplace(Car(Id = 4, Name = "Tesla", Price = 300))
-    arr |> emplace(Car(Id = 5, Name = "Audi",  Price = 200))
-    return <- arr
+    return <- [
+        Car(Id = 1, Name = "BMW",   Price = 100),
+        Car(Id = 2, Name = "Audi",  Price = 200),
+        Car(Id = 3, Name = "BMW",   Price = 150),
+        Car(Id = 4, Name = "Tesla", Price = 300),
+        Car(Id = 5, Name = "Audi",  Price = 200)
+    ]
 }
 
 def sorted_strings(var a : array<string>) : array<string> {
@@ -52,11 +52,8 @@ def sorted_strings(var a : array<string>) : array<string> {
 }
 
 def sorted_int_pairs(cars : array<Car>) : array<tuple<int; int>> {
-    var pairs : array<tuple<int; int>>
-    for (c in cars) {
-        pairs |> push((c.Id, c.Price))
-    }
-    pairs |> sort() <| $(a, b) {
+    var pairs <- [for (c in cars); (c.Id, c.Price)]
+    pairs |> sort() $(a, b) {
         if (a._0 != b._0) {
             return a._0 < b._0
         }

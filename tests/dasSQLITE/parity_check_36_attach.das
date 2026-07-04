@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 36 — ATTACH DATABASE.
 //
@@ -42,12 +42,12 @@ def fixture_users(db : SqlRunner) {
 }
 
 def fixture_array() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Name = "Alice", Active = true))
-    arr |> emplace(User(Id = 2, Name = "Bob",   Active = true))
-    arr |> emplace(User(Id = 3, Name = "Carol", Active = false))
-    arr |> emplace(User(Id = 4, Name = "Dave",  Active = false))
-    return <- arr
+    return <- [
+        User(Id = 1, Name = "Alice", Active = true),
+        User(Id = 2, Name = "Bob",   Active = true),
+        User(Id = 3, Name = "Carol", Active = false),
+        User(Id = 4, Name = "Dave",  Active = false)
+    ]
 }
 
 def user_eq(a : User; b : User) : bool {
@@ -69,7 +69,7 @@ def users_eq(a : array<User>; b : array<User>) : bool {
 }
 
 def sort_by_id(var rows : array<User>) : array<User> {
-    rows |> sort() <| $(a, b) {
+    rows |> sort() $(a, b) {
         return a.Id < b.Id
     }
     return <- rows

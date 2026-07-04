@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // ──────────────────────────────────────────────────────────────────────────
 // `column_info(type<T>)` — compile-time walk over a [sql_table] struct,

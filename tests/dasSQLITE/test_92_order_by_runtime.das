@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name = "Cars")]
 struct Car {
@@ -138,10 +138,7 @@ def test_order_by_runtime_string_each_sql(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture(db)
         let col = "Price"
-        var prices : array<int>
-        for (row in _each_sql(db |> select_from(type<Car>) |> _order_by_descending(col))) {
-            prices |> push(row.Price)
-        }
+        let prices <- [for (row in _each_sql(db |> select_from(type<Car>) |> _order_by_descending(col))); row.Price]
         t |> equal(length(prices), 5, "_each_sql streams 5 rows in order")
         t |> equal(prices[0], 999, "DESC first")
         t |> equal(prices[4], 50, "DESC last")

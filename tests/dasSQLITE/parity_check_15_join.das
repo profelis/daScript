@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 15 — `_join`: inner equi-join.
 //
@@ -46,23 +46,23 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_users() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Name = "Alice", Active = true))
-    arr |> emplace(User(Id = 2, Name = "Bob",   Active = true))
-    arr |> emplace(User(Id = 3, Name = "Carol", Active = false))
-    return <- arr
+    return <- [
+        User(Id = 1, Name = "Alice", Active = true),
+        User(Id = 2, Name = "Bob",   Active = true),
+        User(Id = 3, Name = "Carol", Active = false)
+    ]
 }
 
 def fixture_orders() : array<Order> {
-    var arr : array<Order>
-    arr |> emplace(Order(Id = 10, UserId = 1, Total = 100))
-    arr |> emplace(Order(Id = 11, UserId = 1, Total = 250))
-    arr |> emplace(Order(Id = 12, UserId = 2, Total =  50))
-    return <- arr
+    return <- [
+        Order(Id = 10, UserId = 1, Total = 100),
+        Order(Id = 11, UserId = 1, Total = 250),
+        Order(Id = 12, UserId = 2, Total =  50)
+    ]
 }
 
 def sort_by_pair(var rows : array<auto(R)>) : array<R> {
-    rows |> sort() <| $(a, b) {
+    rows |> sort() $(a, b) {
         if (a.UserName != b.UserName) {
             return a.UserName < b.UserName
         }
@@ -108,7 +108,7 @@ def parity_inner_join_basic(t : T?) {
 }
 
 def sort_by_pair_with_active(var rows : array<auto(R)>) : array<R> {
-    rows |> sort() <| $(a, b) {
+    rows |> sort() $(a, b) {
         if (a.UserName != b.UserName) {
             return a.UserName < b.UserName
         }
@@ -159,7 +159,7 @@ def parity_left_filter_join(t : T?) {
 }
 
 def sort_by_pair_with_orderid(var rows : array<auto(R)>) : array<R> {
-    rows |> sort() <| $(a, b) {
+    rows |> sort() $(a, b) {
         if (a.UserName != b.UserName) {
             return a.UserName < b.UserName
         }
@@ -169,7 +169,7 @@ def sort_by_pair_with_orderid(var rows : array<auto(R)>) : array<R> {
 }
 
 def sort_by_buyer_orderid(var rows : array<auto(R)>) : array<R> {
-    rows |> sort() <| $(a, b) {
+    rows |> sort() $(a, b) {
         if (a.Buyer != b.Buyer) {
             return a.Buyer < b.Buyer
         }

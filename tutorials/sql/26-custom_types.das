@@ -2,7 +2,7 @@ options gen2
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Tutorial 26 — custom column types via the sql_bind / sql_extract pair.
 //
@@ -128,10 +128,7 @@ def main() {
         //     sqlite3_bind_int64(..., _::sql_bind(o.PlacedAt))     // int64
         //     sqlite3_bind_int64(..., _::sql_bind(o.Status))       // enum → int64
         //     sqlite3_bind_double(..., _::sql_bind(o.Total))       // float → double widening
-        var bytes : array<uint8>
-        for (_ in range(16)) {
-            bytes |> push(uint8(0xAB))
-        }
+        var bytes <- [for (_i in range(16)); uint8(0xAB)]
         db |> insert(Order(
             Id = 1,
             ExternalId = Guid(bytes <- bytes),

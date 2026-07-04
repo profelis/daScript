@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/option
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 26 — custom types via sql_bind / sql_extract.
 //
@@ -70,11 +70,7 @@ struct Event {
 }
 
 def sample_bytes() : array<uint8> {
-    var bytes : array<uint8>
-    for (_ in range(16)) {
-        bytes |> push(uint8(0xAB))
-    }
-    return <- bytes
+    return <- [for (_ in range(16)); uint8(0xAB)]
 }
 
 def fixture_orders_db(db : SqlRunner) {
@@ -105,10 +101,10 @@ def fixture_events_db(db : SqlRunner) {
 }
 
 def fixture_events_array() : array<Event> {
-    var arr : array<Event>
-    arr |> emplace(Event(Id = 1, At = DateTime(unix_seconds = 0l), StartsAt = none(type<DateTime>)))
-    arr |> emplace(Event(Id = 2, At = DateTime(unix_seconds = 0l), StartsAt = some(DateTime(unix_seconds = 1713000000l))))
-    return <- arr
+    return <- [
+        Event(Id = 1, At = DateTime(unix_seconds = 0l), StartsAt = none(type<DateTime>)),
+        Event(Id = 2, At = DateTime(unix_seconds = 0l), StartsAt = some(DateTime(unix_seconds = 1713000000l)))
+    ]
 }
 
 def bytes_eq(a : array<uint8>; b : array<uint8>) : bool {

@@ -7,7 +7,7 @@ require daslib/linq_boost
 require daslib/option
 require daslib/result
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 06 — `_try_sql(chain)` is `_sql(chain)` wrapped
 // in `Result<T, string>` for SQL-side prepare/step failures. The INNER chain
@@ -35,10 +35,10 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Name = "alice"))
-    arr |> emplace(User(Id = 2, Name = "bob"))
-    return <- arr
+    return <- [
+        User(Id = 1, Name = "alice"),
+        User(Id = 2, Name = "bob")
+    ]
 }
 
 def user_eq(a : User; b : User) : bool {
@@ -49,7 +49,7 @@ def user_eq(a : User; b : User) : bool {
 def parity_try_sql_first_ok(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         // Mode 1: _try_sql(...) returns Result<User, string>; ok-path here.
         let r1 = _try_sql(db |> select_from(type<User>) |> _first())
@@ -67,7 +67,7 @@ def parity_try_sql_first_ok(t : T?) {
 def parity_try_sql_first_opt_some(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         // Mode 1: _try_sql(... |> _first_opt()) → Result<Option<User>, string>.
         let r1 = _try_sql(db |> select_from(type<User>) |> _first_opt())
@@ -88,7 +88,7 @@ def parity_try_sql_first_opt_none(t : T?) {
     with_sqlite(":memory:") $(db) {
         // Empty table — _first_opt returns none across all three modes.
         db |> create_table(type<User>)
-        var arr : array<User>
+        let arr : array<User>
 
         let r1 = _try_sql(db |> select_from(type<User>) |> _first_opt())
         let m2 = db |> select_from(type<User>) |> _first_opt()

@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/linq
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 12b — UNION / INTERSECT / EXCEPT.
 //
@@ -40,19 +40,19 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_customers() : array<Customer> {
-    var arr : array<Customer>
-    arr |> emplace(Customer(Id = 1, Tier = 10))
-    arr |> emplace(Customer(Id = 2, Tier = 20))
-    arr |> emplace(Customer(Id = 3, Tier = 30))
-    return <- arr
+    return <- [
+        Customer(Id = 1, Tier = 10),
+        Customer(Id = 2, Tier = 20),
+        Customer(Id = 3, Tier = 30)
+    ]
 }
 
 def fixture_prospects() : array<Prospect> {
-    var arr : array<Prospect>
-    arr |> emplace(Prospect(Id = 100, Tier = 20))
-    arr |> emplace(Prospect(Id = 200, Tier = 30))
-    arr |> emplace(Prospect(Id = 300, Tier = 40))
-    return <- arr
+    return <- [
+        Prospect(Id = 100, Tier = 20),
+        Prospect(Id = 200, Tier = 30),
+        Prospect(Id = 300, Tier = 40)
+    ]
 }
 
 def int_arrays_eq(a : array<int>; b : array<int>) : bool {

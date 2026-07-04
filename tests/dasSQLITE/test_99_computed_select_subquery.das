@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require strings
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Features exercised here — all "computed expression pushdown" via pred_to_sql:
 //   B1 — a computed scalar `_select(_.a + _.b)` lowers to `<frag>` via pred_to_sql + a computed projection

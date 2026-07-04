@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/option
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Type-driven nullability — `T` columns are NOT NULL, `Option<T>` columns
 // allow SQL NULL. The same `User` struct doubles as the row shape and the
@@ -127,9 +127,9 @@ def test_where_is_none_runtime(t : T?) {
 [test]
 def test_where_unwrap_or_emits_coalesce(t : T?) {
     var _db = SqlRunner()
-    let cutoff = 18
+    let _cutoff = 18
     let sql = _sql_text(_db |> select_from(type<User>)
-                          |> _where(_.Age |> unwrap_or(0) >= cutoff))
+                          |> _where(_.Age |> unwrap_or(0) >= _cutoff))
     t |> equal(sql,
         "SELECT \"Id\", \"Name\", \"Age\", \"Nick\", \"DeletedAt\" FROM \"Users\" WHERE COALESCE(\"Age\", ?) >= ?",
         "_.Col |> unwrap_or(d) >= x emits COALESCE + comparison")

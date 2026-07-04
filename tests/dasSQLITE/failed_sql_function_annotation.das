@@ -14,7 +14,7 @@ expect 20800:9
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 struct Foo {
     x : int

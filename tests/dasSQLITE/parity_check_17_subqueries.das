@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 17 — subqueries.
 //
@@ -53,19 +53,19 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_users() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Name = "Alice", Active = true))
-    arr |> emplace(User(Id = 2, Name = "Bob",   Active = true))
-    arr |> emplace(User(Id = 3, Name = "Carol", Active = false))
-    return <- arr
+    return <- [
+        User(Id = 1, Name = "Alice", Active = true),
+        User(Id = 2, Name = "Bob",   Active = true),
+        User(Id = 3, Name = "Carol", Active = false)
+    ]
 }
 
 def fixture_orders() : array<Order> {
-    var arr : array<Order>
-    arr |> emplace(Order(Id = 10, UserId = 1, Total = 100))
-    arr |> emplace(Order(Id = 11, UserId = 1, Total = 250))
-    arr |> emplace(Order(Id = 12, UserId = 2, Total =  50))
-    return <- arr
+    return <- [
+        Order(Id = 10, UserId = 1, Total = 100),
+        Order(Id = 11, UserId = 1, Total = 250),
+        Order(Id = 12, UserId = 2, Total =  50)
+    ]
 }
 
 def users_equal(a : array<User>; b : array<User>) : bool {

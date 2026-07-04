@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 require daslib/fts5_query
 
 // Parity check for tutorial 40 — FTS5 full-text search.
@@ -41,19 +41,16 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Doc> {
-    var arr : array<Doc>
-    arr |> emplace(Doc(Body = "The quick brown fox jumps over the lazy dog"))
-    arr |> emplace(Doc(Body = "A swift red fox escaped the hounds at dawn"))
-    arr |> emplace(Doc(Body = "Quicksand swallowed the hiker's boot yesterday"))
-    arr |> emplace(Doc(Body = "Code review is the most cost-effective bug filter"))
-    return <- arr
+    return <- [
+        Doc(Body = "The quick brown fox jumps over the lazy dog"),
+        Doc(Body = "A swift red fox escaped the hounds at dawn"),
+        Doc(Body = "Quicksand swallowed the hiker's boot yesterday"),
+        Doc(Body = "Code review is the most cost-effective bug filter")
+    ]
 }
 
 def bodies_of(rows : array<Doc>) : array<string> {
-    var out : array<string>
-    for (r in rows) {
-        out |> push(r.Body)
-    }
+    var out <- [for (r in rows); r.Body]
     out |> sort()
     return <- out
 }
@@ -75,9 +72,9 @@ def assert_text_match_parity(t : T?; query : string; expected_count : int; tag :
         fixture_db(db)
         var arr <- fixture_array()
 
-        var m1 <- _sql(db |> select_from(type<Doc>) |> _where(_.Body |> text_match(query)))
-        var m2 <- (db |> select_from(type<Doc>) |> _where(_.Body |> text_match(query)))
-        var m3 <- (arr |> _where(_.Body |> text_match(query)))
+        let m1 <- _sql(db |> select_from(type<Doc>) |> _where(_.Body |> text_match(query)))
+        let m2 <- (db |> select_from(type<Doc>) |> _where(_.Body |> text_match(query)))
+        let m3 <- (arr |> _where(_.Body |> text_match(query)))
 
         let b1 <- bodies_of(m1)
         let b2 <- bodies_of(m2)

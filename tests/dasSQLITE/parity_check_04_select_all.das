@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 04 — `_sql` chain ≡ no-`_sql` chain (over the
 // same SQL source) ≡ same chain over a plain `array<T>`. Three modes
@@ -30,13 +30,13 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Car> {
-    var arr : array<Car>
-    arr |> emplace(Car(Id = 1, Name = "BMW",   Price = 100))
-    arr |> emplace(Car(Id = 2, Name = "Audi",  Price = 200))
-    arr |> emplace(Car(Id = 3, Name = "Tesla", Price = 300))
-    arr |> emplace(Car(Id = 4, Name = "Lada",  Price = 50))
-    arr |> emplace(Car(Id = 5, Name = "Lambo", Price = 999))
-    return <- arr
+    return <- [
+        Car(Id = 1, Name = "BMW",   Price = 100),
+        Car(Id = 2, Name = "Audi",  Price = 200),
+        Car(Id = 3, Name = "Tesla", Price = 300),
+        Car(Id = 4, Name = "Lada",  Price = 50),
+        Car(Id = 5, Name = "Lambo", Price = 999)
+    ]
 }
 
 def cars_equal(a : array<Car>; b : array<Car>) : bool {
@@ -55,7 +55,7 @@ def cars_equal(a : array<Car>; b : array<Car>) : bool {
 def parity_select_all(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>))
         let m2 <- (db |> select_from(type<Car>))

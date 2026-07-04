@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // schema_from with empty body — every field synthesized from the .db.
 // Covers all five SQLite affinity classes and the (effective) NOT NULL / nullable contract.

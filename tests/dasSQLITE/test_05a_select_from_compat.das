@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/linq
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name="Cars")]
 struct Car {
@@ -101,7 +101,7 @@ def test_compat_select_from_then_linq_select(t : T?) {
 
 [test]
 def test_compat_select_from_chain_with_to_array_terminal(t : T?) {
-    // sqlite_linq's _to_array is a regular passthrough function in compat
+    // sql_linq's _to_array is a regular passthrough function in compat
     // mode — it just returns the array.
     with_sqlite(":memory:") $(db) {
         fixture(db)
@@ -115,7 +115,7 @@ def test_compat_select_from_chain_with_to_array_terminal(t : T?) {
 def test_compat_try_select_from_ok(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture(db)
-        var r <- db |> try_select_from(type<Car>)
+        let r <- db |> try_select_from(type<Car>)
         t |> success(r |> is_ok, "try_select_from returns Ok on a valid table")
         let cars <- r |> unwrap
         t |> equal(length(cars), 5, "5 rows via try_ form")
@@ -128,7 +128,7 @@ def test_compat_try_select_from_propagates_error(t : T?) {
     // libsqlite3 errmsg through Result rather than panicking.
     with_sqlite(":memory:") $(db) {
         // Note: we did NOT create the Cars table, so the SELECT must fail.
-        var r <- db |> try_select_from(type<Car>)
+        let r <- db |> try_select_from(type<Car>)
         t |> success(r |> is_err, "try_select_from returns Err on missing table")
     }
 }

@@ -17,7 +17,7 @@ expect 30928:2, 30831, 50503:3
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 struct InnerAddress {
     City : string

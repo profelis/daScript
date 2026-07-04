@@ -11,7 +11,9 @@ require sqlite/sqlite_boost
 //   db |> in_transaction()                             // status query
 //
 // `with_transaction` emits ``BEGIN`` on entry, ``COMMIT`` on normal exit, and
-// ``ROLLBACK`` on panic / early return via daslang's ``finally``. When
+// ``ROLLBACK`` on early return (a block ``return`` unwinds through ``finally``).
+// A panic does NOT roll back — daslang skips ``finally`` on panic by design; the
+// open transaction's writes are discarded when the connection closes. When
 // nested inside an existing transaction it falls back to ``SAVEPOINT`` /
 // ``RELEASE`` / ``ROLLBACK TO`` so user code can compose freely without
 // SQLite's "no nested transactions" rule biting.
@@ -23,8 +25,8 @@ require sqlite/sqlite_boost
 //
 // ``try_transaction`` only converts SQL failures (BEGIN / COMMIT errors) into
 // ``some(errmsg)`` and returns ``none`` on success. A panic from inside the
-// block still rolls back and re-propagates — wrap the block in your own
-// ``try / recover`` if you want to convert a block panic into a SqlError.
+// block propagates without rolling back (``finally`` is skipped on panic) —
+// fallible steps inside a transaction should use the ``try_`` API forms.
 
 [sql_table(name = "Friends")]
 struct Friend {

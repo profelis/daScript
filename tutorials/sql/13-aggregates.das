@@ -2,7 +2,7 @@ options gen2
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Tutorial 13 — Column aggregates: `sum`, `average`, `min`, `max`,
 // plus `count` (already shown in tutorial 6).

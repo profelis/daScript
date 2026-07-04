@@ -2,8 +2,7 @@ options gen2
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
-require math
+require daslib/sql_linq
 require daslib/strings_boost
 
 // Tutorial 08 — `_where` predicates: the full surface.

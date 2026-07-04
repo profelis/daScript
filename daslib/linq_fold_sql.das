@@ -8,22 +8,22 @@ module linq_fold_sql shared public
 //! ``db |> select_from(type<Row>)`` chain (where ``Row`` is a ``[sql_table]``/``[sql_view]``/
 //! ``[sql_fts5]`` struct) re-dispatch the whole chain to the ``_sql`` macro instead of folding the
 //! materialized full-table ``array<Row>`` in memory. There is no emitting adapter — ``_sql`` is a
-//! complete parallel lowering; this module only recognizes the source. Optional companion to
-//! ``daslib/linq_fold`` — pulled in via ``require ?sqlite`` and gated by
-//! ``static_if (typeinfo builtin_module_exists(sqlite))``. See daslib/linq_fold.md.
+//! complete parallel lowering; this module only recognizes the source. Companion to
+//! ``daslib/linq_fold``; provider-neutral (matches the ``[sql_table]`` annotation, not a runner
+//! type), so it loads unconditionally. See daslib/linq_fold.md.
 
 require daslib/linq_fold_common public   // get_call_short_name + AST types
 require daslib/ast_boost
 require daslib/ast
 
-// True iff `sqlite_linq` (which defines the `_sql` macro) is in the current program. A consumer may
-// require `sqlite_boost` (for `select_from`) without `sqlite_linq`; then we must NOT rewrite to `_sql`
-// (it wouldn't resolve) — `_fold` falls back to the in-memory array path instead.
+// True iff `sql_linq` (which defines the `_sql` macro) is in the current program. A consumer may
+// require a provider boost (for `select_from`) without `daslib/sql_linq`; then we must NOT rewrite
+// to `_sql` (it wouldn't resolve) — `_fold` falls back to the in-memory array path instead.
 [macro_function]
-def sqlite_linq_loaded(prog : ProgramPtr) : bool {
+def sql_linq_loaded(prog : ProgramPtr) : bool {
     var found = false
     program_for_each_module(prog) $(mod) {
-        if (mod.name == "sqlite_linq") {
+        if (mod.name == "sql_linq") {
             found = true
         }
     }

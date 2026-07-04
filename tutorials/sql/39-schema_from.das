@@ -30,7 +30,7 @@ options gen2
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // --- Empty body: every field synthesized from the .db ---------------------
 //

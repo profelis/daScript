@@ -38,7 +38,7 @@ require daslib/linq_fold_decs public
 require daslib/linq_fold_json public          // in-tree JSON source adapter — emits by name, pulls in no json dep
 require daslib/linq_fold_table public         // in-tree table source adapter — each_kv/keys/values chain heads
 require ?pugixml pugixml/linq_fold_xml       // optional XML source adapter — loaded only when pugixml is linked
-require ?sqlite sqlite/linq_fold_sql         // optional SQL source pass-through — loaded only when sqlite is linked
+require daslib/linq_fold_sql                 // SQL source pass-through — provider-neutral, fires only when sql_linq is in the program
 
 [macro_function]
 def private fold_linq_default(var expr : Expression?) : Expression? {
@@ -172,13 +172,11 @@ def private run_splice_adapter(var calls : array<tuple<ExprCall?; LinqCall?>>; v
 def private try_splice_patterns(prog : ProgramPtr; var expr : Expression?) : Expression? {
     var (top, calls) = flatten_linq(expr)
     if (expr._type == null) return null
-    // SQL pass-through (static_if drops it pre name-resolution when sqlite is absent). A `[sql_table]` `select_from` source means the whole chain is SQL-mappable — hand the pristine `expr` (before any chain normalization, and even with no chain ops) to `_sql`, which re-expands on the next infer pass. Walks `expr` itself (not flattened `top`): the SQL DSL ops aren't `linqCalls`, so flatten stops before the source. `sqlite_linq_loaded()` gates on `_sql` actually being in this program (a consumer may have `select_from` via `sqlite_boost` but not `sqlite_linq`) — if absent, fall through to the in-memory array path.
-    static_if (typeinfo builtin_module_exists(sqlite)) {
-        if (extract_sql_source(expr) != null && sqlite_linq_loaded(prog)) {
-            var sqlCall = make_call(expr.at, "_sql")
-            (sqlCall as ExprCallMacro).arguments |> emplace_new <| clone_expression(expr)
-            return sqlCall
-        }
+    // SQL pass-through. A `[sql_table]` `select_from` source means the whole chain is SQL-mappable — hand the pristine `expr` (before any chain normalization, and even with no chain ops) to `_sql`, which re-expands on the next infer pass. Walks `expr` itself (not flattened `top`): the SQL DSL ops aren't `linqCalls`, so flatten stops before the source. `sql_linq_loaded()` gates on `_sql` actually being in this program (a consumer may have `select_from` via a provider boost but not `daslib/sql_linq`) — if absent, fall through to the in-memory array path.
+    if (extract_sql_source(expr) != null && sql_linq_loaded(prog)) {
+        var sqlCall = make_call(expr.at, "_sql")
+        (sqlCall as ExprCallMacro).arguments |> emplace_new <| clone_expression(expr)
+        return sqlCall
     }
     if (empty(calls)) return null
     normalize_order_reverse(calls)

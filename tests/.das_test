@@ -17,6 +17,11 @@ def can_visit_folder(folder_name : string; var result : bool?) {
         *result = has_module("sqlite")
         return
     }
+    // Provider-neutral suite, but the in-tree conformance shim opens SQLite.
+    if (folder_name == "sql_conformance") {
+        *result = has_module("sqlite")
+        return
+    }
     if (folder_name == "stbimage") {
         *result = has_module("stbimage")
         return

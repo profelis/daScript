@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // The wip.das pattern: one ETL script handling multiple historical DB versions.
 // `typeinfo has_field<>` + `static_if` lets one function body branch at compile time
@@ -55,7 +55,7 @@ def test_each_sql_iterates_synthesized_struct(t : T?) {
         let _r2 = db |> insert(OldLogV2(Id = 2l, Severity = 3l, Message = "error"))
         var seen = 0
         for (row in _each_sql(db |> select_from(type<OldLogV2>))) {
-            seen += 1
+            seen++
             t |> equal(row.Severity >= 1l, true, "Severity present")
         }
         t |> equal(seen, 2, "iterated both rows")

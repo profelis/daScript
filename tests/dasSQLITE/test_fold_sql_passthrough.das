@@ -6,9 +6,9 @@ require daslib/sql
 require daslib/linq_boost
 require daslib/linq_fold
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
-// `_fold` SQL pass-through (daslib/linq_fold + sqlite/linq_fold_sql): a `[sql_table]`
+// `_fold` SQL pass-through (daslib/linq_fold + daslib/linq_fold_sql): a `[sql_table]`
 // `select_from` source makes `_fold(chain)` re-dispatch the whole chain to `_sql(chain)`.
 // These tests assert the pass-through compiles, expands, runs, and is result-identical to
 // writing `_sql(...)` directly across the representative chain shapes. Distinct projection

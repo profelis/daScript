@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Lifetime semantics:
 //   1. Re-registering the same name replaces the prior binding cleanly.

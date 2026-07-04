@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name="Cars")]
 struct Car {
@@ -62,9 +62,9 @@ def test_first_emits_limit_1(t : T?) {
 [test]
 def test_first_with_where_emits_limit_1(t : T?) {
     var _db = SqlRunner()
-    let target = 3
+    let _target = 3
     let sql = _sql_text(_db |> select_from(type<Car>)
-                          |> _where(_.Id == target)
+                          |> _where(_.Id == _target)
                           |> _first())
     t |> equal(sql,
         "SELECT \"Id\", \"Name\", \"Price\" FROM \"Cars\" WHERE \"Id\" = ? LIMIT 1",

@@ -3,7 +3,7 @@ options gen2
 require dastest/testing_boost public
 
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Two `[sql_function]`s with the same SQL name and arity. The install loop in
 // `_install_sql_function_registry` detects this at `try_open_sqlite` time and

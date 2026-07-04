@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name="Cars")]
 struct Car {
@@ -49,9 +49,9 @@ def test_count_with_no_matches_is_zero(t : T?) {
 [test]
 def test_count_with_where_emits_count_with_where_sql(t : T?) {
     var _db = SqlRunner()
-    let cutoff = 150
+    let _cutoff = 150
     let sql = _sql_text(_db |> select_from(type<Car>)
-                          |> _where(_.Price > cutoff)
+                          |> _where(_.Price > _cutoff)
                           |> count())
     t |> equal(sql,
         "SELECT COUNT(*) FROM \"Cars\" WHERE \"Price\" > ?",

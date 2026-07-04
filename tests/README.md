@@ -913,6 +913,25 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 | test_stbtruetype.das | stbtruetype — font loading, glyph metrics, bitmap rendering, SDF | |
 | test_write.das | Image write — PNG, BMP, JPG, TGA output with verification | |
 
+## sql_conformance/
+
+> **Note:** Provider-neutral SQL contract suite (see `tests/sql_conformance/README.md` and `modules/dasSQLITE/PROVIDER_CONTRACT.md`). Every test goes through the `_conformance_provider.das` shim (in-tree: SQLite); an external provider repo copies the directory and swaps only the shim. Requires the dasSQLITE module.
+
+| File | Description | Expects errors |
+|---|---|---|
+| _conformance_provider.das | *(shim)* Provider under test — `with_conf_db` scoped runner + `CONF_HAS_*` capability constants | |
+| test_conf_table_crud.das | `[sql_table]` DDL round-trip, check_schema, column_info, insert single+bulk, update / delete_ / delete_by_id | |
+| test_conf_sql_select.das | `_sql` reads — _where + captured binds, _order_by, take/skip, distinct, _first/_first_opt, _sql_text shape | |
+| test_conf_projection_agg.das | _select forms (column / named-tuple / computed), aggregates, _group_by + _having | |
+| test_conf_joins_subq.das | _join, _left_join (Option right side), _in / _not_in, _any / _none | |
+| test_conf_nullability.das | Option<T> columns — DDL nullability, some/none round-trip, is_some / is_none / unwrap_or | |
+| test_conf_adapters.das | sql_bind / sql_extract rail — custom type, enum, Option-over-custom, @sql_json + path descent | |
+| test_conf_dml_macros.das | _sql_update / _sql_delete / _sql_upsert + returning variants (capability-checked) | |
+| test_conf_streaming_txn.das | _each_sql lifecycle incl. early break; transactions — commit, nesting, try_transaction | |
+| test_conf_views.das | [sql_view] + _create_view — typed reads through a view, captured-local inlining | |
+| test_conf_fts5.das | [sql_fts5] + text_match — file-gated on caps.fts5 | |
+| test_conf_sql_functions.das | [sql_function] UDF visible to `_sql` chains — file-gated on caps.client_udfs | |
+
 ## strings/
 
 | File | Description | Expects errors |

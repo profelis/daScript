@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 24 — indexes.
 //
@@ -37,11 +37,11 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Email = "alice@x.com", Name = "alice", City = "SF",  LastSeen = 100l))
-    arr |> emplace(User(Id = 2, Email = "bob@x.com",   Name = "bob",   City = "SF",  LastSeen = 200l))
-    arr |> emplace(User(Id = 3, Email = "carol@x.com", Name = "carol", City = "NYC", LastSeen = 300l))
-    return <- arr
+    return <- [
+        User(Id = 1, Email = "alice@x.com", Name = "alice", City = "SF",  LastSeen = 100l),
+        User(Id = 2, Email = "bob@x.com",   Name = "bob",   City = "SF",  LastSeen = 200l),
+        User(Id = 3, Email = "carol@x.com", Name = "carol", City = "NYC", LastSeen = 300l)
+    ]
 }
 
 def user_eq(a : User; b : User) : bool {

@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Native daslang field-init becomes the SQL DEFAULT clause: literals only
 // (int/int64/bool/float/double/string). Non-literal initializers are silently

@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name="A")]
 struct TabA {
@@ -127,11 +127,11 @@ def test_except_runtime(t : T?) {
 [test]
 def test_set_op_basic_lhs_rhs_where_binds(t : T?) {
     var _db = SqlRunner()
-    let lo = 15
-    let hi = 35
+    let _lo = 15
+    let _hi = 35
     let sql = _sql_text(
-        (_db |> select_from(type<TabA>) |> _where(_.Tag >= lo) |> _select(_.Tag))
-        |> union(_db |> select_from(type<TabB>) |> _where(_.Tag <= hi) |> _select(_.Tag)))
+        (_db |> select_from(type<TabA>) |> _where(_.Tag >= _lo) |> _select(_.Tag))
+        |> union(_db |> select_from(type<TabB>) |> _where(_.Tag <= _hi) |> _select(_.Tag)))
     t |> equal(sql,
         "SELECT \"Tag\" FROM \"A\" WHERE \"Tag\" >= ? UNION SELECT \"Tag\" FROM \"B\" WHERE \"Tag\" <= ?",
         "compound query with WHERE on both sides emits two placeholders, LHS then RHS")
@@ -184,10 +184,7 @@ def test_set_op_lhs_having_then_rhs_where_runtime(t : T?) {
         // would assign rhs_max_tag=25 to the LHS HAVING (count >= 25 → 0
         // rows) and lhs_min_count=1 to the RHS WHERE (Tag <= 1 → 0 rows),
         // producing an empty result.
-        var tags : array<int>
-        for (r in rows) {
-            tags |> push(r.Tg)
-        }
+        var tags <- [for (r in rows); r.Tg]
         sort(tags)
         t |> equal(length(tags), 2, "LHS HAVING + RHS WHERE binds must occupy correct placeholder positions")
         t |> equal(tags[0], 20)
@@ -198,16 +195,16 @@ def test_set_op_lhs_having_then_rhs_where_runtime(t : T?) {
 [test]
 def test_set_op_lhs_having_emits_correct_sql(t : T?) {
     var _db = SqlRunner()
-    let lo = 15
-    let mc = 1
-    let hi = 25
+    let _lo = 15
+    let _mc = 1
+    let _hi = 25
     let sql = _sql_text(
         (_db |> select_from(type<TabA>)
-            |> _where(_.Tag >= lo)
+            |> _where(_.Tag >= _lo)
             |> _group_by(_.Tag)
-            |> _having(_._1 |> length >= mc)
+            |> _having(_._1 |> length >= _mc)
             |> _select((Tg = _._0)))
-        |> union(_db |> select_from(type<TabB>) |> _where(_.Tag <= hi) |> _select((Tg = _.Tag))))
+        |> union(_db |> select_from(type<TabB>) |> _where(_.Tag <= _hi) |> _select((Tg = _.Tag))))
     t |> equal(sql,
         "SELECT \"Tag\" FROM \"A\" WHERE \"Tag\" >= ? GROUP BY \"Tag\" HAVING COUNT(*) >= ? UNION SELECT \"Tag\" FROM \"B\" WHERE \"Tag\" <= ?",
         "compound SQL preserves clause order: LHS WHERE → GROUP BY → HAVING → UNION → RHS WHERE")
@@ -220,11 +217,11 @@ def test_set_op_rhs_join_on_bind_emits_correct_sql(t : T?) {
     // also walks subQ.joins to fold their rightOnBindExprs into the
     // compound-query placeholder list.
     var _db = SqlRunner()
-    let bnd = 5
+    let _bnd = 5
     let sql = _sql_text(
         (_db |> select_from(type<TabA>) |> _select(_.Tag))
         |> union(_db |> select_from(type<TabA>)
-                    |> _join(_db |> select_from(type<TabB>) |> _where(_.Tag > bnd),
+                    |> _join(_db |> select_from(type<TabB>) |> _where(_.Tag > _bnd),
                              $(a : TabA, b : TabB) => a.Id == b.Id,
                              $(a : TabA, b : TabB) => a.Tag)))
     t |> equal(sql,

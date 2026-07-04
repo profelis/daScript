@@ -7,7 +7,7 @@ require daslib/linq_boost
 require daslib/strings_boost
 require math
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 08 — the full `_where` predicate surface.
 // Each shape recognized by the `_sql` predicate analyzer must produce
@@ -40,13 +40,13 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Car> {
-    var arr : array<Car>
-    arr |> emplace(Car(Id = 1, Name = "Ford",        Price = 100))
-    arr |> emplace(Car(Id = 2, Name = "Ferrari",     Price = 9999))
-    arr |> emplace(Car(Id = 3, Name = "Honda",       Price = 200))
-    arr |> emplace(Car(Id = 4, Name = "Lada",        Price = 50))
-    arr |> emplace(Car(Id = 5, Name = "Lamborghini", Price = 88888))
-    return <- arr
+    return <- [
+        Car(Id = 1, Name = "Ford",        Price = 100),
+        Car(Id = 2, Name = "Ferrari",     Price = 9999),
+        Car(Id = 3, Name = "Honda",       Price = 200),
+        Car(Id = 4, Name = "Lada",        Price = 50),
+        Car(Id = 5, Name = "Lamborghini", Price = 88888)
+    ]
 }
 
 def cars_equal(a : array<Car>; b : array<Car>) : bool {

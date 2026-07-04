@@ -43,7 +43,7 @@ Declaring the virtual table
 
     require daslib/sql
     require sqlite/sqlite_boost
-    require sqlite/sqlite_linq
+    require daslib/sql_linq
 
     [sql_fts5(name = "docs_idx")]
     struct Doc {

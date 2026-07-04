@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // `@sql_column` rename interacting with sibling annotations:
 //   - `[sql_index(fields="<daslang>")]` accepts the daslang field name and

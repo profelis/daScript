@@ -4,8 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
-require math
+require daslib/sql_linq
 
 [sql_table(name="Score")]
 struct Score {
@@ -35,9 +34,9 @@ def test_where_abs_runtime(t : T?) {
 [test]
 def test_where_abs_emits_abs_call(t : T?) {
     var _db = SqlRunner()
-    let threshold = 100
+    let _threshold = 100
     let sql = _sql_text(_db |> select_from(type<Score>)
-                          |> _where((_.Delta |> abs()) > threshold))
+                          |> _where((_.Delta |> abs()) > _threshold))
     t |> equal(sql,
         "SELECT \"Id\", \"Delta\" FROM \"Score\" WHERE ABS(\"Delta\") > ?",
         "abs -> ABS(...)")

@@ -1,23 +1,24 @@
-# SQL — dasSQLITE
+# SQL — daslib/sql_linq + providers (dasSQLITE)
 
-Read this skill before writing or editing any `.das` code that talks to a SQL database. The companion tutorials live under [tutorials/sql/](../tutorials/sql/) (45 files, numbered by teaching order — `01-version.das` through `44-in_not_in_collections.das`, plus `12b-set_ops.das`); read the relevant ones for runnable examples of every pattern below. Implementation is in [modules/dasSQLITE/daslib/sqlite_boost.das](../modules/dasSQLITE/daslib/sqlite_boost.das) (runtime + `[sql_table]` / `[sql_view]` / `[sql_fts5]` / `[sql_function]` macros), [modules/dasSQLITE/daslib/sqlite_linq.das](../modules/dasSQLITE/daslib/sqlite_linq.das) (the `_sql(...)` family of call macros), and [modules/dasSQLITE/daslib/sqlite_migrate.das](../modules/dasSQLITE/daslib/sqlite_migrate.das) (`[sql_migration]` + `migrate_to_latest` runner). Design notes, decision logs, and the deferred-feature list live next to the implementation in [modules/dasSQLITE/API_REWORK.md](../modules/dasSQLITE/API_REWORK.md), [TUTORIALS.md](../modules/dasSQLITE/TUTORIALS.md), and [API_MIGRATION.md](../modules/dasSQLITE/API_MIGRATION.md).
+Read this skill before writing or editing any `.das` code that talks to a SQL database. The companion tutorials live under [tutorials/sql/](../tutorials/sql/) (45 files, numbered by teaching order — `01-version.das` through `44-in_not_in_collections.das`, plus `12b-set_ops.das`); read the relevant ones for runnable examples of every pattern below. Implementation: the provider-neutral core is [daslib/sql_boost.das](../daslib/sql_boost.das) (`[sql_table]` / `[sql_view]` / `[sql_index]` macros, `add_column` / `create_index` ALTER macros, the `sql_bind`/`sql_extract` adapter rail) and [daslib/sql_linq.das](../daslib/sql_linq.das) (the `_sql(...)` family of call macros), routed through the provider registry in [daslib/sql_provider.das](../daslib/sql_provider.das). The SQLite provider is [modules/dasSQLITE/daslib/sqlite_boost.das](../modules/dasSQLITE/daslib/sqlite_boost.das) (`SqlRunner`, exec/query runtime, runner helpers, `[sql_fts5]` / `[sql_function]`) plus the registration shim [sqlite_provider.das](../modules/dasSQLITE/daslib/sqlite_provider.das); [sqlite_migrate.das](../modules/dasSQLITE/daslib/sqlite_migrate.das) carries `[sql_migration]` + the `migrate_to_latest` runner. Design notes, decision logs, and the deferred-feature list live next to the provider in [modules/dasSQLITE/API_REWORK.md](../modules/dasSQLITE/API_REWORK.md), [PROVIDER_CONTRACT.md](../modules/dasSQLITE/PROVIDER_CONTRACT.md), [TUTORIALS.md](../modules/dasSQLITE/TUTORIALS.md), and [API_MIGRATION.md](../modules/dasSQLITE/API_MIGRATION.md).
 
-The shipped backend is **SQLite only**. The split between `daslib/sql` (provider-neutral types — `SqlType`, `ColumnInfo`, re-exported `Option`/`Result`) and `sqlite/sqlite_boost` (provider-specific runtime + macros — `SqlRunner`, `SqlError`, `[sql_table]`, …; these migrate up to `daslib/sql` when a second provider lands) keeps user code portable for the day a second backend lands. Until then the names "SQL" and "SQLite" are interchangeable in this skill.
+The shipped backend is **SQLite only** (DuckDB and PostgreSQL are planned). The macro layer (`daslib/sql_boost` + `daslib/sql_linq`) is provider-neutral; everything runner- or dialect-specific lives in the provider's module and its registry entry. Until a second backend lands, the names "SQL" and "SQLite" are interchangeable in this skill.
 
 ## `require`
 
 ```das
-require daslib/sql                  // abstract layer — SqlType, ColumnInfo (SqlRunner/SqlError live in sqlite_boost)
-require sqlite/sqlite_boost         // runtime, [sql_table], [sql_view], [sql_fts5], [sql_function]
-require sqlite/sqlite_linq          // _sql / _try_sql / _each_sql / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
-require sqlite/sqlite_migrate          // OPTIONAL — [sql_migration], migrate_to_latest, with_latest_sqlite, baseline
+require sqlite/sqlite_boost         // provider: SqlRunner, exec/query runtime, [sql_fts5], [sql_function]
+require daslib/sql_linq             // _sql / _try_sql / _each_sql / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
+require sqlite/sqlite_migrate       // OPTIONAL — [sql_migration], migrate_to_latest, with_latest_sqlite, baseline
 ```
 
-`sqlite_boost` re-exports the raw `sqlite` C-binding module publicly. **Never `require sqlite` directly** — it's the auto-generated thin C binding (`sqlite3_open`, `sqlite3_prepare_v2`, `sqlite3_step`, …). Going through `sqlite_boost` gets you `SqlRunner` + the typed surface; the raw functions are still reachable when you genuinely need them, but reaching for them is almost always wrong.
+`sqlite_boost` re-exports the raw `sqlite` C binding, `daslib/sql` (`SqlType`, `ColumnInfo`, `SqlError`, `Option`/`Result`), and `daslib/sql_boost` (`[sql_table]` / `[sql_view]` / `[sql_index]`, the adapter rail) publicly — one require covers the whole write-side surface. Add `daslib/sql_linq` for the `_sql` chain macros. **Never `require sqlite` directly** — it's the auto-generated thin C binding (`sqlite3_open`, `sqlite3_prepare_v2`, `sqlite3_step`, …). Going through `sqlite_boost` gets you `SqlRunner` + the typed surface; the raw functions are still reachable when you genuinely need them, but reaching for them is almost always wrong.
+
+The old spellings `require sqlite/sqlite_linq` and `require sqlite/sql_provider` are **hard compile errors** (deprecation stubs) — they moved to `daslib/sql_linq` / `daslib/sql_provider`.
 
 `sqlite/sqlite_migrate` is the only optional sub-module — only require it when the app uses versioned migrations. It transitively brings in `sqlite_boost`, so don't double-require.
 
-The path uses **forward slash** (`require sqlite/sqlite_boost` — not backslash). All four `sqlite/*` paths are wired through the [.das_module](../modules/dasSQLITE/.das_module) descriptor.
+The path uses **forward slash** (`require sqlite/sqlite_boost` — not backslash). The `sqlite/*` paths are wired through the [.das_module](../modules/dasSQLITE/.das_module) descriptor.
 
 ## Pick the right tool first
 
@@ -313,7 +314,7 @@ if (r |> is_some) {
 }
 ```
 
-`with_transaction` emits `BEGIN` on entry, `COMMIT` on normal exit, `ROLLBACK` on panic / early return (via `finally`). Nested calls fall back to `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (savepoint name `das_sp`) so user code composes freely without SQLite's "no nested transactions" rule biting. Bulk `insert(array<T>)` likewise auto-uses a savepoint when nested.
+`with_transaction` emits `BEGIN` on entry, `COMMIT` on normal exit, `ROLLBACK` on early return (a block `return` unwinds non-locally through `finally`). **A panic does NOT roll back** — daslang deliberately skips `finally` on panic (see "Error handling" in CLAUDE.md), so the transaction is left open and its writes are discarded when the connection closes; that's consistent with panic-is-fatal (print diagnostics and exit — don't continue after `recover`). Nested calls fall back to `SAVEPOINT` / `RELEASE` / `ROLLBACK TO` (savepoint name `das_sp`) so user code composes freely without SQLite's "no nested transactions" rule biting. Bulk `insert(array<T>)` likewise auto-uses a savepoint when nested.
 
 Two distinct overloads (one with `mode`, one without) — not one with an optional middle parameter, because the trailing-block convention puts the block last and an optional middle wouldn't resolve from a no-mode call site. Same for `try_transaction`.
 
@@ -321,7 +322,7 @@ Two distinct overloads (one with `mode`, one without) — not one with an option
 
 `db |> in_transaction() : bool` wraps SQLite's autocommit flag — useful for library code that wants "join an ambient transaction if one is active, else start one".
 
-`try_transaction` only converts SQL failures (BEGIN / COMMIT errors) into `some(errmsg)` and returns `none` on success. A panic from inside the block still rolls back and re-propagates — wrap in your own `try / recover` if you want to convert a block panic into a `SqlError`.
+`try_transaction` only converts SQL failures (BEGIN / COMMIT errors) into `some(errmsg)` and returns `none` on success. A panic from inside the block propagates without rolling back (same `finally`-skipped-on-panic rule as `with_transaction`) — a fallible step inside a transaction should use the `try_` API forms and early-return, not panic-and-recover.
 
 ## Custom types — `sql_bind` / `sql_extract`
 
@@ -437,7 +438,7 @@ enum Status { Pending = 1; Shipped = 2 }
 def to_sql_literal(s : Status) : string => "{int(s)}"
 ```
 
-Types without an overload hit the catch-all in `sqlite_linq.das` (enums emit as `int(v)`, otherwise compile error pointing at "define a one-line overload in YourType's module"). The value is **frozen at view-creation time** — changing the captured local later does not update the view; drop and re-create. Runtime `_sql(...)` queries against the view still honor `?` binds normally — it's only DDL that can't.
+Types without an overload hit the catch-all in `sql_linq.das` (enums emit as `int(v)`, otherwise compile error pointing at "define a one-line overload in YourType's module"). The value is **frozen at view-creation time** — changing the captured local later does not update the view; drop and re-create. Runtime `_sql(...)` queries against the view still honor `?` binds normally — it's only DDL that can't.
 
 For window functions, recursive CTEs, custom helpers the chain doesn't translate, drop to raw `db |> exec("CREATE VIEW … AS …")` and declare a matching `[sql_view]` struct for the read side.
 
@@ -499,7 +500,7 @@ let strong <- _sql(db |> select_from(type<Enemy>)
 
 `[sql_function]` is the right shape for ambient SQL helpers that should be visible to chain analysis everywhere; `register_function` is for one-off / per-connection registrations.
 
-## Migrations — `daslib/sqlite_migrate`
+## Migrations — `sqlite/sqlite_migrate`
 
 Versioned, append-only schema evolution. Optional sub-module — `require sqlite/sqlite_migrate` only when needed.
 
@@ -698,5 +699,5 @@ Strings produced by `query` / `_sql` are allocated on the calling context's heap
 ## Reference
 
 - Tutorials — every shipped feature has a runnable file under `tutorials/sql/` (45 files).
-- Implementation — `modules/dasSQLITE/daslib/sqlite_boost.das`, `sqlite_linq.das`, `sqlite_migrate.das`.
+- Implementation — `daslib/sql_boost.das`, `daslib/sql_linq.das`, `daslib/sql_provider.das` (neutral core); `modules/dasSQLITE/daslib/sqlite_boost.das`, `sqlite_provider.das`, `sqlite_migrate.das` (SQLite provider).
 - Related skills — `skills/json.md` (`@sql_json` columns), `skills/linq.md` (`_sql` is LINQ-shaped), `skills/das_macros.md` (`[sql_table]` / `_sql` are macros), `skills/gc_migration.md` (`SqlRunner` is one of the residual smart_ptr types).

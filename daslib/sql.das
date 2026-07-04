@@ -19,6 +19,25 @@ module sql shared public
 
 require daslib/option public
 require daslib/result public
+require strings
+
+typedef SqlError = Option<string>
+
+// SQL quoting — pure string helpers, shared by every provider and by the
+// neutral macro layer (daslib/sql_boost) without pulling in any provider.
+
+def sql_quote_id(s : string) : string {
+    //! Wraps ``s`` in double quotes (portable identifier quoting); embedded ``"`` doubled.
+    let escaped = s |> replace("\"", "\"\"")
+    return "\"{escaped}\""
+}
+
+def sql_quote_lit(s : string) : string {
+    //! Wraps ``s`` in single quotes (SQL string literal); embedded ``'`` doubled.
+    //! Used for ``inline_lit`` fragments where the value can't go through ``?`` (CREATE VIEW, PRAGMA, …).
+    let escaped = s |> replace("'", "''")
+    return "'{escaped}'"
+}
 
 // Schema introspection — surfaced by `column_info(type<T>)` over a
 // `[sql_table]`-tagged struct. The data here is the cross-provider subset:

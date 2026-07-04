@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name="Cars")]
 struct Car {
@@ -33,9 +33,9 @@ def test_where_length_runtime(t : T?) {
 [test]
 def test_where_length_emits_length_call(t : T?) {
     var _db = SqlRunner()
-    let cutoff = 5
+    let _cutoff = 5
     let sql = _sql_text(_db |> select_from(type<Car>)
-                          |> _where(length(_.Name) > cutoff))
+                          |> _where(length(_.Name) > _cutoff))
     t |> equal(sql,
         "SELECT \"Id\", \"Name\" FROM \"Cars\" WHERE LENGTH(\"Name\") > ?",
         "length -> LENGTH(...)")

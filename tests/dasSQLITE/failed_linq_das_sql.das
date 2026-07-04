@@ -14,7 +14,7 @@ expect 50503   // group-into member-keeping (identity `select g`) over SQL
 require daslib/linq_das
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name = "Cars")]
 struct Car {

@@ -1,11 +1,11 @@
 # SQL provider contract
 
 What a database provider implements to plug into the `_sql` LINQ-to-SQL machinery
-(`sqlite_linq.das`, migrating to `daslib/sql_linq` in a follow-up). SQLite
-(`sqlite_boost.das`) is the reference implementation; DuckDB and PostgreSQL are the
-planned consumers. This document is the contract; the registry in
-`modules/dasSQLITE/daslib/sql_provider.das` (required as `sqlite/sql_provider`;
-moves to root `daslib/` with the sql_linq promotion) is its executable form.
+(`daslib/sql_linq.das`) and the `[sql_table]` macro layer (`daslib/sql_boost.das`).
+SQLite (`sqlite_boost.das` + the registration shim `sqlite_provider.das`) is the
+reference implementation; DuckDB and PostgreSQL are the planned consumers. This
+document is the contract; the registry core in `daslib/sql_provider.das` is its
+executable form.
 
 ## Architecture in one paragraph
 
@@ -56,10 +56,17 @@ overload-resolve against whichever provider's stmt type instantiated them.
 
 ### 3. Registry entry (compile-time)
 
-Registered via `sqlite/sql_provider`'s `register_sql_provider` (the provider's
-registration code must be in the `require` closure of the macro module —
-consumer-requires-contributor; see skills/das_macros.md "Macro modules each
-compile into their own context"):
+Registries live per macro context (consumer-requires-contributor; see
+skills/das_macros.md "Macro modules each compile into their own context"), so
+registration is pulled, not pushed: each consulting macro module (`daslib/sql_boost`,
+`daslib/sql_linq`) has a `[_macro]` twin calling `sql_register_present_providers`
+(in `daslib/sql_boost`), which optionally-requires each provider's **registration
+shim** (`require ?sqlite sqlite/sqlite_provider`) and calls its registration
+function under `static_if (typeinfo builtin_module_exists(<mod>))`. A new provider
+therefore ships a lean shim module (stmt factories + dialect hooks + caps; it must
+NOT require the provider's boost — that would cycle through `daslib/sql_boost`) and
+adds one `require ?<mod>` line plus one `static_if` branch to
+`sql_register_present_providers`. Entry fields:
 
 | Field | SQLite value | Consulted by |
 |---|---|---|
@@ -71,8 +78,9 @@ compile into their own context"):
 | `noLimitSpelling` | `"LIMIT -1"` | OFFSET-without-LIMIT rendering in `build_sql_string` |
 | `renderJsonExtract(target, path)` | `json_extract({target}, '$....')` | `@sql_json` column descent (`render_json_extract`) |
 | `quoteId(name)` | `"name"` (double quotes) | registered, NOT yet routed — double-quote identifier quoting is portable across SQLite/DuckDB/PostgreSQL; the renderers keep inline quoting until a diverging provider (e.g. MySQL backticks) forces the sweep |
-| `sqlTypeFor(SqlType)` | `sqlite_sql_type` | registered, NOT yet routed — `[sql_table]` DDL emission is provider-agnostic at struct declaration time; routing lands with the neutral `[sql_table]` (per-provider DDL selected by the runner at the `create_table` call site) |
-| `identityDdl` | `PRIMARY KEY` (INTEGER PK aliases rowid) | registered, NOT yet routed — same story as `sqlTypeFor` |
+| `sqlTypeFor(SqlType)` | `sqlite_sql_type` | routed for diagnostics (schema_from type-mismatch labels); DDL column-type emission still flows through the `sql_storage_type_for` witness rail with the standard INTEGER/REAL/TEXT/BLOB spellings — per-provider DDL routing (selected by the runner at the `create_table` call site) lands with the first diverging provider (DuckDB: BIGINT) |
+| `identityDdl` | `PRIMARY KEY` (INTEGER PK aliases rowid) | registered, NOT yet routed — same story as `sqlTypeFor`'s DDL half |
+| `readTableSchema(path, tbl)` | readonly open + `PRAGMA table_info` + affinity rules | `[sql_table(schema_from=...)]` compile-time introspection. Returns `Result<array<SchemaFromCol>, string>` with provider-normalized `data_type : SqlType`; `null` when the provider has no file-based schema source. Annotation time has no runner, so exactly one registered provider may supply the hook (ambiguity is a macro error until a `provider=` annotation arg exists) |
 | capability flags | see below | macro_error gates |
 
 ### 4. Capability flags — `SqlProviderCaps` bitfield + `pkReport`
@@ -99,6 +107,16 @@ registry hooks above plus placeholder style (`?` vs `$n`).
 
 ## Conformance
 
-A provider passes the shared conformance suite (`tests/sql_conformance/`, follow-up
-PR) by shipping a `conformance_provider.das` shim exposing its runner + capability
-flags for self-skip of unsupported groups.
+A provider passes the shared conformance suite (`tests/sql_conformance/`) by shipping
+a `conformance_provider.das` shim exposing its runner + capability flags for self-skip
+of unsupported groups. SQLite's shim is the in-tree reference; an external provider
+repo copies the suite directory and swaps the shim (see the suite's README.md).
+
+## Migrations
+
+`[sql_migration]` + the `migrate_to_latest` runner stay provider-side
+(`sqlite/sqlite_migrate`) for now: the registry stores typed
+`function<(db : SqlRunner) : void>` body pointers, and the runner is dialect-flavored
+(`BEGIN IMMEDIATE`, `sqlite_master` probes, `unixepoch()`, post-commit VACUUM/ANALYZE).
+The neutral shape (type-erased or per-provider-partitioned registry, per-provider
+locking strategy — PG wants advisory locks) gets designed against the PostgreSQL port.

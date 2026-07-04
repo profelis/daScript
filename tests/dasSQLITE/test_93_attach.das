@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 require daslib/fio
 
 [sql_table(name = "Users")]
@@ -40,7 +40,7 @@ def test_with_attached_finally_on_panic(t : T?) {
     with_sqlite(":memory:") $(db) {
         var panicked = false
         try {
-            db |> with_attached(":memory:", "panic_arch") $(arch) {
+            db |> with_attached(":memory:", "panic_arch") $(_arch) {
                 panic("body panic")
             }
         } recover {

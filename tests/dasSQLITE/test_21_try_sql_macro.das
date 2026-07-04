@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 require daslib/result
 require daslib/option
 
@@ -85,6 +85,6 @@ def test_try_sql_count(t : T?) {
         fixture(db)
         let res = _try_sql(db |> select_from(type<Car>) |> count())
         t |> success(res |> is_ok, "count is always 1 row -> ok")
-        t |> equal(int(res |> unwrap), 2, "ok value")
+        t |> equal(res |> unwrap, 2, "ok value")
     }
 }

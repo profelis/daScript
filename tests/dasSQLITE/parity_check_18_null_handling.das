@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/option
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 18 — NULL handling via `Option<T>`.
 //
@@ -33,11 +33,11 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Name = "alice", Age = some(30), Nick = none(type<string>), DeletedAt = none(type<int64>)))
-    arr |> emplace(User(Id = 2, Name = "bob",   Age = none(type<int>), Nick = some("bobby"), DeletedAt = none(type<int64>)))
-    arr |> emplace(User(Id = 3, Name = "carol", Age = some(40), Nick = some("c"), DeletedAt = some(1000l)))
-    return <- arr
+    return <- [
+        User(Id = 1, Name = "alice", Age = some(30), Nick = none(type<string>), DeletedAt = none(type<int64>)),
+        User(Id = 2, Name = "bob",   Age = none(type<int>), Nick = some("bobby"), DeletedAt = none(type<int64>)),
+        User(Id = 3, Name = "carol", Age = some(40), Nick = some("c"), DeletedAt = some(1000l))
+    ]
 }
 
 def opt_int_eq(a : Option<int>; b : Option<int>) : bool {
@@ -96,7 +96,7 @@ def parity_round_trip(t : T?) {
     // SQL prep/step + adapter-rail decode in Mode 1/2; trivially in Mode 3.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<User>) |> _order_by(_.Id))
         let m2 <- (db |> select_from(type<User>) |> _order_by(_.Id))
