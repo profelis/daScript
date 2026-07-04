@@ -1389,6 +1389,7 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "q8_batch_chunks_per_job") $(v) { set_q8_batch_chunks_per_job(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "matmul_min_chunk_rows") $(v) { set_matmul_min_chunk_rows(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "matmul_min_chunk_rows_gemv") $(v) { set_matmul_min_chunk_rows_gemv(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "gemv_wave_fill") $(v) { set_gemv_wave_fill(v != 0l) }
     // stored only — the queue may not exist yet; setup_dasllama_jobque applies these inside with_job_que
     apply_i64_knob(rt, "jobque_spin_us") $(v) { set_jobque_spin_us(v) }
     apply_i64_knob(rt, "jobque_join_poll") $(v) { set_jobque_join_poll(v) }

@@ -204,12 +204,24 @@ var g_matmul_min_chunk_rows_gemv = 64
 def public set_matmul_min_chunk_rows_gemv(v : int) { g_matmul_min_chunk_rows_gemv = max(v, 0) }
 def public get_matmul_min_chunk_rows_gemv() : int { return g_matmul_min_chunk_rows_gemv }
 
+// Wave fill: when the grain-derived count lands in [lanes/2, lanes), round UP to one full wave —
+// chunks shrink but stay >= grain/2 (the grain is chosen halvable), and no lane idles. Counts
+// below lanes/2 stay grain-limited (filling would shred chunks below the halvable bound).
+var g_gemv_wave_fill = true
+def public set_gemv_wave_fill(v : bool) { g_gemv_wave_fill = v }
+def public get_gemv_wave_fill() : bool { return g_gemv_wave_fill }
+
 //! matmul_chunks for the GEMV-shaped dispatches (single-token mm / group3 / groupn): the coarser
 //! GEMV grain, capped at ONE chunk per lane (ggml's mul_mat decode fallback — equal split, no
 //! oversplit). A decode chunk is one bandwidth stream; oversplit only quantizes the tail (EPYC
 //! T=24 anatomy: last lane's +1 chunk = 37% of op wall). `rows` is the TOTAL split row count.
 def public matmul_chunks_gemv(rows, want : int) : int {
-    return g_matmul_min_chunk_rows_gemv <= 0 ? want : clamp(rows / g_matmul_min_chunk_rows_gemv, 1, min(want, get_dispatch_lanes()))
+    if (g_matmul_min_chunk_rows_gemv <= 0) {
+        return want
+    }
+    let lanes = min(want, get_dispatch_lanes())
+    let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, lanes)
+    return (g_gemv_wave_fill && n < lanes && 2 * n >= lanes) ? lanes : n
 }
 
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.

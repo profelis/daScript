@@ -586,6 +586,20 @@ bandwidth-bound, the extra lane is worthless; the 75%-of-lcpp headline HOLDS at 
 **RULE: fair vs `llama-bench -t N` = `DAS_JOBQUE_THREADS=N−1`.** (Env semantics left as-is —
 too much measurement history keyed to it; flag if we ever want env = total lanes.)
 
+### Session 3f: WAVE FILL (Boris's rule) — +14% at the knee
+Rule: chunk counts land on whole waves of the lane count. Grain N is halvable, so a
+grain-derived count in `[lanes/2, lanes)` rounds UP to one full wave (chunks shrink, stay
+≥ N/2, no lane idles); below lanes/2 stays grain-limited (won't shred). Implemented in
+`matmul_chunks_gemv` (knob `set_gemv_wave_fill`, default ON; env `DASLLAMA_GEMV_WAVE_FILL`,
+profile `gemv_wave_fill`). Kept the 1-wave cap for want > lanes (dynamic claims self-balance
+multi-wave; ggml parity).
+ABBA @24 lanes (23w, portable-hybrid, N=128): OFF 93.6/103.0 vs **ON 106.4/118.3** — ON wins
+both ordered pairs; mm_wo 16→24 chunks/disp (bucket −12%), w2 filled (mm_ffn −15%). Defaults
+inert as designed (66.9 vs 68.0; 2×16 < 97 lanes). **Peak 118.3 = 85% of lcpp 138.7; bracket
+avg ~112 = 81% (campaign start: 64%).** Suite 173/173, lint 0.
+NB tonight's drift is large (±10% across brackets after hours of load) — the ON-vs-OFF margin
+exceeds it in both orderings, but absolutes need a fresh-boot confirm.
+
 ## Campaign method reminders
 - Correctness before speed; real-model tests = **small model, one run at a time** (the oracle
   path in `gptoss_parity_probe` is deliberately un-vectorized → slow; not a perf tool).

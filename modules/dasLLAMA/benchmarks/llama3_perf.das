@@ -86,6 +86,9 @@ def main {
             set_matmul_min_chunk_rows(mg)
             print("min chunk rows override: {mg}\n")
         }
+        if (has_env_variable("DASLLAMA_GEMV_WAVE_FILL")) {
+            set_gemv_wave_fill(get_env_variable("DASLLAMA_GEMV_WAVE_FILL") != "0")
+        }
         if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV")) {
             let mgv = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV"))
             set_matmul_min_chunk_rows_gemv(mgv)
