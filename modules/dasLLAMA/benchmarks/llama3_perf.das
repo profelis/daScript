@@ -57,15 +57,13 @@ def main {
     let c = t.config
     print("config: dim={c.dim} hidden={c.hidden_dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size}\n")
     print("active backend: {active_kernel_backend()}\n")
-    // the prompt below is hardcoded Llama-3 token ids (128000 = <|begin_of_text|>); a smaller
-    // vocab reads past the embedding table (prefill_perf is the shape-agnostic harness)
-    if (c.vocab_size <= 128000l) {
-        print("vocab {c.vocab_size} can't index llama-3 token ids — use a Llama-3 gguf here\n")
-        return
-    }
 
     var s <- make_run_state(c)
-    let prompt = [128000l, 12805l, 5304l, 264l, 892l]
+    // synthetic seed ids — forward speed is content-independent (see header), so keep them small
+    // enough to index any real model vocab (ids 1-5; the smallest we bench is Phi-3.5 at 32k),
+    // matching prefill_perf's shape-agnostic ids; the generated continuation is argmax over the
+    // full vocab and is always a valid id
+    let prompt = [1l, 2l, 3l, 4l, 5l]
     with_job_que() {
         setup_dasllama_jobque_()
         // spin-window override for tuning A/Bs (0 disables the spin)

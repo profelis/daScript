@@ -189,11 +189,30 @@ var g_matmul_min_chunk_rows = 16
 def public set_matmul_min_chunk_rows(v : int) { g_matmul_min_chunk_rows = max(v, 0) }
 def public get_matmul_min_chunk_rows() : int { return g_matmul_min_chunk_rows }
 
-//! Chunk count for a matmul row split: `want` (lanes × oversplit) clamped so every chunk keeps
-//! at least the min-grain rows; surplus lanes idle instead of thrashing (ggml's emergent cap).
-//! `rows` is the TOTAL row count of the split range — group-indexed ranges pass groups * 4.
+// The dispatch invariant that killed the prefill regression: a chunk count > lanes MUST be a whole
+// multiple of the dispatch lanes, so no wave is ragged (a partial final wave makes the join wait on
+// its stragglers every matmul). A count <= lanes is one (possibly partial) wave and is fine — a
+// matmul too small for a full wave can't be split further without going sub-grain. Fires in debug/
+// test builds so a future change to the chunk math can't silently re-introduce the ragged wave.
+def private assert_wave_aligned(chunks, lanes : int) {
+    assert(chunks <= lanes || chunks % lanes == 0, "matmul dispatch chunk count must be a whole number of dispatch-lane waves")
+}
+
+//! Chunk count for a matmul row split, rounded DOWN to a whole number of lane-waves so every wave
+//! is fully populated — no ragged final wave whose stragglers the join waits on. `want`
+//! (lanes × oversplit) is the wave ceiling; the min-grain caps the wave count for small matmuls, and
+//! a matmul too small for even one full wave stays at its grain count (a partial wave beats shredding
+//! it sub-grain). `rows` is the TOTAL row count of the split range — group-indexed ranges pass groups * 4.
 def public matmul_chunks(rows, want : int) : int {
-    return g_matmul_min_chunk_rows <= 0 ? want : clamp(rows / g_matmul_min_chunk_rows, 1, want)
+    if (g_matmul_min_chunk_rows <= 0) {
+        return want
+    }
+    let lanes = max(get_dispatch_lanes(), 1)
+    let cap = clamp(rows / g_matmul_min_chunk_rows, 1, want)   // grain-limited ceiling (<= want = lanes × oversplit)
+    let waves = max(cap / lanes, 1)                            // whole lane-waves within the cap
+    let chunks = min(waves * lanes, cap)                       // full waves; never exceed the grain cap
+    assert_wave_aligned(chunks, lanes)
+    return chunks
 }
 
 // Coarser grain for GEMV-shaped splits (ggml mul_mat: chunk_size 16 -> 64 when nr0==1||nr1==1):
@@ -221,7 +240,9 @@ def public matmul_chunks_gemv(rows, want : int) : int {
     }
     let lanes = min(want, get_dispatch_lanes())
     let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, lanes)
-    return (g_gemv_wave_fill && n < lanes && 2 * n >= lanes) ? lanes : n
+    let chunks = (g_gemv_wave_fill && n < lanes && 2 * n >= lanes) ? lanes : n
+    assert_wave_aligned(chunks, get_dispatch_lanes())
+    return chunks
 }
 
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.
