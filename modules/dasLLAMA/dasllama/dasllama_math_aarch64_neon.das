@@ -150,7 +150,7 @@ def template dot_mx4q8_template(lut : int8 const ?; wn : uint8 const ?; we : uin
 [hint(unsafe_range_check, noalias = lut, noalias = wn, noalias = we, noalias = xq, noalias = xs), tuned(fallback = "u2")]
 def dot_mx4q8(lut : int8 const?; wn : uint8 const?; we : uint8 const?; xq : int8 const?; xs : float const?; n : int64) : float {}
 
-def private mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+def mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
     var lut : int8[16]
@@ -193,7 +193,7 @@ def private q8q8_groupn_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; s
     }
 }
 
-def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+def q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     let ng = d / 4l
     var myp = yp
@@ -233,7 +233,7 @@ def private q8q8_groupn_kernel_neon_laneq(var yp : float?; wp : int8 const?; sp 
     }
 }
 
-def private mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+def mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
     var lut : int8[16]
@@ -260,7 +260,7 @@ def private mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : ui
     }
 }
 
-def private mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+def mx4q8_groupn_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nrow = n / 2l
     let nbb = n / 32l
     let ng = d / 4l
@@ -349,7 +349,7 @@ def dot_mx4q8_laneq4(lut : int8 const?; wg : uint8 const?; eg : uint8 const?; xq
 // In-place repack of one MXFP4 region [d x n] into the interleaved-group layout above. Copies both
 // planes to a scratch, then writes the interleaved layout back; tail rows (d % 4) stay row-major.
 // Runs once per expert tensor at load, on the main context.
-def private repack_mx4_neon(var np : uint8?; var ep : uint8?; n, d : int64) {
+def repack_mx4_neon(var np : uint8?; var ep : uint8?; n, d : int64) {
     let nrow = n / 2l    // nibble bytes per row
     let nbb = n / 32l    // blocks per row
     let ng = d / 4l
@@ -393,7 +393,7 @@ def private repack_mx4_neon(var np : uint8?; var ep : uint8?; n, d : int64) {
     delete te
 }
 
-def private mx4q8_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+def mx4q8_kernel_neon_laneq(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nrow = n / 2l
     let nbb = n / 32l
     let ng = d / 4l

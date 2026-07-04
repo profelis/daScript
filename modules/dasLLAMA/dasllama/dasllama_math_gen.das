@@ -19,10 +19,11 @@ require math
 // DAS_TUNE_MODE=tune/test stamps the grid + the *_variants() registries for the harness
 // (gen_parity_probe / gen_tune_probe). This module also registers "arm64-laneq-gen" — the
 // arm64-laneq backend with the batch tile swapped for the stub (and, off the grp4 layout, the
-// generic grp<mr> mm/group3/tail forms) — so gemm_1core_probe A/Bs hand vs generated on
-// identical traversal, repack and dispatch. The generator lives in
-// dasllama/dasllama_gemm_gen.das (llvm-jit context, wired via llvm/daslib/llvm_user_modules.das).
-// NOT in the production require chain: only probes/tests require this module.
+// generic grp<mr> mm/group3/tail forms). Since slice C this IS the arm64 load-select tier
+// (priority 25 over laneq's 20): dasllama_common pulls it in behind a path guard
+// (`require ?llvm/daslib/llvm_tune`), so any Q8 model load on arm64+jit runs the generated
+// batch tile. The generator lives in dasllama/dasllama_gemm_gen.das (llvm-jit context, wired
+// via llvm/daslib/llvm_user_modules.das).
 
 //! The layout companion (the two-function stamp): the repack interleave (mr) the stamped tile
 //! reads. Reference body = the reference tile's grp4; the generator emits the perm's mr and
@@ -237,19 +238,50 @@ def private q8q8_group3_grp_generic(var y0p : float?; var y1p : float?; var y2p 
     }
 }
 
+// grp<mr> region-list GEMV for mr != 4: per-region generic GEMV + a bias post-add — one
+// dispatch per region instead of laneq's fused walk (correct-anywhere stopgap; the GEMV perm
+// sub-family is where mr != 4 decode perf comes from)
+def private q8q8_groupn_grp_generic(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    var myp = yp
+    unsafe {
+        for (r in range64(nregions)) {
+            let woff = offs[r * 2l]
+            let xoff = offs[r * 2l + 1l]
+            q8q8_kernel_grp_generic(myp + r * d, wp + woff, sp + woff / 32l, xqp + xoff, xsp + xoff / 32l, n, d)
+            if (bp != null) {
+                for (i in range64(d)) {
+                    myp[r * d + i] += bp[boffs[r] + i]
+                }
+            }
+        }
+    }
+}
+
 [init]
 def dasllama_math_gen_register() {
-    // same gate as the laneq backend it borrows its slots from; the probe selects it by name
-    // (needs_repack keeps it out of auto-select, priority < laneq keeps it out of load-select).
-    // The layout companion decides which slots are layout-coherent: on the grp4 reference/
-    // fallback the hand laneq mm/group3 read the same bytes; any other stamped mr gets the
-    // generic grp<mr> forms.
+    // Same gate as the laneq backend whose slots it borrows. needs_repack keeps it out of
+    // auto-select (direct callers stay on arm64-sdot); priority 25 makes
+    // select_matmul_backend_for_load pick it OVER arm64-laneq (20) — since slice C the generated
+    // tile is the arm64 load-select batch tier. The layout companion decides which slots are
+    // layout-coherent: on the grp4 fallback/winner the hand laneq mm/group3/rows/mx4 read the
+    // same bytes; any other stamped mr gets the generic grp<mr> Q8 forms, a row-major mx4 family
+    // (interleaved planes + a grp<mr> Q8 scratch can't share the laneq expand map), and the
+    // per-op decode path (rows core stays the unset default).
     if (get_architecture_name() == "arm64" && jit_enabled()) {
         var be = KernelBackend(name = "arm64-laneq-gen", mm = @@q8q8_kernel_neon_laneq,
             batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_kernel_neon_laneq,
             repack = @@repack_q8q8_gen,
-            needs_repack = true, priority = 15)
-        if (q8q8_layout_gen() != 4) {
+            mm_mx4 = @@mx4q8_kernel_neon, repack_mx4 = @@repack_mx4_identity,
+            groupn = @@q8q8_groupn_grp_generic, groupn_mx4 = @@mx4q8_groupn_kernel_neon,
+            needs_repack = true, priority = 25)
+        if (q8q8_layout_gen() == 4) {
+            be.mm_mx4 = @@mx4q8_kernel_neon_laneq
+            be.repack_mx4 = @@repack_mx4_neon
+            be.groupn = @@q8q8_groupn_kernel_neon_laneq
+            be.groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq
+            be.mm_rows = @@q8q8_rows_kernel_neon_laneq
+            be.mx4_expand_interleaved = true
+        } else {
             be.mm = @@q8q8_kernel_grp_generic
             be.group3 = @@q8q8_group3_grp_generic
         }
