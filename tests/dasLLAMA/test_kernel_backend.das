@@ -58,6 +58,46 @@ def test_select_and_pin(t : T?) {
     }
 }
 
+// dummy slots for the availability test — the backend must never activate, so every slot panics
+[unused_argument(yp, wp, sp, xqp, xsp, n, d)]
+def private unavailable_mm(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    panic("test-unavailable backend activated")
+}
+[unused_argument(yp, wp, sp, xqp, xsp, n, d, ntok)]
+def private unavailable_batch(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    panic("test-unavailable backend activated")
+}
+[unused_argument(y0p, y1p, y2p, wp, sp, woff0, woff1, woff2, xqp, xsp, n, d0, d1, d2)]
+def private unavailable_group3(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) {
+    panic("test-unavailable backend activated")
+}
+[unused_argument(wp, sp, n, d)]
+def private unavailable_repack(var wp : int8?; var sp : float?; n, d : int64) {
+    panic("test-unavailable backend activated")
+}
+def private never_available() : bool => false
+
+[test]
+def test_backend_availability_predicate(t : T?) {
+    t |> run("an unavailable backend is skipped by for-load select and refused by pin") @(t : T?) {
+        let saved = active_kernel_backend()
+        // outranks everything (99) but reports unavailable; needs_repack keeps it out of the
+        // registration-time auto-activate (which deliberately does NOT evaluate `available` —
+        // it runs at [init], where a predicate reading JIT-stamped state answers wrong)
+        register_kernel_backend(KernelBackend(name = "test-unavailable",
+            mm = @@unavailable_mm, batch = @@unavailable_batch, group3 = @@unavailable_group3,
+            repack = @@unavailable_repack, needs_repack = true, priority = 99,
+            available = @@never_available))
+        select_matmul_backend_for_load()
+        t |> success(active_kernel_backend() != "test-unavailable", "for-load select skips an unavailable backend")
+        pin_kernel_backend("test-unavailable")
+        t |> success(active_kernel_backend() != "test-unavailable", "pin refuses an unavailable backend")
+        if (saved != "") {
+            select_kernel_backend(saved)
+        }
+    }
+}
+
 [test]
 def test_batch_backend_pin(t : T?) {
     t |> run("batch pin overrides the batch slots, survives re-select, guards layout") @(t : T?) {

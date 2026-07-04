@@ -17,10 +17,12 @@ require math
 // and both generators share one decline predicate, so kernel and repack cannot desync on any
 // tier. Normal runs stamp exactly one winner (manifest > fallback kstep2 = the M2 perm);
 // DAS_TUNE_MODE=tune/test stamps the grid + the *_variants() registries for the harness
-// (gen_parity_probe / gen_tune_probe). This module also registers "arm64-laneq-gen" — the
-// arm64-laneq backend with the batch tile swapped for the stub (and, off the grp4 layout, the
-// generic grp<mr> mm/group3/tail forms). Since slice C this IS the arm64 load-select tier
-// (priority 25 over laneq's 20): dasllama_common pulls it in behind a path guard
+// (gen_parity_probe / gen_tune_probe). This module also registers TWO backend flavors —
+// "arm64-laneq-gen" (grp4: laneq slots + the generated batch tile, priority 25) and
+// "arm64-grp-gen" (any other stamped mr: generic grp<mr> slots + the tile, priority 24) —
+// whose KernelBackend.available predicates read the stamped layout at SELECTION time (see
+// dasllama_math_gen_register below for why [init] can't). Since slice C this is the arm64
+// load-select tier: dasllama_common pulls it in behind a path guard
 // (`require ?llvm/daslib/llvm_tune`), so any Q8 model load on arm64+jit runs the generated
 // batch tile. The generator lives in dasllama/dasllama_gemm_gen.das (llvm-jit context, wired
 // via llvm/daslib/llvm_user_modules.das).
@@ -257,34 +259,42 @@ def private q8q8_groupn_grp_generic(var yp : float?; wp : int8 const?; sp : floa
     }
 }
 
+// Selection-time availability (KernelBackend.available): which flavor matches the STAMPED
+// layout. Evaluated by select_matmul_backend_for_load / pin_kernel_backend at runtime, where
+// the two-function stamp is truthful. [init] MUST NOT read q8q8_layout_gen(): [init]s run
+// before the JIT installs generated code, so the companion still answers with its reference
+// grp4 there — baking slots off that value desyncs them from the load-time repack (the
+// slice C mr8 bug: laneq grp4 readers on grp8 weights, caught by gen_slot_parity_probe).
+def private gen_layout_is_grp4() : bool => q8q8_layout_gen() == 4
+def private gen_layout_is_grpn() : bool => q8q8_layout_gen() != 4
+
 [init]
 def dasllama_math_gen_register() {
-    // Same gate as the laneq backend whose slots it borrows. needs_repack keeps it out of
-    // auto-select (direct callers stay on arm64-sdot); priority 25 makes
-    // select_matmul_backend_for_load pick it OVER arm64-laneq (20) — since slice C the generated
-    // tile is the arm64 load-select batch tier. The layout companion decides which slots are
-    // layout-coherent: on the grp4 fallback/winner the hand laneq mm/group3/rows/mx4 read the
-    // same bytes; any other stamped mr gets the generic grp<mr> Q8 forms, a row-major mx4 family
-    // (interleaved planes + a grp<mr> Q8 scratch can't share the laneq expand map), and the
-    // per-op decode path (rows core stays the unset default).
+    // Same gate as the laneq backend whose slots it borrows; needs_repack keeps both flavors
+    // out of auto-select (direct callers stay on arm64-sdot). Two STATIC flavors — which one
+    // load-select may pick is the `available` predicate's call, at selection time:
+    //   arm64-laneq-gen (priority 25 — over laneq's 20, the load-select tier since slice C):
+    //     the grp4 layout — generated batch tile + the byte-identical laneq mm/group3/rows/mx4
+    //     interleaved family.
+    //   arm64-grp-gen (priority 24 — still over laneq, never co-available with the grp4 flavor):
+    //     any other stamped mr — generic grp<mr> Q8 forms, row-major mx4 family (interleaved
+    //     planes + a grp<mr> Q8 scratch can't share the laneq expand map), per-op decode
+    //     (no rows core).
     if (get_architecture_name() == "arm64" && jit_enabled()) {
-        var be = KernelBackend(name = "arm64-laneq-gen", mm = @@q8q8_kernel_neon_laneq,
+        register_kernel_backend(KernelBackend(name = "arm64-laneq-gen", mm = @@q8q8_kernel_neon_laneq,
             batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_kernel_neon_laneq,
+            repack = @@repack_q8q8_gen,
+            mm_mx4 = @@mx4q8_kernel_neon_laneq, repack_mx4 = @@repack_mx4_neon,
+            groupn = @@q8q8_groupn_kernel_neon_laneq, groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq,
+            mm_rows = @@q8q8_rows_kernel_neon_laneq,
+            needs_repack = true, mx4_expand_interleaved = true, priority = 25,
+            available = @@gen_layout_is_grp4))
+        register_kernel_backend(KernelBackend(name = "arm64-grp-gen", mm = @@q8q8_kernel_grp_generic,
+            batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_grp_generic,
             repack = @@repack_q8q8_gen,
             mm_mx4 = @@mx4q8_kernel_neon, repack_mx4 = @@repack_mx4_identity,
             groupn = @@q8q8_groupn_grp_generic, groupn_mx4 = @@mx4q8_groupn_kernel_neon,
-            needs_repack = true, priority = 25)
-        if (q8q8_layout_gen() == 4) {
-            be.mm_mx4 = @@mx4q8_kernel_neon_laneq
-            be.repack_mx4 = @@repack_mx4_neon
-            be.groupn = @@q8q8_groupn_kernel_neon_laneq
-            be.groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq
-            be.mm_rows = @@q8q8_rows_kernel_neon_laneq
-            be.mx4_expand_interleaved = true
-        } else {
-            be.mm = @@q8q8_kernel_grp_generic
-            be.group3 = @@q8q8_group3_grp_generic
-        }
-        register_kernel_backend(be)
+            needs_repack = true, priority = 24,
+            available = @@gen_layout_is_grpn))
     }
 }

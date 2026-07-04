@@ -464,6 +464,67 @@ functions without an entry untouched instead of stripping them to reference). `"
 stays expressible as an explicit entry. Pinned by llvm_tune_manifest's OTHER/REF assertions
 and a GEMM-client env-path check (missing entry → `kstep2 (fallback)` in the stamp log).
 
+## M4 slice C (2026-07-04, M1 Max) — arm64-laneq-gen is the load-select tier
+
+**The generated family stops being probe-only.** `dasllama_common` requires `dasllama_math_gen`
+behind a new **PATH guard** — `require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen` — and
+the backend registers at **priority 25** with full slots, so `select_matmul_backend_for_load`
+picks it over arm64-laneq (20) on arm64+jit: every Q8 model load runs the generated batch tile.
+No manifest → the kstep2 fallback stamp = the M2 perm, machine-code-identical to the hand tile
+(289/289), with the laneq mm/group3/rows/mx4 slots byte-shared — promotion is numerically
+invisible until a manifest says otherwise. arm64-laneq stays registered for by-name pins/A-B.
+
+**`require ?` grew a path-guard form** (core parser, both walkers): a guard containing `/` is
+resolved as a FILE and there is NO target-resolvability fallback — the witness for a target
+living in an always-present package (dasLLAMA's own mount) while depending on an optional one
+(dasLLVM). Plain-name guards keep the registered-module-else-target-file semantics. Pinned by
+two new optional_require rows (path-guard present → loaded; absent → skipped even though the
+target file resolves).
+
+**Slot coverage follows the stamped layout — decided at SELECTION time, not [init] (the
+slice C bug, and the load-bearing lesson).** The first cut branched on `q8q8_layout_gen()`
+inside the registration `[init]` — and `[init]`s run BEFORE the JIT installs generated code,
+so the companion answered with its reference grp4 there while the load-time repack (a
+runtime call) used the stamped mr8: laneq grp4 readers on grp8 weights. Every kernel-level
+gate passed (they sit below the slot wiring); the model run generated fluent-looking garbage
+that even benched "fast" — caught only by a token-print (`parity.das` GEN_IDS) and pinned by
+the new `harness/gen_slot_parity_probe.das` (portable reference vs the gen backend through
+the REAL rail: pin → backend repack → mm/batch/group3 wrappers; batch passed, mm/group3
+failed exactly as grp4-readers-on-grp8 predicts). This is the same lifecycle wrinkle the
+dastest-jit reference-tier note flagged — generalized: **nothing may consume a JIT-stamped
+value at [init]-time.**
+
+The fix: `KernelBackend.available : function<():bool>` — evaluated by
+`select_matmul_backend_for_load` / `pin_kernel_backend` at runtime (registration-time
+auto-activate deliberately does NOT evaluate it) — and TWO statically-correct flavors:
+- **arm64-laneq-gen** (priority 25, `available` = stamped layout == 4): generated batch tile
+  + the byte-identical laneq mm/group3/groupn/rows + interleaved mx4 family +
+  `mx4_expand_interleaved` (six neon kernels flipped public for the cross-module borrow).
+- **arm64-grp-gen** (priority 24, `available` = stamped layout != 4): generated batch tile +
+  generic grp<mr> mm/group3 + NEW `q8q8_groupn_grp_generic` (per-region generic GEMV + bias
+  post-add), NO rows core (fused chains fall back to per-op), and a **row-major mx4 family**
+  (identity plane repack + sdot-tier kernels): interleaved planes + a grp<mr> Q8 scratch
+  can't share the laneq expand map, so the expand goes row-major and repacks the scratch
+  through the backend's own Q8 repack. mr≠4 decode rides the generic scalar GEMV — the GEMV
+  perm sub-family is exactly the next coverage item, so an mr8 manifest today is a
+  prefill-experiment config, not a daily driver.
+
+Pinned by: gen_slot_parity_probe green at BOTH layouts (mr8 row tail within tolerance,
+everything else maxdiff 0), parity.das mr8 GEN_IDS **token-for-token identical** to the
+default stream (40 greedy tokens), and a portable unit test
+(`test_backend_availability_predicate`: priority-99 unavailable backend skipped by for-load
+select, refused by pin).
+
+`emission_bench` gained the `DASLLAMA_PIN_BACKEND` rail its siblings had plus a
+`backend:` log line (the sweep evidence). Batch-pin note: the donor layout guard compares
+repack function POINTERS, so laneq⇄gen cross-pins are rejected even at byte-identical mr=4 —
+no current config needs them; revisit if a real pin does.
+
+**Gates:** language 1087/1087 (+2 path-guard rows), jit 305/305, dasLLAMA suite green (under
+the promoted backend — the whole suite now loads models through the gen tile), gen_parity_probe
+exact, grid test 13/13, gen_slot_parity_probe both layouts, parity.das token checks both
+stamps. Fleet re-sweep below.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /
