@@ -84,14 +84,23 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
 //! The generated tile: mr interleaved rows x 4 tokens (the q8q8_repack_type(mr) layout — see
 //! dasllama_gemm_schema; the stamped mr is what q8q8_layout_gen reports). The reference body —
 //! 4 single-token laneq4 dots with the same per-block fold order as the tile — runs on interp,
-//! AOT, non-arm64 JIT, and whenever the generator declines; the last three grid rows decline
-//! by design (q-reg budget, sdot lane structure, no per-ISA dot emitter) and pin that rail in
-//! test mode. Not `private`: called from inside the lifted parallel_for worker lambda below.
+//! AOT, non-arm64 JIT, and whenever the generator declines. The dot=/width= rows are the x64
+//! legs (slice F): they decline on arm64 and light per cpuid tier on x86-64 (avx2 / vnni256 /
+//! avx512bw / avx512vnni / avxvnniint8), so ONE grid serves every ISA. The three trailing
+//! suffix rows decline by design everywhere (q-reg budget, lane structure, a dot with no
+//! 128-bit leg) and pin the decline rail in test mode. Not `private`: called from inside the
+//! lifted parallel_for worker lambda below.
 [tune_perm(kstep = 1), tune_perm(kstep = 2), tune_perm(kstep = 4), tune_perm(kstep = 2, nrsplit = 2),
  tune_perm(kstep = 1, nrsplit = 2), tune_perm(kstep = 4, nrsplit = 2),
  tune_perm(kstep = 1, nrsplit = 2, mr = 8), tune_perm(kstep = 2, nrsplit = 2, mr = 8), tune_perm(kstep = 4, nrsplit = 2, mr = 8),
  tune_perm(kstep = 2, gkstep = 2), tune_perm(kstep = 2, gkstep = 4),
  tune_perm(kstep = 4, nrsplit = 2, mr = 8, gkstep = 2), tune_perm(kstep = 4, nrsplit = 2, mr = 8, gkstep = 4),
+ tune_perm(dot = "maddubs", width = 256, mr = 8, kstep = 2), tune_perm(dot = "maddubs", width = 256, mr = 8, kstep = 4, nrsplit = 2),
+ tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 2), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 4, nrsplit = 2),
+ tune_perm(dot = "vpdpbusd", width = 256, mr = 16, kstep = 2, nrsplit = 2), tune_perm(dot = "vpdpbssd", width = 256, mr = 8, kstep = 2),
+ tune_perm(dot = "maddubs", width = 512, mr = 16, kstep = 2), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2),
+ tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 4, nrsplit = 2), tune_perm(dot = "vpdpbusd", width = 512, mr = 32, kstep = 2, nrsplit = 2),
+ tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 2, gkstep = 2), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2, gkstep = 2),
  tune_perm(suffix = "mr8_budget", mr = 8), tune_perm(suffix = "mr2_lanes", mr = 2), tune_perm(dot = "vpdpbusd"),
  tune_companion(fn = "q8q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
  tune_companion(fn = "q8q8_gemv_gen", gen = "dasllama_gemm_gen::q8q8_gemv"),

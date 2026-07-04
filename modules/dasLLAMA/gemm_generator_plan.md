@@ -677,6 +677,91 @@ an extern's `string implicit` parameter SIGSEGVs the compiler (plain interpolati
 das-wrapper callees are fine, hoisting to a `let` is the dodge). Minimal 10-line repro
 against llvm_boost's raw `LLVMBuildBitCast` binding; hit inside emit_block_mx4's s4 naming.
 
+## M4 slice F (2026-07-04, M1 Max) — the x64 dot emitters: one grid, every ISA (emission-proven)
+
+**The x64 legs land in the SAME generator and the SAME grid — `dot` and `width` become real
+knobs.** The M1 design conclusion held exactly: the loop nest, interleaved loads, accumulator
+tiles, scale folds, lane splats and stores were already generic IR, so the x64 legs are a
+`TileEmit` width generalization (`rv` = rows per vector = i32 acc lanes: 4/8/16 at
+width 128/256/512; `rq` becomes weight VECTORS per group = mr/rv) plus per-ISA dot chains in
+ONE `dot_lane` dispatch:
+
+- `dot=vpdpbusd` (VNNI, u8·s8): the proven dot32/dot64 emitter chain — `llvm.abs` (VPABSB,
+  hoisted per weight vector) + VPSIGNB per dot at 256 / compare+negate+select at 512 (no
+  512-bit VPSIGNB) + ONE `vpdpbusd.256/.512`. Exactness precondition unchanged from dot32
+  (x in [-127,127], w may be -128 — |w| goes on the unsigned side).
+- `dot=maddubs` (pre-VNNI, the Zen2 leg): same sign chain, dot = VPMADDUBSW + VPMADDWD(ones)
+  + VPADDD (`avx2.pmadd.*` at 256, `avx512.pmaddubs.w.512`/`pmaddw.d.512` at 512).
+- `dot=vpdpbssd` (AVX-VNNI-INT8, native s8·s8): ONE `llvm.x86.avx2.vpdpbssd.256`, NO sign
+  trick at all (new cpuid tier `avxvnniint8`, leaf-7-subleaf-1 EDX bit 4, added to
+  das_cpu_supports + `g_target_x64_vnniint8`; no fleet silicon — emission-only for now;
+  the 512-bit form is AVX10-only and declines).
+- mx4: `tbl1` -> `pshuf.b` ymm / `pshuf.b.512` (LUT constant broadcast per 16-byte lane;
+  indices 0..15 keep bit 7 clear so the zeroing path never fires) — the e8m0 scale fold was
+  already generic IR. The x64 rows' mx4/gemv companions come free through the shared slice
+  machinery and decline in lockstep (one `perm_declines`, now ISA-aware: tier truth via
+  `g_target_x64_*`, geometry mr % rv == 0, vq <= 2, nrsplit*vq <= 8, vreg budget
+  2*nrsplit*vq + 6 <= 16 ymm / 32 zmm).
+
+**The emission-only rail on a non-x64 box is now first-class.** `--jit-compile-only` (new JIT
+CLI flag): build + verify + optimize (+`--jit-dump`), write/load/install nothing, program runs
+interpreted — with `--jit-target=x86_64-unknown-linux-gnu`, cross x64 tier gates read
+`DAS_JIT_X64_FORCE_FEATURES` as the ONLY tier truth (host cpuid never leaks into a cross
+target; no env = no AVX emission, the pre-slice behavior). The TargetMachine feature string on
+explicit x64 cross triples now folds the forced features too, and `jit_dll_basename` folds the
+target triple (a latent cross-DLL cache-poison fix — a `--jit-target` artifact could
+previously cache-hit a host run of the same program).
+
+**Gates (this box):**
+
+- **arm64 UNCHANGED, machine-code-proven:** full-DLL neutralized instruction streams of the
+  kstep2-fallback stamp AND the mr8 manifest stamp are byte-identical pre/post refactor
+  (64975 + 69681 instruction lines diffed) — no `LLVM_JIT_CODEGEN_VERSION` bump needed.
+- **Grid 29/29 on arm64** (13 sdot rows + 12 x64 rows + 3 decline-by-design + reference):
+  every x64 row declines to reference semantics, maxdiff 0.
+- **Emission proof, 21/21 instruction-count gates green on the FIRST full run**
+  (`harness/gen_x64_emission_check.sh`: cross dump -> llc 22.1.5, same major as the dasLLVM
+  pin, `-mattr=+avx2,...,+avxvnniint8` -> llvm-objdump): busd256 tile = 96 vpdpbusd / 96
+  vpsignb / 24 vpabsb / 0 pair ops; maddubs256 = 96+96 pair / 0 VNNI; bssd256 = 96 vpdpbssd /
+  0 sign ops; busd512 = 96 vpdpbusd on zmm, 0 vpsignb; gemv gkstep2 = 24; mx4 = 8 vpshufb + 8
+  dots per block. Histogram: 96 single `vpbroadcastd` lane splats (the generic shuffle lowers
+  to memory-adjacent broadcasts — the x64 twin of the indexed-sdot zero-dup result), no
+  scalarization, no spill storm.
+- Slot parity + dasLLAMA/jit suites re-green on arm64; lint/format clean.
+
+**What is deliberately NOT proven here (needs x64 silicon):** semantics of the live x64 stamps
+(`DAS_TUNE_MODE=test` gen_tune_probe on Zen2/EPYC — zero extra wiring, the grid + oracle run
+as-is; small test fixtures bumped d 8 -> 32 so mr16/mr32 rows have groups to cover), perf
+(tune mode sweep -> manifest), and runtime selection (no `x64-gen` backend is registered yet —
+see below).
+
+**Queued for the Zen2/EPYC bring-up session (in order):**
+
+1. **The witness companion + `x64-gen` registration.** A fifth `() : bool` companion (reference
+   body returns false, generated body returns true, same lockstep predicate) gives the runtime
+   the "did the stamp actually fire" bit at SELECTION time (slice C rule) — on x64 a declined
+   stamp must not load-select the gen backend (its reference bodies are the scalar NEON
+   fallbacks there, ~3x slower than portable). Registration mirrors arm64-gen: the das
+   traversals are already ISA-agnostic.
+2. Semantics + tune sweep on silicon (test mode, then tune mode -> per-box manifest; Zen2 =
+   maddubs family, EPYC = vpdpbusd zmm — the session-5 lcpp zmm-engine fight).
+3. gen_parity_probe's small shapes assume mr <= 8 (d=8 fixtures) — bump like gen_tune_probe
+   when an mr16 manifest is actually in play.
+
+**Ledger (perf ideas spotted, not chased):**
+
+- **bias128 repack for vpdpbusd:** bake `w ^ 0x80` into the grp<mr> plane at repack (schema
+  field, layout-companion-driven so it can't desync), dot becomes `vpdpbusd(acc, w_biased,
+  x)` + one per-(block,token) correction `128 * blocksum(x)` folded at scale time — kills the
+  per-dot VPSIGNB (~28% of the busd dot-stage µops). Exact (u8 = w+128 in [0,255], x s8);
+  does NOT work for maddubs (PMADDUBSW pair sums saturate at 255·127·2). Measure against the
+  plain sign-trick perm on silicon before adopting.
+- Per-ISA `fallback=` in [tune] (the declared fallback "kstep2" is an arm64 perm; on x64 with
+  no manifest the family declines to reference — correct because selection is witness-gated,
+  but a per-target fallback would give manifest-less x64 boxes a live default).
+- NT/streaming weight loads for the fat w13/w2 batch streams (the mm_ffn 1.42x note) — now
+  expressible as a perm knob on the x64 legs.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /
@@ -697,7 +782,10 @@ get replaced as family coverage lands. What that implies, in order:
 4. **Delete**: arm64-laneq tier, x64 AVX matrix tiers, dasllama_tune's [tuned]/box_profile
    rail (subsumed by the loop-hint manifest kind), keeping portable/default backends only.
 
-**Still open in M4 proper:** slice C as above; loop-hint manifest kind; per-slot perms.
+**Still open in M4 proper:** loop-hint manifest kind; per-slot perms. (Slices C–F above
+delivered the promote, the GEMV/mx4 coverage, and the emission-proven x64 dot emitters; the
+x64 runtime bring-up — witness companion, registration, silicon gates — is the queued Zen2/
+EPYC session, slice F section above.)
 
 ## Pointers
 

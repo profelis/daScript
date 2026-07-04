@@ -257,9 +257,9 @@ def close_to_ref(fx : Fixture; y : array<float>; var maxdiff : float&) : bool {
 
 def test_mode : bool {
     // nb=2 (even main loop), nb=3 (remainder path), production-ish slice — d divides every
-    // grid mr (4 and 8)
-    var fxs <- [ <- build_fixture(64l, 8l, 4l), <- build_fixture(96l, 8l, 4l), <- build_fixture(2048l, 64l, 8l)]
-    var mfxs <- [ <- build_mx4_fixture(96l, 8l), <- build_mx4_fixture(2048l, 64l)]
+    // grid mr (4/8 on arm64, 16/32 on the x64 rows when live)
+    var fxs <- [ <- build_fixture(64l, 32l, 4l), <- build_fixture(96l, 32l, 4l), <- build_fixture(2048l, 64l, 8l)]
+    var mfxs <- [ <- build_mx4_fixture(96l, 32l), <- build_mx4_fixture(2048l, 64l)]
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
     var gtab <- gemv_variants_by_suffix()

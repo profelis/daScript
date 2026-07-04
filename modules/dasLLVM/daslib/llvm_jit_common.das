@@ -417,6 +417,10 @@ var public g_target_x64_avx2 = false
 var public g_target_x64_vnni256 = false
 var public g_target_x64_avx512bw = false
 var public g_target_x64_avx512vnni = false
+// AVX-VNNI-INT8 (VEX vpdpbssd — native s8×s8, no sign trick). No shipped silicon in the fleet
+// yet; lights up via cpuid on future boxes and via DAS_JIT_X64_FORCE_FEATURES for emission-only
+// verification today.
+var public g_target_x64_vnniint8 = false
 
 def private x64_forced_feature(name : string) : bool {
     for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")) {
@@ -431,8 +435,17 @@ def private x64_target_feature(name : string) : bool {
     return cpu_supports(name) || x64_forced_feature(name)
 }
 
-// The forced names as an LLVM target-feature append ("+avxvnni,+avx512bw"); the five matrix names
-// are spelled identically in cpuid and LLVM. Empty when the env is unset.
+// Tier truth per target kind: host targets read cpuid (OR'd with the emission-only force);
+// explicit cross-compile triples read the force string ONLY — the host's cpuid says nothing
+// about a cross target, so without DAS_JIT_X64_FORCE_FEATURES a cross x64 module gets no
+// AVX emission at all (today's behavior).
+def private x64_tier_feature(name : string; cross : bool) : bool {
+    return cross ? x64_forced_feature(name) : x64_target_feature(name)
+}
+
+// The forced names as an LLVM target-feature append ("+avxvnni,+avx512bw"); the matrix/tier names
+// (avx2, avxvnni, avx512f/bw/vl/vnni, avxvnniint8) are spelled identically in cpuid and LLVM.
+// Empty when the env is unset.
 def public x64_forced_plus_features() : string {
     let plus <- [for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")); "+{part}"; where !empty(part)]
     return join(plus, ",")
@@ -545,14 +558,18 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
         ? get_architecture_name() == "x86_64"
         : (starts_with(target_triple, "x86_64") || starts_with(target_triple, "amd64")))
     // AVX2 gate for the x64 intrinsic table (see the declaration comment): host targets take the
-    // running box's cpuid truth; cross targets get empty features, so no AVX2 emission there.
-    g_target_x64_avx2 = g_target_is_x64 && empty(target_triple) && cpu_supports("avx2")
+    // running box's cpuid truth. Explicit x64 cross triples take DAS_JIT_X64_FORCE_FEATURES as
+    // the ONLY tier truth (emission-only artifacts, never executed) — no env, no AVX emission,
+    // which keeps the pre-force cross behavior.
+    let x64_cross = g_target_is_x64 && !empty(target_triple)
+    g_target_x64_avx2 = g_target_is_x64 && (x64_cross ? x64_forced_feature("avx2") : cpu_supports("avx2"))
     // Matrix-tier gates (see the declaration comment): cpuid truth OR'd with the
-    // DAS_JIT_X64_FORCE_FEATURES emission-only override.
-    g_target_x64_vnni256 = g_target_x64_avx2 && (x64_target_feature("avxvnni")
-        || (x64_target_feature("avx512vnni") && x64_target_feature("avx512vl")))
-    g_target_x64_avx512bw = g_target_x64_avx2 && x64_target_feature("avx512f") && x64_target_feature("avx512bw")
-    g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_target_feature("avx512vnni")
+    // DAS_JIT_X64_FORCE_FEATURES emission-only override; forced-only on cross triples.
+    g_target_x64_vnni256 = g_target_x64_avx2 && (x64_tier_feature("avxvnni", x64_cross)
+        || (x64_tier_feature("avx512vnni", x64_cross) && x64_tier_feature("avx512vl", x64_cross)))
+    g_target_x64_avx512bw = g_target_x64_avx2 && x64_tier_feature("avx512f", x64_cross) && x64_tier_feature("avx512bw", x64_cross)
+    g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_tier_feature("avx512vnni", x64_cross)
+    g_target_x64_vnniint8 = g_target_x64_avx2 && x64_tier_feature("avxvnniint8", x64_cross)
     if (!(target_triple |> empty())) {
         // wasm32 target isn't always part of LLVMInitializeAllTargets in
         // prebuilt LLVM.dll — call the explicit wasm initializer when needed.
@@ -563,8 +580,12 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
         // archive is compiled with (see web/CMakeLists.txt). Required on wasm
         // so vec4f returns are v128-in-register on both sides; meaningless
         // (and potentially a target-machine-creation failure) on other
-        // cross-compile triples, so keep features empty there.
-        let features = g_target_is_wasm ? wasm_target_features() : ""
+        // cross-compile triples, so keep features empty there — except x64
+        // cross, where the DAS_JIT_X64_FORCE_FEATURES emission-only override
+        // is the tier truth (see the g_target_x64_* gates above) and must
+        // reach any codegen off this machine too.
+        let features = (g_target_is_wasm ? wasm_target_features()
+            : (x64_cross ? x64_forced_plus_features() : ""))
         with_target_machine(target_triple, "", features, cg_opt_level) $(targetMachine : LLVMTargetMachineRef) {
             let dl = LLVMCreateTargetDataLayout(targetMachine)
             LLVMSetModuleDataLayout(g_mod, dl)

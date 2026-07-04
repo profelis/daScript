@@ -1,0 +1,98 @@
+#!/bin/zsh
+# gen_x64_emission_check.sh — the slice F emission-only proof (gemm_generator_plan.md).
+#
+# Runs the generated GEMM family through a CROSS x64 compile (arm64 host is fine): forced
+# tier features + --jit-compile-only + --jit-dump, then llc (same LLVM major as the dasLLVM
+# pin) + llvm-objdump, and gates per-variant instruction counts — the x64 twin of the M2
+# "96 sdot / 0 dup" machine-code gate. Nothing x64 ever executes here; semantics gates run
+# on x64 silicon via DAS_TUNE_MODE=test (gen_tune_probe).
+#
+# Usage: gen_x64_emission_check.sh [outdir]
+#   LLC / LLVM_OBJDUMP env vars override tool paths (default: /opt/homebrew/opt/llvm/bin).
+set -e
+ROOT=${DAS_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}
+TOOLS=${LLVM_TOOLS:-/opt/homebrew/opt/llvm/bin}
+LLC=${LLC:-$TOOLS/llc}
+OBJDUMP=${LLVM_OBJDUMP:-$TOOLS/llvm-objdump}
+OUT=${1:-/tmp/gen_x64_emission}
+FEATURES=avx2,avxvnni,avx512f,avx512bw,avx512vl,avx512vnni,avxvnniint8
+mkdir -p "$OUT"
+
+echo "== cross compile-only dump (DAS_JIT_X64_FORCE_FEATURES=$FEATURES) =="
+DAS_TUNE_MODE=test DAS_JIT_X64_FORCE_FEATURES=$FEATURES \
+    "$ROOT/bin/daslang" -jit "$ROOT/modules/dasLLAMA/harness/gen_x64_emission_probe.das" \
+    -- --jit-compile-only --jit-dump --jit-target=x86_64-unknown-linux-gnu > "$OUT/dump.txt" 2>&1
+grep -q "compile-only — module built" "$OUT/dump.txt" || { echo "FAIL: compile-only did not complete"; exit 1; }
+
+awk '/^\[I\] LLVM JIT: ; ModuleID/ { sub(/^\[I\] LLVM JIT: /, ""); on=1 } on && /^\[[IEW]\] / { exit } on { print }' \
+    "$OUT/dump.txt" > "$OUT/module.ll"
+echo "module.ll: $(wc -l < "$OUT/module.ll") lines"
+
+echo "== llc + objdump =="
+"$LLC" -mtriple=x86_64-unknown-linux-gnu -mattr=+${FEATURES//,/,+} -filetype=obj \
+    -o "$OUT/module.o" "$OUT/module.ll"
+"$OBJDUMP" -d "$OUT/module.o" > "$OUT/disasm.txt"
+
+# count_in <symbol-substring> <mnemonic> — instruction count inside the (single) matching
+# function block; the das JIT inlines each variant's impl into its one exported wrapper
+count_in() {
+    awk -v pat="$1" -v mn="$2" '
+        /^[0-9a-f]+ </ { infn = index($0, pat) > 0; next }
+        infn && $0 ~ ("\t" mn) { n++ }
+        END { print n + 0 }
+    ' "$OUT/disasm.txt"
+}
+
+fails=0
+gate() { # gate <desc> <sym> <mnemonic> <expected>
+    local got=$(count_in "$2" "$3")
+    if [[ "$got" == "$4" ]]; then
+        echo "OK   $1: $3 == $4"
+    else
+        echo "FAIL $1: $3 == $got, want $4"
+        fails=$((fails+1))
+    fi
+}
+
+# tile, vpdpbusd ymm (kstep2 nrsplit4: 3 block instances x 8 kg x 4 tokens = 96 dots;
+# sign trick: one VPSIGNB per dot, one VPABSB per weight vector = 8 x 3)
+T=q8q8_tile_gen__
+gate "busd256 tile" "${T}dot_vpdpbusd_width256_mr8_kstep2 " vpdpbusd 96
+gate "busd256 tile no-pair" "${T}dot_vpdpbusd_width256_mr8_kstep2 " vpmaddubsw 0
+gate "busd256 tile sign" "${T}dot_vpdpbusd_width256_mr8_kstep2 " vpsignb 96
+gate "busd256 tile abs" "${T}dot_vpdpbusd_width256_mr8_kstep2 " vpabsb 24
+# tile, maddubs ymm: the VPMADDUBSW+VPMADDWD pair per dot, no VNNI op
+gate "maddubs256 tile pair1" "${T}dot_maddubs_width256_mr8_kstep2 " vpmaddubsw 96
+gate "maddubs256 tile pair2" "${T}dot_maddubs_width256_mr8_kstep2 " vpmaddwd 96
+gate "maddubs256 tile no-vnni" "${T}dot_maddubs_width256_mr8_kstep2 " vpdpbusd 0
+# tile, vpdpbssd ymm: native s8*s8 — no sign trick at all
+gate "bssd256 tile" "${T}dot_vpdpbssd_width256_mr8_kstep2 " vpdpbssd 96
+gate "bssd256 tile no-sign" "${T}dot_vpdpbssd_width256_mr8_kstep2 " vpsignb 0
+gate "bssd256 tile no-abs" "${T}dot_vpdpbssd_width256_mr8_kstep2 " vpabsb 0
+# tile, vpdpbusd zmm (mr16 = one zmm row-vector per dword group; select-based sign, no VPSIGNB)
+gate "busd512 tile" "${T}dot_vpdpbusd_width512_mr16_kstep2 " vpdpbusd 96
+gate "busd512 tile no-psign" "${T}dot_vpdpbusd_width512_mr16_kstep2 " vpsignb 0
+# tile, maddubs zmm
+gate "maddubs512 tile pair1" "${T}dot_maddubs_width512_mr16_kstep2 " vpmaddubsw 96
+gate "maddubs512 tile pair2" "${T}dot_maddubs_width512_mr16_kstep2 " vpmaddwd 96
+# gemv gkstep2 (3 block instances x 8 kg x 1 token = 24 dots)
+gate "busd256 gemv gk2" "q8q8_gemv_gen__dot_vpdpbusd_width256_mr8_kstep2_gkstep2 " vpdpbusd 24
+# mx4 gemv (gkstep1: 1 block instance; 4 nibble loads -> 8 VPSHUFB lookups, 8 dots)
+gate "mx4 busd256 lut" "mx4q8_gemv_gen__dot_vpdpbusd_width256_mr8_kstep2 " vpshufb 8
+gate "mx4 busd256 dot" "mx4q8_gemv_gen__dot_vpdpbusd_width256_mr8_kstep2 " vpdpbusd 8
+gate "mx4 bssd256 lut" "mx4q8_gemv_gen__dot_vpdpbssd_width256_mr8_kstep2 " vpshufb 8
+gate "mx4 bssd256 dot" "mx4q8_gemv_gen__dot_vpdpbssd_width256_mr8_kstep2 " vpdpbssd 8
+gate "mx4 bssd256 no-abs" "mx4q8_gemv_gen__dot_vpdpbssd_width256_mr8_kstep2 " vpabsb 0
+
+# zmm presence (register-width sanity for the 512 rows)
+z=$(awk -v pat="q8q8_tile_gen__dot_vpdpbusd_width512_mr16_kstep2 " '
+    /^[0-9a-f]+ </ { infn = index($0, pat) > 0; next }
+    infn && /%zmm/ { n++ } END { print n + 0 }' "$OUT/disasm.txt")
+if [[ $z -gt 0 ]]; then echo "OK   busd512 tile runs on zmm ($z zmm refs)"; else echo "FAIL busd512 tile: no zmm refs"; fails=$((fails+1)); fi
+
+if [[ $fails -eq 0 ]]; then
+    echo "GEN X64 EMISSION OK"
+else
+    echo "GEN X64 EMISSION: $fails gate(s) FAILED"
+    exit 1
+fi

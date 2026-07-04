@@ -1941,6 +1941,7 @@ namespace das
         if ( strcmp(feature, "avx")==0 )        return os_ymm && (r1[2] & (1<<28)) != 0;
         if ( strcmp(feature, "avx2")==0 )       return os_ymm && (r7[1] & (1<<5)) != 0;
         if ( strcmp(feature, "avxvnni")==0 )    return os_ymm && (r71[0] & (1<<4)) != 0;
+        if ( strcmp(feature, "avxvnniint8")==0 ) return os_ymm && (r71[3] & (1<<4)) != 0;
         if ( strcmp(feature, "avx512f")==0 )    return os_zmm && (r7[1] & (1<<16)) != 0;
         if ( strcmp(feature, "avx512bw")==0 )   return os_zmm && (r7[1] & (1<<30)) != 0;
         if ( strcmp(feature, "avx512vl")==0 )   return os_zmm && (r7[1] & (1u<<31)) != 0;
