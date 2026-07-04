@@ -570,6 +570,69 @@ What the honest C column says:
   reading generated GEMV, next coverage item) and a generated mx4 family are exactly what
   gates flipping it on; the batch-side win it buys is already measured and waiting.
 
+## M4 slice D (2026-07-04, M1 Max) — the GEMV sub-family: the three-function stamp
+
+**The nr=1 perm sub-family lands as a THIRD companion in the same [tune] bracket.**
+`q8q8_gemv_gen` is a rows-range core with the mm_rows slot signature (rows [rb, re) of one
+region, no internal dispatch, rb/re multiples of the stamped mr), stamped from the SAME
+manifest entry as the tile and layout — one entry, one coherent layout+tile+gemv decision;
+desync structurally impossible. The generator wraps `emit_slice(tokCount=1)` in an outer
+group loop (g-phi, per-group wg/sg GEPs — the group walk lives INSIDE the generated
+function, one call per dispatch chunk), reference body = the hand laneq rows walk (grp4).
+New knob `gkstep` (1|2|4, GEMV blocks per K-iteration — emit_block's fresh int accumulators
+per block are the independent sdot chains a serial single-token laneq chain lacks); the ONE
+shared `perm_declines` grows the gkstep rail, so all three generators decline in lockstep.
+Grid rows carrying gkstep spell their tile knobs explicitly ("kstep2_gkstep2"), which is
+what lets the tune probe key rows back to their tile family (`tile_key` strips the gkstep
+piece).
+
+**Every Q8 slot on both backend flavors is now the generated family.** mm/group3/groupn
+became das traversals over the rows core (chunk-splitting at region boundaries, bias
+post-add das-side), `mm_rows = q8q8_gemv_gen` directly (signature-identical), and the three
+grp<mr> generic stopgaps are DELETED — the first hand-kernel deletion the mandate called
+for. arm64-grp-gen thereby GAINS a rows core: fused decode chains now work at mr != 4. The
+flavors differ only in the mx4 family (laneq interleaved vs row-major — the next coverage
+item). The hand laneq mm/group3/groupn/rows borrow is gone from the gen backends;
+arm64-laneq stays registered for by-name pins/A-B.
+
+**The sweep grew a GEMV axis and the bench-shape lesson.** The streamed decode shape
+(2048x8192, 16MB per call) is DRAM-bound and CANNOT tell kernels apart — even the scalar
+reference body matches the vector tiers there (~54 GMAC/s single-thread). Differentiation
+needs the cache-resident shape (2048x512 x16 reps): there **mr8 GEMV beats the mr4 hand
+walk 67.4-69.0 vs 62.1-63.6 GMAC/s (~+8%)** — grp8 halves activation reloads per row — and
+gkstep2 adds ~2%. Tune mode benches tile on the batch shape and gemv on both decode shapes,
+then writes the MERGED winner: batch bench picks the tile knobs (and the layout), hot
+decode bench picks gkstep among rows sharing those tile knobs. This box writes
+`kstep4_nrsplit2_mr8_gkstep2`.
+
+**Gates:** grid test 17/17 rows (tile AND gemv vs the grp4-laneq oracle, both layouts;
+mr8 rows show the legal ~2e-6 fast-math regroup drift, mr4 exact); gen_parity_probe tile +
+gemv exact at both stamps; gen_slot_parity_probe green at BOTH layouts through the real
+rail (mm now rides the generated core — maxdiff 0 at mr4, 1.2e-7 worst at mr8);
+parity.das GEN_IDS token-for-token identical default-vs-mr8 on Llama-3.2-1B and
+Qwen2.5-0.5B (40 greedy tokens each); dasLLAMA suite under the promoted backend; fleet
+C-column re-run on the mr8 loser models (table below). No LLVM_JIT_CODEGEN_VERSION bump:
+emit_block/emit_slice untouched (tile emission byte-identical), and the new/changed stamped
+functions self-invalidate via their AST hashes.
+
+### Slice D fleet re-check (M1 Max, 8 lanes, emission_bench -p 512 -n 64 --nprompts 2)
+
+B = default (arm64-laneq-gen, kstep2 fallback), C = mr8 manifest (kstep4_nrsplit2_mr8_gkstep2,
+arm64-grp-gen), back-to-back per model on an idle box. The slice C C-column for these models
+was the generic-scalar GEMV penalty this slice was built to remove.
+
+| model | B pp | C pp | C/B | B emit | C emit | C/B (was, slice C) |
+|---|--:|--:|:--:|--:|--:|:--:|
+| SmolLM2-135M | 4555 | 4518 | 0.99 | 220.4 | 221.1 | 1.00 (was 0.64) |
+| Qwen2.5-0.5B | 1992 | 1986 | 1.00 | 145.4 | 146.0 | 1.00 (was 0.54; pp was 0.71 — the 152k cls GEMV) |
+| Qwen3-0.6B | 1497 | 1494 | 1.00 | 96.9 | 96.4 | 1.00 (was 0.59) |
+
+**mr8's fleet story after slice D:** wins +12–25% prefill on 1.5B–4B dense (slice C table,
+tile unchanged — gkstep is invisible to the tile), neutral on small AND large dense in both
+regimes, loses only gpt-oss (0.49 pp — the row-major mx4 family, exactly the next coverage
+item). The mr8 manifest is no longer a prefill-experiment config on Q8 models; a generated
+mx4 family is what's left before it's the unconditional daily driver.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /

@@ -22,6 +22,9 @@ require dasllama/dasllama_gemm_schema
 //   mr      rows per interleave group (4|8: a positive multiple of 4 — the sdot lane
 //           structure — inside the q-reg budget); the layout companion (q8q8_layout below)
 //           reports the same mr to the runtime repack
+//   gkstep  the GEMV companion's blocks per K-iteration (1|2|4) — fresh int accumulators per
+//           block give the single-token loop the independent sdot chains a serial laneq
+//           chain lacks; the tile ignores it (its K knob is kstep)
 //   dot     dot primitive; only "sdot" has an emitter on this (NEON) leg
 // Illegal perms decline (return false) and the reference body compiles instead — the decline
 // path is the fallback tier; the layout companion declines in LOCKSTEP (shared perm_declines),
@@ -34,6 +37,7 @@ struct private TilePerm {
     kstep : int = 2
     nrsplit : int = 4
     mr : int = GEMM_REFERENCE_MR
+    gkstep : int = 1
     dotPrim : string = "sdot"
 }
 
@@ -45,6 +49,8 @@ def private parse_perm(gc : LlvmCodeCtx) : TilePerm {
     if (nv is tInt) { p.nrsplit = nv as tInt }
     let mv = find_arg(gc.ann.arguments, "mr")
     if (mv is tInt) { p.mr = mv as tInt }
+    let gv = find_arg(gc.ann.arguments, "gkstep")
+    if (gv is tInt) { p.gkstep = gv as tInt }
     let dv = find_arg(gc.ann.arguments, "dot")
     if (dv is tString) { p.dotPrim = dv as tString }
     return p
@@ -60,6 +66,7 @@ def private perm_declines(var gc : LlvmCodeCtx; p : TilePerm) : bool {
         || (p.dotPrim != "sdot")
         || (p.kstep != 1 && p.kstep != 2 && p.kstep != 4)
         || (p.nrsplit != 2 && p.nrsplit != 4)
+        || (p.gkstep != 1 && p.gkstep != 2 && p.gkstep != 4)
         || (p.mr < 4 || p.mr % 4 != 0)
         || (2 * p.mr + p.nrsplit * p.mr / 4 + 2 * p.nrsplit + 2 > 32)) return true
     let rt = q8q8_repack_type(p.mr)
@@ -396,10 +403,99 @@ def private layout_gen(var gc : LlvmCodeCtx) : bool {
     return true
 }
 
+def private is_gemv_signature(fn : Function const?) : bool {
+    if (length(fn.arguments) != 8 || fn.result.baseType != Type.tVoid) return false
+    for (i in range(5)) {
+        if (fn.arguments[i]._type.baseType != Type.tPointer) return false
+    }
+    for (i in range(5, 8)) {
+        if (fn.arguments[i]._type.baseType != Type.tInt64) return false
+    }
+    return true
+}
+
+// The GEMV third of the stamp (the nr=1 perm sub-family): a rows-range core with the mm_rows
+// slot signature — rows [rb, re) of one region, rb/re multiples of the perm's mr, the group
+// loop INSIDE the generated function (one call per dispatch chunk). Per group it is
+// emit_slice with a single token and gkstep blocks per K-iteration: emit_block's fresh int
+// accumulators per block are the independent sdot chains a serial single-token laneq chain
+// lacks. Declines via the SAME perm_declines as the tile — the reference body (the grp4
+// laneq rows walk) falls back in lockstep with the grp4 reference pair.
+def private gemv_gen(var gc : LlvmCodeCtx) : bool {
+    if (!is_gemv_signature(gc.fn)) return false
+    let p = parse_perm(gc)
+    if (perm_declines(gc, p)) return false
+
+    let rt = q8q8_repack_type(p.mr)
+    let mod = LLVMGetGlobalParent(gc.impl)
+    let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.sdot")
+    var te = TileEmit(builder = gc.jit.builder, types = gc.jit.types, interleave = rt.interleave, rq = rt.interleave / 4)
+    te.v16i8 = LLVMVectorType(te.types.t_int8, 16u)
+    te.v4i32 = te.types->LLVMInt4Type()
+    te.v4f32 = te.types->LLVMFloat4Type()
+    var declTypes <- [te.v4i32, te.v16i8]
+    te.sdot_decl = LLVMGetIntrinsicDeclaration(mod, id, declTypes)
+    if (te.sdot_decl == null) return false      // no NEON dotprod on this target: decline
+    var fnArgTypes <- [te.v4i32, te.v16i8, te.v16i8]
+    te.sdot_ty = LLVMFunctionType(te.v4i32, fnArgTypes)
+
+    let b = gc.jit.builder
+    var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
+    var ghead = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "ghead")
+    var gexit = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "gexit")
+
+    // entry: group range off the row range; d=0/t0=0 turn emit_slice's store offset
+    // (tRow*d + col) into the absolute row g*mr
+    LLVMPositionBuilderAtEnd(b, entry)
+    var sa = SliceArgs(gc_impl = gc.impl, ctx = gc.jit.ctx, kstep = p.gkstep)
+    sa.yp = LLVMGetParam(gc.impl, 0u)
+    let wp = LLVMGetParam(gc.impl, 1u)
+    let sp = LLVMGetParam(gc.impl, 2u)
+    te.x[0] = LLVMGetParam(gc.impl, 3u)
+    te.xs[0] = LLVMGetParam(gc.impl, 4u)
+    let n = LLVMGetParam(gc.impl, 5u)
+    let rbv = LLVMGetParam(gc.impl, 6u)
+    let rev = LLVMGetParam(gc.impl, 7u)
+    sa.nb = LLVMBuildSDiv(b, n, te.types->ConstI64(32ul), "nb")
+    sa.d = te.types->ConstI64(0ul)
+    sa.t0 = te.types->ConstI64(0ul)
+    let mrC = te.types->ConstI64(uint64(te.interleave))
+    var g0 = LLVMBuildSDiv(b, rbv, mrC, "g0")
+    var g1 = LLVMBuildSDiv(b, rev, mrC, "g1")
+    var nonempty = LLVMBuildICmp(b, LLVMIntPredicate.LLVMIntSLT, g0, g1, "any")
+    LLVMBuildCondBr(b, nonempty, ghead, gexit)
+
+    // ghead: group phi + this group's weight/scale bases; the k loop hangs off it as its
+    // per-iteration body (emit_slice re-enters with zeroed accumulators each group)
+    LLVMPositionBuilderAtEnd(b, ghead)
+    var gPhi = LLVMBuildPhi(b, te.types.t_int64, "g")
+    var gEntryVals <- [g0]
+    var gEntryBlocks <- [entry]
+    LLVMAddIncoming(gPhi, gEntryVals, gEntryBlocks)
+    sa.g = gPhi
+    var gRow = LLVMBuildMul(b, gPhi, mrC, "grow")
+    te.wg = LLVMBuildGEP2(b, te.types.t_int8, wp, LLVMBuildMul(b, gRow, n, ""), "wg")
+    te.sg = LLVMBuildGEP2(b, te.types.t_float, sp, LLVMBuildMul(b, gRow, sa.nb, ""), "sg")
+
+    var after = emit_slice(te, sa, ghead, 0, 1, "")
+    LLVMPositionBuilderAtEnd(b, after)
+    var gNext = LLVMBuildAdd(b, gPhi, te.types->ConstI64(1ul), "gnext")
+    var more = LLVMBuildICmp(b, LLVMIntPredicate.LLVMIntSLT, gNext, g1, "more")
+    LLVMBuildCondBr(b, more, ghead, gexit)
+    var gLoopVals <- [gNext]
+    var gLoopBlocks <- [after]
+    LLVMAddIncoming(gPhi, gLoopVals, gLoopBlocks)
+
+    LLVMPositionBuilderAtEnd(b, gexit)
+    LLVMBuildRetVoid(b)
+    return true
+}
+
 // Called from llvm_user_modules::register_user_llvm_code_generators — the JIT invokes that in the
 // context that reads the registry, so the direct call lands in the right table copy.
 [macro_function]
 def public register_dasllama_gemm_generators {
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_tile", @@tile_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_layout", @@layout_gen)
+    register_llvm_code_generator("dasllama_gemm_gen::q8q8_gemv", @@gemv_gen)
 }

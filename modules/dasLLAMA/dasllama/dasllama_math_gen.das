@@ -10,30 +10,53 @@ require daslib/jobque_boost public
 require dasllama/dasllama_par
 require math
 
-// The GEMM tile as a [tune] client (gemm_generator_plan.md part 3; promoted from the M2 GO/NO-GO
-// experiment): the perm grid below stamps dasllama_gemm_gen::q8q8_tile perms through [llvm_code],
-// and the [tune_companion] row stamps q8q8_layout_gen from the same entry — the two-function
-// stamp: the runtime repack asks the layout companion which interleave the stamped tile reads,
-// and both generators share one decline predicate, so kernel and repack cannot desync on any
-// tier. Normal runs stamp exactly one winner (manifest > fallback kstep2 = the M2 perm);
-// DAS_TUNE_MODE=tune/test stamps the grid + the *_variants() registries for the harness
-// (gen_parity_probe / gen_tune_probe). This module also registers TWO backend flavors —
-// "arm64-laneq-gen" (grp4: laneq slots + the generated batch tile, priority 25) and
-// "arm64-grp-gen" (any other stamped mr: generic grp<mr> slots + the tile, priority 24) —
-// whose KernelBackend.available predicates read the stamped layout at SELECTION time (see
-// dasllama_math_gen_register below for why [init] can't). Since slice C this is the arm64
-// load-select tier: dasllama_common pulls it in behind a path guard
-// (`require ?llvm/daslib/llvm_tune`), so any Q8 model load on arm64+jit runs the generated
-// batch tile. The generator lives in dasllama/dasllama_gemm_gen.das (llvm-jit context, wired
-// via llvm/daslib/llvm_user_modules.das).
+// The GEMM family as a [tune] client (gemm_generator_plan.md part 3; promoted from the M2
+// GO/NO-GO experiment): the perm grid below stamps dasllama_gemm_gen::q8q8_tile perms through
+// [llvm_code], and the [tune_companion] rows stamp q8q8_layout_gen + q8q8_gemv_gen from the
+// same entry — the three-function stamp: the runtime repack asks the layout companion which
+// interleave the stamped tile AND gemv core read, and all three generators share one decline
+// predicate, so kernels and repack cannot desync on any tier. Normal runs stamp exactly one
+// winner (manifest > fallback kstep2 = the M2 perm); DAS_TUNE_MODE=tune/test stamps the grid
+// + the *_variants() registries for the harness (gen_parity_probe / gen_tune_probe). This
+// module also registers TWO backend flavors — "arm64-laneq-gen" (grp4 layout, laneq
+// interleaved mx4 family, priority 25) and "arm64-grp-gen" (any other stamped mr, row-major
+// mx4 family, priority 24); every Q8 slot on both is the generated family since slice D
+// (batch tile + gemv rows core + the mm/group3/groupn traversals over it). The available
+// predicates read the stamped layout at SELECTION time (see dasllama_math_gen_register below
+// for why [init] can't). Since slice C this is the arm64 load-select tier: dasllama_common
+// pulls it in behind a path guard (`require ?llvm/daslib/llvm_tune`), so any Q8 model load on
+// arm64+jit runs the generated family. The generators live in dasllama/dasllama_gemm_gen.das
+// (llvm-jit context, wired via llvm/daslib/llvm_user_modules.das).
 
-//! The layout companion (the two-function stamp): the repack interleave (mr) the stamped tile
+//! The layout companion (the three-function stamp): the repack interleave (mr) the stamped tile
 //! reads. Reference body = the reference tile's grp4; the generator emits the perm's mr and
 //! declines in lockstep with the tile generator (shared perm_declines), so a perm the tile
 //! can't emit keeps the grp4 reference pair on both sides — on every tier, JIT-time declines
 //! included.
 def q8q8_layout_gen() : int {
     return q8q8_repack_type(GEMM_REFERENCE_MR).interleave
+}
+
+//! The GEMV companion (the nr=1 perm sub-family, slice D): a rows-range core with the mm_rows
+//! slot signature — rows [rb, re) of one region, no internal dispatch, rb/re multiples of the
+//! stamped mr (the mm/group3/groupn wrappers chunk by groups; the mm_rows slot contract is
+//! multiples of 32). The generator emits the grp<mr> single-token k-loop with the group walk
+//! inside (gkstep blocks per iteration — independent sdot chains); the reference body is the
+//! hand laneq rows walk over the grp4 reference layout, declining in lockstep with the tile
+//! and layout via the shared predicate. Not `private`: it IS the mm_rows slot and is called
+//! from inside lifted parallel_for worker lambdas.
+[hint(unsafe_range_check, noalias = wp, noalias = sp, noalias = xqp, noalias = xsp)]
+def q8q8_gemv_gen(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) : void {
+    let nb = n / 32l
+    unsafe {
+        for (g in range64(rb / 4l, re / 4l)) {
+            let f = dot_q8q8_laneq4(wp + g * 4l * n, sp + g * 4l * nb, xqp, xsp, n)
+            yp[g * 4l + 0l] = f.x
+            yp[g * 4l + 1l] = f.y
+            yp[g * 4l + 2l] = f.z
+            yp[g * 4l + 3l] = f.w
+        }
+    }
 }
 
 //! The generated tile: mr interleaved rows x 4 tokens (the q8q8_repack_type(mr) layout — see
@@ -45,8 +68,11 @@ def q8q8_layout_gen() : int {
 [tune_perm(kstep = 1), tune_perm(kstep = 2), tune_perm(kstep = 4), tune_perm(kstep = 2, nrsplit = 2),
  tune_perm(kstep = 1, nrsplit = 2), tune_perm(kstep = 4, nrsplit = 2),
  tune_perm(kstep = 1, nrsplit = 2, mr = 8), tune_perm(kstep = 2, nrsplit = 2, mr = 8), tune_perm(kstep = 4, nrsplit = 2, mr = 8),
+ tune_perm(kstep = 2, gkstep = 2), tune_perm(kstep = 2, gkstep = 4),
+ tune_perm(kstep = 4, nrsplit = 2, mr = 8, gkstep = 2), tune_perm(kstep = 4, nrsplit = 2, mr = 8, gkstep = 4),
  tune_perm(suffix = "mr8_budget", mr = 8), tune_perm(suffix = "mr2_lanes", mr = 2), tune_perm(dot = "vpdpbusd"),
  tune_companion(fn = "q8q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
+ tune_companion(fn = "q8q8_gemv_gen", gen = "dasllama_gemm_gen::q8q8_gemv"),
  tune(gen = "dasllama_gemm_gen::q8q8_tile", fallback = "kstep2"),
  hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xqp, noalias = xsp)]
 def q8q8_tile_gen(var yp : float?; wg : int8 const?; sg : float const?; xqp : int8 const?; xsp : float const?; n, d, g, t0 : int64) : void {
@@ -205,21 +231,17 @@ def private q8q8_batch_kernel_neon_laneq_gen(var yp : float?; wp : int8 const?; 
     }
 }
 
-// grp<mr> GEMV for mr != 4 (the hand laneq mm reads grp4 only): generic dot per group, same
-// dispatch shape as q8q8_kernel_neon_laneq. Correct-anywhere, not fast — the GEMV regime gets
-// its own perm sub-family later; batch is what the mr axis is swept for.
-def private q8q8_kernel_grp_generic(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+// mm slot: the hand laneq dispatch shape with the group walk handed to the generated rows
+// core — ONE core call per chunk (the group loop lives inside the generated code). Strides
+// come off the layout companion, so the same wrapper serves both stamped layouts; the row
+// tail (d % mr) stays row-major in the repack and rides sdot4x4.
+def private q8q8_kernel_gen(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     let mr = int64(q8q8_layout_gen())
     let ng = d / mr
     var myp = yp
     maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(ng), matmul_chunks_gemv(int(ng * mr), get_dispatch_lanes() * get_q8_batch_chunks_per_job())) $(rb, re) {
-        unsafe {
-            for (gi in range(rb, re)) {
-                let g = int64(gi)
-                q8q8_token_grp_generic(myp, wp + g * mr * n, sp + g * mr * nb, xqp, xsp, n, d, g * mr, 0l, mr)
-            }
-        }
+        q8q8_gemv_gen(myp, wp, sp, xqp, xsp, n, int64(rb) * mr, int64(re) * mr)
     }
     unsafe {
         for (i in range64(ng * mr, d)) {
@@ -228,32 +250,89 @@ def private q8q8_kernel_grp_generic(var yp : float?; wp : int8 const?; sp : floa
     }
 }
 
-// grp<mr> group3 for mr != 4: three generic GEMVs — same per-row dots as a fused walk, one
-// dispatch each (probe-only backend; fusion stays a hand-tier property until the scoreboard
-// says otherwise)
-def private q8q8_group3_grp_generic(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?;
-                                    woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) {
+// group3: the hand laneq fused walk (one dispatch over the three regions' combined group
+// space), each worker chunk split at region boundaries into at most three rows-core calls
+def private q8q8_group3_gen(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : float const?;
+                            woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) {
+    let nb = n / 32l
+    let mr = int64(q8q8_layout_gen())
+    let ng0 = d0 / mr
+    let ng1 = d1 / mr
+    let ng2 = d2 / mr
+    let ngtot = ng0 + ng1 + ng2
+    var w0 = y0p
+    var w1 = y1p
+    var w2 = y2p
+    // oversplit only under team dispatch — same trade as the hand laneq group3
+    maybe_parallel_for(n * (d0 + d1 + d2) >= g_matmul_par_threshold, 0, int(ngtot), matmul_chunks_gemv(int(ngtot * mr), get_dispatch_lanes() * (get_jobque_team_mode() ? get_q8_batch_chunks_per_job() : 1))) $(rb, re) {
+        unsafe {
+            let b0 = int64(rb)
+            let e0 = min(int64(re), ng0)
+            if (b0 < e0) {
+                q8q8_gemv_gen(w0, wp + woff0, sp + woff0 / 32l, xqp, xsp, n, b0 * mr, e0 * mr)
+            }
+            let b1 = max(int64(rb) - ng0, 0l)
+            let e1 = min(int64(re) - ng0, ng1)
+            if (b1 < e1) {
+                q8q8_gemv_gen(w1, wp + woff1, sp + woff1 / 32l, xqp, xsp, n, b1 * mr, e1 * mr)
+            }
+            let b2 = max(int64(rb) - ng0 - ng1, 0l)
+            let e2 = min(int64(re) - ng0 - ng1, ng2)
+            if (b2 < e2) {
+                q8q8_gemv_gen(w2, wp + woff2, sp + woff2 / 32l, xqp, xsp, n, b2 * mr, e2 * mr)
+            }
+        }
+    }
     unsafe {
-        q8q8_kernel_grp_generic(y0p, wp + woff0, sp + woff0 / 32l, xqp, xsp, n, d0)
-        q8q8_kernel_grp_generic(y1p, wp + woff1, sp + woff1 / 32l, xqp, xsp, n, d1)
-        q8q8_kernel_grp_generic(y2p, wp + woff2, sp + woff2 / 32l, xqp, xsp, n, d2)
+        for (i in range64(ng0 * mr, d0)) {
+            w0[i] = dot_q8q8_sdot4x4(wp + woff0 + i * n, sp + woff0 / 32l + i * nb, xqp, xsp, n)
+        }
+        for (i in range64(ng1 * mr, d1)) {
+            w1[i] = dot_q8q8_sdot4x4(wp + woff1 + i * n, sp + woff1 / 32l + i * nb, xqp, xsp, n)
+        }
+        for (i in range64(ng2 * mr, d2)) {
+            w2[i] = dot_q8q8_sdot4x4(wp + woff2 + i * n, sp + woff2 / 32l + i * nb, xqp, xsp, n)
+        }
     }
 }
 
-// grp<mr> region-list GEMV for mr != 4: per-region generic GEMV + a bias post-add — one
-// dispatch per region instead of laneq's fused walk (correct-anywhere stopgap; the GEMV perm
-// sub-family is where mr != 4 decode perf comes from)
-def private q8q8_groupn_grp_generic(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+// groupn: the hand laneq fused walk over the (region x group) space; each worker chunk runs
+// region-contiguous rows-core spans + the bias post-add over the same span (an extra y pass,
+// trivial next to the dots)
+def private q8q8_groupn_gen(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nb = n / 32l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
     var myp = yp
+    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * ng), matmul_chunks_gemv(int(nregions * ng * mr), get_dispatch_lanes() * get_q8_batch_chunks_per_job())) $(gb, ge) {
+        unsafe {
+            var gg = int64(gb)
+            while (gg < int64(ge)) {
+                let r = gg / ng
+                let gLocal = gg % ng
+                let gEnd = min(int64(ge) - r * ng, ng)
+                let woff = offs[r * 2l]
+                let xoff = offs[r * 2l + 1l]
+                q8q8_gemv_gen(myp + r * d, wp + woff, sp + woff / 32l, xqp + xoff, xsp + xoff / 32l, n, gLocal * mr, gEnd * mr)
+                if (bp != null) {
+                    for (i in range64(gLocal * mr, gEnd * mr)) {
+                        myp[r * d + i] += bp[boffs[r] + i]
+                    }
+                }
+                gg = r * ng + gEnd
+            }
+        }
+    }
     unsafe {
-        for (r in range64(nregions)) {
+        for (r in range64(nregions)) {   // row tails (d % mr): row-major sdot4x4 per region
             let woff = offs[r * 2l]
             let xoff = offs[r * 2l + 1l]
-            q8q8_kernel_grp_generic(myp + r * d, wp + woff, sp + woff / 32l, xqp + xoff, xsp + xoff / 32l, n, d)
-            if (bp != null) {
-                for (i in range64(d)) {
-                    myp[r * d + i] += bp[boffs[r] + i]
+            for (i in range64(ng * mr, d)) {
+                var v = dot_q8q8_sdot4x4(wp + woff + i * n, sp + woff / 32l + i * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + i]
                 }
+                myp[r * d + i] = v
             }
         }
     }
@@ -270,30 +349,32 @@ def private gen_layout_is_grpn() : bool => q8q8_layout_gen() != 4
 
 [init]
 def dasllama_math_gen_register() {
-    // Same gate as the laneq backend whose slots it borrows; needs_repack keeps both flavors
-    // out of auto-select (direct callers stay on arm64-sdot). Two STATIC flavors — which one
-    // load-select may pick is the `available` predicate's call, at selection time:
+    // Same gate as the laneq backend it supersedes; needs_repack keeps both flavors out of
+    // auto-select (direct callers stay on arm64-sdot). Two STATIC flavors — which one
+    // load-select may pick is the `available` predicate's call, at selection time. Since
+    // slice D every Q8 slot is the generated family on both flavors (batch tile + gemv rows
+    // core + the mm/group3/groupn traversals over it — the hand laneq borrow and the generic
+    // grp<mr> stopgaps are gone); only the mx4 family still differs:
     //   arm64-laneq-gen (priority 25 — over laneq's 20, the load-select tier since slice C):
-    //     the grp4 layout — generated batch tile + the byte-identical laneq mm/group3/rows/mx4
-    //     interleaved family.
+    //     the grp4 layout — laneq interleaved mx4 family.
     //   arm64-grp-gen (priority 24 — still over laneq, never co-available with the grp4 flavor):
-    //     any other stamped mr — generic grp<mr> Q8 forms, row-major mx4 family (interleaved
-    //     planes + a grp<mr> Q8 scratch can't share the laneq expand map), per-op decode
-    //     (no rows core).
+    //     any other stamped mr — row-major mx4 family (interleaved planes + a grp<mr> Q8
+    //     scratch can't share the laneq expand map).
     if (get_architecture_name() == "arm64" && jit_enabled()) {
-        register_kernel_backend(KernelBackend(name = "arm64-laneq-gen", mm = @@q8q8_kernel_neon_laneq,
-            batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_kernel_neon_laneq,
+        register_kernel_backend(KernelBackend(name = "arm64-laneq-gen", mm = @@q8q8_kernel_gen,
+            batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_gen,
             repack = @@repack_q8q8_gen,
             mm_mx4 = @@mx4q8_kernel_neon_laneq, repack_mx4 = @@repack_mx4_neon,
-            groupn = @@q8q8_groupn_kernel_neon_laneq, groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq,
-            mm_rows = @@q8q8_rows_kernel_neon_laneq,
+            groupn = @@q8q8_groupn_gen, groupn_mx4 = @@mx4q8_groupn_kernel_neon_laneq,
+            mm_rows = @@q8q8_gemv_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             available = @@gen_layout_is_grp4))
-        register_kernel_backend(KernelBackend(name = "arm64-grp-gen", mm = @@q8q8_kernel_grp_generic,
-            batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_grp_generic,
+        register_kernel_backend(KernelBackend(name = "arm64-grp-gen", mm = @@q8q8_kernel_gen,
+            batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_gen,
             repack = @@repack_q8q8_gen,
             mm_mx4 = @@mx4q8_kernel_neon, repack_mx4 = @@repack_mx4_identity,
-            groupn = @@q8q8_groupn_grp_generic, groupn_mx4 = @@mx4q8_groupn_kernel_neon,
+            groupn = @@q8q8_groupn_gen, groupn_mx4 = @@mx4q8_groupn_kernel_neon,
+            mm_rows = @@q8q8_gemv_gen,
             needs_repack = true, priority = 24,
             available = @@gen_layout_is_grpn))
     }

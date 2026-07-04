@@ -120,8 +120,22 @@ def test_shape(n, d, ntok : int64) : bool {
         md = max(md, df)
         ok &&= df <= max(CLOSE_ABS, CLOSE_REL * abs(yref[i]))
     }
-    print("n={n} d={d} ntok={ntok} mr={mr}: {exact}/{length(ygen)} exact, maxdiff {md} — {ok ? "OK" : "MISMATCH"}\n")
-    return ok
+
+    // the stamped gemv rows core on the same buffers: token 0's row of the oracle
+    var ygv : array<float>
+    ygv |> resize(int(d))
+    unsafe {
+        q8q8_gemv_gen(addr(ygv[0]), addr(q[0]), addr(s[0]), addr(xq[0]), addr(xs[0]), n, 0l, ng * mr)
+    }
+    var gmd = 0.0
+    var gok = true
+    for (i in range(length(ygv))) {
+        let df = abs(ygv[i] - yref[i])
+        gmd = max(gmd, df)
+        gok &&= df <= max(CLOSE_ABS, CLOSE_REL * abs(yref[i]))
+    }
+    print("n={n} d={d} ntok={ntok} mr={mr}: tile {exact}/{length(ygen)} exact, maxdiff {md} — {ok ? "OK" : "MISMATCH"}; gemv maxdiff {gmd} — {gok ? "OK" : "MISMATCH"}\n")
+    return ok && gok
 }
 
 [export]

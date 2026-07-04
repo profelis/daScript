@@ -3,20 +3,27 @@ options persistent_heap
 options _jit_fast_math = true   // match gemm_1core_probe / the end-to-end config
 
 // M3/M4 grid gates (gemm_generator_plan.md): run with DAS_TUNE_MODE=test or =tune, -jit.
-// Layout is per-variant: each tile variant's mr comes off its q8q8_layout_gen__<suffix>
+// Layout is per-variant: each variant's mr comes off its q8q8_layout_gen__<suffix>
 // companion (declined perms report the reference grp4 — the lockstep rail), and the probe
 // repacks a fresh copy of the row-major master into that variant's grp<mr> before running it.
-//   test: every [tune_perm] variant of q8q8_tile_gen (dasllama_math_gen) must match the hand
-//         laneq oracle (computed once, from a grp4 copy — the fold order is layout-
-//         independent) within CLOSE_REL/CLOSE_ABS on nb-even, nb-odd and a production-ish
-//         slice. Tolerance, not equality: variants run under full fast-math, so the backend
-//         may legally regroup a fold per loop shape (~1e-6 relative; llama.cpp holds no
-//         cross-kernel bit-parity either) — real generator bugs (wrong stride/lane/scale)
-//         are orders louder and still die here. Declining perms (mr8_budget / mr2_lanes /
-//         dot_vpdpbusd) run the reference body.
-//   tune: iso-bench every variant (interleaved best-of) on its own repacked buffers, print
-//         the table, and tune_manifest_set the winner — a following normal run stamps it
-//         (the round-trip; point DAS_TUNE_MANIFEST somewhere writable first).
+// Since slice D the grid stamps a THIRD function — the q8q8_gemv_gen rows core — and both
+// modes cover it alongside the tile.
+//   test: every [tune_perm] variant of q8q8_tile_gen AND q8q8_gemv_gen (dasllama_math_gen)
+//         must match the hand laneq oracle (computed once, from a grp4 copy — the fold order
+//         is layout-independent; the gemv compares the token-0 row) within
+//         CLOSE_REL/CLOSE_ABS on nb-even, nb-odd and a production-ish slice. Tolerance, not
+//         equality: variants run under full fast-math, so the backend may legally regroup a
+//         fold per loop shape (~1e-6 relative; llama.cpp holds no cross-kernel bit-parity
+//         either) — real generator bugs (wrong stride/lane/scale) are orders louder and
+//         still die here. Declining perms (mr8_budget / mr2_lanes / dot_vpdpbusd) run the
+//         reference bodies.
+//   tune: iso-bench every variant (interleaved best-of) on its own repacked buffers — the
+//         tile on a batch shape, the gemv core on a single-token decode shape — print both
+//         tables, and tune_manifest_set the merged winner: the row whose TILE knobs win the
+//         batch bench and whose gkstep wins the decode bench among rows with those tile
+//         knobs (one manifest entry = one coherent layout+tile+gemv decision). A following
+//         normal run stamps it (the round-trip; point DAS_TUNE_MANIFEST somewhere writable
+//         first).
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default
@@ -25,6 +32,7 @@ require dasllama/dasllama_math_gen
 require dasllama/dasllama_quant
 require llvm/daslib/llvm_tune
 require math
+require strings
 
 let ROUNDS = 6
 
@@ -128,6 +136,33 @@ def run_tile(tile; fx : Fixture; q : array<int8>; s : array<float>; mr : int64; 
     }
 }
 
+// one gemv rows-core sweep over all group rows for token 0 (the group loop is inside the
+// generated function — one call, like a production dispatch chunk)
+def run_gemv(gemv; fx : Fixture; q : array<int8>; s : array<float>; mr : int64; var y : array<float>) {
+    unsafe {
+        invoke(gemv, addr(y[0]), addr(q[0]), addr(s[0]), addr(fx.xq[0]), addr(fx.xs[0]), fx.n, 0l, (fx.d / mr) * mr)
+    }
+}
+
+// suffix -> gemv rows-core variant, keyed like the tile registry (same perm rows by
+// construction)
+def gemv_variants_by_suffix() : table<string; MatmulQ8Q8RowsFn> {
+    var tab : table<string; MatmulQ8Q8RowsFn>
+    var gvs <- q8q8_gemv_gen_variants()
+    for (v in gvs) {
+        tab[v._0] = v._1
+    }
+    delete gvs
+    return <- tab
+}
+
+// the row's tile knobs: the suffix minus its gemv piece — rows carrying gkstep spell the
+// tile knobs explicitly, so "kstep2_gkstep2" keys with "kstep2"
+def tile_key(suffix : string) : string {
+    let i = find(suffix, "_gkstep")
+    return i < 0 ? suffix : slice(suffix, 0, i)
+}
+
 let CLOSE_REL = 1e-4
 let CLOSE_ABS = 1e-5
 
@@ -147,11 +182,15 @@ def test_mode : bool {
     var fxs <- [ <- build_fixture(64l, 8l, 4l), <- build_fixture(96l, 8l, 4l), <- build_fixture(2048l, 64l, 8l)]
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
+    var gtab <- gemv_variants_by_suffix()
     var allok = true
     for (v in vs) {
         let mr = int64(mrs?[v._0] ?? 4)
+        verify(gtab |> key_exists(v._0))
         var ok = true
+        var gok = true
         var maxdiff = 0.0
+        var gmaxdiff = 0.0
         for (fx in fxs) {
             var qv := fx.q
             var sv := fx.s
@@ -172,13 +211,30 @@ def test_mode : bool {
                 }
             }
             ok = ok && fxok
+            // the gemv rows core on the same buffers: token 0's row of the oracle
+            var yg : array<float>
+            yg |> resize(int(fx.d))
+            run_gemv(gtab[v._0], fx, qv, sv, mr, yg)
+            let gfxok = close_to_ref(fx, yg, gmaxdiff)
+            if (!gfxok) {
+                var shown = 0
+                for (i in range(length(yg))) {
+                    if (abs(yg[i] - fx.yref[i]) > max(CLOSE_ABS, CLOSE_REL * abs(fx.yref[i])) && shown < 6) {
+                        print("  DBG gemv {v._0} n={fx.n}: y[{i}] = {yg[i]} want {fx.yref[i]}\n")
+                        shown++
+                    }
+                }
+            }
+            gok = gok && gfxok
             delete y
+            delete yg
             delete qv
             delete sv
         }
-        print("{v._0} (mr={mr}): {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff})\n")
-        allok = allok && ok
+        print("{v._0} (mr={mr}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff})\n")
+        allok = allok && ok && gok
     }
+    delete gtab
     delete mrs
     delete vs
     delete fxs
@@ -191,39 +247,73 @@ struct VBuf {
 }
 
 def tune_mode_run : bool {
-    var fx <- build_fixture(2048l, 512l, 64l)
+    var fx <- build_fixture(2048l, 512l, 64l)      // batch shape (the kv projection)
+    var gfx <- build_fixture(2048l, 8192l, 1l)     // streamed decode shape (DRAM-bound ffn GEMV)
+    var hfx <- build_fixture(2048l, 512l, 1l)      // hot decode shape (cache-resident — the
+                                                   // only regime where gemv knobs can show)
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
+    var gtab <- gemv_variants_by_suffix()
     let nv = length(vs)
     // per-variant repacked buffers, built once outside the timing loop
     var bufs : array<VBuf>
+    var gbufs : array<VBuf>
+    var hbufs : array<VBuf>
     bufs |> resize(nv)
+    gbufs |> resize(nv)
+    hbufs |> resize(nv)
     var vmr : array<int64>
     vmr |> resize(nv)
     for (vi in range(nv)) {
         vmr[vi] = int64(mrs?[vs[vi]._0] ?? 4)
+        verify(gtab |> key_exists(vs[vi]._0))
         bufs[vi].q := fx.q
         bufs[vi].s := fx.s
+        gbufs[vi].q := gfx.q
+        gbufs[vi].s := gfx.s
+        hbufs[vi].q := hfx.q
+        hbufs[vi].s := hfx.s
         unsafe {
             repack_q8q8_grp(addr(bufs[vi].q[0]), addr(bufs[vi].s[0]), fx.n, fx.d, vmr[vi])
+            repack_q8q8_grp(addr(gbufs[vi].q[0]), addr(gbufs[vi].s[0]), gfx.n, gfx.d, vmr[vi])
+            repack_q8q8_grp(addr(hbufs[vi].q[0]), addr(hbufs[vi].s[0]), hfx.n, hfx.d, vmr[vi])
         }
     }
     var best : array<double>
+    var gbest : array<double>
+    var hbest : array<double>
     best |> resize(nv)
+    gbest |> resize(nv)
+    hbest |> resize(nv)
     for (i in range(nv)) {
         best[i] = 1.0e30lf
+        gbest[i] = 1.0e30lf
+        hbest[i] = 1.0e30lf
     }
     var y : array<float>
     y |> resize(int(fx.ntok * fx.d))
+    var yg : array<float>
+    yg |> resize(int(gfx.d))
+    var yh : array<float>
+    yh |> resize(int(hfx.d))
     // correctness first — a tune run must never crown a broken variant
     for (vi in range(nv)) {
         run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], y)
         var maxdiff = 0.0
         if (!close_to_ref(fx, y, maxdiff)) {
-            print("{vs[vi]._0}: MISMATCH (maxdiff {maxdiff}) — aborting tune\n")
+            print("{vs[vi]._0}: tile MISMATCH (maxdiff {maxdiff}) — aborting tune\n")
+            return false
+        }
+        run_gemv(gtab[vs[vi]._0], gfx, gbufs[vi].q, gbufs[vi].s, vmr[vi], yg)
+        var gmaxdiff = 0.0
+        if (!close_to_ref(gfx, yg, gmaxdiff)) {
+            print("{vs[vi]._0}: gemv MISMATCH (maxdiff {gmaxdiff}) — aborting tune\n")
             return false
         }
     }
+    // the hot shape runs HOT_REPS back-to-back per timing sample: 1MB of weights stays
+    // cache-resident, so the sample measures compute, not the first-touch stream
+    let HOT_REPS = 16
     for (_r in range(ROUNDS)) {   // interleaved best-of: variant order inside each round
         for (vi in range(nv)) {
             let t0 = ref_time_ticks()
@@ -232,25 +322,64 @@ def tune_mode_run : bool {
             if (us < best[vi]) {
                 best[vi] = us
             }
+            let g0 = ref_time_ticks()
+            run_gemv(gtab[vs[vi]._0], gfx, gbufs[vi].q, gbufs[vi].s, vmr[vi], yg)
+            let gus = double(get_time_usec(g0))
+            if (gus < gbest[vi]) {
+                gbest[vi] = gus
+            }
+            let h0 = ref_time_ticks()
+            for (_h in range(HOT_REPS)) {
+                run_gemv(gtab[vs[vi]._0], hfx, hbufs[vi].q, hbufs[vi].s, vmr[vi], yh)
+            }
+            let hus = double(get_time_usec(h0)) / double(HOT_REPS)
+            if (hus < hbest[vi]) {
+                hbest[vi] = hus
+            }
         }
     }
     let macs = double(fx.n * fx.d * fx.ntok)
+    let gmacs = double(gfx.n * gfx.d)
+    let hmacs = double(hfx.n * hfx.d)
     var winner = 0
     for (vi in range(nv)) {
         if (best[vi] < best[winner]) {
             winner = vi
         }
-        print("{vs[vi]._0} (mr={vmr[vi]}): {macs / best[vi] / 1000.0lf} GMAC/s (best of {ROUNDS})\n")
+        print("{vs[vi]._0} (mr={vmr[vi]}): tile {macs / best[vi] / 1000.0lf} GMAC/s, gemv stream {gmacs / gbest[vi] / 1000.0lf} / hot {hmacs / hbest[vi] / 1000.0lf} GMAC/s (best of {ROUNDS})\n")
     }
-    let ok = tune_manifest_set("q8q8_tile_gen", vs[winner]._0)
-    print("winner: {vs[winner]._0} {ok ? "->" : "-> FAILED TO WRITE"} {tune_manifest_path()}\n")
+    // the merged winner: the batch bench picks the tile knobs (and with them the layout);
+    // the HOT decode bench picks gkstep among the rows sharing those tile knobs (the
+    // streamed shape is DRAM-bound and cannot tell kernels apart) — one entry, one
+    // coherent layout+tile+gemv decision
+    let wkey = tile_key(vs[winner]._0)
+    var merged = winner
+    for (vi in range(nv)) {
+        if (tile_key(vs[vi]._0) == wkey && hbest[vi] < hbest[merged]) {
+            merged = vi
+        }
+    }
+    if (merged != winner) {
+        print("tile winner {vs[winner]._0} + hot decode winner within '{wkey}' -> {vs[merged]._0}\n")
+    }
+    let ok = tune_manifest_set("q8q8_tile_gen", vs[merged]._0)
+    print("winner: {vs[merged]._0} {ok ? "->" : "-> FAILED TO WRITE"} {tune_manifest_path()}\n")
     delete y
+    delete yg
+    delete yh
     delete bufs
+    delete gbufs
+    delete hbufs
     delete vmr
     delete best
+    delete gbest
+    delete hbest
+    delete gtab
     delete mrs
     delete vs
     delete fx
+    delete gfx
+    delete hfx
     return ok
 }
 
