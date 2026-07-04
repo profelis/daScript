@@ -637,6 +637,46 @@ The join-tail attack Boris chose (session 3f next-steps #1), built as general ma
 - Fresh-boot confirm of absolutes still pending (drift tonight as usual; in-process pairs are
   the trustworthy numbers).
 
+## Session 5 (2026-07-04): fleet sweep vs lcpp begins + the prefill "regression" resolved + zvnni batch pin (+20%)
+
+**Fleet-sweep method (Boris's spec):** per (model, T): ours = `DAS_JOBQUE_THREADS=T emission_bench
+-p 512 -n 64 --nprompts 4` (ttft = direct batched prefill-512 + 1 token; derived pp512 validated
+vs prefill_perf direct at ±1% on 1B/8B/gpt-oss); lcpp = clean `llama-bench -p 512 -n 64 -t T`
+(op-profile patch saved to `/data/ggml_op_profile.saved.patch`, tree restored). Same T both sides.
+Driver `/data/sweep/run_bracket.sh`; ~30 min per T bracket, 14 models. **Harness fix that
+mattered:** emission_bench/prefill_perf used raw `load_gguf` → never applied box_profile runtime
+(would have swept the UNTUNED auto stack); both now call `apply_box_profile_runtime()` first
+(commit `eb43dccef`).
+
+**T=8 + T=16 fleet result (acc8-pin config):** prefill uniformly 0.60-0.67× lcpp on every dense
+model; emit scales with size — 0.24× (135M, FLAT across T = the 2M par threshold leaves all
+non-cls matmuls single-lane) up to 0.90-0.97× (4-8B); gpt-oss outlier 0.39×/0.23×. Full tables
+in the session transcript; raw logs `/data/sweep/T{8,16}_*`.
+
+**The "we lost repack" scare — resolved, no regression anywhere:**
+- Boris desktop (3990X Zen2, master tip): 1B pp 361 vs lcpp 409 at 16C (0.88×) — but **+20% WIN
+  at 32C**, reproduced on current code. #3365's 121% claim was @32T; 16T was never a measured
+  point. lcpp scales flat (409→~500), ours steep (361→~600) — the curves cross between 16 and 32.
+  #3368/#3369/#3370 cost nothing on Zen2.
+- Genoa box, same code, same model, T=32: ours 565/571 pp vs lcpp 1072 = **0.53×**. The flip is
+  the opponent, not us: lcpp's `arch/x86/repack.cpp` compiles AVX512VNNI **zmm** GEMM paths on
+  Genoa (absent on Zen2) ≈ 2× per-core int8 throughput. We out-kerneled AVX2-lcpp; VNNI-lcpp is
+  a different engine.
+- Batch-donor A/B (prefill_perf 1B, profile-variant via DASLLAMA_BOX_PROFILE, mirrored brackets):
+  acc8→repack-whole is only **+3%** (the hybrid's acc8 pick cost ~nothing); ladder @T=8:
+  acc8 182 → zbw 198 → vnni256-acc8 201 → vnni256-repack 208 → **zvnni 219 (+20%, wins every
+  pair at T=8/16/32; decode identical — slot isolation confirmed)**.
+
+**Profile updated: `runtime.batch_backend = x64-avx512vnni`** (backup `box_profile.json.pre-zvnni`).
+The zmm acc16 GEMM loses decode (84.2 in the s3b ladder) but wins batch — compute-vs-bandwidth
+split, exactly the hybrid design's use case. Gap after pin: 0.77×/0.71×/0.64× @T=8/16/32.
+Fleet sweep restarted from T=8 under this config.
+
+**Open questions sharpened by the sweep:** (1) portable GEMV pin costs at low T (1B emit 61 @T8
+vs day-1 auto 76; SmolLM T=1 floor 73 vs 116) — per-lane-regime backend pin candidate; (2) the
+fifo-era par thresholds (2M) strangle ≤1B models at every T (135M emit flat 84 vs lcpp ~350);
+(3) remaining prefill gap = Genoa-tuned zmm GEMM arc (tiling/blocking vs lcpp's repack kernels).
+
 ## Campaign method reminders
 - Correctness before speed; real-model tests = **small model, one run at a time** (the oracle
   path in `gptoss_parity_probe` is deliberately un-vectorized → slow; not a perf tool).
