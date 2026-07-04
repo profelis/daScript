@@ -596,7 +596,11 @@ def team_parallel_stages(stages : array<int3>; var l : lambda<(stage : int; job_
     //! stages sequentially inline when team mode is off (or the pool/ranges are trivial).
     var idx = 0
     for (s in stages) {
-        invoke(l, idx, s.x, s.y)   // note, this is never called if job-que is there.
+        // empty stage (zero range) is a pure barrier — skip the invoke, matching
+        // team_parallel_stages_invoke. (Normally dead: the macro rewrites every direct call.)
+        if (s.y > s.x) {
+            invoke(l, idx, s.x, s.y)
+        }
         idx++
     }
 }
