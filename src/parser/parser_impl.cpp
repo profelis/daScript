@@ -1179,12 +1179,21 @@ namespace das {
         // Optional require `require ?guard target`: when the guard module is not available, skip the
         // require entirely (no error). A present guard with a missing target still errors below.
         if ( guard ) {
-            // guard registered (a linked C++ module), or the target's own file resolves (a mounted
-            // das package — pure-das packages have no C++ module to guard on). Must match the
-            // require collector's rule (ast_parse.cpp getAllRequireReq).
-            bool guardAvailable = Module::requireEx(*guard, false) != nullptr;
-            if ( !guardAvailable && !info.fileName.empty() ) {
-                guardAvailable = yyextra->g_Access->getFileInfo(info.fileName) != nullptr;
+            // Path guard (contains '/'): availability = the guard's OWN file resolves — expresses a
+            // cross-package dependency the target's resolvability can't (the target may live in an
+            // always-present package while depending on an optional one). Plain-name guard: registered
+            // (a linked C++ module), or the target's own file resolves (a mounted das package — pure-das
+            // packages have no C++ module to guard on). Must match the require collector's rule
+            // (ast_parse.cpp getAllRequireReq).
+            bool guardAvailable;
+            if ( guard->find('/') != string::npos ) {
+                auto ginfo = yyextra->g_Access->getModuleInfo(*guard, yyextra->g_FileAccessStack.back()->name);
+                guardAvailable = !ginfo.fileName.empty() && yyextra->g_Access->getFileInfo(ginfo.fileName) != nullptr;
+            } else {
+                guardAvailable = Module::requireEx(*guard, false) != nullptr;
+                if ( !guardAvailable && !info.fileName.empty() ) {
+                    guardAvailable = yyextra->g_Access->getFileInfo(info.fileName) != nullptr;
+                }
             }
             delete guard;
             if ( !guardAvailable ) {
