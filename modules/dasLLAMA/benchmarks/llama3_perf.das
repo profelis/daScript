@@ -49,11 +49,20 @@ def main {
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
         pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
     }
+    if (has_env_variable("DASLLAMA_PIN_BATCH_BACKEND")) {
+        select_batch_backend(get_env_variable("DASLLAMA_PIN_BATCH_BACKEND"))
+    }
     print("loading {path}\n")
     let t <- load_gguf(path, QuantMode.q8)
     let c = t.config
     print("config: dim={c.dim} hidden={c.hidden_dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size}\n")
     print("active backend: {active_kernel_backend()}\n")
+    // the prompt below is hardcoded Llama-3 token ids (128000 = <|begin_of_text|>); a smaller
+    // vocab reads past the embedding table (prefill_perf is the shape-agnostic harness)
+    if (c.vocab_size <= 128000l) {
+        print("vocab {c.vocab_size} can't index llama-3 token ids — use a Llama-3 gguf here\n")
+        return
+    }
 
     var s <- make_run_state(c)
     let prompt = [128000l, 12805l, 5304l, 264l, 892l]
@@ -70,6 +79,32 @@ def main {
             let join_spin = to_int(get_env_variable("DAS_JOBQUE_JOIN_SPIN"))
             set_jobque_join_spin(join_spin)
             print("join spin override: level {join_spin}\n")
+        }
+        // A/B the matmul min-grains (rows per chunk floor); 0 = clamp off
+        if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS")) {
+            let mg = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS"))
+            set_matmul_min_chunk_rows(mg)
+            print("min chunk rows override: {mg}\n")
+        }
+        if (has_env_variable("DASLLAMA_GEMV_WAVE_FILL")) {
+            set_gemv_wave_fill(get_env_variable("DASLLAMA_GEMV_WAVE_FILL") != "0")
+        }
+        if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV")) {
+            let mgv = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV"))
+            set_matmul_min_chunk_rows_gemv(mgv)
+            print("gemv min chunk rows override: {mgv}\n")
+        }
+        // A/B the fused per-block decode chains (default on; 0 = per-op dispatches)
+        if (has_env_variable("DASLLAMA_FUSED_DECODE")) {
+            set_fused_decode(get_env_variable("DASLLAMA_FUSED_DECODE") != "0")
+            print("fused decode override: {get_fused_decode()}\n")
+        }
+        // threshold override — also the crude chain selector (attn chain gates at dim*(qd+2kv),
+        // ffn at dim*hidden; a value between them fuses the FFN only)
+        if (has_env_variable("DASLLAMA_MATMUL_PAR_THRESHOLD")) {
+            let mpt = to_int(get_env_variable("DASLLAMA_MATMUL_PAR_THRESHOLD"))
+            set_matmul_par_threshold(int64(mpt))
+            print("matmul par threshold override: {mpt}\n")
         }
         // prefill (untimed)
         var pos = 0l
@@ -91,5 +126,34 @@ def main {
         let gf = double(int64(N_TOKENS) * flops_per_token(c)) / (double(us) * 1000.0lf)
         print("gen Q8: {N_TOKENS} tok in {us} us -> {tps} tok/s ({gf} GFLOP/s)\n")
         forward_profile_report()   // the decode per-section table (set against llama.cpp's GGML_OP_PROFILE dump)
+        // In-process fused-decode A/B: DASLLAMA_FUSED_AB=<pairs> alternates fused/per-op windows
+        // of N_TOKENS in ONE process (the campaign's interleaved-cells method — box drift between
+        // separate processes swamps a ~10% delta). Window order flips per pair (ABBA), so the
+        // KV-depth growth across the run cancels out of the paired deltas.
+        if (has_env_variable("DASLLAMA_FUSED_AB")) {
+            let pairs = to_int(get_env_variable("DASLLAMA_FUSED_AB"))
+            var sum_on = 0.0lf
+            var sum_off = 0.0lf
+            for (p in range(pairs)) {
+                let first_on = (p % 2) == 0
+                for (w in range(2)) {
+                    let on = (w == 0) == first_on
+                    set_fused_decode(on)
+                    let w0 = ref_time_ticks()
+                    for (_i in range(N_TOKENS)) {
+                        forward(t, s, token, pos)
+                        pos++
+                        token = argmax_logits(s, c.vocab_size)
+                    }
+                    let wus = get_time_usec(w0)
+                    let wtps = double(N_TOKENS) / (double(wus) * 1.0e-6lf)
+                    print("fused_ab pair {p} {on ? "ON " : "OFF"}: {wtps} tok/s\n")
+                    if (on) { sum_on += wtps; } else { sum_off += wtps; }
+                }
+            }
+            let mon = sum_on / double(pairs)
+            let moff = sum_off / double(pairs)
+            print("fused_ab mean: ON {mon} vs OFF {moff} tok/s ({100.0lf * (mon - moff) / moff}%)\n")
+        }
     }
 }

@@ -126,6 +126,12 @@ def bench_gemm_iso(b : B?) {
             set_q8_batch_chunks_per_job(bc)
             to_log(LOG_INFO, "batch chunks override: {bc}\n")
         }
+        // A/B the matmul min-grain (rows per chunk floor); 0 = clamp off (pre-grain behavior)
+        if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS")) {
+            let mg = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS"))
+            set_matmul_min_chunk_rows(mg)
+            to_log(LOG_INFO, "min chunk rows override: {mg}\n")
+        }
         // backend pin for row-major A/Bs on one binary (e.g. x64-avx2 vs x64-avx2-acc8), same
         // env contract as llama3_perf; the repack half below still switches to the repack tier
         if (has_env_variable("DASLLAMA_PIN_BACKEND")) {

@@ -21,6 +21,11 @@ def fork_join_round(nj : int) {
     }
 }
 
+def team_round(nj : int) {
+    team_parallel_for(0, nj, nj) <| @(_rb : int; _re : int) {
+    }
+}
+
 def bench_modes(b : B?; nj : int) {
     set_jobque_worker_spin(0)
     set_jobque_batch_dispatch(false)
@@ -40,8 +45,18 @@ def bench_modes(b : B?; nj : int) {
     b |> run("fork_join/{nj}/spin_batch", nj) {
         fork_join_round(nj)
     }
-    set_jobque_worker_spin(0)
+    // team dispatch (#3368): one lambda clone per worker, chunks self-served off one atomic —
+    // the candidate default for the model runners; measured here against the fifo fork/join
     set_jobque_batch_dispatch(false)
+    set_jobque_worker_spin(0)
+    b |> run("team/{nj}/base", nj) {
+        team_round(nj)
+    }
+    set_jobque_worker_spin(SPIN_US)
+    b |> run("team/{nj}/spin", nj) {
+        team_round(nj)
+    }
+    set_jobque_worker_spin(0)
 }
 
 [benchmark]

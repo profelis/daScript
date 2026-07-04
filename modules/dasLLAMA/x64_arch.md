@@ -118,10 +118,10 @@ of it.
 | `x64-avx2-repack` | `dasllama_math_x64_avx.das` | 20 | **yes** | same |
 | `x64-avx2-acc8` | `dasllama_math_x64_avx.das` | 9 | no | same — pinnable experiment |
 | `x64-avx2-ps` | `dasllama_math_x64_avx.das` | 8 | no | same — pinnable experiment |
-| `x64-vnni256` | `dasllama_math_x64_avx.das` | 7 | no | avx2 gate && `DASLLAMA_AVX_MATRIX=1` && (`avxvnni` \|\| `avx512vnni`+`vl`) — matrix, pin-only |
+| `x64-vnni256` | `dasllama_math_x64_avx.das` | 7 | no | avx2 gate && (`avxvnni` \|\| `avx512vnni`+`vl`) — matrix, pin-only |
 | `x64-vnni256-acc8` | `dasllama_math_x64_avx.das` | 6 | no | same — matrix, pin-only |
 | `x64-vnni256-repack` | `dasllama_math_x64_avx.das` | 5 | **yes** | same — matrix, pin-only |
-| `x64-avx512bw` | `dasllama_math_x64_avx.das` | 4 | no | avx2 gate && `DASLLAMA_AVX_MATRIX=1` && `avx512f`+`bw` — matrix, pin-only |
+| `x64-avx512bw` | `dasllama_math_x64_avx.das` | 4 | no | avx2 gate && `avx512f`+`bw` — matrix, pin-only |
 | `x64-avx512vnni` | `dasllama_math_x64_avx.das` | 3 | no | same && `avx512vnni` — matrix, pin-only |
 
 The `jit_enabled()` half of the gate matters: off-JIT the intrinsic functions run their scalar
@@ -139,10 +139,17 @@ slow) and keeps `portable` selected. The same rail answers the higher ISA tiers:
 kernel matrix below gates on `cpu_supports("avxvnni"/"avx512f"/"avx512bw"/"avx512vl"/
 "avx512vnni")` — the builtin knows the leaf-7 map, and unknown names fail closed.
 
-**The AVX kernel matrix (2026-07, unmeasured — default OFF):** VNNI / AVX-512 twins of the
-shipped kernels, built to be measured on rented bare metal (the 3990X has none of the tiers).
-`DASLLAMA_AVX_MATRIX=1` enables registration (plus per-tier cpuid gates); priorities all sit
-below the shipped backends, so nothing auto-selects even when enabled — A/B via
+**Hybrid backend (per-slot pin):** decode (GEMV) and prefill (batch GEMM) can prefer different
+backends — on the EPYC 9654, `[tuned]` portable wins decode (+15% over every intrinsic backend)
+while row-major acc8 wins batch. `select_batch_backend(name)` (profile `runtime.batch_backend`)
+overrides only the batch-shaped slots from a layout-compatible donor; the pin is sticky across
+later (re)selection. A repack donor on a row-major active backend (or vice versa, or a different
+repack layout) is rejected with a warning — the planes are physically one layout.
+
+**The AVX kernel matrix (2026-07, correctness-proven on EPYC 9654):** VNNI / AVX-512 twins of
+the shipped kernels, built to be measured on bare metal (the 3990X has none of the tiers).
+Registration is unconditional per-tier (cpuid-gated, no master switch); priorities all sit
+below the shipped backends, so nothing auto-selects — A/B via
 `DASLLAMA_PIN_BACKEND`. `DASLLAMA_AVX_MATRIX_FORCE=1` registers tiers the box lacks (they run
 the delegating fallbacks — correct, for probe/validation only). Intrinsics (in
 `llvm/daslib/x64_avx.das`, each an exact twin of its donor): `dot32_vnni` / `dot32_acc8_vnni` /

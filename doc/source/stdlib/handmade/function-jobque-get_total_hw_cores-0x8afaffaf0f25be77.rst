@@ -1,0 +1,1 @@
+Returns the number of physical CPU cores on the system, with SMT/hyperthreading siblings collapsed (compare get_total_hw_threads, which counts logical processors). Falls back to the logical count where the core topology cannot be queried.

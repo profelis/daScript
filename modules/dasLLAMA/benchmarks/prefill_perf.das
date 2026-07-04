@@ -30,11 +30,21 @@ def main {
     if (!empty(args) && ends_with(args[length(args) - 1], ".gguf")) {
         path = args[length(args) - 1]
     }
+    apply_box_profile_runtime()   // the tuned per-box stack first; the env pins below override it
+    // backend pin for A/B on one binary — must land BEFORE load_gguf:
+    // select_matmul_backend_for_load honors the pin at load, which decides repack
+    if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
+        pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
+    }
+    if (has_env_variable("DASLLAMA_PIN_BATCH_BACKEND")) {
+        select_batch_backend(get_env_variable("DASLLAMA_PIN_BATCH_BACKEND"))
+    }
     print("loading {path}\n")
     var t <- load_gguf(path, QuantMode.q8)
     t.config.seq_len = min(t.config.seq_len, 8192l)   // cap KV cache (Llama-3 context length is 131072)
     let c = t.config
     print("config: dim={c.dim} hidden={c.hidden_dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size}\n")
+    print("active backend: {active_kernel_backend()}\n")
     print("prompt processing: per-token forward (decode-style) vs one batched forward_prefill\n\n")
 
     var s <- make_run_state(c)
@@ -45,6 +55,17 @@ def main {
             let join_spin = to_int(get_env_variable("DAS_JOBQUE_JOIN_SPIN"))
             set_jobque_join_spin(join_spin)
             print("join spin override: level {join_spin}\n")
+        }
+        // A/B the matmul min-grains (rows per chunk floor); 0 = clamp off (pre-grain behavior)
+        if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS")) {
+            let mg = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS"))
+            set_matmul_min_chunk_rows(mg)
+            print("min chunk rows override: {mg}\n")
+        }
+        if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV")) {
+            let mgv = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV"))
+            set_matmul_min_chunk_rows_gemv(mgv)
+            print("gemv min chunk rows override: {mgv}\n")
         }
         // warmup — JIT both paths
         let warm <- build_prompt(8l)

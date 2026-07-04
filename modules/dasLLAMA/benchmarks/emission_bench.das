@@ -7,6 +7,7 @@ require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires ea
 require dasllama/dasllama_math   // setup_dasllama_jobque_ (the engine-standard jobque config)
 require daslib/jobque_boost
 require daslib/clargs
+require daslib/fio   // has_env_variable / get_env_variable (the DASLLAMA_FUSED_DECODE A/B override)
 require math
 
 // EMISSION baseline — the realistic CPU-inference shape: many independent SHORT prompts, each a
@@ -89,6 +90,7 @@ def main() {
     let np = max(cfg.nprompts, 1)
     let plen = max(int64(cfg.plen), 1l)
     let ngen = max(int64(cfg.ngen), 2l)
+    apply_box_profile_runtime()   // the tuned per-box stack (backend/batch pins, grains) — what load_model users get
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)
     t.config.seq_len = min(t.config.seq_len, plen + ngen + 8l)   // cap the KV allocation
@@ -105,6 +107,11 @@ def main() {
         if (cfg.team) {
             set_jobque_team_mode(true)
             print("team dispatch: on\n")
+        }
+        // A/B the fused per-block decode chains (default on; 0 = per-op dispatches)
+        if (has_env_variable("DASLLAMA_FUSED_DECODE")) {
+            set_fused_decode(get_env_variable("DASLLAMA_FUSED_DECODE") != "0")
+            print("fused decode override: {get_fused_decode()}\n")
         }
         // one throwaway warmup prompt: JIT compilation + first-touch paging stay out of prompt 0
         {
