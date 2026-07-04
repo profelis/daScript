@@ -12,10 +12,13 @@ require strings
 //! Compile-time SQL provider registry. The `_sql` chain analyzer and the
 //! `[sql_table]` structure macro are provider-neutral; everything dialect- or
 //! handle-specific routes through a `SqlProviderInfo` entry registered here.
-//! Providers register from their own module's `[init]` (the registration must be
-//! in the `require` closure of every macro module that consults the registry —
-//! consumer-requires-contributor; see skills/das_macros.md). SQLite registers
-//! from `sqlite/sqlite_boost`. Contract: modules/dasSQLITE/PROVIDER_CONTRACT.md.
+//! Registration happens at macro-build time: each module whose macros consult the
+//! registry calls the provider's registration function from its own `[_macro]`
+//! (only a module's own `[_macro]`s run at its macro build — `[init]`/globals-init
+//! never reach a consumer's macro context; consumer-requires-contributor, see
+//! skills/das_macros.md). SQLite registers via the `[_macro]` wrappers in
+//! `sqlite/sqlite_boost` and `sqlite/sqlite_linq`. Contract:
+//! modules/dasSQLITE/PROVIDER_CONTRACT.md.
 
 enum public SqlPkReport {
     //! How `insert(row)` learns the new row's primary key.
@@ -53,7 +56,8 @@ struct public SqlProviderInfo {
 var private g_sql_providers : array<SqlProviderInfo>
 
 def public register_sql_provider(var info : SqlProviderInfo) {
-    //! Appends a provider entry. Call from the provider module's `[init]`.
+    //! Appends a provider entry. Call from a `[_macro]` function in each macro
+    //! module that consults the registry (`[init]` does not reach macro contexts).
     //! Duplicate (runnerModule, runnerStruct) keys panic at registration time.
     for (p in g_sql_providers) {
         if (p.runnerModule == info.runnerModule && p.runnerStruct == info.runnerStruct) {
