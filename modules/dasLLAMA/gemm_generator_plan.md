@@ -432,14 +432,28 @@ before/after (289/289 disasm gate below).
 
 ## M4 slice B (2026-07-04, M1 Max) — the sweep: a perm the hand tier never had wins
 
+**FP-laxity policy (Boris, same day):** bit-exactness across variants is NOT the standard —
+llama.cpp holds no cross-kernel bit-parity, and `_jit_fast_math` is already declared
+non-bit-exact program-wide. The reassoc pin measured as −2.5% on the kstep4-mr8 shape (the
+machine combiner's regroup is a critical-path optimization), so it's dropped: generated folds
+get the same blanket fast-math as all das code, and the probes gate on a TOLERANCE vs the
+grp4-laneq oracle (CLOSE_REL 1e-4 / CLOSE_ABS 1e-5; legal drift observed ~1e-6 relative,
+real generator bugs are orders louder — 11/13 grid rows still land bit-exact, only the
+loop shapes where the combiner fires drift). The dasLLVM authored-FMF-wins semantics and the
+companion const-fold guard stay — they're correct framework behavior regardless of policy.
+`LLVM_JIT_CODEGEN_VERSION` 0x38 → 0x39.
+
 `DAS_TUNE_MODE=tune` gen_tune_probe, kv-shape iso (2048×512×64, interleaved best-of-6,
-GMAC/s): **kstep2_nrsplit2_mr8 wins at 135.0** — kstep4_nrsplit2_mr8 133.4 > kstep2 132.4
-(the hand-tier-equivalent M2 perm) > kstep4 131.6 > kstep1 124.5 > kstep4_nrsplit2 120.1 >
-kstep2_nrsplit2 119.2 > kstep1_nrsplit2 116.9 > kstep1_nrsplit2_mr8 115.9 > declined/reference
-~85. The 8-row × 2-slice tile (16 weight vectors per block, 26 q-regs) did not exist in the
-hand tier — the generator+sweep found a shape hand-writing never tried, worth ~+2% over the
-shipped hand kernel on this box. Manifest round-trip green (winner written via
-tune_manifest_set → normal run stamps tile+layout from it → parity exact on grp8).
+GMAC/s): **kstep4_nrsplit2_mr8 wins at 137.5** — kstep2_nrsplit2_mr8 135.8 > kstep2 133.2
+(the hand-tier-equivalent M2 perm) > kstep4 132.6 > kstep1 126.6 > kstep4_nrsplit2 120.1 >
+kstep2_nrsplit2 118.6 > kstep1_nrsplit2_mr8 116.1 > kstep1_nrsplit2 115.3 >
+declined/reference ~85. The 8-row × 2-slice × 4-block tile (16 weight vectors per block,
+26 q-regs) did not exist in the hand tier — the generator+sweep found a shape hand-writing
+never tried, worth **+3.3% over the shipped hand kernel** on this box. Manifest round-trip
+green (winner written via tune_manifest_set → normal run stamps tile+layout from it → grp8
+repack → parity within tolerance; nb-even/odd small shapes exact — kstep4's remainder chain
+is straight-line, the regroup only fires in the 4-block main loop). The kstep2-mr4 fallback's
+machine code stays 289/289 identical to the M2 baseline.
 
 **Still open in M4:** fleet re-sweep with the mr8 winner (slice C — needs the gen backend
 reachable from app runs: pin rail or require-chain decision), loop-hint manifest kind,

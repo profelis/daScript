@@ -103,17 +103,6 @@ def private load_v16i8(var te : TileEmit; var base, off : LLVMOpaqueValue?; name
     return LLVMBuildLoad2Aligned(te.builder, te.v16i8, p, 1u, name)
 }
 
-// The scale fold's exactness contract is a FIXED per-block fold order — author explicit FMF
-// with AllowReassoc (bit 0, llvm-c/Core.h) cleared on its fmul/fadd, so the backend's machine
-// combiner can't regroup (af*s)*q into af*(s*q) per loop shape (kstep1/kstep4 x mr8 tripped
-// it: last-ulp drift vs the oracle). AllowContract stays set, so the mul+add still fuses into
-// the same single-rounding fmla as every other variant and the hand tier. Authored flags
-// survive the fast-math blanket stamp (apply_fast_math_to_module fills unset only).
-def private no_reassoc(var v : LLVMOpaqueValue?) : LLVMOpaqueValue? {
-    LLVMSetFastMathFlags(v, 0x7eu)   // nnan|ninf|nsz|arcp|contract|afn — no reassoc
-    return v
-}
-
 def private splat_f32(var te : TileEmit; var v : LLVMOpaqueValue?; name : string) : LLVMOpaqueValue? {
     var one = LLVMBuildInsertElement(te.builder, LLVMGetUndef(te.v4f32), v, te.types->ConstI32(0ul), "")
     return LLVMBuildShuffleVector(te.builder, te.types, one, one, [0, 0, 0, 0], name)
@@ -178,9 +167,9 @@ def private emit_block(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLV
         var q = LLVMBuildLoad2Aligned(b, te.types.t_float, qp, 4u, "q{tk}")
         for (qd in range(rq)) {
             var af = LLVMBuildSIToFP(b, a[i * rq + qd], te.v4f32, "af{tk}")
-            var m = no_reassoc(LLVMBuildFMul(b, af, s4[qd], ""))
-            m = no_reassoc(LLVMBuildFMul(b, m, splat_f32(te, q, "qs{tk}"), ""))
-            f[i * rq + qd] = no_reassoc(LLVMBuildFAdd(b, f[i * rq + qd], m, "f{tk}"))
+            var m = LLVMBuildFMul(b, af, s4[qd], "")
+            m = LLVMBuildFMul(b, m, splat_f32(te, q, "qs{tk}"), "")
+            f[i * rq + qd] = LLVMBuildFAdd(b, f[i * rq + qd], m, "f{tk}")
         }
     }
 }
