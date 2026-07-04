@@ -72,32 +72,35 @@ def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
 // kernel ([tuned] restamping a different perm from a changed box_profile.json) has an
 // IDENTICAL aot hash and would silently reuse a stale DLL. Fold them into the JIT-only
 // cache key here, alongside LLVM_JIT_CODEGEN_VERSION / g_jit_fast_math.
-class private LoopHintHashVisitor : AstVisitor {
-    h : uint64
-    def fold_args(args : AnnotationArgumentList) {
-        // Fold the ONE value field the arg's type says is live. bValue/iValue/fValue share a C++
-        // union — reading a non-live member is UB (a bool load of vectorize_width=8 aborts ubsan
-        // and lets clang -O2 miscompile: chunk workers died with SIGSEGV on linux Release CI).
-        // Type coverage stays total: any basicType re-keys the DLL via its own live field.
-        for (a in args) {
-            h = (h ^ hash(a.name)) * JIT_FNV_PRIME
-            h = (h ^ uint64(int(a.basicType))) * JIT_FNV_PRIME
-            if (a.basicType == Type.tBool) {
-                h = (h ^ (a.bValue ? 1ul : 0ul)) * JIT_FNV_PRIME
-            } elif (a.basicType == Type.tInt) {
-                h = (h ^ uint64(a.iValue)) * JIT_FNV_PRIME
-            } elif (a.basicType == Type.tFloat) {
-                h = (h ^ hash(a.fValue)) * JIT_FNV_PRIME
-            } elif (a.basicType == Type.tString) {
-                h = (h ^ hash(a.sValue)) * JIT_FNV_PRIME
-            }
+// Fold the ONE value field the arg's type says is live. bValue/iValue/fValue share a C++
+// union — reading a non-live member is UB (a bool load of vectorize_width=8 aborts ubsan
+// and lets clang -O2 miscompile: chunk workers died with SIGSEGV on linux Release CI).
+// Type coverage stays total: any basicType re-keys the DLL via its own live field.
+def private fold_annotation_args(args : AnnotationArgumentList; seed : uint64) : uint64 {
+    var h = seed
+    for (a in args) {
+        h = (h ^ hash(a.name)) * JIT_FNV_PRIME
+        h = (h ^ uint64(int(a.basicType))) * JIT_FNV_PRIME
+        if (a.basicType == Type.tBool) {
+            h = (h ^ (a.bValue ? 1ul : 0ul)) * JIT_FNV_PRIME
+        } elif (a.basicType == Type.tInt) {
+            h = (h ^ uint64(a.iValue)) * JIT_FNV_PRIME
+        } elif (a.basicType == Type.tFloat) {
+            h = (h ^ hash(a.fValue)) * JIT_FNV_PRIME
+        } elif (a.basicType == Type.tString) {
+            h = (h ^ hash(a.sValue)) * JIT_FNV_PRIME
         }
     }
+    return h
+}
+
+class private LoopHintHashVisitor : AstVisitor {
+    h : uint64
     def override preVisitExprFor(expr : ExprFor?) : void {
-        fold_args(expr.annotations)
+        h = fold_annotation_args(expr.annotations, h)
     }
     def override preVisitExprWhile(expr : ExprWhile?) : void {
-        fold_args(expr.annotations)
+        h = fold_annotation_args(expr.annotations, h)
     }
 }
 
@@ -116,6 +119,23 @@ def private fold_loop_hints(funcs : array<FunctionPtr>; seed : uint64) : uint64 
     return r
 }
 
+// [llvm_code] annotation args are generator parameters: they change the emitted IR without
+// touching the reference body, so the aot hash is blind to them — fold them like loop hints.
+// A change to the GENERATOR's own code is invisible to the key too: bump
+// LLVM_JIT_CODEGEN_VERSION when a generator's emission changes for fixed args (manual, by design).
+def private fold_llvm_code_hints(funcs : array<FunctionPtr>; seed : uint64) : uint64 {
+    var h = seed
+    for (fn in funcs) {
+        for (ann in fn.annotations) {
+            if (ann.annotation.name == "llvm_code") {
+                h = (h ^ hash("llvm_code")) * JIT_FNV_PRIME
+                h = fold_annotation_args(ann.arguments, h)
+            }
+        }
+    }
+    return h
+}
+
 def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : int;
                      emit_prologue : bool; debug_info : bool) : string {
     var h = LLVM_JIT_CODEGEN_VERSION
@@ -123,6 +143,7 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
         h = (h ^ get_function_aot_hash(fn)) * JIT_FNV_PRIME
     }
     h = fold_loop_hints(funcs, h)   // JIT-only loop tune hints (see LoopHintHashVisitor)
+    h = fold_llvm_code_hints(funcs, h)   // [llvm_code] generator params (annotation args)
     h = (h ^ uint64(opt_level)) * JIT_FNV_PRIME
     h = (h ^ uint64(size_level)) * JIT_FNV_PRIME
     h = (h ^ (emit_prologue ? 1ul : 0ul)) * JIT_FNV_PRIME
