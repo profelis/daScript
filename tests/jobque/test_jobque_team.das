@@ -179,6 +179,23 @@ def test_jobque_team(t : T?) {
             team_sum_round(t, 4, 16)
             fifo_sum_round(t, 4, 16)
         }
+        t |> run("worker limit - dormant workers never break a dispatch") @(t : T?) {
+            set_jobque_team_mode(true)
+            // any limit completes every dispatch: chunks self-serve, the caller drains solo.
+            // limit 2 (a live sliver), limit 0 (caller-only), then unlimited again — team AND
+            // fifo rounds under each, exactly-once coverage throughout.
+            set_jobque_worker_limit(2)
+            t |> equal(get_jobque_worker_limit(), 2)
+            team_sum_round(t, 8, 32)
+            team_once_round(t, 2 * get_total_hw_jobs(), 4 * get_total_hw_jobs())
+            fifo_sum_round(t, 4, 16)
+            set_jobque_worker_limit(0)
+            team_once_round(t, 8, 32)
+            set_jobque_worker_limit(-1)   // raise re-admits the dormant workers (the notify path)
+            team_storm(t, 5)
+            fifo_sum_round(t, 4, 16)
+            set_jobque_team_mode(false)
+        }
         t |> run("epoch crossing - back-to-back shape storm") @(t : T?) {
             // production shape (spin window + fork pool, dasLLAMA decode's config)
             set_jobque_worker_spin(200)

@@ -114,6 +114,11 @@ def main {
             set_batch_lane_cap(blc)
             print("batch lane cap override: {blc}\n")
         }
+        if (has_env_variable("DASLLAMA_WORKER_LIMIT")) {
+            let wl = to_int(get_env_variable("DASLLAMA_WORKER_LIMIT"))
+            set_jobque_worker_limit(wl > 0 ? wl : -1)   // direct: we are inside the que already
+            print("worker limit override: {wl}\n")
+        }
         // prefill (untimed)
         var pos = 0l
         for (tk in prompt) {

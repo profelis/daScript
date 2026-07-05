@@ -124,6 +124,16 @@ namespace das {
         // Single dispatcher at a time.
         void setTeamMode ( bool on );
         bool getTeamMode () const { return mTeamMode.load(std::memory_order_relaxed) != 0; }
+        // Worker-pool limit (runtime dial): workers with threadIndex >= limit go DORMANT — they
+        // drift out of the spin loop at the next check and park WITHOUT joining the publish wake
+        // gate (no mParkedWorkers bump), so team publishes and fifo pushes never wake them; only
+        // setWorkerLimit raising the limit (or shutdown) does. A woken worker re-checks the limit
+        // before rejoining, so a wake racing a lower re-parks it dormant. Chunks are self-served
+        // and the caller drains solo if need be, so ANY limit (0 included) completes every
+        // dispatch — this is a performance dial (a tiny model's inline-dominated token runs
+        // faster with fewer awake workers), never a correctness knob. Negative = unlimited.
+        void setWorkerLimit ( int n );
+        int getWorkerLimit () const { return mWorkerLimit.load(std::memory_order_relaxed); }
         int getNumWorkers () const { return mThreadCount.load(); }
         void teamParallelFor ( int numChunks, const JobChunk & work );   // work(chunkIndex, workerSlot); caller participates as slot getNumWorkers()
         // Multi-stage team dispatch: one rendezvous, numStages dependent phases. Every lane
@@ -213,6 +223,9 @@ namespace das {
         // (worker: parked++ then read seq; publisher: bump seq then read parked — all four seq_cst),
         // so either the worker sees the new op before sleeping or the publisher sees it parked.
         atomic<int32_t>  mParkedWorkers{0};
+        // worker-pool limit (see setWorkerLimit): threadIndex >= this ⇒ dormant. Dormant workers
+        // are deliberately NOT in mParkedWorkers — the publish wake gate must skip them.
+        atomic<int32_t>  mWorkerLimit{0x7fffffff};
         // team dispatch anatomy profiler (env DAS_TEAM_PROF=1): per-op phase aggregates, dumped
         // at queue destruction. Caller-side counters except the two claim-timestamp slots;
         // worker stores happen only under the flag (they perturb the op being measured).

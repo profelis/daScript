@@ -38,6 +38,16 @@ def test_lanes_for_work(t : T?) {
             t |> equal(lanes_for_work(1_000_000_000_000l, 2), min(2, lanes))
             t |> equal(lanes_for_work(1_000_000_000_000l, lanes + 100), lanes, "cap above lanes clamps to lanes")
         }
+        t |> run("worker limit shrinks the live pool the shapers see") @(t : T?) {
+            let jobs = get_total_hw_jobs()
+            if (jobs >= 2) {
+                set_jobque_worker_limit(1)
+                t |> equal(get_dispatch_lanes(), 2, "1 live worker + the caller lane")
+                t |> equal(lanes_for_work(1_000_000_000_000l, 0), 2, "huge work saturates to the LIVE pool")
+                set_jobque_worker_limit(-1)
+                t |> equal(get_dispatch_lanes(), lanes, "unlimited restores the full pool")
+            }
+        }
         t |> run("target knob moves the boundary; extremes force always-inline / always-parallel") @(t : T?) {
             set_target_chunk_work(1_000l)
             t |> equal(lanes_for_work(2_000l, 0), min(2, lanes), "smaller target parallelizes earlier")

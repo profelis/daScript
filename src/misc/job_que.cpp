@@ -332,8 +332,25 @@ namespace das {
     void JobQue::job(int threadIndex) {
         uint32_t teamSeqSeen = mTeamSeq.load(std::memory_order_relaxed);
         while (!mShutdown) {
+            // Worker-pool limit (setWorkerLimit): over-limit workers go DORMANT here — no spin,
+            // no fifo service, and deliberately NO mParkedWorkers bump, so the team publish wake
+            // gate skips them entirely (waking 40 dormant sleepers per dispatch is exactly the
+            // storm the limit removes). Only setWorkerLimit raising the limit (or shutdown)
+            // notifies; the limit is re-checked HERE on every wake, so a wake that raced a
+            // lower re-parks us dormant.
+            if ( threadIndex >= mWorkerLimit.load(std::memory_order_relaxed) ) {
+                unique_lock<mutex> lock(mFifoMutex);
+                mCond.wait(lock, [&]() {
+                    return mShutdown.load()
+                        || threadIndex < mWorkerLimit.load(std::memory_order_seq_cst);
+                });
+                if ( mShutdown ) break;
+                teamSeqSeen = mTeamSeq.load(std::memory_order_relaxed);  // don't serve ops published while dormant
+                continue;
+            }
             Job job;
             bool gotJob = false;
+            bool goDormant = false;
             size_t moreWork = 0;    // work left behind by our pop → wake-propagate (see pushBatch)
             // Spin-before-park (opt-in via setWorkerSpin): poll the fifo for mSpinUs before blocking
             // on the condvar. notify_one to a PARKED worker costs the DISPATCHING thread an OS
@@ -350,6 +367,12 @@ namespace das {
                 auto deadline = chrono::steady_clock::now() + chrono::microseconds(spinUs);
                 for (;;) {
                     if ( mShutdown.load(std::memory_order_relaxed) ) break;
+                    // limit drift-out: exit the spin window; the dormant branch at the top of the
+                    // outer loop parks us (the !gotJob park below is for ELIGIBLE workers only)
+                    if ( threadIndex >= mWorkerLimit.load(std::memory_order_relaxed) ) {
+                        goDormant = true;
+                        break;
+                    }
                     teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
                     if ( teamMode && runTeamChunks(threadIndex, teamSeqSeen) ) {
                         // served team chunks — fresh spin window, same as a fifo raid restarting the loop
@@ -380,6 +403,7 @@ namespace das {
                     if ( chrono::steady_clock::now() >= deadline ) break;
                 }
             }
+            if ( goDormant ) continue;   // top-of-loop dormant branch parks us
             if ( !gotJob ) {
                 unique_lock<mutex> lock(mFifoMutex);
                 // Block until a job is available or we're shutting down. A plain wait (no periodic
@@ -436,6 +460,21 @@ namespace das {
     void JobQue::setTeamMode ( bool on ) {
         // no wake needed: parked workers are woken by the first publish's wake gate
         mTeamMode.store(on ? 1 : 0, std::memory_order_relaxed);
+    }
+
+    void JobQue::setWorkerLimit ( int n ) {
+        int lim = n < 0 ? 0x7fffffff : n;
+        int old = mWorkerLimit.exchange(lim, std::memory_order_seq_cst);
+        if ( lim > old ) {
+            // raising re-admits dormant workers — they only ever wake from here (or shutdown).
+            // The lock pairs with the dormant wait's predicate read: a worker between its limit
+            // check and cond_wait holds mFifoMutex, so this notify can't slip into that window.
+            // In-limit parked workers also wake, re-check their predicates and re-sleep —
+            // transitions are rare, notify_all is fine. Lowering never notifies: workers drift
+            // out at their next spin-loop check (or re-park dormant on their next wake).
+            lock_guard<mutex> guard(mFifoMutex);
+            mCond.notify_all();
+        }
     }
 
     bool JobQue::runTeamChunks ( int threadIndex, uint32_t & seqSeen ) {

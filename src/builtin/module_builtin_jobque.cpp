@@ -740,6 +740,20 @@ namespace das {
         return g_jobQue && g_jobQue->getTeamMode();
     }
 
+    void set_jobque_worker_limit ( int32_t n, Context * context, LineInfoArg * at ) {
+        // Worker-pool limit (JobQue::setWorkerLimit): workers with index >= n go dormant —
+        // they leave the spin loop and the publish wake gate until the limit rises. A perf
+        // dial for inline-dominated workloads (tiny-model LLM decode); never a correctness
+        // knob — any limit completes every dispatch (chunks self-serve, the caller drains).
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->setWorkerLimit(n);
+    }
+
+    int32_t get_jobque_worker_limit ( Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        return g_jobQue->getWorkerLimit();
+    }
+
     // team-prof programmatic rail (the DAS_TEAM_PROF aggregates): probes reset, run a
     // dispatch storm, then read the phase averages — no queue destruction needed.
     void set_jobque_team_prof ( bool on, Context * context, LineInfoArg * at ) {
@@ -1329,6 +1343,12 @@ namespace das {
             addExtern<DAS_BIND_FUN(set_jobque_team_mode)>(*this, lib,  "set_jobque_team_mode",
                 SideEffects::modifyExternal, "set_jobque_team_mode")
                     ->args({"on","context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_worker_limit)>(*this, lib,  "set_jobque_worker_limit",
+                SideEffects::modifyExternal, "set_jobque_worker_limit")
+                    ->args({"limit","context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_worker_limit)>(*this, lib,  "get_jobque_worker_limit",
+                SideEffects::accessExternal, "get_jobque_worker_limit")
+                    ->args({"context","line"});
             addExtern<DAS_BIND_FUN(get_jobque_team_mode)>(*this, lib,  "get_jobque_team_mode",
                 SideEffects::accessExternal, "get_jobque_team_mode")
                     ->args({"context","line"});

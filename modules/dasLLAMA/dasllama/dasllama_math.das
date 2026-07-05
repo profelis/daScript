@@ -119,6 +119,16 @@ var g_jobque_join_poll = 50l
 def public set_jobque_join_poll(v : int64) { g_jobque_join_poll = max(v, 0l) }
 def public get_jobque_join_poll() : int64 { return g_jobque_join_poll }
 
+// Worker-pool limit (JobQue::setWorkerLimit — workers above the limit sleep dormant, out of the
+// publish wake gate AND the spin loop): the tiny-model dial. An inline-dominated decode token
+// runs FASTER with fewer awake workers (zen2 135M: T=8 176 t/s vs T=48 149 — the T-1 pollers
+// interfere with the main thread's weight streaming, and no chunk shaping recovers it).
+// 0 = no limit. Applied by setup_dasllama_jobque_ (needs a live que, same as the spin knobs);
+// get_dispatch_lanes() then sizes every shaper to the live pool automatically.
+var g_dispatch_worker_limit = 0
+def public set_dispatch_worker_limit(v : int) { g_dispatch_worker_limit = max(v, 0) }
+def public get_dispatch_worker_limit() : int { return g_dispatch_worker_limit }
+
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
 //! batched dispatch, the spin-before-park window (box_profile.json "runtime" `jobque_spin_us`
 //! overrides the shipped 30000us; 0 disables the spin), and the join-poll level ("jobque_join_poll",
@@ -135,6 +145,7 @@ def setup_dasllama_jobque_() {
     set_jobque_team_mode(true)
     set_jobque_worker_spin(int(min(g_jobque_spin_us, 2147483647l)))
     set_jobque_join_spin(int(min(g_jobque_join_poll, 2147483647l)))
+    set_jobque_worker_limit(g_dispatch_worker_limit > 0 ? g_dispatch_worker_limit : -1)   // -1 = unlimited
 }
 
 // dasLLAMA matmuls are lockstep linear algebra: SMT siblings share the FMA/load ports, so the
@@ -179,7 +190,10 @@ def public get_dispatch_lanes() : int {
     if (!is_job_que_available()) {
         return 1
     }
-    return get_total_hw_jobs() + (g_dispatch_caller_lane ? 1 : 0)
+    // the live pool: dormant over-limit workers (set_jobque_worker_limit) never serve chunks,
+    // so the shapers must size waves to the awake workers only
+    let live = min(get_total_hw_jobs(), get_jobque_worker_limit())
+    return live + (g_dispatch_caller_lane ? 1 : 0)
 }
 
 // Min grain for matmul row splits (ggml-cpu.c mul_mat chunk_size = 16): without it a fixed
