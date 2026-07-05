@@ -562,9 +562,9 @@ namespace das {
     }
 
     static bool isPosZeroBits ( float f )  { uint32_t u; memcpy(&u,&f,sizeof(u)); return u==0u; }
-    static bool isPosZeroBits ( double d ) { uint64_t u; memcpy(&u,&d,sizeof(u)); return u==0ul; }
+    static bool isPosZeroBits ( double d ) { uint64_t u; memcpy(&u,&d,sizeof(u)); return u==0ull; }
     static bool isNegZeroBits ( float f )  { uint32_t u; memcpy(&u,&f,sizeof(u)); return u==0x80000000u; }
-    static bool isNegZeroBits ( double d ) { uint64_t u; memcpy(&u,&d,sizeof(u)); return u==0x8000000000000000ul; }
+    static bool isNegZeroBits ( double d ) { uint64_t u; memcpy(&u,&d,sizeof(u)); return u==0x8000000000000000ull; }
 
     // every lane is +0.0 exactly (integer zero also qualifies)
     static bool constAllPosZero ( Expression * e ) {
@@ -1266,11 +1266,13 @@ namespace das {
     // ExprCall
         virtual ExpressionPtr visit ( ExprCall * expr ) override {
             // same-type workhorse cast is a no-op: int(x) where x is already int, float(x:float), ...
+            // numeric families only — a string "cast" can be lifetime-relevant (temporary-ness),
+            // and qualifiers don't matter for numeric value types
             if ( expr->func->builtIn && expr->arguments.size()==1 ) {
                 auto arg = expr->arguments[0];
                 if ( expr->type && arg->type && !expr->type->ref && !arg->type->ref
                     && expr->type->baseType==arg->type->baseType
-                    && ( isNumericFamily(expr->type->baseType) || expr->type->baseType==Type::tString )
+                    && isNumericFamily(expr->type->baseType)
                     && expr->func->name==das_to_string(expr->type->baseType) ) {
                     reportFolding();
                     return arg;
