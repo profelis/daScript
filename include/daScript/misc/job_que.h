@@ -135,6 +135,17 @@ namespace das {
         void setWorkerLimit ( int n );
         int getWorkerLimit () const { return mWorkerLimit.load(std::memory_order_relaxed); }
         int getNumWorkers () const { return mThreadCount.load(); }
+        // Per-op worker participation gate (opt-in: DAS_JOBQUE_TEAM_RANK_GATE=1 or this setter):
+        // a team op admits only as many workers as its widest stage has chunks — limit-rank r
+        // serves only when r + 1 < maxChunks (the +1 reserves a lane for the caller, who always
+        // serves). Higher ranks consume the op's seq and keep spinning: they never touch the
+        // claim words, so a tiny op's rendezvous involves only the workers it can feed, and the
+        // next big op re-admits everyone at the cost of one relaxed load — no dormant kernel
+        // wake on the raise path (the asymmetry that makes a per-op setWorkerLimit unviable).
+        // Purely a performance dial: chunks self-serve and the caller drains, so any admit set
+        // completes every dispatch. Composes with setWorkerLimit (dormant stays dormant).
+        void setTeamRankGate ( bool on ) { mTeamRankGate.store(on ? 1 : 0, std::memory_order_relaxed); }
+        bool getTeamRankGate () const { return mTeamRankGate.load(std::memory_order_relaxed) != 0; }
         void teamParallelFor ( int numChunks, const JobChunk & work );   // work(chunkIndex, workerSlot); caller participates as slot getNumWorkers()
         // Multi-stage team dispatch: one rendezvous, numStages dependent phases. Every lane
         // (workers + caller) serves stage s chunks, then waits on that stage's remaining counter
@@ -184,7 +195,7 @@ namespace das {
         void join();
         void job(int threadIndex);
         void submit(Job && job, JobCategory category, JobPriority priority);
-        bool runTeamChunks(int threadIndex, uint32_t & seqSeen);
+        bool runTeamChunks(int threadIndex, int limitRank, uint32_t & seqSeen);
     protected:
         condition_variable mCond;
         int mSleepMs;
@@ -238,6 +249,8 @@ namespace das {
         // creation order — which the OS's round-robin ideal-processor assignment maps loosely
         // onto physical cores (CCD/CCX spread on chiplet parts).
         bool             mLimitOrderSpread = false;
+        // per-op worker participation gate (see setTeamRankGate)
+        atomic<int32_t>  mTeamRankGate{0};
         // team dispatch anatomy profiler (env DAS_TEAM_PROF=1): per-op phase aggregates, dumped
         // at queue destruction. Caller-side counters except the two claim-timestamp slots;
         // worker stores happen only under the flag (they perturb the op being measured).

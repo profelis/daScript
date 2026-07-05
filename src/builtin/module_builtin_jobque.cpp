@@ -754,6 +754,20 @@ namespace das {
         return g_jobQue->getWorkerLimit();
     }
 
+    void set_jobque_team_rank_gate ( bool on, Context * context, LineInfoArg * at ) {
+        // Per-op worker participation gate (JobQue::setTeamRankGate): a team op admits only as
+        // many workers as it published chunks; higher ranks skip the rendezvous and keep
+        // spinning, one relaxed load away from being re-admitted by the next big op. A perf
+        // dial — any admit set completes every dispatch (chunks self-serve, the caller drains).
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->setTeamRankGate(on);
+    }
+
+    bool get_jobque_team_rank_gate ( Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        return g_jobQue->getTeamRankGate();
+    }
+
     // team-prof programmatic rail (the DAS_TEAM_PROF aggregates): probes reset, run a
     // dispatch storm, then read the phase averages — no queue destruction needed.
     void set_jobque_team_prof ( bool on, Context * context, LineInfoArg * at ) {
@@ -1348,6 +1362,12 @@ namespace das {
                     ->args({"limit","context","line"});
             addExtern<DAS_BIND_FUN(get_jobque_worker_limit)>(*this, lib,  "get_jobque_worker_limit",
                 SideEffects::accessExternal, "get_jobque_worker_limit")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_team_rank_gate)>(*this, lib,  "set_jobque_team_rank_gate",
+                SideEffects::modifyExternal, "set_jobque_team_rank_gate")
+                    ->args({"on","context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_team_rank_gate)>(*this, lib,  "get_jobque_team_rank_gate",
+                SideEffects::accessExternal, "get_jobque_team_rank_gate")
                     ->args({"context","line"});
             addExtern<DAS_BIND_FUN(get_jobque_team_mode)>(*this, lib,  "get_jobque_team_mode",
                 SideEffects::accessExternal, "get_jobque_team_mode")

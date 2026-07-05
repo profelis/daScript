@@ -166,6 +166,8 @@ namespace das {
         mTeamProf = teamProfEnv != nullptr && atoi(teamProfEnv) != 0;
         const char * limitOrderEnv = getenv("DAS_JOBQUE_LIMIT_ORDER");   // "spread" = golden-stride worker-limit eligibility
         mLimitOrderSpread = limitOrderEnv != nullptr && strcmp(limitOrderEnv, "spread") == 0;
+        const char * rankGateEnv = getenv("DAS_JOBQUE_TEAM_RANK_GATE");   // =1: per-op worker participation gate (see setTeamRankGate)
+        mTeamRankGate = (rankGateEnv != nullptr && atoi(rankGateEnv) != 0) ? 1 : 0;
         SetCurrentThreadPriority(JobPriority::High);
         for (int j = 0, js = mThreadCount; j < js; j++) {
             mThreads.emplace_back(make_unique<thread>([this, j]() {
@@ -395,8 +397,11 @@ namespace das {
                         break;
                     }
                     teamMode = mTeamMode.load(std::memory_order_relaxed) != 0;
-                    if ( teamMode && runTeamChunks(threadIndex, teamSeqSeen) ) {
-                        // served team chunks — fresh spin window, same as a fifo raid restarting the loop
+                    if ( teamMode && runTeamChunks(threadIndex, limitRank, teamSeqSeen) ) {
+                        // saw a new team op (served it, or was rank-gated past it) — fresh spin
+                        // window, same as a fifo raid restarting the loop. Team activity keeps
+                        // the worker hot even when the gate starves it of chunks, so a decode
+                        // stream of gated tiny ops never drains the pool into parked/wake churn.
                         deadline = chrono::steady_clock::now() + chrono::microseconds(spinUs);
                     }
                     // try_lock, NOT lock: every spinner that sees the same count blip races here, and
@@ -497,9 +502,29 @@ namespace das {
         }
     }
 
-    bool JobQue::runTeamChunks ( int threadIndex, uint32_t & seqSeen ) {
+    bool JobQue::runTeamChunks ( int threadIndex, int limitRank, uint32_t & seqSeen ) {
         uint32_t seq = mTeamSeq.load(std::memory_order_acquire);
         if ( seq == seqSeen || (seq & 1) ) return false;   // nothing new, or publish in progress
+        // Per-op rank gate (opt-in, setTeamRankGate): admit only as many workers as the widest
+        // stage has chunks — rank r serves only when r + 1 < maxChunks (+1 = the caller's lane;
+        // it always serves). A gated worker consumes the seq and reports "saw activity", so its
+        // spin window refreshes and the next, bigger op re-admits it for one relaxed load. The
+        // pre-entrant count read is racy vs a concurrent publish and that is fine: skipping is
+        // ALWAYS correct (chunks self-serve, the caller drains — the property that makes the
+        // worker limit correctness-free), and the enter path re-verifies the seq in the entrant
+        // gate below. Reads ONLY the atomic op words — mTeamStageCount is unsynchronized here —
+        // and publish zeroes the unused stage slots so a stale wider chain can't over-admit.
+        if ( mTeamRankGate.load(std::memory_order_relaxed) ) {
+            uint32_t maxChunks = 0;
+            for ( int s = 0; s != MAX_TEAM_STAGES; ++s ) {
+                uint32_t k = uint32_t(mTeamOpS[s].load(std::memory_order_relaxed) >> 32);
+                maxChunks = k > maxChunks ? k : maxChunks;
+            }
+            if ( uint32_t(limitRank) + 1 >= maxChunks ) {
+                seqSeen = seq;
+                return true;
+            }
+        }
         // entrant gate (Dekker with the publisher): declare in-flight, then re-verify the seq.
         // Publisher: bump seq to odd (seq_cst store), then read mTeamInFlight. Us: bump
         // mTeamInFlight (seq_cst store), then read seq. Either the publisher sees us in-flight
@@ -514,7 +539,6 @@ namespace das {
             return false;                                  // raced a publish — retry next poll
         }
         seqSeen = seq;
-        bool ran = false;
         int nStages = mTeamStageCount;
         for ( int s = 0; s != nStages; ++s ) {
             for (;;) {
@@ -533,7 +557,6 @@ namespace das {
                 }
                 (*mTeamWorkS[s])(int(c), threadIndex);
                 mTeamRemainingS[s].fetch_sub(1, std::memory_order_release);
-                ran = true;
             }
             // stage barrier: stage s+1 reads what stage s wrote, so wait for ALL of stage s —
             // the acquire pairs with every serving lane's release decrement.
@@ -543,7 +566,9 @@ namespace das {
             }
         }
         mTeamInFlight.fetch_sub(1, std::memory_order_release);
-        return ran;
+        // true = seqSeen advanced (we saw this op, whether or not we won any chunks) — the
+        // caller reads it as "team activity, refresh the spin window", not "did work"
+        return true;
     }
 
     void JobQue::teamParallelFor ( int numChunks, const JobChunk & work ) {
@@ -582,6 +607,12 @@ namespace das {
             // {numChunks, counter=0} in one word — see runTeamChunks
             mTeamOpS[s].store(uint64_t(uint32_t(stages[s].numChunks)) << 32, std::memory_order_relaxed);
             totalChunks += stages[s].numChunks;
+        }
+        // zero the unused slots: the rank gate pre-reads all four op words (it can't touch
+        // mTeamStageCount unsynchronized), so a stale wider chain left here would over-admit
+        // every later tiny op — the gate would be neutered after the first fused chain
+        for ( int s = numStages; s != MAX_TEAM_STAGES; ++s ) {
+            mTeamOpS[s].store(0, std::memory_order_relaxed);
         }
         // publish, phase 2: even seq = "published". seq_cst bump + parked check: the Dekker pair
         // with the worker's parked++ / seq-check — either the parking worker sees this chain, or

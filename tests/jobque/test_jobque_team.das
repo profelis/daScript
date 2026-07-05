@@ -6,8 +6,8 @@ require math
 // Correctness of team mode (set_jobque_team_mode + team_parallel_for): workers self-serve chunks
 // off one published atomic instead of per-chunk fifo jobs. Checks the fallback (mode off → one
 // inline invoke), coverage/exactly-once across chunk shapes, back-to-back dispatch storms
-// (seq-bump reuse, stragglers), fifo parallel_for still working while team mode is on, and
-// mode toggling (workers park again after off).
+// (seq-bump reuse, stragglers), fifo parallel_for still working while team mode is on, mode
+// toggling (workers park again after off), the dormant worker limit, and the per-op rank gate.
 
 struct private LimitProbe {
     v : int
@@ -133,6 +133,33 @@ def team_early_return_round(t : T?; nj, total : int) {
     delete hits
 }
 
+def team_stages_round(t : T?; wide : int) {
+    // multi-stage chain with a wide middle stage, then a tiny single-stage op right after —
+    // under the rank gate the tiny op's admit set must come from ITS chunk count, not the wide
+    // chain's stale stage slots (publish zeroes the unused ones), and gated stragglers must
+    // still clear every stage barrier. Exactly-once across all three stage ranges.
+    let n0 = 16
+    let n1 = 4 * wide
+    let total = n0 + n1 + 8
+    var hits : array<int>
+    hits |> resize(total)
+    var pr = unsafe(addr(hits[0]))
+    team_parallel_stages([int3(0, n0, 4), int3(n0, n0 + n1, wide), int3(n0 + n1, total, 2)]) <| @(stage : int; b : int; e : int) {
+        for (i in range(b, e)) {
+            unsafe(pr[i]) += 1
+        }
+    }
+    team_sum_round(t, 2, 8)
+    var bad = 0
+    for (i in range(total)) {
+        if (hits[i] != 1) {
+            bad++
+        }
+    }
+    t |> equal(0, bad)
+    delete hits
+}
+
 def team_storm(t : T?; rounds : int) {
     // back-to-back dispatches at several shapes: 1 chunk (inline path), fewer chunks than items,
     // more chunks than workers, more chunks than items (clamp) — exercises seq reuse + stragglers
@@ -223,6 +250,33 @@ def test_jobque_team(t : T?) {
                 }
             }
             set_jobque_worker_limit(-1)
+        }
+        t |> run("team rank gate - per-op admit set never breaks a dispatch") @(t : T?) {
+            // opt-in per-op participation gate: an op admits only chunk-count-many workers
+            // (limit-rank + 1 < chunks; the caller always serves), higher ranks spin past it.
+            // Pure perf dial — every admit set must stay exactly-once correct across shapes,
+            // storms, epoch crossings, stage chains, and both worker-limit states.
+            set_jobque_team_mode(true)
+            set_jobque_team_rank_gate(true)
+            t |> equal(get_jobque_team_rank_gate() ? 1 : 0, 1)
+            team_sum_round(t, 2, 8)             // tiny op: one admitted worker + the caller
+            team_once_round(t, 2 * get_total_hw_jobs(), 4 * get_total_hw_jobs())   // wide: everyone
+            team_sum_round(t, 2, 8)             // tiny again, right after the wide one
+            team_storm(t, 5)
+            team_epoch_storm(t, 300)            // spin 0: gated workers park and re-wake per publish
+            set_jobque_worker_spin(200)
+            team_epoch_storm(t, 300)            // spin window: gated workers stay hot between ops
+            set_jobque_worker_spin(0)
+            team_stages_round(t, 2 * get_total_hw_jobs())
+            set_jobque_worker_limit(2)          // compose with the dormant worker limit
+            team_once_round(t, 8, 32)
+            team_sum_round(t, 2, 8)
+            set_jobque_worker_limit(-1)
+            fifo_sum_round(t, 4, 16)            // fifo path is not gated
+            set_jobque_team_rank_gate(false)
+            t |> equal(get_jobque_team_rank_gate() ? 1 : 0, 0)
+            team_sum_round(t, 4, 16)
+            set_jobque_team_mode(false)
         }
         t |> run("epoch crossing - back-to-back shape storm") @(t : T?) {
             // production shape (spin window + fork pool, dasLLAMA decode's config)
