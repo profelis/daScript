@@ -48,8 +48,8 @@ def test_join_projection_emits_renamed_column(t : T?) {
         |> _join(_db |> select_from(type<Model>),
                  $(v : Vehicle, m : Model) => v.col_type == m.col_for,
                  $(v : Vehicle, m : Model) => (T = v.col_type, M = m.Maker)))
-    t |> success(sql |> find("SELECT \"t0\".\"type\", \"t1\".\"Maker\"") >= 0,
-        "projection of renamed column emits 'type' qualified by alias")
+    t |> success(sql |> find("SELECT \"t0\".\"type\" AS \"T\", \"t1\".\"Maker\" AS \"M\"") >= 0,
+        "projection of renamed column emits 'type' qualified by alias, aliased to the tuple field")
 }
 
 [test]

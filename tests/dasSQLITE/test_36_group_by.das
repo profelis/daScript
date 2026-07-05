@@ -54,7 +54,7 @@ def test_group_by_count_emits_group_by(t : T?) {
                           |> _group_by(_.City)
                           |> _select((City = _._0, N = _._1 |> length)))
     t |> equal(sql,
-        "SELECT \"City\", COUNT(*) FROM \"Users\" GROUP BY \"City\"",
+        "SELECT \"City\", COUNT(*) AS \"N\" FROM \"Users\" GROUP BY \"City\"",
         "_group_by + (_._0, _._1 |> length) emits GROUP BY + COUNT(*)")
 }
 
@@ -65,7 +65,7 @@ def test_group_by_avg_emits_avg_col(t : T?) {
                           |> _group_by(_.City)
                           |> _select((City = _._0, AvgAge = _._1 |> select($(u : User) => u.Age) |> average)))
     t |> equal(sql,
-        "SELECT \"City\", AVG(\"Age\") FROM \"Users\" GROUP BY \"City\"",
+        "SELECT \"City\", AVG(\"Age\") AS \"AvgAge\" FROM \"Users\" GROUP BY \"City\"",
         "_._1 |> select(u => u.X) |> average emits AVG(col)")
 }
 
@@ -80,7 +80,7 @@ def test_group_by_multi_aggregates(t : T?) {
                                       MaxAge = _._1 |> select($(u : User) => u.Age)    |> max,
                                       Total  = _._1 |> select($(u : User) => u.Salary) |> sum)))
     t |> equal(sql,
-        "SELECT \"City\", COUNT(*), MIN(\"Age\"), MAX(\"Age\"), SUM(\"Salary\") FROM \"Users\" GROUP BY \"City\"",
+        "SELECT \"City\", COUNT(*) AS \"N\", MIN(\"Age\") AS \"MinAge\", MAX(\"Age\") AS \"MaxAge\", SUM(\"Salary\") AS \"Total\" FROM \"Users\" GROUP BY \"City\"",
         "multi-aggregate projection emits all SQL aggregates")
 }
 
@@ -91,7 +91,7 @@ def test_group_by_count_via_count_fn(t : T?) {
                           |> _group_by(_.City)
                           |> _select((City = _._0, N = _._1 |> count)))
     t |> equal(sql,
-        "SELECT \"City\", COUNT(*) FROM \"Users\" GROUP BY \"City\"",
+        "SELECT \"City\", COUNT(*) AS \"N\" FROM \"Users\" GROUP BY \"City\"",
         "_._1 |> count emits COUNT(*) (alias of |> length)")
 }
 
@@ -102,7 +102,7 @@ def test_group_by_multi_key(t : T?) {
                           |> _group_by((_.City, _.Age))
                           |> _select((City = _._0._0, Age = _._0._1, N = _._1 |> length)))
     t |> equal(sql,
-        "SELECT \"City\", \"Age\", COUNT(*) FROM \"Users\" GROUP BY \"City\", \"Age\"",
+        "SELECT \"City\", \"Age\", COUNT(*) AS \"N\" FROM \"Users\" GROUP BY \"City\", \"Age\"",
         "multi-column _group_by emits GROUP BY col1, col2; projection uses _._0._N")
 }
 
@@ -114,7 +114,7 @@ def test_group_by_with_where(t : T?) {
                           |> _group_by(_.City)
                           |> _select((City = _._0, N = _._1 |> length)))
     t |> equal(sql,
-        "SELECT \"City\", COUNT(*) FROM \"Users\" WHERE \"Age\" > ? GROUP BY \"City\"",
+        "SELECT \"City\", COUNT(*) AS \"N\" FROM \"Users\" WHERE \"Age\" > ? GROUP BY \"City\"",
         "_where before _group_by emits WHERE before GROUP BY")
 }
 
@@ -132,7 +132,7 @@ def test_having_with_count_threshold(t : T?) {
                           |> _having(_._1 |> length > 1)
                           |> _select((City = _._0, N = _._1 |> length)))
     t |> equal(sql,
-        "SELECT \"City\", COUNT(*) FROM \"Users\" GROUP BY \"City\" HAVING COUNT(*) > ?",
+        "SELECT \"City\", COUNT(*) AS \"N\" FROM \"Users\" GROUP BY \"City\" HAVING COUNT(*) > ?",
         "_having with COUNT(*) > N emits HAVING")
 }
 
@@ -151,7 +151,7 @@ def test_having_combined_full_query(t : T?) {
                                       AvgSalary = _._1 |> select($(u : User) => u.Salary) |> average))
                           |> take(10))
     t |> equal(sql,
-        "SELECT \"City\", COUNT(*), AVG(\"Salary\") FROM \"Users\" WHERE \"Age\" >= ? GROUP BY \"City\" HAVING COUNT(*) >= ? ORDER BY \"City\" ASC LIMIT ?",
+        "SELECT \"City\", COUNT(*) AS \"N\", AVG(\"Salary\") AS \"AvgSalary\" FROM \"Users\" WHERE \"Age\" >= ? GROUP BY \"City\" HAVING COUNT(*) >= ? ORDER BY \"City\" ASC LIMIT ?",
         "full reporting query: WHERE → GROUP BY → HAVING → ORDER BY → LIMIT")
 }
 

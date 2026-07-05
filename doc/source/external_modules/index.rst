@@ -13,3 +13,5 @@ module does and where its docs live.
    dasimguiimplot
    dasvulkan
    dasvideo
+   dasduckdb
+   daspostgresql

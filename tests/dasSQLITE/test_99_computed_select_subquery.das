@@ -11,8 +11,8 @@ require daslib/sql_linq
 //   B1 — a computed scalar `_select(_.a + _.b)` lowers to `<frag>` via pred_to_sql + a computed projection
 //        slot, so `sum/min/max/average/count` over it works (previously rejected: "_.Field only").
 //   B2 — computed COLUMNS in a named-tuple `_select((N=_.Name, Bonus=_.Price/10))` lower to `<frag>`
-//        via the same pred_to_sql + push_computed_proj_slot path (result tuple fields map by position,
-//        so no SQL alias unless force_aliases is set; previously rejected: "_.Field only").
+//        via the same pred_to_sql + push_computed_proj_slot path (renamed/computed entries emit
+//        `AS "<alias>"` from the record name; previously rejected: "_.Field only").
 //   B3 — string `+` (daslang concatenation) lowers to SQL `||`, not `+` (SQLite `+` is numeric: 'a'+'b'==0).
 //   C  — computed `_order_by(_.Price/10)` keys (single + tuple entry) render with constants inlined, like
 //        _group_by computed keys (previously rejected: "_.Field or string only"). A row-referencing string
@@ -99,9 +99,9 @@ def test_computed_named_tuple_emits_fragment(t : T?) {
     let sql = _sql_text(_db |> select_from(type<Car>)
         |> _select((Name = _.Name, Bonus = _.Price / 10))
         |> to_array())
-    // plain column kept as a column ref; computed column rendered via pred_to_sql alongside it
-    // (result tuple fields map by position via projRecordNames, so no cosmetic SQL alias).
-    t |> success(sql == "SELECT \"Name\", (\"Price\") / (?) FROM \"Cars\"",
+    // plain column kept as a column ref (record name matches, no alias); computed column rendered
+    // via pred_to_sql alongside it with an `AS "<alias>"` from the record name.
+    t |> success(sql == "SELECT \"Name\", (\"Price\") / (?) AS \"Bonus\" FROM \"Cars\"",
         "computed column pushed down next to the plain column; SQL: {sql}")
 }
 
@@ -173,7 +173,7 @@ def test_bare_named_tuple_select_unchanged(t : T?) {
 def test_string_concat_column_emits_pipe(t : T?) {
     var _db = SqlRunner()
     let sql = _sql_text(_db |> select_from(type<Car>) |> _select((G = _.Name + "!")) |> to_array())
-    t |> success(sql == "SELECT (\"Name\") || (?) FROM \"Cars\"", "string `+` lowers to SQL `||`; SQL: {sql}")
+    t |> success(sql == "SELECT (\"Name\") || (?) AS \"G\" FROM \"Cars\"", "string `+` lowers to SQL `||`; SQL: {sql}")
 }
 
 [test]
@@ -290,7 +290,7 @@ def test_order_by_dynamic_column_name(t : T?) {
 def test_bitwise_and_emits(t : T?) {
     var _db = SqlRunner()
     let sql = _sql_text(_db |> select_from(type<Car>) |> _select((V = _.Price & 96)) |> to_array())
-    t |> success(sql == "SELECT (\"Price\") & (?) FROM \"Cars\"", "bitwise & lowers to SQL &; SQL: {sql}")
+    t |> success(sql == "SELECT (\"Price\") & (?) AS \"V\" FROM \"Cars\"", "bitwise & lowers to SQL &; SQL: {sql}")
 }
 
 [test]

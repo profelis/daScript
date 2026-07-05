@@ -206,7 +206,7 @@ def test_set_op_lhs_having_emits_correct_sql(t : T?) {
             |> _select((Tg = _._0)))
         |> union(_db |> select_from(type<TabB>) |> _where(_.Tag <= _hi) |> _select((Tg = _.Tag))))
     t |> equal(sql,
-        "SELECT \"Tag\" FROM \"A\" WHERE \"Tag\" >= ? GROUP BY \"Tag\" HAVING COUNT(*) >= ? UNION SELECT \"Tag\" FROM \"B\" WHERE \"Tag\" <= ?",
+        "SELECT \"Tag\" AS \"Tg\" FROM \"A\" WHERE \"Tag\" >= ? GROUP BY \"Tag\" HAVING COUNT(*) >= ? UNION SELECT \"Tag\" AS \"Tg\" FROM \"B\" WHERE \"Tag\" <= ?",
         "compound SQL preserves clause order: LHS WHERE → GROUP BY → HAVING → UNION → RHS WHERE")
 }
 

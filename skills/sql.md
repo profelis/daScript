@@ -1,8 +1,22 @@
-# SQL — daslib/sql_linq + providers (dasSQLITE)
+# SQL — daslib/sql_linq + providers (dasSQLITE / dasDuckDB / dasPostgreSQL)
 
 Read this skill before writing or editing any `.das` code that talks to a SQL database. The companion tutorials live under [tutorials/sql/](../tutorials/sql/) (45 files, numbered by teaching order — `01-version.das` through `44-in_not_in_collections.das`, plus `12b-set_ops.das`); read the relevant ones for runnable examples of every pattern below. Implementation: the provider-neutral core is [daslib/sql_boost.das](../daslib/sql_boost.das) (`[sql_table]` / `[sql_view]` / `[sql_index]` macros, `add_column` / `create_index` ALTER macros, the `sql_bind`/`sql_extract` adapter rail) and [daslib/sql_linq.das](../daslib/sql_linq.das) (the `_sql(...)` family of call macros), routed through the provider registry in [daslib/sql_provider.das](../daslib/sql_provider.das). The SQLite provider is [modules/dasSQLITE/daslib/sqlite_boost.das](../modules/dasSQLITE/daslib/sqlite_boost.das) (`SqlRunner`, exec/query runtime, runner helpers, `[sql_fts5]` / `[sql_function]`) plus the registration shim [sqlite_provider.das](../modules/dasSQLITE/daslib/sqlite_provider.das); [sqlite_migrate.das](../modules/dasSQLITE/daslib/sqlite_migrate.das) carries `[sql_migration]` + the `migrate_to_latest` runner. Design notes, decision logs, and the deferred-feature list live next to the provider in [modules/dasSQLITE/API_REWORK.md](../modules/dasSQLITE/API_REWORK.md), [PROVIDER_CONTRACT.md](../modules/dasSQLITE/PROVIDER_CONTRACT.md), [TUTORIALS.md](../modules/dasSQLITE/TUTORIALS.md), and [API_MIGRATION.md](../modules/dasSQLITE/API_MIGRATION.md).
 
 Three backends implement the provider contract: in-tree **SQLite** (the reference), and the external **[dasDuckDB](https://github.com/borisbat/dasDuckDB)** and **[dasPostgreSQL](https://github.com/borisbat/dasPostgreSQL)** repos (each carries its own CLAUDE.md with dialect divergences). The macro layer (`daslib/sql_boost` + `daslib/sql_linq`) is provider-neutral; everything runner- or dialect-specific lives in the provider's module and its registry entry. This skill's examples are written against SQLite; the `_sql` chain surface is identical across providers — swap the runner (`with_sqlite` / `with_duckdb` / `with_postgres`) and the require lines.
+
+## Providers at a glance
+
+| | SQLite (in-tree) | DuckDB (external) | PostgreSQL (external) |
+|---|---|---|---|
+| Require | `sqlite/sqlite_boost` | `duckdb/duckdb_boost` | `postgres/postgres_boost` |
+| Scoped open | `with_sqlite(path)` | `with_duckdb(path)` | `with_postgres(conninfo)` |
+| `[sql_fts5]` / `text_match` | ✓ | compile error | compile error |
+| `[sql_function]` UDFs | ✓ | ✓ | compile error (no client-side UDFs) |
+| `_distinct_by` lowering | bare-aggregate `GROUP BY` | `DISTINCT ON` | `DISTINCT ON` |
+| Migrations module | `sqlite/sqlite_migrate` | — (v1 shipped without) | — (v1 shipped without) |
+| PRAGMA / VACUUM / ATTACH / backup | ✓ (SQLite-specific surface) | engine-specific via `exec` | engine-specific via `exec` |
+
+Capability gates are **compile-time** `macro_error`s naming the provider (`caps` bitfield in the registry — see [PROVIDER_CONTRACT.md](../modules/dasSQLITE/PROVIDER_CONTRACT.md)). Everything else — `[sql_table]` DDL, insert-returns-pk, upsert, transactions (nested composes on all three), placeholder style — is handled per-provider under the same surface; user code doesn't change.
 
 ## `require`
 
@@ -26,7 +40,7 @@ When writing or reading SQL, the order of preference is fixed. Reach for the sim
 
 | Situation | Use | Why |
 |---|---|---|
-| Open / close a DB for a scoped block | **`with_sqlite(path) <\| $(db) { ... }`** (or `with_latest_sqlite` if migrations) | RAII; closes on panic / early return. Per-provider; future backends ship `with_postgres`, etc. |
+| Open / close a DB for a scoped block | **`with_sqlite(path) <\| $(db) { ... }`** (or `with_latest_sqlite` if migrations) | RAII; closes on panic / early return. Per-provider: `with_duckdb(path)` / `with_postgres(conninfo)` in the external repos |
 | Declare a row shape | **`[sql_table(name="...")]` struct** | Generates CREATE / DROP / INSERT / SELECT-row helpers + adapter dispatch. The struct is the single source of truth |
 | Query a table you own | **`_sql(db \|> select_from(type<T>) \|> _where(...) \|> _select(...))`** | Compile-time SQL emission, captured-vars auto-bound, type-checked column refs. The flagship; every read-side tutorial uses it |
 | Stream millions of rows | **`for (row in _each_sql(...))`** | Generator; `sqlite3_finalize` runs in `finally` on break/exhaustion/panic. Same chain shape as `_sql`, rejects materializing terminals |
@@ -178,11 +192,12 @@ let cars <- _sql(db |> select_from(type<Car>)
 |---|---|
 | **Source** | `select_from(db, type<T>)` where `T` carries `[sql_table]` or `[sql_view]` |
 | **Filter** | `_where(p)` — multiple calls compose with AND |
-| **Project** | `_select(_.Field)` (single column), `_select((A=_.A, B=_.B))` (named-tuple), `_select(_.A + _.B)` (computed scalar → the arithmetic renders into the projection/aggregate), default = full row |
+| **Project** | `_select(_.Field)` (single column), `_select((A=_.A, B=_.B))` (named-tuple), `_select(_.A + _.B)` (computed scalar → the arithmetic renders into the projection/aggregate), default = full row. Renamed/computed named-tuple entries emit `AS "<name>"`, so result columns carry your record names and a later `_order_by(_.Name)` over a projection alias orders correctly on every provider |
 | **Order** | `_order_by(_.Field)`, `_order_by_descending(_.Field)`, tuple-key `_order_by((_.k1, _.k2))` |
 | **Group** | `_group_by(_.Key)`, `_group_by((_.k1, _.k2))`; post-group `_having(p)` |
 | **Page** | `take(n)`, `skip(m)` — canonical fast form is `skip(m) \|> take(n)`. `take`/`skip` BEFORE an aggregate (`take(n) \|> count()`, `_select(_.X) \|> take(n) \|> sum()`) wraps the bounded rows into an inner subquery so the LIMIT applies pre-aggregate |
 | **Distinct** | `distinct()` |
+| **Distinct-by** | `_distinct_by(_.K)` — one row per key: first in pk order; `reverse() \|> _distinct_by(_.K)` picks the last. Terminators: row-returning (`to_array` / `_first`, trailing `_order_by`/`take`/`skip` OK), `count()` (→ `COUNT(DISTINCT K)`), `_count(p)`, `_select(_.X) \|> sum/min/max/average()`. Provider-lowered via `caps.distinct_on`: `DISTINCT ON (K)` (PG, DuckDB) or SQLite's bare-aggregate `GROUP BY`. Requires a single `@sql_primary_key`; composing with `_where`/`_join`/`_group_by`/set ops is a compile error (v1) |
 | **Aggregate** | `count()`, `sum`, `average`, `min`, `max` (terminal) |
 | **Joins** | `_join(other, $(l, r) => l.X == r.Y, $(l, r) => projection)`, `_left_join(...)` (right side flows as `Option<TB>` through `into`) |
 | **Subqueries** | `x._in(subq)`, `x._not_in(subq)`, `subq._any()`, `subq._any(p)`, `subq._none()`, `subq._none(p)` |
@@ -318,7 +333,7 @@ if (r |> is_some) {
 
 Two distinct overloads (one with `mode`, one without) — not one with an optional middle parameter, because the trailing-block convention puts the block last and an optional middle wouldn't resolve from a no-mode call site. Same for `try_transaction`.
 
-`SqliteTxnMode`: `Deferred` (default; lock acquired on first write), `Immediate` (RESERVED lock at BEGIN — avoids the "another writer raced us between read and write" trap), `Exclusive`.
+`SqliteTxnMode`: `Deferred` (default; lock acquired on first write), `Immediate` (RESERVED lock at BEGIN — avoids the "another writer raced us between read and write" trap), `Exclusive`. The mode overload is SQLite-specific; DuckDB / PostgreSQL providers ship the mode-less `with_transaction` / `try_transaction` only (nesting still composes — savepoints on PG, depth tracking on DuckDB).
 
 `db |> in_transaction() : bool` wraps SQLite's autocommit flag — useful for library code that wants "join an ambient transaction if one is active, else start one".
 
@@ -442,7 +457,7 @@ Types without an overload hit the catch-all in `sql_linq.das` (enums emit as `in
 
 For window functions, recursive CTEs, custom helpers the chain doesn't translate, drop to raw `db |> exec("CREATE VIEW … AS …")` and declare a matching `[sql_view]` struct for the read side.
 
-## FTS5 — full-text search
+## FTS5 — full-text search (SQLite-only, `caps.fts5`)
 
 ```das
 [sql_fts5(name = "docs_idx")]
@@ -466,7 +481,9 @@ Query-string syntax: whitespace-AND, `*` prefix (`quick*` matches `quicksand`), 
 
 v1 limitations: self-contained mode only (FTS5 holds both content and index); UPDATE / DELETE on FTS5 rows aren't typed (drop and re-insert, or raw `exec`); BM25 weighting / snippet helpers / per-column query filters work via the FTS5 query string but lack typed wrappers.
 
-## User-defined SQL functions — `register_function` / `[sql_function]`
+## User-defined SQL functions — `register_function` / `[sql_function]` (`caps.client_udfs`)
+
+SQLite and DuckDB only — PostgreSQL has no client-side UDFs, so `[sql_function]` use against a PG runner is a compile-time error. Each supporting provider ships its own `[sql_function]` annotation (in `sqlite_boost` / `duckdb_boost`).
 
 Two flavors. Per-connection `register_function` for explicit one-off registration; `[sql_function]` annotation for auto-registration on every open + chain visibility.
 
@@ -500,9 +517,9 @@ let strong <- _sql(db |> select_from(type<Enemy>)
 
 `[sql_function]` is the right shape for ambient SQL helpers that should be visible to chain analysis everywhere; `register_function` is for one-off / per-connection registrations.
 
-## Migrations — `sqlite/sqlite_migrate`
+## Migrations — `sqlite/sqlite_migrate` (SQLite-only for now)
 
-Versioned, append-only schema evolution. Optional sub-module — `require sqlite/sqlite_migrate` only when needed.
+Versioned, append-only schema evolution. Optional sub-module — `require sqlite/sqlite_migrate` only when needed. DuckDB and PostgreSQL shipped v1 without a migrations module; the provider-neutral shape (advisory-lock coordination on PG) is an open design item — see PROVIDER_CONTRACT.md §Migrations.
 
 ```das
 require sqlite/sqlite_migrate
@@ -607,7 +624,7 @@ If migration v5 fails midway through `[v4, v5, v6]`:
 
 Body discipline: **migration bodies should be DB-only**. Anything that touches the outside world (HTTP, file writes, `system(...)`) is NOT rolled back when the migration fails; if the migration retries, those side effects re-execute. For genuinely cross-system migrations, sequence them outside the runner.
 
-## PRAGMA, VACUUM, backup
+## PRAGMA, VACUUM, backup (SQLite-specific surface)
 
 ```das
 db |> set_pragma("journal_mode", "WAL")          // string / int64 / bool overloads
@@ -627,7 +644,7 @@ All have `try_` siblings returning `SqlError` (or `Result<array<string>, string>
 
 `apply_recommended_pragmas` is the canonical "sane defaults" call — WAL enables reader+writer coexistence, busy_timeout gives concurrent runners a wait window, foreign_keys=ON makes `@sql_references` constraints actually fire, synchronous=NORMAL is the WAL-appropriate durability/perf tradeoff.
 
-## ATTACH
+## ATTACH (SQLite-specific surface)
 
 ```das
 db |> attach("other.db", "ext")                  // try_attach for non-panic

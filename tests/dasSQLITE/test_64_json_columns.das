@@ -239,7 +239,7 @@ def test_sql_text_projection_named_tuple_two_json_paths(t : T?) {
     let sql = _sql_text(_db |> select_from(type<User>)
         |> _select((Theme = _.Prefs.theme, Lang = _.Prefs.lang)))
     t |> equal(sql,
-        "SELECT json_extract(\"Prefs\", '$.theme'), json_extract(\"Prefs\", '$.lang') FROM \"Users\"",
+        "SELECT json_extract(\"Prefs\", '$.theme') AS \"Theme\", json_extract(\"Prefs\", '$.lang') AS \"Lang\" FROM \"Users\"",
         "named-tuple projection with two JSON paths emits two json_extracts")
 }
 
@@ -249,7 +249,7 @@ def test_sql_text_projection_mixed_plain_and_json_path(t : T?) {
     let sql = _sql_text(_db |> select_from(type<User>)
         |> _select((N = _.Name, T = _.Prefs.theme)))
     t |> equal(sql,
-        "SELECT \"Name\", json_extract(\"Prefs\", '$.theme') FROM \"Users\"",
+        "SELECT \"Name\" AS \"N\", json_extract(\"Prefs\", '$.theme') AS \"T\" FROM \"Users\"",
         "named-tuple mixing plain column and JSON path emits both shapes")
 }
 

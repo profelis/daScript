@@ -125,6 +125,11 @@ def main : int {
     var famSet : table<string>
     load_cells(cfg.interp, interpCells, famSet)
     load_cells(cfg.jit, jitCells, famSet)
+    if (empty(famSet)) {
+        // A bad path parses as 0 rows; without this gate it would silently overwrite the tables with an empty matrix.
+        to_log(LOG_ERROR, "no benchmark rows parsed from '{cfg.interp}' / '{cfg.jit}' — check the paths (expected `dastest --bench --bench-format json` output)\n")
+        return 1
+    }
 
     var families <- [for (f in keys(famSet)); f]
     sort(families)
@@ -147,13 +152,17 @@ def main : int {
         return 1
     }
     let updated = slice(doc, 0, bi) + body + slice(doc, ei + length(END_MARKER))
+    var wrote = false
     fopen(resultsPath, "wb") $(f) {
+        // `return` here only exits the block — the wrote flag carries the failure out to main's exit code.
         if (f == null) {
             to_log(LOG_ERROR, "cannot open {resultsPath} for writing\n")
             return
         }
         fwrite(f, updated)
+        wrote = true
     }
+    if (!wrote) return 1
     to_log(LOG_INFO, "results.md updated: {length(families)} families, INTERP+JIT matrices regenerated\n")
     return 0
 }

@@ -49,7 +49,7 @@ def test_join_groupby_count_emits_alias_resolved_group_by(t : T?) {
         |> _group_by(_.Brand)
         |> _select((Brand = _._0, N = _._1 |> count())))
     t |> equal(sql,
-        "SELECT (\"t1\".\"Brand\"), COUNT(*) FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
+        "SELECT (\"t1\".\"Brand\") AS \"Brand\", COUNT(*) AS \"N\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
         "_join |> _group_by(_.<alias>) resolves the alias against the projection registry — emits the underlying source column in GROUP BY and SELECT")
 }
 
@@ -81,7 +81,7 @@ def test_join_groupby_aliased_left_side_field_emits_t0_alias(t : T?) {
         |> _group_by(_.PriceCol)
         |> _select((P = _._0, N = _._1 |> count())))
     t |> equal(sql,
-        "SELECT (\"t0\".\"Price\"), COUNT(*) FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t0\".\"Price\")",
+        "SELECT (\"t0\".\"Price\") AS \"P\", COUNT(*) AS \"N\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t0\".\"Price\")",
         "alias on the LEFT side (t0) resolves through the registry same as t1")
 }
 
@@ -122,7 +122,7 @@ def test_join_groupby_sum_alias_emits_qualified_column(t : T?) {
         |> _group_by(_.Brand)
         |> _select((Brand = _._0, Total = _._1 |> _select(_.Price) |> sum())))
     t |> equal(sql,
-        "SELECT (\"t1\".\"Brand\"), SUM(\"t0\".\"Price\") FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
+        "SELECT (\"t1\".\"Brand\") AS \"Brand\", SUM(\"t0\".\"Price\") AS \"Total\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
         "sum over join-projection alias `Price` emits SUM(\"t0\".\"Price\") with the qualified source column")
 }
 
@@ -157,7 +157,7 @@ def test_join_groupby_min_max_average_alias(t : T?) {
         |> _group_by(_.Brand)
         |> _select((B = _._0, M = _._1 |> _select(_.Price) |> min())))
     t |> equal(sqlMin,
-        "SELECT (\"t1\".\"Brand\"), MIN(\"t0\".\"Price\") FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
+        "SELECT (\"t1\".\"Brand\") AS \"B\", MIN(\"t0\".\"Price\") AS \"M\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
         "min over alias emits MIN(qualified)")
     let sqlMax = _sql_text(_db |> select_from(type<Car>)
         |> _join(_db |> select_from(type<Dealer>),
@@ -166,7 +166,7 @@ def test_join_groupby_min_max_average_alias(t : T?) {
         |> _group_by(_.Brand)
         |> _select((B = _._0, M = _._1 |> _select(_.Price) |> max())))
     t |> equal(sqlMax,
-        "SELECT (\"t1\".\"Brand\"), MAX(\"t0\".\"Price\") FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
+        "SELECT (\"t1\".\"Brand\") AS \"B\", MAX(\"t0\".\"Price\") AS \"M\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
         "max over alias emits MAX(qualified)")
     let sqlAvg = _sql_text(_db |> select_from(type<Car>)
         |> _join(_db |> select_from(type<Dealer>),
@@ -175,7 +175,7 @@ def test_join_groupby_min_max_average_alias(t : T?) {
         |> _group_by(_.Brand)
         |> _select((B = _._0, A = _._1 |> _select(_.Price) |> average())))
     t |> equal(sqlAvg,
-        "SELECT (\"t1\".\"Brand\"), AVG(\"t0\".\"Price\") FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
+        "SELECT (\"t1\".\"Brand\") AS \"B\", AVG(\"t0\".\"Price\") AS \"A\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY (\"t1\".\"Brand\")",
         "average over alias emits AVG(qualified)")
 }
 
@@ -260,7 +260,7 @@ def test_join_groupby_computed_key_buckets_emit_arithmetic(t : T?) {
         |> _group_by(_.Price / 100)
         |> _select((Bucket = _._0, N = _._1 |> count())))
     t |> equal(sql,
-        "SELECT ((\"t0\".\"Price\") / (100)), COUNT(*) FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY ((\"t0\".\"Price\") / (100))",
+        "SELECT ((\"t0\".\"Price\") / (100)) AS \"Bucket\", COUNT(*) AS \"N\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"DealerId\" = \"t1\".\"Id\" GROUP BY ((\"t0\".\"Price\") / (100))",
         "computed-expression group key over join alias resolves through pred_to_sql, emits arithmetic over qualified column")
 }
 
