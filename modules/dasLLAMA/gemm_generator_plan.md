@@ -995,6 +995,39 @@ per-op profile next session. AMX as a Tier-3 generator family: the 135M prefill 
 (13.3k t/s) is what AMX tiles buy on cache-resident weights — that's the number a
 dot=amx_int8 family would chase.
 
+## SPR silicon session 2 (2026-07-05, c7i.metal-24xl respin) — dispatch-arc validation + AMX scout
+
+Respin from the baked AMI at `5f3d80928` (work-proportional dispatch + worker limit + per-op
+rank gate). 75-cell paired sweep — 15 models × T{8,16,24,32,48}, gate-on, biased busd512-mr16
+manifest stamp, vs the same lcpp-AMX build, prefill AND emit per cell:
+
+- **Fleet emit mean 0.87 vs the AMX build** (zen2's 1.01 parity was vs plain AVX2). The two
+  dispatch regimes from session 1 moved: 135M emit ratio 0.24 → 0.70–0.92 with the T-collapse
+  gone (peaks T16, T48 ≈ T24); ≥1B dense wins/ties prefill everywhere ≤T24 (Mistral-7B
+  1.02–1.10, Llama-8B 1.03–1.10, Phi-3.5 1.05–1.06); **gpt-oss beats the AMX build outright
+  (pp 1.38 @T8, 1.16 @T16; emit ≥ 1.00 T16–T32)**. Llama-1B reproduces session 1's knee
+  numbers exactly (emit 1.02 @T24).
+- **Rank gate promotion evidence complete**: T48 A/B — 135M **+48%** (317.5 vs 214.2), 1B
+  neutral. With zen2's +10%/neutral: no observed regression on server cores, both boxes.
+- **Affinity/placement exonerated**: pin-one-per-physical-core null (48W lands right by
+  itself), spread-rank NEGATIVE on single-socket SPR → experiment retired (zen2 null + SPR
+  negative). Residual T48-vs-T8 emit tax (~7%) ≈ active-core turbo physics, not scheduling.
+- **AMX scout (single core, userland)**: enable = `arch_prctl(ARCH_REQ_XCOMP_PERM,
+  XTILEDATA)` + `ldtilecfg`, no kernel help needed. TMUL reg-resident **3546 GMAC/s = 22×
+  the biased-busd512 tier**; tile-load-fed 2175 @1MB / 579 @32MB / 196 GMAC/s @512MB
+  zero-reuse. Verdict: **prefill/batch family** (transformative under tile reuse,
+  break-even for zero-reuse GEMV streaming). Emitter path is unblocked das-side:
+  `LLVMX86AMXTypeInContext` is already in bindings/llvm_func.das:374 and llvm_boost has
+  name-based intrinsic lookup — `llvm.x86.tdpbssd.internal` & co. reachable with zero C++.
+- **Per-op decode leads (decode_prof @T24)**: Qwen3-0.6B — attn_chain 50–54% of time vs
+  ~36% traffic share (28 deep-thin layers + per-head QK-norm; dispatch-bound, not
+  bandwidth). gemma-3-1b — the un-fused decode path runs mm_qkv (24% time) + mm_wo (15%)
+  fully INLINE, 0 dispatches (fused-decode gate off for its pre/post-norm pattern);
+  classifier 9% time / 30% traffic. Both are das-side dispatch-shape fixes.
+- Raw logs + results page archived Mac-side; sweep rig `~/spr_sweep.sh` baked into the box
+  home dir (survives in the next AMI if re-baked). gemma-4-12B / Qwen1.5-MoE GGUFs could
+  not be re-fetched byte-exact — provenance hunt is a prerequisite before the AMX session.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /
