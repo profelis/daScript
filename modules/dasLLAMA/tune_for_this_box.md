@@ -20,7 +20,8 @@ finish it first; tuning an incorrect kernel is worse than pointless).
 | Loop hints per kernel (`vectorize_width` × `unroll_count`) | `box_profile.json` flat keys, read at **compile time** by `[tuned]` | compile (JIT re-keys automatically) | all 16 `[tuned]` kernels: dot, axpy, add/mul/scale_inplace, copy_floats, softmax(+_sink), rmsnorm, dot_q4, dot_q8q8, dot_mx4q8, quantize_q8_0_into_ptr, rope_scaled_neox_tab, gemm_f32_uk_4x16, dot_q8q8_laneq4x4 |
 | Token block `TB` | `set_q8_token_block(n)` (default 128) / profile `runtime.q8_token_block` | runtime | the repack-tier batch kernel only |
 | L2 budget (TB cliff guard) | `set_q8_l2_budget(bytes)` (default 4 MB — provisional, one M1 Max) / profile `runtime.q8_l2_budget` | runtime | `effective_token_block(tb, n) = clamp(tb, 1, budget/n)` (dasllama_math.das) |
-| Threading thresholds | `set_matmul_par_threshold`, `set_decode_attn_par_threshold` (decode attention over heads — default 262144, the measured M1 Max crossover; sweep inline-vs-threaded at a few context depths to re-derive on a new box), + the six prefill-pass setters (`set_attn/requant/norm/rope/kv_store/act_par_threshold`) / profile `runtime.*_par_threshold` | runtime | every `maybe_parallel_for` gate — the crossovers encode the box's ~90µs (M1) job-dispatch cost |
+| Work-proportional dispatch | `set_target_chunk_work` (MACs per dispatch chunk, default 1M — lanes = clamp(work/target, 1, lanes); 1 lane = inline, so 2×target is the old 2M inline boundary) + `set_gemv_lane_cap` / `set_batch_lane_cap` (per-regime lane ceilings, 0 = uncapped — the GEMV cap is the box's DRAM knee, measured by `harness/team_probe.das`) / profile `runtime.target_chunk_work` / `runtime.gemv_lane_cap` / `runtime.batch_lane_cap` | runtime | every matmul dispatch (the `matmul_chunks*` shapers), the fused-chain gates, decode attention |
+| Threading thresholds (non-matmul) | the six prefill-pass setters (`set_attn/requant/norm/rope/kv_store/act_par_threshold`) / profile `runtime.*_par_threshold` | runtime | the norm/rope/kv/act/requant `maybe_parallel_for` gates — the crossovers encode the box's job-dispatch cost |
 | Chunks per hw job | `set_q8_chunks_per_job` (default 2) / `set_q4_chunks_per_job` (default 4) / profile `runtime.q{8,4}_chunks_per_job` | runtime | the quantized matmuls' row split |
 | Batch oversplit | `set_q8_batch_chunks_per_job` (default 4) / profile `runtime.q8_batch_chunks_per_job` — chunks = hw_jobs × this, so awake workers steal a straggler's remaining chunks (measured 3990X @32w: +9-14% on the fat shapes; the grp4 kernel floors at 4 groups/chunk — see the kernel note) | runtime | the x64 batch (prefill GEMM) kernels |
 | Jobque spin | `set_jobque_spin_us` (default 30000, worker spin-before-park) / `set_jobque_join_poll` (default 50, ggml's poll denomination: level×1024×128 relax-rounds at join before parking) / profile `runtime.jobque_spin_us`, `runtime.jobque_join_poll` — both applied by `setup_dasllama_jobque` inside the queue | runtime | every fork/join dispatch |
@@ -80,7 +81,7 @@ fallback perm (`vec8_u2` for most; dot_q8q8 ships `vec16`, dot_q4 `vec4_u4`, the
 
 ```json
 {"dot":"vec8_u2", "...":"...", "dot_q8q8":"vec16",
- "runtime":{"q8_token_block":128,"q8_l2_budget":4194304,"matmul_par_threshold":2000000,
+ "runtime":{"q8_token_block":128,"q8_l2_budget":4194304,"target_chunk_work":1000000,
             "attn_par_threshold":100000, "...":0, "q8_chunks_per_job":2,"threads":8}}
 ```
 

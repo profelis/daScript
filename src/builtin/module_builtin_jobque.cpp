@@ -931,6 +931,12 @@ namespace das {
         return g_jobQueAvailable == 0;
     }
 
+    bool is_job_que_available () {
+        // Non-throwing "does a queue exist" — the que-gated externs (get_total_hw_jobs etc.)
+        // throw instead. Lets dispatch shapers answer "1 lane, run inline" on a que-less process.
+        return g_jobQue != nullptr;
+    }
+
     uint64_t count_jobque_leaks () {
         // Number of live JobStatus/Channel/LockBox/Stream + Feature objects globally.
         // Tests compare before/after a teardown to assert no net leak (dastest's own
@@ -1374,6 +1380,8 @@ namespace das {
                     ->args({"block","context","line"});
             addExtern<DAS_BIND_FUN(is_job_que_shutting_down)>(*this, lib,  "is_job_que_shutting_down",
                 SideEffects::modifyExternal, "is_job_que_shutting_down");
+            addExtern<DAS_BIND_FUN(is_job_que_available)>(*this, lib,  "is_job_que_available",
+                SideEffects::accessExternal, "is_job_que_available");
             addExtern<DAS_BIND_FUN(count_jobque_leaks)>(*this, lib,  "count_jobque_leaks",
                 SideEffects::accessExternal, "count_jobque_leaks");
         }

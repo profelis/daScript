@@ -12,9 +12,10 @@ require daslib/fio
 def private restore_defaults() {
     set_q8_token_block(128l)
     set_q8_l2_budget(4l * 1024l * 1024l)
-    set_matmul_par_threshold(2_000_000l)
+    set_target_chunk_work(1_000_000l)
+    set_gemv_lane_cap(0)
+    set_batch_lane_cap(0)
     set_attn_par_threshold(100_000l)
-    set_decode_attn_par_threshold(262_144l)
     set_requant_par_threshold(256_000l)
     set_norm_par_threshold(256_000l)
     set_rope_par_threshold(100_000l)
@@ -34,8 +35,8 @@ def test_runtime_section_applies(t : T?) {
     t |> success(terr == "", "temp_directory resolves")
     let path = path_join(dir, "dasllama_test_box_profile.json")
     let js = ("\{\"dot\":\"vec8_u2\",\"runtime\":\{\"q8_token_block\":256,\"q8_l2_budget\":8388608,"
-        + "\"matmul_par_threshold\":1000000,\"attn_par_threshold\":50000,\"decode_attn_par_threshold\":2000000,"
-        + "\"requant_par_threshold\":128000,"
+        + "\"target_chunk_work\":500000,\"gemv_lane_cap\":12,\"batch_lane_cap\":24,"
+        + "\"attn_par_threshold\":50000,\"requant_par_threshold\":128000,"
         + "\"norm_par_threshold\":128000,\"rope_par_threshold\":50000,\"kv_store_par_threshold\":128000,"
         + "\"act_par_threshold\":50000,\"q8_chunks_per_job\":3,\"q4_chunks_per_job\":5,"
         + "\"q8_batch_chunks_per_job\":2,\"jobque_spin_us\":1000,\"jobque_join_poll\":10\}\}")
@@ -43,9 +44,10 @@ def test_runtime_section_applies(t : T?) {
     apply_box_profile_runtime(path)
     t |> equal(get_q8_token_block(), 256l, "q8_token_block applied")
     t |> equal(get_q8_l2_budget(), 8388608l, "q8_l2_budget applied")
-    t |> equal(get_matmul_par_threshold(), 1000000l, "matmul_par_threshold applied")
+    t |> equal(get_target_chunk_work(), 500000l, "target_chunk_work applied")
+    t |> equal(get_gemv_lane_cap(), 12, "gemv_lane_cap applied")
+    t |> equal(get_batch_lane_cap(), 24, "batch_lane_cap applied")
     t |> equal(get_attn_par_threshold(), 50000l, "attn_par_threshold applied")
-    t |> equal(get_decode_attn_par_threshold(), 2000000l, "decode_attn_par_threshold applied")
     t |> equal(get_requant_par_threshold(), 128000l, "requant_par_threshold applied")
     t |> equal(get_norm_par_threshold(), 128000l, "norm_par_threshold applied")
     t |> equal(get_rope_par_threshold(), 50000l, "rope_par_threshold applied")
@@ -71,7 +73,7 @@ def test_partial_and_missing_are_no_ops(t : T?) {
     t |> success(fwrite(path, "\{\"runtime\":\{\"q8_token_block\":512\}\}"), "partial profile written")
     apply_box_profile_runtime(path)
     t |> equal(get_q8_token_block(), 512l, "the one present key applied")
-    t |> equal(get_matmul_par_threshold(), 2_000_000l, "absent keys keep defaults")
+    t |> equal(get_target_chunk_work(), 1_000_000l, "absent keys keep defaults")
     restore_defaults()
 
     // kernel-perms-only profile (no "runtime" section) — a no-op for the runtime knobs

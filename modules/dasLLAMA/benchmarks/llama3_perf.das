@@ -97,12 +97,22 @@ def main {
             set_fused_decode(get_env_variable("DASLLAMA_FUSED_DECODE") != "0")
             print("fused decode override: {get_fused_decode()}\n")
         }
-        // threshold override — also the crude chain selector (attn chain gates at dim*(qd+2kv),
-        // ffn at dim*hidden; a value between them fuses the FFN only)
-        if (has_env_variable("DASLLAMA_MATMUL_PAR_THRESHOLD")) {
-            let mpt = to_int(get_env_variable("DASLLAMA_MATMUL_PAR_THRESHOLD"))
-            set_matmul_par_threshold(int64(mpt))
-            print("matmul par threshold override: {mpt}\n")
+        // work-target override — also the crude chain selector (attn chain gates at dim*(qd+2kv),
+        // ffn at dim*hidden; the fuse needs lanes_for_work(gate work) > 1, i.e. work >= 2*target)
+        if (has_env_variable("DASLLAMA_TARGET_CHUNK_WORK")) {
+            let tcw = to_int(get_env_variable("DASLLAMA_TARGET_CHUNK_WORK"))
+            set_target_chunk_work(int64(tcw))
+            print("target chunk work override: {tcw}\n")
+        }
+        if (has_env_variable("DASLLAMA_GEMV_LANE_CAP")) {
+            let glc = to_int(get_env_variable("DASLLAMA_GEMV_LANE_CAP"))
+            set_gemv_lane_cap(glc)
+            print("gemv lane cap override: {glc}\n")
+        }
+        if (has_env_variable("DASLLAMA_BATCH_LANE_CAP")) {
+            let blc = to_int(get_env_variable("DASLLAMA_BATCH_LANE_CAP"))
+            set_batch_lane_cap(blc)
+            print("batch lane cap override: {blc}\n")
         }
         // prefill (untimed)
         var pos = 0l

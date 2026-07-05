@@ -1384,9 +1384,8 @@ def apply_box_profile_runtime(path : string = "") {
     let rt = jv?["runtime"]   // null-sentinel when absent — every read below then keeps its default
     apply_i64_knob(rt, "q8_token_block") $(v) { set_q8_token_block(v) }
     apply_i64_knob(rt, "q8_l2_budget") $(v) { set_q8_l2_budget(v) }
-    apply_i64_knob(rt, "matmul_par_threshold") $(v) { set_matmul_par_threshold(v) }
+    apply_i64_knob(rt, "target_chunk_work") $(v) { set_target_chunk_work(v) }
     apply_i64_knob(rt, "attn_par_threshold") $(v) { set_attn_par_threshold(v) }
-    apply_i64_knob(rt, "decode_attn_par_threshold") $(v) { set_decode_attn_par_threshold(v) }
     apply_i64_knob(rt, "requant_par_threshold") $(v) { set_requant_par_threshold(v) }
     apply_i64_knob(rt, "norm_par_threshold") $(v) { set_norm_par_threshold(v) }
     apply_i64_knob(rt, "rope_par_threshold") $(v) { set_rope_par_threshold(v) }
@@ -1398,6 +1397,8 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "q8_batch_chunks_per_job") $(v) { set_q8_batch_chunks_per_job(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "matmul_min_chunk_rows") $(v) { set_matmul_min_chunk_rows(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "matmul_min_chunk_rows_gemv") $(v) { set_matmul_min_chunk_rows_gemv(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "gemv_lane_cap") $(v) { set_gemv_lane_cap(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "batch_lane_cap") $(v) { set_batch_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "gemv_wave_fill") $(v) { set_gemv_wave_fill(v != 0l) }
     apply_i64_knob(rt, "fused_decode") $(v) { set_fused_decode(v != 0l) }
     // stored only — the queue may not exist yet; setup_dasllama_jobque applies these inside with_job_que
@@ -1736,7 +1737,7 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
         } else {
             copy_floats(s.k, 0l, s.v, 0l, kv)
         }
-    } elif (t.quant == QuantMode.q8 && dim * (qd + 2l * kv) >= g_matmul_par_threshold) {
+    } elif (t.quant == QuantMode.q8 && lanes_for_work(dim * (qd + 2l * kv), g_gemv_lane_cap) > 1) {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
         matmul_q8q8_group3(s.q, s.k, s.v, t.qblob, t.qscales, qoff, koff, voff, s.xq, s.xs, dim, qd, kv, kv)
     } else {
@@ -1955,7 +1956,7 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
     return (g_fused_decode && t.quant == QuantMode.q8 && !c.pre_post_norm && g_use_rope_table
         && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
         && get_jobque_team_mode() && kernel_backend_has_rows()
-        && c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)) >= g_matmul_par_threshold)
+        && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
 }
 
 // Fused attention block: ONE team rendezvous runs [qkv rows + bias/qk-norm/rope/kv-store] →
@@ -1988,10 +1989,10 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let ts_chain = ref_time_ticks()
     // stage geometry (same grain math as the per-op dispatches; the C++ side clamps chunks <= range)
     let nslots = int(n_heads + 2l * n_kv_heads)
-    let n0 = matmul_chunks_gemv(int(qd + 2l * kv_dim), get_dispatch_lanes())
+    let n0 = matmul_chunks_gemv(int(qd + 2l * kv_dim), 1, dim * (qd + 2l * kv_dim))
     let n1 = get_dispatch_lanes()
     let ngrp = int(dim / 32l)
-    let n2 = matmul_chunks_gemv(int(dim), get_dispatch_lanes())
+    let n2 = matmul_chunks_gemv(int(dim), 1, qd * dim)
     s.chain_stages |> resize(3)
     s.chain_stages[0] = int3(0, nslots, n0)
     s.chain_stages[1] = int3(0, int(n_heads), n1)
@@ -2157,7 +2158,7 @@ def private fused_ffn_ok(t : Model) : bool {
     let c = t.config
     return (g_fused_decode && t.quant == QuantMode.q8 && !c.pre_post_norm && !c.layer_out_scale
         && get_jobque_team_mode() && kernel_backend_has_rows()
-        && c.dim * c.hidden_dim >= g_matmul_par_threshold)
+        && lanes_for_work(c.dim * c.hidden_dim, g_gemv_lane_cap) > 1)
 }
 
 // Fused dense FFN block: ONE team rendezvous runs [w1+w3 rows + act + requant] → [w2 rows +
@@ -2181,8 +2182,8 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
     let vec = g_act_vec
     let ngrp0 = int(hidden / 32l)
     let ngrp1 = int(dim / 32l)
-    let n0 = matmul_chunks_gemv(int(hidden), get_dispatch_lanes())
-    let n1 = matmul_chunks_gemv(int(dim), get_dispatch_lanes())
+    let n0 = matmul_chunks_gemv(int(hidden), 1, 2l * dim * hidden)
+    let n1 = matmul_chunks_gemv(int(dim), 1, hidden * dim)
     s.chain_stages |> resize(2)
     s.chain_stages[0] = int3(0, ngrp0, n0)
     s.chain_stages[1] = int3(0, ngrp1, n1)
@@ -2329,9 +2330,9 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let ts_attn = ref_time_ticks()
     let seq_len = c.seq_len
     let attn_softcap = c.attn_logit_softcap
-    // team dispatch costs ~µs, so the fifo-measured crossover no longer applies: always thread
-    // (ggml threads flash-attn at any depth; measured 1B ctx8 attn 420 → 194 µs/tok under team)
-    let attn_par = get_jobque_team_mode() || cnt * head_size * n_heads >= g_decode_attn_par_threshold
+    // work-proportional lanes (QK^T + AV both stream the KV slice: 2·cnt·hs·nh MACs) — tiny-cnt
+    // early-decode attention (~2K MACs at cnt=1) inlines instead of paying a rendezvous
+    let attn_lanes = min(int(n_heads), lanes_for_work(2l * cnt * head_size * n_heads, g_gemv_lane_cap))
     let sinksp = (c.attn_sinks
         ? unsafe(reinterpret<float const?>(unsafe(addr(t.fblob[t.sinks_off + l * n_heads]))))
         : null)
@@ -2341,7 +2342,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         let vcp = reinterpret<float const?>(addr(s.value_cache[0]))
         var xbp = addr(s.xb[0])
         var attp = addr(s.att[0])
-        maybe_parallel_for(attn_par, 0, int(n_heads), get_dispatch_lanes()) $(rb, re) {
+        maybe_parallel_for(0, int(n_heads), attn_lanes) $(rb, re) {
             unsafe {
                 for (h in range(rb, re)) {
                     let hh = int64(h)
@@ -2820,17 +2821,9 @@ def get_kv_store_par_threshold() : int64 => g_kv_store_par_threshold
 def set_act_par_threshold(v : int64) { g_act_par_threshold = max(v, 0l) }
 def get_act_par_threshold() : int64 => g_act_par_threshold
 
-// Thread the DECODE attention over heads once cnt × head_size × n_heads clears this. Decode
-// attention is the one per-token cost that grows linearly with context (the KV read), so it
-// eventually rivals the weight traffic — the per-layer-per-token dispatch (~90µs on M1) must
-// amortize first. Default MEASURED (M1 Max, quiet box, 2026-07-02): the inline-vs-threaded
-// crossover sits at ~200-260K work on both Llama-3.2-1B (hs 64 × 32 heads) and gemma-4-12B
-// (hs 512 × 16 heads); below it threading costs ≤2%, above it wins grow to +74%/+89% at 2048 ctx.
-// Set huge to disable, 0 to always thread (the A/B). Under team dispatch the gate is bypassed —
-// the ~90µs fifo fork/join this crossover amortizes shrinks to ~µs, and threading wins at any depth.
-var g_decode_attn_par_threshold = 262_144l
-def set_decode_attn_par_threshold(v : int64) { g_decode_attn_par_threshold = max(v, 0l) }
-def get_decode_attn_par_threshold() : int64 => g_decode_attn_par_threshold
+// Decode attention threads work-proportionally (min(n_heads, lanes_for_work(2·cnt·hs·nh)) at
+// the dispatch site; the M1-measured inline-vs-threaded crossover that used to live here as a
+// binary decode_attn_par_threshold knob is now owned per box by target_chunk_work).
 // Query-block width for the blocked prefill attention (each K/V tile is reused across this many queries).
 let ATTN_BLOCK_Q = 8l
 // Tile dims for the flash prefill attention (Q rows × KV cols processed per GEMM tile). The flash

@@ -70,7 +70,7 @@ def dot_q8q8_sdot4x4(wq : int8 const?; ws : float const?; xq : int8 const?; xs :
 def private q8q8_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), get_dispatch_lanes() * get_q8_batch_chunks_per_job())) $(rb, re) {
+    maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), get_q8_batch_chunks_per_job(), n * d)) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 myp[i] = dot_q8q8_sdot4x4(wp + int64(i) * n, sp + int64(i) * nb, xqp, xsp, n)
@@ -82,7 +82,7 @@ def private q8q8_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : flo
 def private q8q8_batch_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re) {
+    maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n
@@ -104,7 +104,7 @@ def private q8q8_group3_kernel_neon_sdot4x4(var y0p : float?; var y1p : float?; 
     var w2 = y2p
     // oversplit only under team dispatch: ×4 chunks cost the fifo path ~20% on this small mm
     // (measured 1B mm_qkv 86.6k → 108k us) but win ~19% when workers self-serve them
-    maybe_parallel_for(n * dtot >= g_matmul_par_threshold, 0, int(dtot), matmul_chunks_gemv(int(dtot), get_dispatch_lanes() * (get_jobque_team_mode() ? get_q8_batch_chunks_per_job() : 1))) $(rb, re) {
+    maybe_parallel_for(0, int(dtot), matmul_chunks_gemv(int(dtot), get_jobque_team_mode() ? get_q8_batch_chunks_per_job() : 1, n * dtot)) $(rb, re) {
         unsafe {
             for (gi in range(rb, re)) {
                 let g = int64(gi)
@@ -156,7 +156,7 @@ def mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), get_dispatch_lanes() * get_q8_batch_chunks_per_job())) $(rb, re) {
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), get_q8_batch_chunks_per_job(), n * d)) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     myp[i] = dot_mx4q8(lutp, wn + int64(i) * (n / 2l), we + int64(i) * nb, xqp, xsp, n)
@@ -174,7 +174,7 @@ def mx4q8_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp
 def private q8q8_groupn_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), get_dispatch_lanes() * get_q8_batch_chunks_per_job())) $(rb, re) {
+    maybe_parallel_for(0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), get_q8_batch_chunks_per_job(), n * d * nregions)) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let ii = int64(i)
@@ -199,7 +199,7 @@ def mx4q8_groupn_kernel_neon(var yp : float?; wn : uint8 const?; we : uint8 cons
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(n * d * nregions >= g_matmul_par_threshold, 0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), get_dispatch_lanes() * get_q8_batch_chunks_per_job())) $(rb, re) {
+        maybe_parallel_for(0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), get_q8_batch_chunks_per_job(), n * d * nregions)) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let ii = int64(i)

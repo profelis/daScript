@@ -6,13 +6,13 @@ require dastest/testing_boost public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; load_checkpoint resolves "llama" from the registry
 require daslib/jobque_boost
 require daslib/fio
-require dasllama/dasllama_math  // setup_dasllama_jobque_ + matmul_par_threshold + fused knob
+require dasllama/dasllama_math  // setup_dasllama_jobque_ + target_chunk_work + fused knob
 
 // Fused decode chains (team_parallel_stages: qkv→attn→wo and w1/w3→w2 as ONE dispatch each) vs
 // the per-op dispatch path: bit-exact equivalence. The fused path claims bit-identical arithmetic
 // — same backend row dots, same per-head norm/rope/store order, same act/quant/add per element —
 // so greedy ids AND final logits must match EXACTLY, not within tolerance. stories15M sits below
-// the fused size gate, so both sides run with matmul_par_threshold forced to 0 (identical
+// the fused size gate, so both sides run with target_chunk_work forced to 1 (identical
 // dispatch decisions per-op path included).
 
 def private llama2c_dir() : string {
@@ -64,10 +64,10 @@ def test_fused_decode_bit_exact(t : T?) {
         var tr <- load_checkpoint(MODEL_PATH)
         let c = tr.config
         quantize_weights(tr)  // fused chains are Q8-only
-        let prev_thresh = get_matmul_par_threshold()
+        let prev_thresh = get_target_chunk_work()
         with_job_que() {
             setup_dasllama_jobque_()   // team mode on — the fused gate requires it
-            set_matmul_par_threshold(0l)
+            set_target_chunk_work(1l)
             var ids_std : array<int64>
             var ids_fused : array<int64>
             var lg_std : array<float>
@@ -99,7 +99,7 @@ def test_fused_decode_bit_exact(t : T?) {
             delete lg_std
             delete lg_fused
         }
-        set_matmul_par_threshold(prev_thresh)
+        set_target_chunk_work(prev_thresh)
         delete tr
     }
 }
@@ -157,10 +157,10 @@ def test_fused_decode_attn_chain(t : T?) {
             return
         }
         let prev_backend = active_kernel_backend()
-        let prev_thresh = get_matmul_par_threshold()
+        let prev_thresh = get_target_chunk_work()
         with_job_que() {
             setup_dasllama_jobque_()
-            set_matmul_par_threshold(0l)
+            set_target_chunk_work(1l)
             if (kernel_backend_has_rows()) {   // auto backend pass (skipped where auto has no rows core)
                 var tr <- load_gguf(path, QuantMode.q8)
                 fused_vs_std_bit_exact(t, tr)
@@ -172,7 +172,7 @@ def test_fused_decode_attn_chain(t : T?) {
             delete tr2
             clear_kernel_backend_pin()
         }
-        set_matmul_par_threshold(prev_thresh)
+        set_target_chunk_work(prev_thresh)
         select_kernel_backend(prev_backend)
     }
 }

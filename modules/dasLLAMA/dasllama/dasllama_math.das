@@ -104,14 +104,6 @@ def template copy_floats_template(var d : float ?; s : float const ?; n : int64)
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def copy_floats(var d : float?; s : float const?; n : int64) {}
 
-// n*d above this -> split the output rows across worker threads. Below it, the per-call
-// job-dispatch overhead (~90us) dwarfs the gain, so stay single-thread. (Measured on M1 Max:
-// classifier 32000x288 = 9.2M threads to ~2x; ffn 768x288 = 0.22M would be ~5x slower.)
-// Runtime knob: the crossover tracks the box's job-dispatch latency and core count, not the kernel.
-var g_matmul_par_threshold = 2_000_000l
-def public set_matmul_par_threshold(v : int64) { g_matmul_par_threshold = max(v, 0l) }
-def public get_matmul_par_threshold() : int64 { return g_matmul_par_threshold }
-
 // Spin-before-park window for the jobque workers (see setup_dasllama_jobque). Runtime knob:
 // the useful window tracks the box's serial-gap lengths and burn tolerance, not the kernel.
 // 30ms covers the between-call gaps of a decode/prefill dispatch loop (with main-steal +
@@ -180,7 +172,15 @@ def public get_q8_batch_chunks_per_job() : int { return g_q8_batch_chunks_per_jo
 var g_dispatch_caller_lane = true
 def public set_dispatch_caller_lane(v : bool) { g_dispatch_caller_lane = v }
 def public get_dispatch_caller_lane() : bool { return g_dispatch_caller_lane }
-def public get_dispatch_lanes() : int { return get_total_hw_jobs() + (g_dispatch_caller_lane ? 1 : 0) }
+def public get_dispatch_lanes() : int {
+    // Que-less process: the calling thread is the only lane, so every shaper answers "inline".
+    // (The work-proportional shapers evaluate eagerly at the dispatch sites — the old bool-gated
+    // form only read this in its parallel arm, so que-less small-matmul callers never noticed.)
+    if (!is_job_que_available()) {
+        return 1
+    }
+    return get_total_hw_jobs() + (g_dispatch_caller_lane ? 1 : 0)
+}
 
 // Min grain for matmul row splits (ggml-cpu.c mul_mat chunk_size = 16): without it a fixed
 // lanes×oversplit chunk count shatters a small matmul into sub-grain work items on many-core
@@ -198,20 +198,57 @@ def private assert_wave_aligned(chunks, lanes : int) {
     assert(chunks <= lanes || chunks % lanes == 0, "matmul dispatch chunk count must be a whole number of dispatch-lane waves")
 }
 
-//! Chunk count for a matmul row split, rounded DOWN to a whole number of lane-waves so every wave
-//! is fully populated — no ragged final wave whose stragglers the join waits on. `want`
-//! (lanes × oversplit) is the wave ceiling; the min-grain caps the wave count for small matmuls, and
-//! a matmul too small for even one full wave stays at its grain count (a partial wave beats shredding
-//! it sub-grain). `rows` is the TOTAL row count of the split range — group-indexed ranges pass groups * 4.
-def public matmul_chunks(rows, want : int) : int {
+// ===== work-proportional dispatch (lanes sized to the matmul, not the box) =====
+
+// MACs of work that justify one dispatch chunk: lanes_for_work invites one lane per this much
+// work, so a tiny matmul stays inline (1 lane ⇔ work < 2×target — at the 1M default this is
+// exactly the old 2M binary par-threshold boundary) and a mid-size one invites only the lanes
+// it can feed. Runtime knob: tracks the box's per-chunk dispatch overhead (team_probe measures
+// it), not the kernel.
+var g_target_chunk_work = 1_000_000l
+def public set_target_chunk_work(v : int64) { g_target_chunk_work = max(v, 1l) }
+def public get_target_chunk_work() : int64 { return g_target_chunk_work }
+
+// Per-regime lane caps (0 = uncapped). GEMV rides memory bandwidth — past the box's DRAM knee
+// extra lanes just queue at the memory door (team_probe's streaming ladder finds the knee).
+// Batch (GEMM) is compute-bound and caps at the overhead knee instead.
+var g_gemv_lane_cap = 0
+def public set_gemv_lane_cap(v : int) { g_gemv_lane_cap = max(v, 0) }
+def public get_gemv_lane_cap() : int { return g_gemv_lane_cap }
+
+var g_batch_lane_cap = 0
+def public set_batch_lane_cap(v : int) { g_batch_lane_cap = max(v, 0) }
+def public get_batch_lane_cap() : int { return g_batch_lane_cap }
+
+//! Dispatch lanes proportional to work: clamp(work / target_chunk_work, 1,
+//! min(get_dispatch_lanes(), lane_cap)). 1 means "not worth a dispatch" — the matmul_chunks
+//! shapers return 1 and the num_jobs form of maybe_parallel_for runs inline. lane_cap 0 = uncapped.
+def public lanes_for_work(work : int64; lane_cap : int) : int {
+    let lanes = max(get_dispatch_lanes(), 1)
+    let cap = lane_cap > 0 ? min(lanes, lane_cap) : lanes
+    return int(clamp(work / g_target_chunk_work, 1l, int64(cap)))
+}
+
+//! Work-aware chunk count for a batch (GEMM) row split: L = lanes_for_work(work, batch cap);
+//! 1 ⇒ inline (returns 1); else chunks rounded DOWN to a whole number of L-waves so every wave
+//! is fully populated — no ragged final wave whose stragglers the join waits on. `oversplit`
+//! waves are wanted (awake workers pop a straggler's leftovers); the min-grain caps the wave
+//! count for small matmuls, and a matmul too small for even one full wave stays at its grain
+//! count (a partial wave beats shredding it sub-grain). `rows` is the TOTAL row count of the
+//! split range — group-indexed ranges pass groups * mr; `work` is the matmul's MAC count.
+def public matmul_chunks(rows : int; oversplit : int; work : int64) : int {
+    let L = lanes_for_work(work, g_batch_lane_cap)
+    if (L <= 1) {
+        return 1
+    }
+    let want = L * max(oversplit, 1)
     if (g_matmul_min_chunk_rows <= 0) {
         return want
     }
-    let lanes = max(get_dispatch_lanes(), 1)
-    let cap = clamp(rows / g_matmul_min_chunk_rows, 1, want)   // grain-limited ceiling (<= want = lanes × oversplit)
-    let waves = max(cap / lanes, 1)                            // whole lane-waves within the cap
-    let chunks = min(waves * lanes, cap)                       // full waves; never exceed the grain cap
-    assert_wave_aligned(chunks, lanes)
+    let cap = clamp(rows / g_matmul_min_chunk_rows, 1, want)   // grain-limited ceiling (<= want = L × oversplit)
+    let waves = max(cap / L, 1)                                // whole L-waves within the cap
+    let chunks = min(waves * L, cap)                           // full waves; never exceed the grain cap
+    assert_wave_aligned(chunks, L)
     return chunks
 }
 
@@ -230,18 +267,23 @@ var g_gemv_wave_fill = true
 def public set_gemv_wave_fill(v : bool) { g_gemv_wave_fill = v }
 def public get_gemv_wave_fill() : bool { return g_gemv_wave_fill }
 
-//! matmul_chunks for the GEMV-shaped dispatches (single-token mm / group3 / groupn): the coarser
-//! GEMV grain, capped at ONE chunk per lane (ggml's mul_mat decode fallback — equal split, no
-//! oversplit). A decode chunk is one bandwidth stream; oversplit only quantizes the tail (EPYC
-//! T=24 anatomy: last lane's +1 chunk = 37% of op wall). `rows` is the TOTAL split row count.
-def public matmul_chunks_gemv(rows, want : int) : int {
-    if (g_matmul_min_chunk_rows_gemv <= 0) {
-        return want
+//! matmul_chunks for the GEMV-shaped dispatches (single-token mm / group3 / groupn): L =
+//! lanes_for_work(work, gemv cap); 1 ⇒ inline (returns 1); else the coarser GEMV grain, capped
+//! at ONE chunk per work-lane (ggml's mul_mat decode fallback — equal split; a decode chunk is
+//! one bandwidth stream, oversplit only quantizes the tail — EPYC T=24 anatomy: last lane's +1
+//! chunk = 37% of op wall, so `oversplit` matters only via the grain-off escape hatch).
+//! `rows` is the TOTAL split row count; `work` is the matmul's MAC count.
+def public matmul_chunks_gemv(rows : int; oversplit : int; work : int64) : int {
+    let L = lanes_for_work(work, g_gemv_lane_cap)
+    if (L <= 1) {
+        return 1
     }
-    let lanes = min(want, get_dispatch_lanes())
-    let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, lanes)
-    let chunks = (g_gemv_wave_fill && n < lanes && 2 * n >= lanes) ? lanes : n
-    assert_wave_aligned(chunks, get_dispatch_lanes())
+    if (g_matmul_min_chunk_rows_gemv <= 0) {
+        return L * max(oversplit, 1)
+    }
+    let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, L)
+    let chunks = (g_gemv_wave_fill && n < L && 2 * n >= L) ? L : n
+    assert_wave_aligned(chunks, L)
     return chunks
 }
 
@@ -255,7 +297,7 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
         var yp = addr(y[0])                              // var: stays a writable pointer when captured
         let wp = reinterpret<float const?>(addr(w[0]))   // strip the `#` if w is a view
         let xp = addr(x[0])
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), get_dispatch_lanes())) $(rb, re) {
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot(wp + int64(i) * n, xp, n)
@@ -274,7 +316,7 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
         var yp = addr(y[0])
         let wp = reinterpret<float const?>(addr(w[0]))
         let xp = reinterpret<float const?>(addr(x[0]))
-        maybe_parallel_for(n * d * ntok >= g_matmul_par_threshold, 0, int(d), matmul_chunks(int(d), get_dispatch_lanes())) $(rb, re) {
+        maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wp + int64(i) * n
@@ -414,7 +456,7 @@ def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #;
         let sp = reinterpret<float const?>(addr(ws[0]))
         let xp = addr(x[0])
         // default 2 chunks per hw job (knob): Q8 dequant-in-dot is compute-bound and threads better than fp32
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), g_q8_chunks_per_job * get_dispatch_lanes())) $(rb, re) {
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q8_chunks_per_job, n * d)) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q8(wp + int64(i) * n, sp + int64(i) * nb, xp, n)
@@ -439,7 +481,7 @@ def public get_q8_token_block() : int64 { return g_q8_token_block }
 // A token-blocked Q8·Q8 GEMM keeps a TB×n activation slice L2-resident and reuses it across the weight
 // groups; if TB×n exceeds L2 the slice spills and prefill falls off a cliff (measured M1 Max, ntok=2048:
 // n=8192 breaks ~TB 1024, n=14336 ~512 — i.e. the knee is TB ≈ L2/n). So TB is clamped to keep TB×n
-// within a per-box budget. `effective_token_block` is pure L2 arithmetic — the arm64 laneq kernel calls
+// within a per-box budget. `effective_token_block` is pure L2 arithmetic — the gen batch kernel calls
 // it and a future x64 token-blocked kernel reuses it unchanged. Default 4 MB is PROVISIONAL (one box,
 // M1 Max); it is inert at the default TB=128 for every realistic n (4MB/n >> 128), so this changes
 // nothing today — it only caps a raised TB or a very-large-n kernel below the cliff.
@@ -1049,7 +1091,7 @@ def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #
         let xp = addr(x[0])
         // default 4 chunks per hw job (knob): the heavy nibble unpack makes each row compute-bound, so finer
         // splitting balances better (esp. the classifier) — more than the compute-light Q8 path.
-        maybe_parallel_for(n * d >= g_matmul_par_threshold, 0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job * get_dispatch_lanes())) $(rb, re) {
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job, n * d)) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)
