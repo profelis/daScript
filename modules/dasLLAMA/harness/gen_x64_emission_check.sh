@@ -15,7 +15,7 @@ TOOLS=${LLVM_TOOLS:-/opt/homebrew/opt/llvm/bin}
 LLC=${LLC:-$TOOLS/llc}
 OBJDUMP=${LLVM_OBJDUMP:-$TOOLS/llvm-objdump}
 OUT=${1:-/tmp/gen_x64_emission}
-FEATURES=avx2,avxvnni,avx512f,avx512bw,avx512vl,avx512vnni,avxvnniint8
+FEATURES=avx2,avxvnni,avx512f,avx512bw,avx512vl,avx512vnni,avxvnniint8,amx-tile,amx-int8
 mkdir -p "$OUT"
 
 echo "== cross compile-only dump (DAS_JIT_X64_FORCE_FEATURES=$FEATURES) =="
@@ -99,6 +99,45 @@ gate "mx4 busd256 dot" "mx4q8_gemv_gen__dot_vpdpbusd_width256_mr8_kstep2 " vpdpb
 gate "mx4 bssd256 lut" "mx4q8_gemv_gen__dot_vpdpbssd_width256_mr8_kstep2 " vpshufb 8
 gate "mx4 bssd256 dot" "mx4q8_gemv_gen__dot_vpdpbssd_width256_mr8_kstep2 " vpdpbssd 8
 gate "mx4 bssd256 no-abs" "mx4q8_gemv_gen__dot_vpdpbssd_width256_mr8_kstep2 " vpabsb 0
+
+# amx tiles (slice I): the 2×2 TMUL macro per k-block = 2 B + 2 A tileloadd, 4 tilezero +
+# tdpbssd + tilestored, 4×16 cvt fold rows; s8·s8 native so ZERO sign-trick ops anywhere;
+# ldtilecfg is inserted by the backend's fast tile config (presence-gated below)
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit2
+gate "amx 2x2 tile dots" "$A " tdpbssd 4
+gate "amx 2x2 tile loads" "$A " tileloadd 4
+gate "amx 2x2 tile zero" "$A " tilezero 4
+gate "amx 2x2 tile spill" "$A " tilestored 4
+gate "amx 2x2 tile fold" "$A " vcvtdq2ps 64
+gate "amx 2x2 tile no-sign" "$A " vpsignb 0
+gate "amx 2x2 tile no-abs" "$A " vpabsb 0
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit1
+gate "amx 1x1 tile dots" "$A " tdpbssd 1
+gate "amx 1x1 tile loads" "$A " tileloadd 2
+gate "amx 1x1 tile fold" "$A " vcvtdq2ps 16
+# the vector companions under the amx stamp = the plain sign-trick busd512 lattice over the
+# same unbiased plane (design fork (a)): gemv gkstep2 = 3 block instances x 8 kg = 24 dots +
+# 24 |w|, select-based sign at 512 (no VPSIGNB); mx4 = 8 pshufb lookups + 8 dots; no tile ops
+G=q8q8_gemv_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2_gkstep2
+gate "amx gemv gk2 dots" "$G " vpdpbusd 24
+gate "amx gemv gk2 abs" "$G " vpabsb 24
+gate "amx gemv no-psign" "$G " vpsignb 0
+gate "amx gemv no-tile" "$G " tdpbssd 0
+M=mx4q8_gemv_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2
+gate "amx mx4 lut" "$M " vpshufb 8
+gate "amx mx4 dots" "$M " vpdpbusd 8
+gate "amx mx4 no-tile" "$M " tdpbssd 0
+# the amx witness IS the runtime enable: syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM,
+# XFEATURE_XTILEDATA) == 0 as a JIT-resolved libc call. Zero-arg witnesses carry no
+# mangled-signature suffix, so the symbol anchor is '>' (not the trailing space).
+W='q8q8_family_live__dot_amx_int8_width512_mr16_kstep1_nrsplit2>'
+gate "amx witness enable" "$W" callq 1
+
+# ldtilecfg presence in the amx tile (fast tile config runs at codegen)
+tc=$(awk -v pat="q8q8_tile_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2 " '
+    /^[0-9a-f]+ </ { infn = index($0, pat) > 0; next }
+    infn && /ldtilecfg/ { n++ } END { print n + 0 }' "$OUT/disasm.txt")
+if [[ $tc -gt 0 ]]; then echo "OK   amx 2x2 tile configures tiles ($tc ldtilecfg)"; else echo "FAIL amx 2x2 tile: no ldtilecfg"; fails=$((fails+1)); fi
 
 # zmm presence (register-width sanity for the 512 rows)
 z=$(awk -v pat="q8q8_tile_gen__dot_vpdpbusd_width512_mr16_kstep2 " '

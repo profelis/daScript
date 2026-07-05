@@ -1935,6 +1935,7 @@ namespace das
         const uint64_t xcr0 = osxsave ? das_xgetbv0() : 0;
         const bool os_ymm = (xcr0 & 0x6) == 0x6;                // OS saves xmm+ymm state
         const bool os_zmm = (xcr0 & 0xE6) == 0xE6;              // + opmask/zmm state
+        const bool os_amx = (xcr0 & 0x60000) == 0x60000;        // + XTILECFG/XTILEDATA state
         if ( strcmp(feature, "sse4.2")==0 )     return (r1[2] & (1<<20)) != 0;
         if ( strcmp(feature, "fma")==0 )        return os_ymm && (r1[2] & (1<<12)) != 0;
         if ( strcmp(feature, "f16c")==0 )       return os_ymm && (r1[2] & (1<<29)) != 0;
@@ -1946,6 +1947,12 @@ namespace das
         if ( strcmp(feature, "avx512bw")==0 )   return os_zmm && (r7[1] & (1<<30)) != 0;
         if ( strcmp(feature, "avx512vl")==0 )   return os_zmm && (r7[1] & (1u<<31)) != 0;
         if ( strcmp(feature, "avx512vnni")==0 ) return os_zmm && (r7[2] & (1<<11)) != 0;
+        // AMX names use the LLVM hyphen spelling so cpuid names == target-feature names
+        // (DAS_JIT_X64_FORCE_FEATURES / llc -mattr pass them through verbatim). XCR0 tile
+        // bits are kernel-boot truth; the per-process XTILEDATA grant (Linux arch_prctl)
+        // is a separate, runtime step — the dasLLAMA amx witness does it, not this query.
+        if ( strcmp(feature, "amx-tile")==0 )   return os_amx && (r7[3] & (1<<24)) != 0;
+        if ( strcmp(feature, "amx-int8")==0 )   return os_amx && (r7[3] & (1<<24)) != 0 && (r7[3] & (1<<25)) != 0;
 #endif
         return false;
     }

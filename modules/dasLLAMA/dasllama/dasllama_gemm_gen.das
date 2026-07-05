@@ -30,7 +30,10 @@ require dasllama/dasllama_gemm_schema
 //           "maddubs" (x64 VPMADDUBSW+VPMADDWD sign-trick pair), "vpdpbusd" (x64 VNNI,
 //           sign trick, one dot op), "vpdpbssd" (x64 AVX-VNNI-INT8, native s8·s8),
 //           "smmla" (NEON i8mm 2×2 MMA, slice J — implies the kg8 plane; tile only, the
-//           gemv/mx4 companions ride the sdot lattice)
+//           gemv/mx4 companions ride the sdot lattice), "amx_int8" (x64 TMUL TDPBSSD
+//           macro-tile over the plain grp16/kg4 plane, slice I — tile only; nrsplit ≙
+//           tiles per macro side, kstep pinned 1; the gemv/mx4 companions ride the
+//           sign-trick busd512 lattice)
 //   width   vector width in bits: 128 (NEON, implied by sdot), 256 (ymm), 512 (zmm)
 //   bias    128 = bias128 (vpdpbusd only): the repack bakes w^0x80 into the grp<mr> plane,
 //           dots run plain vpdpbusd(acc, w_biased, x) — no abs/sign ops — and the exactness
@@ -40,7 +43,8 @@ require dasllama/dasllama_gemm_schema
 // perm_declines), so repacks and kernels fall back to the grp4 reference family together.
 // Runs in the llvm-jit context; wired via llvm_user_modules.das. The stubs it generates for
 // are dasllama/dasllama_math_gen.das::q8q8_tile_gen, ::q8q8_layout_gen, ::q8q8_wbias_gen,
-// ::q8q8_kgroup_gen, ::q8q8_gemv_gen, ::mx4q8_gemv_gen and ::q8q8_family_live (the witness).
+// ::q8q8_kgroup_gen, ::q8q8_tokstep_gen, ::q8q8_gemv_gen, ::mx4q8_gemv_gen and
+// ::q8q8_family_live (the witness).
 
 // dot-primitive kinds (TilePerm.dotPrim, parsed once into TileEmit.dotKind)
 let DOT_SDOT = 0
@@ -48,13 +52,25 @@ let DOT_MADDUBS = 1
 let DOT_VPDPBUSD = 2
 let DOT_VPDPBSSD = 3
 let DOT_SMMLA = 4
+let DOT_AMX = 5
 
 def private dot_kind(prim : string) : int {
     if (prim == "maddubs") return DOT_MADDUBS
     if (prim == "vpdpbusd") return DOT_VPDPBUSD
     if (prim == "vpdpbssd") return DOT_VPDPBSSD
     if (prim == "smmla") return DOT_SMMLA
+    if (prim == "amx_int8") return DOT_AMX
     return DOT_SDOT
+}
+
+// under an amx stamp the VECTOR companions (gemv/mx4 — the tile is the only TMUL slot) ride
+// the plain sign-trick busd lattice over the same unbiased grp16/kg4 plane — design fork (a),
+// gemm_generator_plan.md slice I. Everything downstream then treats the perm exactly like the
+// matching vpdpbusd row.
+def private companion_perm(p : TilePerm) : TilePerm {
+    var cp = p
+    if (cp.dotPrim == "amx_int8") { cp.dotPrim = "vpdpbusd" }
+    return cp
 }
 
 // the perm's plane kgroup (k-bytes per row per interleave group): smmla reads row-pair × 8-k
@@ -99,6 +115,37 @@ def private parse_perm(gc : LlvmCodeCtx) : TilePerm {
 // (cpuid on host targets, DAS_JIT_X64_FORCE_FEATURES-only on cross triples — the emission
 // rail), row/vector geometry, vreg budget, dot machinery availability (belt).
 def private perm_declines(var gc : LlvmCodeCtx; p : TilePerm) : bool {
+    if (p.dotPrim == "amx_int8") {
+        // the TMUL leg (slice I): batch tile = 2×2 TDPBSSD macro over the grp16/kg4 plane
+        // (byte-for-byte the TDPBSSD B-tile layout — zero new repack). kstep pinned 1 (Q8's
+        // per-block scale boundary — i32 cannot accumulate across blocks); nrsplit ≙ tiles
+        // per macro side (1 = the probe shape, 2 = the 8-tmm production macro); s8·s8 native
+        // so the plane stays UNBIASED (the vector companions ride the sign-trick busd512
+        // lattice over it — companion_perm); the runtime enable is Linux arch_prctl, so a
+        // non-linux target declines the whole family.
+        if ((p.kstep != 1)
+            || (p.nrsplit != 1 && p.nrsplit != 2)
+            || (p.gkstep != 1 && p.gkstep != 2 && p.gkstep != 4)
+            || (p.mr != 16) || (p.width != 512) || (p.bias != 0)
+            || (!g_target_is_x64) || (!g_target_x64_amx)
+            || (!g_target_x64_avx512vnni)     // the companions' busd512 lattice + zmm fold
+            || (!g_target_os_linux)) return true
+        let rt = q8q8_repack_type(p.mr, p.bias, kgroup_of(p))
+        if (rt.interleave != p.mr || !rt.f32_scales) return true
+        // tile + companion machinery availability (belt — shared, so the family stays lockstep)
+        let mod = LLVMGetGlobalParent(gc.impl)
+        var noTypes : array<LLVMOpaqueType?>
+        for (nm in fixed_array("llvm.x86.tileloadd64.internal", "llvm.x86.tdpbssd.internal",
+                               "llvm.x86.tilestored64.internal", "llvm.x86.tilezero.internal",
+                               "llvm.x86.avx512.vpdpbusd.512", "llvm.x86.avx512.pshuf.b.512")) {
+            let id = LLVMLookupIntrinsicID(nm)
+            if (LLVMGetIntrinsicDeclaration(mod, id, noTypes) == null) return true
+        }
+        var v64i8 = LLVMVectorType(gc.jit.types.t_int8, 64u)
+        let absId = LLVMLookupIntrinsicID("llvm.abs")
+        var absTypes <- [v64i8]
+        return LLVMGetIntrinsicDeclaration(mod, absId, absTypes) == null
+    }
     // bias128 is a vpdpbusd-only knob: u8 = w+128 feeds the dot's unsigned side exactly;
     // maddubs saturates word pair-sums at biased magnitudes, bssd/sdot are native s8·s8
     if ((p.kstep != 1 && p.kstep != 2 && p.kstep != 4)
@@ -209,6 +256,15 @@ struct private TileEmit {
     xbs : LLVMOpaqueValue? [4]           // per-token bsum bases (−128·Σx i32 per block) — the tile's
                                          // bias128 correction plane; null = compute inline (gemv)
     mx4 : bool                           // block emitter: mx4 LUT-dequant instead of Q8 loads
+    t_amx : LLVMOpaqueType?              // x86_amx — virtual tile values (the TMUL tile, slice I)
+    tload_decl : LLVMOpaqueValue?        // llvm.x86.tileloadd64.internal
+    tload_ty : LLVMOpaqueType?
+    tdp_decl : LLVMOpaqueValue?          // llvm.x86.tdpbssd.internal
+    tdp_ty : LLVMOpaqueType?
+    tstore_decl : LLVMOpaqueValue?       // llvm.x86.tilestored64.internal
+    tstore_ty : LLVMOpaqueType?
+    tzero_decl : LLVMOpaqueValue?        // llvm.x86.tilezero.internal
+    tzero_ty : LLVMOpaqueType?
     tbl_decl : LLVMOpaqueValue?          // llvm.aarch64.neon.tbl1 (NEON mx4)
     tbl_ty : LLVMOpaqueType?
     pshuf_decl : LLVMOpaqueValue?        // llvm.x86.avx2.pshuf.b / avx512.pshuf.b.512 (x64 mx4)
@@ -908,12 +964,178 @@ def private setup_tile_emit(var te : TileEmit; var gc : LlvmCodeCtx; p : TilePer
     return true
 }
 
+// AMX machinery for the TMUL tile: virtual-tile x86_amx values through the .internal
+// intrinsics (non-overloaded) — LLVM's x86 codegen-prep (lower-amx-type + fast tile config)
+// materializes tmm allocation and ldtilecfg itself under +amx-tile,+amx-int8. The fold runs
+// on plain zmm vectors (rv = 16), so splat_f32 and the store shapes are the busd512 tile's.
+def private setup_amx_emit(var te : TileEmit; var gc : LlvmCodeCtx) : bool {
+    te.builder = gc.jit.builder
+    te.types = gc.jit.types
+    te.dotKind = DOT_AMX
+    te.interleave = 16
+    te.rv = 16
+    te.vni32 = LLVMVectorType(te.types.t_int32, 16u)
+    te.vnf32 = LLVMVectorType(te.types.t_float, 16u)
+    te.t_amx = LLVMX86AMXTypeInContext(gc.jit.ctx)
+    if (te.t_amx == null) return false
+    let mod = LLVMGetGlobalParent(gc.impl)
+    var noTypes : array<LLVMOpaqueType?>
+    te.tload_decl = LLVMGetIntrinsicDeclaration(mod, LLVMLookupIntrinsicID("llvm.x86.tileloadd64.internal"), noTypes)
+    te.tdp_decl = LLVMGetIntrinsicDeclaration(mod, LLVMLookupIntrinsicID("llvm.x86.tdpbssd.internal"), noTypes)
+    te.tstore_decl = LLVMGetIntrinsicDeclaration(mod, LLVMLookupIntrinsicID("llvm.x86.tilestored64.internal"), noTypes)
+    te.tzero_decl = LLVMGetIntrinsicDeclaration(mod, LLVMLookupIntrinsicID("llvm.x86.tilezero.internal"), noTypes)
+    if (te.tload_decl == null || te.tdp_decl == null || te.tstore_decl == null || te.tzero_decl == null) {
+        return false      // belt — perm_declines already gated the same decls
+    }
+    var ptrTy = te.types->LLVMVoidPtrType()
+    var loadArgs <- [te.types.t_int16, te.types.t_int16, ptrTy, te.types.t_int64]
+    te.tload_ty = LLVMFunctionType(te.t_amx, loadArgs)
+    var dpArgs <- [te.types.t_int16, te.types.t_int16, te.types.t_int16, te.t_amx, te.t_amx, te.t_amx]
+    te.tdp_ty = LLVMFunctionType(te.t_amx, dpArgs)
+    var storeArgs <- [te.types.t_int16, te.types.t_int16, ptrTy, te.types.t_int64, te.t_amx]
+    te.tstore_ty = LLVMFunctionType(te.types.t_void, storeArgs)
+    var zeroArgs <- [te.types.t_int16, te.types.t_int16]
+    te.tzero_ty = LLVMFunctionType(te.t_amx, zeroArgs)
+    return true
+}
+
+// The TMUL batch tile (slice I): one call covers 16·nt tokens × nt grp16 row-groups (nt =
+// nrsplit; groups g..g+nt-1, plane offset +16·n each — the batch wrapper walks nt-group units
+// and 16·nt-token steps off the tokstep companion). Per 32-k block: nt B tile loads straight
+// off the grp16 plane (a block's 8 dword-groups ARE the 8×64 TDPBSSD B tile — zero new
+// repack), nt A tile loads straight off the activation rows (stride n), then nt² tilezero →
+// TDPBSSD → tilestored-to-scratch, and the per-block scale fold f32-accumulates INTO yp
+// (per C-tile token row: cvt(v16i32) · ws_vec[block] · splat(xs) — the vector tile's fold
+// order, so the one grp4 oracle serves). yp IS the k-loop accumulator (registers cannot hold
+// 32×32 f32 across blocks): the tile zero-inits its own y region first, which also makes the
+// wrapper's overlapped token-tail recompute idempotent. kstep is pinned 1 — Q8's per-block
+// scale boundary (i32 cannot accumulate across blocks).
+def private emit_amx_tile(var gc : LlvmCodeCtx; p : TilePerm) : bool {
+    var te = TileEmit()
+    if (!setup_amx_emit(te, gc)) return false
+    let b = gc.jit.builder
+    let nt = p.nrsplit
+    var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
+    var head = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "head")
+    var body = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "body")
+    var after = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "after")
+
+    LLVMPositionBuilderAtEnd(b, entry)
+    var yp = LLVMGetParam(gc.impl, 0u)
+    var wg = LLVMGetParam(gc.impl, 1u)
+    var sg = LLVMGetParam(gc.impl, 2u)
+    var xqp = LLVMGetParam(gc.impl, 3u)
+    var xsp = LLVMGetParam(gc.impl, 4u)
+    var n = LLVMGetParam(gc.impl, 6u)
+    var d = LLVMGetParam(gc.impl, 7u)
+    var g = LLVMGetParam(gc.impl, 8u)
+    var t0 = LLVMGetParam(gc.impl, 9u)
+    var nb = LLVMBuildSDiv(b, n, te.types->ConstI64(32ul), "nb")
+    var col = LLVMBuildMul(b, g, te.types->ConstI64(16ul), "col")
+    // C spill: one 16×64 tile region, reused per (token tile, row group) fold
+    var scratch = LLVMBuildArrayAlloca(b, te.types.t_int8, te.types->ConstI64(1024ul), "cspill")
+    LLVMSetAlignment(scratch, 64u)
+    var n16 = LLVMBuildMul(b, n, te.types->ConstI64(16ul), "n16")
+    var nb16 = LLVMBuildMul(b, nb, te.types->ConstI64(16ul), "nb16")
+    var wplane : LLVMOpaqueValue? [2]     // adjacent row-group planes (+16·n each)
+    var sgoff : LLVMOpaqueValue? [2]      // their scale-region offsets (+16·nb floats)
+    var xbase : LLVMOpaqueValue? [2]      // A tile activation bases (rows t0 + ts·16 ..)
+    for (r in range(nt)) {
+        wplane[r] = r == 0 ? wg : LLVMBuildGEP2(b, te.types.t_int8, wg, n16, "wplane{r}")
+        sgoff[r] = r == 0 ? LLVMConstNull(te.types.t_int64) : nb16
+    }
+    for (ts in range(nt)) {
+        var trow = ts == 0 ? t0 : LLVMBuildAdd(b, t0, te.types->ConstI64(uint64(ts * 16)), "")
+        xbase[ts] = LLVMBuildGEP2(b, te.types.t_int8, xqp, LLVMBuildMul(b, trow, n, ""), "xbase{ts}")
+    }
+    // y row pointers + zero init, and the fold's xs row bases
+    var yptr : LLVMOpaqueValue? [64]      // [t * nt + r]
+    var xsrow : LLVMOpaqueValue? [32]
+    for (t in range(16 * nt)) {
+        var trow = LLVMBuildAdd(b, t0, te.types->ConstI64(uint64(t)), "")
+        var yoffBase = LLVMBuildAdd(b, LLVMBuildMul(b, trow, d, ""), col, "")
+        for (r in range(nt)) {
+            var yoff = r == 0 ? yoffBase : LLVMBuildAdd(b, yoffBase, te.types->ConstI64(uint64(r * 16)), "")
+            yptr[t * nt + r] = LLVMBuildGEP2(b, te.types.t_float, yp, yoff, "y{t}_{r}")
+            LLVMBuildStoreAligned(b, LLVMConstNull(te.vnf32), yptr[t * nt + r], 4u)
+        }
+        xsrow[t] = LLVMBuildGEP2(b, te.types.t_float, xsp, LLVMBuildMul(b, trow, nb, ""), "xs{t}")
+    }
+    LLVMBuildBr(b, head)
+
+    LLVMPositionBuilderAtEnd(b, head)
+    var biPhi = LLVMBuildPhi(b, te.types.t_int64, "bi")
+    var entryVals <- [LLVMConstNull(te.types.t_int64)]
+    var entryBlocks <- [entry]
+    LLVMAddIncoming(biPhi, entryVals, entryBlocks)
+    var more = LLVMBuildICmp(b, LLVMIntPredicate.LLVMIntSLT, biPhi, nb, "more")
+    LLVMBuildCondBr(b, more, body, after)
+
+    LLVMPositionBuilderAtEnd(b, body)
+    var c8 = te.types->ConstI16(int16(8))
+    var c16 = te.types->ConstI16(int16(16))
+    var c32 = te.types->ConstI16(int16(32))
+    var c64 = te.types->ConstI16(int16(64))
+    // B tiles: block bi is a contiguous 512-byte region per group plane (8 k-groups × 16×4)
+    var wboff = LLVMBuildMul(b, biPhi, te.types->ConstI64(512ul), "wboff")
+    var Bs : LLVMOpaqueValue? [2]
+    for (r in range(nt)) {
+        var wp2 = LLVMBuildGEP2(b, te.types.t_int8, wplane[r], wboff, "wb{r}")
+        var largs <- [c8, c64, wp2, te.types->ConstI64(64ul)]
+        Bs[r] = LLVMBuildCall2(b, te.tload_ty, te.tload_decl, largs, "bt{r}")
+    }
+    var xoff = LLVMBuildMul(b, biPhi, te.types->ConstI64(32ul), "xoff")
+    var As : LLVMOpaqueValue? [2]
+    for (ts in range(nt)) {
+        var xp2 = LLVMBuildGEP2(b, te.types.t_int8, xbase[ts], xoff, "xa{ts}")
+        var largs <- [c16, c32, xp2, n]
+        As[ts] = LLVMBuildCall2(b, te.tload_ty, te.tload_decl, largs, "at{ts}")
+    }
+    var bi16 = LLVMBuildMul(b, biPhi, te.types->ConstI64(16ul), "bi16")
+    for (r in range(nt)) {
+        // ws_vec: the block's 16 f32 group scales, mr-contiguous in the grp plane — one zmm
+        var sidx = r == 0 ? bi16 : LLVMBuildAdd(b, bi16, sgoff[r], "")
+        var swp = LLVMBuildGEP2(b, te.types.t_float, sg, sidx, "sw{r}")
+        var ws = LLVMBuildLoad2Aligned(b, te.vnf32, swp, 4u, "ws{r}")
+        for (ts in range(nt)) {
+            var zargs <- [c16, c64]
+            var cz = LLVMBuildCall2(b, te.tzero_ty, te.tzero_decl, zargs, "cz")
+            var dargs <- [c16, c64, c32, cz, As[ts], Bs[r]]
+            var cd = LLVMBuildCall2(b, te.tdp_ty, te.tdp_decl, dargs, "cd")
+            var sargs <- [c16, c64, scratch, te.types->ConstI64(64ul), cd]
+            LLVMBuildCall2(b, te.tstore_ty, te.tstore_decl, sargs, "")
+            for (t16 in range(16)) {
+                let t = ts * 16 + t16
+                var crp = t16 == 0 ? scratch : LLVMBuildGEP2(b, te.types.t_int8, scratch, te.types->ConstI64(uint64(t16 * 64)), "")
+                var crow = LLVMBuildLoad2Aligned(b, te.vni32, crp, 64u, "c{t}_{r}")
+                var cf = LLVMBuildSIToFP(b, crow, te.vnf32, "cf{t}_{r}")
+                var qp = LLVMBuildGEP2(b, te.types.t_float, xsrow[t], biPhi, "qp{t}")
+                var q = LLVMBuildLoad2Aligned(b, te.types.t_float, qp, 4u, "q{t}")
+                var m = LLVMBuildFMul(b, cf, ws, "")
+                m = LLVMBuildFMul(b, m, splat_f32(te, q, "qs{t}"), "")
+                var yv = LLVMBuildLoad2Aligned(b, te.vnf32, yptr[t * nt + r], 4u, "")
+                LLVMBuildStoreAligned(b, LLVMBuildFAdd(b, yv, m, "f{t}_{r}"), yptr[t * nt + r], 4u)
+            }
+        }
+    }
+    var biNext = LLVMBuildAdd(b, biPhi, te.types->ConstI64(1ul), "binext")
+    LLVMBuildBr(b, head)
+    var bodyVals <- [biNext]
+    var bodyBlocks <- [body]
+    LLVMAddIncoming(biPhi, bodyVals, bodyBlocks)
+
+    LLVMPositionBuilderAtEnd(b, after)
+    LLVMBuildRetVoid(b)
+    return true
+}
+
 def private tile_gen(var gc : LlvmCodeCtx) : bool {
     // decline on a foreign signature, and on every shared rail (perm_declines — the layout
     // companion declines in lockstep): the reference body compiles instead
     if (!is_tile_signature(gc.fn)) return false
     let p = parse_perm(gc)
     if (perm_declines(gc, p)) return false
+    if (dot_kind(p.dotPrim) == DOT_AMX) return emit_amx_tile(gc, p)
 
     var te = TileEmit()
     if (!setup_tile_emit(te, gc, p, false)) return false
@@ -1004,6 +1226,22 @@ def private kgroup_gen(var gc : LlvmCodeCtx) : bool {
     return true
 }
 
+// the tokstep eighth of the stamp (slice I): `() : int` returning the tokens one tile call
+// covers — 16·nrsplit for the amx perms (whose macro also spans tokstep/16 row-groups: amx
+// macros are square in tile units), 4 for every vector perm. The batch wrapper walks its
+// (token, group) space off it. Declines via the SAME perm_declines: a declined perm keeps
+// the 4-token reference contract.
+def private tokstep_gen(var gc : LlvmCodeCtx) : bool {
+    if (!is_layout_signature(gc.fn)) return false
+    let p = parse_perm(gc)
+    if (perm_declines(gc, p)) return false
+    var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
+    LLVMPositionBuilderAtEnd(gc.jit.builder, entry)
+    let ts = dot_kind(p.dotPrim) == DOT_AMX ? 16 * p.nrsplit : 4
+    LLVMBuildRet(gc.jit.builder, gc.jit.types->ConstI32(uint64(ts)))
+    return true
+}
+
 def private is_witness_signature(fn : Function const?) : bool {
     return empty(fn.arguments) && fn.result.baseType == Type.tBool
 }
@@ -1020,8 +1258,28 @@ def private witness_gen(var gc : LlvmCodeCtx) : bool {
     let p = parse_perm(gc)
     if (perm_declines(gc, p)) return false
     var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
-    LLVMPositionBuilderAtEnd(gc.jit.builder, entry)
-    LLVMBuildRet(gc.jit.builder, LLVMConstInt(gc.jit.types.t_int1, 1ul, 0))
+    let b = gc.jit.builder
+    LLVMPositionBuilderAtEnd(b, entry)
+    if (dot_kind(p.dotPrim) == DOT_AMX) {
+        // TMUL executes only after the per-process XTILEDATA grant, so the enable IS the
+        // witness: syscall(SYS_arch_prctl=158, ARCH_REQ_XCOMP_PERM=0x1023, XFEATURE_XTILEDATA
+        // =18) == 0 via libc's syscall(2) as a JIT-resolved external symbol (glibc exports no
+        // arch_prctl wrapper). Linux-only by construction — perm_declines gated the target OS.
+        let mod = LLVMGetGlobalParent(gc.impl)
+        var scTy : LLVMOpaqueType?
+        var argTypes <- [gc.jit.types.t_int64, gc.jit.types.t_int64, gc.jit.types.t_int64]
+        scTy = LLVMFunctionType(gc.jit.types.t_int64, argTypes)
+        var sc = LLVMGetNamedFunction(mod, "syscall")
+        if (sc == null) {
+            sc = LLVMAddFunction(mod, "syscall", scTy)
+        }
+        var cargs <- [gc.jit.types->ConstI64(158ul), gc.jit.types->ConstI64(0x1023ul), gc.jit.types->ConstI64(18ul)]
+        var rc = LLVMBuildCall2(b, scTy, sc, cargs, "xtile")
+        var ok = LLVMBuildICmp(b, LLVMIntPredicate.LLVMIntEQ, rc, LLVMConstNull(gc.jit.types.t_int64), "ok")
+        LLVMBuildRet(b, ok)
+    } else {
+        LLVMBuildRet(b, LLVMConstInt(gc.jit.types.t_int1, 1ul, 0))
+    }
     return true
 }
 
@@ -1045,8 +1303,9 @@ def private is_gemv_signature(fn : Function const?) : bool {
 // laneq rows walk) falls back in lockstep with the grp4 reference pair.
 def private gemv_gen(var gc : LlvmCodeCtx) : bool {
     if (!is_gemv_signature(gc.fn)) return false
-    let p = parse_perm(gc)
-    if (perm_declines(gc, p)) return false
+    let p0 = parse_perm(gc)
+    if (perm_declines(gc, p0)) return false
+    let p = companion_perm(p0)
 
     var te = TileEmit()
     if (!setup_tile_emit(te, gc, p, false)) return false
@@ -1109,8 +1368,9 @@ def private gemv_gen(var gc : LlvmCodeCtx) : bool {
 // in-register e8m0 fold; the loop machinery, gkstep knob, and decline rails are shared.
 def private mx4_gemv_gen(var gc : LlvmCodeCtx) : bool {
     if (!is_gemv_signature(gc.fn)) return false
-    let p = parse_perm(gc)
-    if (perm_declines(gc, p)) return false
+    let p0 = parse_perm(gc)
+    if (perm_declines(gc, p0)) return false
+    let p = companion_perm(p0)
 
     var te = TileEmit(mx4 = true)
     if (!setup_tile_emit(te, gc, p, true)) return false
@@ -1173,6 +1433,7 @@ def public register_dasllama_gemm_generators {
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_layout", @@layout_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_wbias", @@wbias_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_kgroup", @@kgroup_gen)
+    register_llvm_code_generator("dasllama_gemm_gen::q8q8_tokstep", @@tokstep_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_gemv", @@gemv_gen)
     register_llvm_code_generator("dasllama_gemm_gen::mx4_gemv", @@mx4_gemv_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_witness", @@witness_gen)

@@ -1092,6 +1092,57 @@ Grid rows: amx 1×1 (probe shape) + 2×2, decline-by-design everywhere off-SPR; 
 tune sweep = the AMX respin session (prereq GGUFs now resolved, see above; chase target =
 lcpp-AMX 135M prefill 13.3k t/s cache-resident).
 
+### Slice I RESULTS (2026-07-05, emission M1 Max — silicon = the SPR respin session)
+
+**Shipped as designed, emission-proven.** `dot="amx_int8"` perms (width=512, mr=16, kstep
+pinned 1, bias=0, nrsplit ≙ tiles per macro side ∈ {1,2}): `emit_amx_tile` builds the TMUL
+macro exactly as specified — per 32-k block nt B `tileloadd` straight off the grp16 plane
+(bi·512, stride 64 — zero new repack held), nt A `tileloadd` off the activation rows
+(stride n), nt² `tilezero → tdpbssd → tilestored`-to-scratch, then the 16-row cvt·ws·splat(q)
+fold — with **yp as the k-loop accumulator** (registers can't hold 32×32 f32): the tile
+zero-inits its own y region, which doubles as the idempotence guarantee for the wrapper's
+overlapped token-tail call.
+
+**The call-contract decision the design left open:** the 10-param tile stub is kept, but an
+amx stamp covers 16·nrsplit tokens × nrsplit groups per call — so the stamp gained an
+**EIGHTH companion, `q8q8_tokstep_gen()` (reference 4; amx 16·nrsplit)**, and the batch
+wrapper walks (token, group) space off it: full-macro calls; token tail = ONE overlapped
+macro call at `t0 = tbe−ts` (idempotent per the zero-init); batches shorter than one macro
+and leftover row-groups (d 16-but-not-32-multiples) ride the vector rows-core per token
+(q8q8_gemv_gen — under an amx stamp that is the busd512 lattice, so no scalar-generic cliff);
+TB clamps up to one macro. Probes walk per-variant via the tokstep registry; tile fixtures
+grew to ntok=32 (one full 2×2 macro, divides every other row's step).
+
+**The plane-bias fork resolved as (a) for now:** amx stamps keep the plane UNBIASED and the
+vector companions (gemv/mx4) remap `amx_int8 → vpdpbusd` (`companion_perm`) — the plain
+sign-trick busd512 lattice over the same grp16/kg4 plane. The biased-vs-plain gemv delta on
+SPR (slice-H logs have both rows) stays the first measurement of the silicon session; if
+biased gemv matters, per-slot perms (option c) is the escalation.
+
+**Enable-as-witness:** the amx witness emits `syscall(SYS_arch_prctl=158, 0x1023, 18) == 0`
+(glibc exports no arch_prctl wrapper — libc `syscall(2)` as the JIT-resolved symbol);
+perm_declines gates `g_target_os_linux` (new llvm_jit_common flag: host platform / triple OS
+field) + new tier `g_target_x64_amx` (cpuid names `amx-tile`/`amx-int8` added to
+das_cpu_supports, hyphen-spelled = LLVM feature spelling so force-env and llc -mattr take the
+same names; XCR0 tile bits 17/18 gate them).
+
+**Gates (all green first run, except one symbol-anchor fix):** `gen_x64_emission_check.sh`
+48/48 — amx 2×2 tile = 4 tdpbssd / 4 tileloadd / 4 tilezero / 4 tilestored / 64 vcvtdq2ps /
+0 sign-trick ops; 1×1 = 1/2/16; **ldtilecfg hoisted to entry + tilerelease at exit (NOT
+per-block — the fast-tile-config placement question answered at llc level)**; gemv-under-amx
+= 24 dots/24 abs/0 psign/0 tile ops; mx4-under-amx = 8 pshufb/8 dots; witness = 1 callq
+(zero-arg witnesses carry no mangled-signature suffix — symbol anchor is '>'). All 29
+pre-amx gates unchanged-green (the vector emitters are IR-untouched); arm64 emission script
+unchanged-green; native test grid 44 rows green (amx rows stamp + decline to reference on
+M1); jit_tests 312/312.
+
+**Queued for the SPR respin session:** grid semantics on silicon (maxdiff vs the grp4
+oracle), the enable path (witness syscall on a real kernel), tune sweep (amx vs biased
+busd512 — chase lcpp-AMX 13.3k t/s 135M cache-resident prefill), the biased-vs-plain gemv
+fork measurement, batch-wrapper tail/overlap validation at real prompt lengths, and
+in-proc-JIT ldtilecfg placement confirmation (llc-level is entry/exit; same backend passes
+should hold).
+
 ## M4 slice J — the smmla leg (dot="smmla", i8mm; DESIGN 2026-07-05)
 
 **Slot scope: the batch tile.** SMMLA is a 2×2 MMA — `acc[i][j] += a_row_i · b_row_j` over 8

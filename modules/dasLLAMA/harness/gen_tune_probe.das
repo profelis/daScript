@@ -151,11 +151,26 @@ def variant_kgroups() : table<string; int> {
     return <- kgs
 }
 
-// one full tile sweep: every group x every 4-token block through `tile`, on the variant's
-// own repacked buffers (q/s), walking mr-row groups; the fixture's bsums plane rides along
-// (biased variants read it, everything else ignores the parameter)
-def run_tile(tile; fx : Fixture; q : array<int8>; s : array<float>; mr : int64; var y : array<float>) {
+// suffix -> tokens per tile call, off the tokstep companion's variants registry (same
+// lockstep; 16/32 on the amx rows, whose macro also spans ts/16 row-groups — the walk below
+// must match the stamped shape)
+def variant_toksteps() : table<string; int> {
+    var tss : table<string; int>
+    var tvs <- q8q8_tokstep_gen_variants()
+    for (v in tvs) {
+        tss[v._0] = invoke(v._1)
+    }
+    delete tvs
+    return <- tss
+}
+
+// one full tile sweep: every (ts-token, gs-group) unit through `tile`, on the variant's own
+// repacked buffers (q/s); the fixture's bsums plane rides along (biased variants read it,
+// everything else ignores the parameter). Fixtures divide evenly (ntok % ts == 0, groups %
+// gs == 0) — production tails are the batch wrapper's job, not the tile's.
+def run_tile(tile; fx : Fixture; q : array<int8>; s : array<float>; mr, ts, gs : int64; var y : array<float>) {
     let ng = fx.d / mr
+    verify(fx.ntok % ts == 0l && ng % gs == 0l)
     unsafe {
         let wp = addr(q[0])
         let sp = addr(s[0])
@@ -163,13 +178,14 @@ def run_tile(tile; fx : Fixture; q : array<int8>; s : array<float>; mr : int64; 
         let xsp = addr(fx.xs[0])
         let xbsp = addr(fx.xbs[0])
         var yp = addr(y[0])
-        for (g in range64(ng)) {
+        for (u in range64(ng / gs)) {
+            let g = u * gs
             let wgp = wp + g * mr * fx.n
             let sgp = sp + g * mr * fx.nb
             var t0 = 0l
             while (t0 < fx.ntok) {
                 invoke(tile, yp, wgp, sgp, xqp, xsp, xbsp, fx.n, fx.d, g, t0)
-                t0 += 4l
+                t0 += ts
             }
         }
     }
@@ -307,13 +323,15 @@ def close_to_ref(fx : Fixture; y : array<float>; var maxdiff : float&) : bool {
 
 def test_mode : bool {
     // nb=2 (even main loop), nb=3 (remainder path), production-ish slice — d divides every
-    // grid mr (4/8 on arm64, 16/32 on the x64 rows when live)
-    var fxs <- [ <- build_fixture(64l, 32l, 4l), <- build_fixture(96l, 32l, 4l), <- build_fixture(2048l, 64l, 8l)]
+    // grid mr (4/8 on arm64, 16/32 on the x64 rows when live); ntok=32 covers one full amx
+    // 2×2 macro (and divides the 4/16-token steps of every other row)
+    var fxs <- [ <- build_fixture(64l, 32l, 32l), <- build_fixture(96l, 32l, 32l), <- build_fixture(2048l, 64l, 32l)]
     var mfxs <- [ <- build_mx4_fixture(96l, 32l), <- build_mx4_fixture(2048l, 64l)]
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
     var wbs <- variant_wbias()
     var kgs <- variant_kgroups()
+    var tss <- variant_toksteps()
     var gtab <- gemv_variants_by_suffix()
     var mtab <- mx4_variants_by_suffix()
     var wtab <- witness_variants_by_suffix()
@@ -322,12 +340,14 @@ def test_mode : bool {
         let mr = int64(mrs?[v._0] ?? 4)
         let wbias = int64(wbs?[v._0] ?? 0)
         let kgv = int64(kgs?[v._0] ?? 4)
+        let tsv = int64(tss?[v._0] ?? 4)
+        let gsv = max(tsv / 16l, 1l)
         verify(gtab |> key_exists(v._0))
         verify(mtab |> key_exists(v._0))
         verify(wtab |> key_exists(v._0))
         // witness-lockstep invariants: the reference row is never "live", and a
-        // non-reference layout, a biased plane or a kg8 plane proves the family emitted —
-        // the witness must agree
+        // non-reference layout, a biased plane, a kg8 plane or a non-4 tokstep proves the
+        // family emitted — the witness must agree
         let live = invoke(wtab[v._0])
         if (v._0 == "reference") {
             verify(!live)
@@ -344,6 +364,10 @@ def test_mode : bool {
             print("  KGROUP DESYNC {v._0}: kgroup={kgv} but witness says not live\n")
             allok = false
         }
+        if (tsv != 4l && !live) {
+            print("  TOKSTEP DESYNC {v._0}: tokstep={tsv} but witness says not live\n")
+            allok = false
+        }
         var ok = true
         var gok = true
         var maxdiff = 0.0
@@ -356,7 +380,7 @@ def test_mode : bool {
             }
             var y : array<float>
             y |> resize(int(fx.ntok * fx.d))
-            run_tile(v._1, fx, qv, sv, mr, y)
+            run_tile(v._1, fx, qv, sv, mr, tsv, gsv, y)
             let fxok = close_to_ref(fx, y, maxdiff)
             if (!fxok) {
                 var shown = 0
@@ -423,6 +447,7 @@ def test_mode : bool {
     delete wtab
     delete mtab
     delete gtab
+    delete tss
     delete kgs
     delete wbs
     delete mrs
@@ -446,6 +471,7 @@ def tune_mode_run : bool {
     var mrs <- variant_mrs()
     var wbs <- variant_wbias()
     var kgs <- variant_kgroups()
+    var tss <- variant_toksteps()
     var gtab <- gemv_variants_by_suffix()
     let nv = length(vs)
     // per-variant repacked buffers, built once outside the timing loop
@@ -456,9 +482,15 @@ def tune_mode_run : bool {
     gbufs |> resize(nv)
     hbufs |> resize(nv)
     var vmr : array<int64>
+    var vts : array<int64>
+    var vgs : array<int64>
     vmr |> resize(nv)
+    vts |> resize(nv)
+    vgs |> resize(nv)
     for (vi in range(nv)) {
         vmr[vi] = int64(mrs?[vs[vi]._0] ?? 4)
+        vts[vi] = int64(tss?[vs[vi]._0] ?? 4)
+        vgs[vi] = max(vts[vi] / 16l, 1l)
         let wb = int64(wbs?[vs[vi]._0] ?? 0)
         let kgv = int64(kgs?[vs[vi]._0] ?? 4)
         verify(gtab |> key_exists(vs[vi]._0))
@@ -493,7 +525,7 @@ def tune_mode_run : bool {
     yh |> resize(int(hfx.d))
     // correctness first — a tune run must never crown a broken variant
     for (vi in range(nv)) {
-        run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], y)
+        run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
         var maxdiff = 0.0
         if (!close_to_ref(fx, y, maxdiff)) {
             print("{vs[vi]._0}: tile MISMATCH (maxdiff {maxdiff}) — aborting tune\n")
@@ -512,7 +544,7 @@ def tune_mode_run : bool {
     for (_r in range(ROUNDS)) {   // interleaved best-of: variant order inside each round
         for (vi in range(nv)) {
             let t0 = ref_time_ticks()
-            run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], y)
+            run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
             let us = double(get_time_usec(t0))
             if (us < best[vi]) {
                 best[vi] = us
@@ -566,10 +598,13 @@ def tune_mode_run : bool {
     delete gbufs
     delete hbufs
     delete vmr
+    delete vts
+    delete vgs
     delete best
     delete gbest
     delete hbest
     delete gtab
+    delete tss
     delete kgs
     delete wbs
     delete mrs

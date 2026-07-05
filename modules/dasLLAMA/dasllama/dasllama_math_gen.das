@@ -13,12 +13,14 @@ require math
 // The GEMM family as a [tune] client (gemm_generator_plan.md part 3; promoted from the M2
 // GO/NO-GO experiment): the perm grid below stamps dasllama_gemm_gen::q8q8_tile perms through
 // [llvm_code], and the [tune_companion] rows stamp q8q8_layout_gen + q8q8_wbias_gen +
-// q8q8_kgroup_gen + q8q8_gemv_gen + mx4q8_gemv_gen + q8q8_family_live from the same entry —
-// the seven-function stamp: the runtime repacks (Q8 AND mx4 planes) ask the layout companion
-// which interleave the stamped cores read, the wbias companion how the plane bytes are baked
-// (bias128), the kgroup companion how the plane groups its k-bytes (kg8 on smmla stamps),
-// the witness answers "did the family actually emit", and all seven generators share one
-// decline predicate, so kernels, repacks and availability cannot desync on any tier. Normal runs stamp exactly one winner (manifest > the per-ISA fallback chain:
+// q8q8_kgroup_gen + q8q8_tokstep_gen + q8q8_gemv_gen + mx4q8_gemv_gen + q8q8_family_live from
+// the same entry — the eight-function stamp: the runtime repacks (Q8 AND mx4 planes) ask the
+// layout companion which interleave the stamped cores read, the wbias companion how the plane
+// bytes are baked (bias128), the kgroup companion how the plane groups its k-bytes (kg8 on
+// smmla stamps), the tokstep companion how many tokens one tile call covers (16·nrsplit on
+// amx stamps — the batch wrapper walks its space off it), the witness answers "did the family
+// actually emit", and all eight generators share one decline predicate, so kernels, repacks,
+// walk shape and availability cannot desync on any tier. Normal runs stamp exactly one winner (manifest > the per-ISA fallback chain:
 // biased busd512 on AVX512-VNNI boxes / biased busd256 on VEX-VNNI / maddubs on plain AVX2 /
 // kstep2 elsewhere — each ISA's measured tune winner as the manifest-less default);
 // DAS_TUNE_MODE=tune/test stamps the grid + the *_variants() registries for the harness
@@ -53,6 +55,15 @@ def q8q8_wbias_gen() : int {
 //! shared predicate, so plane byte order and kernels can never disagree about the grouping.
 def q8q8_kgroup_gen() : int {
     return q8q8_repack_type(GEMM_REFERENCE_MR).kgroup
+}
+
+//! The tokstep companion (slice I): tokens one stamped tile call covers — 16·nrsplit for the
+//! amx perms (whose TMUL macro also spans tokstep/16 row-groups: amx macros are square in
+//! tile units), 4 for every vector perm. The batch wrapper walks its (token, row-group) space
+//! off it. Reference body = the 4-token contract; declines in lockstep via the shared
+//! predicate, so walk shape and tile can never disagree.
+def q8q8_tokstep_gen() : int {
+    return 4
 }
 
 //! The witness companion: did the stamped family actually EMIT on this target? Reference body
@@ -143,10 +154,14 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
  tune_perm(dot = "smmla", mr = 4, kstep = 2, requires = "i8mm"), tune_perm(dot = "smmla", mr = 4, kstep = 2, nrsplit = 2, requires = "i8mm"),
  tune_perm(dot = "smmla", mr = 8, kstep = 2, nrsplit = 2, requires = "i8mm"), tune_perm(dot = "smmla", mr = 8, kstep = 4, nrsplit = 2, requires = "i8mm"),
  tune_perm(dot = "smmla", mr = 8, kstep = 2, nrsplit = 2, gkstep = 2, requires = "i8mm"),
+ tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 1, requires = "amx-int8"),
+ tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 2, requires = "amx-int8"),
+ tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 2, gkstep = 2, requires = "amx-int8"),
  tune_perm(suffix = "mr8_budget", mr = 8), tune_perm(suffix = "mr2_lanes", mr = 2), tune_perm(dot = "vpdpbusd"),
  tune_companion(fn = "q8q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
  tune_companion(fn = "q8q8_wbias_gen", gen = "dasllama_gemm_gen::q8q8_wbias"),
  tune_companion(fn = "q8q8_kgroup_gen", gen = "dasllama_gemm_gen::q8q8_kgroup"),
+ tune_companion(fn = "q8q8_tokstep_gen", gen = "dasllama_gemm_gen::q8q8_tokstep"),
  tune_companion(fn = "q8q8_gemv_gen", gen = "dasllama_gemm_gen::q8q8_gemv"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
@@ -331,7 +346,8 @@ def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?;
 // stays L2-resident and is reused across this thread's groups instead of re-streaming the whole
 // activation once per group (effective_token_block clamps TB to the per-box L2 budget — above
 // ~L2/n the slice spills and prefill cliffs). Strides come off the layout companion: any
-// stamped mr walks grp<mr> groups and runs its token tail through the generic dot. For a
+// stamped mr walks grp<mr> groups and runs its token tail through the generic dot; the tokstep
+// companion picks the walk shape (4-token vector tiles, or the amx macro's ts×gs units). For a
 // bias128 stamp the bsums plane (−128·Σx i32 per (token, block) — the tile's acc-init
 // correction) is built once per call before dispatch: O(ntok·n), noise against the dots'
 // O(ntok·n·d), amortized over every group.
@@ -362,38 +378,89 @@ def private q8q8_batch_kernel_neon_laneq_gen(var yp : float?; wp : int8 const?; 
         }
     }
     let xbsp : int const? = wbias != 0l ? unsafe(addr(bs[0])) : null
-    maybe_parallel_for(0, int(ng), matmul_chunks(int(ng * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
-        unsafe {
-            var tb = 0l
-            while (tb < ntok) {
-                let tbe = min(tb + TB, ntok)
-                let tb4 = tb + ((tbe - tb) / 4l) * 4l
-                for (gi in range(rb, re)) {
-                    let g = int64(gi)
-                    let wgp = wp + g * mr * n
-                    let sgp = sp + g * mr * nb
-                    var tk = tb
-                    while (tk < tb4) {
-                        q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, g, tk)
-                        tk += 4l
-                    }
-                    if (mr == 4l && kg == 4l) {   // an smmla mr4 stamp's plane is kg8 — generic tail below
-                        while (tk < tbe) {
-                            let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * nb, n)
-                            myp[tk * d + g * 4l + 0l] = f.x
-                            myp[tk * d + g * 4l + 1l] = f.y
-                            myp[tk * d + g * 4l + 2l] = f.z
-                            myp[tk * d + g * 4l + 3l] = f.w
-                            tk++
+    let ts = int64(q8q8_tokstep_gen())   // tokens per tile call (4; 16/32 on amx stamps)
+    if (ts != 4l) {
+        // the amx-shaped walk (slice I): one tile call covers ts tokens × gs row-groups, so
+        // the chunk space is gs-group units. Full-macro calls only; the token tail rides ONE
+        // overlapped macro call (the tile zero-inits its own y region, so recomputing covered
+        // tokens is idempotent); a batch shorter than one macro rides the vector rows-core
+        // per token. TB clamps up to one macro (a sub-macro block would overlap every call).
+        let gs = ts / 16l                // row-groups per call — amx macros are square in tile units
+        let ngu = ng / gs
+        let TBa = max(TB, ts)
+        maybe_parallel_for(0, int(ngu), matmul_chunks(int(ngu * gs * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(ub, ue) {
+            unsafe {
+                var tb = 0l
+                while (tb < ntok) {
+                    let tbe = min(tb + TBa, ntok)
+                    let tbS = tb + ((tbe - tb) / ts) * ts
+                    for (ui in range(ub, ue)) {
+                        let gg = int64(ui) * gs
+                        let wgp = wp + gg * mr * n
+                        let sgp = sp + gg * mr * nb
+                        var tk = tb
+                        while (tk < tbS) {
+                            q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, gg, tk)
+                            tk += ts
                         }
-                    } else {
-                        while (tk < tbe) {
-                            q8q8_token_grp_generic(myp, wgp, sgp, xqp + tk * n, xsp + tk * nb, n, d, g * mr, tk, mr, wbias, kg)
-                            tk++
+                        if (tk < tbe) {
+                            if (tbe >= ts) {
+                                q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, gg, tbe - ts)
+                            } else {
+                                while (tk < tbe) {
+                                    q8q8_gemv_gen(myp + tk * d, wp, sp, xqp + tk * n, xsp + tk * nb, n, gg * mr, (gg + gs) * mr)
+                                    tk++
+                                }
+                            }
                         }
                     }
+                    tb += TBa
                 }
-                tb += TB
+            }
+        }
+        if (ngu * gs < ng) {
+            // leftover row-groups (ng % gs — dims that are 16- but not 32-multiples): the
+            // vector rows-core per token
+            unsafe {
+                for (tk in range64(ntok)) {
+                    q8q8_gemv_gen(myp + tk * d, wp, sp, xqp + tk * n, xsp + tk * nb, n, ngu * gs * mr, ng * mr)
+                }
+            }
+        }
+    } else {
+        maybe_parallel_for(0, int(ng), matmul_chunks(int(ng * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
+            unsafe {
+                var tb = 0l
+                while (tb < ntok) {
+                    let tbe = min(tb + TB, ntok)
+                    let tb4 = tb + ((tbe - tb) / 4l) * 4l
+                    for (gi in range(rb, re)) {
+                        let g = int64(gi)
+                        let wgp = wp + g * mr * n
+                        let sgp = sp + g * mr * nb
+                        var tk = tb
+                        while (tk < tb4) {
+                            q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, g, tk)
+                            tk += 4l
+                        }
+                        if (mr == 4l && kg == 4l) {   // an smmla mr4 stamp's plane is kg8 — generic tail below
+                            while (tk < tbe) {
+                                let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * nb, n)
+                                myp[tk * d + g * 4l + 0l] = f.x
+                                myp[tk * d + g * 4l + 1l] = f.y
+                                myp[tk * d + g * 4l + 2l] = f.z
+                                myp[tk * d + g * 4l + 3l] = f.w
+                                tk++
+                            }
+                        } else {
+                            while (tk < tbe) {
+                                q8q8_token_grp_generic(myp, wgp, sgp, xqp + tk * n, xsp + tk * nb, n, d, g * mr, tk, mr, wbias, kg)
+                                tk++
+                            }
+                        }
+                    }
+                    tb += TB
+                }
             }
         }
     }

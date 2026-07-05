@@ -421,6 +421,15 @@ var public g_target_x64_avx512vnni = false
 // yet; lights up via cpuid on future boxes and via DAS_JIT_X64_FORCE_FEATURES for emission-only
 // verification today.
 var public g_target_x64_vnniint8 = false
+// AMX INT8 tiles (TDPBSSD — SPR/Genoa-X server silicon; the dasLLAMA amx tile family). Both
+// amx-tile and amx-int8 cpuid bits, hyphen-spelled like the LLVM target features so the force
+// env and llc -mattr take the same names. cpuid says nothing about the per-process XTILEDATA
+// grant — that runtime enable (Linux arch_prctl) lives in the family's witness companion.
+var public g_target_x64_amx = false
+
+// The JIT target OS is Linux: host platform on native runs, the triple's OS field on cross
+// targets. Gates emission that calls Linux-only externs (the amx witness's arch_prctl).
+var public g_target_os_linux = false
 
 // ARMv8.6 i8mm (SMMLA — 2×2 s8 matrix-multiply-accumulate; Apple M2/A15+, Graviton3+; M1 has
 // DotProd only). Host truth comes off LLVMGetHostCPUFeatures() ("+i8mm" — populated on Linux
@@ -599,6 +608,11 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
     g_target_x64_avx512bw = g_target_x64_avx2 && x64_tier_feature("avx512f", x64_cross) && x64_tier_feature("avx512bw", x64_cross)
     g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_tier_feature("avx512vnni", x64_cross)
     g_target_x64_vnniint8 = g_target_x64_avx2 && x64_tier_feature("avxvnniint8", x64_cross)
+    g_target_x64_amx = g_target_is_x64 && x64_tier_feature("amx-tile", x64_cross) && x64_tier_feature("amx-int8", x64_cross)
+    // target OS truth (native = host platform; cross = the triple's OS field)
+    g_target_os_linux = (empty(target_triple)
+        ? get_platform_name() == "linux"
+        : find(target_triple, "linux") >= 0)
     // aarch64 i8mm tier (see the g_target_arm64_i8mm declaration comment): host targets read
     // LLVM's host-features string OR the arm force env; cross aarch64 triples the env only.
     g_target_arm64_i8mm = g_target_is_aarch64 && (arm64_forced_feature("i8mm")
