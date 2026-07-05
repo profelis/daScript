@@ -73,6 +73,9 @@ def main {
             set_batch_grid_2d(bg2)
             print("batch grid 2d override: {bg2}\n")
         }
+        // team dispatch profile over each batched prefill (per-op publish/serve/join costs +
+        // caller/solo shares — the starved-shape diagnostic)
+        let teamProf = has_env_variable("DASLLAMA_TEAM_PROF")
         // warmup — JIT both paths
         let warm <- build_prompt(8l)
         for (p in range64(8l)) {
@@ -89,9 +92,22 @@ def main {
             }
             let us_old = get_time_usec(t0)
             forward_profile_reset()   // per-section table over the LAST batched prefill only
+            if (teamProf) {
+                set_jobque_team_prof(true)
+                reset_jobque_team_prof()
+            }
             let t1 = ref_time_ticks()
             forward_prefill(t, s, prompt, n, 0l)
             let us_new = get_time_usec(t1)
+            if (teamProf) {
+                let prof = get_jobque_team_prof()
+                let counts = get_jobque_team_prof_counts()
+                let react = get_jobque_team_prof_react()
+                set_jobque_team_prof(false)
+                let callerShare = counts.y > 0 ? 100 * counts.z / counts.y : 0
+                let soloShare = counts.x > 0 ? 100 * counts.w / counts.x : 0
+                print("team prof N={n}: avg ns/op publish {prof.x} serve {prof.y} join-tail {prof.z} total {prof.w} | ops {counts.x} chunks {counts.y} caller-share {callerShare}% solo {soloShare}% | claims first +{react.x}ns last +{react.y}ns\n")
+            }
             let tps_old = double(n) / (double(us_old) * 1.0e-6lf)
             let tps_new = double(n) / (double(us_new) * 1.0e-6lf)
             let speedup = double(us_old) / double(us_new)
