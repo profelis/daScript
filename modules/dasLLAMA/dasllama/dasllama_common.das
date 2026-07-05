@@ -1949,13 +1949,14 @@ def has_dual_rope(c : Config) : bool => (c.sliding_window > 0l
 
 // attn-norm → QKV(+bias) → RoPE → KV-store → GQA multi-head attention → out-proj(+post-norm) → residual.
 // Can layer l's attention run as the fused 3-stage chain? Std shape only: Q8 weights, group3
-// layout (no V-from-K), no post-block norm, table rope. Also needs team mode, a backend row core,
-// and the same size threshold the group3 fuse gates on.
+// layout (no V-from-K), table rope. Also needs team mode, a backend row core, and the same size
+// threshold the group3 fuse gates on. pre_post_norm (Gemma2/3) is handled: the chain defers the
+// residual add and the caller runs the serial post-norm + add after the rendezvous.
 def private fused_attn_ok(t : Model; l : int64) : bool {
     let c = t.config
     // head_size % 32: the per-head epilogues slice on head boundaries, and the wo-input requant
     // needs whole 32-quant groups per head (real targets are 64/128/256; stories15M's 48 falls back)
-    return (g_fused_decode && t.quant == QuantMode.q8 && !c.pre_post_norm && g_use_rope_table
+    return (g_fused_decode && t.quant == QuantMode.q8 && g_use_rope_table
         && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
@@ -2006,6 +2007,9 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let seq_len = c.seq_len
     let attn_softcap = c.attn_logit_softcap
     let kvoff = loff + pos * kv_dim
+    // Gemma2/3: the post-attention norm is a whole-vector reduction over the wo output, so the
+    // chain can't fold the residual add into stage 2 — it lands serially after the rendezvous
+    let post_norm = c.pre_post_norm
     unsafe {
         // activations / scratch — raw pointers only (the stage lambda runs in fork contexts)
         var qp = addr(s.q[0])
@@ -2137,6 +2141,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                 }
             } else {
                 // output projection rows + optional bias + residual add, all chunk-local
+                // (post-norm arches defer the add — the caller's serial tail owns it)
                 unsafe {
                     let r0 = int64(jb) * 32l
                     let r1 = int64(je) * 32l
@@ -2146,19 +2151,29 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             xb2p[i] += bop[booff + i]
                         }
                     }
-                    add_inplace(xp + r0, xb2p + r0, r1 - r0)
+                    if (!post_norm) {
+                        add_inplace(xp + r0, xb2p + r0, r1 - r0)
+                    }
                 }
             }
         }
     }
     prof_add("attn_chain", ts_chain)
+    if (post_norm) {  // Gemma2/3: post-attention RMSNorm before the residual add — same serial
+        // tail as the un-fused path (dim-sized, microseconds), bit-identical order
+        let ts_resid = ref_time_ticks()
+        rms_at(s.xb2, t, t.rms_post_att_off + l * dim, s.xb2, dim)
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
+        prof_add("act_resid", ts_resid)
+    }
 }
 
-// Can the dense FFN run as the fused 2-stage chain? Q8, no post-block norm/scale, team mode +
-// a backend row core, and the size threshold.
+// Can the dense FFN run as the fused 2-stage chain? Q8, no post-block scale, team mode + a
+// backend row core, and the size threshold. pre_post_norm (Gemma2/3) is handled: the chain
+// defers the residual add and the caller runs the serial post-norm + add after the rendezvous.
 def private fused_ffn_ok(t : Model) : bool {
     let c = t.config
-    return (g_fused_decode && t.quant == QuantMode.q8 && !c.pre_post_norm && !c.layer_out_scale
+    return (g_fused_decode && t.quant == QuantMode.q8 && !c.layer_out_scale
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && lanes_for_work(c.dim * c.hidden_dim, g_gemv_lane_cap) > 1)
 }
@@ -2182,6 +2197,9 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
     let is_gelu = c.ffn_act == FfnAct.gelu
     let is_oai = c.ffn_act == FfnAct.swiglu_oai
     let vec = g_act_vec
+    // Gemma2/3: the post-FFN norm is a whole-vector reduction over the down-proj output, so the
+    // chain can't fold the residual add into stage 1 — it lands serially after the rendezvous
+    let post_norm = c.pre_post_norm
     let ngrp0 = int(hidden / 32l)
     let ngrp1 = int(dim / 32l)
     let n0 = matmul_chunks_gemv(int(hidden), 1, 2l * dim * hidden)
@@ -2236,14 +2254,24 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
                     }
                     quantize_q8_0_into_ptr(gup + r0, r1 - r0, xq2p, xs2p, r0, r0 / 32l)
                 } else {
-                    // down-projection rows + residual add
+                    // down-projection rows + residual add (post-norm arches defer the add —
+                    // the caller's serial tail owns it)
                     invoke(mmrows, xbp, wp2, ws2, xq2p, xs2p, hidden, r0, r1)
-                    add_inplace(xp + r0, xbp + r0, r1 - r0)
+                    if (!post_norm) {
+                        add_inplace(xp + r0, xbp + r0, r1 - r0)
+                    }
                 }
             }
         }
     }
     prof_add("ffn_chain", ts_chain)
+    if (post_norm) {  // Gemma2/3: post-FFN RMSNorm before the residual add — same serial tail
+        // as the un-fused path (dim-sized, microseconds), bit-identical order
+        let ts_resid = ref_time_ticks()
+        rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
+        prof_add("act_resid", ts_resid)
+    }
 }
 
 def private attention_std_decode(t : Model; var s : Session; l : int64; pos : int64) {

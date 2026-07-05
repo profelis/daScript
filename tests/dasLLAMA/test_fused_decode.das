@@ -144,6 +144,39 @@ def private fused_vs_std_bit_exact(t : T?; tr : Model) {
 // under a "portable" pin — the rows core every host shares, and the EPYC box's profile-pinned
 // decode config; without the pin an x64 auto-select picks an intrinsic tier with no rows core
 // and the fused gate silently falls back (the A/B would compare std vs std).
+// pre_post_norm arches (Gemma2/3): the chains defer the residual add and run the post-norm as a
+// serial tail after the rendezvous. gemma-3-1b covers qk-norm + dual-rope sliding (5:1) + the
+// attn deferral; gemma-2-2b covers softcap + GeGLU + qd != dim + alternating sliding.
+[test]
+def test_fused_decode_pre_post_norm(t : T?) {
+    t |> run("fused chains bit-exact on pre/post-norm arches (needs the gemma ggufs)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let prev_backend = active_kernel_backend()
+        let prev_thresh = get_target_chunk_work()
+        with_job_que() {
+            setup_dasllama_jobque_()
+            set_target_chunk_work(1l)
+            pin_kernel_backend("portable")   // the rows core every host shares (see the attn-chain twin)
+            for (name in ["gemma-3-1b-it-Q8_0.gguf", "gemma-2-2b-it-Q8_0.gguf"]) {
+                let path = path_join(models_dir(), name)
+                if (!stat(path).is_valid) {
+                    t |> success(true, "skipped: {path} not present")
+                    continue
+                }
+                var tr <- load_gguf(path, QuantMode.q8)
+                fused_vs_std_bit_exact(t, tr)
+                delete tr
+            }
+            clear_kernel_backend_pin()
+        }
+        set_target_chunk_work(prev_thresh)
+        select_kernel_backend(prev_backend)
+    }
+}
+
 [test]
 def test_fused_decode_attn_chain(t : T?) {
     t |> run("fused attention chain bit-exact on SmolLM2-135M (needs the gguf)") @(t : T?) {

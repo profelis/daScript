@@ -243,5 +243,11 @@ def main() {
         set_dispatch_caller_lane(false)
         print("dispatch lanes: workers only (legacy)\n")
     }
+    // A/B the fused per-block decode chains (default on; 0 = per-op dispatches) — same rail
+    // as emission_bench
+    if (has_env_variable("DASLLAMA_FUSED_DECODE")) {
+        set_fused_decode(get_env_variable("DASLLAMA_FUSED_DECODE") != "0")
+        print("fused decode override: {get_fused_decode()}\n")
+    }
     run_profile(t, p, n, p2, cfg.team)
 }
