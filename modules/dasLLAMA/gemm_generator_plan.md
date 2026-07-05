@@ -1422,6 +1422,63 @@ SPR protocol unchanged (P1/P2 probes first, per-arm ladder, cumulative, arch-lad
 AMI bake). Note for the ladder: `latch` and `bias` change the GEMV/companion side too — the
 kernel-iso A/B attributes the tile, emission_bench attributes the family.
 
+### Slice K SILICON — SPR session 4 (2026-07-05): the fair shot answered, amx CLOSED
+
+Boris re-shaped the protocol on entry: full pin sweep on the arch-ladder models, one model
+first, sanity before everything. Executed as: pairwise rows added (`c0ff31896` — pipe1_latch1
+/ pipe1_bias128 / latch1_bias128 complete the 2^3 tile lattice; emission gates 100/100, M1
+grid 51 rows decline-clean) → box sanity (suite 213/213, grid 51 rows LIVE incl. all four
+bias128-amx rows at 3.8e-06 = sanctioned fold-order tolerance, slot parity 7/7, oracle parity
+40/40 ×3 incl. amx-cumulative + grid-on) → Llama-1B @T24 full lattice (10 rows × grid{0,2} ×
+2 reps, 40 cells, zero failures, every cell stamp-verified) → condensed lattice on
+Qwen3-0.6B / gemma-3-1b / Qwen3-4B.
+
+**Verdict: amx < vnni everywhere — 0.36–0.55× the biased-busd512 champion across all four
+models; the best cell ever (pipe1_latch1 on Qwen3-0.6B, 0.55×) is below the plain AVX2
+maddubs tier. The family stays grid-resident; spr_manifest unchanged. Arc CLOSED.**
+
+The decomposition (no mysteries left):
+
+- **Codegen exonerated** (Boris's "llvm producing god knows what" check): objdump of the
+  production JIT DLL (the sweep cells' own artifact) shows exactly the designed shape —
+  pipelined 2×2 macro (8 loads / 8 dots / 8 zero / 8 spill), raw tmm on the fixed C=tmm0-3
+  / A=tmm4-5 / B=tmm6-7 plan, ONE ldtilecfg in the whole object (the cfg companion), rolled
+  k-loop (single back-branch), ~115-165 fold insns between dot chains = the lcpp cadence.
+  Box-JIT output ≡ the M1 llc-cross gates.
+- **Frequency license exonerated** (P1 turbostat, bench-phase-anchored): das-amx 3745 MHz ≡
+  das-vnni 3730 MHz @T24 — our tile density never leaves the vector license class. lcpp-amx
+  drops to 3322 MHz (−11%) and still wins 2.7× — they pay the license and win anyway.
+- **Dispatch mostly exonerated** (P2, the new `DASLLAMA_TEAM_PROF` rail in prefill_perf,
+  `0719968ed`): publish 528ns/op (negligible), join-tail 283µs vs vnni's 29µs ≈ 10-15% of op
+  time (coarse 32-token units → ragged waves) — real but secondary.
+- **The bill: serve 2.28×** (1125µs vs 493µs per op, N=512 — the chunk kernels themselves).
+  Structural root = the kstep=1 Q8-scale-boundary fold: every 32-k block spills all four C
+  tiles and folds on vector ports — ~256KB C-spill traffic per 32-row × 32-token unit vs
+  64KB of weight traffic, ~960 instructions per k-iteration wrapping 4 tdpbsud. The TMUL
+  idles behind the fold; no pin reorganizes that away.
+
+Pin attribution: pipe1_latch1 is the one real arm — +15% kernel-iso 1-core (105.5 vs 92.1
+GMAC/s; raw tmm undoes LLVM's serialized-tmm4 chain, THEN pipelining pays — the slice-K bet,
+correct within the family) and +34% e2e on deep-thin Qwen3-0.6B; flat inside the noise band
+on the other three. bias128-on-amx = net e2e LOSS on every model (the fold gains one vpaddd
+per element; the biased gemv side doesn't recoup it) — the slice-I plane-bias fork's option
+(a) stands. amx run-to-run variance ±14% (same stamp, same grid) vs champion ±0.7% — the
+fragility itself is a verdict: the family is hypersensitive to warm-up/claim order, the
+champion is unconditionally robust.
+
+Also this session: **e2e confirm pass first SPR outing** — tune mode 1-core crowned amx
+nrsplit1 (174 GMAC/s on the d=32 fixture), confirm child measured 0.49× e2e, REJECTED,
+fallback pinned — the session-3 methodology hole closed on the box that exposed it.
+**batch_grid_2d SPR verdict: no pin** — 135M @T48 champ interleaved ×2: grid2 within ±1%,
+grid1 −5% (zen2's +8-15% does NOT transfer; SPR's 1-D chunk counts already fill 48 lanes on
+the vector walk). SPR box_profile stays {65536, 48, 0, team_rank_gate:1}. JIT-cache nit for
+the ledger: the artifact GC keeps one DLL per namespace, so alternating stamps recompile
+every run (~60-90s/cell tax on sweeps; correctness unaffected).
+
+Ledger (conditional, not queued): **amx kstep=2 fold** — K=64 tiles folding two scale
+segments per spill halves the C traffic; honest ceiling ≈ 1.6× behind the champion, so it
+only matters if a future box inverts the fold/TMUL cost ratio.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /
