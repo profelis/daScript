@@ -189,6 +189,22 @@ namespace das {
         }
     }
 
+    void JobQue::resetTeamProf () {
+        mTPn = mTPchunks = mTPcallerChunks = mTPsolo = 0;
+        mTPpub = mTPserve = mTPtail = mTPtotal = 0;
+        mTPreact = mTPreactN = mTPlastRel = mTPlastN = 0;
+        mTeamFirstClaimT.store(0, std::memory_order_relaxed);
+        mTeamLastClaimT.store(0, std::memory_order_relaxed);
+    }
+
+    JobQue::TeamProfSnapshot JobQue::getTeamProf () const {
+        TeamProfSnapshot s;
+        s.ops = mTPn; s.chunks = mTPchunks; s.callerChunks = mTPcallerChunks; s.solo = mTPsolo;
+        s.publishT = mTPpub; s.serveT = mTPserve; s.tailT = mTPtail; s.totalT = mTPtotal;
+        s.reactT = mTPreact; s.reactN = mTPreactN; s.lastT = mTPlastRel; s.lastN = mTPlastN;
+        return s;
+    }
+
     void JobQue::EvalOnMainThread(Job && expr) {
         lock_guard<mutex> guard(mEvalMainThreadMutex);
         mEvalMainThread.emplace_back(das::move(expr));

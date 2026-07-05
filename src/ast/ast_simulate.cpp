@@ -3749,6 +3749,7 @@ namespace das
                     gfun.stackSize = pfun->totalStackSize;
                     gfun.mangledNameHash = MNH;
                     gfun.aotFunction = nullptr;
+                    gfun.jitFunction = nullptr;
                     gfun.flags = 0;
                     gfun.fastcall = pfun->fastCall;
                     gfun.unsafe = pfun->unsafeOperation;

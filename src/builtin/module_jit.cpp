@@ -49,7 +49,7 @@ namespace das {
     void register_native_path(const char *, const char *, const char *, Context *, LineInfoArg *);
     bool builtin_fexist ( const char * path );
 
-    typedef vec4f ( * JitFunction ) ( Context * , vec4f *, void * );
+    // JitFunction typedef lives in arraytype.h (the SimFunction::jitFunction mirror shares it)
 
     struct SimNode_Jit : SimNode {
         SimNode_Jit ( const LineInfo & at, JitFunction eval )
@@ -123,11 +123,18 @@ namespace das {
             simfn->code = jitNode->saved_code;
             simfn->aot = jitNode->saved_aot;
             simfn->aotFunction = jitNode->saved_aot_function;
+            simfn->jitFunction = nullptr;   // pre-instrument mirror is always null (aot/jit exclusive)
             simfn->jit = false;
             return true;
         } else {
             return false;
         }
+    }
+
+    bool das_has_jit_fastpath ( const Func func ) {
+        // test rail: is the invoke fastpath armed for this function (SimFunction::jitFunction mirror set)?
+        auto simfn = func.PTR;
+        return simfn && simfn->jitFunction;
     }
 
     bool das_instrument_jit ( void * pfun, const Func func, const LineInfo & lineInfo, Context & context ) {
@@ -138,6 +145,7 @@ namespace das {
             auto jitNode = static_cast<SimNode_Jit *>(simfn->code);
             jitNode->func = (JitFunction) pfun;
             jitNode->debugInfo = lineInfo;
+            simfn->jitFunction = pfun;
         } else {
             auto node = context.code->makeNode<SimNode_Jit>(lineInfo, (JitFunction)pfun);
             node->saved_code = simfn->code;
@@ -146,6 +154,7 @@ namespace das {
             simfn->code = node;
             simfn->aot = false;
             simfn->aotFunction = nullptr;
+            simfn->jitFunction = pfun;      // the invoke-fastpath mirror of node->func
             simfn->jit = true;
         }
         return true;
@@ -157,6 +166,13 @@ extern "C" {
     }
 
     DAS_API vec4f jit_call_or_fastcall ( SimFunction * fn, vec4f * args, Context * context ) {
+        if ( fn->jitFunction ) {
+            // JIT->JIT direct call: skip the stack push/prologue (JIT'd bodies push their own
+            // frame via jit_prologue when they need one) and the virtual SimNode_Jit::eval.
+            auto res = ((JitFunction) fn->jitFunction)(context, args, nullptr);
+            context->stopFlags = 0;     // mirror callOrFastcall (an invoked interpreted block may leak stopForReturn)
+            return res;
+        }
         return context->callOrFastcall(fn, args, nullptr);
     }
 
@@ -290,6 +306,7 @@ extern "C" {
             fn.debugInfo = finfo;
             auto node = code->makeNode<SimNode_Jit>(LineInfo{}, (JitFunction) fnPtr);
             fn.code = node;
+            fn.jitFunction = fnPtr;         // the invoke-fastpath mirror
             (*tabMnLookup)[mnh] = &fn;
             return &fn;
         }
@@ -1268,6 +1285,9 @@ extern "C" {
             addExtern<DAS_BIND_FUN(das_remove_jit)>(*this, lib, "remove_jit",
                 SideEffects::worstDefault, "das_remove_jit")
                     ->args({"function"})->unsafeOperation = true;
+            addExtern<DAS_BIND_FUN(das_has_jit_fastpath)>(*this, lib, "has_jit_fastpath",
+                SideEffects::none, "das_has_jit_fastpath")
+                    ->args({"function"});
             addExtern<DAS_BIND_FUN(das_instrument_line_info)>(*this, lib, "instrument_line_info",
                 SideEffects::worstDefault, "das_instrument_line_info")
                     ->args({"info","context","at"});

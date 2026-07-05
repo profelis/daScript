@@ -83,6 +83,12 @@ namespace das
         FuncInfo *  debugInfo;
         uint64_t    mangledNameHash;
         void *      aotFunction;
+        // native JIT entry (the SimNode_Jit::func mirror), type JitFunction. Set/cleared by
+        // das_instrument_jit / das_remove_jit only — mutually exclusive with aotFunction, so
+        // the invoke fastpaths test aot first, then jit, then fall to code->eval. Written at
+        // install time (before any dispatch); the team publish/claim seq_cst pair orders it
+        // for workers. Fork/clone contexts share the functions array, so one write is global.
+        void *      jitFunction;
         uint32_t    stackSize;
         union {
             uint32_t    flags;

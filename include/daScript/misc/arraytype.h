@@ -37,6 +37,7 @@ namespace das {
     class Context;
 
     typedef vec4f (*JitBlockFunction)(Context *, vec4f *, void *, Block *);
+    typedef vec4f (*JitFunction)(Context *, vec4f *, void *);
 
     template <typename Result, typename... Args>
     struct TBlock : Block {

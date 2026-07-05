@@ -107,6 +107,28 @@ def team_epoch_storm(t : T?; rounds : int) {
     delete hits
 }
 
+def team_early_return_round(t : T?; nj, total : int) {
+    // chunk lambdas that RETURN early — pins the invoke fastpath's stopFlags clear (a leaked
+    // stopForReturn would make the serial code after the dispatch misbehave)
+    var hits : array<int>
+    hits |> resize(total)
+    var pr = unsafe(addr(hits[0]))
+    team_parallel_for(0, total, nj) <| @(job_begin : int; job_end : int) {
+        for (i in range(job_begin, job_end)) {
+            unsafe(pr[i]) += 1
+        }
+        return                              // explicit early return out of the chunk lambda
+    }
+    var bad = 0
+    for (i in range(total)) {
+        if (hits[i] != 1) {
+            bad++
+        }
+    }
+    t |> equal(0, bad)                      // this line must RUN — a leaked stop flag skips it
+    delete hits
+}
+
 def team_storm(t : T?; rounds : int) {
     // back-to-back dispatches at several shapes: 1 chunk (inline path), fewer chunks than items,
     // more chunks than workers, more chunks than items (clamp) — exercises seq reuse + stragglers
@@ -144,6 +166,12 @@ def test_jobque_team(t : T?) {
                 fifo_sum_round(t, 4, 16)
                 fifo_sum_round(t, 2 * get_total_hw_jobs(), 4 * get_total_hw_jobs())
             }
+            set_jobque_team_mode(false)
+        }
+        t |> run("early-return chunk lambda - stop flags do not leak") @(t : T?) {
+            set_jobque_team_mode(true)
+            team_early_return_round(t, 8, 32)
+            team_early_return_round(t, 2 * get_total_hw_jobs(), 4 * get_total_hw_jobs())
             set_jobque_team_mode(false)
         }
         t |> run("workers park again after off") @(t : T?) {

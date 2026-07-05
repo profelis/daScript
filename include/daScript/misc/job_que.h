@@ -137,6 +137,19 @@ namespace das {
             int numChunks;
         };
         void teamParallelForStages ( const TeamStage * stages, int numStages );
+        // Programmatic access to the DAS_TEAM_PROF aggregates (below) so probes can
+        // reset, run a dispatch storm, and snapshot without destroying the queue.
+        // All times are ns (ref_time_ticks deltas). Set/reset from the dispatching
+        // thread with no dispatch in flight — worker-side stores are gated on the
+        // same unsynchronized bool the env path uses.
+        struct TeamProfSnapshot {
+            uint64_t ops = 0, chunks = 0, callerChunks = 0, solo = 0;
+            uint64_t publishT = 0, serveT = 0, tailT = 0, totalT = 0;   // summed ns per phase
+            uint64_t reactT = 0, reactN = 0, lastT = 0, lastN = 0;      // worker claim latencies
+        };
+        void setTeamProf ( bool on ) { mTeamProf = on; }
+        void resetTeamProf ();
+        TeamProfSnapshot getTeamProf () const;
     protected:
         struct JobEntry {
             JobEntry( Job&& _function, JobCategory _category, JobPriority _priority) {
