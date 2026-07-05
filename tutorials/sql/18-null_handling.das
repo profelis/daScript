@@ -3,7 +3,7 @@ options gen2
 require daslib/sql
 require daslib/option
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Tutorial 18 — NULL handling: `Option<T>` everywhere.
 //

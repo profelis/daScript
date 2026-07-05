@@ -12,7 +12,7 @@ expect 50503:5
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 struct Foo {
     x : int

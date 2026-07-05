@@ -10,7 +10,7 @@ require daslib/sql
 require daslib/linq
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name = "Users")]
 struct User {
@@ -31,13 +31,13 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Name = "Alice", City = "NYC",     Age = 30, Salary = 100))
-    arr |> emplace(User(Id = 2, Name = "Bob",   City = "NYC",     Age = 25, Salary = 80))
-    arr |> emplace(User(Id = 3, Name = "Carol", City = "Chicago", Age = 40, Salary = 120))
-    arr |> emplace(User(Id = 4, Name = "Dave",  City = "Chicago", Age = 35, Salary = 90))
-    arr |> emplace(User(Id = 5, Name = "Eve",   City = "Boston",  Age = 50, Salary = 200))
-    return <- arr
+    return <- [
+        User(Id = 1, Name = "Alice", City = "NYC",     Age = 30, Salary = 100),
+        User(Id = 2, Name = "Bob",   City = "NYC",     Age = 25, Salary = 80),
+        User(Id = 3, Name = "Carol", City = "Chicago", Age = 40, Salary = 120),
+        User(Id = 4, Name = "Dave",  City = "Chicago", Age = 35, Salary = 90),
+        User(Id = 5, Name = "Eve",   City = "Boston",  Age = 50, Salary = 200)
+    ]
 }
 
 [test]

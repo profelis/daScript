@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Composite UNIQUE on (Email, Tenant) via [sql_index(unique=true, fields=...)].
 [sql_table(name = "UserAccts"),

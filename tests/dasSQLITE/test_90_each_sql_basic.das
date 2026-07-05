@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name = "Cars")]
 struct Car {
@@ -26,10 +26,7 @@ def private fixture(db : SqlRunner) {
 def test_each_sql_iterate_full_rows(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture(db)
-        var seen : array<string>
-        for (c in _each_sql(db |> select_from(type<Car>))) {
-            seen |> push(c.Name)
-        }
+        let seen <- [for (c in _each_sql(db |> select_from(type<Car>))); c.Name]
         t |> equal(length(seen), 5, "5 rows yielded")
         t |> equal(seen[0], "BMW",   "row 0")
         t |> equal(seen[4], "Lambo", "row 4")
@@ -77,10 +74,7 @@ def test_each_sql_with_where_filter(t : T?) {
 def test_each_sql_single_column_projection(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture(db)
-        var names : array<string>
-        for (n in _each_sql(db |> select_from(type<Car>) |> _select(_.Name))) {
-            names |> push(n)
-        }
+        let names <- [for (n in _each_sql(db |> select_from(type<Car>) |> _select(_.Name))); n]
         t |> equal(length(names), 5, "5 names")
         t |> equal(names[2], "Tesla", "row 2")
     }
@@ -90,10 +84,7 @@ def test_each_sql_single_column_projection(t : T?) {
 def test_each_sql_named_tuple_projection(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture(db)
-        var pairs : array<int>
-        for (p in _each_sql(db |> select_from(type<Car>) |> _select((Id = _.Id, Price = _.Price)))) {
-            pairs |> push(p.Id * 1000 + p.Price)
-        }
+        let pairs <- [for (p in _each_sql(db |> select_from(type<Car>) |> _select((Id = _.Id, Price = _.Price)))); p.Id * 1000 + p.Price]
         t |> equal(length(pairs), 5, "5 named-tuple rows")
         t |> equal(pairs[0], 1100, "row 0: 1*1000+100")
         t |> equal(pairs[4], 5999, "row 4: 5*1000+999")

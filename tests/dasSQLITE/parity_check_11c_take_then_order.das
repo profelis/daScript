@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Multi-Q lowering parity check: outer-Q `_order_by` over inner-Q `take`.
 //
@@ -34,13 +34,13 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Car> {
-    var arr : array<Car>
-    arr |> emplace(Car(Id = 1, Name = "BMW",   Price = 100))
-    arr |> emplace(Car(Id = 2, Name = "Audi",  Price = 200))
-    arr |> emplace(Car(Id = 3, Name = "Tesla", Price = 300))
-    arr |> emplace(Car(Id = 4, Name = "Lada",  Price = 50))
-    arr |> emplace(Car(Id = 5, Name = "Lambo", Price = 999))
-    return <- arr
+    return <- [
+        Car(Id = 1, Name = "BMW",   Price = 100),
+        Car(Id = 2, Name = "Audi",  Price = 200),
+        Car(Id = 3, Name = "Tesla", Price = 300),
+        Car(Id = 4, Name = "Lada",  Price = 50),
+        Car(Id = 5, Name = "Lambo", Price = 999)
+    ]
 }
 
 def cars_equal(a : array<Car>; b : array<Car>) : bool {
@@ -61,7 +61,7 @@ def parity_take_then_order(t : T?) {
     // (BMW=100 < Audi=200 < Tesla=300 — same order; just covers the divert path).
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Id) |> take(3) |> _order_by(_.Price))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Id) |> take(3) |> _order_by(_.Price))
@@ -78,7 +78,7 @@ def parity_take_then_order_desc(t : T?) {
     // (Tesla=300, Audi=200, BMW=100).
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Id) |> take(3) |> _order_by_descending(_.Price))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Id) |> take(3) |> _order_by_descending(_.Price))
@@ -103,7 +103,7 @@ def parity_three_level_nesting(t : T?) {
     //   ) AS "t0" LIMIT 2
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Id) |> take(4) |> _order_by(_.Price) |> take(2))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Id) |> take(4) |> _order_by(_.Price) |> take(2))

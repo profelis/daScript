@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Tutorial 26 — sql_bind / sql_extract adapter rail. Tests cover:
 //   - DateTime via INTEGER (default storage choice — 64-bit unix seconds)

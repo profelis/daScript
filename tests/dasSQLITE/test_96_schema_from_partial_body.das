@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Partial body — hand-declared fields are CONTRACTS. Same-affinity narrowing is allowed
 // (int instead of synthesized int64). Annotation overrides (@sql_json on TEXT, @sql_blob on BLOB)

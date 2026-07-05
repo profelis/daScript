@@ -160,8 +160,8 @@ ENDIF()
 SET(AOT_DASSQLITE_MODULE_FILES)
 IF(NOT DAS_SQLITE_DISABLED)
     SET(AOT_DASSQLITE_MODULE_FILES
+        modules/dasSQLITE/daslib/sqlite_provider.das
         modules/dasSQLITE/daslib/sqlite_boost.das
-        modules/dasSQLITE/daslib/sqlite_linq.das
         modules/dasSQLITE/daslib/sqlite_migrate.das
     )
 ENDIF()
@@ -172,6 +172,18 @@ IF(NOT DAS_SQLITE_DISABLED)
     FILE(GLOB AOT_DASSQLITE_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasSQLITE/*.das")
     # Exclude expect-error tests (they intentionally fail to compile)
     list(FILTER AOT_DASSQLITE_FILES EXCLUDE REGEX "failed_")
+ENDIF()
+
+# AOT for the SQL provider conformance suite (in-tree shim opens SQLite)
+SET(AOT_SQL_CONFORMANCE_MODULE_FILES)
+SET(AOT_SQL_CONFORMANCE_FILES)
+IF(NOT DAS_SQLITE_DISABLED)
+    SET(AOT_SQL_CONFORMANCE_MODULE_FILES
+        tests/sql_conformance/_conformance_provider.das
+    )
+    FILE(GLOB AOT_SQL_CONFORMANCE_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/sql_conformance/*.das")
+    # Exclude the shim module (AOT'd via DAS_AOT_LIB above)
+    list(FILTER AOT_SQL_CONFORMANCE_FILES EXCLUDE REGEX "/_")
 ENDIF()
 
 # AOT for strudel/audio module library files (required by strudel tests)
@@ -649,6 +661,18 @@ IF(NOT DAS_SQLITE_DISABLED)
     DAS_AOT("${AOT_DASSQLITE_FILES}" DASSQLITE_AOT_GENERATED_SRC test_aot_dassqlite daslang)
 ENDIF()
 
+add_custom_target(test_aot_sql_conformance_modules)
+SET(SQL_CONFORMANCE_MODULES_AOT_GENERATED_SRC)
+IF(NOT DAS_SQLITE_DISABLED)
+    DAS_AOT_LIB("${AOT_SQL_CONFORMANCE_MODULE_FILES}" SQL_CONFORMANCE_MODULES_AOT_GENERATED_SRC test_aot_sql_conformance_modules daslang)
+ENDIF()
+
+add_custom_target(test_aot_sql_conformance)
+SET(SQL_CONFORMANCE_AOT_GENERATED_SRC)
+IF(NOT DAS_SQLITE_DISABLED)
+    DAS_AOT("${AOT_SQL_CONFORMANCE_FILES}" SQL_CONFORMANCE_AOT_GENERATED_SRC test_aot_sql_conformance daslang)
+ENDIF()
+
 add_custom_target(test_aot_pugixml_modules)
 SET(PUGIXML_MODULES_AOT_GENERATED_SRC)
 IF(NOT DAS_PUGIXML_DISABLED)
@@ -977,6 +1001,8 @@ SOURCE_GROUP_FILES("aot generated" MINFFT_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" STRUDEL_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASSQLITE_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASSQLITE_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" SQL_CONFORMANCE_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" SQL_CONFORMANCE_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" PUGIXML_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" PUGIXML_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASHV_MODULES_AOT_GENERATED_SRC)
@@ -1066,6 +1092,8 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
     ${STRUDEL_AOT_GENERATED_SRC}
     ${DASSQLITE_MODULES_AOT_GENERATED_SRC}
     ${DASSQLITE_AOT_GENERATED_SRC}
+    ${SQL_CONFORMANCE_MODULES_AOT_GENERATED_SRC}
+    ${SQL_CONFORMANCE_AOT_GENERATED_SRC}
     ${PUGIXML_MODULES_AOT_GENERATED_SRC}
     ${PUGIXML_AOT_GENERATED_SRC}
     ${DASHV_MODULES_AOT_GENERATED_SRC}
@@ -1110,6 +1138,7 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_stbimage test_aot_stbimage_modules test_aot_minfft
     test_aot_strudel
     test_aot_dassqlite test_aot_dassqlite_modules
+    test_aot_sql_conformance test_aot_sql_conformance_modules
     test_aot_pugixml test_aot_pugixml_modules
     test_aot_dashv test_aot_dashv_modules
     test_aot_mcp

@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 35 — `_each_sql` streaming iteration.
 //
@@ -42,6 +42,7 @@ def fixture_db(db : SqlRunner) {
 
 def fixture_array() : array<LogEntry> {
     var arr : array<LogEntry>
+    arr |> reserve(20)
     for (i in range(20)) {
         arr |> emplace(LogEntry(
             Id = i + 1,
@@ -77,22 +78,13 @@ def parity_each_sql_vs_materialized(t : T?) {
         fixture_db(db)
         var arr <- fixture_array()
 
-        var m1a <- _sql(db |> select_from(type<LogEntry>) |> _where(_.Severity >= 2) |> _order_by(_.Id))
+        let m1a <- _sql(db |> select_from(type<LogEntry>) |> _where(_.Severity >= 2) |> _order_by(_.Id))
 
-        var m1b : array<LogEntry>
-        for (e in _each_sql(db |> select_from(type<LogEntry>) |> _where(_.Severity >= 2) |> _order_by(_.Id))) {
-            m1b |> push(e)
-        }
+        let m1b <- [for (e in _each_sql(db |> select_from(type<LogEntry>) |> _where(_.Severity >= 2) |> _order_by(_.Id))); e]
 
-        var m2 : array<LogEntry>
-        for (e in (db |> select_from(type<LogEntry>) |> _where(_.Severity >= 2) |> _order_by(_.Id))) {
-            m2 |> push(e)
-        }
+        let m2 <- [for (e in (db |> select_from(type<LogEntry>) |> _where(_.Severity >= 2) |> _order_by(_.Id))); e]
 
-        var m3 : array<LogEntry>
-        for (e in (arr |> _where(_.Severity >= 2) |> _order_by(_.Id))) {
-            m3 |> push(e)
-        }
+        let m3 <- [for (e in (arr |> _where(_.Severity >= 2) |> _order_by(_.Id))); e]
 
         t |> equal(length(m1a), 10, "stream: 10 severe logs")
         t |> success(logs_eq(m1a, m1b), "stream: M1a (materialized) ≡ M1b (streamed)")
@@ -107,7 +99,7 @@ def parity_each_sql_early_break(t : T?) {
     // must be the same across modes.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         var first_id_m1 = 0
         for (e in _each_sql(db |> select_from(type<LogEntry>) |> _order_by(_.Id))) {
@@ -149,22 +141,13 @@ def parity_each_sql_scalar_projection(t : T?) {
     // _select(_.Message) — streaming a single-column projection.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
-        var m1 : array<string>
-        for (s in _each_sql(db |> select_from(type<LogEntry>) |> _order_by(_.Id) |> _select(_.Message))) {
-            m1 |> push(s)
-        }
+        let m1 <- [for (s in _each_sql(db |> select_from(type<LogEntry>) |> _order_by(_.Id) |> _select(_.Message))); s]
 
-        var m2 : array<string>
-        for (s in (db |> select_from(type<LogEntry>) |> _order_by(_.Id) |> _select(_.Message))) {
-            m2 |> push(s)
-        }
+        let m2 <- [for (s in (db |> select_from(type<LogEntry>) |> _order_by(_.Id) |> _select(_.Message))); s]
 
-        var m3 : array<string>
-        for (s in (arr |> _order_by(_.Id) |> _select(_.Message))) {
-            m3 |> push(s)
-        }
+        let m3 <- [for (s in (arr |> _order_by(_.Id) |> _select(_.Message))); s]
 
         t |> equal(length(m1), 20, "scalar stream: 20 messages")
         t |> equal(length(m1), length(m2), "scalar stream: M1 length ≡ M2")

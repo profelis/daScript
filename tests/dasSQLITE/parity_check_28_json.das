@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 28 — `@sql_json` columns and `_sql` walker
 // descent into JSON paths.
@@ -41,11 +41,11 @@ def fixture_users_db(db : SqlRunner) {
 }
 
 def fixture_users_array() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Name = "alice", Prefs = (theme = "dark",  lang = "en", notify = true)))
-    arr |> emplace(User(Id = 2, Name = "bob",   Prefs = (theme = "light", lang = "ru", notify = false)))
-    arr |> emplace(User(Id = 3, Name = "carol", Prefs = (theme = "dark",  lang = "fr", notify = false)))
-    return <- arr
+    return <- [
+        User(Id = 1, Name = "alice", Prefs = (theme = "dark",  lang = "en", notify = true)),
+        User(Id = 2, Name = "bob",   Prefs = (theme = "light", lang = "ru", notify = false)),
+        User(Id = 3, Name = "carol", Prefs = (theme = "dark",  lang = "fr", notify = false))
+    ]
 }
 
 def user_eq(a : User; b : User) : bool {
@@ -69,7 +69,7 @@ def users_eq(a : array<User>; b : array<User>) : bool {
 }
 
 def sort_by_id(var users : array<User>) : array<User> {
-    users |> sort() <| $(a, b) {
+    users |> sort() $(a, b) {
         return a.Id < b.Id
     }
     return <- users
@@ -135,13 +135,13 @@ def parity_json_select_named_tuple(t : T?) {
                      |> _select((Name = _.Name, Theme = _.Prefs.theme, Notify = _.Prefs.notify)))
         var m3 <- (arr |> _select((Name = _.Name, Theme = _.Prefs.theme, Notify = _.Prefs.notify)))
 
-        m1 |> sort() <| $(a, b) {
+        m1 |> sort() $(a, b) {
             return a.Name < b.Name
         }
-        m2 |> sort() <| $(a, b) {
+        m2 |> sort() $(a, b) {
             return a.Name < b.Name
         }
-        m3 |> sort() <| $(a, b) {
+        m3 |> sort() $(a, b) {
             return a.Name < b.Name
         }
 
@@ -165,8 +165,8 @@ def parity_json_where_count(t : T?) {
         var arr <- fixture_users_array()
 
         let m1 = _sql(db |> select_from(type<User>) |> _where(_.Prefs.notify == true) |> count())
-        let m2 = db |> select_from(type<User>) |> _where(_.Prefs.notify == true) |> count()
-        let m3 = arr |> _where(_.Prefs.notify == true) |> count()
+        let m2 = db |> select_from(type<User>) |> _where(_.Prefs.notify) |> count()
+        let m3 = arr |> _where(_.Prefs.notify) |> count()
 
         t |> equal(m1, 1,  "json where|count: 1 notifiable user (alice)")
         t |> equal(m1, m2, "json where|count: M1 ≡ M2")
@@ -218,15 +218,15 @@ def fixture_accounts_db(db : SqlRunner) {
 }
 
 def fixture_accounts_array() : array<Account> {
-    var arr : array<Account>
-    arr |> emplace(Account(Id = 1, Profile = Profile(Addr = Address(City = "SF", Zip = "94000"), Bio = "engineer")))
-    arr |> emplace(Account(Id = 2, Profile = Profile(Addr = Address(City = "NYC", Zip = "10000"), Bio = "writer")))
-    arr |> emplace(Account(Id = 3, Profile = Profile(Addr = Address(City = "SF", Zip = "94100"), Bio = "designer")))
-    return <- arr
+    return <- [
+        Account(Id = 1, Profile = Profile(Addr = Address(City = "SF", Zip = "94000"), Bio = "engineer")),
+        Account(Id = 2, Profile = Profile(Addr = Address(City = "NYC", Zip = "10000"), Bio = "writer")),
+        Account(Id = 3, Profile = Profile(Addr = Address(City = "SF", Zip = "94100"), Bio = "designer"))
+    ]
 }
 
 def sort_accounts_by_id(var rows : array<Account>) : array<Account> {
-    rows |> sort() <| $(a, b) {
+    rows |> sort() $(a, b) {
         return a.Id < b.Id
     }
     return <- rows

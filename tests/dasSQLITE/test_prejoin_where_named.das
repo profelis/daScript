@@ -14,7 +14,7 @@ require daslib/sql
 require daslib/linq_boost
 require daslib/linq_fold
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 struct CarMeta {
     color : string

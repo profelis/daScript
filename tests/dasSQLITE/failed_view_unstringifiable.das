@@ -2,14 +2,14 @@ options gen2
 
 // _create_view body inlines bind values via _::to_sql_literal. A bind whose
 // type has no overload (here: a whole struct, not a primitive field of one)
-// hits the catch-all `to_sql_literal(auto(TT))` at sqlite_linq.das, which
+// hits the catch-all `to_sql_literal(auto(TT))` at sql_linq.das, which
 // concept_asserts (40103). Confirms the user gets a pointed "define
 // to_sql_literal for your type" message instead of an opaque overload error.
 expect 31400
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name = "Items")]
 struct Item {

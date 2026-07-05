@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/option
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 23 — foreign keys.
 //
@@ -46,25 +46,22 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_orders() : array<Order> {
-    var arr : array<Order>
-    arr |> emplace(Order(Id = 100, UserId = 1, Total = 42.0f))
-    arr |> emplace(Order(Id = 101, UserId = 1, Total = 99.0f))
-    arr |> emplace(Order(Id = 102, UserId = 2, Total =  7.5f))
-    return <- arr
+    return <- [
+        Order(Id = 100, UserId = 1, Total = 42.0f),
+        Order(Id = 101, UserId = 1, Total = 99.0f),
+        Order(Id = 102, UserId = 2, Total =  7.5f)
+    ]
 }
 
 def fixture_comments() : array<Comment> {
-    var arr : array<Comment>
-    arr |> emplace(Comment(Id = 1000, AuthorId = none(type<int>), Body = "alice's"))
-    arr |> emplace(Comment(Id = 1001, AuthorId = none(type<int>), Body = "bob's"))
-    return <- arr
+    return <- [
+        Comment(Id = 1000, AuthorId = none(type<int>), Body = "alice's"),
+        Comment(Id = 1001, AuthorId = none(type<int>), Body = "bob's")
+    ]
 }
 
 def comment_eq(a : Comment; b : Comment) : bool {
-    if (a.Id != b.Id || a.Body != b.Body) {
-        return false
-    }
-    if ((a.AuthorId |> is_some) != (b.AuthorId |> is_some)) {
+    if (a.Id != b.Id || a.Body != b.Body || (a.AuthorId |> is_some) != (b.AuthorId |> is_some)) {
         return false
     }
     if (a.AuthorId |> is_none) {

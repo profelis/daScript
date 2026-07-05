@@ -14,7 +14,7 @@ expect 30341
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name = "Cars")]
 struct Car {

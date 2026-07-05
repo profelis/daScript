@@ -72,7 +72,7 @@ require daslib/<helper>   // as needed
 
 **`require` rules:**
 
-- For dasSQLITE the canonical user-facing pair is `require daslib/sql` + `require sqlite/sqlite_boost`. Add `require sqlite/sqlite_linq` only when the tutorial uses the `_sql(...)` macro. `daslib/sql` is the abstract layer; never re-export sqlite-specific symbols through it.
+- For dasSQLITE the canonical user-facing pair is `require daslib/sql` + `require sqlite/sqlite_boost`. Add `require daslib/sql_linq` only when the tutorial uses the `_sql(...)` macro. `daslib/sql` is the abstract layer; never re-export sqlite-specific symbols through it.
 - For other modules, follow the require shape used by the area's existing tutorials.
 
 **`options`:** keep to the minimum the tutorial actually needs. `gen2` is mandatory. `persistent_heap` for audio / strudel / async / heavy-allocation paths. `indenting = 4` is fine but not required (the formatter normalizes).

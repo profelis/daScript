@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 11 — `take(n)` / `skip(n)` pagination.
 //
@@ -40,13 +40,13 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Car> {
-    var arr : array<Car>
-    arr |> emplace(Car(Id = 1, Name = "BMW",   Price = 100))
-    arr |> emplace(Car(Id = 2, Name = "Audi",  Price = 200))
-    arr |> emplace(Car(Id = 3, Name = "Tesla", Price = 300))
-    arr |> emplace(Car(Id = 4, Name = "Lada",  Price = 50))
-    arr |> emplace(Car(Id = 5, Name = "Lambo", Price = 999))
-    return <- arr
+    return <- [
+        Car(Id = 1, Name = "BMW",   Price = 100),
+        Car(Id = 2, Name = "Audi",  Price = 200),
+        Car(Id = 3, Name = "Tesla", Price = 300),
+        Car(Id = 4, Name = "Lada",  Price = 50),
+        Car(Id = 5, Name = "Lambo", Price = 999)
+    ]
 }
 
 def cars_equal(a : array<Car>; b : array<Car>) : bool {
@@ -65,7 +65,7 @@ def cars_equal(a : array<Car>; b : array<Car>) : bool {
 def parity_order_take(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> take(2))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Price) |> take(2))
@@ -80,7 +80,7 @@ def parity_order_take(t : T?) {
 def parity_order_skip(t : T?) {
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> skip(3))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Price) |> skip(3))
@@ -103,7 +103,7 @@ def parity_order_take_skip(t : T?) {
     // stays a flat SELECT.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> take(2) |> skip(1))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Price) |> take(2) |> skip(1))
@@ -119,7 +119,7 @@ def parity_order_take_skip_n_gt_m(t : T?) {
     // n > m: take(4) → 4 rows, skip(2) drops 2 → 2 rows. All three modes agree.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> take(4) |> skip(2))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Price) |> take(4) |> skip(2))
@@ -135,7 +135,7 @@ def parity_order_take_skip_degenerate(t : T?) {
     // m > n: take(2), skip(5) drops everything → 0 rows. All three modes agree.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> take(2) |> skip(5))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Price) |> take(2) |> skip(5))
@@ -154,7 +154,7 @@ def parity_order_skip_then_take(t : T?) {
     // semantics (skip first, then take). All three modes agree.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> skip(1) |> take(2))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Price) |> skip(1) |> take(2))
@@ -196,7 +196,7 @@ def parity_take_first_terminal(t : T?) {
     // be the same Car in all three modes.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 = _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> take(5) |> _first())
         let m2 = (db |> select_from(type<Car>) |> _order_by(_.Price) |> take(5) |> _first())

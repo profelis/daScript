@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // `@sql_column` rename through a JOIN. Both sides rename a different daslang
 // field to a SQLite-keyword column name; the JOIN ON clause must emit the

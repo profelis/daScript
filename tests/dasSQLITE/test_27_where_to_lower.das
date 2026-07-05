@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name="Cars")]
 struct Car {
@@ -34,9 +34,9 @@ def test_where_to_lower_runtime(t : T?) {
 [test]
 def test_where_to_lower_emits_lower_call(t : T?) {
     var _db = SqlRunner()
-    let target = "x"
+    let _target = "x"
     let sql = _sql_text(_db |> select_from(type<Car>)
-                          |> _where(_.Name |> to_lower() == target))
+                          |> _where(_.Name |> to_lower() == _target))
     t |> equal(sql,
         "SELECT \"Id\", \"Name\" FROM \"Cars\" WHERE LOWER(\"Name\") = ?",
         "to_lower -> LOWER(...)")
@@ -45,9 +45,9 @@ def test_where_to_lower_emits_lower_call(t : T?) {
 [test]
 def test_where_to_upper_emits_upper_call(t : T?) {
     var _db = SqlRunner()
-    let target = "X"
+    let _target = "X"
     let sql = _sql_text(_db |> select_from(type<Car>)
-                          |> _where(_.Name |> to_upper() == target))
+                          |> _where(_.Name |> to_upper() == _target))
     t |> equal(sql,
         "SELECT \"Id\", \"Name\" FROM \"Cars\" WHERE UPPER(\"Name\") = ?",
         "to_upper -> UPPER(...)")

@@ -125,7 +125,7 @@ Note adapters can still *emit* code referencing the contributor's symbols by nam
 
 ## Shared AST-match helpers
 
-`daslib/ast_match.das` exposes a small set of public helpers harvested from `linq_fold` + `sqlite_linq` during the 2026-05 refactor. Reach for these BEFORE writing a new `is X / as X` cascade — they capture the exact semantics each pattern was hand-rolling, with module-gating and generic-instantiation transparency baked in.
+`daslib/ast_match.das` exposes a small set of public helpers harvested from `linq_fold` + `sql_linq` (then `sqlite_linq`) during the 2026-05 refactor. Reach for these BEFORE writing a new `is X / as X` cascade — they capture the exact semantics each pattern was hand-rolling, with module-gating and generic-instantiation transparency baked in.
 
 | Helper | Signature | Purpose |
 |---|---|---|
@@ -141,7 +141,7 @@ Note adapters can still *emit* code referencing the contributor's symbols by nam
 | `qm_peel_ref2value` | `(var e : Expression?&) → void` | Single source of truth for `ExprRef2Value` peeling. Always call this instead of hand-rolling `while (... is ExprRef2Value)` or `if`-peel — see ["Peel ExprRef2Value before qmatch"](#peel-exprref2value-before-qmatch). |
 | `push_block_list` | `(var stmts, var blockExpr)` in `daslib/templates_boost.das` | Splices every statement from a `qmacro_block(...)` result into `stmts`, cloning each. See ["Push cluster consolidation"](#push-cluster-consolidation). |
 
-**When the patterns apply (and when they don't).** These helpers earn their keep in files that **probe AST shape** to route macro emission — `linq_fold`, `sqlite_linq`, `ast_match` itself. Files that only **emit code** without introspecting it — `decs_boost`, the emitter half of `templates_boost` — won't find adoption sites. Audit before mechanically searching: if a file has zero hand-rolled `is X / as X` call-cascades and zero qname construction, the patterns don't apply there.
+**When the patterns apply (and when they don't).** These helpers earn their keep in files that **probe AST shape** to route macro emission — `linq_fold`, `sql_linq`, `ast_match` itself. Files that only **emit code** without introspecting it — `decs_boost`, the emitter half of `templates_boost` — won't find adoption sites. Audit before mechanically searching: if a file has zero hand-rolled `is X / as X` call-cascades and zero qname construction, the patterns don't apply there.
 
 ## `qmatch` — predicate-style pattern matching
 
@@ -176,7 +176,7 @@ Pattern tags inside `qmatch(expr, <pattern>)`:
 
 Result is `QMatchResult` with `.matched : bool` and `.error : QMatchError` — captured bindings live in the pre-declared outer variables, NOT on the result struct. On match failure the bindings are left untouched.
 
-Canonical examples in `modules/dasSQLITE/daslib/sqlite_linq.das` — search for `qmatch(` for 37+ adoption sites. Tests in `tests/ast_match/test_qmatch_*.das` + `test_capture_*.das` exercise every tag and grammar form. Full pattern grammar lives in `daslib/ast_match.das`.
+Canonical examples in `daslib/sql_linq.das` — search for `qmatch(` for 37+ adoption sites. Tests in `tests/ast_match/test_qmatch_*.das` + `test_capture_*.das` exercise every tag and grammar form. Full pattern grammar lives in `daslib/ast_match.das`.
 
 **Not every probe fits qmatch.** Shapes with cross-statement constraints (e.g., "3 statements with specific types where push target equals res var and recordNames count matches sources count") exceed qmatch's grammar — fall back to hand-rolled `is X / as X` for those. Self-circular file dependencies are also out: `ast_match.das` itself can't use `qmatch` to define its own grammar.
 
@@ -302,7 +302,7 @@ return finalize_emission_stmts(topClone, ...)
 return finalize_emission_stmts(adapter.arrayTop, ...)
 ```
 
-PERF024 catches both shapes. Canonical annotated set (grows over time): `peel_lambda_rename_var`/`_replace_var`/`_rename_2vars` + `qm_extract_stmts` in `ast_match`, `push_block_list` + `apply_qmacro_template_function` in `templates_boost`, the `emit_*`/`finalize_emission_stmts` family in `linq_fold`, `push_bind`/`push_inline_id`/`push_inline_lit` in `sqlite_linq`.
+PERF024 catches both shapes. Canonical annotated set (grows over time): `peel_lambda_rename_var`/`_replace_var`/`_rename_2vars` + `qm_extract_stmts` in `ast_match`, `push_block_list` + `apply_qmacro_template_function` in `templates_boost`, the `emit_*`/`finalize_emission_stmts` family in `linq_fold`, `push_bind`/`push_inline_id`/`push_inline_lit` in `sql_linq`.
 
 **To mark your own function** — add `[clone(p1, p2)]` (one annotation per function, comma-separated param names). The annotation is registered C++-side, no `require` needed.
 
@@ -416,7 +416,7 @@ documented in `modules/dasSQLITE/API_REWORK.md` chunk-2 section is the
 cautionary tale: `_sql` shipped briefly with `canVisitArgument → false`
 overrides because a synthetic test seemed to show inner expansion not
 firing. The real cause was a missing `require daslib/linq_boost public`
-in `sqlite_linq.das` — without that, `_where` / `_select` weren't
+in `sql_linq.das` — without that, `_where` / `_select` weren't
 registered as call_macros at user-file scope, so they had nothing to
 expand into. Removing the override + adding the require made everything
 work. **If inner macros aren't expanding, look for a missing require

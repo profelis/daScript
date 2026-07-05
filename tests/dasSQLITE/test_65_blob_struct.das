@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // ──────────────────────────────────────────────────────────────────────────
 // @sql_blob — BLOB-backed columns through daslib/archive.
@@ -94,8 +94,7 @@ def test_blob_payload_with_array_table_nested(t : T?) {
         var snap = DeepSnap(seq <- [10, 20, 30, 40])
         snap.bag |> insert("alpha", 1)
         snap.bag |> insert("beta", 2)
-        snap.nested |> push(PointSnap(x = 1, y = 2))
-        snap.nested |> push(PointSnap(x = 5, y = 6))
+        snap.nested <- [PointSnap(x = 1, y = 2), PointSnap(x = 5, y = 6)]
 
         db |> insert(DeepRow(Id = 1, State <- snap))
 

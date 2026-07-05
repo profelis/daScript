@@ -2,7 +2,7 @@ options gen2
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Tutorial 11 — `take(n)` / `skip(n)`: LIMIT and OFFSET pagination.
 //

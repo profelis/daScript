@@ -7,7 +7,7 @@ expect 31400
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Schema says `Severity INTEGER NOT NULL`. User declares it as `string` — TEXT affinity.
 // SqlType mismatch is caught at typecheck via the static_if + concept_assert(false) emission.

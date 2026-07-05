@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 32 — `[sql_function]` user-defined SQL scalars.
 //
@@ -46,11 +46,11 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Enemy> {
-    var arr : array<Enemy>
-    arr |> emplace(Enemy(Id = 1, Name = "goblin", Hp = 100.0f, Armor = 10))
-    arr |> emplace(Enemy(Id = 2, Name = "ogre",   Hp = 800.0f, Armor = 30))
-    arr |> emplace(Enemy(Id = 3, Name = "dragon", Hp = 5000.0f, Armor = 60))
-    return <- arr
+    return <- [
+        Enemy(Id = 1, Name = "goblin", Hp = 100.0f, Armor = 10),
+        Enemy(Id = 2, Name = "ogre",   Hp = 800.0f, Armor = 30),
+        Enemy(Id = 3, Name = "dragon", Hp = 5000.0f, Armor = 60)
+    ]
 }
 
 def enemy_eq(a : Enemy; b : Enemy) : bool {
@@ -73,7 +73,7 @@ def enemies_eq(a : array<Enemy>; b : array<Enemy>) : bool {
 }
 
 def sort_by_id(var rows : array<Enemy>) : array<Enemy> {
-    rows |> sort() <| $(a, b) {
+    rows |> sort() $(a, b) {
         return a.Id < b.Id
     }
     return <- rows

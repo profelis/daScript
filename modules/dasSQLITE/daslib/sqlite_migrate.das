@@ -330,7 +330,7 @@ def try_migration_history(db : SqlRunner) : Result<array<MigrationRecord>, strin
     if (!(exists |> unwrap)) return ok(default<array<MigrationRecord>>, type<string>)
     return <- try_run_select(db,
         "SELECT version, description, applied_at FROM __schema_version ORDER BY version",
-        $(var stmt : sqlite3_stmt?) {},
+        $(var _stmt : sqlite3_stmt?) {},
         $(stmt : sqlite3_stmt?) {
             return MigrationRecord(
                 version = sqlite3_column_int(stmt, 0),
@@ -624,16 +624,32 @@ def struct_convert_field(var dst : string&; src : auto(SCF_S)) : void {
 // Disambiguators — primitive target from Option source. Beats both auto(T)←Option<T> and primitive←auto(S)
 // at the typer's specificity check, so ``Option<int> → int`` (etc.) routes here cleanly with NULL→default<T>.
 def struct_convert_field(var dst : int&; src : Option<auto(SCF_T)>) : void {
-    dst = int(src ?? default<SCF_T>)
+    static_if (typeinfo is_int(type<SCF_T>)) {
+        dst = src ?? default<SCF_T>
+    } else {
+        dst = int(src ?? default<SCF_T>)
+    }
 }
 def struct_convert_field(var dst : int64&; src : Option<auto(SCF_T)>) : void {
-    dst = int64(src ?? default<SCF_T>)
+    static_if (typeinfo is_int64(type<SCF_T>)) {
+        dst = src ?? default<SCF_T>
+    } else {
+        dst = int64(src ?? default<SCF_T>)
+    }
 }
 def struct_convert_field(var dst : float&; src : Option<auto(SCF_T)>) : void {
-    dst = float(src ?? default<SCF_T>)
+    static_if (typeinfo is_float(type<SCF_T>)) {
+        dst = src ?? default<SCF_T>
+    } else {
+        dst = float(src ?? default<SCF_T>)
+    }
 }
 def struct_convert_field(var dst : double&; src : Option<auto(SCF_T)>) : void {
-    dst = double(src ?? default<SCF_T>)
+    static_if (typeinfo is_double(type<SCF_T>)) {
+        dst = src ?? default<SCF_T>
+    } else {
+        dst = double(src ?? default<SCF_T>)
+    }
 }
 def struct_convert_field(var dst : string&; src : Option<auto(SCF_T)>) : void {
     dst = "{src ?? default<SCF_T>}"

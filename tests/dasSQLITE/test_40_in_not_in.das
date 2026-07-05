@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name="Users")]
 struct User {
@@ -71,10 +71,10 @@ def test_in_with_outer_where(t : T?) {
 [test]
 def test_in_with_inner_where_binds(t : T?) {
     var _db = SqlRunner()
-    let threshold = 100
+    let _threshold = 100
     let sql = _sql_text(_db |> select_from(type<User>)
                           |> _where(_.Id._in(_db |> select_from(type<Order>)
-                                                  |> _where(_.Total > threshold)
+                                                  |> _where(_.Total > _threshold)
                                                   |> _select(_.UserId))))
     t |> equal(sql,
         "SELECT \"Id\", \"Name\", \"Active\" FROM \"Users\" WHERE \"Id\" IN (SELECT \"UserId\" FROM \"Orders\" WHERE \"Total\" > ?)",

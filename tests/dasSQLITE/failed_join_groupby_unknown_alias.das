@@ -2,7 +2,7 @@ options gen2
 
 // `_join |> _group_by(_.<not-an-alias>)` rejects with a clear error message
 // listing the valid projection aliases. The fix path lives in push_group_key's
-// post-join branch (sqlite_linq.das): when `q.seenJoin` is true and the
+// post-join branch (sql_linq.das): when `q.seenJoin` is true and the
 // `_.<field>` name is not in `q.joinProjRecordNames`, emit a macro_error.
 //
 // The macro_error fires but the typer continues expanding the chain because
@@ -21,7 +21,7 @@ expect 30808
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name = "Cars")]
 struct Car {

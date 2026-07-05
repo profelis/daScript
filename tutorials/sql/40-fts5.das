@@ -2,7 +2,7 @@ options gen2
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 require daslib/fts5_query   // for in-memory text_match against the same query syntax
 
 // Tutorial 40 — FTS5 full-text search.
@@ -98,12 +98,7 @@ def main {
     // Useful for: scanning log lines, filtering arrays before bulk insert,
     // implementing custom highlighters.
     let lines = ["The quick brown fox", "the lazy dog", "quicksand boot"]
-    var hits : array<string>
-    for (line in lines) {
-        if (line |> text_match("quick OR fox")) {
-            hits |> push_clone(line)
-        }
-    }
+    let hits <- [for (line in lines); line; where line |> text_match("quick OR fox")]
     to_log(LOG_INFO, "in-memory match: {length(hits)} of {length(lines)} lines")
 
     // --- text_match on a non-FTS5 [sql_table] is a COMPILE ERROR --- nolint:STYLE014

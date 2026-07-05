@@ -19,18 +19,21 @@ Atomic groups of statements:
 ==============================================  ===================================================
 Form                                            Behavior
 ==============================================  ===================================================
-``db |> with_transaction() { ... }``            ``BEGIN`` / ``COMMIT`` (rolls back on panic)
+``db |> with_transaction() { ... }``            ``BEGIN`` / ``COMMIT`` (rolls back on early return)
 ``db |> with_transaction(mode) { ... }``        same, with SQLite-specific BEGIN modifier
 ``db |> try_transaction() { ... }``             non-panic; returns ``SqlError = Option<string>``
 ``db |> in_transaction()``                      status query: ``true`` if a txn is active
 ==============================================  ===================================================
 
 ``with_transaction`` emits ``BEGIN`` on entry, ``COMMIT`` on
-normal exit, and ``ROLLBACK`` on panic / early return via
-daslang's ``finally``. When nested inside an existing transaction
-it falls back to ``SAVEPOINT`` / ``RELEASE`` / ``ROLLBACK TO`` so
-user code can compose freely without SQLite's "no nested
-transactions" rule biting.
+normal exit, and ``ROLLBACK`` on early return (a block ``return``
+unwinds non-locally through ``finally``). A panic does NOT roll
+back --- daslang deliberately skips ``finally`` on panic; the open
+transaction's writes are discarded when the connection closes.
+When nested inside an existing transaction it falls back to
+``SAVEPOINT`` / ``RELEASE`` / ``ROLLBACK TO`` so user code can
+compose freely without SQLite's "no nested transactions" rule
+biting.
 
 Why two overloads instead of one optional parameter
 ===================================================
@@ -117,9 +120,9 @@ loops.
 
 The ``Option``-based ``try_transaction`` only converts SQL
 failures (``BEGIN`` / ``COMMIT`` errors) into ``some(errmsg)``. A
-panic from inside the block still rolls back and re-propagates ---
-wrap the block in your own ``try / recover`` if you want to convert
-a block panic into a ``SqlError`` value.
+panic from inside the block propagates without rolling back
+(``finally`` is skipped on panic) --- fallible steps inside a
+transaction should use the ``try_`` API forms.
 
 Why ``Option<string>`` instead of ``Result<void, string>``
 ==========================================================

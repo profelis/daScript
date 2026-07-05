@@ -2,10 +2,10 @@ options gen2
 
 require dastest/testing_boost public
 
-require math       // pulls math::normalize(float2/3/4) into scope — collision regression for `normalize` below
+require math       // nolint:STYLE030 — pulls math::normalize(float2/3/4) into scope — collision regression for `normalize` below
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // [sql_function] auto-registers the function against every opened SQL connection
 // and makes it visible to the `_sql` chain analyzer (rendered as `name(args)` SQL).

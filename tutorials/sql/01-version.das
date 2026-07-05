@@ -1,6 +1,5 @@
 options gen2
 
-require daslib/sql
 require sqlite/sqlite_boost
 
 [export]

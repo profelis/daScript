@@ -2194,7 +2194,7 @@ class private QMatchFunction : AstCallMacro {
 }
 
 // ── Shared AST-match helpers ────────────────────────────────────────────
-// Hand-rolled probes harvested from daslib/linq_fold.das + modules/dasSQLITE/daslib/sqlite_linq.das.
+// Hand-rolled probes harvested from daslib/linq_fold.das + daslib/sql_linq.das.
 // Reach for these BEFORE writing a new ``is X / as X`` cascade. For deeper structural matches use ``qmatch`` directly.
 
 def match_call_in_module(var expr : Expression?; name, modName : string) : ExprCall? {
@@ -2214,7 +2214,7 @@ def match_call_in_module(var expr : Expression?; name, modName : string) : ExprC
 
 def match_call_in_linq(var expr : Expression?; name : string) : ExprCall? {
     //! Match an ``ExprCall`` to ``name`` in the ``linq`` module. Thin wrapper on ``match_call_in_module``
-    //! kept for readability at the heavy-call-site files (linq_fold, sqlite_linq, decs_boost).
+    //! kept for readability at the heavy-call-site files (linq_fold, sql_linq, decs_boost).
     return match_call_in_module(expr, name, "linq")
 }
 

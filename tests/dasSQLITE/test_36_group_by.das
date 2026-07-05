@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 [sql_table(name="Users")]
 struct User {
@@ -139,12 +139,12 @@ def test_having_with_count_threshold(t : T?) {
 [test]
 def test_having_combined_full_query(t : T?) {
     var _db = SqlRunner()
-    let min_age = 25
-    let min_count = 1
+    let _min_age = 25
+    let _min_count = 1
     let sql = _sql_text(_db |> select_from(type<User>)
-                          |> _where(_.Age >= min_age)
+                          |> _where(_.Age >= _min_age)
                           |> _group_by(_.City)
-                          |> _having(_._1 |> length >= min_count)
+                          |> _having(_._1 |> length >= _min_count)
                           |> _order_by(_._0)
                           |> _select((City = _._0,
                                       N = _._1 |> length,

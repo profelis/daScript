@@ -24,10 +24,10 @@ Three requires::
 
     require daslib/sql
     require sqlite/sqlite_boost
-    require sqlite/sqlite_linq
+    require daslib/sql_linq
 
 The first two are the standard pair from tutorial 1. The third,
-``sqlite/sqlite_linq``, brings in the ``_sql`` and ``_sql_text`` call
+``daslib/sql_linq``, brings in the ``_sql`` and ``_sql_text`` call
 macros plus the ``select_from`` runtime entry. The abstract layer
 ``daslib/sql`` deliberately does *not* re-export sqlite-specific
 symbols --- each provider keeps its linq adapter in its own boost

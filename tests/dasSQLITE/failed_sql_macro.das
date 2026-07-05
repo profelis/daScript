@@ -10,7 +10,7 @@ expect 30341, 30928:2, 50503:24
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 require daslib/fts5_query   // for the bad22 case
 
 [sql_table(name="Cars")]
@@ -58,7 +58,7 @@ def main() {
 
     // _to_array() ordering is unchecked — it's a materializer-mode flag that
     // doesn't change emitted SQL, so any chain position is valid (see
-    // sqlite_linq.das comment by the _to_array peel).
+    // sql_linq.das comment by the _to_array peel).
 
     // 10. _having without _group_by — HAVING is meaningless without aggregation
     let bad10 <- _sql(db |> select_from(type<Car>) |> _having(_._1 |> length > 1))
@@ -96,9 +96,9 @@ def main() {
     // 16. Two joins in one chain (3+ table). Chunk 5 ships single-join
     //     only — the `q.joins` slot is one-deep. The second `_join`'s
     //     `on` must be a valid single-column equi-join (`==`), or
-    //     linq_boost rejects it before sqlite_linq's multi-join guard
+    //     linq_boost rejects it before sql_linq's multi-join guard
     //     fires; here we equi-join on `.Name` (cosmetically meaningless
-    //     but well-formed) so the diagnostic comes from sqlite_linq.
+    //     but well-formed) so the diagnostic comes from sql_linq.
     let bad16 <- _sql(db |> select_from(type<Car>)
                         |> _join(db |> select_from(type<Owner>),
                                  $(c : Car, o : Owner) => c.Id == o.CarId,
@@ -165,7 +165,7 @@ def main() {
     let bad26 <- _sql(db |> select_from(type<Car>) |> _select(string(_.Id, true)))
     // (Note: the "_in subquery without _select(_.Col)" diagnostic added in
     //  this round is also belt-and-suspenders — a daslang `contains` type-
-    //  check rejects mismatched element types before sqlite_linq even sees
+    //  check rejects mismatched element types before sql_linq even sees
     //  the chain in most realistic shapes. We keep the macro_error path
     //  live for the rare case where the row-vs-rowset shape type-checks
     //  but produces a multi-column subquery; constructing that test

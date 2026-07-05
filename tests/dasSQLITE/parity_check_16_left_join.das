@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/linq_boost
 require daslib/option
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 16 — every join shape (INNER, LEFT, RIGHT, FULL OUTER, CROSS).
 //

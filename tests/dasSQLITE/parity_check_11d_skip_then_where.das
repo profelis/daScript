@@ -5,7 +5,7 @@ require dastest/testing_boost public
 require daslib/sql
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Multi-Q lowering parity check: outer-Q `_where` over inner-Q `skip`.
 //
@@ -33,13 +33,13 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<Car> {
-    var arr : array<Car>
-    arr |> emplace(Car(Id = 1, Name = "BMW",   Price = 100))
-    arr |> emplace(Car(Id = 2, Name = "Audi",  Price = 200))
-    arr |> emplace(Car(Id = 3, Name = "Tesla", Price = 300))
-    arr |> emplace(Car(Id = 4, Name = "Lada",  Price = 50))
-    arr |> emplace(Car(Id = 5, Name = "Lambo", Price = 999))
-    return <- arr
+    return <- [
+        Car(Id = 1, Name = "BMW",   Price = 100),
+        Car(Id = 2, Name = "Audi",  Price = 200),
+        Car(Id = 3, Name = "Tesla", Price = 300),
+        Car(Id = 4, Name = "Lada",  Price = 50),
+        Car(Id = 5, Name = "Lambo", Price = 999)
+    ]
 }
 
 def cars_equal(a : array<Car>; b : array<Car>) : bool {
@@ -61,7 +61,7 @@ def parity_skip_then_where(t : T?) {
     // Audi=200, Tesla=300, Lambo=999 all > 100).
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> skip(2) |> _where(_.Price > 100))
         let m2 <- (db |> select_from(type<Car>) |> _order_by(_.Price) |> skip(2) |> _where(_.Price > 100))
@@ -79,7 +79,7 @@ def parity_skip_then_where_then_order_desc(t : T?) {
     // then order_descending(Price). All in outer Q after the skip's divert.
     with_sqlite(":memory:") $(db) {
         fixture_db(db)
-        var arr <- fixture_array()
+        let arr <- fixture_array()
 
         let m1 <- _sql(db |> select_from(type<Car>) |> _order_by(_.Price) |> skip(1)
                          |> _where(_.Price > 50)

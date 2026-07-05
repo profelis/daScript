@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // `@sql_column` rename across UPSERT (INSERT ... ON CONFLICT ... DO UPDATE SET).
 // The rename must surface on (a) the INSERT column list, (b) the ON CONFLICT

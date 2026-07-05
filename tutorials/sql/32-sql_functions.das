@@ -1,7 +1,7 @@
 options gen2
 
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 require math
 
 // Tutorial 32 — User-defined SQL scalar functions.
@@ -109,7 +109,7 @@ def main {
         // results can land in `array<float>`.
         let dmg <- (db |> try_run_select(
             "SELECT damage_formula(100.0, Armor, 1.5) FROM Enemies ORDER BY Id",
-            $(var stmt : sqlite3_stmt?) {},
+            $(var _stmt : sqlite3_stmt?) {},
             $(stmt : sqlite3_stmt?) : float {
                 return float(sqlite3_column_double(stmt, 0))
             })) |> unwrap
@@ -197,7 +197,7 @@ def sql_event(tag : string) : int {
     // Trivial demo hash — real code would do something useful.
     var h = 0
     for (c in tag) {
-        h = h * 31 + int(c)
+        h = h * 31 + c
     }
     return h
 }

@@ -89,7 +89,7 @@ them out of inner loops or use them as the indexed expression in a
 .. code-block:: das
 
     require sqlite/sqlite_boost
-    require sqlite/sqlite_linq
+    require daslib/sql_linq
     require math
 
     def damage_formula(base : float; armor : int; mult : float) : float {

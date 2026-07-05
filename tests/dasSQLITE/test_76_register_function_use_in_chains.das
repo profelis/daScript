@@ -4,7 +4,7 @@ require dastest/testing_boost public
 
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Registered functions should be usable in WHERE / ORDER BY / projection
 // just like a built-in scalar. We verify that a deterministic UDF embeds

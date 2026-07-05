@@ -4,7 +4,7 @@ require dastest/testing_boost public
 require daslib/linq_das
 require daslib/sql
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // linq_das over a SQL source: `from c : Car in db` → `from_in(db, type<Car>)` → `select_from`, which
 // `_fold` routes to `_sql` (WHERE/SELECT pushdown). The C# range variable is spliced verbatim; `_sql`

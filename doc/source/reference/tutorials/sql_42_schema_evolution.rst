@@ -31,7 +31,7 @@ One struct per known historical shape
 
     require daslib/sql
     require sqlite/sqlite_boost
-    require sqlite/sqlite_linq
+    require daslib/sql_linq
 
     [sql_table(name = "Logs",
                schema_from = "tests/dasSQLITE/test_data/schema_from_v1.db")]

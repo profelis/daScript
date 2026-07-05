@@ -6,7 +6,7 @@ require daslib/sql
 require daslib/linq
 require daslib/linq_boost
 require sqlite/sqlite_boost
-require sqlite/sqlite_linq
+require daslib/sql_linq
 
 // Parity check for tutorial 14 — `_group_by` and `_having`.
 
@@ -31,15 +31,15 @@ def fixture_db(db : SqlRunner) {
 }
 
 def fixture_array() : array<User> {
-    var arr : array<User>
-    arr |> emplace(User(Id = 1, Name = "Alice", City = "NYC",     Age = 30, Salary = 100))
-    arr |> emplace(User(Id = 2, Name = "Bob",   City = "NYC",     Age = 25, Salary = 80))
-    arr |> emplace(User(Id = 3, Name = "Carol", City = "Chicago", Age = 40, Salary = 120))
-    arr |> emplace(User(Id = 4, Name = "Dave",  City = "Chicago", Age = 35, Salary = 90))
-    arr |> emplace(User(Id = 5, Name = "Eve",   City = "Chicago", Age = 50, Salary = 200))
-    arr |> emplace(User(Id = 6, Name = "Frank", City = "Boston",  Age = 28, Salary = 70))
-    arr |> emplace(User(Id = 7, Name = "Adam",  City = "NYC",     Age = 30, Salary = 110))
-    return <- arr
+    return <- [
+        User(Id = 1, Name = "Alice", City = "NYC",     Age = 30, Salary = 100),
+        User(Id = 2, Name = "Bob",   City = "NYC",     Age = 25, Salary = 80),
+        User(Id = 3, Name = "Carol", City = "Chicago", Age = 40, Salary = 120),
+        User(Id = 4, Name = "Dave",  City = "Chicago", Age = 35, Salary = 90),
+        User(Id = 5, Name = "Eve",   City = "Chicago", Age = 50, Salary = 200),
+        User(Id = 6, Name = "Frank", City = "Boston",  Age = 28, Salary = 70),
+        User(Id = 7, Name = "Adam",  City = "NYC",     Age = 30, Salary = 110)
+    ]
 }
 
 def sort_by_city_age(var rows : array<auto(R)>) : array<R> {
