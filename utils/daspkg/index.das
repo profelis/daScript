@@ -980,9 +980,10 @@ def cmd_update_index(root : string) : int {
                 index[name].latest_version = strip(tag_output)
             }
 
-            // get last commit date
+            // get last commit date; --date=short --format=%cd, NOT %cs — pre-2.25 git
+            // has no %cs and passes unknown placeholders through LITERALLY
             var date_output : string
-            let date_exit = run_cmd("git -C \"{tmp_dir}\" log -1 --format=%cs", date_output)
+            let date_exit = run_cmd("git -C \"{tmp_dir}\" log -1 --date=short --format=%cd", date_output)
             if (date_exit == 0 && !empty(strip(date_output))) {
                 index[name].last_updated = strip(date_output)
             }
