@@ -1,7 +1,7 @@
 options gen2
 
 // Per-box TB (token-block) measurement harness for the repack-tier batched Q8·Q8 GEMM
-// (arm64-laneq / x64-avx2-repack). TB is a RUNTIME knob (set_q8_token_block) read by the repack
+// (arm64-gen / x64-gen). TB is a RUNTIME knob (set_q8_token_block) read by the repack
 // batch kernels: it tiles the token loop so a TB×n activation slice stays cache-resident and is
 // reused across the d/4 weight groups, instead of re-streaming the whole weight matrix once per
 // token-block. Physics: TB_opt ≈ cache/n — n
@@ -18,8 +18,7 @@ options gen2
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default          // nolint:STYLE030 — portable fallback + [init] ordering
-require dasllama/dasllama_math_aarch64_neon      // nolint:STYLE030 — registers the arm64-laneq backend at [init]
-require dasllama/dasllama_math_x64_avx           // nolint:STYLE030 — registers the x64-avx2-repack backend at [init]
+require dasllama/dasllama_math_gen               // nolint:STYLE030 — registers the arm64-gen/x64-gen repack backends at [init]
 require dasllama/dasllama_quant
 require daslib/jobque_boost
 require math
@@ -55,7 +54,7 @@ def all_equal(a, b : array<float>; len : int64) : bool {
 // best-of-N. Returns the winning TB (or -1 if a variant broke the bit-identity gate).
 def bench_shape(name : string; n, d : int64) : int64 {
     let nb = n / 32l
-    // Q8 weights, repacked into the laneq interleaved layout (load-time cost, done once, untimed).
+    // Q8 weights, repacked into the gen interleaved layout (load-time cost, done once, untimed).
     var w : array<float>
     fillf(w, n * d)
     var qt <- quantize_q8_0(w, n * d)
@@ -168,14 +167,14 @@ def bench_shape(name : string; n, d : int64) : int64 {
 [export]
 def main {
     if (!jit_enabled()) {
-        print("skipped: interpreted — the laneq backend (the only TB consumer) registers under -jit only\n")
+        print("skipped: interpreted — the gen repack backend (the only TB consumer) registers under -jit only\n")
         return
     }
     with_job_que() {
         setup_dasllama_jobque_()
         let need_repack = select_matmul_backend_for_load()
         print("active backend: {active_kernel_backend()} (needs_repack={need_repack})\n")
-        let repack_backend = get_architecture_name() == "arm64" ? "arm64-laneq" : "x64-avx2-repack"
+        let repack_backend = get_architecture_name() == "arm64" ? "arm64-gen" : "x64-gen"
         if (active_kernel_backend() != repack_backend) {
             print("skipped: {repack_backend} backend not active (needs its arch + jit) — TB is only read by the repack-tier batch kernels\n")
             return

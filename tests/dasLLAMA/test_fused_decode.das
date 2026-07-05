@@ -140,7 +140,7 @@ def private fused_vs_std_bit_exact(t : T?; tr : Model) {
 
 // stories15M's head_size (48) gates the ATTENTION chain off — this twin runs a real GGUF with
 // head_size 64, so both chains (qkv→attn→wo AND w1/w3→w2) take the fused path. Two passes: the
-// auto-selected backend (arm64-laneq on an M1 — the interleaved rows core), then a fresh load
+// auto-selected backend (arm64-gen on an M1 — the interleaved rows core), then a fresh load
 // under a "portable" pin — the rows core every host shares, and the EPYC box's profile-pinned
 // decode config; without the pin an x64 auto-select picks an intrinsic tier with no rows core
 // and the fused gate silently falls back (the A/B would compare std vs std).

@@ -6,8 +6,7 @@ require daslib/fio
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs and false-flags this as unused
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default  // registers the portable Q8·Q8 backend at [init] (the fallback everywhere)
-require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backends at [init]; no-op off-ARM
-require dasllama/dasllama_math_x64_avx  // registers the x86-64 dot4 Q8·Q8 backend at [init]; no-op off-x64
+require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backend at [init]; no-op off-ARM
 require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
 require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
@@ -3445,7 +3444,7 @@ def private moe_gather_rows(var s : Session; b0, cnt, dim, k : int64) {
 // into EXACT Q8 blocks in the given scratch: q[j] = the doubled-e2m1 LUT value (already an int8),
 // scale = e8m0_half(e) — no requantization error, every value representable. Grouped prefill runs
 // the proven Q8 batch GEMM off this scratch (one expansion per touched expert amortizes over the
-// whole bucket). On a backend with mx4_expand_interleaved (arm64-laneq, arm64-gen) the mx planes
+// whole bucket). On a backend with mx4_expand_interleaved (the gen tiers) the mx planes
 // are ALREADY interleaved at the backend's mr (repack_mx4_stacks), and the interleaved nibble
 // order maps byte-for-byte onto the interleaved Q8 order — nibble byte `off` (0..16*mr) of
 // block-group bg lands at q8[bg*32*mr + off] (low nibbles, k-chunk 0..15) and

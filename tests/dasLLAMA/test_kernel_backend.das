@@ -3,12 +3,12 @@ options gen2
 require dastest/testing_boost public
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default        // registers the "portable" backend at [init]
-require dasllama/dasllama_math_aarch64_neon   // registers "arm64-sdot" / "arm64-laneq" on arm64+jit
-require dasllama/dasllama_math_x64_avx        // registers "x64-avx2*" (+repack/acc8/ps) on x86-64+avx2+jit
+require dasllama/dasllama_math_aarch64_neon   // registers "arm64-sdot" on arm64+jit
+require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — registers "arm64-gen"/"x64-gen" (the repack tier) when dasLLVM is mounted
 
 // The kernel-backend registry must self-populate at [init]: the portable Q8·Q8 backend is always
 // registered (the fallback everywhere), and one is auto-activated as the row-major default. A repack
-// backend (arm64 laneq / x64 grp4) is only activated by select_matmul_backend_for_load. No model file needed.
+// backend (arm64-gen / x64-gen) is only activated by select_matmul_backend_for_load. No model file needed.
 
 def private registered(name : string) : bool {
     for (n in kernel_backend_names()) {
@@ -111,19 +111,19 @@ def test_batch_backend_pin(t : T?) {
         // a repack donor on a row-major active backend is layout-incompatible: warn + keep
         var tested_reject = false
         for (n in kernel_backend_names()) {
-            if (n == "arm64-laneq" || n == "x64-avx2-repack") {
+            if (n == "arm64-gen" || n == "x64-gen") {
                 select_batch_backend(n)
                 t |> equal(active_batch_backend(), "portable", "repack donor rejected on row-major active")
                 tested_reject = true
             }
         }
         if (!tested_reject) {
-            to_log(LOG_WARNING, "test_batch_backend_pin: no repack donor (arm64-laneq/x64-avx2-repack) registered on this build — layout-guard path not exercised\n")
+            to_log(LOG_WARNING, "test_batch_backend_pin: no repack donor (arm64-gen/x64-gen) registered on this build — layout-guard path not exercised\n")
         }
         // a row-major donor takes the batch slots and survives re-activation
         var tested_accept = false
         for (n in kernel_backend_names()) {
-            if (n == "arm64-sdot" || n == "x64-avx2-acc8") {
+            if (n == "arm64-sdot") {
                 select_batch_backend(n)
                 t |> equal(active_batch_backend(), n, "row-major donor takes the batch slots")
                 select_kernel_backend("portable")   // re-activate: the standing pin must re-apply
@@ -132,7 +132,7 @@ def test_batch_backend_pin(t : T?) {
             }
         }
         if (!tested_accept) {
-            to_log(LOG_WARNING, "test_batch_backend_pin: no row-major donor (arm64-sdot/x64-avx2-acc8) registered on this build — batch-pin override/survival not exercised\n")
+            to_log(LOG_WARNING, "test_batch_backend_pin: no row-major donor (arm64-sdot; x64 has none — its row-major default is portable) registered on this build — batch-pin override/survival not exercised\n")
         }
         // clearing the pin restores whole-backend slots on the next activation
         select_batch_backend("")

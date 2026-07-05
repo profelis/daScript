@@ -1,5 +1,11 @@
 # AVX kernel matrix — VNNI / AVX-512 tiers (default OFF, unmeasured)
 
+> **HISTORICAL (superseded 2026-07-04).** The whole matrix — and its host file
+> `dasllama_math_x64_avx.das`, plus `harness/avx_matrix_probe.das` / `mx4x64_probe.das` —
+> was DELETED after the generated GEMM family (`x64-gen`, per-ISA fallback chains incl.
+> VNNI/AVX-512 bias128 tiles) out-performed every hand tier on EPYC and SPR silicon.
+> Kept as the design record of the hand-tier exploration.
+
 Session notes + runbook for the AVX kernel matrix (built 2026-07-03, commit `cca44fc30` on
 `bbatkin/dasllama-mxfp4-x64`). Companion to `x64_arch.md` (which carries the backend registry
 architecture and the shipped-backend story; its backend table includes the matrix rows).

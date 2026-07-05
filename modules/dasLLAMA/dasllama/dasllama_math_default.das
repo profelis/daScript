@@ -10,7 +10,7 @@ require math
 
 // The PORTABLE Q8·Q8 kernel backend — auto-vectorized dot_q8q8, no repack (row-major weights). It is
 // the default/fallback backend on every host, registered at [init] with the lowest priority; a platform
-// module (dasllama_math_aarch64_neon, dasllama_math_x64_avx) registers a higher-priority backend that
+// module (dasllama_math_aarch64_neon, dasllama_math_gen) registers a higher-priority backend that
 // wins the auto-select where its ISA kernels are available. dasllama_math owns the registry + the public
 // matmul wrappers; this module supplies the portable kernels and registers them.
 

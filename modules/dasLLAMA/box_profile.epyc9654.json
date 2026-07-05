@@ -19,8 +19,7 @@
   "q8_token_block": 128,
   "matmul_min_chunk_rows": 16,
   "matmul_min_chunk_rows_gemv": 128,
-  "backend": "portable",
-  "batch_backend": "x64-avx512vnni"
+  "backend": "portable"
  },
  "rope_scaled_neox_tab": "plain",
  "softmax": "vec8",

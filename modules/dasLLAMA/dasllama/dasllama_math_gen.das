@@ -155,7 +155,7 @@ def q8q8_tile_gen(var yp : float?; wg : int8 const?; sg : float const?; xqp : in
 }
 
 //! mr-generalized Q8 interleave repack — the q8q8_repack_type(mr) layout for any mr
-//! (repack_q8q8_neon is the mr=4 instance: same loops, byte-identical output there). mr-row
+//! (mr=4 reproduces the old hand arm64-laneq interleave byte-for-byte). mr-row
 //! groups, dword-group interleave (4 k-bytes per row per group), f32 scales interleaved per
 //! block; group bytes biased by wbias (the bias128 vpdpbusd stamps bake w^0x80; tail rows
 //! stay row-major AND unbiased — the sdot4x4 tail path reads them as plain s8). Runs once
@@ -216,8 +216,8 @@ def private repack_q8q8_gen(var wp : int8?; var sp : float?; n, d : int64) {
     repack_q8q8_grp(wp, sp, n, d, int64(q8q8_layout_gen()), int64(q8q8_wbias_gen()))
 }
 
-//! mr-generalized MXFP4 plane repack — repack_mx4_neon is the mr=4 instance (same loops,
-//! byte-identical output there). Nibble bytes interleave [dword-group j][row r][4 bytes]
+//! mr-generalized MXFP4 plane repack (mr=4 reproduces the old hand arm64-laneq mx
+//! interleave byte-for-byte). Nibble bytes interleave [dword-group j][row r][4 bytes]
 //! per block (16*mr bytes per block-group — the layout whose nibble order maps byte-for-byte
 //! onto the grp<mr> Q8 order, see expand_mx4_region_q8), E8M0 scale bytes mr-per-block; tail
 //! rows (d % mr) stay row-major. Public: the probes repack per-variant copies with an
@@ -309,9 +309,11 @@ def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?;
     }
 }
 
-// q8q8_batch_kernel_neon_laneq with the hand tile swapped for the generated one — traversal,
-// token-blocking, chunking and tails identical (see the original for the design notes), except
-// strides come off the layout companion: at mr=4 this is the original byte-for-byte, any other
+// The interleaved batch GEMM (grew out of the hand laneq batch kernel, tile swapped for the
+// generated one). Token-blocked: TB tokens outer, groups inner, so the TB×n activation slice
+// stays L2-resident and is reused across this thread's groups instead of re-streaming the whole
+// activation once per group (effective_token_block clamps TB to the per-box L2 budget — above
+// ~L2/n the slice spills and prefill cliffs). Strides come off the layout companion: any
 // stamped mr walks grp<mr> groups and runs its token tail through the generic dot. For a
 // bias128 stamp the bsums plane (−128·Σx i32 per (token, block) — the tile's acc-init
 // correction) is built once per call before dispatch: O(ntok·n), noise against the dots'

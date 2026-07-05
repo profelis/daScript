@@ -15,7 +15,7 @@ options gen2
 
 require dasllama/dasllama_math   // nolint:STYLE030 — side-effect: loads the *_template kernels for the cross-module scan
 require dasllama/dasllama_math_default   // nolint:STYLE030 — dot_q8q8_template lives here
-require dasllama/dasllama_math_aarch64_neon   // laneq4x4 template + backend registration (pin for the repack)
+require dasllama/dasllama_math_aarch64_neon   // laneq4x4 template (the repack backend "arm64-gen" registers via dasllama_common's math_gen require)
 require dasllama/dasllama_quant  // quantize templates + the Q4/Q8 reference quantizers
 require dasllama/dasllama_common // the runtime-knob getters (the profile's "runtime" section snapshots them)
 require dasllama/dasllama_tune   // [dasllama_grid] emitter
@@ -978,7 +978,10 @@ def bench_laneq4x4() : string {
     for (i in range(int(d * nb))) {
         refs[i] = wq.scales[i]
     }
-    pin_kernel_backend("arm64-laneq")             // activates the repack fn the next call uses
+    pin_kernel_backend("arm64-gen")               // activates the repack fn the next call uses; the
+                                                  // arm64 default stamp is mr=4 — byte-identical to
+                                                  // the laneq4x4 tile's expected interleave (the
+                                                  // correctness gate below catches any mr drift)
     repack_q8q8_weight(wq.q, wq.scales, 0l, n, d)
     var xf : array<float>
     xf |> resize(int(ntok * n))

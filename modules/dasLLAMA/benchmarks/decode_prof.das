@@ -205,7 +205,7 @@ def main() {
     let p = max(int64(cfg.prefill), 8l)
     let n = max(int64(cfg.ngen), 1l)
     let p2 = int64(cfg.prefill2)
-    // backend pin for A/B on one binary (e.g. portable vs x64-avx2-repack) — must land BEFORE
+    // backend pin for A/B on one binary (e.g. portable vs x64-gen) — must land BEFORE
     // load_gguf: select_matmul_backend_for_load honors the pin at load, which decides repack
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
         pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))

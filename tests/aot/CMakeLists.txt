@@ -104,7 +104,6 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_math.das
     modules/dasLLAMA/dasllama/dasllama_math_default.das
     modules/dasLLAMA/dasllama/dasllama_math_aarch64_neon.das
-    modules/dasLLAMA/dasllama/dasllama_math_x64_avx.das
     modules/dasLLAMA/dasllama/dasllama_quant.das
     modules/dasLLAMA/dasllama/dasllama_gguf.das
     modules/dasLLAMA/dasllama/dasllama_unicode.das

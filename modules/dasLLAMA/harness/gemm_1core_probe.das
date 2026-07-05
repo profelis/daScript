@@ -12,7 +12,6 @@ options _jit_fast_math = true   // match the end-to-end config AND ggml's -O3 FP
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default
-require dasllama/dasllama_math_x64_avx
 require dasllama/dasllama_math_aarch64_neon
 require dasllama/dasllama_math_gen
 require dasllama/dasllama_quant

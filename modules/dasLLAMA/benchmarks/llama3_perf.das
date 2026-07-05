@@ -44,7 +44,7 @@ def main {
     if (!empty(args) && ends_with(args[length(args) - 1], ".gguf")) {
         path = args[length(args) - 1]
     }
-    // backend pin for A/B on one binary (e.g. x64-avx2 row-major vs x64-avx2-repack) — must land
+    // backend pin for A/B on one binary (e.g. portable row-major vs x64-gen) — must land
     // BEFORE load_gguf: select_matmul_backend_for_load honors the pin at load, which decides repack
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
         pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))

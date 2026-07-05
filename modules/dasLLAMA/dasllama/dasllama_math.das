@@ -476,7 +476,7 @@ def get_disp_inline() : int64 => g_disp_inline
 // context and call through a function pointer (g_mm_q8q8 / _batch / _group3). A *backend* is a named set
 // of those three kernels + a weight repack (KernelBackend); each ISA module registers its backend(s) at
 // [init] — dasllama_math_default = the portable fallback, dasllama_math_aarch64_neon = arm64 SDOT,
-// dasllama_math_x64_avx = x64 VNNI (later). Dispatch is at the MATMUL level — a backend owns its whole
+// dasllama_math_gen = the generated GEMM tier (arm64-gen / x64-gen, load-select). Dispatch is at the MATMUL level — a backend owns its whole
 // matmul, threading and tiling included — so the pointer is read in the main context, never inside a
 // worker. Kernels take raw pointers (a function pointer can't carry the `array<T> | #` owning-or-view
 // union), so the array->pointer extraction lives in the wrappers.
@@ -564,12 +564,12 @@ struct KernelBackend {
     // stub, and the fused multi-stage decode falls back to the per-op dispatch path.
     mm_rows : MatmulQ8Q8RowsFn = @@q8q8_unset_rows
     needs_repack : bool
-    // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the laneq byte-for-byte
-    // expand map (expand_mx4_region_q8's direct-interleave branch): nibble byte `off` of block-
-    // group bg -> q8[bg*128 + off] / q8[bg*128 + 64 + off], scale bytes 1:1 positional. True only
-    // for arm64-laneq. When false on a needs_repack backend (x64 grp4: repack_mx4 is identity and
-    // the Q8 interleave is block-granular), grouped prefill expands row-major and repacks the
-    // scratch through `repack` instead.
+    // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the interleaved
+    // byte-for-byte expand map (expand_mx4_region_q8's direct-interleave branch): nibble byte
+    // `off` of block-group bg maps positionally onto the interleaved Q8 bytes, scale bytes 1:1.
+    // True for the gen tiers (mr off the layout companion; mr=4 = the old laneq contract). When
+    // false on a needs_repack backend (mx planes left row-major), grouped prefill expands
+    // row-major and repacks the scratch through `repack` instead.
     mx4_expand_interleaved : bool = false
     // The backend's mx4_batch beats expand-to-Q8 + Q8 batch, so grouped MoE prefill should dispatch
     // matmul_mx4q8_batch instead of expand_mx4_region_q8 (x64: the expansion's 3·d·n Q8 scratch
@@ -734,7 +734,7 @@ def select_kernel_backend(name : string) {
 }
 
 //! Pin the active backend to `name` (forces it; suppresses auto-select on later registrations). For A/B
-//! benchmarking on one binary — e.g. pin "arm64-sdot" to measure the row-major baseline against laneq.
+//! benchmarking on one binary — e.g. pin "arm64-sdot" to measure the row-major baseline against the gen tier.
 def pin_kernel_backend(name : string) {
     // Reject an unknown name rather than sticking an invalid pin: a bad pin would suppress
     // auto-activation AND keep select_matmul_backend_for_load from picking the best (repack) backend,
@@ -756,7 +756,7 @@ def clear_kernel_backend_pin() {
 
 //! Pin the BATCH-shaped kernel slots (prefill GEMM + mx4 batch) to backend `name`, keeping the
 //! active backend's GEMV slots — the hybrid for boxes where decode and prefill prefer different
-//! backends (EPYC 9654: portable GEMV + x64-avx2-acc8 batch). The pin survives later backend
+//! backends (e.g. portable GEMV + a row-major donor's batch tiles). The pin survives later backend
 //! (re)selection, including select_matmul_backend_for_load. `""` clears it (next activation
 //! restores whole-backend slots). The donor must read the active backend's weight layout —
 //! a layout-incompatible or unknown donor logs a warning and leaves the batch slots alone.

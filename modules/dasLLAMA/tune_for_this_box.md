@@ -16,7 +16,7 @@ finish it first; tuning an incorrect kernel is worse than pointless).
 | Axis | Knob | Bound when | Consumer |
 |---|---|---|---|
 | Kernel backend (ISA) | auto by priority; `pin_kernel_backend(name)` for A/B; loader picks repack backends; profile `runtime.backend` pins | runtime | `matmul_q8q8*` wrappers |
-| Batch backend (hybrid) | `select_batch_backend(name)` / profile `runtime.batch_backend` / env `DASLLAMA_PIN_BATCH_BACKEND` (benches) — overrides ONLY the batch-shaped slots (prefill GEMM + mx4 batch) from a layout-compatible donor, GEMV slots stay with `runtime.backend`. For boxes where decode and prefill prefer different backends (EPYC 9654: portable GEMV + acc8 batch). Survives load-time re-select | runtime | the batch matmul wrappers |
+| Batch backend (hybrid) | `select_batch_backend(name)` / profile `runtime.batch_backend` / env `DASLLAMA_PIN_BATCH_BACKEND` (benches) — overrides ONLY the batch-shaped slots (prefill GEMM + mx4 batch) from a layout-compatible donor, GEMV slots stay with `runtime.backend`. For boxes where decode and prefill prefer different backends (e.g. portable GEMV + a row-major donor's batch). Survives load-time re-select | runtime | the batch matmul wrappers |
 | Loop hints per kernel (`vectorize_width` × `unroll_count`) | `box_profile.json` flat keys, read at **compile time** by `[tuned]` | compile (JIT re-keys automatically) | all 16 `[tuned]` kernels: dot, axpy, add/mul/scale_inplace, copy_floats, softmax(+_sink), rmsnorm, dot_q4, dot_q8q8, dot_mx4q8, quantize_q8_0_into_ptr, rope_scaled_neox_tab, gemm_f32_uk_4x16, dot_q8q8_laneq4x4 |
 | Token block `TB` | `set_q8_token_block(n)` (default 128) / profile `runtime.q8_token_block` | runtime | the repack-tier batch kernel only |
 | L2 budget (TB cliff guard) | `set_q8_l2_budget(bytes)` (default 4 MB — provisional, one M1 Max) / profile `runtime.q8_l2_budget` | runtime | `effective_token_block(tb, n) = clamp(tb, 1, budget/n)` (dasllama_math.das) |
@@ -139,8 +139,8 @@ TB falls off hard once `TB × n` spills (+13% → +46%); the knee moves down as 
 `effective_token_block` guard as pure insurance (inert at defaults), **not** a per-shape TB
 map (there was ~0% to capture).
 
-**On x64:** the harness pins `arm64-laneq` and skips cleanly elsewhere — when an x64
-token-blocked kernel exists, generalize the pin (or copy the harness). Re-derive the budget
+**On x64:** the harness pins the gen repack tier (`arm64-gen` / `x64-gen`) and skips
+cleanly where it isn't registered. Re-derive the budget
 from the *measured* cliff, not the spec sheet: x64 cache hierarchy differs in kind (small
 private L2 per core + large shared L3, vs M1's big shared L2), so which level bounds the
 re-streamed slice is an empirical question. Expect the cliff shape, find its knee, set
@@ -194,7 +194,7 @@ other models. This is the kernel scoreboard; `prefill_perf.das` is the end-to-en
    recompile a consumer and confirm the `dasllama_tune:` log lines → re-run an end-to-end
    bench to see if it moved anything. **A "neutral" verdict here is only valid per-backend:
    `[tuned]` perms bite ONLY on the portable-tier kernels, so an intrinsic auto-backend
-   (e.g. `x64-avx2-repack`) masks the profile entirely. Run the backend ladder
+   (e.g. `x64-gen`) masks the profile entirely. Run the backend ladder
    (`DASLLAMA_PIN_BACKEND` per rung, profile ON, bracketed controls) before concluding —
    on the EPYC 9654 the profile was "neutral" under auto but +34% on portable
    (77→104 t/s), flipping portable from worst backend to best and beating auto by ~15%.
