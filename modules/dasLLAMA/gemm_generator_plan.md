@@ -762,6 +762,25 @@ see below).
 - NT/streaming weight loads for the fat w13/w2 batch streams (the mm_ffn 1.42x note) — now
   expressible as a perm knob on the x64 legs.
 
+**TIGHTEN EMISSION (Boris, 2026-07-04: "the biggest thing" — the follow-up session(s)
+agenda).** The generator wins on structure; the next wins are inside the emitted lattice:
+
+1. **bias128 repack for vpdpbusd** (above) — kills the per-dot VPSIGNB, ~28% of the busd
+   dot-stage µops; layout-companion field, exact.
+2. **The kstep4@512 collapse** (SPR scout sweep: busd512 kstep2 88.3 vs kstep4_nrsplit2 63.0
+   GMAC/s): diagnose via disasm — spills? scheduling? If it's acc pressure, the budget rail
+   is too permissive at 512; if scheduling, the block-emission order needs a k-interleave.
+3. **Broadcast amortization**: one vpbroadcastd per dot today (96/tile) — an 8-byte k-group
+   layout (qword broadcast serving 2 dword-groups) halves them; pairs naturally with the
+   future smmla family's 2-token pairing. Layout-companion territory, new `kgroup` knob.
+4. **Weight-load/dequant fusion on x64 mx4**: the nibble->pshufb->sign chain re-derives |w|
+   per lookup; a biased-LUT variant (bake |lut| + sign plane) could drop abs entirely.
+5. Per-slot perms (M4 open item): the batch tile and the gemv core want different winners
+   already (SPR: gkstep2 helps gemv, kstep2 tile) — one manifest entry per SLOT family.
+6. New dot families when silicon arrives: smmla/i8mm (the parked branch, the other Mac),
+   SME (if that Mac is M4), AMX (the lcpp Intel ceiling — tile ISA, biggest lift, biggest
+   prize), vpdpbssd on Sierra-Forest-class metal.
+
 ## M4 slice G (2026-07-04, Zen2 3990X + M1 Max) — the witness five-function stamp + x64-gen
 
 **The witness closes the stamp** (`q8q8_family_live() : bool`, the fifth companion): reference
