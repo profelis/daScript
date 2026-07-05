@@ -1183,6 +1183,23 @@ production (multi-core, DRAM-streamed); vector rows never diverged. Candidate fi
 a multi-core/streaming tune leg, an end-to-end confirm pass in the tuner, or an eligibility
 rail demoting tile-family rows that need cache residency.
 
+**→ RESOLVED (2026-07-05, Boris picked the e2e confirm pass; SHIPPED same day):**
+`tune_mode_run` no longer writes a divergent crown blind. After the merged winner is picked:
+(1) a compile-only child (`GEN_TUNE_COMPILE_ONLY=1`, `DAS_TUNE_MODE=normal`, no manifest)
+prints the `llvm_tune: q8q8_tile_gen <- … (fallback)` stamp line — the per-ISA fallback this
+box would resolve to; (2) winner == fallback ⇒ write as before (the common case, zero new
+cost beyond the child compile); (3) winner ≠ fallback ⇒ the challenger must BEAT the fallback
+in a real-model prefill A/B — `harness/tune_confirm_prefill.das` children (512-tok synthetic
+prefill, production stamps + box_profile knobs, `_jit_fast_math` parity), interleaved F/W ×2
+best-of, challenger needs > ×1.02, wrong-stamp or crashing child scores 0 (a SIGILL-ing
+manifest-forced stamp = a rejection, by construction) — winner confirmed ⇒ written, else the
+FALLBACK is pinned explicitly (clears stale entries). No `DASLLAMA_CONFIRM_MODEL` env set ⇒
+the divergent crown is NOT written and the run says how to confirm. First live run (M1 Max,
+135M): the microbench crowned `kstep4_nrsplit2_mr8_gkstep4` (the slice-B +3.3% iso shape) but
+e2e it made only +2.0% (4328 vs 4244) — under the bar, kstep2 pinned. The guard bites on its
+first outing: iso wins shrink e2e, and sub-2% doesn't displace a fleet-proven default. On SPR
+this same pass would have rejected the amx crown at ~0.5× emphatically.
+
 **The arch ladder (Boris's ask, same session — full CSV in the session scratchpad):** 4 models
 × 3 ISA tiers × both engines × T{8,24}, both engines genuinely tier-limited (das: explicit
 host-triple + DAS_JIT_X64_FORCE_FEATURES + per-tier manifest — the cross-triple rail executes

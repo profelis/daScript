@@ -34,6 +34,8 @@ require dasllama/dasllama_quant
 require llvm/daslib/llvm_tune
 require daslib/random
 require daslib/fio   // has_env_variable: the compile-only mint gate (slice J recipe)
+require daslib/strings_boost   // split — the confirm pass parses child output
+require daslib/command_line    // get_das_exe — the confirm pass spawns daslang children
 require math
 require strings
 
@@ -462,6 +464,147 @@ struct VBuf {
     s : array<float>
 }
 
+// ===== the e2e confirm pass (the SPR amx lesson: a 1-core crown must prove itself) =====
+// The 1-core fixtures rank kernels in a regime real prefill never runs (one lane, no
+// dispatch rendezvous, cache-warm weights) — on SPR they crowned amx_int8 while the same
+// stamp lost end-to-end prefill 1.7-2.2x at every T. So a winner that DIVERGES from the
+// per-ISA fallback default must beat it in a real-model prefill A/B (production stamps +
+// box_profile knobs, interleaved, a crashing challenger = a rejection) before
+// tune_manifest_set ships it. A winner that IS the fallback writes as before — the
+// microbench keeps doing the ranking; the confirm only gates the unusual crown.
+
+let CONFIRM_MARGIN = 1.02lf   // the challenger must beat the fallback e2e by >2%
+let CONFIRM_ROUNDS = 2        // interleaved fallback/winner rounds, best-of per arm
+
+def private env_cmd(envs : array<tuple<string; string>>; cmd : string) : string {
+    return build_string() $(w) {
+        let win = get_platform_name() == "windows"
+        for (e in envs) {
+            w |> write(win ? "set {e._0}={e._1}&& " : "{e._0}={e._1} ")
+        }
+        w |> write(cmd)
+    }
+}
+
+// daspkg's run_cmd shape: tmp-file redirect so the child's stdout survives cmd.exe quirks.
+// The command never starts with a quote (the env prefix leads), so no sacrificial-quote wrap.
+def private run_child(cmd : string) : string {
+    let tmp = "{get_das_root()}/_tune_confirm_out.txt"
+    let full = "{cmd} > \"{tmp}\" 2>&1"
+    var shellNoise = ""
+    unsafe(popen(full) $(f) {
+        if (f != null) {
+            shellNoise = fread(f)
+        }
+    })
+    var outp = ""
+    if (fexist(tmp)) {
+        fopen(tmp, "rb") $(f) {
+            if (f != null) {
+                outp = fread(f)
+            }
+        }
+        remove(tmp)
+    }
+    return empty(outp) ? shellNoise : outp
+}
+
+def private harness_dir() : string => "{get_das_root()}/modules/dasLLAMA/harness"
+
+def private parse_stamp_suffix(outp : string) : string {
+    let tag = "llvm_tune: q8q8_tile_gen <- "
+    for (ln in split(outp, "\n")) {
+        let ix = find(ln, tag)
+        if (ix >= 0) {
+            let rest = slice(ln, ix + length(tag))
+            let sp = find(rest, " ")
+            return sp > 0 ? slice(rest, 0, sp) : rest
+        }
+    }
+    return ""
+}
+
+def private parse_confirm_pp(outp : string) : double {
+    let tag = "CONFIRM_PP: "
+    for (ln in split(outp, "\n")) {
+        let ix = find(ln, tag)
+        if (ix >= 0) {
+            return double(to_float(slice(ln, ix + length(tag))))
+        }
+    }
+    return 0.0lf
+}
+
+// What a manifest-less normal run would stamp on this box: a compile-only child prints the
+// `llvm_tune: q8q8_tile_gen <- <suffix> (fallback)` line during its [tune] macro pass.
+def private discover_fallback_stamp() : string {
+    var envs <- [("DAS_TUNE_MODE" => "normal"), ("DAS_TUNE_MANIFEST" => ""), ("GEN_TUNE_COMPILE_ONLY" => "1")]
+    let cmd = env_cmd(envs, "\"{get_das_exe()}\" -jit \"{harness_dir()}/gen_tune_probe.das\"")
+    delete envs
+    return parse_stamp_suffix(run_child(cmd))
+}
+
+// One confirm arm: real-model prefill under the given manifest (empty = the fallback chain).
+// The stamp line doubles as the plumbing check — a wrong stamp scores 0 (= a rejection).
+def private confirm_pp_run(model, manifest_path, expected : string) : double {
+    var envs <- [("DAS_TUNE_MODE" => "normal"), ("DAS_TUNE_MANIFEST" => manifest_path)]
+    let cmd = env_cmd(envs, "\"{get_das_exe()}\" -jit \"{harness_dir()}/tune_confirm_prefill.das\" -- \"{model}\"")
+    delete envs
+    let outp = run_child(cmd)
+    let stamped = parse_stamp_suffix(outp)
+    if (stamped != expected) {
+        print("confirm: arm expected stamp '{expected}' but the child stamped '{stamped}' — scoring 0\n")
+        return 0.0lf
+    }
+    return parse_confirm_pp(outp)
+}
+
+def private write_winner(suffix : string) : bool {
+    let ok = tune_manifest_set("q8q8_tile_gen", suffix)
+    print("winner: {suffix} {ok ? "->" : "-> FAILED TO WRITE"} {tune_manifest_path()}\n")
+    return ok
+}
+
+def private confirm_and_write(winner : string) : bool {
+    let fb = discover_fallback_stamp()
+    if (empty(fb)) {
+        print("confirm: fallback-discovery child failed — writing the winner unguarded (pre-confirm behavior)\n")
+        return write_winner(winner)
+    }
+    if (fb == winner) {
+        print("confirm: winner '{winner}' IS the per-ISA fallback — no e2e confirm needed\n")
+        return write_winner(winner)
+    }
+    let model = get_env_variable("DASLLAMA_CONFIRM_MODEL")
+    if (empty(model)) {
+        print("confirm: winner '{winner}' DIVERGES from the per-ISA fallback '{fb}' — a 1-core crown must confirm end-to-end before it ships (the SPR amx lesson)\n")
+        print("confirm: manifest NOT updated — re-run with DASLLAMA_CONFIRM_MODEL=<q8 gguf> to run the confirm pass\n")
+        return true
+    }
+    let tmpm = "{get_das_root()}/_tune_confirm_manifest.json"
+    if (!fwrite(tmpm, "\{\"q8q8_tile_gen\": \"{winner}\"\}")) {
+        print("confirm: cannot write {tmpm} — is das_root writable?\n")
+        return false
+    }
+    var bestF = 0.0lf
+    var bestW = 0.0lf
+    for (_r in range(CONFIRM_ROUNDS)) {
+        bestF = max(bestF, confirm_pp_run(model, "", fb))
+        bestW = max(bestW, confirm_pp_run(model, tmpm, winner))
+    }
+    remove(tmpm)
+    if (bestF <= 0.0lf) {
+        print("confirm: the FALLBACK arm produced no pp number — not writing anything (fix the box, rerun)\n")
+        return false
+    }
+    if (bestW > bestF * CONFIRM_MARGIN) {
+        print("confirm: challenger '{winner}' {bestW} tok/s BEATS fallback '{fb}' {bestF} tok/s — CONFIRMED\n")
+        return write_winner(winner)
+    }
+    print("confirm: challenger '{winner}' {bestW} tok/s does NOT beat fallback '{fb}' {bestF} tok/s by x{CONFIRM_MARGIN} — REJECTED, pinning the fallback\n")
+    return write_winner(fb)
+}
+
 def tune_mode_run : bool {
     var fx <- build_fixture(2048l, 512l, 64l)      // batch shape (the kv projection)
     var gfx <- build_fixture(2048l, 8192l, 1l)     // streamed decode shape (DRAM-bound ffn GEMV)
@@ -600,8 +743,7 @@ def tune_mode_run : bool {
     if (merged != winner) {
         print("tile winner {vs[winner]._0} + hot decode winner within '{wkey}' -> {vs[merged]._0}\n")
     }
-    let ok = tune_manifest_set("q8q8_tile_gen", vs[merged]._0)
-    print("winner: {vs[merged]._0} {ok ? "->" : "-> FAILED TO WRITE"} {tune_manifest_path()}\n")
+    let ok = confirm_and_write(vs[merged]._0)
     delete y
     delete yg
     delete yh
