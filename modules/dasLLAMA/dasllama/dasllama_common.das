@@ -1219,6 +1219,12 @@ struct Session {
     xq2 : array<int8>         // activated-hidden requant quants (ffn width)
     xs2 : array<float>        // ... and their scales (ffn width / 32)
     chain_stages : array<int3>  // stage defs, int3(range_begin, range_end, num_chunks)
+    // flash-decode attention partials (fused chain, ctx > FLASH_DECODE_SLICE): per (head, slice)
+    // running max / exp-sum / unnormalized AV accumulator, combined per head in the chain's
+    // combine stage. Sized lazily on first deep-ctx use (n_heads x nsl [x head_size])
+    fl_m : array<float>
+    fl_l : array<float>
+    fl_o : array<float>
     key_cache : array<float>  // (n_layers * seq_len * kv_dim)
     value_cache : array<float>
     // batched prefill scratch — empty until forward_prefill sizes them to npos × ... (see forward_prefill)
@@ -1947,6 +1953,17 @@ def has_dual_rope(c : Config) : bool => (c.sliding_window > 0l
 // the per-layer loop so the seam is a function-pointer swap: a new arch registers a different block
 // here without touching forward(). Bit-identical to the inlined form.
 
+// Flash-decode slicing (fused attention chain): a decode context deeper than FLASH_DECODE_SLICE
+// positions splits each head's KV pass into ceil(cnt/slice) slices (capped) with a per-head
+// combine stage — the KV stream stops being limited to n_heads lanes (Qwen3-0.6B zen2: T>16 bought
+// nothing, attn_chain 68% of token time at ctx 2048). Slice count derives from CONTEXT ONLY —
+// never lane count — so generation stays deterministic and box/T-independent; ctx <= 256 keeps
+// the exact single-pass body (bit-identical to the un-fused path). The sliced path reassociates
+// the softmax/AV sums (flash-decode partials), so deep-ctx fused output is tolerance-equal, not
+// bit-equal, to the un-fused path (test_fused_flash_deep_ctx). Slice length tuning = ledger.
+let FLASH_DECODE_SLICE = 256l
+let FLASH_DECODE_MAX_SLICES = 16l
+
 // attn-norm → QKV(+bias) → RoPE → KV-store → GQA multi-head attention → out-proj(+post-norm) → residual.
 // Can layer l's attention run as the fused 3-stage chain? Std shape only: Q8 weights, group3
 // layout (no V-from-K), table rope. Also needs team mode, a backend row core, and the same size
@@ -1964,12 +1981,16 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
 
 // Fused attention block: ONE team rendezvous runs [qkv rows + bias/qk-norm/rope/kv-store] →
 // [attn heads + per-head wo-input requant] → [wo rows + bias + residual add] as three stages
-// (team_parallel_stages). Bit-identical to attention_std_decode — the same backend row dots, the
-// same per-head norm/rope/store/softmax order, the same adds — only the scheduling changes: the
-// per-op fork/joins collapse into worker-side stage barriers, and every piece of serial glue
-// between the old dispatches becomes a chunk-local epilogue. Stage geometry: stage 0 splits over
-// HEAD slots (q heads, then k heads, then v heads — each head_size rows, so rope/norm/store are
-// chunk-local), stage 1 over query heads, stage 2 over 32-row output groups.
+// (team_parallel_stages). At ctx <= FLASH_DECODE_SLICE this is bit-identical to
+// attention_std_decode — the same backend row dots, the same per-head norm/rope/store/softmax
+// order, the same adds — only the scheduling changes: the per-op fork/joins collapse into
+// worker-side stage barriers, and every piece of serial glue between the old dispatches becomes
+// a chunk-local epilogue. Deeper contexts switch to the 4-stage flash shape (see
+// FLASH_DECODE_SLICE above): stage 1 becomes (head x kv-slice) partials and a per-head combine
+// stage rescales + requants — tolerance-equal, not bit-equal, to the un-fused path. Stage
+// geometry: stage 0 splits over HEAD slots (q heads, then k heads, then v heads — each
+// head_size rows, so rope/norm/store are chunk-local), stage 1 over query heads (or
+// head x slice units), then [combine +] 32-row output groups.
 def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : int64) {
     let c = t.config
     let dim = c.dim
@@ -1996,11 +2017,35 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let n1 = get_dispatch_lanes()
     let ngrp = int(dim / 32l)
     let n2 = matmul_chunks_gemv(int(dim), 1, qd * dim)
-    s.chain_stages |> resize(3)
-    s.chain_stages[0] = int3(0, nslots, n0)
-    s.chain_stages[1] = int3(0, int(n_heads), n1)
-    s.chain_stages[2] = int3(0, ngrp, n2)
-    count_parallel_dispatch(min(n0, nslots) + min(n1, int(n_heads)) + min(n2, ngrp))
+    // flash-decode slicing: nsl slices per head past FLASH_DECODE_SLICE positions (ctx-derived
+    // ONLY — deterministic, box/T-independent); nsl == 1 keeps the exact single-pass body and
+    // today's 3-stage shape. Sliced shape inserts a per-head combine stage: [qkv][partials]
+    // [combine+requant][wo].
+    let nsl = int(min(FLASH_DECODE_MAX_SLICES, 1l + (cnt - 1l) / FLASH_DECODE_SLICE))
+    let slice_len = (cnt + int64(nsl) - 1l) / int64(nsl)
+    if (nsl > 1) {
+        let need = int(n_heads) * nsl
+        if (length(s.fl_m) < need) {
+            s.fl_m |> resize(need)
+            s.fl_l |> resize(need)
+        }
+        let needo = int(n_heads * int64(nsl) * head_size)
+        if (length(s.fl_o) < needo) {
+            s.fl_o |> resize(needo)
+        }
+        s.chain_stages |> resize(4)
+        s.chain_stages[0] = int3(0, nslots, n0)
+        s.chain_stages[1] = int3(0, int(n_heads) * nsl, int(n_heads) * nsl)
+        s.chain_stages[2] = int3(0, int(n_heads), int(n_heads))
+        s.chain_stages[3] = int3(0, ngrp, n2)
+        count_parallel_dispatch(min(n0, nslots) + int(n_heads) * nsl + int(n_heads) + min(n2, ngrp))
+    } else {
+        s.chain_stages |> resize(3)
+        s.chain_stages[0] = int3(0, nslots, n0)
+        s.chain_stages[1] = int3(0, int(n_heads), n1)
+        s.chain_stages[2] = int3(0, ngrp, n2)
+        count_parallel_dispatch(min(n0, nslots) + min(n1, int(n_heads)) + min(n2, ngrp))
+    }
     let mmrows = mm_q8q8_rows_fn()
     let neox = c.rope_neox
     let eps = c.norm_eps
@@ -2051,6 +2096,10 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         let bqoff = l * qd
         let bkvoff = l * kv_dim
         let booff = l * dim
+        // flash-decode partial planes (deep ctx only; the arrays are empty when nsl == 1)
+        var flmp = nsl > 1 ? addr(s.fl_m[0]) : null
+        var fllp = nsl > 1 ? addr(s.fl_l[0]) : null
+        var flop = nsl > 1 ? addr(s.fl_o[0]) : null
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             if (stage == 0) {
                 // qkv rows by head slot; per-slot epilogue = bias → norm → rope → cache store
@@ -2105,7 +2154,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         }
                     }
                 }
-            } elif (stage == 1) {
+            } elif (stage == 1 && nsl == 1) {
                 // multi-head attention (the attention_std_decode worker body) + per-head requant of
                 // the wo input — each head's xb slice is final here, and head_size % 32 == 0, so the
                 // quant groups are chunk-local. Overwrites xq/xs; stage 0 (the only reader of the
@@ -2139,6 +2188,100 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
                     }
                 }
+            } elif (stage == 1) {
+                // flash-decode partials: unit = (head, slice) — scores exactly as the single-pass
+                // body (dot·scale, softcap), then slice-local max / exp-sum / unnormalized AV
+                unsafe {
+                    for (u in range(jb, je)) {
+                        let hh = int64(u / nsl)
+                        let sl = int64(u % nsl)
+                        let qoff = hh * head_size
+                        let kvhoff = (hh / kv_mul) * head_size
+                        var arow = attp + hh * seq_len
+                        let j0 = sl * slice_len
+                        let j1 = min(j0 + slice_len, cnt)
+                        for (j in range64(j0, j1)) {
+                            let koff = loff + (kstart + j) * kv_dim + kvhoff
+                            arow[j] = dot(qp + qoff, kcp + koff, head_size) * scale
+                        }
+                        if (attn_softcap > 0.0) {
+                            softcap(arow + j0, j1 - j0, attn_softcap)
+                        }
+                        var m = arow[j0]   // slices are non-empty by construction
+                        for (j in range64(j0 + 1l, j1)) {
+                            m = max(m, arow[j])
+                        }
+                        // exponentials in place over the slice — exp4 fast path, clamped to -80
+                        // like the prefill flash fold (underflow -> ~0, negligible vs real probs);
+                        // element-constructed float4: slice offsets carry no 16B alignment
+                        var lsum = 0.0
+                        {
+                            let m4 = float4(m, m, m, m)
+                            var sum4 = float4(0.0)
+                            var j = j0
+                            while (j + 4l <= j1) {
+                                let e = exp4(max(float4(arow[j], arow[j + 1l], arow[j + 2l], arow[j + 3l]) - m4, EXP4_LO))
+                                arow[j] = e.x
+                                arow[j + 1l] = e.y
+                                arow[j + 2l] = e.z
+                                arow[j + 3l] = e.w
+                                sum4 += e
+                                j += 4l
+                            }
+                            lsum = sum4.x + sum4.y + sum4.z + sum4.w
+                            while (j < j1) {
+                                let e = exp(max(arow[j] - m, -80.0))
+                                arow[j] = e
+                                lsum += e
+                                j++
+                            }
+                        }
+                        var op = flop + (hh * int64(nsl) + sl) * head_size
+                        for (i in range64(head_size)) {
+                            op[i] = 0.0
+                        }
+                        for (j in range64(j0, j1)) {
+                            let voff = loff + (kstart + j) * kv_dim + kvhoff
+                            axpy(op, vcp + voff, arow[j], head_size)
+                        }
+                        flmp[hh * int64(nsl) + sl] = m
+                        fllp[hh * int64(nsl) + sl] = lsum
+                    }
+                }
+            } elif (stage == 2 && nsl > 1) {
+                // per-head combine (flash rescale; sink joins max + denominator, softmax_sink
+                // contract) + the wo-input requant that the single-pass body does in stage 1
+                unsafe {
+                    for (h in range(jb, je)) {
+                        let hh = int64(h)
+                        let qoff = hh * head_size
+                        let fbase = hh * int64(nsl)
+                        var mg = flmp[fbase]
+                        for (sl in range64(1l, int64(nsl))) {
+                            mg = max(mg, flmp[fbase + sl])
+                        }
+                        if (sinksp != null) {
+                            mg = max(mg, sinksp[hh])
+                        }
+                        for (i in range64(head_size)) {
+                            xbp[qoff + i] = 0.0
+                        }
+                        var lg = 0.0
+                        for (sl in range64(int64(nsl))) {
+                            let f = exp(flmp[fbase + sl] - mg)
+                            lg += fllp[fbase + sl] * f
+                            axpy(xbp + qoff, flop + (fbase + sl) * head_size, f, head_size)
+                        }
+                        if (sinksp != null) {
+                            lg += exp(sinksp[hh] - mg)
+                        }
+                        let inv = 1.0 / lg
+                        for (i in range64(head_size)) {
+                            xbp[qoff + i] *= inv
+                        }
+                        quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
+                    }
+                }
             } else {
                 // output projection rows + optional bias + residual add, all chunk-local
                 // (post-norm arches defer the add — the caller's serial tail owns it)
@@ -2156,6 +2299,53 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                     }
                 }
             }
+        }
+        if (nsl > 1 && g_flash_decode_check) {
+            // test-only witness (set_flash_decode_check): the sliced partials + combine must equal
+            // an exact single-pass recompute — scores re-derived from q·K here (the partial pass
+            // stores slice-local exps into att, so the score row is not reusable) — to fp32
+            // reassociation tolerance. Logit-level A/Bs can't gate this — a 1-ulp xb difference can
+            // cross an int8 requant boundary and amplify through the remaining Q8 layers — so the
+            // contract is checked HERE, per layer, at the attention output itself.
+            var sref : array<float>
+            sref |> resize(int(cnt))
+            for (hh in range64(n_heads)) {
+                let qoff = hh * head_size
+                let kvhoff = (hh / kv_mul) * head_size
+                for (j in range64(cnt)) {
+                    let koff = loff + (kstart + j) * kv_dim + kvhoff
+                    let sc = dot(qp + qoff, kcp + koff, head_size) * scale
+                    sref[j] = attn_softcap > 0.0 ? attn_softcap * tanh(sc / attn_softcap) : sc
+                }
+                var m2 = sref[0]
+                for (j in range64(1l, cnt)) {
+                    m2 = max(m2, sref[j])
+                }
+                if (sinksp != null) {
+                    m2 = max(m2, sinksp[hh])
+                }
+                var l2 = 0.0
+                for (j in range64(cnt)) {
+                    l2 += exp(sref[j] - m2)
+                }
+                if (sinksp != null) {
+                    l2 += exp(sinksp[hh] - m2)
+                }
+                var worstd = 0.0
+                for (i in range64(head_size)) {
+                    var acc = 0.0
+                    for (j in range64(cnt)) {
+                        let voff = loff + (kstart + j) * kv_dim + kvhoff
+                        acc += exp(sref[j] - m2) / l2 * vcp[voff + i]
+                    }
+                    worstd = max(worstd, abs(acc - s.xb[qoff + i]))
+                }
+                if (worstd > 1e-4) {
+                    panic("flash-decode check failed: layer {l} head {hh} worst |xb diff| {worstd} (cnt {cnt}, nsl {nsl})")
+                }
+            }
+            g_flash_decode_checked++
+            delete sref
         }
     }
     prof_add("attn_chain", ts_chain)
@@ -2877,12 +3067,14 @@ def get_prefill_attn_mode() : AttnPrefillMode {
 // dense-FFN block (w1/w3→w2) instead of one per matmul — team_parallel_stages replaces the per-op
 // rendezvous with worker-side stage barriers, and the serial glue (rope, kv store, activation,
 // requant, residual adds) rides inside the stages' chunk epilogues. Bit-identical to the per-op
-// path (same row dots, same per-element order); requires team mode + a backend row core
-// (kernel_backend_has_rows) — per-layer gates fall back to the std path otherwise.
+// path (same row dots, same per-element order) at ctx <= FLASH_DECODE_SLICE; deeper contexts
+// slice the attention stage (flash-decode, tolerance-equal). Requires team mode + a backend row
+// core (kernel_backend_has_rows) — per-layer gates fall back to the std path otherwise.
 var g_fused_decode = true
 
 //! Select the decode dispatch shape: fused per-block stage chains (default true) vs one dispatch
-//! per matmul. Bit-identical either way — A/B benchmarking toggle.
+//! per matmul. Bit-identical either way at ctx <= FLASH_DECODE_SLICE; deeper contexts slice the
+//! fused attention stage (flash-decode) and are tolerance-equal — A/B benchmarking toggle.
 def set_fused_decode(on : bool) {
     g_fused_decode = on
 }
@@ -2890,6 +3082,23 @@ def set_fused_decode(on : bool) {
 //! Whether decode uses the fused per-block stage chains.
 def get_fused_decode() : bool {
     return g_fused_decode
+}
+
+// test-only witness rail for the flash-decode slicing (see attention_chain_decode): when on,
+// every sliced layer recomputes exact single-pass attention from the raw scores and panics past
+// fp32 reassociation tolerance; the counter proves the sliced path actually ran
+var g_flash_decode_check = false
+var g_flash_decode_checked = 0
+
+//! Enable the per-layer flash-decode witness check (tests only — serial recompute per layer).
+def set_flash_decode_check(on : bool) {
+    g_flash_decode_check = on
+    g_flash_decode_checked = 0
+}
+
+//! Sliced-attention layers checked since set_flash_decode_check(true).
+def get_flash_decode_check_count() : int {
+    return g_flash_decode_checked
 }
 
 // Prefill RoPE: when true (default) precompute the cos/sin table once per prefill and look it up;

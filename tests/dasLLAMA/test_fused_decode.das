@@ -6,6 +6,7 @@ require dastest/testing_boost public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; load_checkpoint resolves "llama" from the registry
 require daslib/jobque_boost
 require daslib/fio
+require math
 require dasllama/dasllama_math  // setup_dasllama_jobque_ + target_chunk_work + fused knob
 
 // Fused decode chains (team_parallel_stages: qkv→attn→wo and w1/w3→w2 as ONE dispatch each) vs
@@ -144,6 +145,78 @@ def private fused_vs_std_bit_exact(t : T?; tr : Model) {
 // under a "portable" pin — the rows core every host shares, and the EPYC box's profile-pinned
 // decode config; without the pin an x64 auto-select picks an intrinsic tier with no rows core
 // and the fused gate silently falls back (the A/B would compare std vs std).
+// Deep-context flash-decode slicing: past FLASH_DECODE_SLICE (256) positions the fused attn
+// chain splits each head's KV pass into ctx-derived slices and combines per head. The slicing
+// reassociates the softmax/AV sums; a 1-ulp attention difference can then cross an int8 requant
+// boundary and amplify through the remaining Q8 layers, so logit-level A/Bs cannot gate this
+// (measured: ~3e-6 at every attention output, ~0.5 at the final logits). The real contract is
+// checked INSIDE the chain: set_flash_decode_check makes every sliced layer recompute exact
+// single-pass attention from the raw scores and panic past fp32 tolerance (1e-4). The logit
+// bound here is a loose structural backstop (a dropped/double-counted slice is O(10)).
+[test]
+def test_fused_flash_deep_ctx(t : T?) {
+    t |> run("flash-sliced fused chain: per-layer witness + structural logit bound (needs SmolLM2-135M)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: {path} not present")
+            return
+        }
+        let prev_backend = active_kernel_backend()
+        let prev_thresh = get_target_chunk_work()
+        with_job_que() {
+            setup_dasllama_jobque_()
+            set_target_chunk_work(1l)
+            pin_kernel_backend("portable")
+            var tr <- load_gguf(path, QuantMode.q8)
+            tr.config.seq_len = min(tr.config.seq_len, 384l)
+            let c = tr.config
+            let PREFILL = 300  // past the 256 boundary -> the fused side slices (nsl == 2)
+            let STEPS = 4
+            var lg_std : array<float>   // mode 0's per-step logits, STEPS x vocab (teacher-forced)
+            lg_std |> resize(int(int64(STEPS) * c.vocab_size))
+            var worst = 0.0
+            for (mode in range(2)) {
+                set_fused_decode(mode == 1)
+                set_flash_decode_check(mode == 1)   // panics inside the chain past 1e-4
+                var s <- make_run_state(c)
+                var pos = 0l
+                for (i in range(PREFILL)) {   // fixed pseudo-prompt, per-token (decode path both sides)
+                    forward(tr, s, int64(i % 100 + 2), pos)
+                    pos++
+                }
+                for (st in range(STEPS)) {
+                    forward(tr, s, int64(st * 37 + 11), pos)
+                    pos++
+                    let base = int64(st) * c.vocab_size
+                    if (mode == 0) {
+                        for (i in range64(c.vocab_size)) {
+                            lg_std[base + i] = s.logits[i]
+                        }
+                    } else {
+                        for (i in range64(c.vocab_size)) {
+                            worst = max(worst, abs(lg_std[base + i] - s.logits[i]))
+                        }
+                    }
+                }
+                delete s
+            }
+            t |> success(get_flash_decode_check_count() > 0, "the sliced path ran and every layer passed the witness ({get_flash_decode_check_count()} layers checked)")
+            set_flash_decode_check(false)
+            set_fused_decode(true)
+            t |> success(worst < 4.0, "teacher-forced logits within the structural bound (worst |diff| = {worst})")
+            delete lg_std
+            delete tr
+            clear_kernel_backend_pin()
+        }
+        set_target_chunk_work(prev_thresh)
+        select_kernel_backend(prev_backend)
+    }
+}
+
 // pre_post_norm arches (Gemma2/3): the chains defer the residual add and run the post-norm as a
 // serial tail after the rendezvous. gemma-3-1b covers qk-norm + dual-rope sliding (5:1) + the
 // attn deferral; gemma-2-2b covers softcap + GeGLU + qd != dim + alternating sliding.
