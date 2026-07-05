@@ -582,7 +582,7 @@ def private is_nullable_column_ref(var node : ExpressionPtr; var q : SqlQuery&) 
 
 // ===== Chain analysis (walk pipe-composed chain backwards) =====
 
-// nolint:STYLE015 Shared subquery-wrap, dialect-routed on `caps.distinct_on`. Without it: SQLite's bare-aggregate optimization — `SELECT *, MIN/MAX(pk) FROM t GROUP BY K` picks the row with the min (useMax=false) or max (useMax=true) pk per K, preserving all `*` columns at those values (SQLite-only semantics; strict engines reject bare columns beside GROUP BY). With it: SQL-standard `SELECT DISTINCT ON (K) * FROM t ORDER BY K, pk [DESC]` — first row per K in pk order (DESC = last). Both forms: MIN/ASC matches linq `_distinct_by`'s "first row per K", MAX/DESC matches `reverse() |> _distinct_by(K)` "last row per K" — when pk is monotonic with insertion order.
+// nolint:STYLE015 Shared subquery-wrap, dialect-routed on `caps.distinct_on`. Without it: SQLite's bare-aggregate optimization — `SELECT *, MIN/MAX(pk) FROM t GROUP BY K` picks the row with the min (useMax=false) or max (useMax=true) pk per K, preserving all `*` columns at those values (SQLite-only semantics; strict engines reject bare columns beside GROUP BY). With it: PostgreSQL-style `SELECT DISTINCT ON (K) * FROM t ORDER BY K, pk [DESC]` (a PG extension, also implemented by DuckDB) — first row per K in pk order (DESC = last). Both forms: MIN/ASC matches linq `_distinct_by`'s "first row per K", MAX/DESC matches `reverse() |> _distinct_by(K)` "last row per K" — when pk is monotonic with insertion order.
 [macro_function]
 def private build_distinct_by_inner_subquery(q : SqlQuery; pkField : string; useMax : bool) : string {
     let sqlK = field_to_column_name(q.rootType, q.distinctByCol)
