@@ -4,7 +4,7 @@ options no_unused_block_arguments = false
 options no_unused_function_arguments = false
 
 // Contract area: _each_sql streaming (iterator lifecycle incl. early break, then the
-// connection stays usable) and transactions (commit, rollback-on-panic, try_transaction).
+// connection stays usable) and transactions (commit, savepoint nesting, try_transaction).
 
 require dastest/testing_boost public
 require _conformance_provider
