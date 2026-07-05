@@ -223,9 +223,15 @@ namespace das {
         // (worker: parked++ then read seq; publisher: bump seq then read parked — all four seq_cst),
         // so either the worker sees the new op before sleeping or the publisher sees it parked.
         atomic<int32_t>  mParkedWorkers{0};
-        // worker-pool limit (see setWorkerLimit): threadIndex >= this ⇒ dormant. Dormant workers
+        // worker-pool limit (see setWorkerLimit): limit-rank >= this ⇒ dormant. Dormant workers
         // are deliberately NOT in mParkedWorkers — the publish wake gate must skip them.
         atomic<int32_t>  mWorkerLimit{0x7fffffff};
+        // worker-limit eligibility order (fixed at construction, DAS_JOBQUE_LIMIT_ORDER=spread):
+        // prefix (default) gates on the raw threadIndex; spread ranks workers along a
+        // golden-stride visit so every runtime limit L selects a near-uniform lattice over the
+        // creation order — which the OS's round-robin ideal-processor assignment maps loosely
+        // onto physical cores (CCD/CCX spread on chiplet parts).
+        bool             mLimitOrderSpread = false;
         // team dispatch anatomy profiler (env DAS_TEAM_PROF=1): per-op phase aggregates, dumped
         // at queue destruction. Caller-side counters except the two claim-timestamp slots;
         // worker stores happen only under the flag (they perturb the op being measured).

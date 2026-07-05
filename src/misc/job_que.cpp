@@ -164,6 +164,8 @@ namespace das {
         mThreadCount = get_num_threads();
         const char * teamProfEnv = getenv("DAS_TEAM_PROF");   // =0 / empty is off, matching the documented =1 contract
         mTeamProf = teamProfEnv != nullptr && atoi(teamProfEnv) != 0;
+        const char * limitOrderEnv = getenv("DAS_JOBQUE_LIMIT_ORDER");   // "spread" = golden-stride worker-limit eligibility
+        mLimitOrderSpread = limitOrderEnv != nullptr && strcmp(limitOrderEnv, "spread") == 0;
         SetCurrentThreadPriority(JobPriority::High);
         for (int j = 0, js = mThreadCount; j < js; j++) {
             mThreads.emplace_back(make_unique<thread>([this, j]() {
@@ -329,7 +331,25 @@ namespace das {
         return true;
     }
 
+    // Worker-limit eligibility rank (see mLimitOrderSpread). Spread order: rank workers along
+    // the golden-stride visit v(k) = (k*s) mod T with s co-prime ≈ T/φ — by the three-distance
+    // theorem every prefix {v(0..L-1)} is a near-uniform lattice over the index space, so ANY
+    // runtime limit keeps the live sliver spread instead of clumped at the low indices.
+    // O(T) once per worker at startup.
+    static int workerLimitRank ( int threadIndex, int total, bool spread ) {
+        if ( !spread || total <= 2 ) return threadIndex;
+        int s = int(double(total) * 0.6180339887498949 + 0.5);
+        auto gcd = [](int a, int b) { while ( b ) { int t = a % b; a = b; b = t; } return a; };
+        while ( s <= 1 || gcd(s, total) != 1 ) s++;
+        for ( int k = 0; k < total; ++k ) {
+            if ( (k * s) % total == threadIndex ) return k;
+        }
+        return threadIndex;   // unreachable: v is a bijection when gcd(s,total)==1
+    }
+
     void JobQue::job(int threadIndex) {
+        const int limitRank = workerLimitRank(threadIndex,
+            mThreadCount.load(std::memory_order_relaxed), mLimitOrderSpread);
         uint32_t teamSeqSeen = mTeamSeq.load(std::memory_order_relaxed);
         while (!mShutdown) {
             // Worker-pool limit (setWorkerLimit): over-limit workers go DORMANT here — no spin,
@@ -338,11 +358,11 @@ namespace das {
             // storm the limit removes). Only setWorkerLimit raising the limit (or shutdown)
             // notifies; the limit is re-checked HERE on every wake, so a wake that raced a
             // lower re-parks us dormant.
-            if ( threadIndex >= mWorkerLimit.load(std::memory_order_relaxed) ) {
+            if ( limitRank >= mWorkerLimit.load(std::memory_order_relaxed) ) {
                 unique_lock<mutex> lock(mFifoMutex);
                 mCond.wait(lock, [&]() {
                     return mShutdown.load()
-                        || threadIndex < mWorkerLimit.load(std::memory_order_seq_cst);
+                        || limitRank < mWorkerLimit.load(std::memory_order_seq_cst);
                 });
                 if ( mShutdown ) break;
                 teamSeqSeen = mTeamSeq.load(std::memory_order_relaxed);  // don't serve ops published while dormant
@@ -369,7 +389,7 @@ namespace das {
                     if ( mShutdown.load(std::memory_order_relaxed) ) break;
                     // limit drift-out: exit the spin window; the dormant branch at the top of the
                     // outer loop parks us (the !gotJob park below is for ELIGIBLE workers only)
-                    if ( threadIndex >= mWorkerLimit.load(std::memory_order_relaxed) ) {
+                    if ( limitRank >= mWorkerLimit.load(std::memory_order_relaxed) ) {
                         goDormant = true;
                         break;
                     }
