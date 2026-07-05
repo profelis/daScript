@@ -1,0 +1,1 @@
+Enables or disables the per-op team rank gate: when enabled, a worker serves a published team operation only if its rank fits within that operation's chunk count, so small operations do not wake the whole pool.
