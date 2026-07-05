@@ -1331,6 +1331,52 @@ Air-box operational gotchas recorded in [[dasllama-m3-air-box]]: `modules/dasLLA
 is a DOTFILE — a `rsync dir1 dir2` ship misses it and every `dasllama/*` require fails
 "file not found" (ship it explicitly); `-dasroot` doesn't substitute for it.
 
+## M4 slice K — the AMX fair shot (PLANNED 2026-07-05, Boris; build post-/clear)
+
+**The call (Boris): the pipelined fold is THE bet — "if I were to do 1 thing, I would do
+this". Not budget-constrained; the discipline is single-variable clarity over gradient
+search — every item lands as an independently toggleable arm so each on-box number names
+its cause.** Source truth re-read 2026-07-05 (lcpp mmq.cpp); four deltas vs our slice-I leg:
+
+- **I4 — software-pipelined fold (build FIRST, the bet).** lcpp mmq.cpp:2008-2105:
+  double-buffered C scratch (TileC0/C1 swap), block i−1's AVX-512 i32→f32 scale fold
+  interleaved BETWEEN block i's tdpbssd ops — vector ports fold while TMUL crunches. Same
+  fold cadence as ours (their TILE_K=32 = one Q8 block = our kstep 1); ours simply stalls
+  TMUL during every fold. Delivery: additional `[tune_perm]` rows (`…_pipelined`), NOT a
+  rewrite of the serial rows — the grid A/Bs serial-vs-pipelined on-box as a pure
+  single-variable comparison, and the e2e confirm pass guards the crown. Upside is ON TOP
+  of the 1-core win (191 vs 156 already absorbed the serial-fold cost).
+- **I1 — tile-config latch.** lcpp mmq.cpp:204: `thread_local bool done`, ldtilecfg once
+  per thread, NO tilerelease anywhere. Ours: cfg+release per macro call — the release
+  forfeits TMUL state and may bounce the AMX frequency license; invisible at 1 core,
+  compounds at T24. Emitter: thread-local once-latch, drop tilerelease. Small.
+- **I2 — 2-D grid on the amx arm.** lcpp mmq.cpp:2472: MB×NB grid of 32-tok × 32-row
+  blocks, flattened (even balance211 split suffices at that density). Our amx arm is 1-D
+  over ngu=ng/gs — 135M qkv = 18 chunks for 48 lanes, twice as starved as the vector walk
+  the batch_grid_2d work just fixed. Mechanical: extend matmul_grid + cell decode to the
+  ts≠4 walk (ts-token × gs-group cells); rides the same batch_grid_2d pin. Small.
+- **I3 — biased-plane unification (kills the slice-I bias fork).** lcpp packs ONE buffer
+  serving both regimes: s8s8 tiles + per-block compensation row (s8s8_compensation :770)
+  so m=1 rides u8s8 VNNI. Our mirror: plane w^0x80 (bias128), tile fold subtracts 128·bsum
+  in the FOLD STAGE (xbsp is already the tile's 10th param; keep tilezero — pure AVX-512
+  arithmetic on the C scratch), companions remap to BIASED busd. One plane, both slots
+  optimal; the measured plain-busd gemv penalty under an amx stamp (+2.6-8% emit,
+  +18-26% pp on the busd A/B) goes away. Medium.
+- (noted, deferred: lcpp M∈2..15 = tile sub-blocks, M==1 = 64-row VNNI walk; our
+  short-batch per-token gemv fallback is the only remaining gap — minor.)
+
+**Build order: I4 → I1 → I2 → I3, all emission-proven on M1 first** (x64 emission check
+counts + native grid maxdiff + suite + oracle parity — amx rows decline on M1, emission
+gates still prove the asm). **Then the SPR respin (ami-067fe7f4a0b6c2be5), on box until
+we're happy:** P1 frequency probe (turbostat: das-amx / das-vnni / lcpp-amx @T24 — decompose
+the license component of the 1-core-win/e2e-loss inversion); P2 dispatch probe (team-prof +
+per-op on an amx-stamped pp run — quantify the 18-chunk starvation); then the A/B ladder —
+each arm in isolation, then cumulative — re-run the arch-ladder row, flip or permanently
+close the amx verdict with attributable data. Piggyback: vector-walk batch_grid_2d pin A/B
+(zen2 winner = wave-aligned knob 2), the confirm pass's SPR outing, and bake a FRESH AMI at
+session end (box_profile + simple_ids + manifest included — session 3's died with the
+instance).
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /
