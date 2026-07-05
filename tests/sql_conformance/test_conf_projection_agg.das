@@ -51,12 +51,19 @@ def test_conf_projections(t : T?) {
     t |> run("computed-scalar projection") @(t : T?) {
         with_conf_db() $(db) {
             seed(db)
-            // Column-only computed expr. KNOWN GAP (pre-existing, upstream): a LITERAL in a
-            // computed projection combined with _where mis-orders binds — `_select(_.Amount * 2)`
-            // emits `SELECT ("Amount") * (?) ... WHERE ... = ?` but collect_query_binds
-            // (daslib/sql_linq.das) enumerates projection binds after WHERE binds.
             let doubled <- _sql(db |> select_from(type<ConfSale>)
                 |> _where(_.Region == "north") |> _select(_.Amount + _.Amount))
+            t |> equal(doubled[0], 1998)
+        }
+    }
+    t |> run("literal bind in computed projection + _where (SELECT-list binds order first)") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            // `SELECT ("Amount") * (?) ... WHERE "Region" = ?` — the projection's literal bind
+            // must enumerate BEFORE the WHERE bind (SELECT list parses first).
+            let doubled <- _sql(db |> select_from(type<ConfSale>)
+                |> _where(_.Region == "north") |> _select(_.Amount * 2))
+            t |> equal(length(doubled), 1)
             t |> equal(doubled[0], 1998)
         }
     }

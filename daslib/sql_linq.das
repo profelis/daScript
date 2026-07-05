@@ -176,6 +176,8 @@ struct private SqlQuery {
     aggregateType : TypeDeclPtr
     whereSql    : string
     bindExprs   : array<ExpressionPtr>
+    // SELECT-list binds (computed projections) — the SELECT list parses before FROM/ON/WHERE, so collect_query_binds emits these first.
+    projBindExprs : array<ExpressionPtr>
     limitBindExpr : ExpressionPtr
     offsetBindExpr : ExpressionPtr
     distinctFlag : bool
@@ -938,6 +940,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
             q.selectColSqlFragments |> clear
             q.selectColTypes |> clear
             q.projRecordNames |> clear
+            q.projBindExprs |> clear    // dropped _select ⇒ its SELECT-list placeholders are gone too
             fill_default_columns(q, q.rootType, prog, at)
             q.proj = ProjectionShape.FullRow
         } else {
@@ -965,6 +968,7 @@ def private snapshot_q_to_subquery_wrap(var q : SqlQuery&; prog : ProgramPtr; at
     q.aggregateType = null
     q.whereSql := ""
     q.bindExprs |> clear
+    q.projBindExprs |> clear
     q.limitBindExpr = null
     q.offsetBindExpr = null
     q.distinctFlag = false
@@ -1399,18 +1403,20 @@ def private process_cross_join_call(var jCall : ExprCall?; var q : SqlQuery&;
 def private collect_query_binds(var q : SqlQuery&; var out : array<ExpressionPtr>&) {
     // nolint:STYLE015
     // Placeholder order matches SQL parse order, depth-first inner-first:
-    //   1. Inner-Q (FROM subquery) binds — innermost SELECT parsed first
-    //   2. Per-join ON binds — within outer FROM clause
-    //   3. WHERE binds
-    //   4. HAVING binds
-    //   5. Set-op RHS binds (compound `<lhs> UNION <rhs>` — RHS parsed before any outer LIMIT)
-    //   6. LIMIT bind (compound applies to combined result, parsed last)
-    //   7. OFFSET bind
-    var total = length(q.innerBindExprs) + length(q.bindExprs) + length(q.havingBindExprs) + length(q.setOpRhsBinds) + 2
+    //   1. SELECT-list binds (computed projections) — parsed before every other clause
+    //   2. Inner-Q (FROM subquery) binds — innermost SELECT parsed first
+    //   3. Per-join ON binds — within outer FROM clause
+    //   4. WHERE binds
+    //   5. HAVING binds
+    //   6. Set-op RHS binds (compound `<lhs> UNION <rhs>` — RHS parsed before any outer LIMIT)
+    //   7. LIMIT bind (compound applies to combined result, parsed last)
+    //   8. OFFSET bind
+    var total = length(q.projBindExprs) + length(q.innerBindExprs) + length(q.bindExprs) + length(q.havingBindExprs) + length(q.setOpRhsBinds) + 2
     for (j in q.joins) {
         total += length(j.rightOnBindExprs)
     }
     out |> reserve(out |> length + total)
+    out |> push_from(q.projBindExprs)   // nolint:STYLE033 — variadic push_from forwards ==const; array<Expression?> sources fail 31400
     out |> push_from(q.innerBindExprs)
     for (j in q.joins) {
         out |> push_from(j.rightOnBindExprs)
@@ -2253,6 +2259,21 @@ def private resolve_proj_arg_to_source(q : SqlQuery; argName : string; prog : Pr
 
 [macro_function]
 def private analyze_projection(var body : ExpressionPtr; var q : SqlQuery&; prog : ProgramPtr; at : LineInfo) : bool {
+    // Divert binds the computed paths push into q.bindExprs to projBindExprs — SELECT-list placeholders parse before FROM/ON/WHERE.
+    let beforeBinds = length(q.bindExprs)
+    let ok = analyze_projection_impl(body, q, prog, at)
+    if (ok) {
+        q.projBindExprs |> reserve(length(q.projBindExprs) + length(q.bindExprs) - beforeBinds)
+        for (i in range(beforeBinds, length(q.bindExprs))) {
+            q.projBindExprs |> push(q.bindExprs[i])
+        }
+        q.bindExprs |> resize(beforeBinds)
+    }
+    return ok
+}
+
+[macro_function]
+def private analyze_projection_impl(var body : ExpressionPtr; var q : SqlQuery&; prog : ProgramPtr; at : LineInfo) : bool {
     if (body == null) {
         macro_error(prog, at, "_sql: _select: missing projection")
         return false
@@ -3328,7 +3349,10 @@ def private pred_to_sql(var node : ExpressionPtr; var q : SqlQuery&; prog : Prog
                     return ""
                 }
                 subSql = build_sql_string(subQ)
-                binds |> reserve(length(binds) + length(subQ.bindExprs))
+                binds |> reserve(length(binds) + length(subQ.projBindExprs) + length(subQ.bindExprs))
+                for (b in subQ.projBindExprs) {
+                    binds |> push <| clone_expression(b)
+                }
                 for (b in subQ.bindExprs) {
                     binds |> push <| clone_expression(b)
                 }
@@ -3445,7 +3469,10 @@ def private analyze_subquery(var subqExpr : ExpressionPtr; var binds : array<Exp
         return ""
     }
     let sql = build_sql_string(subQ)
-    binds |> reserve(length(binds) + length(subQ.bindExprs))
+    binds |> reserve(length(binds) + length(subQ.projBindExprs) + length(subQ.bindExprs))
+    for (b in subQ.projBindExprs) {
+        binds |> push <| clone_expression(b)
+    }
     for (b in subQ.bindExprs) {
         binds |> push <| clone_expression(b)
     }
@@ -3486,7 +3513,10 @@ def private analyze_subquery_with_pred(var subqExpr : ExpressionPtr; var predLam
     }
     if (!analyze_predicate(body, subQ, prog, at)) return ""
     let sql = build_sql_string(subQ)
-    binds |> reserve(length(binds) + length(subQ.bindExprs))
+    binds |> reserve(length(binds) + length(subQ.projBindExprs) + length(subQ.bindExprs))
+    for (b in subQ.projBindExprs) {
+        binds |> push <| clone_expression(b)
+    }
     for (b in subQ.bindExprs) {
         binds |> push <| clone_expression(b)
     }
