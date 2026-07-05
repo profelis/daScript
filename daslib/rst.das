@@ -378,7 +378,13 @@ def rst_describe_function_short(func : FunctionPtr) {
         }
     }
 
-    var res = "{function_name(func)} ({join(args,"; ")})"
+    // a trailing-underscore name (delete_, where_) parses as an RST reference in the
+    // emitted plain-text def line — escape the underscore (`delete\_ (`)
+    var fname = function_name(func)
+    if (fname |> ends_with("_")) {
+        fname = slice(fname, 0, -1) + "\\_"
+    }
+    var res = "{fname} ({join(args,"; ")})"
     if (func.result != null && func.result.baseType != Type.tVoid) {
         res = "{res} : {describe_type_short(func.result)}"
     }

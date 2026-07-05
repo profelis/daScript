@@ -2,7 +2,14 @@ IF (NOT DEFINED PATH_TO_LIBCLANG)
 	SET(PATH_TO_LIBCLANG "${PROJECT_SOURCE_DIR}/../libclang")
 ENDIF()
 IF ((NOT ${DAS_CLANG_BIND_DISABLED}) OR (NOT DEFINED DAS_CLANG_BIND_DISABLED))
+	# The official LLVM SDK's LLVMConfig.cmake does set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
+	# at OUR scope, silently flipping every daslang target to the static CRT (/MT) and breaking
+	# any module whose vendored lib is /MD (dasHV's hv_static.lib -> LNK2038/OLDNAMES). libclang
+	# is consumed as a DLL through its C API, so daslang's CRT never has to match LLVM's — save
+	# and restore the knob around the find_package.
+	SET(_das_saved_msvc_runtime_library "${CMAKE_MSVC_RUNTIME_LIBRARY}")
 	find_package(Clang 22.1 PATHS "${PATH_TO_LIBCLANG}")
+	SET(CMAKE_MSVC_RUNTIME_LIBRARY "${_das_saved_msvc_runtime_library}")
 ENDIF()
 IF ((NOT DAS_CLANG_BIND_INCLUDED) AND (${Clang_FOUND}) AND ((NOT ${DAS_CLANG_BIND_DISABLED}) OR (NOT DEFINED DAS_CLANG_BIND_DISABLED)))
     SET(DAS_CLANG_BIND_INCLUDED TRUE)
