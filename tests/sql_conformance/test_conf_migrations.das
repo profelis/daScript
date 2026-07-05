@@ -23,17 +23,19 @@ struct private ConfM1 {
 
 [sql_migration(version = 1, description = "create conf_m1")]
 def private conf_migration_v1(db : SqlRunner) {
-    db |> exec("CREATE TABLE conf_m1 (Id INTEGER PRIMARY KEY, X INTEGER)")
+    // quoted identifiers: unquoted names case-fold on PostgreSQL, and the
+    // [sql_table] read-back below emits quoted "Id"/"X"
+    db |> exec("CREATE TABLE conf_m1 (\"Id\" INTEGER PRIMARY KEY, \"X\" INTEGER)")
 }
 
 [sql_migration(version = 2, description = "create conf_m2")]
 def private conf_migration_v2(db : SqlRunner) {
-    db |> exec("CREATE TABLE conf_m2 (y INTEGER)")
+    db |> exec("CREATE TABLE conf_m2 (\"Y\" INTEGER)")
 }
 
 [sql_migration(version = 3, description = "seed conf_m1")]
 def private conf_migration_v3(db : SqlRunner) {
-    db |> exec("INSERT INTO conf_m1 (Id, X) VALUES (?, ?)", 1, 42)
+    db |> exec("INSERT INTO conf_m1 (\"Id\", \"X\") VALUES (?, ?)", 1, 42)
 }
 
 // v4 is benign by default; the failure-rollback test flips the flag for one run.
@@ -154,8 +156,8 @@ def private conf_shape_old_to_new(old : ConfShapeOld; var fresh : ConfShape) {
 def test_conf_struct_convert_rebuild(t : T?) {
     t |> run("convert_and_rename rebuilds the table with translated rows") @(t : T?) {
         with_conf_db() $(db) {
-            db |> exec("CREATE TABLE ConfShape (Id INTEGER PRIMARY KEY, Label TEXT NOT NULL)")
-            db |> exec("INSERT INTO ConfShape (Id, Label) VALUES (1, 'one'), (2, 'two')")
+            db |> exec("CREATE TABLE \"ConfShape\" (\"Id\" INTEGER PRIMARY KEY, \"Label\" TEXT NOT NULL)")
+            db |> exec("INSERT INTO \"ConfShape\" (\"Id\", \"Label\") VALUES (1, 'one'), (2, 'two')")
             db |> convert_and_rename(type<ConfShapeOld>, type<ConfShape>)
             let rows <- _sql(db |> select_from(type<ConfShape>) |> _order_by(_.Label))
             t |> equal(rows |> length, 2)
