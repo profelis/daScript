@@ -115,6 +115,58 @@ A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit1
 gate "amx 1x1 tile dots" "$A " tdpbssd 1
 gate "amx 1x1 tile loads" "$A " tileloadd 2
 gate "amx 1x1 tile fold" "$A " vcvtdq2ps 16
+# pipelined amx tile (slice K I4): peeled block-0 macro + steady-state loop body = 2× every
+# tile op; the 64 fold cvts appear twice (loop body folds block bi−1, exit folds the last spill)
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit2_pipe1
+gate "amx 2x2 pipe dots" "$A " tdpbssd 8
+gate "amx 2x2 pipe loads" "$A " tileloadd 8
+gate "amx 2x2 pipe zero" "$A " tilezero 8
+gate "amx 2x2 pipe spill" "$A " tilestored 8
+gate "amx 2x2 pipe fold" "$A " vcvtdq2ps 128
+gate "amx 2x2 pipe no-sign" "$A " vpsignb 0
+gate "amx 2x2 pipe no-abs" "$A " vpabsb 0
+# latch amx tile (slice K I1): raw immediate-tmm ops — same serial macro counts, but ZERO
+# config traffic in the tile (no backend ldtilecfg at entry, no tilerelease at exit); the
+# ONE ldtilecfg lives in the cfg companion the batch wrapper calls per chunk (zero-arg
+# void companion — symbol anchor is '>', like the witness)
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit2_latch1
+gate "amx 2x2 latch dots" "$A " tdpbssd 4
+gate "amx 2x2 latch loads" "$A " tileloadd 4
+gate "amx 2x2 latch zero" "$A " tilezero 4
+gate "amx 2x2 latch spill" "$A " tilestored 4
+gate "amx 2x2 latch fold" "$A " vcvtdq2ps 64
+gate "amx 2x2 latch no-cfg" "$A " ldtilecfg 0
+gate "amx 2x2 latch no-release" "$A " tilerelease 0
+C='q8q8_amx_cfg_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2_latch1>'
+gate "amx latch cfg companion" "$C" ldtilecfg 1
+gate "amx latch cfg no-release" "$C" tilerelease 0
+C='q8q8_amx_cfg_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2>'
+gate "amx non-latch cfg empty" "$C" ldtilecfg 0
+# biased amx tile (slice K I3): TDPBSUD (signed activations × unsigned w^0x80 plane) replaces
+# TDPBSSD; the −128·Σx bsum correction is 64 embedded-broadcast vpaddd in the fold stage
+# (tilezero stays — no acc init); its gemv companion rides the BIASED busd512 lattice
+# (gkstep1: 8 kg dots + 1 inline bsum = 9, zero sign-trick ops — the fork's gemv penalty gone)
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit2_bias128
+gate "amx 2x2 b128 dots" "$A " tdpbsud 4
+gate "amx 2x2 b128 no-ssd" "$A " tdpbssd 0
+gate "amx 2x2 b128 fold" "$A " vcvtdq2ps 64
+gate "amx 2x2 b128 bsum" "$A " vpaddd 64
+gate "amx 2x2 b128 zero" "$A " tilezero 4
+G=q8q8_gemv_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2_bias128
+gate "amx b128 gemv dots" "$G " vpdpbusd 9
+gate "amx b128 gemv no-abs" "$G " vpabsb 0
+gate "amx b128 gemv no-mask" "$G " vpmovb2m 0
+# the cumulative row (pipe + latch + bias): pipelined structure on raw tmm ops with the
+# biased dot — 8 tdpbsud, zero config traffic, 128 fold cvts + 128 bsum adds
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit2_pipe1_latch1_bias128
+gate "amx cumul dots" "$A " tdpbsud 8
+gate "amx cumul no-ssd" "$A " tdpbssd 0
+gate "amx cumul no-cfg" "$A " ldtilecfg 0
+gate "amx cumul no-release" "$A " tilerelease 0
+gate "amx cumul fold" "$A " vcvtdq2ps 128
+gate "amx cumul bsum" "$A " vpaddd 128
+C='q8q8_amx_cfg_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2_pipe1_latch1_bias128>'
+gate "amx cumul cfg companion" "$C" ldtilecfg 1
 # the vector companions under the amx stamp = the plain sign-trick busd512 lattice over the
 # same unbiased plane (design fork (a)): gemv gkstep2 = 3 block instances x 8 kg = 24 dots +
 # 24 |w|, select-based sign at 512 (no VPSIGNB); mx4 = 8 pshufb lookups + 8 dots; no tile ops

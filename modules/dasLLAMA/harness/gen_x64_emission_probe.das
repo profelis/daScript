@@ -20,14 +20,17 @@ def main {
     var vs <- q8q8_tile_gen_variants()
     var gvs <- q8q8_gemv_gen_variants()
     var mvs <- mx4q8_gemv_gen_variants()
-    // the witness + tokstep registries too, so their impls land in the dump (the amx
-    // witness carries the syscall enable — gated by the check script)
+    // the witness + tokstep + cfg registries too, so their impls land in the dump (the amx
+    // witness carries the syscall enable, the latch cfg companion the LDTILECFG — both
+    // gated by the check script)
     var wvs <- q8q8_family_live_variants()
     var tvs <- q8q8_tokstep_gen_variants()
-    print("tile variants: {length(vs)}, gemv: {length(gvs)}, mx4: {length(mvs)}, witness: {length(wvs)}, tokstep: {length(tvs)}\n")
+    var cvs <- q8q8_amx_cfg_gen_variants()
+    print("tile variants: {length(vs)}, gemv: {length(gvs)}, mx4: {length(mvs)}, witness: {length(wvs)}, tokstep: {length(tvs)}, cfg: {length(cvs)}\n")
     delete vs
     delete gvs
     delete mvs
     delete wvs
     delete tvs
+    delete cvs
 }

@@ -66,6 +66,12 @@ def q8q8_tokstep_gen() : int {
     return 4
 }
 
+//! The tile-config companion (slice K I1): a latch=1 raw-tile stamp carries no per-call
+//! ldtilecfg and no tilerelease, so the batch wrapper calls this once per dispatch chunk to
+//! load the family's static TMUL palette on the worker thread. Reference body — and the
+//! generated body of every non-latch stamp — is a no-op.
+def q8q8_amx_cfg_gen() : void {}
+
 //! The witness companion: did the stamped family actually EMIT on this target? Reference body
 //! = false; the generator emits `return true`, declining in lockstep with the whole family
 //! (the one shared predicate) — so true ⟺ every slot below is generated code. Read at backend
@@ -131,7 +137,9 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
 //! plane — only biased stamps read it, and their wrapper always passes one). The dot=/width=
 //! rows are the x64 legs (slice F): they decline on arm64 and light per cpuid tier on x86-64
 //! (avx2 / vnni256 / avx512bw / avx512vnni / avxvnniint8), so ONE grid serves every ISA; the
-//! bias=128 rows (slice H) additionally bake w^0x80 into the plane and drop the sign trick.
+//! bias=128 rows (slice H) additionally bake w^0x80 into the plane and drop the sign trick;
+//! the amx pipe=1 row (slice K) defers the TMUL macro's scale fold one k-block behind a
+//! double-buffered C spill so vector ports fold while TMUL crunches.
 //! The trailing suffix rows and the bias-on-maddubs row decline by design everywhere (q-reg
 //! budget, lane structure, a dot with no 128-bit leg, word-saturating biased pair-sums) and
 //! pin the decline rail in test mode. Not `private`: called from inside the lifted
@@ -157,11 +165,16 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
  tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 1, requires = "amx-int8"),
  tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 2, requires = "amx-int8"),
  tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 2, gkstep = 2, requires = "amx-int8"),
+ tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 2, pipe = 1, requires = "amx-int8"),
+ tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 2, latch = 1, requires = "amx-int8"),
+ tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 2, bias = 128, requires = "amx-int8"),
+ tune_perm(dot = "amx_int8", width = 512, mr = 16, kstep = 1, nrsplit = 2, pipe = 1, latch = 1, bias = 128, requires = "amx-int8"),
  tune_perm(suffix = "mr8_budget", mr = 8), tune_perm(suffix = "mr2_lanes", mr = 2), tune_perm(dot = "vpdpbusd"),
  tune_companion(fn = "q8q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
  tune_companion(fn = "q8q8_wbias_gen", gen = "dasllama_gemm_gen::q8q8_wbias"),
  tune_companion(fn = "q8q8_kgroup_gen", gen = "dasllama_gemm_gen::q8q8_kgroup"),
  tune_companion(fn = "q8q8_tokstep_gen", gen = "dasllama_gemm_gen::q8q8_tokstep"),
+ tune_companion(fn = "q8q8_amx_cfg_gen", gen = "dasllama_gemm_gen::q8q8_amx_cfg"),
  tune_companion(fn = "q8q8_gemv_gen", gen = "dasllama_gemm_gen::q8q8_gemv"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
@@ -381,6 +394,45 @@ def private q8q8_batch_cell_gen(var myp : float?; wp : int8 const?; sp : float c
     }
 }
 
+// One (unit range × token range) cell of the amx-shaped walk (slice K I2 — the ts≠4 twin of
+// q8q8_batch_cell_gen): (ts-token × gs-group) macro units over units [ub, ue), tokens
+// [tb0, te). The 1-D arm calls it with the full token range, the 2-D grid once per cell.
+// Interior token cells are whole-macro by construction (whole-ts even division); a ragged
+// block tail rides ONE overlapped macro when the overlap stays inside this cell's token range
+// (the tile zero-inits its own y region — same-thread recompute is idempotent, and the tb0
+// guard keeps the overlap from ever crossing into a concurrent cell's rows), else the vector
+// rows-core per token.
+def private q8q8_batch_amx_cell_gen(var myp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, nb, mr, TBa, ts, gs : int64; ub, ue : int; tb0, te : int64) {
+    unsafe {
+        var tb = tb0
+        while (tb < te) {
+            let tbe = min(tb + TBa, te)
+            let tbS = tb + ((tbe - tb) / ts) * ts
+            for (ui in range(ub, ue)) {
+                let gg = int64(ui) * gs
+                let wgp = wp + gg * mr * n
+                let sgp = sp + gg * mr * nb
+                var tk = tb
+                while (tk < tbS) {
+                    q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, gg, tk)
+                    tk += ts
+                }
+                if (tk < tbe) {
+                    if (tbe - ts >= tb0) {
+                        q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, gg, tbe - ts)
+                    } else {
+                        while (tk < tbe) {
+                            q8q8_gemv_gen(myp + tk * d, wp, sp, xqp + tk * n, xsp + tk * nb, n, gg * mr, (gg + gs) * mr)
+                            tk++
+                        }
+                    }
+                }
+            }
+            tb += TBa
+        }
+    }
+}
+
 // The interleaved batch GEMM (grew out of the hand laneq batch kernel, tile swapped for the
 // generated one). Token-blocked: TB tokens outer, groups inner, so the TB×n activation slice
 // stays L2-resident and is reused across this thread's groups instead of re-streaming the whole
@@ -428,33 +480,28 @@ def private q8q8_batch_kernel_neon_laneq_gen(var yp : float?; wp : int8 const?; 
         let gs = ts / 16l                // row-groups per call — amx macros are square in tile units
         let ngu = ng / gs
         let TBa = max(TB, ts)
-        maybe_parallel_for(0, int(ngu), matmul_chunks(int(ngu * gs * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(ub, ue) {
-            unsafe {
-                var tb = 0l
-                while (tb < ntok) {
-                    let tbe = min(tb + TBa, ntok)
-                    let tbS = tb + ((tbe - tb) / ts) * ts
-                    for (ui in range(ub, ue)) {
-                        let gg = int64(ui) * gs
-                        let wgp = wp + gg * mr * n
-                        let sgp = sp + gg * mr * nb
-                        var tk = tb
-                        while (tk < tbS) {
-                            q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, gg, tk)
-                            tk += ts
-                        }
-                        if (tk < tbe) {
-                            if (tbe >= ts) {
-                                q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, gg, tbe - ts)
-                            } else {
-                                while (tk < tbe) {
-                                    q8q8_gemv_gen(myp + tk * d, wp, sp, xqp + tk * n, xsp + tk * nb, n, gg * mr, (gg + gs) * mr)
-                                    tk++
-                                }
-                            }
-                        }
-                    }
-                    tb += TBa
+        let grid = matmul_grid(int(ngu), gs * mr, get_q8_batch_chunks_per_job(), n * d * ntok, ntok, int(ts))
+        if (grid.y <= 1) {
+            maybe_parallel_for(0, int(ngu), grid.x) $(ub, ue) {
+                q8q8_amx_cfg_gen()      // latch stamps: load the TMUL palette on this worker
+                q8q8_batch_amx_cell_gen(myp, wp, sp, xqp, xsp, xbsp, n, d, nb, mr, TBa, ts, gs, ub, ue, 0l, ntok)
+            }
+        } else {
+            // the 2-D grid on the amx walk (slice K I2 — 135M qkv = 18 macro units for 48
+            // lanes was twice as starved as the vector walk): one claim per (unit range ×
+            // token range) cell, ROWS-FASTEST decode, token axis in whole ts-token macros
+            let ntile = ntok / ts
+            let cells = grid.x * grid.y
+            maybe_parallel_for(0, cells, cells) $(cb, ce) {
+                q8q8_amx_cfg_gen()      // latch stamps: load the TMUL palette on this worker
+                for (ci in range(cb, ce)) {
+                    let ri = ci % grid.x
+                    let ti = ci / grid.x
+                    let ub = int(int64(ri) * ngu / int64(grid.x))
+                    let ue = int(int64(ri + 1) * ngu / int64(grid.x))
+                    let ctb = int64(ti) * ntile / int64(grid.y) * ts
+                    let cte = ti == grid.y - 1 ? ntok : int64(ti + 1) * ntile / int64(grid.y) * ts
+                    q8q8_batch_amx_cell_gen(myp, wp, sp, xqp, xsp, xbsp, n, d, nb, mr, TBa, ts, gs, ub, ue, ctb, cte)
                 }
             }
         }

@@ -1377,6 +1377,51 @@ close the amx verdict with attributable data. Piggyback: vector-walk batch_grid_
 session end (box_profile + simple_ids + manifest included — session 3's died with the
 instance).
 
+### Slice K BUILT (2026-07-05, M1 emission-proven — silicon adjudication = the SPR respin)
+
+All four arms landed as independently toggleable perm axes; the serial slice-I rows are
+byte-identical controls. New grid rows: `…nrsplit2_pipe1`, `…nrsplit2_latch1`,
+`…nrsplit2_bias128` (isolation) + `…nrsplit2_pipe1_latch1_bias128` (cumulative). Gates:
+x64 emission 81/81 (llc cross-compile counts), arm64 emission unchanged-green, M1 native
+grid 48 rows lockstep (all 4 new rows decline cleanly off-silicon), suite + 1B parity green.
+
+- **I4 `pipe=1`** — double-buffered C spill (2×nt² tile regions, one alloca), peel block 0
+  compute-only, steady-state loop folds block bi−1 from C[pre] textually between block bi's
+  tile ops (buffer swap via head phis; exit block folds the final spill off the post-swap
+  cPre). Emission: 8 tdpbssd / 8 loads / 8 zero / 8 spill / 128 fold cvts; disasm shows
+  ~115 vector-fold instructions sitting between consecutive tdpbssd chains — the lcpp
+  cadence (mmq.cpp:2008-2105) verbatim.
+- **I1 `latch=1`** — implemented as the RAW immediate-tmm intrinsics (`llvm.x86.tdpbssd`
+  etc.), NOT the `.internal` SSA form: the backend's fast-tile-config insertion
+  (entry ldtilecfg + exit tilerelease) has no C-API off-switch, and raw ops are exactly
+  lcpp's user-managed mode. Fixed register plan C=tmm0-3 (r·nt+ts) / A=tmm4-5 / B=tmm6-7 —
+  bonus over `.internal`: LLVM's RA was serializing all four C chains through one tmm4.
+  Config = NINTH companion `q8q8_amx_cfg_gen` (`() : void`; latch rows emit one LDTILECFG
+  of a 64-byte private-constant palette, every other row a bare ret), called by the batch
+  wrapper ONCE PER CHUNK — per-chunk beats a thread-local latch on plumbing (no TLS-in-JIT
+  risk, no worker identity needed) and amortizes identically. 🔑 harness trap found: an
+  `.internal` amx row TILERELEASEs at exit, so a latch row invoked after it faults with no
+  palette — gen_tune_probe now invokes the row's cfg companion before EVERY direct tile
+  sweep (test + tune legs).
+- **I2** — the amx ts≠4 arm now rides `matmul_grid` (units = ngu, unit_rows = gs·mr,
+  tokq = ts) behind the same batch_grid_2d pin; shared `q8q8_batch_amx_cell_gen` walk
+  (1-D arm = old body verbatim with the full token range). Tail rule made cell-safe: the
+  overlapped tail macro fires only when `tbe − ts >= tb0` (identical to the old absolute
+  check at tb0=0), so an overlap can never reach into a concurrent cell's token range —
+  race-free by construction, no reliance on division proofs.
+- **I3 `bias=128`** — the dot is **TDPBSUD** (signed A tiles × unsigned w^0x80 B plane):
+  feeding biased bytes to TDPBSSD is NOT linearly correctable (s8 reinterpretation of
+  w^0x80 is w±128 piecewise by sign), but SU-order is Σw·x + 128·Σx exactly, and the
+  existing xbsp bsums plane (−128·Σx i32) lands in the FOLD stage as one embedded-broadcast
+  vpaddd per row before the cvt (tilezero untouched). Companions inherit bias through
+  companion_perm → the gemv rides the BIASED busd512 lattice (9 dots = 8 + inline bsum,
+  zero sign ops) — the slice-I fork's measured gemv penalty (+2.6-8% emit, +18-26% pp)
+  is gone. mx4 companion already forces bias=0 internally (nibble plane never biased).
+
+SPR protocol unchanged (P1/P2 probes first, per-arm ladder, cumulative, arch-ladder re-run,
+AMI bake). Note for the ladder: `latch` and `bias` change the GEMV/companion side too — the
+kernel-iso A/B attributes the tile, emission_bench attributes the family.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /

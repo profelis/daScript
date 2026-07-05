@@ -170,9 +170,10 @@ def variant_toksteps() : table<string; int> {
 // repacked buffers (q/s); the fixture's bsums plane rides along (biased variants read it,
 // everything else ignores the parameter). Fixtures divide evenly (ntok % ts == 0, groups %
 // gs == 0) — production tails are the batch wrapper's job, not the tile's.
-def run_tile(tile; fx : Fixture; q : array<int8>; s : array<float>; mr, ts, gs : int64; var y : array<float>) {
+def run_tile(tile, cfg; fx : Fixture; q : array<int8>; s : array<float>; mr, ts, gs : int64; var y : array<float>) {
     let ng = fx.d / mr
     verify(fx.ntok % ts == 0l && ng % gs == 0l)
+    invoke(cfg)     // latch rows: load the TMUL palette (the wrapper's per-chunk call)
     unsafe {
         let wp = addr(q[0])
         let sp = addr(s[0])
@@ -222,6 +223,20 @@ def witness_variants_by_suffix() : table<string; function<() : bool>> {
         tab[v._0] = v._1
     }
     delete wvs
+    return <- tab
+}
+
+// suffix -> tile-config companion (slice K I1), keyed like the tile registry. This harness
+// invokes stamped tiles directly, so it mirrors the batch wrapper: cfg before every tile
+// sweep — an internal-substrate amx tile TILERELEASEs at exit, which would leave a following
+// latch (raw-tmm) tile with no palette. No-op for every non-latch row.
+def cfg_variants_by_suffix() : table<string; function<() : void>> {
+    var tab : table<string; function<() : void>>
+    var cvs <- q8q8_amx_cfg_gen_variants()
+    for (v in cvs) {
+        tab[v._0] = v._1
+    }
+    delete cvs
     return <- tab
 }
 
@@ -337,6 +352,7 @@ def test_mode : bool {
     var gtab <- gemv_variants_by_suffix()
     var mtab <- mx4_variants_by_suffix()
     var wtab <- witness_variants_by_suffix()
+    var ctab <- cfg_variants_by_suffix()
     var allok = true
     for (v in vs) {
         let mr = int64(mrs?[v._0] ?? 4)
@@ -347,6 +363,7 @@ def test_mode : bool {
         verify(gtab |> key_exists(v._0))
         verify(mtab |> key_exists(v._0))
         verify(wtab |> key_exists(v._0))
+        verify(ctab |> key_exists(v._0))
         // witness-lockstep invariants: the reference row is never "live", and a
         // non-reference layout, a biased plane, a kg8 plane or a non-4 tokstep proves the
         // family emitted — the witness must agree
@@ -382,7 +399,7 @@ def test_mode : bool {
             }
             var y : array<float>
             y |> resize(int(fx.ntok * fx.d))
-            run_tile(v._1, fx, qv, sv, mr, tsv, gsv, y)
+            run_tile(v._1, ctab[v._0], fx, qv, sv, mr, tsv, gsv, y)
             let fxok = close_to_ref(fx, y, maxdiff)
             if (!fxok) {
                 var shown = 0
@@ -449,6 +466,7 @@ def test_mode : bool {
     delete wtab
     delete mtab
     delete gtab
+    delete ctab
     delete tss
     delete kgs
     delete wbs
@@ -616,6 +634,7 @@ def tune_mode_run : bool {
     var kgs <- variant_kgroups()
     var tss <- variant_toksteps()
     var gtab <- gemv_variants_by_suffix()
+    var ctab <- cfg_variants_by_suffix()
     // TMUL executes only after the per-process XTILEDATA grant — the witness IS the enable
     // (slice I), and this harness invokes stamped tiles directly (production consults the
     // witness at backend selection), so consume every row's witness up front like test_mode
@@ -648,6 +667,7 @@ def tune_mode_run : bool {
         let wb = int64(wbs?[vs[vi]._0] ?? 0)
         let kgv = int64(kgs?[vs[vi]._0] ?? 4)
         verify(gtab |> key_exists(vs[vi]._0))
+        verify(ctab |> key_exists(vs[vi]._0))
         bufs[vi].q := fx.q
         bufs[vi].s := fx.s
         gbufs[vi].q := gfx.q
@@ -679,7 +699,7 @@ def tune_mode_run : bool {
     yh |> resize(int(hfx.d))
     // correctness first — a tune run must never crown a broken variant
     for (vi in range(nv)) {
-        run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
+        run_tile(vs[vi]._1, ctab[vs[vi]._0], fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
         var maxdiff = 0.0
         if (!close_to_ref(fx, y, maxdiff)) {
             print("{vs[vi]._0}: tile MISMATCH (maxdiff {maxdiff}) — aborting tune\n")
@@ -698,7 +718,7 @@ def tune_mode_run : bool {
     for (_r in range(ROUNDS)) {   // interleaved best-of: variant order inside each round
         for (vi in range(nv)) {
             let t0 = ref_time_ticks()
-            run_tile(vs[vi]._1, fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
+            run_tile(vs[vi]._1, ctab[vs[vi]._0], fx, bufs[vi].q, bufs[vi].s, vmr[vi], vts[vi], vgs[vi], y)
             let us = double(get_time_usec(t0))
             if (us < best[vi]) {
                 best[vi] = us
@@ -757,6 +777,7 @@ def tune_mode_run : bool {
     delete gbest
     delete hbest
     delete gtab
+    delete ctab
     delete tss
     delete kgs
     delete wbs
