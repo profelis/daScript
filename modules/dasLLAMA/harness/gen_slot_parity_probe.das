@@ -32,6 +32,14 @@ def private rand_q8(n : int64) : array<int8> {
     return <- [for (_i in range64(n)); int8(random_int(g_seed) % 256)]
 }
 
+// ACTIVATION bytes are [-127, 127] by construction in production (the Q8 quantizer's
+// d = amax/127) — and the x64 sign-trick kernels (hand dot32 tiers and the generated
+// maddubs/vpdpbusd legs) are exact ONLY under that precondition (PSIGNB of -128 wraps; see
+// x64_avx.das dot32). Weights stay full-range rand_q8: w = -128 is legal and must be covered.
+def private rand_q8_activation(n : int64) : array<int8> {
+    return <- [for (_i in range64(n)); int8(random_int(g_seed) % 255 - 127)]
+}
+
 def private rand_scales(n : int64) : array<float> {
     // positive, spread over a couple of octaves — like real Q8 block scales
     return <- [for (_i in range64(n)); 0.002 + 0.01 * random_float(g_seed)]
@@ -61,8 +69,17 @@ def private compare(tag : string; y : array<float>; yref : array<float>; var fai
 
 [export]
 def main {
-    if (!(get_architecture_name() == "arm64" && jit_enabled())) {
-        print("SKIP: arm64 + -jit only (the arm64-gen backend is not registered here)\n")
+    if (!jit_enabled()) {
+        print("SKIP: -jit only (the gen backends need the LLVM JIT)\n")
+        return
+    }
+    let genbe = get_architecture_name() == "arm64" ? "arm64-gen" : "x64-gen"
+    var found = false
+    for (nm in kernel_backend_names()) {
+        found ||= nm == genbe
+    }
+    if (!found) {
+        print("SKIP: {genbe} not registered on this box\n")
         return
     }
     with_job_que() {
@@ -83,7 +100,7 @@ def main {
         var wq <- rand_q8(total)
         var ws <- rand_scales(total / 32l)
         let ntok = 5l   // 4-token tile + a 1-token tail
-        var xq <- rand_q8(ntok * n)
+        var xq <- rand_q8_activation(ntok * n)
         var xs <- rand_scales(ntok * n / 32l)
 
         // reference: the portable row-major backend
@@ -99,8 +116,15 @@ def main {
         yref_b |> resize(int(ntok * d0))
         matmul_q8q8_batch(yref_b, wq, ws, xq, xs, n, d0, ntok)
 
-        // the gen backend: one flavor since slice E — every slot reads the stamped layout
-        pin_kernel_backend("arm64-gen")
+        // the gen backend: one flavor since slice E — every slot reads the stamped layout.
+        // The pin honors the witness (`available`): on x64 a declined stamp keeps the pin
+        // on the current backend, and portable-vs-portable would be a vacuous pass — skip
+        // loudly instead.
+        pin_kernel_backend(genbe)
+        if (active_kernel_backend() != genbe) {
+            print("SKIP: {genbe} unavailable (declined stamp — no manifest for this box?)\n")
+            return
+        }
         repack_q8q8_weight(wq, ws, woff0, n, d0)
         repack_q8q8_weight(wq, ws, woff1, n, d1)
         repack_q8q8_weight(wq, ws, woff2, n, d2)
@@ -148,7 +172,7 @@ def main {
         mgref |> resize(int(d2 * 2l))
         matmul_mx4q8_groupn(mgref, gxq, gxs, moffs, 2l, xq, xs, bias, mboffs, n, d2)
 
-        pin_kernel_backend("arm64-gen")
+        pin_kernel_backend(genbe)
         repack_mx4_weight(mxq, mxs, 0l, n, d0)
         repack_mx4_weight(gxq, gxs, 0l, n, d2)
         repack_mx4_weight(gxq, gxs, d2 * n, n, d2)

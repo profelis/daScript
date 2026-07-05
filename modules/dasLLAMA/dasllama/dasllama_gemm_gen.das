@@ -34,8 +34,8 @@ require dasllama/dasllama_gemm_schema
 // path is the fallback tier; every companion declines in LOCKSTEP (the one shared
 // perm_declines), so repacks and kernels fall back to the grp4 reference family together.
 // Runs in the llvm-jit context; wired via llvm_user_modules.das. The stubs it generates for
-// are dasllama/dasllama_math_gen.das::q8q8_tile_gen, ::q8q8_layout_gen, ::q8q8_gemv_gen and
-// ::mx4q8_gemv_gen.
+// are dasllama/dasllama_math_gen.das::q8q8_tile_gen, ::q8q8_layout_gen, ::q8q8_gemv_gen,
+// ::mx4q8_gemv_gen and ::q8q8_family_live (the witness).
 
 // dot-primitive kinds (TilePerm.dotPrim, parsed once into TileEmit.dotKind)
 let DOT_SDOT = 0
@@ -740,6 +740,27 @@ def private layout_gen(var gc : LlvmCodeCtx) : bool {
     return true
 }
 
+def private is_witness_signature(fn : Function const?) : bool {
+    return empty(fn.arguments) && fn.result.baseType == Type.tBool
+}
+
+// the witness fifth of the stamp: `() : bool` — did the stamped family actually EMIT on this
+// target? Reference body returns false; the generated body is `return true`, and it declines
+// via the SAME perm_declines as everything else — so "witness true" ⟺ "the whole family is
+// generated code". Backend availability reads it at SELECTION time (never [init] — the
+// slice C rule): on x64 a declined stamp must not load-select the gen backend, because the
+// reference bodies there are the NEON functions' scalar fallbacks — correct but far slower
+// than the portable backend.
+def private witness_gen(var gc : LlvmCodeCtx) : bool {
+    if (!is_witness_signature(gc.fn)) return false
+    let p = parse_perm(gc)
+    if (perm_declines(gc, p)) return false
+    var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
+    LLVMPositionBuilderAtEnd(gc.jit.builder, entry)
+    LLVMBuildRet(gc.jit.builder, LLVMConstInt(gc.jit.types.t_int1, 1ul, 0))
+    return true
+}
+
 def private is_gemv_signature(fn : Function const?) : bool {
     if (length(fn.arguments) != 8 || fn.result.baseType != Type.tVoid) return false
     for (i in range(5)) {
@@ -888,4 +909,5 @@ def public register_dasllama_gemm_generators {
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_layout", @@layout_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_gemv", @@gemv_gen)
     register_llvm_code_generator("dasllama_gemm_gen::mx4_gemv", @@mx4_gemv_gen)
+    register_llvm_code_generator("dasllama_gemm_gen::q8q8_witness", @@witness_gen)
 }

@@ -762,6 +762,48 @@ see below).
 - NT/streaming weight loads for the fat w13/w2 batch streams (the mm_ffn 1.42x note) — now
   expressible as a perm knob on the x64 legs.
 
+## M4 slice G (2026-07-04, Zen2 3990X + M1 Max) — the witness five-function stamp + x64-gen
+
+**The witness closes the stamp** (`q8q8_family_live() : bool`, the fifth companion): reference
+body false, generated body `return true`, declining through the ONE shared predicate — so
+"witness true" ⟺ "every slot is generated code". It is read ONLY at backend-selection time
+(the slice C rule), and it is what makes `x64-gen` registrable: on x64 a declined stamp's
+reference bodies are the NEON functions' scalar fallbacks (~9.5 GMAC/s vs portable's ~19), so
+an un-emitted family must never load-select. `x64-gen` registers over the SAME ISA-agnostic
+slot traversals as arm64-gen (priority 25, needs_repack, `available = @@q8q8_family_live`,
+avx2 minimum); arm64-gen keeps no predicate (a declined stamp still leaves the fast grp4
+reference pair there). gen_tune_probe test mode now asserts the lockstep invariants (mr !=
+reference ⟹ witness live; reference row ⟹ not live) and prints live/ref per row.
+
+**The Zen2 bring-up (Boris's 3990X desktop, native Windows/MSVC + VS2026, repo E:\das,
+models D:\Work\llama.cpp\models, ssh `zen2`):**
+
+- **Grid on silicon:** GEN TUNE TEST OK — both maddubs-256 rows live at mr=8, BIT-EXACT
+  (maxdiff 0) for tile + Q8 gemv + pshufb mx4 gemv on the first-ever x64 run; every
+  VNNI/512/vnniint8 row declines per cpuid. Tune sweep winner
+  `dot_maddubs_width256_mr8_kstep2` -> zen2_manifest.json (the x64 manifest round-trip).
+- **Slot parity through the REAL rail** (pin x64-gen, grp8 repack, generated cores): ALL
+  slots maxdiff 0 at the maddubs stamp; the no-manifest leg SKIPs loudly via the witness
+  (pin refused, portable kept). **The probe caught a real fixture bug on the way:** its
+  activations were raw random int8 INCLUDING -128, violating the documented sign-trick
+  precondition (PSIGNB of -128 wraps; the Q8 quantizer guarantees [-127,127] by construction
+  — verified in dasllama_quant). arm64 never noticed (sdot has no precondition). Fixed:
+  activations use the quantizer's range, weights stay full-range (w = -128 must stay covered).
+- **Registered A/B (gemm_1core_probe, same slots, interleaved best-of-6):** x64-gen batch
+  52.6–53.2 GMAC/s vs acc8 30.9–32.1 (the best hand tier) and repack ~26 — **1.65–1.7x over
+  acc8, ~2x over the layout-comparable repack tier, on all four shapes**; gemv 1.3–1.5x.
+  The Zen2/AVX2 hand-tier class is decisively covered on the deletion scoreboard.
+- **e2e:** parity.das Llama-3.2-1B GEN_IDS token-for-token identical, no-manifest rail vs
+  x64-gen maddubs-mr8 rail (24 greedy tokens); emission_bench logs `backend: x64-gen (batch:
+  x64-gen)` and reads ~994 t/s prefill-512 / 36.1 t/s emit on Llama-1B (llama.cpp yardstick
+  on this box = next session; needs a Windows llama-bench build check).
+- arm64 unchanged: grid witness column correct (sdot rows live, x64 rows ref), slot parity
+  both stamps, dasLLAMA suite 179/179.
+
+**Still open after G:** the lcpp yardstick on Zen2 (llama-bench.exe) + a fleet pass with the
+zen2 manifest; loop-hint manifest kind; per-slot perms; then the deletion (the hand AVX
+tiers are now beaten on Zen2 — EPYC zvnni is the remaining leg before the x64 matrix goes).
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /

@@ -13,25 +13,38 @@ require math
 // The GEMM family as a [tune] client (gemm_generator_plan.md part 3; promoted from the M2
 // GO/NO-GO experiment): the perm grid below stamps dasllama_gemm_gen::q8q8_tile perms through
 // [llvm_code], and the [tune_companion] rows stamp q8q8_layout_gen + q8q8_gemv_gen +
-// mx4q8_gemv_gen from the same entry — the four-function stamp: the runtime repacks (Q8 AND
-// mx4 planes) ask the layout companion which interleave the stamped cores read, and all four
-// generators share one decline predicate, so kernels and repacks cannot desync on any tier.
-// Normal runs stamp exactly one winner (manifest > fallback kstep2 = the M2 perm);
+// mx4q8_gemv_gen + q8q8_family_live from the same entry — the five-function stamp: the
+// runtime repacks (Q8 AND mx4 planes) ask the layout companion which interleave the stamped
+// cores read, the witness answers "did the family actually emit", and all five generators
+// share one decline predicate, so kernels, repacks and availability cannot desync on any
+// tier. Normal runs stamp exactly one winner (manifest > fallback kstep2 = the M2 perm);
 // DAS_TUNE_MODE=tune/test stamps the grid + the *_variants() registries for the harness
-// (gen_parity_probe / gen_tune_probe). This module registers ONE backend — "arm64-gen"
-// (priority 25, the arm64 load-select tier since slice C): every slot, Q8 and mx4, is the
-// generated family or a das traversal over it, reading the stamped layout at runtime.
-// dasllama_common pulls it in behind a path guard (`require ?llvm/daslib/llvm_tune`), so any
-// Q8/mx4 model load on arm64+jit runs the generated family. The generators live in
-// dasllama/dasllama_gemm_gen.das (llvm-jit context, wired via llvm/daslib/llvm_user_modules.das).
+// (gen_parity_probe / gen_tune_probe). This module registers TWO backends over the SAME
+// ISA-agnostic slot traversals: "arm64-gen" (priority 25, the arm64 load-select tier since
+// slice C) and "x64-gen" (priority 25, witness-gated — only selectable when the stamped
+// family emitted). dasllama_common pulls it in behind a path guard
+// (`require ?llvm/daslib/llvm_tune`), so any Q8/mx4 model load on a gen-capable box runs the
+// generated family. The generators live in dasllama/dasllama_gemm_gen.das (llvm-jit context,
+// wired via llvm/daslib/llvm_user_modules.das).
 
-//! The layout companion (the four-function stamp): the repack interleave (mr) the stamped tile
+//! The layout companion (the five-function stamp): the repack interleave (mr) the stamped tile
 //! reads. Reference body = the reference tile's grp4; the generator emits the perm's mr and
 //! declines in lockstep with the tile generator (shared perm_declines), so a perm the tile
 //! can't emit keeps the grp4 reference pair on both sides — on every tier, JIT-time declines
 //! included.
 def q8q8_layout_gen() : int {
     return q8q8_repack_type(GEMM_REFERENCE_MR).interleave
+}
+
+//! The witness companion: did the stamped family actually EMIT on this target? Reference body
+//! = false; the generator emits `return true`, declining in lockstep with the whole family
+//! (the one shared predicate) — so true ⟺ every slot below is generated code. Read at backend
+//! SELECTION time only (never [init] — the slice C rule): on x64 a declined stamp keeps the
+//! gen backend unavailable, because the reference bodies there are the NEON functions' scalar
+//! fallbacks — correct, but far slower than the portable backend. On arm64 a declined stamp
+//! still leaves the fast grp4 reference pair, so arm64-gen stays available regardless.
+def q8q8_family_live() : bool {
+    return false
 }
 
 //! The GEMV companion (the nr=1 perm sub-family, slice D): a rows-range core with the mm_rows
@@ -105,6 +118,7 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
  tune_companion(fn = "q8q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
  tune_companion(fn = "q8q8_gemv_gen", gen = "dasllama_gemm_gen::q8q8_gemv"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
+ tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
  tune(gen = "dasllama_gemm_gen::q8q8_tile", fallback = "kstep2"),
  hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xqp, noalias = xsp)]
 def q8q8_tile_gen(var yp : float?; wg : int8 const?; sg : float const?; xqp : int8 const?; xsp : float const?; n, d, g, t0 : int64) : void {
@@ -495,14 +509,14 @@ def private mx4q8_groupn_gen(var yp : float?; wn : uint8 const?; we : uint8 cons
 
 [init]
 def dasllama_math_gen_register() {
-    // Same gate as the laneq backend it supersedes; needs_repack keeps it out of auto-select
-    // (direct callers stay on arm64-sdot). ONE backend since slice E: every slot — Q8 and
-    // mx4 — reads the STAMPED layout at runtime (repacks and traversal strides off the
-    // layout companion, cores generated for that mr), so the slice C two-flavor split
-    // (laneq borrows vs grp stopgaps, selected by an `available` predicate) is gone. The
-    // q8_layout field feeds the activation-time cache the mx4 expand's positional map reads;
-    // it is evaluated at selection time, never at [init] ([init]s run before the JIT
-    // installs generated code — the slice C mr8 bug).
+    // Same gate as the laneq backend it superseded; needs_repack keeps it out of auto-select
+    // (direct callers stay on arm64-sdot). Every slot — Q8 and mx4 — reads the STAMPED
+    // layout at runtime (repacks and traversal strides off the layout companion, cores
+    // generated for that mr). The q8_layout field feeds the activation-time cache the mx4
+    // expand's positional map reads; it is evaluated at selection time, never at [init]
+    // ([init]s run before the JIT installs generated code — the slice C mr8 bug). arm64
+    // needs no availability predicate: a declined stamp still leaves the fast grp4
+    // reference pair there.
     if (get_architecture_name() == "arm64" && jit_enabled()) {
         register_kernel_backend(KernelBackend(name = "arm64-gen", mm = @@q8q8_kernel_gen,
             batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_gen,
@@ -512,5 +526,21 @@ def dasllama_math_gen_register() {
             mm_rows = @@q8q8_gemv_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen))
+    }
+    // The x64 twin (slice F emitters + the witness): the das traversals above are
+    // ISA-agnostic, so the ONLY x64-specific wiring is the availability predicate — the
+    // witness companion is true iff the stamped family actually emitted (a declined stamp's
+    // reference bodies are the NEON functions' scalar fallbacks here, far slower than the
+    // portable backend, so an un-emitted family must never load-select). avx2 is the
+    // family's minimum tier (the maddubs leg).
+    if (get_architecture_name() == "x86_64" && jit_enabled() && cpu_supports("avx2")) {
+        register_kernel_backend(KernelBackend(name = "x64-gen", mm = @@q8q8_kernel_gen,
+            batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_gen,
+            repack = @@repack_q8q8_gen,
+            mm_mx4 = @@mx4q8_kernel_gen, repack_mx4 = @@repack_mx4_gen,
+            groupn = @@q8q8_groupn_gen, groupn_mx4 = @@mx4q8_groupn_gen,
+            mm_rows = @@q8q8_gemv_gen,
+            needs_repack = true, mx4_expand_interleaved = true, priority = 25,
+            q8_layout = @@q8q8_layout_gen, available = @@q8q8_family_live))
     }
 }

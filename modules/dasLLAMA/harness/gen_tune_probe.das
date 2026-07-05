@@ -29,6 +29,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_math_default
 require dasllama/dasllama_math_aarch64_neon
 require dasllama/dasllama_math_gen
+require dasllama/dasllama_gemm_schema
 require dasllama/dasllama_quant
 require llvm/daslib/llvm_tune
 require daslib/random
@@ -157,6 +158,18 @@ def gemv_variants_by_suffix() : table<string; MatmulQ8Q8RowsFn> {
     return <- tab
 }
 
+// suffix -> witness variant (the five-function stamp's availability bit), keyed like the
+// tile registry
+def witness_variants_by_suffix() : table<string; function<() : bool>> {
+    var tab : table<string; function<() : bool>>
+    var wvs <- q8q8_family_live_variants()
+    for (v in wvs) {
+        tab[v._0] = v._1
+    }
+    delete wvs
+    return <- tab
+}
+
 // the row's tile knobs: the suffix minus its gemv piece — rows carrying gkstep spell the
 // tile knobs explicitly, so "kstep2_gkstep2" keys with "kstep2"
 def tile_key(suffix : string) : string {
@@ -264,11 +277,23 @@ def test_mode : bool {
     var mrs <- variant_mrs()
     var gtab <- gemv_variants_by_suffix()
     var mtab <- mx4_variants_by_suffix()
+    var wtab <- witness_variants_by_suffix()
     var allok = true
     for (v in vs) {
         let mr = int64(mrs?[v._0] ?? 4)
         verify(gtab |> key_exists(v._0))
         verify(mtab |> key_exists(v._0))
+        verify(wtab |> key_exists(v._0))
+        // witness-lockstep invariants: the reference row is never "live", and a
+        // non-reference layout proves the family emitted — the witness must agree
+        let live = invoke(wtab[v._0])
+        if (v._0 == "reference") {
+            verify(!live)
+        }
+        if (int(mr) != GEMM_REFERENCE_MR && !live) {
+            print("  WITNESS DESYNC {v._0}: layout mr={mr} but witness says not live\n")
+            allok = false
+        }
         var ok = true
         var gok = true
         var maxdiff = 0.0
@@ -340,9 +365,10 @@ def test_mode : bool {
             delete nv
             delete ev
         }
-        print("{v._0} (mr={mr}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
+        print("{v._0} (mr={mr}, {live ? "live" : "ref"}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
         allok = allok && ok && gok && mok
     }
+    delete wtab
     delete mtab
     delete gtab
     delete mrs
