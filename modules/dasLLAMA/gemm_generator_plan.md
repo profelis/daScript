@@ -800,9 +800,29 @@ models D:\Work\llama.cpp\models, ssh `zen2`):**
 - arm64 unchanged: grid witness column correct (sdot rows live, x64 rows ref), slot parity
   both stamps, dasLLAMA suite 179/179.
 
-**Still open after G:** the lcpp yardstick on Zen2 (llama-bench.exe) + a fleet pass with the
-zen2 manifest; loop-hint manifest kind; per-slot perms; then the deletion (the hand AVX
-tiers are now beaten on Zen2 — EPYC zvnni is the remaining leg before the x64 matrix goes).
+### Slice G small-fleet yardstick (Zen2 3990X, das x64-gen maddubs-mr8 vs llama.cpp CPU
+### build fdb1db877, -p 512 -n 64, back-to-back per model, pp = 512000/(ttft − 1/emit))
+
+| model | T | das pp | lcpp pp | ratio | das emit | lcpp tg64 | ratio |
+|---|---|--:|--:|:--:|--:|--:|:--:|
+| SmolLM2-135M | 16 | 2193 | 2317 | 0.95 | 103.5 | 219.0 | 0.47 |
+| SmolLM2-135M | 32 | 2413 | 2715 | 0.89 | 104.8 | 193.1 | 0.54 |
+| Qwen3-0.6B | 16 | 874 | 752 | **1.16** | 52.8 | 70.0 | 0.75 |
+| Qwen3-0.6B | 32 | 1157 | 853 | **1.36** | 54.2 | 66.2 | 0.82 |
+| gemma-3-1b | 16 | 614 | 543 | **1.13** | 36.3 | 44.2 | 0.82 |
+| gemma-3-1b | 32 | 779 | 563 | **1.38** | 36.7 | 42.0 | 0.87 |
+| Llama-3.2-1B | 16 | 598 | 424 | **1.41** | 35.7 | 40.1 | 0.89 |
+| Llama-3.2-1B | 32 | 904 | 465 | **1.94** | 37.7 | 40.7 | 0.93 |
+
+**Prefill is the win column on Zen2** — the generated batch tile scales with threads while
+lcpp's Zen2 path stays flat (no zmm engine there; the pre-gen +20%@32C observation,
+amplified). **Decode losses shrink with size (0.47 -> 0.93)** and are the KNOWN
+dispatch-side issue (tiny models single-lane most matmuls under the 2M par threshold — the
+queued per-lane-regime item), not kernels: the registered A/B has our GEMV 1.3–1.5x ahead.
+
+**Still open after G:** the decode dispatch work above; a full-fleet pass with the zen2
+manifest; loop-hint manifest kind; per-slot perms; then the deletion (the hand AVX tiers are
+now beaten on Zen2 — EPYC zvnni is the remaining leg before the x64 matrix goes).
 
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
