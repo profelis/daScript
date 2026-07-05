@@ -339,7 +339,19 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
-- **2-D batch chunk space (row-units × token-blocks) — the chunk-starved-shape remedy.**
+- **✅ SHIPPED + SILICON-ADJUDICATED (zen2, 2026-07-05): 2-D batch chunk space (row-units ×
+  token-blocks).** Landed as `batch_grid_2d` (0 = 1-D / 1 = fine grid, ggml's 16-token cells /
+  2 = wave-aligned, rc·ntc = whole L-waves); the knob arms a per-dispatch auto-gate (engages only
+  when the 1-D grain cap starves the admitted lanes), gen ts=4 walk factored into a shared
+  body_cell so the off-path is the old walk verbatim; bit-exact all three ways (op-level test +
+  512-tok GEN_IDS on both boxes). zen2 A/B (T=48, 3 interleaved reps): 135M pp512 knob2 +7.9%
+  (every rep; +15% in the post-pin interleaved confirm), knob1 only +2.8% — **wave alignment
+  beats ggml's amortize-the-tail at one-claim-per-lane granularity, the same physics as the 1-D
+  wave invariant**; 1B +3-4% (kv d=512 starves); Qwen3-0.6B null as geometry predicts (nothing
+  starves at 48 lanes); T=24 control identical (gate can't engage). zen2 profile pinned
+  `batch_grid_2d: 2`; M1 pin stays off (≤11 lanes can never starve — verified no-regress).
+  OPEN: the SPR respin should A/B the pin at T≥48 (more shapes starve at higher lane counts;
+  fine-vs-aligned may flip where claim overhead differs). Original scoping kept below.
   Our batch dispatch chunks over out-row units only; tokens loop inside each chunk. Shapes
   with few row-units starve high lane counts (135M d=576 → ~5-36 chunks for 48 lanes; the
   Qwen3-0.6B attn_chain "deep-thin" 50% lead is the same geometry). llama.cpp's GENERIC path
