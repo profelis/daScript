@@ -226,9 +226,9 @@ def private _migrate_inner(db; blocking : bool) : Result<int, string> {
         }
     }
     if (pending |> empty) return ok(0, type<string>)
-    // Provider lock + transaction begin (SQLite: BEGIN IMMEDIATE; PostgreSQL: advisory
-    // lock then BEGIN — blocking waits, non-blocking fails fast; DuckDB: plain BEGIN).
-    // Lock contention surfaces here as a soft error.
+    // Provider lock + txn begin — all-or-nothing per contract: on err the glue holds
+    // NOTHING (e.g. PG unlocks its advisory lock itself if BEGIN fails after locking),
+    // so this early return correctly skips _migration_end. Contention = soft error.
     let begin_err = _::_migration_begin(db, blocking)
     if (begin_err |> is_some) return err(begin_err |> unwrap, type<int>)
     // Concurrent-runner guard (Scenario 8): re-read MAX(version) under the write lock and drop pending entries another runner already applied between our optimistic read and the lock.
@@ -403,6 +403,7 @@ def private _baseline_inner(db; version : int; blocking : bool) : Result<int, st
     if (version > max_reg) return err("baseline(version={version}) is above the highest registered migration (v{max_reg}) — looks like a typo", type<int>)
     let create_err = db |> _::try_exec(AUDIT_CREATE_DDL)
     if (create_err |> is_some) return err(create_err |> unwrap, type<int>)
+    // all-or-nothing per contract — on err the glue holds nothing; skipping _migration_end is correct
     let begin_err = _::_migration_begin(db, blocking)
     if (begin_err |> is_some) return err(begin_err |> unwrap, type<int>)
     var stamped = 0
