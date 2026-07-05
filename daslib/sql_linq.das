@@ -1908,7 +1908,7 @@ def private analyze_chain(var node : ExpressionPtr; var q : SqlQuery&; prog : Pr
                 return false
             }
             q.inHaving = true
-            let s = pred_to_sql(body, q, prog, at)
+            let s = pred_to_sql_boolctx(body, q, prog, at)
             q.inHaving = false
             if (q.hadError || empty(s)) return false   // pred_to_sql emitted macro_error, OR returned "" without setting hadError
             q.havingSql = s
@@ -2966,7 +2966,7 @@ def private analyze_predicate(var body : ExpressionPtr; var q : SqlQuery&; prog 
         macro_error(prog, at, "_sql: _where: missing predicate")
         return false
     }
-    let s = pred_to_sql(body, q, prog, at)
+    let s = pred_to_sql_boolctx(body, q, prog, at)
     // operator handlers wrap empty children (`lhs = rhs` -> `" = ?"`); empty(s) alone isn't reliable
     if (q.hadError || empty(s)) return false
     if (empty(q.whereSql)) {
@@ -3027,6 +3027,23 @@ def private mentions_source_arg(node : ExpressionPtr; q : SqlQuery; asReceiver :
     return false
 }
 
+[macro_function]
+def private pred_to_sql_boolctx(var node : ExpressionPtr; var q : SqlQuery&; prog : ProgramPtr; at : LineInfo) : string {
+    // nolint:STYLE015 boolean SQL position (WHERE/HAVING root, NOT/AND/OR operand): a bare
+    // bool-typed column ref coerces to `(col <> 0)` — bool lives in an INTEGER column and strict
+    // dialects (PostgreSQL) reject int truthiness; comparison operands stay bare (int binds)
+    let s = pred_to_sql(node, q, prog, at)
+    if (q.hadError || empty(s)) return s
+    var peeled = node
+    if (peeled is ExprRef2Value) {
+        peeled = (peeled as ExprRef2Value).subexpr
+    }
+    if (peeled != null && peeled is ExprField && peeled._type != null && peeled._type.baseType == Type.tBool) {
+        return "({s} <> 0)"
+    }
+    return s
+}
+
 def private pred_to_sql(var node : ExpressionPtr; var q : SqlQuery&; prog : ProgramPtr; at : LineInfo) : string {
     if (node == null) return pred_fail(q, prog, at, "_sql: _where: null sub-expression")
     if (node is ExprRef2Value) {
@@ -3070,20 +3087,20 @@ def private pred_to_sql(var node : ExpressionPtr; var q : SqlQuery&; prog : Prog
                     }
                 }
             }
-            return "NOT ({pred_to_sql(inner, q, prog, at)})"
+            return "NOT ({pred_to_sql_boolctx(inner, q, prog, at)})"
         }
     }
     // Logical AND
     {
         var lhs : ExpressionPtr
         var rhs : ExpressionPtr
-        if (qmatch(node, $e(lhs) && $e(rhs)).matched) return "({pred_to_sql(lhs, q, prog, at)}) AND ({pred_to_sql(rhs, q, prog, at)})"
+        if (qmatch(node, $e(lhs) && $e(rhs)).matched) return "({pred_to_sql_boolctx(lhs, q, prog, at)}) AND ({pred_to_sql_boolctx(rhs, q, prog, at)})"
     }
     // Logical OR
     {
         var lhs : ExpressionPtr
         var rhs : ExpressionPtr
-        if (qmatch(node, $e(lhs) || $e(rhs)).matched) return "({pred_to_sql(lhs, q, prog, at)}) OR ({pred_to_sql(rhs, q, prog, at)})"
+        if (qmatch(node, $e(lhs) || $e(rhs)).matched) return "({pred_to_sql_boolctx(lhs, q, prog, at)}) OR ({pred_to_sql_boolctx(rhs, q, prog, at)})"
     }
     // Comparison ops.
     {
@@ -3248,6 +3265,12 @@ def private pred_to_sql(var node : ExpressionPtr; var q : SqlQuery&; prog : Prog
                     if (q.rootType == null && q.fromRowType != null) {
                         if (!fromrow_alias_exists(q.fromRowType, fieldName)) return pred_fail(q, prog, at, "_sql: column `{fieldName}` is not a projection alias of the inner subquery; valid aliases are {fromrow_alias_list(q.fromRowType)}")
                         return "\"{fieldName}\""
+                    }
+                    // nolint:STYLE015 `_.Col` in DO UPDATE SET values → table-qualified: PG rejects the
+                    // unqualified spelling as ambiguous vs `excluded`; SQLite/DuckDB accept the qualified form
+                    if (q.upsertMode) {
+                        let sqlCol = field_to_column_name(q.rootType, fieldName)
+                        return "\"{sql_table_name_from_type(q.rootType)}\".\"{sqlCol}\""
                     }
                     return column_sql_for_alias("", q.rootType, fieldName)
                 }
@@ -4898,7 +4921,7 @@ def private emit_update_body(prog : ProgramPtr; var call : ExprCallMacro?;
         return null
     }
     // Translate WHERE — raw AST. pred_to_sql emitted macro_error, OR returned "" without setting hadError.
-    let whereSql = pred_to_sql(whereE, q, prog, call.at)
+    let whereSql = pred_to_sql_boolctx(whereE, q, prog, call.at)
     if (q.hadError || empty(whereSql)) return null
     // Translate SET — raw named-tuple literal.
     var setSqlClauses : array<string>
@@ -4966,7 +4989,7 @@ def private emit_delete_body(prog : ProgramPtr; var call : ExprCallMacro?;
         return null
     }
     // pred_to_sql emitted macro_error, OR returned "" without setting hadError.
-    let whereSql = pred_to_sql(whereE, q, prog, call.at)
+    let whereSql = pred_to_sql_boolctx(whereE, q, prog, call.at)
     if (q.hadError || empty(whereSql)) return null
     var sql = "DELETE FROM \"{tableName}\" WHERE {whereSql}"
     if (isReturning) {

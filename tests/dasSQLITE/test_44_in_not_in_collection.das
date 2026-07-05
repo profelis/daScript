@@ -74,7 +74,7 @@ def test_in_collection_with_outer_where(t : T?) {
     let sql = _sql_text(_db |> select_from(type<User>)
                           |> _where(_.Active && _.Id._in([1, 2, 4])))
     t |> equal(sql,
-        "SELECT \"Id\", \"Name\", \"Active\" FROM \"Users\" WHERE (\"Active\") AND (\"Id\" IN (SELECT value FROM json_each(?)))",
+        "SELECT \"Id\", \"Name\", \"Active\" FROM \"Users\" WHERE ((\"Active\" <> 0)) AND (\"Id\" IN (SELECT value FROM json_each(?)))",
         "_in(arr) composes with other WHERE predicates via &&")
 }
 

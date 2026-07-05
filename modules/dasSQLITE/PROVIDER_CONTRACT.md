@@ -3,7 +3,8 @@
 What a database provider implements to plug into the `_sql` LINQ-to-SQL machinery
 (`daslib/sql_linq.das`) and the `[sql_table]` macro layer (`daslib/sql_boost.das`).
 SQLite (`sqlite_boost.das` + the registration shim `sqlite_provider.das`) is the
-reference implementation; DuckDB and PostgreSQL are the planned consumers. This
+reference implementation; [dasDuckDB](https://github.com/borisbat/dasDuckDB) and
+[dasPostgreSQL](https://github.com/borisbat/dasPostgreSQL) are the external consumers. This
 document is the contract; the registry core in `daslib/sql_provider.das` is its
 executable form.
 
@@ -74,7 +75,7 @@ adds one `require ?<mod>` line plus one `static_if` branch to
 | `runnerModule` + `runnerStruct` | `"sqlite_boost"` + `"SqlRunner"` | registry lookup key, matched against `q.dbExpr._type`'s struct + owning module |
 | `makeStmtType` | `qmacro_type(type<sqlite3_stmt?>)` | bind-block parameter splices (mutable flavor) |
 | `makeStmtTypeConst` | `qmacro_type(type<sqlite3_stmt? const>)` | row-reader block/lambda parameter splices — qualifiers are spelled in the type expression; `$t` substitution replaces the placeholder type wholesale, so the parser's const-append on non-`var` params does not apply to spliced types |
-| `renderPlaceholder(ordinal)` | `"?"` | `fold_to_builder` — the single render point for bind frags (`?` inside `build_sql_string` output is internal IR that `sql_to_frags` re-splits). Ordinal is 1-based among macro-enumerated binds; upsert row-binds are emitted as literal `?` text (bound by the generated `_sql_bind_row`, not enumerated), so a numbered-placeholder provider must also handle row-binder placeholders at port time |
+| `renderPlaceholder(ordinal)` | `"?"` | `fold_to_builder` — the single render point for bind frags (`?` inside `build_sql_string` output is internal IR that `sql_to_frags` re-splits). Ordinal is 1-based among macro-enumerated binds; upsert row-binds are emitted as literal `?` text (bound by the generated `_sql_bind_row`, not enumerated), so a numbered-placeholder provider must also handle row-binder placeholders at port time. dasPostgreSQL's resolution: register `"?"` here and renumber every statement's `?` markers to `$n` in one quote-aware runtime pass at execute time — text order equals bind-index order by construction across chain SQL, upsert, and generated CRUD |
 | `noLimitSpelling` | `"LIMIT -1"` | OFFSET-without-LIMIT rendering in `build_sql_string` |
 | `renderJsonExtract(target, path)` | `json_extract({target}, '$....')` | `@sql_json` column descent (`render_json_extract`) |
 | `quoteId(name)` | `"name"` (double quotes) | registered, NOT yet routed — double-quote identifier quoting is portable across SQLite/DuckDB/PostgreSQL; the renderers keep inline quoting until a diverging provider (e.g. MySQL backticks) forces the sweep |
