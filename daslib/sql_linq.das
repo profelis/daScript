@@ -3767,10 +3767,12 @@ def private fn_call_to_sql(var call : ExprCall?; var q : SqlQuery&; prog : Progr
             return "NOT EXISTS ({subSql})"
         }
     }
-    // ---- User-defined [sql_function] — emit `<name>(args...)` so SQLite calls the registered UDF.
+    // ---- User-defined [sql_function] — emit `<name>(args...)` so the engine calls the registered UDF.
     if (call.func != null) {
         let info = sql_function_info_from_func(call.func)
         if (!empty(info.name)) {
+            // The annotation is neutral (daslib/sql_boost) — fail closed on non-UDF providers.
+            if (!sql_provider_at(q.providerIdx).caps.client_udfs) return pred_fail(q, prog, at, "_sql: [sql_function] '{info.name}' cannot be used on provider '{sql_provider_at(q.providerIdx).name}' — it does not support client-registered UDFs (caps.client_udfs); define the function server-side (e.g. CREATE FUNCTION via exec) and inline the call in raw SQL instead")
             if (info.directonly && q.inView) return pred_fail(q, prog, at, "_sql: [sql_function(directonly=true)] '{info.name}' cannot be used in `_create_view` body — SQLite forbids SQLITE_DIRECTONLY functions in views (drop directonly=true, or call the function only from application SQL)")
             let sql = build_string() $(var w) {
                 w |> write(info.name)

@@ -2266,3 +2266,206 @@ class private CreateUniqueIndexMacro : AstCallMacro {
         return emit_create_index(prog, call, true)
     }
 }
+
+// ===== [sql_function] — auto-registered scalar UDF, visible in `_sql` chains =====
+// Provider-neutral: tagged functions land in ONE erased queue; every UDF-capable
+// provider's open path replays it (`_install_sql_function_registry` in each boost).
+
+enum public SqlFnTag : uint8 {
+    //! Type-tag wire contract shared with each provider's userfn trampoline C++
+    //! (dasSQLITE.userfn.cpp, dasDUCKDB.userfn.cpp). Order is wire-stable; do NOT
+    //! renumber without also updating every provider's C++.
+    Int = uint8(0)
+    Int64 = uint8(1)
+    Float = uint8(2)
+    Double = uint8(3)
+    Bool = uint8(4)
+    String = uint8(5)
+}
+
+typedef public SqlFnCarrier = function<() : void>
+//! Erasure carrier for the queued function pointer. The provider registration externs
+//! take a raw ``das::Func`` (any function), so only the 64-bit value matters — the
+//! spelled signature is a placeholder; never invoke through it.
+
+struct public SqlFunctionEntry {
+    //! One queued ``[sql_function]`` registration, type-erased. Providers marshal via
+    //! the tag slots (unused slots are 0/ignored per ``nArgs``), not the das-side type.
+    name : string
+    nArgs : int
+    tag0 : uint8
+    tag1 : uint8
+    tag2 : uint8
+    tag3 : uint8
+    retTag : uint8
+    deterministic : bool
+    directonly : bool
+    fn : SqlFnCarrier
+}
+
+// Populated by [init] thunks emitted into consumer modules; replayed by every provider
+// open path (try_open_sqlite / try_open_duckdb / ...).
+var private g_sql_functions : array<SqlFunctionEntry>
+
+def public _add_sql_function_entry(name : string; nArgs : int;
+                                   tag0, tag1, tag2, tag3 : uint8;
+                                   retTag : uint8; deterministic : bool; directonly : bool;
+                                   fn : auto(FN)) : void {
+    //! Public entry point used by ``[sql_function]``-generated ``[init]`` blocks to append
+    //! a registration to the neutral queue. End users never call this directly.
+    var e <- SqlFunctionEntry(name = name, nArgs = nArgs,
+        tag0 = tag0, tag1 = tag1, tag2 = tag2, tag3 = tag3,
+        retTag = retTag, deterministic = deterministic, directonly = directonly,
+        fn = unsafe(reinterpret<SqlFnCarrier>(fn)))
+    g_sql_functions |> emplace(e)
+}
+
+def public for_each_sql_function(blk : block<(e : SqlFunctionEntry) : void>) : void {
+    //! Iterates the queued registrations — the provider boosts' install loops drive this
+    //! once per opened connection.
+    for (e in g_sql_functions) {
+        invoke(blk, e)
+    }
+}
+
+def public sql_function_duplicate_error : SqlError {
+    //! ``some(msg)`` when two queued registrations collide on (name, nArgs) — engines would
+    //! silently replace the earlier binding. Provider install loops check this first.
+    var seen : table<string; bool>
+    for (e in g_sql_functions) {
+        let key = "{e.name}/{e.nArgs}"
+        if (key_exists(seen, key)) {
+            return some("[sql_function] duplicate registration: '{e.name}' with {e.nArgs} args is tagged in more than one place; the engine would silently replace the earlier binding")
+        }
+        seen |> insert(key, true)
+    }
+    return none(type<string>)
+}
+
+[macro_function]
+def public sql_fn_tag_for_type(td : TypeDeclPtr) : tuple<tag : uint8; ok : bool> {
+    //! Maps a scalar das type to its SqlFnTag wire value; ``ok = false`` for anything a
+    //! scalar UDF can't marshal. Shared by the annotation and the providers' direct
+    //! ``register_function`` call macros.
+    if (td == null || td.baseType == Type.tFixedArray) return (tag = uint8(0), ok = false)
+    if (td.baseType == Type.tInt) return (tag = uint8(SqlFnTag.Int), ok = true)
+    if (td.baseType == Type.tInt64) return (tag = uint8(SqlFnTag.Int64), ok = true)
+    if (td.baseType == Type.tFloat) return (tag = uint8(SqlFnTag.Float), ok = true)
+    if (td.baseType == Type.tDouble) return (tag = uint8(SqlFnTag.Double), ok = true)
+    if (td.baseType == Type.tBool) return (tag = uint8(SqlFnTag.Bool), ok = true)
+    if (td.baseType == Type.tString) return (tag = uint8(SqlFnTag.String), ok = true)
+    return (tag = uint8(0), ok = false)
+}
+
+def private _is_valid_sql_function_name(s : string) : bool {
+    // Unquoted identifier shape: [A-Za-z_][A-Za-z0-9_]* — anything else would need quoting in emitted SQL.
+    if (empty(s)) return false
+    var ok = true
+    peek_data(s) $(arr) {
+        let c0 = int(arr[0])
+        if (!(is_alpha(c0) || c0 == '_')) {
+            ok = false
+            return
+        }
+        for (i in range(1, length(arr))) {
+            let c = int(arr[i])
+            if (!(is_alnum(c) || c == '_')) {
+                ok = false
+                return
+            }
+        }
+    }
+    return ok
+}
+
+[function_macro(name="sql_function")]
+class SqlFunctionMacro : AstFunctionAnnotation {
+    //! Marks a daslang function as a scalar SQL UDF: registered against every connection
+    //! of every UDF-capable provider, and emitted as ``<name>(args)`` inside ``_sql(...)``
+    //! chains. Optional args: ``name``, ``deterministic``, ``directonly``.
+    def override apply(var func : FunctionPtr; var group : ModuleGroup;
+                       args : AnnotationArgumentList; var errors : das_string) : bool {
+        if (func.fromGeneric != null) {
+            errors := "[sql_function] is not supported on generic functions; instantiate with concrete types and tag the concrete instance"
+            return false
+        }
+        let nArgs = func.arguments |> length
+        if (nArgs > 4) {
+            errors := "[sql_function]: scalar SQL functions support up to 4 arguments; got {nArgs}"
+            return false
+        }
+        var tags : array<uint8>
+        tags |> reserve(4)
+        for (i in range(nArgs)) {
+            let r = sql_fn_tag_for_type(func.arguments[i]._type)
+            if (!r.ok) {
+                errors := "[sql_function]: argument #{i + 1} of '{func.name}' has unsupported type '{describe(func.arguments[i]._type)}' — supported: int, int64, float, double, bool, string"
+                return false
+            }
+            tags |> push(r.tag)
+        }
+        while (tags |> length < 4) {
+            tags |> push(uint8(0))
+        }
+        let retR = sql_fn_tag_for_type(func.result)
+        if (!retR.ok) {
+            errors := "[sql_function]: return type '{describe(func.result)}' of '{func.name}' is unsupported — supported: int, int64, float, double, bool, string"
+            return false
+        }
+        let funcDasName = "{func.name}"
+        var sqlName = funcDasName
+        let nameArg = args |> find_arg("name")
+        if (nameArg is tString) {
+            sqlName = nameArg as tString
+            if (empty(sqlName)) {
+                errors := "[sql_function]: name= cannot be empty"
+                return false
+            }
+            if (!_is_valid_sql_function_name(sqlName)) {
+                errors := "[sql_function]: name='{sqlName}' is not a valid SQL identifier (must match [A-Za-z_][A-Za-z0-9_]*)"
+                return false
+            }
+        } elif (!(nameArg is nothing)) {
+            errors := "[sql_function]: name= must be a string literal"
+            return false
+        }
+        var deterministic = false
+        let detArg = args |> find_arg("deterministic")
+        if (detArg is tBool) {
+            deterministic = detArg as tBool
+        } elif (!(detArg is nothing)) {
+            errors := "[sql_function]: deterministic= must be a bool literal (true/false)"
+            return false
+        }
+        var directonly = false
+        let donArg = args |> find_arg("directonly")
+        if (donArg is tBool) {
+            directonly = donArg as tBool
+        } elif (!(donArg is nothing)) {
+            errors := "[sql_function]: directonly= must be a bool literal (true/false)"
+            return false
+        }
+        var reg <- setup_call_list("register`sql`functions", func.at, true/*isInit*/, true/*isPrivate*/)
+        let nArgsLit = nArgs
+        let tag0 = tags[0]
+        let tag1 = tags[1]
+        let tag2 = tags[2]
+        let tag3 = tags[3]
+        let retTag = retR.tag
+        // ExprAddr with explicit funcType + `__::` target — funcType alone ties on same-signature imports.
+        var fnType = new TypeDecl(at = func.at, baseType = Type.tFunction)
+        for (a in func.arguments) {
+            fnType.argTypes |> emplace_new <| clone_type(a._type)
+        }
+        fnType.firstType = clone_type(func.result)
+        // `__::<name>` scopes ExprAddr resolution to *this* module (where `func` lives), so
+        // a same-signature import (e.g. fio_core::normalize) doesn't tie with user's `normalize`.
+        var fnAddr = new ExprAddr(at = func.at, target := "__::{funcDasName}", funcType <- fnType)
+        reg.list |> emplace_new <| qmacro_block() {
+            sql_boost::_add_sql_function_entry($v(sqlName), $v(nArgsLit),
+                $v(tag0), $v(tag1), $v(tag2), $v(tag3),
+                $v(retTag), $v(deterministic), $v(directonly), $e(fnAddr))
+        }
+        return true
+    }
+}

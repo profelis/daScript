@@ -8,6 +8,7 @@ module _conformance_provider shared public
 //! capability constants for self-skip of unsupported groups.
 
 require sqlite/sqlite_boost public
+require sqlite/sqlite_migrate public
 require daslib/sql_linq public
 
 // Capability constants — mirror the provider's SqlProviderCaps registry entry.
