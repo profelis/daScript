@@ -104,7 +104,8 @@ def test_shape(n, d, ntok : int64) : bool {
             let sgp = sp + g * mr * nb
             var t0 = 0l
             while (t0 < ntok) {
-                q8q8_tile_gen(ygp, wgp, sgp, xqp, xsp, n, d, g, t0)
+                // xbsp = null: this probe is arm64-gen-gated (main), and sdot stamps never bias
+                q8q8_tile_gen(ygp, wgp, sgp, xqp, xsp, null, n, d, g, t0)
                 t0 += 4l
             }
         }

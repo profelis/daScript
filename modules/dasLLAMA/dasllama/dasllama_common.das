@@ -3479,10 +3479,19 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
             // interleaved: whole mr-row block-groups first, then the row-major tail rows. The
             // positional map holds at ANY interleave mr (nibble byte off of block-group bg ->
             // q8[bg*32*mr + off] low / +16*mr high); mr comes off the activation-time layout cache.
+            // A bias128 stamp reads w^0x80 group bytes, so the group writes go through a BIASED
+            // LUT copy (the tail loop below keeps the plain LUT — tail rows ride the unbiased
+            // row-major dot).
             let mr = active_q8_layout_mr()
+            let wbias = int(active_q8_wbias())
+            var blut : int8[16]
+            for (i in range(16)) {
+                blut[i] = int8(int(lut[i]) + wbias)
+            }
             let nbyt = 16l * mr    // nibble bytes per block-group
             let qbyt = 32l * mr    // q8 bytes per block-group
             let ngrp = (d / mr) * (n / 32l)
+            let blutp = addr(blut[0])   // frame outlives the join, same as lutp
             maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_dispatch_lanes()) $(gb, ge) {
                 unsafe {
                     for (bg0 in range(gb, ge)) {
@@ -3491,8 +3500,8 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
                         let qb = bg * qbyt
                         for (off in range64(nbyt)) {
                             let b = int(np[nb + off])
-                            qp[qb + off] = lutp[b & 15]
-                            qp[qb + nbyt + off] = lutp[b >> 4]
+                            qp[qb + off] = blutp[b & 15]
+                            qp[qb + nbyt + off] = blutp[b >> 4]
                         }
                     }
                 }

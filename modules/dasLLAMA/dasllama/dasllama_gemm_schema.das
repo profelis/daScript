@@ -14,12 +14,16 @@ struct Q8RepackType {
     interleave : int
     //! scales pre-converted to f32 at repack time and interleaved per group
     f32_scales : bool
+    //! additive bias baked into every GROUP-row weight byte (`w ^ 0x80` when 128 — the
+    //! vpdpbusd bias128 perms; 0 = plain s8). Row-major tail rows always stay unbiased.
+    wbias : int
 }
 
 //! The repack layout an mr-row tile perm requires: mr-row block interleave with f32 group
-//! scales. `needs_repack` and every kernel stride derive from this.
-def q8q8_repack_type(mr : int) : Q8RepackType {
-    return Q8RepackType(interleave = mr, f32_scales = true)
+//! scales, group bytes biased by `wbias`. `needs_repack` and every kernel stride derive
+//! from this.
+def q8q8_repack_type(mr : int; wbias : int = 0) : Q8RepackType {
+    return Q8RepackType(interleave = mr, f32_scales = true, wbias = wbias)
 }
 
 //! The mr of the REFERENCE tier's layout (repack_q8q8_neon = the q8q8_repack_type(4)

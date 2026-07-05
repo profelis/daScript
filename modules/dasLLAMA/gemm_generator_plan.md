@@ -766,10 +766,13 @@ see below).
 agenda).** The generator wins on structure; the next wins are inside the emitted lattice:
 
 1. **bias128 repack for vpdpbusd** (above) — kills the per-dot VPSIGNB, ~28% of the busd
-   dot-stage µops; layout-companion field, exact.
+   dot-stage µops; layout-companion field, exact. **→ DONE, slice H** (emitted + gated;
+   silicon measurement = next SPR/EPYC session).
 2. **The kstep4@512 collapse** (SPR scout sweep: busd512 kstep2 88.3 vs kstep4_nrsplit2 63.0
    GMAC/s): diagnose via disasm — spills? scheduling? If it's acc pressure, the budget rail
    is too permissive at 512; if scheduling, the block-emission order needs a k-interleave.
+   **→ CLOSED, slice H**: no spills, no scheduling — nrsplit2 halves weight-vector token
+   reuse, doubling the sign-trick preamble per dot; bias128 deletes the preamble.
 3. **Broadcast amortization**: one vpbroadcastd per dot today (96/tile) — an 8-byte k-group
    layout (qword broadcast serving 2 dword-groups) halves them; pairs naturally with the
    future smmla family's 2-token pairing. Layout-companion territory, new `kgroup` knob.
@@ -842,6 +845,91 @@ queued per-lane-regime item), not kernels: the registered A/B has our GEMV 1.3�
 **Still open after G:** the decode dispatch work above; a full-fleet pass with the zen2
 manifest; loop-hint manifest kind; per-slot perms; then the deletion (the hand AVX tiers are
 now beaten on Zen2 — EPYC zvnni is the remaining leg before the x64 matrix goes).
+
+## M4 slice H (2026-07-04, M1 Max) — tighten emission I: the kstep4@512 verdict + bias128
+
+**The kstep4@512 collapse, diagnosed from the scout dump (ledger item 2 — CLOSED).** Both
+variants' machine code is clean: ZERO spills (no stack traffic in either loop), no
+scheduling pathology, memory-operand `vpbroadcastd` splats throughout. The collapse is
+reuse geometry: nrsplit2 halves the tokens per k-pass (4 -> 2), so every weight vector's
+sign-trick preamble (load + VPABSB + VPMOVB2M) amortizes over HALF the dots — per 64-dot
+iteration, kstep2/nrsplit4 spends 16 loads + 16 abs + 16 masks where kstep4_nrsplit2 spends
+32/32/32 (and streams the whole weight plane TWICE per tile call). At width512/mr16 (rq=1)
+there is no register pressure for the split to relieve — 26/32 zmm live at nrsplit4 — so it
+is pure loss: +17% dot-stage µops (339 vs 289 instructions for the same 64 dots), 2x weight
+load traffic ⇒ 88.3 -> 63.0 (port math alone predicts ~0.86x; the doubled weight streaming
+eats the rest). The same knob WINS on arm64 (kstep4_nrsplit2_mr8, 137.5) because sdot has
+no per-weight preamble AND the q-reg budget (2mr + nrsplit·mr/4 + 2·nrsplit + 2 > 32) makes
+nrsplit4 illegal at mr8 — there the split is what unlocks mr8 at all. Verdict: the budget
+rail is correct (nrsplit4@512 is legal and wins; the sweep rejects the loser); the collapse
+is the sign-trick preamble amplified — which bias128 (item 1) deletes.
+
+**bias128 (ledger item 1) — the design.** Bake `w ^ 0x80` into the grp&lt;mr&gt; plane at repack
+(u8 = w+128 ∈ [0,255]); the dot becomes plain `vpdpbusd(acc, w_biased, x)` — no VPABSB, no
+VPMOVB2M/VPSIGNB, no masked VPSUBB. Exact: Σ(w+128)·x = Σw·x + 128·Σx in i32 (|acc| ≤
+~1.6M per block against 2^31), and it REMOVES the x ∈ [-127,127] sign-trick precondition.
+The correction is folded as the ACCUMULATOR INIT: acc starts at −128·Σx(block) instead of
+zero — the correction costs zero ALU (the vpxor zeroing it replaces was free at rename, the
+init is one embedded-broadcast load). Per 64-dot busd512-kstep2 iteration the dot-stage
+SIMD-ALU count drops 192 -> 96 (+8 broadcast loads) — the ALU-bound tile ceiling nearly
+doubles; SPR tile 88.3 should land 120-150 GMAC/s (silicon next SPR/EPYC session).
+vpdpbusd-only: maddubs saturates word pair-sums at biased magnitudes, bssd is native s8·s8.
+
+Transport (where −128·Σx comes from):
+
+- **tile**: a bsums plane `xbsp : int const?` ([ntok x nb] i32, −128·Σx per (token, block))
+  as the tile's 10th parameter — the tile signature is gen-family-internal (batch wrapper +
+  probes only). The batch wrapper computes it once per call before dispatch (O(ntok·n),
+  noise against the O(ntok·n·d) dots) when the stamped family is biased.
+- **gemv**: mm_rows is a SHARED slot typedef invoked with raw activation planes from the
+  fused decode chain — no plane transport. The block's −128·Σx is computed inline (concat
+  the two 16-byte chunks, one `vpdpbusd(0, splat(128u8), x)` at kernel width,
+  `vector.reduce.add`, negate, splat): ~8 µops per (block, group) against the 24·rq the
+  trick removes — and the gemv is bandwidth-bound anyway (SPR: width-insensitive).
+
+Lockstep: a SIXTH companion `q8q8_wbias_gen() : int` (reference 0, generated = the perm's
+bias, same shared decline) drives the runtime repack — schema `Q8RepackType` gains `wbias`,
+`repack_q8q8_grp` biases the group rows in one extra pass (row-major tails stay unbiased
+for the sdot4x4 tail path, which never reads groups). The batch wrapper's generic token
+tail (`q8q8_token_grp_generic`) un-biases scalar-wise (`w − wbias`). The mx4-&gt;Q8 expand
+(gpt-oss MoE grouped prefill) writes the interleaved branch through a BIASED LUT copy when
+the active stamp is biased (tail loop keeps the unbiased LUT); `KernelBackend` carries
+`q8_wbias` next to `q8_layout` for that activation-time read. The mx4 EMITTER itself is
+untouched (nibble planes and LUT unbiased; biased-LUT fusion is ledger item 4, separate).
+
+Grid: +6 rows — busd 256-mr8/512-mr16 × kstep2 × {plain, gkstep2} biased, a biased
+kstep4_nrsplit2@512 (re-tests the collapse with the preamble gone — the weight-stream
+doubling remains, so it should still lose, but by less), and a bias-on-maddubs
+decline-by-design pin. Emission gates: biased tiles = 96 vpdpbusd / 0 vpsignb / 0 vpabsb /
+0 vpmovb2m; biased gemv gk2 = 24 + 3 vpdpbusd (the per-block-instance bsum dots). Zen2
+declines every biased row (no VNNI); arm64 unaffected.
+
+**Gates (this box, 2026-07-04):**
+
+- **Emission, 29/29 green on the first full run** (10 new bias128 gates): biased 256/512
+  tiles = 96 vpdpbusd / 0 vpsignb / 0 vpabsb / 0 vpmovb2m / 0 vpsubb; biased gemv gk2 = 27
+  vpdpbusd (24 dots + 3 inline bsums); every pre-slice gate unchanged.
+- **The biased busd512-kstep2 hot loop is 138 instructions per 64-dot iteration vs 289
+  unbiased (2.09x, same toolchain/signature)** — the sign trick's 96 SIMD-ALU ops are gone
+  AND an unplanned second win landed: with the sign chain no longer separating them, LLVM
+  folds every per-dot activation splat INTO the dot as an EVEX embedded broadcast
+  (`vpdpbusd -0x30(%rbp,%r14,8){1to16}, %zmm9, %zmm8`) — the 64 standalone vpbroadcastd
+  instructions vanish too. Per-iteration SIMD-ALU 192 -> 96 (64 dots + 32 fold ops, nothing
+  else); the only remaining loop ops are 16 weight loads + 8 acc-init broadcasts + fold.
+  The ALU-bound ceiling roughly doubles; silicon number = next SPR/EPYC session.
+- **das rail (interpreted, host-independent):** biased plane == plain plane ^0x80 on group
+  bytes with tails and scales untouched; the generic token tail's un-bias (the int8 +128
+  involution) is BIT-EXACT against the plain pair.
+- **arm64 regression:** grid 35/35 (all six new rows decline to reference; witness/wbias
+  lockstep asserted per row), gen parity 3 shapes maxdiff 0, slot parity all slots maxdiff
+  0, dasLLAMA suite green. No byte-identity claim this slice — the tile stub gained the
+  xbsp parameter (the DLL cache self-invalidates via per-function AST hashes; grid+parity
+  +suite are the proof instead).
+
+**Ledger (new):** hoist the batch wrapper's per-call O(ntok·n) bsum pass into the
+activation quantizer (a bsums plane in RunState next to xq/xs) — saves one re-read of x
+per biased batch matmul and would let a future gen-internal rows core read plane
+corrections instead of inline ones. Only worth it once bias128 proves out on silicon.
 
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 

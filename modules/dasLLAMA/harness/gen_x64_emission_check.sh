@@ -75,8 +75,24 @@ gate "busd512 tile no-psign" "${T}dot_vpdpbusd_width512_mr16_kstep2 " vpsignb 0
 # tile, maddubs zmm
 gate "maddubs512 tile pair1" "${T}dot_maddubs_width512_mr16_kstep2 " vpmaddubsw 96
 gate "maddubs512 tile pair2" "${T}dot_maddubs_width512_mr16_kstep2 " vpmaddwd 96
+# bias128 tiles (slice H): plain u8·s8 dots off the biased plane — the whole sign trick
+# (VPABSB + VPSIGNB at 256 / VPMOVB2M + masked VPSUBB at 512) must vanish; the −128·Σx
+# correction is the acc init (a broadcast load, not an ALU op)
+B=${T}dot_vpdpbusd_width256_mr8_kstep2_bias128
+gate "busd256-b128 tile" "$B " vpdpbusd 96
+gate "busd256-b128 tile no-sign" "$B " vpsignb 0
+gate "busd256-b128 tile no-abs" "$B " vpabsb 0
+B=${T}dot_vpdpbusd_width512_mr16_kstep2_bias128
+gate "busd512-b128 tile" "$B " vpdpbusd 96
+gate "busd512-b128 tile no-mask" "$B " vpmovb2m 0
+gate "busd512-b128 tile no-sub" "$B " vpsubb 0
 # gemv gkstep2 (3 block instances x 8 kg x 1 token = 24 dots)
 gate "busd256 gemv gk2" "q8q8_gemv_gen__dot_vpdpbusd_width256_mr8_kstep2_gkstep2 " vpdpbusd 24
+# bias128 gemv: 24 dots + one inline-bsum dot per block instance (3) = 27; no sign ops
+G=q8q8_gemv_gen__dot_vpdpbusd_width256_mr8_kstep2_gkstep2_bias128
+gate "busd256-b128 gemv gk2" "$G " vpdpbusd 27
+gate "busd256-b128 gemv no-sign" "$G " vpsignb 0
+gate "busd256-b128 gemv no-abs" "$G " vpabsb 0
 # mx4 gemv (gkstep1: 1 block instance; 4 nibble loads -> 8 VPSHUFB lookups, 8 dots)
 gate "mx4 busd256 lut" "mx4q8_gemv_gen__dot_vpdpbusd_width256_mr8_kstep2 " vpshufb 8
 gate "mx4 busd256 dot" "mx4q8_gemv_gen__dot_vpdpbusd_width256_mr8_kstep2 " vpdpbusd 8

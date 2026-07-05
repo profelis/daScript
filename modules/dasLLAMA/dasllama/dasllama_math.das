@@ -584,6 +584,10 @@ struct KernelBackend {
     // layout still answers with its reference tier there). The mx4 expand's positional map and
     // the probes read the cached value via active_q8_layout_mr().
     q8_layout : function<() : int> = @@q8_layout_grp4
+    // The additive bias the backend's repack bakes into GROUP-row weight bytes (128 for a
+    // bias128 gen stamp, 0 everywhere else). Same activation-time contract as q8_layout;
+    // the mx4->Q8 expand reads the cached value via active_q8_wbias().
+    q8_wbias : function<() : int> = @@q8_wbias_zero
 }
 
 // Active kernels — the hot path reads these directly. A backend must register before any Q8·Q8 matmul
@@ -608,6 +612,7 @@ var g_active_needs_repack = false   // does the active backend need repacked wei
 var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
 var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
 var g_active_q8_layout_mr = 4l                // see KernelBackend.q8_layout (activation-time cache)
+var g_active_q8_wbias = 0l                    // see KernelBackend.q8_wbias (activation-time cache)
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
 var g_batch_pin = ""                // hybrid: donor backend for the BATCH-shaped slots; "" = whole-backend
 var g_active_batch_backend = ""     // == g_active_backend unless a batch pin overrode the batch slots
@@ -625,10 +630,16 @@ def private no_backend() {
 }
 def private backend_always_available() : bool => true
 def private q8_layout_grp4() : int => 4
+def private q8_wbias_zero() : int => 0
 
 //! The Q8 interleave (mr) of the ACTIVE backend's weight layout — cached at activation from
 //! KernelBackend.q8_layout (4 for every hand tier; the stamped mr on the gen backend).
 def active_q8_layout_mr() : int64 => g_active_q8_layout_mr
+
+//! The weight-plane bias of the ACTIVE backend's Q8 layout — cached at activation from
+//! KernelBackend.q8_wbias (0 for every hand tier; 128 on a bias128 gen stamp). The mx4->Q8
+//! expand biases its LUT writes to match.
+def active_q8_wbias() : int64 => g_active_q8_wbias
 [unused_argument(yp, wp, sp, xqp, xsp, n, d)]
 def private q8q8_unset_kernel(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d : int64) { no_backend() }
 [unused_argument(yp, wp, sp, xqp, xsp, n, d, ntok)]
@@ -675,6 +686,7 @@ def private activate(be : KernelBackend) {
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
     g_active_mx4_native_batch = be.mx4_native_batch
     g_active_q8_layout_mr = int64(invoke(be.q8_layout))
+    g_active_q8_wbias = int64(invoke(be.q8_wbias))
     g_active_batch_backend = be.name
     // a standing batch pin survives re-activation (auto-select, load-time select, explicit select)
     if (g_batch_pin != "") {

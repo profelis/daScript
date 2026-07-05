@@ -44,6 +44,7 @@ struct Fixture {
     s : array<float>
     xq : array<int8>
     xs : array<float>
+    xbs : array<int>      // −128·Σx per (token, block) — the bias128 tile's bsums plane
     yref : array<float>
 }
 
@@ -73,6 +74,16 @@ def build_fixture(n, d, ntok : int64) : Fixture {
             xrow[i] = float((i + tk * 7l) % 23l) * 0.07 - 0.8
         }
         quantize_q8_0_into(xrow, n, fx.xq, fx.xs, tk * n, tk * fx.nb)
+    }
+    fx.xbs |> resize(int(ntok * fx.nb))
+    for (tk in range64(ntok)) {
+        for (bi in range64(fx.nb)) {
+            var bsum = 0
+            for (j in range64(32l)) {
+                bsum += int(fx.xq[tk * n + bi * 32l + j])
+            }
+            fx.xbs[tk * fx.nb + bi] = -128 * bsum
+        }
     }
 
     // the oracle: hand laneq semantics off a grp4 copy — the per-block fold order is the same
@@ -116,8 +127,20 @@ def variant_mrs() : table<string; int> {
     return <- mrs
 }
 
+// suffix -> weight-plane bias, off the wbias companion's variants registry (same lockstep)
+def variant_wbias() : table<string; int> {
+    var wbs : table<string; int>
+    var bvs <- q8q8_wbias_gen_variants()
+    for (v in bvs) {
+        wbs[v._0] = invoke(v._1)
+    }
+    delete bvs
+    return <- wbs
+}
+
 // one full tile sweep: every group x every 4-token block through `tile`, on the variant's
-// own repacked buffers (q/s), walking mr-row groups
+// own repacked buffers (q/s), walking mr-row groups; the fixture's bsums plane rides along
+// (biased variants read it, everything else ignores the parameter)
 def run_tile(tile; fx : Fixture; q : array<int8>; s : array<float>; mr : int64; var y : array<float>) {
     let ng = fx.d / mr
     unsafe {
@@ -125,13 +148,14 @@ def run_tile(tile; fx : Fixture; q : array<int8>; s : array<float>; mr : int64; 
         let sp = addr(s[0])
         let xqp = addr(fx.xq[0])
         let xsp = addr(fx.xs[0])
+        let xbsp = addr(fx.xbs[0])
         var yp = addr(y[0])
         for (g in range64(ng)) {
             let wgp = wp + g * mr * fx.n
             let sgp = sp + g * mr * fx.nb
             var t0 = 0l
             while (t0 < fx.ntok) {
-                invoke(tile, yp, wgp, sgp, xqp, xsp, fx.n, fx.d, g, t0)
+                invoke(tile, yp, wgp, sgp, xqp, xsp, xbsp, fx.n, fx.d, g, t0)
                 t0 += 4l
             }
         }
@@ -275,23 +299,30 @@ def test_mode : bool {
     var mfxs <- [ <- build_mx4_fixture(96l, 32l), <- build_mx4_fixture(2048l, 64l)]
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
+    var wbs <- variant_wbias()
     var gtab <- gemv_variants_by_suffix()
     var mtab <- mx4_variants_by_suffix()
     var wtab <- witness_variants_by_suffix()
     var allok = true
     for (v in vs) {
         let mr = int64(mrs?[v._0] ?? 4)
+        let wbias = int64(wbs?[v._0] ?? 0)
         verify(gtab |> key_exists(v._0))
         verify(mtab |> key_exists(v._0))
         verify(wtab |> key_exists(v._0))
         // witness-lockstep invariants: the reference row is never "live", and a
-        // non-reference layout proves the family emitted — the witness must agree
+        // non-reference layout or a biased plane proves the family emitted — the witness
+        // must agree
         let live = invoke(wtab[v._0])
         if (v._0 == "reference") {
             verify(!live)
         }
         if (int(mr) != GEMM_REFERENCE_MR && !live) {
             print("  WITNESS DESYNC {v._0}: layout mr={mr} but witness says not live\n")
+            allok = false
+        }
+        if (wbias != 0l && !live) {
+            print("  WBIAS DESYNC {v._0}: wbias={wbias} but witness says not live\n")
             allok = false
         }
         var ok = true
@@ -302,7 +333,7 @@ def test_mode : bool {
             var qv := fx.q
             var sv := fx.s
             unsafe {
-                repack_q8q8_grp(addr(qv[0]), addr(sv[0]), fx.n, fx.d, mr)
+                repack_q8q8_grp(addr(qv[0]), addr(sv[0]), fx.n, fx.d, mr, wbias)
             }
             var y : array<float>
             y |> resize(int(fx.ntok * fx.d))
@@ -365,12 +396,14 @@ def test_mode : bool {
             delete nv
             delete ev
         }
-        print("{v._0} (mr={mr}, {live ? "live" : "ref"}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
+        let biasTag = wbias != 0l ? " bias{wbias}" : ""
+        print("{v._0} (mr={mr}{biasTag}, {live ? "live" : "ref"}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
         allok = allok && ok && gok && mok
     }
     delete wtab
     delete mtab
     delete gtab
+    delete wbs
     delete mrs
     delete vs
     delete mfxs
@@ -390,6 +423,7 @@ def tune_mode_run : bool {
                                                    // only regime where gemv knobs can show)
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
+    var wbs <- variant_wbias()
     var gtab <- gemv_variants_by_suffix()
     let nv = length(vs)
     // per-variant repacked buffers, built once outside the timing loop
@@ -403,6 +437,7 @@ def tune_mode_run : bool {
     vmr |> resize(nv)
     for (vi in range(nv)) {
         vmr[vi] = int64(mrs?[vs[vi]._0] ?? 4)
+        let wb = int64(wbs?[vs[vi]._0] ?? 0)
         verify(gtab |> key_exists(vs[vi]._0))
         bufs[vi].q := fx.q
         bufs[vi].s := fx.s
@@ -411,9 +446,9 @@ def tune_mode_run : bool {
         hbufs[vi].q := hfx.q
         hbufs[vi].s := hfx.s
         unsafe {
-            repack_q8q8_grp(addr(bufs[vi].q[0]), addr(bufs[vi].s[0]), fx.n, fx.d, vmr[vi])
-            repack_q8q8_grp(addr(gbufs[vi].q[0]), addr(gbufs[vi].s[0]), gfx.n, gfx.d, vmr[vi])
-            repack_q8q8_grp(addr(hbufs[vi].q[0]), addr(hbufs[vi].s[0]), hfx.n, hfx.d, vmr[vi])
+            repack_q8q8_grp(addr(bufs[vi].q[0]), addr(bufs[vi].s[0]), fx.n, fx.d, vmr[vi], wb)
+            repack_q8q8_grp(addr(gbufs[vi].q[0]), addr(gbufs[vi].s[0]), gfx.n, gfx.d, vmr[vi], wb)
+            repack_q8q8_grp(addr(hbufs[vi].q[0]), addr(hbufs[vi].s[0]), hfx.n, hfx.d, vmr[vi], wb)
         }
     }
     var best : array<double>
@@ -512,6 +547,7 @@ def tune_mode_run : bool {
     delete gbest
     delete hbest
     delete gtab
+    delete wbs
     delete mrs
     delete vs
     delete fx
