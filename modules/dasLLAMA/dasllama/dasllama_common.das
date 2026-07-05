@@ -2035,10 +2035,10 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         }
         s.chain_stages |> resize(4)
         s.chain_stages[0] = int3(0, nslots, n0)
-        s.chain_stages[1] = int3(0, int(n_heads) * nsl, int(n_heads) * nsl)
+        s.chain_stages[1] = int3(0, int(n_kv_heads) * nsl, int(n_kv_heads) * nsl)
         s.chain_stages[2] = int3(0, int(n_heads), int(n_heads))
         s.chain_stages[3] = int3(0, ngrp, n2)
-        count_parallel_dispatch(min(n0, nslots) + int(n_heads) * nsl + int(n_heads) + min(n2, ngrp))
+        count_parallel_dispatch(min(n0, nslots) + int(n_kv_heads) * nsl + int(n_heads) + min(n2, ngrp))
     } else {
         s.chain_stages |> resize(3)
         s.chain_stages[0] = int3(0, nslots, n0)
@@ -2189,63 +2189,77 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                     }
                 }
             } elif (stage == 1) {
-                // flash-decode partials: unit = (head, slice) — scores exactly as the single-pass
-                // body (dot·scale, softcap), then slice-local max / exp-sum / unnormalized AV
+                // flash-decode partials: unit = (KV-head, slice) — the slice's K/V rows stream
+                // ONCE and serve all kv_mul q-heads of the group (a GQA logical-read halving;
+                // deep-ctx decode attention is DRAM-bound on many-lane boxes, so the per-q-head
+                // re-read was the ceiling). Per q-head arithmetic is identical to the per-head
+                // form: scores (dot·scale, softcap) -> slice max -> exp4 in place -> exp-sum +
+                // unnormalized AV.
                 unsafe {
                     for (u in range(jb, je)) {
-                        let hh = int64(u / nsl)
+                        let kvh = int64(u / nsl)
                         let sl = int64(u % nsl)
-                        let qoff = hh * head_size
-                        let kvhoff = (hh / kv_mul) * head_size
-                        var arow = attp + hh * seq_len
+                        let kvhoff = kvh * head_size
+                        let qh0 = kvh * kv_mul
                         let j0 = sl * slice_len
                         let j1 = min(j0 + slice_len, cnt)
+                        // K pass: each K row read once, dotted against every group q-head
                         for (j in range64(j0, j1)) {
                             let koff = loff + (kstart + j) * kv_dim + kvhoff
-                            arow[j] = dot(qp + qoff, kcp + koff, head_size) * scale
-                        }
-                        if (attn_softcap > 0.0) {
-                            softcap(arow + j0, j1 - j0, attn_softcap)
-                        }
-                        var m = arow[j0]   // slices are non-empty by construction
-                        for (j in range64(j0 + 1l, j1)) {
-                            m = max(m, arow[j])
-                        }
-                        // exponentials in place over the slice — exp4 fast path, clamped to -80
-                        // like the prefill flash fold (underflow -> ~0, negligible vs real probs);
-                        // element-constructed float4: slice offsets carry no 16B alignment
-                        var lsum = 0.0
-                        {
-                            let m4 = float4(m, m, m, m)
-                            var sum4 = float4(0.0)
-                            var j = j0
-                            while (j + 4l <= j1) {
-                                let e = exp4(max(float4(arow[j], arow[j + 1l], arow[j + 2l], arow[j + 3l]) - m4, EXP4_LO))
-                                arow[j] = e.x
-                                arow[j + 1l] = e.y
-                                arow[j + 2l] = e.z
-                                arow[j + 3l] = e.w
-                                sum4 += e
-                                j += 4l
-                            }
-                            lsum = sum4.x + sum4.y + sum4.z + sum4.w
-                            while (j < j1) {
-                                let e = exp(max(arow[j] - m, -80.0))
-                                arow[j] = e
-                                lsum += e
-                                j++
+                            for (g in range64(kv_mul)) {
+                                attp[(qh0 + g) * seq_len + j] = dot(qp + (qh0 + g) * head_size, kcp + koff, head_size) * scale
                             }
                         }
-                        var op = flop + (hh * int64(nsl) + sl) * head_size
-                        for (i in range64(head_size)) {
-                            op[i] = 0.0
+                        for (g in range64(kv_mul)) {
+                            let hh = qh0 + g
+                            var arow = attp + hh * seq_len
+                            if (attn_softcap > 0.0) {
+                                softcap(arow + j0, j1 - j0, attn_softcap)
+                            }
+                            var m = arow[j0]   // slices are non-empty by construction
+                            for (j in range64(j0 + 1l, j1)) {
+                                m = max(m, arow[j])
+                            }
+                            // exponentials in place over the slice — exp4 fast path, clamped to
+                            // -80 like the prefill flash fold (underflow -> ~0, negligible);
+                            // element-constructed float4: slice offsets carry no 16B alignment
+                            var lsum = 0.0
+                            {
+                                let m4 = float4(m, m, m, m)
+                                var sum4 = float4(0.0)
+                                var j = j0
+                                while (j + 4l <= j1) {
+                                    let e = exp4(max(float4(arow[j], arow[j + 1l], arow[j + 2l], arow[j + 3l]) - m4, EXP4_LO))
+                                    arow[j] = e.x
+                                    arow[j + 1l] = e.y
+                                    arow[j + 2l] = e.z
+                                    arow[j + 3l] = e.w
+                                    sum4 += e
+                                    j += 4l
+                                }
+                                lsum = sum4.x + sum4.y + sum4.z + sum4.w
+                                while (j < j1) {
+                                    let e = exp(max(arow[j] - m, -80.0))
+                                    arow[j] = e
+                                    lsum += e
+                                    j++
+                                }
+                            }
+                            var op = flop + (hh * int64(nsl) + sl) * head_size
+                            for (i in range64(head_size)) {
+                                op[i] = 0.0
+                            }
+                            flmp[hh * int64(nsl) + sl] = m
+                            fllp[hh * int64(nsl) + sl] = lsum
                         }
+                        // V pass: each V row read once, weighted into every group head's partial
                         for (j in range64(j0, j1)) {
                             let voff = loff + (kstart + j) * kv_dim + kvhoff
-                            axpy(op, vcp + voff, arow[j], head_size)
+                            for (g in range64(kv_mul)) {
+                                let hh = qh0 + g
+                                axpy(flop + (hh * int64(nsl) + sl) * head_size, vcp + voff, attp[hh * seq_len + j], head_size)
+                            }
                         }
-                        flmp[hh * int64(nsl) + sl] = m
-                        fllp[hh * int64(nsl) + sl] = lsum
                     }
                 }
             } elif (stage == 2 && nsl > 1) {
