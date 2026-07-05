@@ -422,6 +422,35 @@ var public g_target_x64_avx512vnni = false
 // verification today.
 var public g_target_x64_vnniint8 = false
 
+// ARMv8.6 i8mm (SMMLA — 2×2 s8 matrix-multiply-accumulate; Apple M2/A15+, Graviton3+; M1 has
+// DotProd only). Host truth comes off LLVMGetHostCPUFeatures() ("+i8mm" — populated on Linux
+// aarch64; EMPTY on macOS, where features are implied by the CPU name), OR'd with
+// DAS_JIT_ARM64_FORCE_FEATURES — so on Apple silicon the env is the rail on BOTH the emitting
+// box and the executing box (same string = same DLL cache key, the no-linker-on-target recipe).
+// Cross aarch64 triples read the force string only, same contract as the x64 tiers above.
+var public g_target_arm64_i8mm = false
+
+def private arm64_forced_feature(name : string) : bool {
+    for (part in split(get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES"), ",")) {
+        if (part == name) {
+            return true
+        }
+    }
+    return false
+}
+
+// "+name" present in LLVM's host-features string (comma-separated "+feat"/"-feat" entries;
+// exact match on the enabled spelling, so a "-i8mm" entry never reads as support)
+def private host_llvm_feature(name : string) : bool {
+    let feats = LLVMGetHostCPUFeatures()
+    var found = false
+    for (part in split(feats, ",")) {
+        found ||= part == "+{name}"
+    }
+    LLVMDisposeMessage(feats)
+    return found
+}
+
 def private x64_forced_feature(name : string) : bool {
     for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")) {
         if (part == name) {
@@ -570,6 +599,10 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
     g_target_x64_avx512bw = g_target_x64_avx2 && x64_tier_feature("avx512f", x64_cross) && x64_tier_feature("avx512bw", x64_cross)
     g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_tier_feature("avx512vnni", x64_cross)
     g_target_x64_vnniint8 = g_target_x64_avx2 && x64_tier_feature("avxvnniint8", x64_cross)
+    // aarch64 i8mm tier (see the g_target_arm64_i8mm declaration comment): host targets read
+    // LLVM's host-features string OR the arm force env; cross aarch64 triples the env only.
+    g_target_arm64_i8mm = g_target_is_aarch64 && (arm64_forced_feature("i8mm")
+        || (empty(target_triple) && host_llvm_feature("i8mm")))
     if (!(target_triple |> empty())) {
         // wasm32 target isn't always part of LLVMInitializeAllTargets in
         // prebuilt LLVM.dll — call the explicit wasm initializer when needed.

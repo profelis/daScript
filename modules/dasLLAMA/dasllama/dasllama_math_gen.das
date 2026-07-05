@@ -13,10 +13,11 @@ require math
 // The GEMM family as a [tune] client (gemm_generator_plan.md part 3; promoted from the M2
 // GO/NO-GO experiment): the perm grid below stamps dasllama_gemm_gen::q8q8_tile perms through
 // [llvm_code], and the [tune_companion] rows stamp q8q8_layout_gen + q8q8_wbias_gen +
-// q8q8_gemv_gen + mx4q8_gemv_gen + q8q8_family_live from the same entry — the six-function
-// stamp: the runtime repacks (Q8 AND mx4 planes) ask the layout companion which interleave
-// the stamped cores read and the wbias companion how the plane bytes are baked (bias128),
-// the witness answers "did the family actually emit", and all six generators share one
+// q8q8_kgroup_gen + q8q8_gemv_gen + mx4q8_gemv_gen + q8q8_family_live from the same entry —
+// the seven-function stamp: the runtime repacks (Q8 AND mx4 planes) ask the layout companion
+// which interleave the stamped cores read, the wbias companion how the plane bytes are baked
+// (bias128), the kgroup companion how the plane groups its k-bytes (kg8 on smmla stamps),
+// the witness answers "did the family actually emit", and all seven generators share one
 // decline predicate, so kernels, repacks and availability cannot desync on any tier. Normal runs stamp exactly one winner (manifest > the per-ISA fallback chain:
 // biased busd512 on AVX512-VNNI boxes / biased busd256 on VEX-VNNI / maddubs on plain AVX2 /
 // kstep2 elsewhere — each ISA's measured tune winner as the manifest-less default);
@@ -44,6 +45,14 @@ def q8q8_layout_gen() : int {
 //! via the shared predicate, so plane bytes and kernels can never disagree about the bias.
 def q8q8_wbias_gen() : int {
     return q8q8_repack_type(GEMM_REFERENCE_MR).wbias
+}
+
+//! The kgroup companion (slice J): k-bytes per row per interleave group of the stamped plane —
+//! 8 for the smmla perms (row-pair × 8-k MMA operands load straight off the plane), 4 for
+//! every vector-dot perm. Reference body = the kg4 grp4 pair; declines in lockstep via the
+//! shared predicate, so plane byte order and kernels can never disagree about the grouping.
+def q8q8_kgroup_gen() : int {
+    return q8q8_repack_type(GEMM_REFERENCE_MR).kgroup
 }
 
 //! The witness companion: did the stamped family actually EMIT on this target? Reference body
@@ -131,9 +140,13 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
  tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2, bias = 128), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2, gkstep = 2, bias = 128, requires = "avx512vnni,avx512bw"),
  tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 4, nrsplit = 2, bias = 128),
  tune_perm(dot = "maddubs", width = 256, mr = 8, kstep = 2, bias = 128),
+ tune_perm(dot = "smmla", mr = 4, kstep = 2, requires = "i8mm"), tune_perm(dot = "smmla", mr = 4, kstep = 2, nrsplit = 2, requires = "i8mm"),
+ tune_perm(dot = "smmla", mr = 8, kstep = 2, nrsplit = 2, requires = "i8mm"), tune_perm(dot = "smmla", mr = 8, kstep = 4, nrsplit = 2, requires = "i8mm"),
+ tune_perm(dot = "smmla", mr = 8, kstep = 2, nrsplit = 2, gkstep = 2, requires = "i8mm"),
  tune_perm(suffix = "mr8_budget", mr = 8), tune_perm(suffix = "mr2_lanes", mr = 2), tune_perm(dot = "vpdpbusd"),
  tune_companion(fn = "q8q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
  tune_companion(fn = "q8q8_wbias_gen", gen = "dasllama_gemm_gen::q8q8_wbias"),
+ tune_companion(fn = "q8q8_kgroup_gen", gen = "dasllama_gemm_gen::q8q8_kgroup"),
  tune_companion(fn = "q8q8_gemv_gen", gen = "dasllama_gemm_gen::q8q8_gemv"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
@@ -156,15 +169,16 @@ def q8q8_tile_gen(var yp : float?; wg : int8 const?; sg : float const?; xqp : in
 
 //! mr-generalized Q8 interleave repack — the q8q8_repack_type(mr) layout for any mr
 //! (mr=4 reproduces the old hand arm64-laneq interleave byte-for-byte). mr-row
-//! groups, dword-group interleave (4 k-bytes per row per group), f32 scales interleaved per
+//! groups, kgroup k-bytes per row per group (4 = the dword-group layout every vector-dot
+//! perm reads; 8 = the smmla row-pair layout, slice J), f32 scales interleaved per
 //! block; group bytes biased by wbias (the bias128 vpdpbusd stamps bake w^0x80; tail rows
 //! stay row-major AND unbiased — the sdot4x4 tail path reads them as plain s8). Runs once
 //! per weight tensor at load, on the main context. Public: the probes repack per-variant
-//! copies with an explicit mr/wbias.
-def repack_q8q8_grp(var wp : int8?; var sp : float?; n, d, mr : int64; wbias : int64 = 0l) {
+//! copies with an explicit mr/wbias/kgroup.
+def repack_q8q8_grp(var wp : int8?; var sp : float?; n, d, mr : int64; wbias : int64 = 0l; kgroup : int64 = 4l) {
     let nb = n / 32l
     let ng = d / mr
-    let ncg = n / 4l
+    let ncg = n / kgroup
     var tw : array<int8>
     var ts : array<float>
     tw |> resize(int(d * n))
@@ -181,13 +195,12 @@ def repack_q8q8_grp(var wp : int8?; var sp : float?; n, d, mr : int64; wbias : i
         for (g in range64(ng)) {
             let gbase = g * mr * n
             for (kg in range64(ncg)) {
-                let dst = gbase + kg * 4l * mr
+                let dst = gbase + kg * kgroup * mr
                 for (r in range64(mr)) {
-                    let src = (g * mr + r) * n + kg * 4l
-                    wp[dst + r * 4l + 0l] = twp[src + 0l]
-                    wp[dst + r * 4l + 1l] = twp[src + 1l]
-                    wp[dst + r * 4l + 2l] = twp[src + 2l]
-                    wp[dst + r * 4l + 3l] = twp[src + 3l]
+                    let src = (g * mr + r) * n + kg * kgroup
+                    for (j in range64(kgroup)) {
+                        wp[dst + r * kgroup + j] = twp[src + j]
+                    }
                 }
             }
             let sgbase = g * mr * nb
@@ -209,11 +222,12 @@ def repack_q8q8_grp(var wp : int8?; var sp : float?; n, d, mr : int64; wbias : i
     delete ts
 }
 
-// the backend repack slot: the layout companion decides the interleave and the wbias
-// companion the plane bias, so a stamped bias128-mr16 tile gets biased grp16 weights from
-// the same load path that gave the grp4 pair its plain grp4 weights
+// the backend repack slot: the layout companion decides the interleave, the wbias companion
+// the plane bias, the kgroup companion the k-byte grouping — so a stamped bias128-mr16 tile
+// gets biased grp16 weights and an smmla stamp gets the kg8 row-pair plane from the same
+// load path that gave the grp4 pair its plain grp4 weights
 def private repack_q8q8_gen(var wp : int8?; var sp : float?; n, d : int64) {
-    repack_q8q8_grp(wp, sp, n, d, int64(q8q8_layout_gen()), int64(q8q8_wbias_gen()))
+    repack_q8q8_grp(wp, sp, n, d, int64(q8q8_layout_gen()), int64(q8q8_wbias_gen()), int64(q8q8_kgroup_gen()))
 }
 
 //! mr-generalized MXFP4 plane repack (mr=4 reproduces the old hand arm64-laneq mx
@@ -276,9 +290,10 @@ def private repack_mx4_gen(var np : uint8?; var ep : uint8?; n, d : int64) {
 //! anywhere, same per-block fold order as the tile (acc int-exact, then f += float(acc) * s *
 //! q per block in bi order). Writes the group's mr outputs for token trow at column col.
 //! wbias un-biases bias128 planes byte-wise (int8(b + 128) — the +128-mod-256 involution,
-//! int-exact, same acc as the plain plane; identity at wbias=0). Public: the parity probe
+//! int-exact, same acc as the plain plane; identity at wbias=0); kgroup selects the plane's
+//! k-byte grouping (4 = dword groups, 8 = the smmla row-pair plane). Public: the parity probe
 //! uses it as the grp<mr> reference when the stamped mr isn't 4.
-def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n, d, col, trow, mr : int64; wbias : int64 = 0l) {
+def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n, d, col, trow, mr : int64; wbias : int64 = 0l; kgroup : int64 = 4l) {
     let nb = n / 32l
     let wb0 = int(wbias)
     var f : float[32]   // scratch cap = the grid's max stampable mr (busd512 mr32 row)
@@ -293,7 +308,9 @@ def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?;
             for (r in range64(mr)) {
                 var acc = 0
                 for (kg in range64(8l)) {
-                    let wo = wb + kg * 4l * mr + r * 4l
+                    let wo = (kgroup == 8l
+                        ? wb + (kg / 2l) * 8l * mr + r * 8l + (kg % 2l) * 4l
+                        : wb + kg * 4l * mr + r * 4l)
                     let xo = xb + kg * 4l
                     acc += int(int8(int(wg[wo + 0l]) + wb0)) * int(xq[xo + 0l])
                     acc += int(int8(int(wg[wo + 1l]) + wb0)) * int(xq[xo + 1l])
@@ -322,6 +339,7 @@ def private q8q8_batch_kernel_neon_laneq_gen(var yp : float?; wp : int8 const?; 
     let nb = n / 32l
     let mr = int64(q8q8_layout_gen())
     let wbias = int64(q8q8_wbias_gen())
+    let kg = int64(q8q8_kgroup_gen())
     let ng = d / mr
     var myp = yp
     let TB = effective_token_block(g_q8_token_block, n)
@@ -359,7 +377,7 @@ def private q8q8_batch_kernel_neon_laneq_gen(var yp : float?; wp : int8 const?; 
                         q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, g, tk)
                         tk += 4l
                     }
-                    if (mr == 4l) {
+                    if (mr == 4l && kg == 4l) {   // an smmla mr4 stamp's plane is kg8 — generic tail below
                         while (tk < tbe) {
                             let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * nb, n)
                             myp[tk * d + g * 4l + 0l] = f.x
@@ -370,7 +388,7 @@ def private q8q8_batch_kernel_neon_laneq_gen(var yp : float?; wp : int8 const?; 
                         }
                     } else {
                         while (tk < tbe) {
-                            q8q8_token_grp_generic(myp, wgp, sgp, xqp + tk * n, xsp + tk * nb, n, d, g * mr, tk, mr, wbias)
+                            q8q8_token_grp_generic(myp, wgp, sgp, xqp + tk * n, xsp + tk * nb, n, d, g * mr, tk, mr, wbias, kg)
                             tk++
                         }
                     }
@@ -583,7 +601,8 @@ def dasllama_math_gen_register() {
             groupn = @@q8q8_groupn_gen, groupn_mx4 = @@mx4q8_groupn_gen,
             mm_rows = @@q8q8_gemv_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
-            q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen))
+            q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
+            q8_kgroup = @@q8q8_kgroup_gen))
     }
     // The x64 twin (slice F emitters + the witness): the das traversals above are
     // ISA-agnostic, so the ONLY x64-specific wiring is the availability predicate — the
@@ -600,6 +619,7 @@ def dasllama_math_gen_register() {
             mm_rows = @@q8q8_gemv_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
+            q8_kgroup = @@q8q8_kgroup_gen,
             available = @@q8q8_family_live))
     }
 }

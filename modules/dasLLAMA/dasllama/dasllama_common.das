@@ -3724,11 +3724,14 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
             // interleaved: whole mr-row block-groups first, then the row-major tail rows. The
             // positional map holds at ANY interleave mr (nibble byte off of block-group bg ->
             // q8[bg*32*mr + off] low / +16*mr high); mr comes off the activation-time layout cache.
+            // A kg8 Q8 plane (smmla stamp) regroups within the block-group: nibble byte
+            // (j, r, b) -> q8[(j/2)*8*mr + r*8 + (j%2)*4 + b] low, hi still at +16*mr.
             // A bias128 stamp reads w^0x80 group bytes, so the group writes go through a BIASED
             // LUT copy (the tail loop below keeps the plain LUT — tail rows ride the unbiased
             // row-major dot).
             let mr = active_q8_layout_mr()
             let wbias = int(active_q8_wbias())
+            let kgv = active_q8_kgroup()
             var blut : int8[16]
             for (i in range(16)) {
                 blut[i] = int8(int(lut[i]) + wbias)
@@ -3737,16 +3740,36 @@ def private expand_mx4_region_q8(t : Model; woff, n, d : int64; var wq : array<i
             let qbyt = 32l * mr    // q8 bytes per block-group
             let ngrp = (d / mr) * (n / 32l)
             let blutp = addr(blut[0])   // frame outlives the join, same as lutp
-            maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_dispatch_lanes()) $(gb, ge) {
-                unsafe {
-                    for (bg0 in range(gb, ge)) {
-                        let bg = int64(bg0)
-                        let nb = bg * nbyt
-                        let qb = bg * qbyt
-                        for (off in range64(nbyt)) {
-                            let b = int(np[nb + off])
-                            qp[qb + off] = blutp[b & 15]
-                            qp[qb + nbyt + off] = blutp[b >> 4]
+            if (kgv == 8l) {
+                maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_dispatch_lanes()) $(gb, ge) {
+                    unsafe {
+                        for (bg0 in range(gb, ge)) {
+                            let bg = int64(bg0)
+                            let nb = bg * nbyt
+                            let qb = bg * qbyt
+                            for (off in range64(nbyt)) {
+                                let j = off / (4l * mr)
+                                let rem = off % (4l * mr)
+                                let q8o = (j / 2l) * 8l * mr + (rem / 4l) * 8l + (j % 2l) * 4l + rem % 4l
+                                let b = int(np[nb + off])
+                                qp[qb + q8o] = blutp[b & 15]
+                                qp[qb + nbyt + q8o] = blutp[b >> 4]
+                            }
+                        }
+                    }
+                }
+            } else {
+                maybe_parallel_for(total >= g_requant_par_threshold, 0, int(ngrp), get_dispatch_lanes()) $(gb, ge) {
+                    unsafe {
+                        for (bg0 in range(gb, ge)) {
+                            let bg = int64(bg0)
+                            let nb = bg * nbyt
+                            let qb = bg * qbyt
+                            for (off in range64(nbyt)) {
+                                let b = int(np[nb + off])
+                                qp[qb + off] = blutp[b & 15]
+                                qp[qb + nbyt + off] = blutp[b >> 4]
+                            }
                         }
                     }
                 }

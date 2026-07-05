@@ -28,7 +28,9 @@ require dasllama/dasllama_gemm_schema
 //           chain lacks; the tile ignores it (its K knob is kstep)
 //   dot     the per-ISA dot primitive: "sdot" (NEON indexed sdot — the arm64 leg),
 //           "maddubs" (x64 VPMADDUBSW+VPMADDWD sign-trick pair), "vpdpbusd" (x64 VNNI,
-//           sign trick, one dot op), "vpdpbssd" (x64 AVX-VNNI-INT8, native s8·s8)
+//           sign trick, one dot op), "vpdpbssd" (x64 AVX-VNNI-INT8, native s8·s8),
+//           "smmla" (NEON i8mm 2×2 MMA, slice J — implies the kg8 plane; tile only, the
+//           gemv/mx4 companions ride the sdot lattice)
 //   width   vector width in bits: 128 (NEON, implied by sdot), 256 (ymm), 512 (zmm)
 //   bias    128 = bias128 (vpdpbusd only): the repack bakes w^0x80 into the grp<mr> plane,
 //           dots run plain vpdpbusd(acc, w_biased, x) — no abs/sign ops — and the exactness
@@ -38,20 +40,28 @@ require dasllama/dasllama_gemm_schema
 // perm_declines), so repacks and kernels fall back to the grp4 reference family together.
 // Runs in the llvm-jit context; wired via llvm_user_modules.das. The stubs it generates for
 // are dasllama/dasllama_math_gen.das::q8q8_tile_gen, ::q8q8_layout_gen, ::q8q8_wbias_gen,
-// ::q8q8_gemv_gen, ::mx4q8_gemv_gen and ::q8q8_family_live (the witness).
+// ::q8q8_kgroup_gen, ::q8q8_gemv_gen, ::mx4q8_gemv_gen and ::q8q8_family_live (the witness).
 
 // dot-primitive kinds (TilePerm.dotPrim, parsed once into TileEmit.dotKind)
 let DOT_SDOT = 0
 let DOT_MADDUBS = 1
 let DOT_VPDPBUSD = 2
 let DOT_VPDPBSSD = 3
+let DOT_SMMLA = 4
 
 def private dot_kind(prim : string) : int {
     if (prim == "maddubs") return DOT_MADDUBS
     if (prim == "vpdpbusd") return DOT_VPDPBUSD
     if (prim == "vpdpbssd") return DOT_VPDPBSSD
+    if (prim == "smmla") return DOT_SMMLA
     return DOT_SDOT
 }
+
+// the perm's plane kgroup (k-bytes per row per interleave group): smmla reads row-pair × 8-k
+// MMA operands straight off a kg8 plane ([kg8][r][8b], slice J); every vector-dot perm reads
+// the dword-group kg4 plane. Feeds q8q8_repack_type so kernel strides, the kgroup companion
+// and the runtime repack derive from the one schema.
+def private kgroup_of(p : TilePerm) : int => p.dotPrim == "smmla" ? 8 : 4
 
 // the perm vector both generators read off the [llvm_code] annotation args
 struct private TilePerm {
@@ -96,8 +106,30 @@ def private perm_declines(var gc : LlvmCodeCtx; p : TilePerm) : bool {
         || (p.gkstep != 1 && p.gkstep != 2 && p.gkstep != 4)
         || (p.mr < 4)
         || (p.bias != 0 && (p.bias != 128 || p.dotPrim != "vpdpbusd"))) return true
-    let rt = q8q8_repack_type(p.mr, p.bias)
+    let rt = q8q8_repack_type(p.mr, p.bias, kgroup_of(p))
     if (rt.interleave != p.mr || !rt.f32_scales) return true
+    if (p.dotPrim == "smmla") {
+        // the i8mm MMA leg (slice J): NEON widths, row-quad geometry (the fold transpose and
+        // the gemv kg8→kg4 fixup both work in quads), s8·s8 native (bias128 already declined
+        // above), the SAME q-reg budget space as sdot (w 2mr + acc nrsplit·mr/4 + act
+        // 2·nrsplit + 2 — MMA patches and A pairs land on the same counts), and the i8mm tier
+        // flag (host LLVM features / DAS_JIT_ARM64_FORCE_FEATURES — M1 is dotprod-only)
+        if ((!g_target_is_aarch64) || (!g_target_arm64_i8mm) || (p.width != 128)
+            || (p.mr % 4 != 0)
+            || (2 * p.mr + p.nrsplit * p.mr / 4 + 2 * p.nrsplit + 2 > 32)) return true
+        let mod = LLVMGetGlobalParent(gc.impl)
+        var v16i8 = LLVMVectorType(gc.jit.types.t_int8, 16u)
+        let mmId = LLVMLookupIntrinsicID("llvm.aarch64.neon.smmla")
+        var mmTypes <- [gc.jit.types->LLVMInt4Type(), v16i8]
+        if (LLVMGetIntrinsicDeclaration(mod, mmId, mmTypes) == null) return true
+        // the gemv/mx4 companions ride the sdot lattice over the kg8 plane — both rails
+        let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.sdot")
+        var declTypes <- [gc.jit.types->LLVMInt4Type(), v16i8]
+        if (LLVMGetIntrinsicDeclaration(mod, id, declTypes) == null) return true
+        let tblId = LLVMLookupIntrinsicID("llvm.aarch64.neon.tbl1")
+        var tblTypes <- [v16i8]
+        return LLVMGetIntrinsicDeclaration(mod, tblId, tblTypes) == null
+    }
     if (p.dotPrim == "sdot") {
         // the NEON leg (the M2 shape): 128-bit q-regs, 4-row sdot lane structure, q-reg
         // budget (weights 2*mr + acc nrsplit*mr/4 + activations 2*nrsplit + 2 scratch)
@@ -164,7 +196,10 @@ struct private TileEmit {
     dp_ty : LLVMOpaqueType?
     interleave : int                     // rows per group (q8q8_repack_type(mr).interleave)
     rq : int                             // weight VECTORS per group (mr / rv; NEON: row quads)
+    kgroup : int                         // k-bytes per row per group (4; 8 = the smmla plane)
     bias : int                           // 128 = bias128 dots (weight plane is w^0x80); 0 = sign trick
+    smmla_decl : LLVMOpaqueValue?        // NEON i8mm 2x2 MMA (the smmla tile lattice)
+    smmla_ty : LLVMOpaqueType?
     reduce_decl : LLVMOpaqueValue?       // llvm.vector.reduce.add at vni32 (the gemv inline bsum)
     reduce_ty : LLVMOpaqueType?
     wg : LLVMOpaqueValue?                // interleaved mr-row weight group base (mx4: nibble plane)
@@ -208,7 +243,9 @@ def private ones_i16(te : TileEmit) : LLVMOpaqueValue? {
 // select there — w==0 lanes keep x, but they multiply |w| = 0 anyway). Same exactness
 // precondition as dot32: x values in [-127, 127] (the Q8 quantizer's range); w may be -128.
 def private dot_lane(var te : TileEmit; var acc, wv, uwv, xv : LLVMOpaqueValue?; lane : int) : LLVMOpaqueValue? {
-    if (te.dotKind == DOT_SDOT) {
+    if (te.dotKind == DOT_SDOT || te.dotKind == DOT_SMMLA) {
+        // SMMLA reaches here only off the MMA lattice's fallbacks — the gemv single-token
+        // slice and the mx4 companion ride the sdot lattice (i8mm implies dotprod)
         return sdot_lane(te, acc, wv, xv, lane)
     }
     let b = te.builder
@@ -315,12 +352,36 @@ def private emit_block(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLV
     var xb = LLVMBuildMul(b, bi, te.types->ConstI64(0x20ul), "xb")
     var wv : LLVMOpaqueValue? [16]
     var uw : LLVMOpaqueValue? [16]
-    for (kg in range(8)) {
-        for (qd in range(rq)) {
-            let boff = kg * 4 * te.interleave + qd * (te.width / 8)
-            var off = boff == 0 ? wb : LLVMBuildAdd(b, wb, te.types->ConstI64(uint64(boff)), "")
-            wv[kg * rq + qd] = load_vec(te, te.vwi8, te.wg, off, "wv{kg * rq + qd}")
-            uw[kg * rq + qd] = abs_w(te, wv[kg * rq + qd], "uw{kg * rq + qd}")
+    if (te.kgroup == 8) {
+        // kg8 plane under the sdot lattice (the smmla stamp's gemv / single-token path): per
+        // (kg8 group, row quad) two row-pair loads + uzp1/uzp2.4s reassemble the two
+        // kg4-shaped weight vectors — [r0 klo, r1 klo, r2 klo, r3 klo] — and the lattice
+        // below is untouched. Only smmla perms stamp kg8, so this path is NEON-width only.
+        for (g in range(4)) {
+            for (qd in range(rq)) {
+                let boff = g * 8 * te.interleave + (2 * qd) * 16
+                var off0 = boff == 0 ? wb : LLVMBuildAdd(b, wb, te.types->ConstI64(uint64(boff)), "")
+                var p0 = load_v16i8(te, te.wg, off0, "wp{g * rq + qd}a")
+                var off1 = LLVMBuildAdd(b, wb, te.types->ConstI64(uint64(boff + 16)), "")
+                var p1 = load_v16i8(te, te.wg, off1, "wp{g * rq + qd}b")
+                var p0i = LLVMBuildBitCast(b, p0, te.v4i32, "")
+                var p1i = LLVMBuildBitCast(b, p1, te.v4i32, "")
+                var lo = LLVMBuildShuffleVector(b, te.types, p0i, p1i, [0, 2, 4, 6], "wlo{g * rq + qd}")
+                var hi = LLVMBuildShuffleVector(b, te.types, p0i, p1i, [1, 3, 5, 7], "whi{g * rq + qd}")
+                wv[(2 * g) * rq + qd] = LLVMBuildBitCast(b, lo, te.vwi8, "wv{(2 * g) * rq + qd}")
+                wv[(2 * g + 1) * rq + qd] = LLVMBuildBitCast(b, hi, te.vwi8, "wv{(2 * g + 1) * rq + qd}")
+                uw[(2 * g) * rq + qd] = abs_w(te, wv[(2 * g) * rq + qd], "uw{(2 * g) * rq + qd}")
+                uw[(2 * g + 1) * rq + qd] = abs_w(te, wv[(2 * g + 1) * rq + qd], "uw{(2 * g + 1) * rq + qd}")
+            }
+        }
+    } else {
+        for (kg in range(8)) {
+            for (qd in range(rq)) {
+                let boff = kg * 4 * te.interleave + qd * (te.width / 8)
+                var off = boff == 0 ? wb : LLVMBuildAdd(b, wb, te.types->ConstI64(uint64(boff)), "")
+                wv[kg * rq + qd] = load_vec(te, te.vwi8, te.wg, off, "wv{kg * rq + qd}")
+                uw[kg * rq + qd] = abs_w(te, wv[kg * rq + qd], "uw{kg * rq + qd}")
+            }
         }
     }
     var xv0 : LLVMOpaqueValue? [4]
@@ -357,6 +418,16 @@ def private emit_block(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLV
             }
         }
     }
+    emit_scale_fold(te, bi, a, f, tokBase, tokCount)
+}
+
+// the per-block Q8 scale fold shared by the sdot/x64 lattice and the smmla MMA form: f[acc] +=
+// float(a[acc]) * s[qd] * splat(q[i]) — the exact op order of the hand template
+// dot_q8q8_laneq4x4_template, so every emitter's fast-math contraction sees the same input and
+// the one grp4 oracle serves all layouts. `a` is token-major (token * rq + row-vector).
+def private emit_scale_fold(var te : TileEmit; var bi : LLVMOpaqueValue?; a : LLVMOpaqueValue? [8]; var f : LLVMOpaqueValue? [8]; tokBase, tokCount : int) {
+    let b = te.builder
+    let rq = te.rq
     var s4 : LLVMOpaqueValue? [4]
     var sgIdx0 = LLVMBuildMul(b, bi, te.types->ConstI64(uint64(te.interleave)), "")
     for (qd in range(rq)) {
@@ -375,6 +446,73 @@ def private emit_block(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLV
             f[i * rq + qd] = LLVMBuildFAdd(b, f[i * rq + qd], m, "f{tk}")
         }
     }
+}
+
+// one 32-k block, SMMLA form (the kg8 plane, slice J): B operands are row-pair × 8-k
+// 16-byte loads straight off the plane (4 k-slices × mr/2 row pairs — the repack did the
+// marshalling); A operands pair tokens (2tp, 2tp+1) per k-slice via zip1/zip2.2d byte
+// shuffles off the same chunk loads as the sdot form (4 per token pair, reused across every
+// row pair); the MMA lattice accumulates 2×2 patches m[tp][rp] = [t0·ra, t0·rb, t1·ra,
+// t1·rb]; then a 2-shuffle i32 transpose per (token pair, row quad) hands token-major
+// accumulators to the SAME per-block scale fold — fold order preserved, one oracle.
+// tokCount is even by construction (nrsplit ∈ {2,4}; single-token slices ride emit_block).
+def private emit_block_smmla(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLVMOpaqueValue? [8]; tokBase, tokCount : int) {
+    let b = te.builder
+    let rq = te.rq                    // row quads — the transpose/fold granularity
+    let nrp = te.interleave / 2       // row pairs — the MMA granularity
+    let ntp = tokCount / 2            // token pairs
+    var wb = LLVMBuildMul(b, bi, te.types->ConstI64(uint64(te.interleave * 0x20)), "wb")
+    var xb = LLVMBuildMul(b, bi, te.types->ConstI64(0x20ul), "xb")
+    var wv : LLVMOpaqueValue? [16]    // [g * nrp + rp]; 4 * nrp <= 16 under the budget rail
+    for (g in range(4)) {
+        for (rp in range(nrp)) {
+            let boff = g * 8 * te.interleave + rp * 16
+            var off = boff == 0 ? wb : LLVMBuildAdd(b, wb, te.types->ConstI64(uint64(boff)), "")
+            wv[g * nrp + rp] = load_v16i8(te, te.wg, off, "wv{g * nrp + rp}")
+        }
+    }
+    var xv0 : LLVMOpaqueValue? [4]
+    var xv1 : LLVMOpaqueValue? [4]
+    var xb1 = LLVMBuildAdd(b, xb, te.types->ConstI64(16ul), "")
+    for (i in range(tokCount)) {
+        xv0[i] = load_v16i8(te, te.x[tokBase + i], xb, "x{tokBase + i}lo")
+        xv1[i] = load_v16i8(te, te.x[tokBase + i], xb1, "x{tokBase + i}hi")
+    }
+    // A[tp][g] = tokens (2tp, 2tp+1) k-bytes (8g..8g+7): zip1/zip2.2d byte-shuffle shapes
+    let mlo <- [for (i in range(16)); i < 8 ? i : 8 + i]        // [0..7, 16..23]
+    let mhi <- [for (i in range(16)); i < 8 ? 8 + i : 16 + i]   // [8..15, 24..31]
+    var av : LLVMOpaqueValue? [8]     // [tp * 4 + g]; ntp * 4 <= 8
+    for (tp in range(ntp)) {
+        let i0 = 2 * tp
+        av[tp * 4 + 0] = LLVMBuildShuffleVector(b, te.types, xv0[i0], xv0[i0 + 1], mlo, "a{tp}k0")
+        av[tp * 4 + 1] = LLVMBuildShuffleVector(b, te.types, xv0[i0], xv0[i0 + 1], mhi, "a{tp}k1")
+        av[tp * 4 + 2] = LLVMBuildShuffleVector(b, te.types, xv1[i0], xv1[i0 + 1], mlo, "a{tp}k2")
+        av[tp * 4 + 3] = LLVMBuildShuffleVector(b, te.types, xv1[i0], xv1[i0 + 1], mhi, "a{tp}k3")
+    }
+    var m : LLVMOpaqueValue? [8]      // [tp * nrp + rp]; ntp * nrp <= 8 under the budget rail
+    for (i in range(ntp * nrp)) {
+        m[i] = LLVMConstNull(te.vni32)
+    }
+    for (g in range(4)) {
+        for (tp in range(ntp)) {
+            for (rp in range(nrp)) {
+                var margs <- [m[tp * nrp + rp], av[tp * 4 + g], wv[g * nrp + rp]]
+                m[tp * nrp + rp] = LLVMBuildCall2(b, te.smmla_ty, te.smmla_decl, margs, "mm")
+            }
+        }
+    }
+    // transpose the 2×2 patches to token-major row quads: a[2tp][q] = [mA.0, mA.1, mB.0,
+    // mB.1] (uzp1.2d shape), a[2tp+1][q] = [mA.2, mA.3, mB.2, mB.3] (uzp2.2d)
+    var a : LLVMOpaqueValue? [8]
+    for (tp in range(ntp)) {
+        for (q in range(rq)) {
+            var mA = m[tp * nrp + 2 * q]
+            var mB = m[tp * nrp + 2 * q + 1]
+            a[(2 * tp) * rq + q] = LLVMBuildShuffleVector(b, te.types, mA, mB, [0, 1, 4, 5], "at{tokBase + 2 * tp}q{q}")
+            a[(2 * tp + 1) * rq + q] = LLVMBuildShuffleVector(b, te.types, mA, mB, [2, 3, 6, 7], "at{tokBase + 2 * tp + 1}q{q}")
+        }
+    }
+    emit_scale_fold(te, bi, a, f, tokBase, tokCount)
 }
 
 // constant i8 splat at the weight-vector width
@@ -485,10 +623,14 @@ def private emit_block_mx4(var te : TileEmit; var bi : LLVMOpaqueValue?; var f :
     }
 }
 
-// block-emitter dispatch: the slice/loop machinery is quant-agnostic
+// block-emitter dispatch: the slice/loop machinery is quant-agnostic. The MMA form needs a
+// token PAIR — the gemv companion's single-token slices ride the sdot lattice (emit_block's
+// kg8 weight fixup reads the same plane).
 def private emit_one_block(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLVMOpaqueValue? [8]; tokBase, tokCount : int) {
     if (te.mx4) {
         emit_block_mx4(te, bi, f, tokBase, tokCount)
+    } elif (te.dotKind == DOT_SMMLA && tokCount >= 2) {
+        emit_block_smmla(te, bi, f, tokBase, tokCount)
     } else {
         emit_block(te, bi, f, tokBase, tokCount)
     }
@@ -646,15 +788,21 @@ def private emit_slice(var te : TileEmit; var sa : SliceArgs; var pred : LLVMOpa
 // decline (belt — perm_declines already gated the same rails). needMx4 additionally wires the
 // LUT-dequant primitive (tbl1 / pshufb) and bakes the doubled-e2m1 LUT constant.
 def private setup_tile_emit(var te : TileEmit; var gc : LlvmCodeCtx; p : TilePerm; needMx4 : bool) : bool {
-    let rt = q8q8_repack_type(p.mr)
+    let rt = q8q8_repack_type(p.mr, p.bias, kgroup_of(p))
     te.builder = gc.jit.builder
     te.types = gc.jit.types
     te.interleave = rt.interleave
     te.dotKind = dot_kind(p.dotPrim)
+    // the mx4 nibble plane is kgroup-independent (its own repack) — under an smmla perm the
+    // mx4 companion rides the plain sdot lattice (i8mm implies dotprod)
+    if (te.mx4 && te.dotKind == DOT_SMMLA) {
+        te.dotKind = DOT_SDOT
+    }
+    te.kgroup = te.mx4 ? 4 : rt.kgroup
     // the perm's bias applies to the Q8 weight plane only — the mx4 nibble/LUT path always
     // runs unbiased (its dequanted weights never see the repack)
     te.bias = te.mx4 ? 0 : p.bias
-    te.width = te.dotKind == DOT_SDOT ? 128 : p.width
+    te.width = (te.dotKind == DOT_SDOT || te.dotKind == DOT_SMMLA) ? 128 : p.width
     te.rv = te.width / 32
     te.rq = rt.interleave / te.rv
     te.v16i8 = LLVMVectorType(te.types.t_int8, 16u)
@@ -663,13 +811,21 @@ def private setup_tile_emit(var te : TileEmit; var gc : LlvmCodeCtx; p : TilePer
     te.vni32 = LLVMVectorType(te.types.t_int32, uint(te.rv))
     te.vnf32 = LLVMVectorType(te.types.t_float, uint(te.rv))
     let mod = LLVMGetGlobalParent(gc.impl)
-    if (te.dotKind == DOT_SDOT) {
+    if (te.dotKind == DOT_SDOT || te.dotKind == DOT_SMMLA) {
         let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.sdot")
         var declTypes <- [te.vni32, te.v16i8]
         te.sdot_decl = LLVMGetIntrinsicDeclaration(mod, id, declTypes)
         if (te.sdot_decl == null) return false      // no NEON dotprod on this target: decline
         var fnArgTypes <- [te.vni32, te.v16i8, te.v16i8]
         te.sdot_ty = LLVMFunctionType(te.vni32, fnArgTypes)
+        if (te.dotKind == DOT_SMMLA) {
+            let mmId = LLVMLookupIntrinsicID("llvm.aarch64.neon.smmla")
+            var mmTypes <- [te.vni32, te.v16i8]
+            te.smmla_decl = LLVMGetIntrinsicDeclaration(mod, mmId, mmTypes)
+            if (te.smmla_decl == null) return false // lockstep with perm_declines' smmla rail
+            var mmArgTypes <- [te.vni32, te.v16i8, te.v16i8]
+            te.smmla_ty = LLVMFunctionType(te.vni32, mmArgTypes)
+        }
         if (needMx4) {
             let tblId = LLVMLookupIntrinsicID("llvm.aarch64.neon.tbl1")
             var tblDeclTypes <- [te.v16i8]
@@ -831,6 +987,20 @@ def private wbias_gen(var gc : LlvmCodeCtx) : bool {
     var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
     LLVMPositionBuilderAtEnd(gc.jit.builder, entry)
     LLVMBuildRet(gc.jit.builder, gc.jit.types->ConstI32(uint64(p.bias)))
+    return true
+}
+
+// the kgroup seventh of the stamp (slice J): `() : int` returning the perm's plane kgroup —
+// 8 for smmla perms (row-pair × 8-k layout), 4 for every vector-dot perm. The runtime repack,
+// the token-tail generic and the mx4→Q8 expand map ask it how the plane groups its k-bytes.
+// Declines via the SAME perm_declines: a declined perm keeps the kg4 grp4 reference pair.
+def private kgroup_gen(var gc : LlvmCodeCtx) : bool {
+    if (!is_layout_signature(gc.fn)) return false
+    let p = parse_perm(gc)
+    if (perm_declines(gc, p)) return false
+    var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
+    LLVMPositionBuilderAtEnd(gc.jit.builder, entry)
+    LLVMBuildRet(gc.jit.builder, gc.jit.types->ConstI32(uint64(q8q8_repack_type(p.mr, p.bias, kgroup_of(p)).kgroup)))
     return true
 }
 
@@ -1002,6 +1172,7 @@ def public register_dasllama_gemm_generators {
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_tile", @@tile_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_layout", @@layout_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_wbias", @@wbias_gen)
+    register_llvm_code_generator("dasllama_gemm_gen::q8q8_kgroup", @@kgroup_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_gemv", @@gemv_gen)
     register_llvm_code_generator("dasllama_gemm_gen::mx4_gemv", @@mx4_gemv_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_witness", @@witness_gen)

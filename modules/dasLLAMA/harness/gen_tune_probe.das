@@ -33,6 +33,7 @@ require dasllama/dasllama_gemm_schema
 require dasllama/dasllama_quant
 require llvm/daslib/llvm_tune
 require daslib/random
+require daslib/fio   // has_env_variable: the compile-only mint gate (slice J recipe)
 require math
 require strings
 
@@ -136,6 +137,18 @@ def variant_wbias() : table<string; int> {
     }
     delete bvs
     return <- wbs
+}
+
+// suffix -> plane kgroup, off the kgroup companion's variants registry (same lockstep; 8 on
+// the smmla rows — the repack below must write the row-pair plane those tiles read)
+def variant_kgroups() : table<string; int> {
+    var kgs : table<string; int>
+    var kvs <- q8q8_kgroup_gen_variants()
+    for (v in kvs) {
+        kgs[v._0] = invoke(v._1)
+    }
+    delete kvs
+    return <- kgs
 }
 
 // one full tile sweep: every group x every 4-token block through `tile`, on the variant's
@@ -300,6 +313,7 @@ def test_mode : bool {
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
     var wbs <- variant_wbias()
+    var kgs <- variant_kgroups()
     var gtab <- gemv_variants_by_suffix()
     var mtab <- mx4_variants_by_suffix()
     var wtab <- witness_variants_by_suffix()
@@ -307,12 +321,13 @@ def test_mode : bool {
     for (v in vs) {
         let mr = int64(mrs?[v._0] ?? 4)
         let wbias = int64(wbs?[v._0] ?? 0)
+        let kgv = int64(kgs?[v._0] ?? 4)
         verify(gtab |> key_exists(v._0))
         verify(mtab |> key_exists(v._0))
         verify(wtab |> key_exists(v._0))
         // witness-lockstep invariants: the reference row is never "live", and a
-        // non-reference layout or a biased plane proves the family emitted — the witness
-        // must agree
+        // non-reference layout, a biased plane or a kg8 plane proves the family emitted —
+        // the witness must agree
         let live = invoke(wtab[v._0])
         if (v._0 == "reference") {
             verify(!live)
@@ -325,6 +340,10 @@ def test_mode : bool {
             print("  WBIAS DESYNC {v._0}: wbias={wbias} but witness says not live\n")
             allok = false
         }
+        if (kgv != 4l && !live) {
+            print("  KGROUP DESYNC {v._0}: kgroup={kgv} but witness says not live\n")
+            allok = false
+        }
         var ok = true
         var gok = true
         var maxdiff = 0.0
@@ -333,7 +352,7 @@ def test_mode : bool {
             var qv := fx.q
             var sv := fx.s
             unsafe {
-                repack_q8q8_grp(addr(qv[0]), addr(sv[0]), fx.n, fx.d, mr, wbias)
+                repack_q8q8_grp(addr(qv[0]), addr(sv[0]), fx.n, fx.d, mr, wbias, kgv)
             }
             var y : array<float>
             y |> resize(int(fx.ntok * fx.d))
@@ -397,12 +416,14 @@ def test_mode : bool {
             delete ev
         }
         let biasTag = wbias != 0l ? " bias{wbias}" : ""
-        print("{v._0} (mr={mr}{biasTag}, {live ? "live" : "ref"}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
+        let kgTag = kgv != 4l ? " kg{kgv}" : ""
+        print("{v._0} (mr={mr}{biasTag}{kgTag}, {live ? "live" : "ref"}): tile {ok ? "ok" : "MISMATCH"} (maxdiff {maxdiff}), gemv {gok ? "ok" : "MISMATCH"} (maxdiff {gmaxdiff}), mx4 {mok ? "ok" : "MISMATCH"} (maxdiff {mmaxdiff})\n")
         allok = allok && ok && gok && mok
     }
     delete wtab
     delete mtab
     delete gtab
+    delete kgs
     delete wbs
     delete mrs
     delete vs
@@ -424,6 +445,7 @@ def tune_mode_run : bool {
     var vs <- q8q8_tile_gen_variants()
     var mrs <- variant_mrs()
     var wbs <- variant_wbias()
+    var kgs <- variant_kgroups()
     var gtab <- gemv_variants_by_suffix()
     let nv = length(vs)
     // per-variant repacked buffers, built once outside the timing loop
@@ -438,6 +460,7 @@ def tune_mode_run : bool {
     for (vi in range(nv)) {
         vmr[vi] = int64(mrs?[vs[vi]._0] ?? 4)
         let wb = int64(wbs?[vs[vi]._0] ?? 0)
+        let kgv = int64(kgs?[vs[vi]._0] ?? 4)
         verify(gtab |> key_exists(vs[vi]._0))
         bufs[vi].q := fx.q
         bufs[vi].s := fx.s
@@ -446,9 +469,9 @@ def tune_mode_run : bool {
         hbufs[vi].q := hfx.q
         hbufs[vi].s := hfx.s
         unsafe {
-            repack_q8q8_grp(addr(bufs[vi].q[0]), addr(bufs[vi].s[0]), fx.n, fx.d, vmr[vi], wb)
-            repack_q8q8_grp(addr(gbufs[vi].q[0]), addr(gbufs[vi].s[0]), gfx.n, gfx.d, vmr[vi], wb)
-            repack_q8q8_grp(addr(hbufs[vi].q[0]), addr(hbufs[vi].s[0]), hfx.n, hfx.d, vmr[vi], wb)
+            repack_q8q8_grp(addr(bufs[vi].q[0]), addr(bufs[vi].s[0]), fx.n, fx.d, vmr[vi], wb, kgv)
+            repack_q8q8_grp(addr(gbufs[vi].q[0]), addr(gbufs[vi].s[0]), gfx.n, gfx.d, vmr[vi], wb, kgv)
+            repack_q8q8_grp(addr(hbufs[vi].q[0]), addr(hbufs[vi].s[0]), hfx.n, hfx.d, vmr[vi], wb, kgv)
         }
     }
     var best : array<double>
@@ -547,6 +570,7 @@ def tune_mode_run : bool {
     delete gbest
     delete hbest
     delete gtab
+    delete kgs
     delete wbs
     delete mrs
     delete vs
@@ -560,6 +584,17 @@ def tune_mode_run : bool {
 def main {
     if (!jit_enabled()) {
         print("run with -jit — the generator only fires under the LLVM JIT\n")
+        return
+    }
+    // pre-i8mm mint rail (the slice J no-linker-on-target recipe): the JIT has already
+    // linked + installed the full grid DLL by the time main runs — this gate skips
+    // EXECUTION only (forced smmla variants would SIGILL on a dotprod-only host). Ship
+    // .jitted_scripts to the i8mm box and run there with the same env minus this one —
+    // the cache key matches, dlopen, no linker needed on the target.
+    if (has_env_variable("GEN_TUNE_COMPILE_ONLY")) {
+        var vs <- q8q8_tile_gen_variants()
+        print("compile-only: DLL linked, {length(vs)} tile variants, execution skipped\n")
+        delete vs
         return
     }
     // select the gen backend where it exists (arm64) — test/tune drive the variant

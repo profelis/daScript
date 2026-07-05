@@ -1092,6 +1092,109 @@ Grid rows: amx 1×1 (probe shape) + 2×2, decline-by-design everywhere off-SPR; 
 tune sweep = the AMX respin session (prereq GGUFs now resolved, see above; chase target =
 lcpp-AMX 135M prefill 13.3k t/s cache-resident).
 
+## M4 slice J — the smmla leg (dot="smmla", i8mm; DESIGN 2026-07-05)
+
+**Slot scope: the batch tile.** SMMLA is a 2×2 MMA — `acc[i][j] += a_row_i · b_row_j` over 8
+k-bytes, 32 MACs/instr, no horizontal reduce; the M3 scout measured 2.21× sdot4 GMAC/s
+register-resident ([[dasllama-m3-air-box]]). The 2×2 shape needs two tokens per A operand, so
+the tile (nrsplit 2/4, both even) is the natural client; the GEMV slot (one token) would waste
+half the MMA and stays on the sdot lattice.
+
+**The layout is NOT ours this time — kgroup=8.** smmla's B operand is a ROW-PAIR × 8 k-bytes
+in one q-reg; the grp<mr> plane's dword groups ([kg4][r][4b]) put those bytes in four places.
+Marshalling in-kernel (zip per weight vector, no reuse across anything but the 2 token pairs)
+costs ≈ the MMA advantage — counted it: mr8 break-even, mr4 worse. So the perm carries a
+second layout axis: **kgroup** — bytes per row per k-group. kg8 = `[kg8][r][8 bytes]`, B
+operands become straight 16-byte loads (the scout probe's exact layout), and the marshalling
+moves to load-time repack where it belongs. `Q8RepackType` gains `kgroup` (4 default), the
+stamp gains a SEVENTH companion (`q8q8_kgroup_gen`, reference body 4), and the runtime repack /
+token-tail generic / mx4→Q8 expand map all branch on it. The batch wrapper's mr==4 laneq token
+tail additionally gates on kgroup==4 (an smmla mr4 stamp's plane is kg8 — the generic tail
+reads it instead).
+
+**The block emitter (emit_block_smmla).** Per 32-k block: 4·(mr/2) straight B loads
+(`bi·mr·32 + g·8·mr + rp·16`); A operands from the token chunk loads via 4 byte-shuffles per
+token pair (zip1/zip2.2d shapes — `[0..7,16..23]` / `[8..15,24..31]` masks, reused across all
+row pairs); MMA lattice `m[tp][rp] = smmla(m[tp][rp], A[tp][g], B[g][rp])`; then a per-block
+2-shuffle i32 transpose per (token pair, row quad) — `[0,1,4,5]`/`[2,3,6,7]` = uzp1/uzp2.2d —
+back into the token-major `a[token][rowquad]` accumulators, so the per-block scale fold and
+the store machinery are byte-for-byte the existing ones (fold order preserved → the one grp4
+oracle still serves). Register budget is the sdot formula unchanged (w 2mr + acc nrsplit·mr/4
++ act 2·nrsplit + 2): smmla admits exactly the sdot (mr, nrsplit) space — mr4/nr4 22,
+mr8/nr2 26 regs. Op-count sizing per mr8/nr2 block: 16 B loads + 4 x loads + 4 zips +
+16 smmla + 4 uzp vs sdot's 20 loads + 32 sdot — ~1.3-1.4× ALU-side expected at the kernel
+(the 2.21× is the no-marshalling ceiling; fold + A-pairing eat the rest). A-side pre-pairing
+at quantize time would drop the 4 zips — ledger, only if silicon says the zips show.
+
+**Companions under an smmla perm.** GEMV: sdot lattice over the kg8 plane — per (kg8 g,
+row quad): two pair-loads + uzp1/uzp2.4s reassemble the two kg4-shaped sdot vectors
+(`[r0k0-3,r1k0-3,r2k0-3,r3k0-3]`), the lattice above the loads untouched; GEMV is DRAM-bound,
+the extra uzp is hidden. mx4: the nibble plane is kgroup-independent ([j][r][4b], its own
+repack) — the mx4 emitter forces the sdot lattice (i8mm implies dotprod), zero change. wbias:
+smmla is s8·s8 native, bias128 declines (vpdpbusd-only rail already says so).
+
+**Declines (the shared predicate, one new leg):** dot="smmla" → aarch64 + width 128 + mr%4==0
+(row-quad transpose + gemv fixup) + bias==0 + **g_target_arm64_i8mm** + smmla intrinsic decl
+(+ tbl1, the mx4 lockstep rail). The new tier flag: host targets read
+`LLVMGetHostCPUFeatures()` for "+i8mm" (populated on Linux aarch64) OR'd with
+DAS_JIT_ARM64_FORCE_FEATURES (the macOS story — LLVM's host-features string is empty there, so
+the env is the rail on Apple silicon, same string on emitter box and target box = DLL cache
+key match, the slice's whole no-linker-on-target recipe). `requires = "i8mm"` eligibility in
+the fallback chain reads both env rails (llvm_tune is macro-context — no cpuid for arm, the
+env IS the truth there).
+
+**Gates.** M1 cannot execute smmla (dotprod only): emission proof =
+`gen_arm64_emission_check.sh` (the slice F script's arm64 twin — native triple + forced
++i8mm, compile-only + --jit-dump → llc -mattr=+dotprod,+i8mm → objdump; per-variant gates:
+tile smmla counts exact (mr8/nr2/kstep2 = 96), zero sdot in the smmla tile body, gemv = sdot
+16 + uzp 16 + zero smmla, mx4 rides tbl). Semantics + tune = the M3 Air (`ssh air`,
+[[dasllama-m3-air-box]] recipe: compile grid on M1 under the forced env, rsync
+.jitted_scripts + sources, cache-hit there). kg8 repack + generic-dot correctness is pure das
+— unit-tested on M1 (no i8mm needed). Fallback-chain promotion (`dot_smmla_…;kstep2` with
+requires="i8mm") waits for the Air tune verdict, same discipline as bias128.
+
+### Slice J RESULTS (2026-07-05, emission M1 Max / silicon M3 Air)
+
+**Shipped as designed**: kgroup axis end-to-end (schema + 7th companion + repack + token
+generic + batch-tail gate + mx4→Q8 expand remap + tune-probe lockstep + KernelBackend cache),
+DOT_SMMLA emitter, kg8 sdot fixup, `g_target_arm64_i8mm`, `GEN_TUNE_COMPILE_ONLY` mint gate.
+M1: emission gates ALL GREEN (tile mr8 = 96 smmla / 0 sdot, mr4 = 48/0; gemv 16 sdot + the
+kg8 fixup folded to **ld2.4s structured de-interleave loads** (7 ld2 + 1 uzp pair = 16
+vectors — better than the predicted 8 uzp pairs, the de-interleave rides the load unit; the
+gate checks the invariant 2·ld2+uzp1+uzp2 == 16); tile body histogram exactly the design
+budget: 96 smmla + 24 zip2.2d + 24 mov.d A-pairs (4/block) + fold). x64 emission gates
+unchanged-green (the emit_block/fold refactor is IR-neutral); suite 204/204 (+4:
+test_kgroup_repack), jit_tests 312/312, gen_tune_probe test grid green with all 5 smmla rows
+declining to ref on M1.
+
+**M3 Air silicon**: grid test — all 5 smmla rows LIVE on kg8 planes, tile maxdiff 0 vs the
+grp4 oracle (kstep2 rows bit-exact), gemv/mx4 in tolerance; the no-linker cache-hit recipe
+worked (one DLL serves test+tune — the grid stamps identically in both modes). Tune table
+(single-core, interleaved best-of-6, no thermal gradient — the ~106 reference rows are flat
+across the run):
+
+| family | tile (n2048 d512 t64) | gemv hot | gemv stream |
+|---|---|---|---|
+| sdot kstep2 (mr4, M1's default) | 159.0 | 85.6 | 59.7 |
+| **sdot kstep2_nrsplit2_mr8 (air winner)** | **162.9** | **91.2** | 59.7 |
+| smmla mr8_kstep2_nrsplit2 (best MMA row) | 130.6 | 84.3 | 59.5 |
+| reference / declined x64 rows | ~106 | ~85.6 | ~59.7 |
+
+**Verdict — M3 runs smmla on ONE NEON pipe.** 130.6 GMAC/s ÷ 32 MACs = 4.08 G MMA/s ≈ 1/cyc
+at the ~4.05 GHz P-core: the tile sits at **100% of the 1-pipe MMA ceiling** (marshalling
+fully hidden — the emitter has nothing left to give), while sdot issues ~2.45/cyc across 4
+pipes. 1 pipe × 32 MACs < 4 pipes × 16 MACs, structurally. The scout's 2.21× was the
+LOAD-BOUND ratio (half the byte traffic per MAC at equal loads), not ALU truth — the tile
+amortizes loads differently and the pipe asymmetry dominates. **No fallback-chain change**
+(sdot keeps arm64; the air box manifest crowned `kstep2_nrsplit2_mr8` — an sdot row). The
+smmla leg stays grid-resident + requires="i8mm"-gated for server arm64 (Neoverse V1/V2 /
+Graviton3+ issue smmla 2-4/cyc — there the same stamp should flip the verdict; the tune
+framework decides per box, which is the whole point).
+
+Air-box operational gotchas recorded in [[dasllama-m3-air-box]]: `modules/dasLLAMA/.das_module`
+is a DOTFILE — a `rsync dir1 dir2` ship misses it and every `dasllama/*` require fails
+"file not found" (ship it explicitly); `-dasroot` doesn't substitute for it.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /

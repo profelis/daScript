@@ -107,9 +107,17 @@ struct private TunePerm {
 // lockstep; that module lives outside this macro context). requires= is an ELIGIBILITY
 // hint for fallback selection only — the generator's own decline predicate remains the
 // emission truth (a stamped-but-declining row still lands on the reference body).
+// arm64 feature names (e.g. "i8mm") ride DAS_JIT_ARM64_FORCE_FEATURES: cpu_supports is
+// x64-cpuid-only (fail-closed on arm), and this is macro context — no LLVM host-features
+// query here — so on aarch64 the env IS the eligibility truth (the same env the emission
+// rail and the DLL cache key read; a native-i8mm box without it still runs smmla via the
+// manifest, which bypasses requires=).
 def private fallback_feature_ok(name : string) : bool {
     if (cpu_supports(name)) return true
     for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")) {
+        if (part == name) return true
+    }
+    for (part in split(get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES"), ",")) {
         if (part == name) return true
     }
     return false
