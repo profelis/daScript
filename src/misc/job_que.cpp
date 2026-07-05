@@ -238,6 +238,7 @@ namespace das {
             lock_guard<mutex> lock(mFifoMutex);
             mShutdown = true;
             mCond.notify_all();
+            mLimitCond.notify_all();   // dormant over-limit workers wait on their own condvar
         }
         while ( mThreadCount ) {
             this_thread::yield();
@@ -360,7 +361,7 @@ namespace das {
             // lower re-parks us dormant.
             if ( limitRank >= mWorkerLimit.load(std::memory_order_relaxed) ) {
                 unique_lock<mutex> lock(mFifoMutex);
-                mCond.wait(lock, [&]() {
+                mLimitCond.wait(lock, [&]() {
                     return mShutdown.load()
                         || limitRank < mWorkerLimit.load(std::memory_order_seq_cst);
                 });
@@ -489,11 +490,10 @@ namespace das {
             // raising re-admits dormant workers — they only ever wake from here (or shutdown).
             // The lock pairs with the dormant wait's predicate read: a worker between its limit
             // check and cond_wait holds mFifoMutex, so this notify can't slip into that window.
-            // In-limit parked workers also wake, re-check their predicates and re-sleep —
-            // transitions are rare, notify_all is fine. Lowering never notifies: workers drift
-            // out at their next spin-loop check (or re-park dormant on their next wake).
+            // Lowering never notifies: workers drift out at their next spin-loop check (or
+            // re-park dormant on their next wake).
             lock_guard<mutex> guard(mFifoMutex);
-            mCond.notify_all();
+            mLimitCond.notify_all();
         }
     }
 

@@ -224,8 +224,14 @@ namespace das {
         // so either the worker sees the new op before sleeping or the publisher sees it parked.
         atomic<int32_t>  mParkedWorkers{0};
         // worker-pool limit (see setWorkerLimit): limit-rank >= this ⇒ dormant. Dormant workers
-        // are deliberately NOT in mParkedWorkers — the publish wake gate must skip them.
+        // are deliberately NOT in mParkedWorkers — the publish wake gate must skip them — and
+        // they park on their OWN condvar: sharing mCond would let a dormant waiter absorb a
+        // push()/wake-propagation notify_one meant for an eligible parked worker (the token is
+        // consumed, the predicate re-sleeps it, the fifo job stalls), and every team-publish
+        // notify_all would kernel-wake the whole dormant pool just to re-sleep it. Only
+        // setWorkerLimit raising the limit (and shutdown) notifies mLimitCond.
         atomic<int32_t>  mWorkerLimit{0x7fffffff};
+        condition_variable mLimitCond;   // dormant workers wait here (under mFifoMutex)
         // worker-limit eligibility order (fixed at construction, DAS_JOBQUE_LIMIT_ORDER=spread):
         // prefix (default) gates on the raw threadIndex; spread ranks workers along a
         // golden-stride visit so every runtime limit L selects a near-uniform lattice over the

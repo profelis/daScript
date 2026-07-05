@@ -9,6 +9,10 @@ require math
 // (seq-bump reuse, stragglers), fifo parallel_for still working while team mode is on, and
 // mode toggling (workers park again after off).
 
+struct private LimitProbe {
+    v : int
+}
+
 def team_sum_round(t : T?; nj, total : int) {
     var results : array<int>
     results |> resize(total)
@@ -195,6 +199,30 @@ def test_jobque_team(t : T?) {
             team_storm(t, 5)
             fifo_sum_round(t, 4, 16)
             set_jobque_team_mode(false)
+        }
+        t |> run("worker limit - a fifo notify must land on an ELIGIBLE worker") @(t : T?) {
+            // regression: dormant workers once shared mCond — a push()'s notify_one could land on
+            // a dormant waiter (predicate false, token consumed, re-sleeps) and the pushed job
+            // stalled with every eligible worker parked. Dormant workers now wait on mLimitCond,
+            // so this must complete promptly: spin 0 parks eligible workers between jobs (the
+            // theft window), and new_job + a blocking channel read has no joiner work-steal to
+            // paper over a lost wake (a regression HANGS here, it does not just slow down).
+            set_jobque_worker_spin(0)
+            set_jobque_worker_limit(2)
+            for (_r in range(20)) {
+                with_channel(1) $(ch) {
+                    new_job() @() {
+                        ch |> push_clone(LimitProbe(v = 42))
+                        ch |> notify_and_release
+                    }
+                    var got = 0
+                    ch |> for_each_clone() $(val : LimitProbe#) {
+                        got = val.v
+                    }
+                    t |> equal(42, got)
+                }
+            }
+            set_jobque_worker_limit(-1)
         }
         t |> run("epoch crossing - back-to-back shape storm") @(t : T?) {
             // production shape (spin window + fork pool, dasLLAMA decode's config)
