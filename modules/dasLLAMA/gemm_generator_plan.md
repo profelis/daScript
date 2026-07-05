@@ -931,6 +931,41 @@ activation quantizer (a bsums plane in RunState next to xq/xs) — saves one re-
 per biased batch matmul and would let a future gen-internal rows core read plane
 corrections instead of inline ones. Only worth it once bias128 proves out on silicon.
 
+## M4 slice H — SPR silicon (2026-07-04 night, AWS c7i.metal-24xl)
+
+Box: Xeon Platinum 8488C metal, 48C/96T, avx512_vnni + avx_vnni + amx_int8, **no
+avx_vnni_int8** (bssd still unproven on silicon — same as the scout VM). Bring-up = the
+EPYC recipe (clang 18, Ninja, DAS_LLVM_DISABLED=OFF), branch tip `b2985e636` via thin
+bundle. The scout's caution about VM absolutes was right in the other direction: metal
+plain busd512-kstep2 is 105.7 GMAC/s where the scout VM said 88.3.
+
+**bias128 first silicon — everything the emission gates predicted, plus margin:**
+
+- **Grid (DAS_TUNE_MODE=test): 35/35 rows, every row maxdiff 0** (tile+gemv+mx4) —
+  first-ever bias128 execution. All five biased rows live+exact; maddubs-bias declines by
+  design; bssd declines per cpuid.
+- **Sweep: biased busd512-kstep2-gkstep2 tile = 157.9 GMAC/s vs 105.7 plain (+49%)** —
+  above the 120-150 prediction. Biased 256 = 120.5 vs 84.6 (+42%). The biased
+  kstep4_nrsplit2@512 diagnostic = 137.0: still loses to kstep2 (weight-stream doubling
+  remains) but by less (−13% vs −17%), exactly the slice H verdict. GEMV hot: 58.3 biased
+  vs 50.1 plain (+16%); stream stays bandwidth-bound ~10.5. Winner
+  `dot_vpdpbusd_width512_mr16_kstep2_gkstep2_bias128` → spr_manifest.json. (The sweep's
+  tile numbers ride the small tune fixture (d=32); real shapes below are higher.)
+- **The first mr16 production stamp caught a real bug:** `q8q8_token_grp_generic`'s
+  scratch was `float[8]` — the batch token tail crashed (`dim index out of range`) at the
+  mr=16 stamp; no prior box ever stamped mr>8 on production slots. Fix = cap 32 (the
+  grid's max stampable mr, busd512-mr32 row), commit `1b4dacddb`. gen_slot_parity_probe
+  caught it exactly as designed (the kernel-level grid was green; the slot layer wasn't).
+- **Post-fix production gates, all green at the biased mr16 stamp:** slot parity 7/7
+  (maxdiff 0 or ~1e-6 fast-math drift, incl. mx4 legs + row/token tails); parity.das
+  GEN_IDS **byte-identical default-vs-stamp on Llama-1B and gpt-oss-20b** (the mx4 biased
+  LUT expand covered).
+- **Registered A/B (gemm_1core, real shapes, 1 core): x64-gen batch 190-200 GMAC/s vs
+  best hand tier avx512vnni 47-49 = 4.0-4.3× on every shape** (kv/qo/w13/w2); hot-shape
+  gemv (kv 2048×512) 84.4 vs 48.8 (+73%); large-d gemv ~30 vs ~28 (DRAM-bound, as
+  expected). The SPR/VNNI hand-tier class (avx512bw/avx512vnni/vnni256*) is now covered
+  on the deletion scoreboard.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /
