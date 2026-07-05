@@ -26,6 +26,7 @@ def private restore_defaults() {
     set_q8_batch_chunks_per_job(4)
     set_jobque_spin_us(30000l)
     set_jobque_join_poll(50l)
+    set_team_rank_gate(-1)
 }
 
 [test]
@@ -39,7 +40,8 @@ def test_runtime_section_applies(t : T?) {
         + "\"attn_par_threshold\":50000,\"requant_par_threshold\":128000,"
         + "\"norm_par_threshold\":128000,\"rope_par_threshold\":50000,\"kv_store_par_threshold\":128000,"
         + "\"act_par_threshold\":50000,\"q8_chunks_per_job\":3,\"q4_chunks_per_job\":5,"
-        + "\"q8_batch_chunks_per_job\":2,\"jobque_spin_us\":1000,\"jobque_join_poll\":10\}\}")
+        + "\"q8_batch_chunks_per_job\":2,\"jobque_spin_us\":1000,\"jobque_join_poll\":10,"
+        + "\"team_rank_gate\":1\}\}")
     t |> success(fwrite(path, js), "profile written")
     apply_box_profile_runtime(path)
     t |> equal(get_q8_token_block(), 256l, "q8_token_block applied")
@@ -58,6 +60,45 @@ def test_runtime_section_applies(t : T?) {
     t |> equal(get_q8_batch_chunks_per_job(), 2, "q8_batch_chunks_per_job applied")
     t |> equal(get_jobque_spin_us(), 1000l, "jobque_spin_us stored")
     t |> equal(get_jobque_join_poll(), 10l, "jobque_join_poll stored")
+    t |> equal(get_team_rank_gate(), 1, "team_rank_gate stored")
+    remove(path)
+    restore_defaults()
+}
+
+[test]
+def test_team_rank_gate_tristate(t : T?) {
+    restore_defaults()
+    var terr = ""
+    let dir = temp_directory(terr)
+    let path = path_join(dir, "dasllama_test_box_profile_gate.json")
+
+    // 0 = force off is a real value (apply_i64_knob fires on v >= 0)
+    t |> success(fwrite(path, "\{\"runtime\":\{\"team_rank_gate\":0\}\}"), "gate-off profile written")
+    apply_box_profile_runtime(path)
+    t |> equal(get_team_rank_gate(), 0, "profile 0 stored (force off)")
+
+    // negative profile value = unset (skipped, same as absent) — the tuner writes -1 on unset boxes
+    set_team_rank_gate(-1)
+    t |> success(fwrite(path, "\{\"runtime\":\{\"team_rank_gate\":-1\}\}"), "unset profile written")
+    apply_box_profile_runtime(path)
+    t |> equal(get_team_rank_gate(), -1, "negative profile value skipped (stays unset)")
+
+    // setup_dasllama_jobque_ lands the stored knob on the live que — unless the env override is
+    // present (the sweep rigs' A/B rail; also how the gate-forced suite run reaches this test)
+    if (!has_env_variable("DAS_JOBQUE_TEAM_RANK_GATE")) {
+        with_job_que() {
+            set_team_rank_gate(1)
+            setup_dasllama_jobque_()
+            t |> success(get_jobque_team_rank_gate(), "profile 1 lands on the que")
+            set_team_rank_gate(0)
+            setup_dasllama_jobque_()
+            t |> success(!get_jobque_team_rank_gate(), "profile 0 lands on the que")
+            set_jobque_team_rank_gate(true)   // unset must leave whatever the que already has
+            set_team_rank_gate(-1)
+            setup_dasllama_jobque_()
+            t |> success(get_jobque_team_rank_gate(), "unset leaves the que state alone")
+        }
+    }
     remove(path)
     restore_defaults()
 }

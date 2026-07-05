@@ -3,6 +3,7 @@ options gen2
 module dasllama_math shared public
 
 require math
+require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses the profile's team_rank_gate knob
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
 require dasllama/dasllama_tune  // [tuned]: reconstitute dot from dot_template with per-box loop hints
@@ -129,6 +130,18 @@ var g_dispatch_worker_limit = 0
 def public set_dispatch_worker_limit(v : int) { g_dispatch_worker_limit = max(v, 0) }
 def public get_dispatch_worker_limit() : int { return g_dispatch_worker_limit }
 
+// Per-op team rank gate (JobQue::setTeamRankGate — each team op admits only as many workers as
+// its widest stage published chunks; gated ranks keep spinning, re-admitted by the next big op).
+// The other tiny-model dial, and it composes with full lanes: 135M T=48 emit +10% zen2 / +48% SPR,
+// >=1B neutral on both. Server-core boxes want it ON; heterogeneous P/E boxes (M1) keep it off —
+// rank-static admission wobbles when low ranks land on slow cores. Tri-state: -1 = leave the
+// que's default (the DAS_JOBQUE_TEAM_RANK_GATE env read at creation), 0 = force off, 1 = force on.
+// Applied by setup_dasllama_jobque_ (needs a live que); an explicit DAS_JOBQUE_TEAM_RANK_GATE
+// env always wins over the profile (the A/B rail the sweep rigs use).
+var g_team_rank_gate = -1
+def public set_team_rank_gate(v : int) { g_team_rank_gate = clamp(v, -1, 1) }
+def public get_team_rank_gate() : int { return g_team_rank_gate }
+
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
 //! batched dispatch, the spin-before-park window (box_profile.json "runtime" `jobque_spin_us`
 //! overrides the shipped 30000us; 0 disables the spin), and the join-poll level ("jobque_join_poll",
@@ -146,6 +159,9 @@ def setup_dasllama_jobque_() {
     set_jobque_worker_spin(int(min(g_jobque_spin_us, 2147483647l)))
     set_jobque_join_spin(int(min(g_jobque_join_poll, 2147483647l)))
     set_jobque_worker_limit(g_dispatch_worker_limit > 0 ? g_dispatch_worker_limit : -1)   // -1 = unlimited
+    if (g_team_rank_gate >= 0 && !has_env_variable("DAS_JOBQUE_TEAM_RANK_GATE")) {
+        set_jobque_team_rank_gate(g_team_rank_gate != 0)
+    }
 }
 
 // dasLLAMA matmuls are lockstep linear algebra: SMT siblings share the FMA/load ports, so the

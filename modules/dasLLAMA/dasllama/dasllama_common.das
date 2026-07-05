@@ -1405,6 +1405,7 @@ def apply_box_profile_runtime(path : string = "") {
     // stored only — the queue may not exist yet; setup_dasllama_jobque applies these inside with_job_que
     apply_i64_knob(rt, "jobque_spin_us") $(v) { set_jobque_spin_us(v) }
     apply_i64_knob(rt, "jobque_join_poll") $(v) { set_jobque_join_poll(v) }
+    apply_i64_knob(rt, "team_rank_gate") $(v) { set_team_rank_gate(int(min(v, 1l))) }
     let be = read_json_field(rt, "backend", "")
     if (be != "") {
         pin_kernel_backend(be)   // warns and keeps the current backend if the name is unknown
