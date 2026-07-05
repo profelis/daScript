@@ -66,9 +66,9 @@ struct public SqlProviderInfo {
 var private g_sql_providers : array<SqlProviderInfo>
 
 def public sql_register_present_providers_done : bool {
-    //! True once a provider registration pass ran in this macro context — the
-    //! `sql_register_present_providers` aggregator (daslib/sql_boost) checks it
-    //! so twin `[_macro]`s in multiple consulting modules stay idempotent.
+    //! True once at least one provider is registered in this macro context — the
+    //! `sql_register_present_providers` aggregator (daslib/sql_boost) checks it so twin
+    //! `[_macro]`s stay idempotent (a pass that found no providers re-runs harmlessly).
     return !empty(g_sql_providers)
 }
 
