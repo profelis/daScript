@@ -103,12 +103,22 @@ def test_bitwise_identities(t : T?) {
 [test]
 def test_bool_identities(t : T?) {
     t |> run("const arms fold") @(t : T?) {
+        // both values of g_b — with only g_b==true, a fold that wrongly rewrote
+        // `b && true` to constant `true` would pass undetected
         t |> equal(g_b && true, true)
         t |> equal(g_b && false, false)
         t |> equal(g_b || false, true)
         t |> equal(g_b || true, true)
         t |> equal(true && g_b, true)
         t |> equal(false || g_b, true)
+        g_b = false
+        t |> equal(g_b && true, false)
+        t |> equal(g_b && false, false)
+        t |> equal(g_b || false, false)
+        t |> equal(g_b || true, true)
+        t |> equal(true && g_b, false)
+        t |> equal(false || g_b, false)
+        g_b = true
     }
     t |> run("short-circuit never evaluates right of const-false") @(t : T?) {
         g_calls = 0
