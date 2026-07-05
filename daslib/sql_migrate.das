@@ -152,7 +152,8 @@ let private ADOPTION_HINT = "this DB has existing tables/views/indexes but __sch
 
 def private _scalar_int_or_zero(db; sql : string) : int {
     // Treats query failure (e.g. "no such table") as 0 — natural default for COUNT/MAX probes.
-    let r = db |> _::try_query_scalar(sql, type<int>)
+    // Routed through the glue: the raw query* family is provider-specific, not a contract rail.
+    let r = db |> _::_migration_query_int(sql)
     return (r |> is_ok) ? (r |> unwrap) : 0
 }
 
@@ -320,7 +321,7 @@ def try_current_schema_version(db) : Result<int, string> {
     let exists <- _::_migration_audit_exists(db)
     if (exists |> is_err) return err(exists |> unwrap_err, type<int>)
     if (!(exists |> unwrap)) return ok(0, type<string>)
-    return <- db |> _::try_query_scalar("SELECT COALESCE(MAX(version), 0) FROM __schema_version", type<int>)
+    return <- db |> _::_migration_query_int("SELECT COALESCE(MAX(version), 0) FROM __schema_version")
 }
 
 def try_pending_migrations(db) : Result<array<PendingMigration>, string> {

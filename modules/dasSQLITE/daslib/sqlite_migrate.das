@@ -46,6 +46,12 @@ def _migration_end(db : SqlRunner) : void {
     //! No-op: the write lock is released with COMMIT/ROLLBACK.
 }
 
+def _migration_query_int(db : SqlRunner; sql : string) : Result<int, string> {
+    //! One-int-result query rail for the engine's COUNT/MAX probes (the raw ``query*``
+    //! family is provider-specific, so the engine can't call it unqualified).
+    return <- db |> try_query_scalar(sql, type<int>)
+}
+
 def _migration_audit_exists(db : SqlRunner) : Result<bool, string> {
     //! Catalog probe for ``__schema_version``. sqlite_master itself never reports
     //! "no such table"; transient errors here propagate.

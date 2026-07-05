@@ -13,9 +13,17 @@ require _conformance_provider
 
 // ===== registered migrations (program-global registry, fresh DB per test) =====
 
+// Current shape of conf_m1 — used only to READ BACK what the migrations did
+// (the bodies themselves use raw DDL, as real early migrations must).
+[sql_table(name = "conf_m1")]
+struct private ConfM1 {
+    @sql_primary_key Id : int
+    X : int
+}
+
 [sql_migration(version = 1, description = "create conf_m1")]
 def private conf_migration_v1(db : SqlRunner) {
-    db |> exec("CREATE TABLE conf_m1 (x INTEGER)")
+    db |> exec("CREATE TABLE conf_m1 (Id INTEGER PRIMARY KEY, X INTEGER)")
 }
 
 [sql_migration(version = 2, description = "create conf_m2")]
@@ -25,7 +33,7 @@ def private conf_migration_v2(db : SqlRunner) {
 
 [sql_migration(version = 3, description = "seed conf_m1")]
 def private conf_migration_v3(db : SqlRunner) {
-    db |> exec("INSERT INTO conf_m1 (x) VALUES (?)", 42)
+    db |> exec("INSERT INTO conf_m1 (Id, X) VALUES (?, ?)", 1, 42)
 }
 
 // v4 is benign by default; the failure-rollback test flips the flag for one run.
@@ -44,7 +52,7 @@ def test_conf_migrate_apply(t : T?) {
         with_conf_db() $(db) {
             t |> equal(db |> migrate_to_latest(), 4)
             t |> equal(db |> current_schema_version(), 4)
-            t |> equal(db |> query_scalar("SELECT x FROM conf_m1", type<int>), 42)
+            t |> equal(_sql(db |> select_from(type<ConfM1>) |> _first()).X, 42)
             // second run: nothing pending, applies 0
             t |> equal(db |> migrate_to_latest(), 0)
             t |> equal(db |> current_schema_version(), 4)

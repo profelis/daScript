@@ -137,6 +137,7 @@ generics via `_::`:
 | `_migration_stream_key(db)` | `"sqlite_boost::SqlRunner"` | MUST equal the annotation's derived key — registry `(runnerModule, runnerStruct)` identity |
 | `_migration_begin(db, blocking)` | `BEGIN IMMEDIATE` | takes the provider's migration lock + opens the txn. PostgreSQL: session advisory lock (`pg_advisory_lock` when `blocking`, `pg_try_advisory_lock` fail-fast otherwise — `migrate_to_latest` blocks, `try_migrate_to_latest` fails fast), then `BEGIN`. DuckDB: plain `BEGIN` (single-writer engine locks for us) |
 | `_migration_end(db)` | no-op | releases the lock after COMMIT/ROLLBACK (PostgreSQL: `pg_advisory_unlock`; session locks auto-release on crash/disconnect) |
+| `_migration_query_int(db, sql)` | `try_query_scalar` | `Result<int, string>` one-int-result rail for the engine's COUNT/MAX probes (the raw `query*` family is provider-specific, so the engine can't call it) |
 | `_migration_audit_exists(db)` | `sqlite_master` probe | `Result<bool, string>` — `information_schema.tables` on PostgreSQL/DuckDB |
 | `_migration_has_user_objects(db)` | `sqlite_master` count | drives the adoption hint |
 | `_migration_history_rows(db)` | native stmt rail | reads `__schema_version` into `array<MigrationRecord>` |
