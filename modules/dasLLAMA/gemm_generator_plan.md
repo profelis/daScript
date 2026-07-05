@@ -1027,6 +1027,70 @@ manifest stamp, vs the same lcpp-AMX build, prefill AND emit per cell:
 - Raw logs + results page archived Mac-side; sweep rig `~/spr_sweep.sh` baked into the box
   home dir (survives in the next AMI if re-baked). gemma-4-12B / Qwen1.5-MoE GGUFs could
   not be re-fetched byte-exact — provenance hunt is a prerequisite before the AMX session.
+  (RESOLVED 2026-07-05: bartowski/gemma-4-12B-it-GGUF + RichardErkhov/Qwen_-_Qwen1.5-MoE-
+  A2.7B-Chat-gguf, both HEAD-verified byte-exact — the fetches lived in the wave3-gemma4
+  worktree session transcripts.)
+
+## M4 slice I — the AMX tile family (DESIGN, 2026-07-05, off-box)
+
+**Slot scope: the batch tile only.** Scout verdict stands — TMUL is a prefill/batch family
+(reg-resident 3546 GMAC/s = 22× the biased-busd512 tier; 196 GMAC/s at DRAM zero-reuse =
+GEMV break-even). gemv/mm_rows slots stay vector.
+
+**The layout is already ours.** TDPBSSD wants B[k-group][4·n+j] (VNNI 4-byte interleave) —
+that is byte-for-byte the `grp<mr>` plane at mr=16: `repack_q8q8_grp` writes
+`[kg][r][4 bytes]` per row-group, so one 32-k block's 8 k-groups are a contiguous 512-byte
+region per group (`tileloadd64(rows=8, colsb=64, ptr=gbase + b·512, stride=64)`). ZERO new
+repack. The A side tile-loads straight off the activation plane
+(`tileloadd64(rows=ntok_tile, colsb=32, xqp + t0·n + b·32, stride=n)`) — no activation
+repack either. AMX is s8·s8 native: **wbias must be 0** (no sign trick to delete; bias128
+is busd-only).
+
+**Per-block scale fold (the Q8_0 constraint).** Q8's fp32 scale is per 32-k block, so C
+cannot accumulate i32 across blocks. K-step = ONE block (A colsb=32, B 8×64): per block,
+`tdpbssd` then fold `C_i32 → acc_f32` with the rank-1 scale product (per token row t:
+`acc[t][·] += cvt(C[t][·]) · (xs[t][b] ⊗ ws_vec[b])`; ws is already block-interleaved
+mr-contiguous in the grp plane's scale region — one zmm load). Fold cost ≈ 1KB tilestored +
+16 zmm FMAs per C tile per block vs 8192 MACs — ~3-6%. This is the same structure lcpp's
+amx path uses. `tilezero` re-arms C. (Deferred fold via kstep>1 is unsound across scale
+boundaries — kstep stays 1 in perm terms.)
+
+**Macro-kernel = 2×2 tiles, exactly 8 tmm.** A0,A1 (two 16-token tiles) × B0,B1 (two
+adjacent grp16 row-groups, plane offset +16·n) → C00..C11: 4 tdpbssd per 2A+2B loads —
+double weight-tile reuse, 32 tok × 32 rows per k-block. Perm mapping: `dot="amx_int8"`,
+mr=16 (the layout), nrsplit=2 ≙ row-group count, kstep=1 pinned; declines = new cpuid tier
+`amx_int8` (leaf-7 EDX bits 24/25 tile+int8) + geometry (probe fixtures need ntok≥32 rows
+d≥32). Token/row tails ride the existing generic tail machinery (scratch cap 32 holds:
+token tail is per-16-token slabs).
+
+**Enable is part of the witness.** `q8q8_family_live()` for an amx stamp: cpuid amx_int8
+AND `arch_prctl(0x1023, 18) == 0` — call libc's `arch_prctl` as a JIT-resolved external
+symbol (Linux-only by construction; anything else declines). Zero C++ holds:
+`LLVMX86AMXTypeInContext` is bound (bindings/llvm_func.das:374), intrinsics by name via
+`LLVMLookupIntrinsicID` (`llvm.x86.tileloadd64.internal`, `tdpbssd.internal`,
+`tilestored64.internal`, `tilezero.internal`); the `.internal` forms use virtual tile
+values — LLVM's X86 codegen-prep (x86-lower-amx-type + fast tile config) inserts
+`ldtilecfg` itself under `+amx-tile,+amx-int8`. (Assumption to re-verify at emission: the
+dasLLVM JIT pipeline runs codegen-prep exactly like llc — the scout numbers suggest yes.)
+
+**The one real design fork — the plane bias conflict.** One backend = one repack: an amx
+stamp needs the grp plane UNBIASED, but the current SPR winner biases it for the busd512
+gemv (`gkstep2_bias128`). The batch-backend hybrid can't bridge it (biased vs plain planes
+are layout-INcompatible donors). Resolution candidates, in order: (a) amx backend owns the
+box with plain plane + sign-trick busd512 gemv — costs nothing IF SPR gemv is truly
+bandwidth-bound (biased-vs-plain GEMV delta on SPR = **the first measurement of the AMX
+session**, the slice-H logs have both rows); (b) per-slot wbias (grp plane biased, a
+second UNBIASED grp16 copy of only the batch-hot tensors — memory cost); (c) per-slot
+perms manifest split (ledger 5 — AMX is its forcing function either way).
+
+**Emission gates (M1, before any silicon):** `--jit-target=x86_64-…` +
+`DAS_JIT_X64_FORCE_FEATURES=+amx-int8,+amx-tile` → llc/objdump gates in
+`gen_x64_emission_check.sh`: per-block loop = 1 tileloadd(A) + 1 tileloadd(B, cached across
+token tiles) + tdpbssd count = tiles, 1 tilestored + 16 vcvtdq2ps/vfmadd per C per block,
+ldtilecfg present once per kernel entry, ZERO vpsignb/vpabsb anywhere in the tile body.
+Grid rows: amx 1×1 (probe shape) + 2×2, decline-by-design everywhere off-SPR; semantics +
+tune sweep = the AMX respin session (prereq GGUFs now resolved, see above; chase target =
+lcpp-AMX 135M prefill 13.3k t/s cache-resident).
 
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
