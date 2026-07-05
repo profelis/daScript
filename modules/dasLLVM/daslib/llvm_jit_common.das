@@ -1087,7 +1087,16 @@ def public with_default_target_machine(opt_level : uint; use_host_cpu : bool;
     // than trusting CPU-name recognition. (Verified: -mcpu=generic fails to select
     // SDOT; -mcpu=generic -mattr=+dotprod emits `sdot.4s`.)
     if (use_host_cpu && g_target_is_aarch64) {
-        let feats = empty(features_msg) ? "+dotprod" : "{features_msg},+dotprod"
+        var feats = empty(features_msg) ? "+dotprod" : "{features_msg},+dotprod"
+        // DAS_JIT_ARM64_FORCE_FEATURES (comma-separated aarch64 feature names, e.g. "i8mm"): the
+        // x64 rail's twin — lets a pre-i8mm host EMIT AND LINK an artifact for newer silicon (the
+        // DLL-cache key folds the string, so a forced artifact never cache-hits a normal run, and
+        // the same-env run on the target box cache-hits it without needing a linker there).
+        // Executing forced instructions on this host SIGILLs — pair with a skip-execution gate.
+        let forced_arm <- [for (part in split(get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES"), ",")); "+{part}"; where !empty(part)]
+        if (!empty(forced_arm)) {
+            feats = "{feats},{join(forced_arm, ",")}"
+        }
         with_target_machine(triple_msg, cpu_msg, feats, opt_level, blk)
     } elif (use_host_cpu && g_target_is_x64 && !empty(x64_forced_plus_features())) {
         // DAS_JIT_X64_FORCE_FEATURES emission-only override (see the g_target_x64_* declaration

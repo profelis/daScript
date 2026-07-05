@@ -185,6 +185,12 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
     if (!empty(forced)) {
         h = (h ^ hash(forced)) * JIT_FNV_PRIME
     }
+    // the aarch64 twin (DAS_JIT_ARM64_FORCE_FEATURES, e.g. "i8mm"): a forced artifact must never
+    // cache-hit a normal run — and the same-env run on the TARGET box must hit it exactly
+    let forced_arm = get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES")
+    if (!empty(forced_arm)) {
+        h = (h ^ hash(forced_arm)) * JIT_FNV_PRIME
+    }
     // Cross-compile artifacts key on their triple: a --jit-target DLL must never
     // cache-hit a host run of the same program (dlopen of a foreign-arch DLL), and
     // vice versa.
