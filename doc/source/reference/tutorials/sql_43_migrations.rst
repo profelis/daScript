@@ -29,9 +29,13 @@ Three rules make this work:
    invisible to existing DBs and silent divergence between fresh
    and existing DBs is the result. So: don't edit, add.
 
-2. **Versions are unique across the whole program.** Two devs
-   picking ``version=N`` on parallel branches is a compile-time
-   error --- the macro scans every loaded module's
+2. **Versions are unique per provider stream.** The migration
+   body's runner parameter type picks the stream --- in this
+   SQLite-only program that means unique across the whole
+   program, while a program also carrying PostgreSQL migrations
+   numbers that stream independently. Two devs picking
+   ``version=N`` on parallel branches (same runner type) is a
+   compile-time error --- the macro scans every loaded module's
    ``[sql_migration]`` annotations and refuses the dup. The
    error message names both function names + both module paths,
    and a runtime belt-and-suspenders check guards against any

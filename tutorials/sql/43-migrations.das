@@ -13,8 +13,10 @@ options gen2
 //
 //   1. Migrations are append-only. Once shipped, a migration is FROZEN —
 //      to change anything, write a new one with a higher version number.
-//   2. Versions are unique across the whole program. Two devs picking
-//      `version=N` on parallel branches is a compile-time error.
+//   2. Versions are unique per provider stream — the runner type of the
+//      migration body picks the stream, so in this SQLite-only program that
+//      means unique across the whole program. Two devs picking `version=N`
+//      on parallel branches is a compile-time error.
 //   3. The runner uses one transaction per call. If any migration fails,
 //      every effect rolls back — re-run replays the whole pending list.
 //

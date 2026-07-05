@@ -116,9 +116,35 @@ repo copies the suite directory and swaps the shim (see the suite's README.md).
 
 ## Migrations
 
-`[sql_migration]` + the `migrate_to_latest` runner stay provider-side
-(`sqlite/sqlite_migrate`) for now: the registry stores typed
-`function<(db : SqlRunner) : void>` body pointers, and the runner is dialect-flavored
-(`BEGIN IMMEDIATE`, `sqlite_master` probes, `unixepoch()`, post-commit VACUUM/ANALYZE).
-The neutral shape (type-erased or per-provider-partitioned registry, per-provider
-locking strategy — PG wants advisory locks) gets designed against the PostgreSQL port.
+`[sql_migration]`, the `migrate_to_latest` runner family, `baseline`, and the
+`[struct_convert]` / `convert_and_rename` rebuild rail live in the neutral
+`daslib/sql_migrate`. The registry is **partitioned into per-provider streams keyed by
+the migration body's runner parameter type** — the annotation derives the stream key
+`"<runnerModule>::<RunnerStruct>"` from the parameter, and validates the type against
+the provider registry. Version uniqueness is checked **per stream** (a PostgreSQL v2
+and a SQLite v2 coexist), both at compile time (cross-module annotation scan, grouped
+by stream) and at runtime (per-stream dup panic). Bodies are stored type-erased
+(`MigrationBodyCarrier`); the glue re-types them on invocation.
+
+A provider ships a small glue module (`sqlite/sqlite_migrate` is the in-tree
+reference; `duckdb/duckdb_migrate`, `postgres/postgres_migrate` external) that
+`require daslib/sql_migrate public` (re-export keeps the one-require surface) and
+implements the hook contract, dispatched on the runner type from the engine's
+generics via `_::`:
+
+| Hook | SQLite reference | Notes |
+|---|---|---|
+| `_migration_stream_key(db)` | `"sqlite_boost::SqlRunner"` | MUST equal the annotation's derived key — registry `(runnerModule, runnerStruct)` identity |
+| `_migration_begin(db, blocking)` | `BEGIN IMMEDIATE` | takes the provider's migration lock + opens the txn, **all-or-nothing**: on `err` the glue must hold NOTHING — a glue that locks and then fails to `BEGIN` releases its own lock before returning (the engine's error return never calls `_migration_end`). PostgreSQL: session advisory lock (`pg_advisory_lock` when `blocking`, `pg_try_advisory_lock` fail-fast otherwise — `migrate_to_latest` blocks, `try_migrate_to_latest` fails fast), then `BEGIN`, unlocking internally if `BEGIN` fails. DuckDB: plain `BEGIN` (single-writer engine locks for us) |
+| `_migration_end(db)` | no-op | releases the lock after COMMIT/ROLLBACK (PostgreSQL: `pg_advisory_unlock`; session locks auto-release on crash/disconnect) |
+| `_migration_query_int(db, sql)` | `try_query_scalar` | `Result<int, string>` one-int-result rail for the engine's COUNT/MAX probes (the raw `query*` family is provider-specific, so the engine can't call it) |
+| `_migration_audit_exists(db)` | `sqlite_master` probe | `Result<bool, string>` — `information_schema.tables` on PostgreSQL/DuckDB |
+| `_migration_has_user_objects(db)` | `sqlite_master` count | drives the adoption hint |
+| `_migration_history_rows(db)` | native stmt rail | reads `__schema_version` into `array<MigrationRecord>` |
+| `_migration_invoke_body(db, body)` | reinterpret + invoke | re-types the erased body to `function<(db : <Runner>) : void>` |
+
+Engine SQL is portable by construction: the audit table uses `BIGINT` for
+`applied_at` and the INSERT binds the epoch client-side (`int64(get_clock())` — no
+`unixepoch()` / `EXTRACT(EPOCH ...)` divergence), and COMMIT/ROLLBACK/COALESCE/COUNT
+are universal. Post-commit `VACUUM` / `ANALYZE` remain warnings-only.
+`tests/sql_conformance/test_conf_migrations.das` exercises the contract.

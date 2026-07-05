@@ -10,6 +10,9 @@ rewrites only the shim:
 - `with_conf_db(blk)` — scoped fresh empty database over the provider's runner type
 - `CONF_PROVIDER_NAME` / `CONF_HAS_*` capability constants mirroring the provider's
   `SqlProviderCaps` registry entry
+- a public require of the provider's migration glue module (in-tree:
+  `sqlite/sqlite_migrate`) so `test_conf_migrations.das` sees the runner's
+  `[sql_migration]` stream and the `migrate_to_latest` family
 
 ## Capability skip policy
 
@@ -35,6 +38,7 @@ rewrites only the shim:
 | `test_conf_views.das` | [sql_view] + _create_view (captured locals inline via to_sql_literal) |
 | `test_conf_fts5.das` | [sql_fts5] + text_match — file-gated on caps.fts5 |
 | `test_conf_sql_functions.das` | [sql_function] UDF visible to chains — file-gated on caps.client_udfs |
+| `test_conf_migrations.das` | [sql_migration] per-stream apply/idempotence/pending/history, baseline adoption, failure rollback, [struct_convert] + convert_and_rename rebuild |
 
 Deep provider-specific behavior stays in the provider's own suite (`tests/dasSQLITE/`,
 904 tests for SQLite) — this suite asserts the shared contract, not exhaustive behavior.

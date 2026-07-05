@@ -1,6 +1,6 @@
 # SQL — daslib/sql_linq + providers (dasSQLITE / dasDuckDB / dasPostgreSQL)
 
-Read this skill before writing or editing any `.das` code that talks to a SQL database. The companion tutorials live under [tutorials/sql/](../tutorials/sql/) (45 files, numbered by teaching order — `01-version.das` through `44-in_not_in_collections.das`, plus `12b-set_ops.das`); read the relevant ones for runnable examples of every pattern below. Implementation: the provider-neutral core is [daslib/sql_boost.das](../daslib/sql_boost.das) (`[sql_table]` / `[sql_view]` / `[sql_index]` macros, `add_column` / `create_index` ALTER macros, the `sql_bind`/`sql_extract` adapter rail) and [daslib/sql_linq.das](../daslib/sql_linq.das) (the `_sql(...)` family of call macros), routed through the provider registry in [daslib/sql_provider.das](../daslib/sql_provider.das). The SQLite provider is [modules/dasSQLITE/daslib/sqlite_boost.das](../modules/dasSQLITE/daslib/sqlite_boost.das) (`SqlRunner`, exec/query runtime, runner helpers, `[sql_fts5]` / `[sql_function]`) plus the registration shim [sqlite_provider.das](../modules/dasSQLITE/daslib/sqlite_provider.das); [sqlite_migrate.das](../modules/dasSQLITE/daslib/sqlite_migrate.das) carries `[sql_migration]` + the `migrate_to_latest` runner. Design notes, decision logs, and the deferred-feature list live next to the provider in [modules/dasSQLITE/API_REWORK.md](../modules/dasSQLITE/API_REWORK.md), [PROVIDER_CONTRACT.md](../modules/dasSQLITE/PROVIDER_CONTRACT.md), [TUTORIALS.md](../modules/dasSQLITE/TUTORIALS.md), and [API_MIGRATION.md](../modules/dasSQLITE/API_MIGRATION.md).
+Read this skill before writing or editing any `.das` code that talks to a SQL database. The companion tutorials live under [tutorials/sql/](../tutorials/sql/) (45 files, numbered by teaching order — `01-version.das` through `44-in_not_in_collections.das`, plus `12b-set_ops.das`); read the relevant ones for runnable examples of every pattern below. Implementation: the provider-neutral core is [daslib/sql_boost.das](../daslib/sql_boost.das) (`[sql_table]` / `[sql_view]` / `[sql_index]` macros, `add_column` / `create_index` ALTER macros, the `sql_bind`/`sql_extract` adapter rail) and [daslib/sql_linq.das](../daslib/sql_linq.das) (the `_sql(...)` family of call macros), routed through the provider registry in [daslib/sql_provider.das](../daslib/sql_provider.das). The SQLite provider is [modules/dasSQLITE/daslib/sqlite_boost.das](../modules/dasSQLITE/daslib/sqlite_boost.das) (`SqlRunner`, exec/query runtime, runner helpers, `[sql_fts5]`) plus the registration shim [sqlite_provider.das](../modules/dasSQLITE/daslib/sqlite_provider.das); the `[sql_function]` annotation is provider-neutral (in `daslib/sql_boost`), and migrations (`[sql_migration]` + the `migrate_to_latest` runner + `[struct_convert]`) live in the neutral [daslib/sql_migrate.das](../daslib/sql_migrate.das) with per-provider glue ([sqlite_migrate.das](../modules/dasSQLITE/daslib/sqlite_migrate.das) re-exports it). Design notes, decision logs, and the deferred-feature list live next to the provider in [modules/dasSQLITE/API_REWORK.md](../modules/dasSQLITE/API_REWORK.md), [PROVIDER_CONTRACT.md](../modules/dasSQLITE/PROVIDER_CONTRACT.md), [TUTORIALS.md](../modules/dasSQLITE/TUTORIALS.md), and [API_MIGRATION.md](../modules/dasSQLITE/API_MIGRATION.md).
 
 Three backends implement the provider contract: in-tree **SQLite** (the reference), and the external **[dasDuckDB](https://github.com/borisbat/dasDuckDB)** and **[dasPostgreSQL](https://github.com/borisbat/dasPostgreSQL)** repos (each carries its own CLAUDE.md with dialect divergences). The macro layer (`daslib/sql_boost` + `daslib/sql_linq`) is provider-neutral; everything runner- or dialect-specific lives in the provider's module and its registry entry. This skill's examples are written against SQLite; the `_sql` chain surface is identical across providers — swap the runner (`with_sqlite` / `with_duckdb` / `with_postgres`) and the require lines.
 
@@ -13,7 +13,7 @@ Three backends implement the provider contract: in-tree **SQLite** (the referenc
 | `[sql_fts5]` / `text_match` | ✓ | compile error | compile error |
 | `[sql_function]` UDFs | ✓ | ✓ | compile error (no client-side UDFs) |
 | `_distinct_by` lowering | bare-aggregate `GROUP BY` | `DISTINCT ON` | `DISTINCT ON` |
-| Migrations module | `sqlite/sqlite_migrate` | — (v1 shipped without) | — (v1 shipped without) |
+| Migrations glue | `sqlite/sqlite_migrate` | `duckdb/duckdb_migrate` | `postgres/postgres_migrate` (advisory-lock coordination) |
 | PRAGMA / VACUUM / ATTACH / backup | ✓ (SQLite-specific surface) | engine-specific via `exec` | engine-specific via `exec` |
 
 Capability gates are **compile-time** `macro_error`s naming the provider (`caps` bitfield in the registry — see [PROVIDER_CONTRACT.md](../modules/dasSQLITE/PROVIDER_CONTRACT.md)). Everything else — `[sql_table]` DDL, insert-returns-pk, upsert, transactions (nested composes on all three), placeholder style — is handled per-provider under the same surface; user code doesn't change.
@@ -483,7 +483,7 @@ v1 limitations: self-contained mode only (FTS5 holds both content and index); UP
 
 ## User-defined SQL functions — `register_function` / `[sql_function]` (`caps.client_udfs`)
 
-SQLite and DuckDB only — PostgreSQL has no client-side UDFs, so `[sql_function]` use against a PG runner is a compile-time error. Each supporting provider ships its own `[sql_function]` annotation (in `sqlite_boost` / `duckdb_boost`).
+SQLite and DuckDB only — PostgreSQL has no client-side UDFs, so `[sql_function]` use in a chain against a PG runner is a compile-time error (`caps.client_udfs` gate). The annotation itself is provider-neutral (ONE `[sql_function]` in `daslib/sql_boost`): a tagged function lands in a type-erased queue that every UDF-capable provider replays against each connection it opens — tag once, visible on SQLite and DuckDB connections alike.
 
 Two flavors. Per-connection `register_function` for explicit one-off registration; `[sql_function]` annotation for auto-registration on every open + chain visibility.
 
@@ -513,13 +513,20 @@ let strong <- _sql(db |> select_from(type<Enemy>)
 - `deterministic=true` → `SQLITE_DETERMINISTIC` (allows the fn in `CREATE INDEX … ON tbl(myfn(col))` and lets the planner factor it out of inner loops)
 - `directonly=true` → `SQLITE_DIRECTONLY` (blocks invocation from triggers / views / CHECK constraints)
 
-**`[sql_function]` install**: the annotation queues a thunk into a global registry; `try_open_sqlite` / `open_sqlite` / `with_sqlite` install every thunk against the new connection. Duplicate `(name, arity)` registration across modules → install-time `SqlError`. Manual `register_function` after open overrides the registry's binding.
+**`[sql_function]` install**: the annotation queues an entry into the neutral `daslib/sql_boost` registry; every UDF-capable provider's open path (`try_open_sqlite` / `with_sqlite`, `with_duckdb`, …) installs every entry against the new connection. Duplicate `(name, arity)` registration across modules → install-time `SqlError`. Manual `register_function` after open overrides the registry's binding.
 
 `[sql_function]` is the right shape for ambient SQL helpers that should be visible to chain analysis everywhere; `register_function` is for one-off / per-connection registrations.
 
-## Migrations — `sqlite/sqlite_migrate` (SQLite-only for now)
+## Migrations — `daslib/sql_migrate` + per-provider glue
 
-Versioned, append-only schema evolution. Optional sub-module — `require sqlite/sqlite_migrate` only when needed. DuckDB and PostgreSQL shipped v1 without a migrations module; the provider-neutral shape (advisory-lock coordination on PG) is an open design item — see PROVIDER_CONTRACT.md §Migrations.
+Versioned, append-only schema evolution, provider-neutral. The engine and the
+`[sql_migration]` / `[struct_convert]` annotations live in `daslib/sql_migrate`; each
+provider ships a glue module that re-exports it — require the glue, never the engine
+directly: `sqlite/sqlite_migrate`, `duckdb/duckdb_migrate`, or `postgres/postgres_migrate`
+(see PROVIDER_CONTRACT.md §Migrations for the glue hook contract). Optional — only require
+it when the app uses versioned migrations. The migration body's runner parameter type
+selects the provider **stream**: versions are unique per stream, so SQLite and PostgreSQL
+migration sets number independently in one program.
 
 ```das
 require sqlite/sqlite_migrate
@@ -561,9 +568,9 @@ def main() : int {
 ### The five rules
 
 1. **Append-only.** Once shipped, a migration is FROZEN. Never edit `migration_002` after release — write `migration_003` that does the additional change. The mechanism: a user whose DB is already at v2 will never re-execute v2 on their machine; edits to v2 wouldn't reach existing users.
-2. **Versions are program-global unique.** Two devs picking `version=2` on parallel branches is a **compile-time error** — the macro tracks a global `[sql_migration]` registry across modules. Resolution: renumber the later branch.
+2. **Versions are unique per provider stream.** Two devs picking `version=2` on parallel branches (for the same runner type) is a **compile-time error** — the macro scans the `[sql_migration]` registry across modules, grouped by the body's runner type. Resolution: renumber the later branch. Migrations for *different* providers (e.g. `db : SqlRunner` from sqlite_boost vs postgres_boost) live in separate streams and may share version numbers.
 3. **Strict-forward pending detection.** Pending = registered versions where `version > MAX(applied)`. Set-difference (EF-style) is **not** how this works.
-4. **One transaction per call (α-shape).** All pending migrations + their audit inserts share one `BEGIN IMMEDIATE / COMMIT`. If any migration fails, the whole call rolls back — re-run replays the entire pending list. Implication: prior successful migrations in the same call get rolled back too. Long-running backfills should live in their own `migrate_to_latest` invocation if replay cost matters.
+4. **One transaction per call (α-shape).** All pending migrations + their audit inserts share one transaction (SQLite: `BEGIN IMMEDIATE`; PostgreSQL: session advisory lock + `BEGIN`; DuckDB: `BEGIN`). If any migration fails, the whole call rolls back — re-run replays the entire pending list. Implication: prior successful migrations in the same call get rolled back too. Long-running backfills should live in their own `migrate_to_latest` invocation if replay cost matters.
 5. **Body is plain daslang.** Raw `db |> exec(...)`, typed DDL (`add_column` / `create_index` / `drop_index_if_exists` / `create_table` / `drop_table_if_exists`), typed DML (`_sql_update` / `insert` / `_sql_upsert` / etc.), reads (`_sql(...)`), arbitrary control flow. No special migration sub-DSL.
 
 ### The struct-vs-migration disconnect
@@ -590,7 +597,7 @@ def migration_history(db) : array<MigrationRecord>   // {version, description (f
 
 ### Audit table
 
-`__schema_version (version INTEGER PRIMARY KEY, description TEXT, applied_at INTEGER)`. Eagerly created. Success-only rows — failed migrations roll back the audit insert atomically with their own body. `description` in `migration_history` is **frozen at apply time** (DB wins); `pending_migrations` reads from the annotation. Editing a description on an already-shipped migration is a no-op for any DB past it.
+`__schema_version (version INTEGER PRIMARY KEY, description TEXT, applied_at BIGINT)`. Eagerly created; `applied_at` is stamped client-side (epoch seconds) so the insert is portable across engines. Success-only rows — failed migrations roll back the audit insert atomically with their own body. `description` in `migration_history` is **frozen at apply time** (DB wins); `pending_migrations` reads from the annotation. Editing a description on an already-shipped migration is a no-op for any DB past it.
 
 ### Annotation parameters
 
@@ -613,7 +620,7 @@ Two layers of help:
 
 ### Concurrent runners
 
-Coordination via SQLite's RESERVED lock. `apply_recommended_pragmas` (called by `with_latest_sqlite`) sets `busy_timeout = 5000ms`, so concurrent migrators block on `BEGIN IMMEDIATE` for 5 seconds before erroring. Three pods racing on startup → one wins, two block briefly, all three end up at the latest version with no special application logic.
+Per-provider coordination behind the same surface. SQLite: the RESERVED lock — `apply_recommended_pragmas` (called by `with_latest_sqlite`) sets `busy_timeout = 5000ms`, so concurrent migrators block on `BEGIN IMMEDIATE` for 5 seconds before erroring. PostgreSQL: a session advisory lock keyed on the current database — `migrate_to_latest` / `baseline` **block indefinitely** waiting for a concurrent migrator (the session lock auto-releases if the holder crashes or disconnects, so there's no stuck-lock failure mode); `try_migrate_to_latest` / `try_baseline` use `pg_try_advisory_lock` and **fail fast** with `err` instead. DuckDB: the engine's single-writer lock covers it. Three pods racing on startup → one wins, the others wait, all end up at the latest version with no special application logic; a re-check under the lock skips work another runner already did.
 
 ### Failure semantics
 
