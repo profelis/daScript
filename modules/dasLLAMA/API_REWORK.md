@@ -350,9 +350,15 @@ what it costs today and what the fix would change.
   (unit range, token-block range)); y-slices stay disjoint by construction. Ordering: linearize
   ROWS-FASTEST (concurrent workers then share the token block's activation slice in LLC and
   stream disjoint weight rows — lcpp's choice; their counter-starts-at-nth first-wave trick is
-  the rank gate's natural analog on our side). Sized: the 135M-class T≥24 residual vs lcpp
-  (their 0.90-1.0 cells) + the attn_chain lead. (Spotted reading their amx/generic drivers
-  during SPR session 3, 2026-07-05.)
+  the rank gate's natural analog on our side). **Delivery shape (Boris, 2026-07-05): a PIN per
+  architecture, not a default rewrite** — the 1-D scheme already wins 2 of 3 ladder rungs
+  head-to-head (avx2, vnni) and the M1/zen2 boxes; 2-D lands as a box_profile knob (default
+  off, current behavior byte-identical), enabled where the per-box tune/fleet A/B proves it
+  (SPR-class high-T tiny models, deep-thin attn shapes). Candidate refinement to discuss at
+  implementation: an in-code auto-gate that only engages 2-D when the 1-D unit count starves
+  the admitted lanes (units < k·lanes) — the knob then pins the gate rather than the mode.
+  Sized: the 135M-class T≥24 residual vs lcpp (their 0.90-1.0 cells) + the attn_chain lead.
+  (Spotted reading their amx/generic drivers during SPR session 3, 2026-07-05.)
 - **FOLLOW-UP after the 2-D chunk space: the Qwen2-Audio arc (speech→text, Boris 2026-07-05).**
   The cheapest audio-input path: Whisper-large-v3 encoder (~640M — mel frontend via the
   ALREADY-BOUND dasMinfft real FFT, the same per-frame-FFT pattern dasAudio's partitioned
