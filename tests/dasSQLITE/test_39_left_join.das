@@ -44,7 +44,7 @@ def test_left_join_emits_left_join_on(t : T?) {
                                         $(u : User, o : Order) => u.Id == o.UserId,
                                         $(u : User, o : Option<Order>) => (Name = u.Name, HasOrder = o |> is_some)))
     t |> equal(sql,
-        "SELECT \"t0\".\"Name\", \"t1\".\"UserId\" IS NOT NULL FROM \"Users\" AS \"t0\" LEFT JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\"",
+        "SELECT \"t0\".\"Name\", \"t1\".\"UserId\" IS NOT NULL AS \"HasOrder\" FROM \"Users\" AS \"t0\" LEFT JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\"",
         "_left_join + o|>is_some emits LEFT JOIN + IS NOT NULL probe on right key")
 }
 
@@ -56,7 +56,7 @@ def test_left_join_is_none_in_select(t : T?) {
                                         $(u : User, o : Order) => u.Id == o.UserId,
                                         $(u : User, o : Option<Order>) => (Name = u.Name, NoOrder = o |> is_none)))
     t |> equal(sql,
-        "SELECT \"t0\".\"Name\", \"t1\".\"UserId\" IS NULL FROM \"Users\" AS \"t0\" LEFT JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\"",
+        "SELECT \"t0\".\"Name\", \"t1\".\"UserId\" IS NULL AS \"NoOrder\" FROM \"Users\" AS \"t0\" LEFT JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\"",
         "_left_join + o|>is_none emits LEFT JOIN + IS NULL probe")
 }
 
@@ -99,7 +99,7 @@ def test_left_join_with_inner_where_emits_in_on(t : T?) {
     // filter in the outer WHERE would silently drop unmatched-NULL rows and
     // turn LEFT JOIN into INNER JOIN.
     t |> equal(sql,
-        "SELECT \"t0\".\"Name\", \"t1\".\"UserId\" IS NOT NULL FROM \"Users\" AS \"t0\" LEFT JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\" AND (\"t1\".\"Total\" > ?)",
+        "SELECT \"t0\".\"Name\", \"t1\".\"UserId\" IS NOT NULL AS \"HasBigOrder\" FROM \"Users\" AS \"t0\" LEFT JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\" AND (\"t1\".\"Total\" > ?)",
         "_left_join + right-side _where emits in JOIN's ON clause (NOT outer WHERE) — required to preserve LEFT JOIN semantics for unmatched left rows")
 }
 

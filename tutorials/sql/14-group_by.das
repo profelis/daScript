@@ -60,7 +60,7 @@ def main() {
         fixture(db)
 
         // ── Single-key group_by: head-count per city ─────────────────────
-        // SELECT "City", COUNT(*) FROM "Users" GROUP BY "City"
+        // SELECT "City", COUNT(*) AS "N" FROM "Users" GROUP BY "City"
         let by_city <- _sql(db |> select_from(type<User>)
                               |> _group_by(_.City)
                               |> _order_by(_._0)
@@ -71,7 +71,8 @@ def main() {
         }
 
         // ── Multiple aggregates in one projection ────────────────────────
-        // SELECT "City", COUNT(*), MIN("Age"), MAX("Age"), SUM("Salary")
+        // SELECT "City", COUNT(*) AS "N", MIN("Age") AS "MinAge",
+        //        MAX("Age") AS "MaxAge", SUM("Salary") AS "Total"
         // FROM "Users" GROUP BY "City"
         let stats <- _sql(db |> select_from(type<User>)
                             |> _group_by(_.City)
@@ -102,7 +103,7 @@ def main() {
         }
 
         // ── _having (post-aggregate filter) ─────────────────────────────
-        // SELECT "City", COUNT(*) FROM "Users"
+        // SELECT "City", COUNT(*) AS "N" FROM "Users"
         // GROUP BY "City" HAVING COUNT(*) > ?
         // Binds: [1]
         let popular <- _sql(db |> select_from(type<User>)

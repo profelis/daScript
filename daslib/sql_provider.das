@@ -27,9 +27,13 @@ enum public SqlPkReport {
 bitfield public SqlProviderCaps {
     //! Feature gates for the macros' capability checks (wired as providers land);
     //! a missing capability is a compile-time `macro_error` naming the provider.
+    //! `distinct_on` selects the `_distinct_by` lowering: providers with SQL-standard
+    //! `SELECT DISTINCT ON (K) ... ORDER BY K, pk` (PostgreSQL, DuckDB) set it; without
+    //! it the SQLite-only bare-aggregate `SELECT *, MIN(pk) ... GROUP BY K` form is used.
     fts5
     client_udfs
     returning
+    distinct_on
 }
 
 struct public SchemaFromCol {

@@ -334,7 +334,7 @@ def test_groupby_first_emits_bare_aggregate_with_expanded_row(t : T?) {
                           |> _group_by(_.Name)
                           |> _select((Brand = _._0, FirstCar = _._1 |> first())))
     t |> equal(sql,
-        "SELECT \"Name\", \"Id\", \"Name\", \"Price\" FROM (SELECT *, MIN(\"Id\") FROM \"Cars\" GROUP BY \"Name\") AS \"t0\"",
+        "SELECT \"Name\" AS \"Brand\", \"Id\", \"Name\", \"Price\" FROM (SELECT *, MIN(\"Id\") FROM \"Cars\" GROUP BY \"Name\") AS \"t0\"",
         "_group_by(K) |> _select((K=_._0, R=_._1|>first())) wraps source in bare-aggregate subquery and expands the row entry to all source columns")
 }
 

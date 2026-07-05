@@ -55,7 +55,7 @@ def test_prejoin_where_named_emits_t0_col(t : T?) {
                                    $(c : Car, d : Dealer) => c.did == d.id,
                                    $(c : Car, d : Dealer) => (N = c.name, City = d.city)))
     t |> equal(sql,
-        "SELECT \"t0\".\"name\", \"t1\".\"city\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"did\" = \"t1\".\"id\" WHERE \"t0\".\"did\" >= ?",
+        "SELECT \"t0\".\"name\" AS \"N\", \"t1\".\"city\" AS \"City\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"did\" = \"t1\".\"id\" WHERE \"t0\".\"did\" >= ?",
         "named-param _where before _join resolves to t0.did (was error[30838])")
 }
 
@@ -108,7 +108,7 @@ def test_prejoin_order_by_named_string_key_emits_computed(t : T?) {
                                    $(c : Car, d : Dealer) => c.did == d.id,
                                    $(c : Car, d : Dealer) => (N = c.name, City = d.city)))
     t |> equal(sql,
-        "SELECT \"t0\".\"name\", \"t1\".\"city\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"did\" = \"t1\".\"id\" ORDER BY LOWER(\"t0\".\"name\") ASC",
+        "SELECT \"t0\".\"name\" AS \"N\", \"t1\".\"city\" AS \"City\" FROM \"Cars\" AS \"t0\" INNER JOIN \"Dealers\" AS \"t1\" ON \"t0\".\"did\" = \"t1\".\"id\" ORDER BY LOWER(\"t0\".\"name\") ASC",
         "named-param pre-join _order_by(to_lower(c.name)) lowers to ORDER BY LOWER(t0.name)")
 }
 

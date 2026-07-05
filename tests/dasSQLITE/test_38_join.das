@@ -45,7 +45,7 @@ def test_inner_join_emits_inner_join_on(t : T?) {
                                    $(u : User, o : Order) => u.Id == o.UserId,
                                    $(u : User, o : Order) => (UserName = u.Name, Total = o.Total)))
     t |> equal(sql,
-        "SELECT \"t0\".\"Name\", \"t1\".\"Total\" FROM \"Users\" AS \"t0\" INNER JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\"",
+        "SELECT \"t0\".\"Name\" AS \"UserName\", \"t1\".\"Total\" FROM \"Users\" AS \"t0\" INNER JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\"",
         "_join emits SELECT aliased cols + INNER JOIN ON aliased keys")
 }
 
@@ -58,7 +58,7 @@ def test_inner_join_with_outer_where(t : T?) {
                                    $(u : User, o : Order) => u.Id == o.UserId,
                                    $(u : User, o : Order) => (UserName = u.Name, Total = o.Total)))
     t |> equal(sql,
-        "SELECT \"t0\".\"Name\", \"t1\".\"Total\" FROM \"Users\" AS \"t0\" INNER JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\" WHERE (\"t0\".\"Active\" <> 0)",
+        "SELECT \"t0\".\"Name\" AS \"UserName\", \"t1\".\"Total\" FROM \"Users\" AS \"t0\" INNER JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\" WHERE (\"t0\".\"Active\" <> 0)",
         "_where on left side qualifies as t0.Col in multi-source mode")
 }
 
@@ -70,7 +70,7 @@ def test_inner_join_with_inner_where(t : T?) {
                                    $(u : User, o : Order) => u.Id == o.UserId,
                                    $(u : User, o : Order) => (UserName = u.Name, Total = o.Total)))
     t |> equal(sql,
-        "SELECT \"t0\".\"Name\", \"t1\".\"Total\" FROM \"Users\" AS \"t0\" INNER JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\" AND (\"t1\".\"Total\" > ?)",
+        "SELECT \"t0\".\"Name\" AS \"UserName\", \"t1\".\"Total\" FROM \"Users\" AS \"t0\" INNER JOIN \"Orders\" AS \"t1\" ON \"t0\".\"Id\" = \"t1\".\"UserId\" AND (\"t1\".\"Total\" > ?)",
         "_where inside the right-side chain emits in JOIN's ON clause (qualified t1.Col, NOT in outer WHERE) — required for LEFT JOIN, used uniformly for INNER too")
 }
 

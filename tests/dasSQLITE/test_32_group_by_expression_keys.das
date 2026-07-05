@@ -24,7 +24,7 @@ def private fixture(db : SqlRunner) {
 def test_expr_key_modulo_emits_inline_constant(t : T?) {
     var _db = SqlRunner()
     let sql = _sql_text(_db |> select_from(type<Car>) |> _group_by(_.Price % 100) |> _select((K = _._0, N = _._1 |> length)))
-    t |> equal(sql, "SELECT ((\"Price\") % (100)), COUNT(*) FROM \"Cars\" GROUP BY ((\"Price\") % (100))",
+    t |> equal(sql, "SELECT ((\"Price\") % (100)) AS \"K\", COUNT(*) AS \"N\" FROM \"Cars\" GROUP BY ((\"Price\") % (100))",
         "expr-key SELECT + GROUP BY share the same inlined fragment, no `?` binds")
 }
 
@@ -74,7 +74,7 @@ def test_multi_key_mixed_field_and_expression(t : T?) {
     let sql = _sql_text(_db |> select_from(type<Car>)
                            |> _group_by((_.Brand, _.Price % 100))
                            |> _select((B = _._0._0, K = _._0._1, N = _._1 |> length)))
-    t |> equal(sql, "SELECT \"Brand\", ((\"Price\") % (100)), COUNT(*) FROM \"Cars\" GROUP BY \"Brand\", ((\"Price\") % (100))",
+    t |> equal(sql, "SELECT \"Brand\" AS \"B\", ((\"Price\") % (100)) AS \"K\", COUNT(*) AS \"N\" FROM \"Cars\" GROUP BY \"Brand\", ((\"Price\") % (100))",
         "multi-key tuple mixes field key and expression key; both render in SELECT + GROUP BY in order")
 }
 

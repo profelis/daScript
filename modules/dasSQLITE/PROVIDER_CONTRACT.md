@@ -91,6 +91,7 @@ adds one `require ?<mod>` line plus one `static_if` branch to
 | `caps.fts5` | set | `[sql_fts5]` / `text_match` → compile error when absent |
 | `caps.client_udfs` | set | `[sql_function]` → compile error when absent (PG has no client-side UDFs) |
 | `caps.returning` | set | `_sql_*_returning` |
+| `caps.distinct_on` | clear | `_distinct_by` lowering selector, routed in `build_distinct_by_inner_subquery`: clear → SQLite's bare-aggregate `SELECT *, MIN/MAX(pk) FROM t GROUP BY K` (bare columns beside GROUP BY are SQLite-only semantics); set → SQL-standard `SELECT DISTINCT ON (K) * FROM t ORDER BY K, pk [DESC]` (PostgreSQL, DuckDB). Not a macro_error gate — every provider gets one of the two lowerings |
 | `pkReport : SqlPkReport` | `LastInsertRowid` | `insert(...) : id` — `ReturningPk` for providers without rowid |
 
 The gates wire up as the second provider lands; in this PR the flags are

@@ -582,11 +582,15 @@ def private is_nullable_column_ref(var node : ExpressionPtr; var q : SqlQuery&) 
 
 // ===== Chain analysis (walk pipe-composed chain backwards) =====
 
-// nolint:STYLE015 Shared subquery-wrap: SQLite's bare-aggregate optimization — `SELECT *, MIN/MAX(pk) FROM t GROUP BY K` picks the row with the min (useMax=false) or max (useMax=true) pk per K, preserving all `*` columns at those values. MIN matches linq `_distinct_by`'s "first row per K" semantics; MAX matches `reverse() |> _distinct_by(K)` "last row per K" — both when pk is monotonic with insertion order.
+// nolint:STYLE015 Shared subquery-wrap, dialect-routed on `caps.distinct_on`. Without it: SQLite's bare-aggregate optimization — `SELECT *, MIN/MAX(pk) FROM t GROUP BY K` picks the row with the min (useMax=false) or max (useMax=true) pk per K, preserving all `*` columns at those values (SQLite-only semantics; strict engines reject bare columns beside GROUP BY). With it: SQL-standard `SELECT DISTINCT ON (K) * FROM t ORDER BY K, pk [DESC]` — first row per K in pk order (DESC = last). Both forms: MIN/ASC matches linq `_distinct_by`'s "first row per K", MAX/DESC matches `reverse() |> _distinct_by(K)` "last row per K" — when pk is monotonic with insertion order.
 [macro_function]
 def private build_distinct_by_inner_subquery(q : SqlQuery; pkField : string; useMax : bool) : string {
     let sqlK = field_to_column_name(q.rootType, q.distinctByCol)
     let pkCol = field_to_column_name(q.rootType, pkField)
+    if (sql_provider_at(q.providerIdx).caps.distinct_on) {
+        let dir = useMax ? " DESC" : ""
+        return "SELECT DISTINCT ON (\"{sqlK}\") * FROM \"{q.tableName}\" ORDER BY \"{sqlK}\", \"{pkCol}\"{dir}"
+    }
     let aggOp = useMax ? "MAX" : "MIN"
     return "SELECT *, {aggOp}(\"{pkCol}\") FROM \"{q.tableName}\" GROUP BY \"{sqlK}\""
 }
@@ -3928,9 +3932,12 @@ def private build_sql_select(var q : SqlQuery&; force_aliases : bool = false) : 
         if (q.proj == ProjectionShape.Aggregate) {
             w |> write(q.aggregateExpr)
         } elif (q.proj == ProjectionShape.GroupedNamedTuple) {
-            // nolint:STYLE015 Pre-formatted frags emit verbatim; AS "<alias>" only when force_aliases
-            // (multi-Q outer resolution) or when alias differs from natural identifier (renamed projection).
-            // groupedSelectIsRow entries are whole-row picks (`_._1 |> first()`): expand to all source columns inline.
+            // nolint:STYLE015 Pre-formatted frags emit verbatim; AS "<alias>" whenever the alias differs
+            // from the natural identifier (renamed projection — `_order_by(_.Alias)` renders the alias name,
+            // which every engine resolves only when declared; SQLite otherwise degrades the unresolvable
+            // quoted name to a string literal and silently skips the ordering) or when force_aliases
+            // (multi-Q outer resolution). groupedSelectIsRow entries are whole-row picks (`_._1 |> first()`):
+            // expand to all source columns inline.
             var first_out = true
             for (i in range(length(q.groupedSelectExprs))) {
                 let isRow = i < length(q.groupedSelectIsRow) && q.groupedSelectIsRow[i]
@@ -3946,7 +3953,7 @@ def private build_sql_select(var q : SqlQuery&; force_aliases : bool = false) : 
                 }
                 if (!first_out) w |> write(", ")
                 w |> write(q.groupedSelectExprs[i])
-                if (force_aliases && i < length(q.projRecordNames) && !empty(q.projRecordNames[i])
+                if (i < length(q.projRecordNames) && !empty(q.projRecordNames[i])
                         && !sql_fragment_is_quoted_ident(q.groupedSelectExprs[i], q.projRecordNames[i])) {
                     w |> write(" AS \"")
                     w |> write(q.projRecordNames[i])
@@ -3973,7 +3980,7 @@ def private build_sql_select(var q : SqlQuery&; force_aliases : bool = false) : 
                     w |> write(column_sql_for_alias("", q.rootType, q.selectCols[i]))
                     natColName = field_to_column_name(q.rootType, q.selectCols[i])
                 }
-                if (force_aliases && i < length(q.projRecordNames) && !empty(q.projRecordNames[i])
+                if (i < length(q.projRecordNames) && !empty(q.projRecordNames[i])
                         && q.projRecordNames[i] != natColName) {
                     w |> write(" AS \"")
                     w |> write(q.projRecordNames[i])

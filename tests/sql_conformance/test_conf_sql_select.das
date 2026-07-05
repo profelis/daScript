@@ -4,8 +4,10 @@ options no_unused_block_arguments = false
 options no_unused_function_arguments = false
 
 // Contract area: the `_sql` read chain — _where translation with captured-var binds,
-// _order_by, take/skip, distinct, _first/_first_opt terminals, and the _sql_text
-// analyzer surface (placeholder style is provider-rendered, so only shape is asserted).
+// _order_by, take/skip, distinct, _distinct_by (provider-lowered: bare-aggregate GROUP BY
+// or DISTINCT ON per caps.distinct_on), renamed-projection aliases + ordering over them,
+// _first/_first_opt terminals, and the _sql_text analyzer surface (placeholder style is
+// provider-rendered, so only shape is asserted).
 
 require dastest/testing_boost public
 require _conformance_provider
@@ -101,6 +103,92 @@ def test_conf_terminals(t : T?) {
             let missing = _sql(db |> select_from(type<ConfNum>)
                 |> _where(_.Val > 1000) |> _first_opt())
             t |> success(missing |> is_none, "_first_opt on an empty result is none")
+        }
+    }
+}
+
+[test]
+def test_conf_distinct_by(t : T?) {
+    t |> run("_distinct_by picks the first row per key in pk order") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let rows <- _sql(db |> select_from(type<ConfNum>) |> _distinct_by(_.Tag) |> _order_by(_.Val))
+            t |> equal(length(rows), 3)
+            t |> equal(rows[0].Val, 10)
+            t |> equal(rows[0].Tag, "a")
+            t |> equal(rows[1].Val, 20)
+            t |> equal(rows[1].Tag, "b")
+            t |> equal(rows[2].Val, 40)
+            t |> equal(rows[2].Tag, "c")
+        }
+    }
+    t |> run("reverse() |> _distinct_by picks the last row per key") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let rows <- _sql(db |> select_from(type<ConfNum>)
+                |> reverse() |> _distinct_by(_.Tag) |> _order_by((_.Val, _.Tag)))
+            t |> equal(length(rows), 3)
+            t |> equal(rows[0].Val, 20)     // last "b" row
+            t |> equal(rows[1].Val, 40)     // last "a" row is (40, "a")
+            t |> equal(rows[1].Tag, "a")
+            t |> equal(rows[2].Val, 40)     // last "c" row is (40, "c")
+            t |> equal(rows[2].Tag, "c")
+        }
+    }
+    t |> run("_distinct_by count / predicate count / column aggregate") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let n = _sql(db |> select_from(type<ConfNum>) |> _distinct_by(_.Tag) |> count())
+            t |> equal(n, 3)
+            let n2 = _sql(db |> select_from(type<ConfNum>) |> _distinct_by(_.Tag) |> _count(_.Val >= 20))
+            t |> equal(n2, 2)               // first-per-tag rows are (10,a) (20,b) (40,c)
+            let total = _sql(db |> select_from(type<ConfNum>) |> _distinct_by(_.Tag) |> _select(_.Val) |> sum())
+            t |> equal(total, 70)
+        }
+    }
+    t |> run("_group_by |> _select(key, first()) returns one whole row per group") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let groups <- _sql(db |> select_from(type<ConfNum>)
+                |> _group_by(_.Tag)
+                |> _select((Tag = _._0, First = _._1 |> first())))
+            t |> equal(length(groups), 3)
+            var byTag : table<string; int>
+            for (g in groups) {
+                byTag[g.Tag] = g.First.Val
+            }
+            t |> equal(byTag?["a"] ?? -1, 10)
+            t |> equal(byTag?["b"] ?? -1, 20)
+            t |> equal(byTag?["c"] ?? -1, 40)
+        }
+    }
+}
+
+[test]
+def test_conf_projection_alias_order(t : T?) {
+    t |> run("_order_by over a renamed projection alias actually orders") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let rows <- _sql(db |> select_from(type<ConfNum>)
+                |> _select((Name = _.Tag, Cost = _.Val))
+                |> _order_by_descending(_.Cost) |> take(2))
+            t |> equal(length(rows), 2)
+            t |> equal(rows[0].Cost, 40)
+            t |> equal(rows[1].Cost, 40)
+        }
+    }
+    t |> run("grouped aggregate orders by its projection alias") @(t : T?) {
+        with_conf_db() $(db) {
+            seed(db)
+            let groups <- _sql(db |> select_from(type<ConfNum>)
+                |> _group_by(_.Tag)
+                |> _select((Tag = _._0, Total = _._1 |> select($(c : ConfNum) => c.Val) |> sum()))
+                |> _order_by_descending(_.Total))
+            t |> equal(length(groups), 3)
+            t |> equal(groups[0].Tag, "a")  // a: 10+30+40 = 80
+            t |> equal(groups[0].Total, 80)
+            t |> equal(groups[1].Total, 40) // c
+            t |> equal(groups[2].Total, 20) // b
         }
     }
 }
