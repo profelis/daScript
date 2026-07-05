@@ -24,6 +24,7 @@ require daslib/json_boost public    // [sql_table] @sql_json adapter codegen cal
 require daslib/archive public       // [sql_table] @sql_blob adapter codegen calls mem_archive_save / mem_archive_load
 
 require ?sqlite sqlite/sqlite_provider    // in-tree provider registration shim -- loaded only when sqlite is linked
+require ?duckdb duckdb/duckdb_provider    // external provider (github.com/borisbat/dasDuckDB) -- loaded only when duckdb is linked
 
 //! Provider-neutral SQL macro layer: ``[sql_table]`` / ``[sql_view]`` / ``[sql_index]``,
 //! the typed ALTER macros (``add_column`` / ``create_index``), and the ``sql_bind`` /
@@ -39,6 +40,9 @@ def public sql_register_present_providers {
     if (sql_register_present_providers_done()) return
     static_if (typeinfo builtin_module_exists(sqlite)) {
         register_sqlite_provider()
+    }
+    static_if (typeinfo builtin_module_exists(duckdb)) {
+        register_duckdb_provider()
     }
 }
 
