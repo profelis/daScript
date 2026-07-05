@@ -339,6 +339,42 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **2-D batch chunk space (row-units × token-blocks) — the chunk-starved-shape remedy.**
+  Our batch dispatch chunks over out-row units only; tokens loop inside each chunk. Shapes
+  with few row-units starve high lane counts (135M d=576 → ~5-36 chunks for 48 lanes; the
+  Qwen3-0.6B attn_chain "deep-thin" 50% lead is the same geometry). llama.cpp's GENERIC path
+  chunks 2-D — (out-rows × tokens) grid, chunk 16, one atomic counter, all architectures
+  (ggml-cpu.c:1388-1442) — which is exactly why their mid/high-lane scaling holds on tiny
+  models where our gated pool tops out. Our batch walk already loops tokens inside units, so
+  the chunk space generalizes mechanically (matmul_chunks gains a token axis; worker chunk =
+  (unit range, token-block range)); y-slices stay disjoint by construction. Ordering: linearize
+  ROWS-FASTEST (concurrent workers then share the token block's activation slice in LLC and
+  stream disjoint weight rows — lcpp's choice; their counter-starts-at-nth first-wave trick is
+  the rank gate's natural analog on our side). Sized: the 135M-class T≥24 residual vs lcpp
+  (their 0.90-1.0 cells) + the attn_chain lead. (Spotted reading their amx/generic drivers
+  during SPR session 3, 2026-07-05.)
+- **FOLLOW-UP after the 2-D chunk space: the Qwen2-Audio arc (speech→text, Boris 2026-07-05).**
+  The cheapest audio-input path: Whisper-large-v3 encoder (~640M — mel frontend via the
+  ALREADY-BOUND dasMinfft real FFT, the same per-frame-FFT pattern dasAudio's partitioned
+  convolution reverb production-tests; 2× conv1d+GELU subsample = kernel-3 neural convs →
+  im2col over EXISTING matmuls, no new compute kernel — FFT convolution only pays at long
+  kernels; N PLAIN encoder blocks = existing matmul/norm/softmax with non-causal no-cache
+  attention) → avg-pool → linear projector → soft tokens spliced at the `<|audio|>`
+  placeholder; the decoder is our EXISTING qwen2 arch untouched (no cross-attention anywhere).
+  New pieces: im2col gather, encoder forward, embedding-span prefill (driver), mmproj GGUF
+  loader; oracle = llama.cpp mtmd (GGUF pairs ship). ~1 modest arc; the encoder is SHARED
+  infrastructure — the same implementation unlocks Ultravox (llama-3 decoder ✓ have it) and
+  ~80% of a Whisper-proper port later.
+- **AMX fold pipelining (double-buffered C spill) — only if amx silicon verdict ever flips.**
+  lcpp's tinygemm_kernel_amx interleaves block i−1's AVX-512 scale-fold between block i's
+  TMUL ops (double-buffered thread-local C scratch, mmq.cpp:2015-2105) — the fold hides under
+  tile latency; our emit_amx_tile serializes them, likely most of the T-independent ~1.6×
+  end-to-end amx loss on SPR. Pure emission-order change (second spill alloca + reordered
+  fold). NOT worth doing while the amx leg loses on frequency/bandwidth grounds anyway
+  (SPR session-3 verdict: grid-resident, biased busd512 keeps the manifest); revisit on
+  Granite-Rapids-class silicon or a cache-resident serving regime. Their thread-local
+  once-per-thread ldtilecfg (vs our per-call config+release) rides the same follow-up.
+  (Spotted reading mmq.cpp during SPR session 3, 2026-07-05.)
 - **x64 intrinsic backends lack the `mm_rows` row-range GEMV core (fused-chain fallback).** The
   fused decode chains (team_parallel_stages, 2026-07-03) gate on `kernel_backend_has_rows()`;
   portable + both arm64 backends carry the core, so the EPYC (profile-pinned portable) and M1

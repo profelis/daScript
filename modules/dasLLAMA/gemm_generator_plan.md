@@ -1143,6 +1143,74 @@ fork measurement, batch-wrapper tail/overlap validation at real prompt lengths, 
 in-proc-JIT ldtilecfg placement confirmation (llc-level is entry/exit; same backend passes
 should hold).
 
+### Slice I SILICON (2026-07-05, SPR session 3, c7i.metal-24xl 8488C) — correct everywhere, kernel-iso win, END-TO-END LOSS
+
+**Correctness: everything green on first silicon.** cpuid names live; test grid 44 rows with
+all 3 amx rows LIVE, tile maxdiff 0 vs the grp4 oracle; slot parity 7/7 maxdiff 0 under an
+amx manifest (incl. the ntok=5 sub-macro gemv path); oracle parity (simple_ids) Llama-1B
+40/40 token-for-token under the amx stamp on BOTH a 5-token prompt (sub-macro) and a
+26-token prompt (full macro + the overlapped tail — the idempotence path); suite 204/204 on
+box. One REAL bug found by silicon (`2c435a39e`): the first-ever amx tune run SIGILL'd on
+its first tdpbssd — tune_mode_run invoked stamped tiles directly, and the witness IS the
+per-process XTILEDATA grant (test mode was green only because its lockstep checks invoke
+every witness). Production is safe (selection evaluates the witness); the harness now
+consumes witnesses up front.
+
+**Tune sweep (single-core, d=512 fixture): amx WINS kernel-iso** — 1×1 macro 191.2 GMAC/s /
+2×2 157.9 vs biased busd512 156.4 (+22% for 1×1; note 191 ≈ the scout's DRAM-fed ceiling
+196, i.e. the fixture regime is memory-fed, not the 3546 ALU regime).
+
+**End-to-end (emission_bench, T24): amx LOSES — badly.** 135M pp 5477 (biased busd512) vs
+3259 (amx 1×1) / 2462 (2×2); 1B pp 2413 vs 979/1080. T8 discriminator (1B): 0.64× vs 0.41×
+at T24 ⇒ the loss is BOTH structural (~1.6× at low T) and scaling-amplified (AMX frequency
+license / memory contention at 24C). The production regime is DRAM-streamed and
+fold-bounded — TMUL's ALU advantage has nothing to cash against (consistent with lcpp-AMX
+shining only cache-resident). **Verdict: the amx leg stays grid-resident; biased busd512
+keeps the SPR manifest.** Do not revisit end-to-end amx on SPR without a structural change
+(deeper B-residency / cache-resident scheduling); next look = a different AMX box class
+(Granite Rapids) or the cache-resident-serving regime.
+
+**The bias fork (first measurement, single bracket, both gkstep2 — the clean A/B):** biased
+busd512 beats plain +2.6% emit / +26% pp (1B), +8.0% emit / +18% pp (0.6B). bias128 pays on
+BOTH sides, so fork option (a) costs real decode under an amx stamp — moot on SPR (amx isn't
+the driver), but per-slot perms remains the escalation if any box ever flips the amx
+end-to-end verdict.
+
+**🔑 TUNE-METHODOLOGY FINDING (needs a decision):** the single-core tile microbench CROWNED
+amx nrsplit1 — `tune_for_this_box` on SPR would write a manifest that loses ~2× end-to-end.
+First-ever divergence between the tune fixture regime (1-core, cache-warm reps) and
+production (multi-core, DRAM-streamed); vector rows never diverged. Candidate fixes:
+a multi-core/streaming tune leg, an end-to-end confirm pass in the tuner, or an eligibility
+rail demoting tile-family rows that need cache residency.
+
+**The arch ladder (Boris's ask, same session — full CSV in the session scratchpad):** 4 models
+× 3 ISA tiers × both engines × T{8,24}, both engines genuinely tier-limited (das: explicit
+host-triple + DAS_JIT_X64_FORCE_FEATURES + per-tier manifest — the cross-triple rail executes
+natively, proven; lcpp: per-tier clang builds, amx = native). pp512 @T24, avx2→vnni→amx:
+das 1952→3058→1237 / lcpp 1378→1781→3387 (0.6B); das 1268→2369→1314 / lcpp 861→904→2556 (1B);
+das 1276→1931→897 / lcpp 989→1197→2874 (gemma-3-1b); das 338→688→324 / lcpp 228→259→716 (4B).
+READING: the engines climb in different places — das gains 1.9-2.4× from the VNNI step
+(bias128 busd512) and nothing from amx; lcpp gains 1.1-1.3× from VNNI and 2.3-2.9× ONLY from
+the AMX unit. **das-on-VNNI ≈ lcpp-on-AMX within 8-15% on 3 of 4 models** (gemma = their
+standout amx case, 1.49×); same-tier head-to-head das wins prefill 1.4-2.8× everywhere.
+Decode is tier-insensitive for both (bandwidth-bound); lcpp's amx-build +11-15% emit is the
+packed VNNI weight LAYOUT feeding their m=1 vector fast path, not tile ops. das ladder emit
+carries a ~13% generic-CPU-scheduling handicap (no -mcpu on cross triples) — within-engine
+shape honest, cross-engine decode ratios come from native runs (session-2 sweep: parity-ish).
+
+**lcpp AMX source read (why theirs wins where it wins; mmq.cpp):** same 2×2 macro geometry,
+same per-block C spill + fold — but the fold is SOFTWARE-PIPELINED (double-buffered C scratch,
+block i−1's AVX-512 fold interleaves between block i's TMUL ops, :2015-2105), ldtilecfg is
+thread_local once-per-thread, decode never touches tiles (m=1 = vnni fast path over the
+packed layout), and their GENERIC path chunks matmuls 2-D (out-rows × tokens, rows-fastest
+linearization, ggml-cpu.c:1388-1442) — the chunk-starved-shape remedy now on OUR ledger
+(2-D batch chunk space; amx fold pipelining ledgered as conditional).
+
+**Flash-decode deep-ctx on SPR (the queued zen2 soft-spot check):** Qwen3-0.6B ctx2048 T24
+emit 79.4 fused vs 50.6 per-op = **+57%** — zen2's −5% does not reproduce; SPR follows M1's
+direction with margin. (The env rail toggles the whole chain — a FLASH_DECODE_SLICE env for
+slice-only A/Bs is a ledger nit.)
+
 ## M4 slice J — the smmla leg (dot="smmla", i8mm; DESIGN 2026-07-05)
 
 **Slot scope: the batch tile.** SMMLA is a 2×2 MMA — `acc[i][j] += a_row_i · b_row_j` over 8
