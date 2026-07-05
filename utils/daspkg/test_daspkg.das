@@ -125,6 +125,43 @@ def test_is_index_name(t : T?) {
 }
 
 [test]
+def test_index_has_push_access(t : T?) {
+    t |> run("exact true") @(t : T?) {
+        t |> success(index_has_push_access("true"))
+    }
+    t |> run("trailing newline tolerated") @(t : T?) {
+        t |> success(index_has_push_access("true\n"))
+    }
+    t |> run("false is no access") @(t : T?) {
+        t |> success(!index_has_push_access("false"))
+    }
+    t |> run("empty (gh error / no permissions field) is no access") @(t : T?) {
+        t |> success(!index_has_push_access(""))
+    }
+    t |> run("only lowercase true accepted") @(t : T?) {
+        t |> success(!index_has_push_access("True"))
+    }
+}
+
+[test]
+def test_index_push_target(t : T?) {
+    t |> run("write access → origin + bare branch") @(t : T?) {
+        let tgt = index_push_target(true, "octocat", "introduce-minmaxheap")
+        t |> equal(tgt.remote, "origin")
+        t |> equal(tgt.head_ref, "introduce-minmaxheap")
+    }
+    t |> run("no access → fork + login-qualified head") @(t : T?) {
+        let tgt = index_push_target(false, "JohnathanKG", "introduce-minmaxheap")
+        t |> equal(tgt.remote, "fork")
+        t |> equal(tgt.head_ref, "JohnathanKG:introduce-minmaxheap")
+    }
+    t |> run("login ignored when write access") @(t : T?) {
+        let tgt = index_push_target(true, "someone", "withdraw-foo")
+        t |> equal(tgt.head_ref, "withdraw-foo")
+    }
+}
+
+[test]
 def test_parse_args(t : T?) {
     t |> run("install command") @(t : T?) {
         var r <- parse_args(type<DaspkgArgs>, ["install", "dasImgui"])
