@@ -473,6 +473,17 @@ def tune_mode_run : bool {
     var kgs <- variant_kgroups()
     var tss <- variant_toksteps()
     var gtab <- gemv_variants_by_suffix()
+    // TMUL executes only after the per-process XTILEDATA grant — the witness IS the enable
+    // (slice I), and this harness invokes stamped tiles directly (production consults the
+    // witness at backend selection), so consume every row's witness up front like test_mode
+    // does. One grant covers the whole process. Found the hard way: first-ever amx tune run
+    // SIGILL'd on the first tdpbssd while the test grid (which checks witnesses) was green.
+    var wtab <- witness_variants_by_suffix()
+    for (v in vs) {
+        verify(wtab |> key_exists(v._0))
+        invoke(wtab[v._0])
+    }
+    delete wtab
     let nv = length(vs)
     // per-variant repacked buffers, built once outside the timing loop
     var bufs : array<VBuf>
