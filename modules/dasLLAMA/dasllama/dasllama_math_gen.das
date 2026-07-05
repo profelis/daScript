@@ -278,7 +278,7 @@ def private repack_mx4_gen(var np : uint8?; var ep : uint8?; n, d : int64) {
 def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?; xq : int8 const?; xs : float const?; n, d, col, trow, mr : int64; wbias : int64 = 0l) {
     let nb = n / 32l
     let wb0 = int(wbias)
-    var f : float[8]
+    var f : float[32]   // scratch cap = the grid's max stampable mr (busd512 mr32 row)
     for (r in range(int(mr))) {
         f[r] = 0.0
     }
