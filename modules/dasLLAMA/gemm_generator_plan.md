@@ -966,6 +966,35 @@ plain busd512-kstep2 is 105.7 GMAC/s where the scout VM said 88.3.
   expected). The SPR/VNNI hand-tier class (avx512bw/avx512vnni/vnni256*) is now covered
   on the deletion scoreboard.
 
+**Small-fleet yardstick vs llama.cpp built WITH AMX (the requested ceiling; amx.cpp.o
+compiled under -march=native, amx_int8 live).** Method: emission_bench -p 512 -n 64
+--nprompts 4 back-to-back with llama-bench -p 512 -n 64 -r 1 per model;
+das pp = 512000/(ttft − 1000/emit). das = x64-gen biased-mr16 stamp everywhere
+(proof-of-consumption line checked per run).
+
+| model | T=24 pp das/lcpp (ratio) | T=24 emit (ratio) | T=48 pp (ratio) | T=48 emit (ratio) |
+|---|---|---|---|---|
+| SmolLM2-135M | 5376 / 13324 (0.40) | 105 / 440 (0.24) | 4910 / 13054 (0.38) | 106 / 342 (0.31) |
+| Qwen3-0.6B | 3185 / 3313 (0.96) | 120 / 210 (0.57) | 3127 / 4587 (0.68) | 104 / 176 (0.59) |
+| gemma-3-1b | 1904 / 3233 (0.59) | 62 / 123 (0.51) | 1895 / 3149 (0.60) | 57 / 115 (0.50) |
+| Llama-3.2-1B | 2401 / 2601 (0.92) | **119 / 117 (1.02)** | 2819 / 3584 (0.79) | 109 / 123 (0.88) |
+| Qwen3-4B | **700 / 683 (1.03)** | 32 / 39 (0.84) | 849 / 957 (0.89) | 33 / 39 (0.84) |
+| gpt-oss-20b MoE | **317 / 311 (1.02)** | **54 / 50 (1.09)** | 357 / 459 (0.78) | 53 / 57 (0.94) |
+
+Reading: SPR lcpp is a different animal from Zen2 lcpp — AMX int8 GEMM + zmm-vnni repack
+make its prefill scale where Zen2's stayed flat. At T=24 das is parity-to-win on ≥1B
+dense and the MoE flagship (**gpt-oss: pp 1.02 AND emit 1.09 — we beat the AMX build
+end-to-end at the knee**; Qwen3-4B pp 1.03; Llama-1B emit 1.02). At T=48 lcpp keeps
+scaling while das sits at its knee (the known high-lane regime: das T48 ≈ T24 on every
+model here) — same defaults-vs-knee shape as EPYC, now against a stronger ceiling. Tiny
+models remain the dispatch story (135M: pp 0.40, emit 0.24-0.31; the 2M par threshold
+single-lanes every non-cls matmul — queued per-lane-regime work, NOT kernels: the A/B
+above has gen 4× ahead kernel-to-kernel). gemma-3-1b (0.5-0.6 across the board) is the
+one dense outlier — 262k vocab cls + pre/post-norm gates fused decode off; worth a
+per-op profile next session. AMX as a Tier-3 generator family: the 135M prefill column
+(13.3k t/s) is what AMX tiles buy on cache-resident weights — that's the number a
+dot=amx_int8 family would chase.
+
 ## Direction (Boris, 2026-07-04, post slice B) — the deletion is the mandate, not a maybe
 
 Get rid of the hand-written kernels **apart from the default ones** (the portable /
