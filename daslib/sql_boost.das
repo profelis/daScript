@@ -25,6 +25,7 @@ require daslib/archive public       // [sql_table] @sql_blob adapter codegen cal
 
 require ?sqlite sqlite/sqlite_provider    // in-tree provider registration shim -- loaded only when sqlite is linked
 require ?duckdb duckdb/duckdb_provider    // external provider (github.com/borisbat/dasDuckDB) -- loaded only when duckdb is linked
+require ?postgres postgres/postgres_provider    // external provider (github.com/borisbat/dasPostgreSQL) -- loaded only when postgres is linked
 
 //! Provider-neutral SQL macro layer: ``[sql_table]`` / ``[sql_view]`` / ``[sql_index]``,
 //! the typed ALTER macros (``add_column`` / ``create_index``), and the ``sql_bind`` /
@@ -43,6 +44,9 @@ def public sql_register_present_providers {
     }
     static_if (typeinfo builtin_module_exists(duckdb)) {
         register_duckdb_provider()
+    }
+    static_if (typeinfo builtin_module_exists(postgres)) {
+        register_postgres_provider()
     }
 }
 

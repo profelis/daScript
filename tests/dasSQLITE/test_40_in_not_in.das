@@ -64,7 +64,7 @@ def test_in_with_outer_where(t : T?) {
     let sql = _sql_text(_db |> select_from(type<User>)
                           |> _where(_.Active && _.Id._in(_db |> select_from(type<Order>) |> _select(_.UserId))))
     t |> equal(sql,
-        "SELECT \"Id\", \"Name\", \"Active\" FROM \"Users\" WHERE (\"Active\") AND (\"Id\" IN (SELECT \"UserId\" FROM \"Orders\"))",
+        "SELECT \"Id\", \"Name\", \"Active\" FROM \"Users\" WHERE ((\"Active\" <> 0)) AND (\"Id\" IN (SELECT \"UserId\" FROM \"Orders\"))",
         "_in composes with other WHERE predicates via && — bind order preserved")
 }
 
