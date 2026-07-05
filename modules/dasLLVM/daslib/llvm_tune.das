@@ -98,7 +98,34 @@ def tune_manifest_set(fname : string; suffix : string) : bool {
 
 struct private TunePerm {
     suffix : string
+    requires : string   // fallback-eligibility hint: "a,b" = AND, "a|b" = OR per element; "" = everywhere
     args : array<tuple<argname : string; argvalue : RttiValue>>
+}
+
+// fallback tier truth: host cpuid OR'd with the DAS_JIT_X64_FORCE_FEATURES emission-only
+// override — same names and semantics as llvm_jit_common's x64_target_feature (keep in
+// lockstep; that module lives outside this macro context). requires= is an ELIGIBILITY
+// hint for fallback selection only — the generator's own decline predicate remains the
+// emission truth (a stamped-but-declining row still lands on the reference body).
+def private fallback_feature_ok(name : string) : bool {
+    if (cpu_supports(name)) return true
+    for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")) {
+        if (part == name) return true
+    }
+    return false
+}
+
+def private perm_requires_ok(p : TunePerm) : bool {
+    if (empty(p.requires)) return true
+    for (conj in split(p.requires, ",")) {
+        continue if (empty(conj))
+        var anyOk = false
+        for (alt in split(conj, "|")) {
+            anyOk ||= !empty(alt) && fallback_feature_ok(alt)
+        }
+        if (!anyOk) return false
+    }
+    return true
 }
 
 def private suffix_piece(name : string; v : RttiValue) : string {
@@ -125,6 +152,12 @@ def private build_perm_row(args : AnnotationArgumentList) : TunePerm {
         let v = get_annotation_argument_value(aa)
         if (aa.name == "suffix") {
             if (v is tString) { row.suffix = v as tString }
+            continue
+        }
+        if (aa.name == "requires") {
+            // eligibility hint, consumed here — must not leak into the stamp args or the
+            // auto-derived suffix
+            if (v is tString) { row.requires = v as tString }
             continue
         }
         row.args |> emplace((argname = string(aa.name), argvalue = v))
@@ -405,13 +438,36 @@ class private TuneAnnotation : AstFunctionAnnotation {
             suffix = manifest?[fname] ?? ""
         }
         let fromManifest = !empty(suffix)
+        var ok = true
         if (empty(suffix)) {
+            // fallback= is a ';'-chain tried in declaration order: the first perm whose
+            // requires= hint passes on this box (per-ISA defaults — a manifest-less box
+            // still lands on its ISA's known-good row instead of the reference tier).
+            // Every listed suffix must exist in the grid; none eligible => reference.
             let fv = find_arg(args, "fallback")
-            if (fv is tString) { suffix = fv as tString }
+            if (fv is tString) {
+                for (cand in split(fv as tString, ";")) {
+                    continue if (empty(cand))
+                    var found = false
+                    for (p in perms) {
+                        if (p.suffix == cand) {
+                            found = true
+                            if (perm_requires_ok(p)) {
+                                suffix = cand
+                            }
+                            break
+                        }
+                    }
+                    if (!found) {
+                        errors := "[tune] on {func.name}: fallback perm '{cand}' is not in the [tune_perm] grid"
+                        ok = false
+                    }
+                    break if (!ok || !empty(suffix))
+                }
+            }
         }
         delete manifest
-        var ok = true
-        if (!empty(suffix) && suffix != "reference") {
+        if (ok && !empty(suffix) && suffix != "reference") {
             ok = false
             for (p in perms) {
                 if (p.suffix == suffix) {

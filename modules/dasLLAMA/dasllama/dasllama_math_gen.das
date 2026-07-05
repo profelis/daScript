@@ -17,7 +17,9 @@ require math
 // stamp: the runtime repacks (Q8 AND mx4 planes) ask the layout companion which interleave
 // the stamped cores read and the wbias companion how the plane bytes are baked (bias128),
 // the witness answers "did the family actually emit", and all six generators share one
-// decline predicate, so kernels, repacks and availability cannot desync on any tier. Normal runs stamp exactly one winner (manifest > fallback kstep2 = the M2 perm);
+// decline predicate, so kernels, repacks and availability cannot desync on any tier. Normal runs stamp exactly one winner (manifest > the per-ISA fallback chain:
+// biased busd512 on AVX512-VNNI boxes / biased busd256 on VEX-VNNI / maddubs on plain AVX2 /
+// kstep2 elsewhere — each ISA's measured tune winner as the manifest-less default);
 // DAS_TUNE_MODE=tune/test stamps the grid + the *_variants() registries for the harness
 // (gen_parity_probe / gen_tune_probe). This module registers TWO backends over the SAME
 // ISA-agnostic slot traversals: "arm64-gen" (priority 25, the arm64 load-select tier since
@@ -119,14 +121,14 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
  tune_perm(kstep = 1, nrsplit = 2, mr = 8), tune_perm(kstep = 2, nrsplit = 2, mr = 8), tune_perm(kstep = 4, nrsplit = 2, mr = 8),
  tune_perm(kstep = 2, gkstep = 2), tune_perm(kstep = 2, gkstep = 4),
  tune_perm(kstep = 4, nrsplit = 2, mr = 8, gkstep = 2), tune_perm(kstep = 4, nrsplit = 2, mr = 8, gkstep = 4),
- tune_perm(dot = "maddubs", width = 256, mr = 8, kstep = 2), tune_perm(dot = "maddubs", width = 256, mr = 8, kstep = 4, nrsplit = 2),
+ tune_perm(dot = "maddubs", width = 256, mr = 8, kstep = 2, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, kstep = 4, nrsplit = 2),
  tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 2), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 4, nrsplit = 2),
  tune_perm(dot = "vpdpbusd", width = 256, mr = 16, kstep = 2, nrsplit = 2), tune_perm(dot = "vpdpbssd", width = 256, mr = 8, kstep = 2),
  tune_perm(dot = "maddubs", width = 512, mr = 16, kstep = 2), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2),
  tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 4, nrsplit = 2), tune_perm(dot = "vpdpbusd", width = 512, mr = 32, kstep = 2, nrsplit = 2),
  tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 2, gkstep = 2), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2, gkstep = 2),
- tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 2, bias = 128), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 2, gkstep = 2, bias = 128),
- tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2, bias = 128), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2, gkstep = 2, bias = 128),
+ tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 2, bias = 128), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, kstep = 2, gkstep = 2, bias = 128, requires = "avxvnni|avx512vnni"),
+ tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2, bias = 128), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 2, gkstep = 2, bias = 128, requires = "avx512vnni,avx512bw"),
  tune_perm(dot = "vpdpbusd", width = 512, mr = 16, kstep = 4, nrsplit = 2, bias = 128),
  tune_perm(dot = "maddubs", width = 256, mr = 8, kstep = 2, bias = 128),
  tune_perm(suffix = "mr8_budget", mr = 8), tune_perm(suffix = "mr2_lanes", mr = 2), tune_perm(dot = "vpdpbusd"),
@@ -135,7 +137,8 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
  tune_companion(fn = "q8q8_gemv_gen", gen = "dasllama_gemm_gen::q8q8_gemv"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
- tune(gen = "dasllama_gemm_gen::q8q8_tile", fallback = "kstep2"), unused_argument(xbsp),
+ tune(gen = "dasllama_gemm_gen::q8q8_tile",
+      fallback = "dot_vpdpbusd_width512_mr16_kstep2_gkstep2_bias128;dot_vpdpbusd_width256_mr8_kstep2_gkstep2_bias128;dot_maddubs_width256_mr8_kstep2;kstep2"), unused_argument(xbsp),
  hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def q8q8_tile_gen(var yp : float?; wg : int8 const?; sg : float const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
     let nb = n / 32l
