@@ -4,7 +4,7 @@ options persistent_heap
 require daslib/sql public
 require daslib/linq_boost public
 require sqlite/sqlite_boost public
-require sqlite/sqlite_linq public
+require daslib/sql_linq public
 require dastest/testing_boost public
 require daslib/fio public
 require daslib/decs_boost public
