@@ -17,7 +17,6 @@ require dasllama/dasllama_math_default
 require dasllama/dasllama_quant
 require daslib/jobque_boost
 require math
-require strings
 
 let ROUNDS_EMPTY = 2000     // empty dispatches per ladder point (per rep)
 let REPS = 5                // best-of reps per measurement
@@ -30,7 +29,7 @@ var private g_per_dispatch_ns = 0.0lf   // K=L ladder point, filled by empty_lad
 
 def best_of_us(reps : int; blk : block<() : void>) : double {
     var best = 1.0e18lf
-    for (r in range(reps)) {
+    for (_r in range(reps)) {
         let t0 = ref_time_ticks()
         invoke(blk)
         best = min(best, double(get_time_usec(t0)))
@@ -47,8 +46,8 @@ def empty_ladder(lanes : int) : double {
     for (k in ladder) {
         set_jobque_team_prof(true)
         reset_jobque_team_prof()
-        let us = best_of_us(REPS) $() {
-            for (r in range(ROUNDS_EMPTY)) {
+        let us = best_of_us(REPS) $ {
+            for (_r in range(ROUNDS_EMPTY)) {
                 team_parallel_for(0, k, k) <| @(rb, re : int) {}
             }
         }
@@ -136,7 +135,7 @@ def gemv_ladder(lanes : int) : int {
             let xqp = addr(fx.xq[0])
             let xsp = addr(fx.xs[0])
             var yp = addr(fx.y[0])
-            let us = best_of_us(REPS) $() {
+            let us = best_of_us(REPS) $ {
                 for (r in range(reps)) {
                     let copy = int64((r * lanesNow) % GEMV_COPIES)
                     let wq = addr(fx.q[0]) + copy * planeQ
