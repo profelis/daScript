@@ -1,0 +1,16 @@
+options gen2
+require daslib/daspkg
+
+[export]
+def package() {
+    package_name("sql-engine-benchmarks")
+    package_description("Four-engine SQL benchmark example: sqlite / duckdb / postgres / plain array over one Car schema")
+    package_author("borisbat")
+    package_license("MIT")
+}
+
+[export, unused_argument(version)]
+def dependencies(version : string) {
+    require_package("github.com/borisbat/dasDuckDB")
+    require_package("github.com/borisbat/dasPostgreSQL")
+}

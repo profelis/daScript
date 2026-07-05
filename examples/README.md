@@ -181,6 +181,20 @@ is a self-contained project with a `.das_package` descriptor.
 | `packages/daspkg-example-cpp/` | Template for a daspkg package with C++ shared module |
 | `packages/daspkg-example-mixed/` | Template for a mixed daslang + C++ package |
 
+## benchmarks/sql/ — Four-Engine SQL Benchmarks
+
+The `benchmarks/sql` query families measured across SQLite, DuckDB, PostgreSQL,
+and a plain-array baseline, in interpreted and JIT mode. The DuckDB/PostgreSQL
+providers install via this folder's `.das_package`; results land in a generated
+`results.md`. See [benchmarks/sql/README.md](benchmarks/sql/README.md).
+
+| File | Description |
+|------|-------------|
+| `sqlite.das` / `duckdb.das` / `postgres.das` | Engine lanes — thin `[benchmark]` wrappers over the shared families |
+| `array.das` | Baseline lane — same chains as fused linq folds over `array<Car>` |
+| `_sql_families.das` | The query families, once, generic over the runner type |
+| `_update_results.das` | Regenerates the INTERP/JIT matrices in `results.md` from sweep JSON |
+
 ## telegram/ — Telegram Bot Example
 
 A Telegram echo bot using the `das-telegram` daspkg package. Requires setup:
