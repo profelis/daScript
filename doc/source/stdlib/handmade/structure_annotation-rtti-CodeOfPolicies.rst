@@ -62,6 +62,7 @@ Report invisible functions.
 Report private functions.
 Enables strict property checks.
 Disables all optimizations.
+Allows float optimizations with major bit differences (x*0, x-x, reciprocal division, NaN-compare flips, reassociation); also stamps JIT fast-math flags. Doubles stay bit-exact unless enabled.
 Disables infer-time constant folding.
 Fails compilation if AOT is not available.
 Fails compilation if AOT export is not available.

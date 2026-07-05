@@ -150,6 +150,15 @@ Optimization
      - bool
      - false
      - Disables all optimizations unconditionally. Overrides all other optimization settings.
+   * - ``fast_math``
+     - bool
+     - false
+     - Allows float optimizations that change results in a major way for inf/NaN inputs or rounding
+       (``x*0`` and ``x-x`` to ``0``, division by a constant via reciprocal multiply, ``!(a<b)`` to
+       ``a>=b``, constant reassociation), and lets the JIT stamp fast-math flags on all FP
+       instructions. ``double`` stays bit-exact unless this is on; ``float`` identities with only
+       sign-of-zero differences (``x+0.0``) fold regardless, since float32 is not bit-exact across
+       execution tiers. Also available as ``CodeOfPolicies::fast_math``.
    * - ``fusion``
      - bool
      - true

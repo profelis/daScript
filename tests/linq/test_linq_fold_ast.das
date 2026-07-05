@@ -1839,8 +1839,10 @@ def test_all_loop_shape(t : T?) {
             return $e(body_expr)
         }
         t |> success(r.matched && body_expr is ExprInvoke, "expected invoke wrapper")
-        // all emits `if (!pred) return false` — at least one ExprOp1 with op `!`.
-        t |> success(count_op1(body_expr, "!") >= 1, "all: at least one `!` for predicate negation")
+        // all emits `if (!pred) return false`; the optimizer's compare flip folds
+        // `!(_ > 0)` into `_ <= 0`, so accept either shape.
+        t |> success(count_op1(body_expr, "!") >= 1 || count_op2(body_expr, "<=") >= 1,
+            "all: negated predicate present (as `!` or as the flipped compare)")
         t |> equal(1, count_inner_for_loops(body_expr), "all: one for-loop")
     }
 }
