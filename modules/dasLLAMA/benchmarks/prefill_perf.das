@@ -67,6 +67,12 @@ def main {
             set_matmul_min_chunk_rows_gemv(mgv)
             print("gemv min chunk rows override: {mgv}\n")
         }
+        // A/B the 2-D batch chunk grid (0 = 1-D, 1 = fine grid, 2 = wave-aligned)
+        if (has_env_variable("DASLLAMA_BATCH_GRID_2D")) {
+            let bg2 = to_int(get_env_variable("DASLLAMA_BATCH_GRID_2D"))
+            set_batch_grid_2d(bg2)
+            print("batch grid 2d override: {bg2}\n")
+        }
         // warmup — JIT both paths
         let warm <- build_prompt(8l)
         for (p in range64(8l)) {

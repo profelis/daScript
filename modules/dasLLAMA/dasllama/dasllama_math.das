@@ -282,6 +282,66 @@ def public matmul_chunks(rows : int; oversplit : int; work : int64) : int {
     return chunks
 }
 
+// ===== 2-D batch chunk grid (row-units × token-blocks) — the chunk-starved-shape remedy =====
+
+// The per-box 2-D grid pin (box_profile "batch_grid_2d"): 0 = off (1-D always, the default);
+// 1/2 arm the per-dispatch auto-gate with a tail strategy. 2-D engages only when the 1-D
+// grain-capped chunk count can't fill one wave of the admitted lanes — a starved shape idles
+// lanes every wave, while big GEMMs keep the weight-stationary 1-D walk (each weight row
+// streamed once; a token split re-streams rows once per token cell, worth it only when the
+// row axis is short). Strategy 1 = fine grid, ggml-cpu.c's answer (16-token cells, ragged
+// tail amortized over many cells per lane); strategy 2 = wave-aligned (ntc rounded so
+// rc·ntc is a whole number of L-waves — the 1-D invariant carried into the grid).
+var g_batch_grid_2d = 0
+def public set_batch_grid_2d(v : int) { g_batch_grid_2d = clamp(v, 0, 2) }
+def public get_batch_grid_2d() : int { return g_batch_grid_2d }
+
+def private gcd_int(a, b : int) : int {
+    var x = max(a, 1)
+    var y = max(b, 1)
+    while (y != 0) {
+        let t = y
+        y = x % y
+        x = t
+    }
+    return x
+}
+
+//! Chunk grid for the token-blocked batch GEMM: (row chunks, token chunks). y == 1 ⇒ stay 1-D
+//! (x is the matmul_chunks count — feed the classic dispatch). With the batch_grid_2d pin armed,
+//! a starved shape (1-D chunks < admitted lanes) goes 2-D: the token axis supplies the missing
+//! parallelism at the same row grain. Cells decode ROWS-FASTEST at the dispatch site, so
+//! concurrent workers share a token block's activation slice in LLC and stream disjoint weight
+//! rows. `units` is the row-unit count of the split range, `unit_rows` the rows per unit (mr);
+//! `tokq` is the tile token quantum — token cells stay whole-tile so no cell pays a systematic
+//! sub-tile tail (the range tail still rides the walk's per-token tail path).
+def public matmul_grid(units : int; unit_rows : int64; oversplit : int; work : int64; ntok : int64; tokq : int) : int2 {
+    let c1 = matmul_chunks(units * int(unit_rows), oversplit, work)
+    if (g_batch_grid_2d == 0 || c1 <= 1) {
+        return int2(c1, 1)
+    }
+    let L = lanes_for_work(work, g_batch_lane_cap)
+    let ntile = int(ntok / int64(tokq))
+    if (c1 >= L || ntile < 2) {   // not starved, or no token axis to split
+        return int2(c1, 1)
+    }
+    let rc = clamp(c1, 1, max(units, 1))   // row cells finer than one unit are empty claims
+    var ntc = 1
+    if (g_batch_grid_2d == 1) {
+        ntc = min((int(ntok) + 15) / 16, ntile)
+    } else {
+        // smallest whole-wave ntc covering the oversplit target; alignment that can't fit the
+        // available tiles stays 1-D (a clamped ntc would be unaligned = strategy 1 in disguise)
+        let step = L / gcd_int(rc, L)
+        let need = (L * max(oversplit, 1) + rc - 1) / rc
+        ntc = ((need + step - 1) / step) * step
+        if (ntc > ntile) {
+            return int2(c1, 1)
+        }
+    }
+    return ntc > 1 ? int2(rc, ntc) : int2(c1, 1)
+}
+
 // Coarser grain for GEMV-shaped splits (ggml mul_mat: chunk_size 16 -> 64 when nr0==1||nr1==1):
 // a decode matvec row is one dot, far less work than a GEMM row reused across ntok tokens, and
 // the coarser floor doubles as the decode lane cap (EPYC 9654: grain 64 = +13-15% decode at

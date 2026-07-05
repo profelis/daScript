@@ -118,6 +118,11 @@ def main() {
             set_fused_decode(get_env_variable("DASLLAMA_FUSED_DECODE") != "0")
             print("fused decode override: {get_fused_decode()}\n")
         }
+        // A/B the 2-D batch chunk grid over the profile's pin (0 = 1-D, 1 = fine, 2 = aligned)
+        if (has_env_variable("DASLLAMA_BATCH_GRID_2D")) {
+            set_batch_grid_2d(to_int(get_env_variable("DASLLAMA_BATCH_GRID_2D")))
+            print("batch grid 2d override: {get_batch_grid_2d()}\n")
+        }
         // one throwaway warmup prompt: JIT compilation + first-touch paging stay out of prompt 0
         {
             var s <- make_run_state(c)

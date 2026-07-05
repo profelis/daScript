@@ -17,6 +17,7 @@ def private restore_shaping_defaults() {
     set_matmul_min_chunk_rows(16)
     set_matmul_min_chunk_rows_gemv(64)
     set_gemv_wave_fill(true)
+    set_batch_grid_2d(0)
 }
 
 [test]
@@ -86,6 +87,63 @@ def test_matmul_chunks_batch(t : T?) {
             set_batch_lane_cap(2)
             let capped = matmul_chunks(16 * lanes * 8, 4, huge)
             t |> equal(capped, min(2, lanes) * 4, "cap bounds the wave width")
+            restore_shaping_defaults()
+        }
+    }
+}
+
+[test]
+def test_matmul_grid(t : T?) {
+    with_job_que() {
+        restore_shaping_defaults()
+        let lanes = get_dispatch_lanes()
+        let huge = 1_000_000_000_000l
+        // the starved fixture: mr=4 units sized so the grain caps 1-D at lanes-1 chunks (< L)
+        let sunits = 4 * (lanes - 1)
+        t |> run("knob off (default): 1-D always, x = matmul_chunks") @(t : T?) {
+            if (lanes >= 3) {
+                let g = matmul_grid(sunits, 4l, 4, huge, 2048l, 4)
+                t |> equal(g.x, lanes - 1, "starved shape keeps the grain-capped 1-D count")
+                t |> equal(g.y, 1)
+            }
+            t |> equal(matmul_grid(4 * lanes * 8, 4l, 4, huge, 2048l, 4).y, 1, "roomy shape 1-D")
+        }
+        t |> run("knob 1 (fine grid): starved shape goes 2-D at 16-token cells") @(t : T?) {
+            set_batch_grid_2d(1)
+            if (lanes >= 3) {
+                let g = matmul_grid(sunits, 4l, 4, huge, 2048l, 4)
+                t |> equal(g.x, lanes - 1, "row resolution = the 1-D grain cap")
+                t |> equal(g.y, 128, "2048 tokens / 16-token cells")
+                t |> equal(matmul_grid(sunits, 4l, 4, huge, 20l, 4).y, 2, "ntc = ceil(ntok/16), tile-clamped")
+                t |> equal(matmul_grid(sunits, 4l, 4, huge, 4l, 4).y, 1, "no token axis (ntok < 2 tiles) stays 1-D")
+            }
+            t |> equal(matmul_grid(4 * lanes * 8, 4l, 4, huge, 2048l, 4).y, 1, "unstarved shape stays 1-D")
+            t |> equal(matmul_grid(4 * lanes * 8, 4l, 4, 1_999_999l, 2048l, 4).y, 1, "inline signal stays 1-D")
+            restore_shaping_defaults()
+        }
+        t |> run("knob 2 (wave-aligned): rc*ntc is whole L-waves, or falls back 1-D") @(t : T?) {
+            set_batch_grid_2d(2)
+            if (lanes >= 3) {
+                let g = matmul_grid(sunits, 4l, 4, huge, 2048l, 4)
+                t |> equal(g.x, lanes - 1)
+                t |> success(g.y > 1, "starved shape with plenty of tokens goes 2-D")
+                t |> equal((g.x * g.y) % lanes, 0, "the grid total is a whole number of L-waves")
+                t |> success(g.x * g.y >= lanes * 4, "the grid covers the oversplit target")
+                t |> equal(matmul_grid(sunits, 4l, 4, huge, 16l, 4).y, 1, "alignment that can't fit the tiles stays 1-D")
+            }
+            restore_shaping_defaults()
+        }
+        t |> run("row cells clamp to whole units; knob value clamps to [0,2]") @(t : T?) {
+            set_batch_grid_2d(1)
+            if (lanes > 4) {
+                let g = matmul_grid(2, 32l, 4, huge, 2048l, 4)   // 64 rows = 4 grain chunks, but only 2 units
+                t |> equal(g.x, 2, "rc never exceeds the unit count")
+                t |> success(g.y > 1)
+            }
+            set_batch_grid_2d(7)
+            t |> equal(get_batch_grid_2d(), 2)
+            set_batch_grid_2d(-3)
+            t |> equal(get_batch_grid_2d(), 0)
             restore_shaping_defaults()
         }
     }

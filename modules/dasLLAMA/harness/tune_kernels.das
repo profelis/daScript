@@ -1139,7 +1139,8 @@ def main {
         matmul_min_chunk_rows = get_matmul_min_chunk_rows(),
         matmul_min_chunk_rows_gemv = get_matmul_min_chunk_rows_gemv(),
         target_chunk_work = get_target_chunk_work(), gemv_lane_cap = get_gemv_lane_cap(),
-        batch_lane_cap = get_batch_lane_cap(), dispatch_worker_limit = get_dispatch_worker_limit(),
+        batch_lane_cap = get_batch_lane_cap(), batch_grid_2d = get_batch_grid_2d(),
+        dispatch_worker_limit = get_dispatch_worker_limit(),
         team_rank_gate = get_team_rank_gate(),   // -1 = unset (apply skips negatives; env/que default rules)
         attn_par_threshold = get_attn_par_threshold(),
         requant_par_threshold = get_requant_par_threshold(), norm_par_threshold = get_norm_par_threshold(),

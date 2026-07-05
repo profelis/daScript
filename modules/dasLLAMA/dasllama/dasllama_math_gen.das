@@ -341,6 +341,46 @@ def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?;
     }
 }
 
+// One (unit range × token range) cell of the interleaved batch walk — the worker body of the
+// classic 1-D dispatch verbatim (TB blocks outer, groups inner): the 1-D arm calls it once with
+// the full token range, the 2-D grid arm once per cell, so the two arms share one walk and the
+// off-path stays byte-identical.
+def private q8q8_batch_cell_gen(var myp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, nb, mr, TB, kg, wbias : int64; ub, ue : int; tb0, te : int64) {
+    unsafe {
+        var tb = tb0
+        while (tb < te) {
+            let tbe = min(tb + TB, te)
+            let tb4 = tb + ((tbe - tb) / 4l) * 4l
+            for (gi in range(ub, ue)) {
+                let g = int64(gi)
+                let wgp = wp + g * mr * n
+                let sgp = sp + g * mr * nb
+                var tk = tb
+                while (tk < tb4) {
+                    q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, g, tk)
+                    tk += 4l
+                }
+                if (mr == 4l && kg == 4l) {   // an smmla mr4 stamp's plane is kg8 — generic tail below
+                    while (tk < tbe) {
+                        let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * nb, n)
+                        myp[tk * d + g * 4l + 0l] = f.x
+                        myp[tk * d + g * 4l + 1l] = f.y
+                        myp[tk * d + g * 4l + 2l] = f.z
+                        myp[tk * d + g * 4l + 3l] = f.w
+                        tk++
+                    }
+                } else {
+                    while (tk < tbe) {
+                        q8q8_token_grp_generic(myp, wgp, sgp, xqp + tk * n, xsp + tk * nb, n, d, g * mr, tk, mr, wbias, kg)
+                        tk++
+                    }
+                }
+            }
+            tb += TB
+        }
+    }
+}
+
 // The interleaved batch GEMM (grew out of the hand laneq batch kernel, tile swapped for the
 // generated one). Token-blocked: TB tokens outer, groups inner, so the TB×n activation slice
 // stays L2-resident and is reused across this thread's groups instead of re-streaming the whole
@@ -428,38 +468,27 @@ def private q8q8_batch_kernel_neon_laneq_gen(var yp : float?; wp : int8 const?; 
             }
         }
     } else {
-        maybe_parallel_for(0, int(ng), matmul_chunks(int(ng * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
-            unsafe {
-                var tb = 0l
-                while (tb < ntok) {
-                    let tbe = min(tb + TB, ntok)
-                    let tb4 = tb + ((tbe - tb) / 4l) * 4l
-                    for (gi in range(rb, re)) {
-                        let g = int64(gi)
-                        let wgp = wp + g * mr * n
-                        let sgp = sp + g * mr * nb
-                        var tk = tb
-                        while (tk < tb4) {
-                            q8q8_tile_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, g, tk)
-                            tk += 4l
-                        }
-                        if (mr == 4l && kg == 4l) {   // an smmla mr4 stamp's plane is kg8 — generic tail below
-                            while (tk < tbe) {
-                                let f = dot_q8q8_laneq4(wgp, sgp, xqp + tk * n, xsp + tk * nb, n)
-                                myp[tk * d + g * 4l + 0l] = f.x
-                                myp[tk * d + g * 4l + 1l] = f.y
-                                myp[tk * d + g * 4l + 2l] = f.z
-                                myp[tk * d + g * 4l + 3l] = f.w
-                                tk++
-                            }
-                        } else {
-                            while (tk < tbe) {
-                                q8q8_token_grp_generic(myp, wgp, sgp, xqp + tk * n, xsp + tk * nb, n, d, g * mr, tk, mr, wbias, kg)
-                                tk++
-                            }
-                        }
-                    }
-                    tb += TB
+        let grid = matmul_grid(int(ng), mr, get_q8_batch_chunks_per_job(), n * d * ntok, ntok, 4)
+        if (grid.y <= 1) {
+            maybe_parallel_for(0, int(ng), grid.x) $(rb, re) {
+                q8q8_batch_cell_gen(myp, wp, sp, xqp, xsp, xbsp, n, d, nb, mr, TB, kg, wbias, rb, re, 0l, ntok)
+            }
+        } else {
+            // the 2-D grid (matmul_grid engaged): one claim per (unit range × token range) cell,
+            // decoded ROWS-FASTEST so concurrent workers share a token block's activation slice
+            // in LLC while streaming disjoint weight rows. Even-division bounds, token axis in
+            // whole ts=4 tiles with the range tail folded into the last cell.
+            let ntile = ntok / 4l
+            let cells = grid.x * grid.y
+            maybe_parallel_for(0, cells, cells) $(cb, ce) {
+                for (ci in range(cb, ce)) {
+                    let ri = ci % grid.x
+                    let ti = ci / grid.x
+                    let ub = int(int64(ri) * ng / int64(grid.x))
+                    let ue = int(int64(ri + 1) * ng / int64(grid.x))
+                    let ctb = int64(ti) * ntile / int64(grid.y) * 4l
+                    let cte = ti == grid.y - 1 ? ntok : int64(ti + 1) * ntile / int64(grid.y) * 4l
+                    q8q8_batch_cell_gen(myp, wp, sp, xqp, xsp, xbsp, n, d, nb, mr, TB, kg, wbias, ub, ue, ctb, cte)
                 }
             }
         }

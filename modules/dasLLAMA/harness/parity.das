@@ -4,6 +4,7 @@ require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires ea
 require daslib/jobque_boost
 require strings
 require daslib/strings_boost
+require daslib/fio   // has_env_variable / get_env_variable (the DASLLAMA_BATCH_GRID_2D A/B rail)
 require math
 require dasllama/dasllama_math  // setup_dasllama_jobque_ + the runtime knob setters (engine-level, not re-exported)
 
@@ -65,6 +66,12 @@ def main {
     var s = make_run_state(c)
     with_job_que() {
         setup_dasllama_jobque_()
+        // A/B rail: force the 2-D batch chunk grid (0 = 1-D, 1 = fine, 2 = aligned) — the
+        // knob-on GEN_IDS gate; parity stays raw-defaults otherwise
+        if (has_env_variable("DASLLAMA_BATCH_GRID_2D")) {
+            set_batch_grid_2d(to_int(get_env_variable("DASLLAMA_BATCH_GRID_2D")))
+            print("batch grid 2d override: {get_batch_grid_2d()}\n")
+        }
         let ids <- generate(t, s, prompt, length(prompt) + n_gen)
         // generate echoes prompt[1..] then the continuation, so the first generated token is at
         // index length(prompt)-1 (same indexing the runners use)
