@@ -167,6 +167,29 @@ gate "amx cumul fold" "$A " vcvtdq2ps 128
 gate "amx cumul bsum" "$A " vpaddd 128
 C='q8q8_amx_cfg_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2_pipe1_latch1_bias128>'
 gate "amx cumul cfg companion" "$C" ldtilecfg 1
+# pairwise rows (the full 2^3 pin lattice for the SPR sweep): each pair = the union of its
+# arms' structural signatures
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit2_pipe1_latch1
+gate "amx pipe+latch dots" "$A " tdpbssd 8
+gate "amx pipe+latch no-cfg" "$A " ldtilecfg 0
+gate "amx pipe+latch no-release" "$A " tilerelease 0
+gate "amx pipe+latch fold" "$A " vcvtdq2ps 128
+C='q8q8_amx_cfg_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2_pipe1_latch1>'
+gate "amx pipe+latch cfg companion" "$C" ldtilecfg 1
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit2_pipe1_bias128
+gate "amx pipe+b128 dots" "$A " tdpbsud 8
+gate "amx pipe+b128 no-ssd" "$A " tdpbssd 0
+gate "amx pipe+b128 fold" "$A " vcvtdq2ps 128
+gate "amx pipe+b128 bsum" "$A " vpaddd 128
+A=${T}dot_amx_int8_width512_mr16_kstep1_nrsplit2_latch1_bias128
+gate "amx latch+b128 dots" "$A " tdpbsud 4
+gate "amx latch+b128 no-ssd" "$A " tdpbssd 0
+gate "amx latch+b128 no-cfg" "$A " ldtilecfg 0
+gate "amx latch+b128 no-release" "$A " tilerelease 0
+gate "amx latch+b128 fold" "$A " vcvtdq2ps 64
+gate "amx latch+b128 bsum" "$A " vpaddd 64
+C='q8q8_amx_cfg_gen__dot_amx_int8_width512_mr16_kstep1_nrsplit2_latch1_bias128>'
+gate "amx latch+b128 cfg companion" "$C" ldtilecfg 1
 # the vector companions under the amx stamp = the plain sign-trick busd512 lattice over the
 # same unbiased plane (design fork (a)): gemv gkstep2 = 3 block instances x 8 kg = 24 dots +
 # 24 |w|, select-based sign at 512 (no VPSIGNB); mx4 = 8 pshufb lookups + 8 dots; no tile ops
