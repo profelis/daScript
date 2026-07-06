@@ -371,7 +371,11 @@ what it costs today and what the fix would change.
   the admitted lanes (units < k·lanes) — the knob then pins the gate rather than the mode.
   Sized: the 135M-class T≥24 residual vs lcpp (their 0.90-1.0 cells) + the attn_chain lead.
   (Spotted reading their amx/generic drivers during SPR session 3, 2026-07-05.)
-- **FOLLOW-UP after the 2-D chunk space: the Qwen2-Audio arc (speech→text, Boris 2026-07-05).**
+- **✅ SHIPPED (audio arc, 2026-07-06): the Qwen2-Audio arc (speech→text, Boris 2026-07-05).**
+  Landed token-for-token vs mtmd, then grew into the whole audio wave — whisper-proper ASR
+  (6-model family sweep), Ultravox/Qwen2.5-Omni/Voxtral, Qwen3-ASR (new qwen3a chunked
+  encoder), Parakeet-TDT, live-mic dictation, uniform `load_asr_model`/`transcribe` surface +
+  chat-audio verbs on the facade. Arc-local perf ledgers folded in below. Original scoping kept:
   The cheapest audio-input path: Whisper-large-v3 encoder (~640M — mel frontend via the
   ALREADY-BOUND dasMinfft real FFT, the same per-frame-FFT pattern dasAudio's partitioned
   convolution reverb production-tests; 2× conv1d+GELU subsample = kernel-3 neural convs →
@@ -577,6 +581,24 @@ what it costs today and what the fix would change.
   but the quantizer would store fp16-rounded scales, so oracle fixtures need a refreeze check).
   Expected: cls 1.12× → ~1.06×, ffn 1.04× → ~parity; decode e2e ~+2-3%. NOT this PR — needs its
   own arc. (Spotted GEMV hunt, 2026-07-03.)
+- **Audio arc: the fp32 encoder is the whole ASR cost — q8 the encoder GEMMs.** The whisper-family
+  encoder runs fp32 ≈ 18–19 s per 30 s chunk on M1 (~37 s for qwen2a's standard 2 chunks;
+  large-v3-turbo transcribe = 0.49× realtime, almost all of it the encoder window). Fast path:
+  q8 the 6 encoder GEMM families + projector at load (`quantize_weights` pattern) onto the
+  generated q8q8 kernels — expect the usual ~4× (turbo → ~2× realtime) — plus threading the
+  im2col/pack loops. Tolerance-gate like flash-decode (stage witness vs fp32), token-parity
+  revalidate. (Audio arc, 2026-07-05/06.)
+- **Audio arc: the all-silence second chunk's soft tokens are input-independent.** Every ≤30 s
+  clip pads to 2 chunks and the second is all mel-floor — its 750 soft tokens are the same for
+  every clip, cacheable per tower; halves qwen2a encoder cost for short clips. (Audio arc,
+  2026-07-05.)
+- **Audio arc: whisper decoder logits GEMV, only if it shows.** The ASR decoders are small
+  (tiny ~35 MMAC/token, turbo ~140 incl. the 66 MMAC tied logits) — fp32 is fine; q8 the
+  token_embd logits GEMV if profiling ever surfaces it. (Audio arc, 2026-07-06.)
+- **Audio arc (correctness follow-up, not perf): honor `encode(parse_special=true)`.** The flag
+  is documented-unhonored; every call site assembles specials by id + per-segment text encode
+  (the chat-layer pattern). Fix belongs in the tokenizer proper; the workaround callers migrate
+  after. (Audio arc, 2026-07-05.)
 
 ## What collapsed (done — Phase 5)
 
