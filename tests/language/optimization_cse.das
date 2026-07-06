@@ -1,6 +1,7 @@
 options gen2
 options rtti
 options no_coverage
+options disable_auto_inline    // this file pins CSE shapes; auto-splicing would dissolve them
 
 require daslib/ast
 require daslib/rtti
@@ -169,6 +170,77 @@ def target_blockarg(x : int) : int {
     return r + a
 }
 
+// ----- v2: field/index chains rooted at locals and arguments (ast_alias.h) -----
+
+struct CsePoint {
+    x : int
+    y : int
+}
+
+struct CseBody {
+    pos : CsePoint
+    id : int
+}
+
+def touch(var b : CseBody) {
+    b.pos.x += 1
+}
+
+[export]
+def target_field_reuse(b : CseBody) : int {
+    let a = b.pos.x * 19
+    return b.pos.x * 19 + a // chain reused: becomes a + a
+}
+
+[export]
+def target_field_kill(var b : CseBody) : int {
+    let a = b.pos.x * 23
+    b.pos.x = 9   // visible store through the base kills the pair
+    return b.pos.x * 23 + a
+}
+
+[export]
+def target_field_opaque(var b : CseBody) : int {
+    let a = b.pos.x * 29
+    touch(b)      // impure call: kills every memory pair
+    return b.pos.x * 29 + a
+}
+
+[export]
+def target_index_reuse(arr : array<int>; i : int) : int {
+    let a = arr[i] * 31
+    return arr[i] * 31 + a // index chain reused: becomes a + a
+}
+
+[export]
+def target_index_kill(var arr : array<int>; i : int) : int {
+    let a = arr[i] * 37
+    arr |> push(1) // argument-writing call kills chains rooted at arr
+    return arr[i] * 37 + a
+}
+
+[export]
+def target_local_precision(x : int) : int {
+    var s1 = CseBody(pos = CsePoint(x = x, y = 0), id = 0)
+    var s2 = CseBody(pos = CsePoint(x = x + 1, y = 0), id = 0)
+    let a = s1.pos.x * 41
+    s2.pos.x = 7  // a store through ANOTHER local cannot alias s1: the pair survives
+    return s1.pos.x * 41 + a + s2.pos.x
+}
+
+[export]
+def target_arg_aliasing(var a : CseBody; b : CseBody) : int {
+    let t = b.pos.x * 43
+    a.pos.x = 5   // arguments may alias each other: kills argument-rooted pairs
+    return b.pos.x * 43 + t
+}
+
+[export]
+def target_pure_ref_read(arr : array<int>) : int {
+    let n = length(arr) * 47
+    return length(arr) * 47 + n // pure by-ref read of a chain base reused
+}
+
 def has(s, sub : string) : bool {
     return find(s, sub, 0) >= 0
 }
@@ -270,6 +342,38 @@ def test_cse_fired(t : T?) {
             var td = new TypeDecl(baseType = Type.tInt)
             t |> success(target_ptr_factory(td), "fresh clones are distinct")
         }
+        t |> run("field chain is reused") @(t : T?) {
+            let b = body_of(t, "target_field_reuse")
+            t |> equal(count_of(b, "* 19"), 1)
+        }
+        t |> run("store through the base kills the chain pair") @(t : T?) {
+            let b = body_of(t, "target_field_kill")
+            t |> equal(count_of(b, "* 23"), 2)
+        }
+        t |> run("impure call kills memory pairs") @(t : T?) {
+            let b = body_of(t, "target_field_opaque")
+            t |> equal(count_of(b, "* 29"), 2)
+        }
+        t |> run("index chain is reused") @(t : T?) {
+            let b = body_of(t, "target_index_reuse")
+            t |> equal(count_of(b, "* 31"), 1)
+        }
+        t |> run("argument-writing call kills the array chain") @(t : T?) {
+            let b = body_of(t, "target_index_kill")
+            t |> equal(count_of(b, "* 37"), 2)
+        }
+        t |> run("store through another local keeps the pair") @(t : T?) {
+            let b = body_of(t, "target_local_precision")
+            t |> equal(count_of(b, "* 41"), 1)
+        }
+        t |> run("store through one argument kills pairs on another") @(t : T?) {
+            let b = body_of(t, "target_arg_aliasing")
+            t |> equal(count_of(b, "* 43"), 2)
+        }
+        t |> run("pure by-ref read is reused") @(t : T?) {
+            let b = body_of(t, "target_pure_ref_read")
+            t |> equal(count_of(b, "* 47"), 1)
+        }
     }
 }
 
@@ -301,5 +405,24 @@ def test_cse_behavior(t : T?) {
     }
     t |> run("aliased leaf still recomputes") @(t : T?) {
         t |> equal(target_alias(5), 42)
+    }
+    t |> run("chain values preserved") @(t : T?) {
+        var b = CseBody(pos = CsePoint(x = 3, y = 0), id = 0)
+        t |> equal(target_field_reuse(b), 114)
+        t |> equal(target_field_kill(b), 276)
+        b.pos.x = 3
+        t |> equal(target_field_opaque(b), 203)
+        var arr <- [2, 5, 8]
+        t |> equal(target_index_reuse(arr, 0), 124)
+        t |> equal(target_index_kill(arr, 0), 148)
+        t |> equal(target_local_precision(2), 171)
+        t |> equal(target_pure_ref_read(arr), 376)  // push above grew it to 4
+    }
+    t |> run("same struct passed to both parameters reads the store") @(t : T?) {
+        var s = CseBody(pos = CsePoint(x = 2, y = 0), id = 0)
+        t |> equal(target_arg_aliasing(s, s), 301)  // 5*43 + 2*43: the recompute observes the write
+        var s2 = CseBody(pos = CsePoint(x = 2, y = 0), id = 0)
+        var s3 = CseBody(pos = CsePoint(x = 2, y = 0), id = 0)
+        t |> equal(target_arg_aliasing(s2, s3), 172)
     }
 }

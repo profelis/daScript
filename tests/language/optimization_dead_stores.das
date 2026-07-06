@@ -1,5 +1,6 @@
 options gen2
 options rtti
+options disable_auto_inline    // this file pins DSE shapes; auto-splicing would dissolve them
 
 require daslib/ast
 require daslib/rtti
@@ -146,6 +147,76 @@ def target_opassign(x : int) : int {
     return x
 }
 
+// ----- v2: field-chain stores and declaration inits (ast_alias.h) -----
+
+struct DsePoint {
+    x : int
+    y : int
+}
+
+struct DseBody {
+    pos : DsePoint
+    id : int
+}
+
+def observe_field(s : DseBody) : int => s.pos.x
+
+[export]
+def target_field_overwrite(x : int) : int {
+    var s : DseBody
+    s.pos.x = x * 51 // dead: overwritten below before any read
+    s.pos.x = x + 53
+    return s.pos.x
+}
+
+[export]
+def target_field_disjoint(x : int) : int {
+    var s : DseBody
+    s.pos.x = x + 57 // LIVE: disjoint fields never kill each other
+    s.pos.y = x + 59
+    return s.pos.x + s.pos.y
+}
+
+[export]
+def target_field_partial(x : int) : int {
+    var s : DseBody
+    s.pos = DsePoint(x = x + 61, y = x + 67) // LIVE: its y survives the partial overwrite below
+    s.pos.x = x + 71
+    return s.pos.x + s.pos.y
+}
+
+[export]
+def target_whole_read(x : int) : int {
+    var s : DseBody
+    s.pos.x = x + 73 // LIVE: the whole-struct read below observes it
+    return observe_field(s)
+}
+
+[export]
+def target_arg_store(var s : DseBody; x : int) {
+    s.pos.x = x + 79 // LIVE: argument writes are the caller's to observe
+}
+
+[export]
+def target_init_strip(x : int) : int {
+    var t = x * 83 // dead init: overwritten on every path before any read
+    if (x > 0) {
+        t = x + 1
+    } else {
+        t = x + 2
+    }
+    return t
+}
+
+[export]
+def target_init_live(x : int) : int {
+    var t = x * 89 // LIVE init: read on the else path
+    if (x > 0) {
+        t = x + 3
+    }
+    return t
+}
+
 def has(s, sub : string) : bool {
     return find(s, sub, 0) >= 0
 }
@@ -225,6 +296,37 @@ def test_dead_stores_fired(t : T?) {
             let b = body_of(t, "target_opassign")
             t |> success(has(b, "+="), "op-assign statement kept: {b}")
         }
+        t |> run("overwritten field store is removed") @(t : T?) {
+            let b = body_of(t, "target_field_overwrite")
+            t |> success(!has(b, "* 51"), "dead field store gone: {b}")
+            t |> success(has(b, "+ 53"), "live field store kept: {b}")
+        }
+        t |> run("disjoint fields never kill each other") @(t : T?) {
+            let b = body_of(t, "target_field_disjoint")
+            t |> success(has(b, "+ 57") && has(b, "+ 59"), "both field stores kept: {b}")
+        }
+        t |> run("partial overwrite keeps the whole-chain store") @(t : T?) {
+            let b = body_of(t, "target_field_partial")
+            t |> success(has(b, "+ 67"), "prefix store kept for its y: {b}")
+            t |> success(has(b, "+ 71"), "partial store kept: {b}")
+        }
+        t |> run("whole-struct read keeps the field store") @(t : T?) {
+            let b = body_of(t, "target_whole_read")
+            t |> success(has(b, "+ 73"), "field store kept: {b}")
+        }
+        t |> run("argument stores are never candidates") @(t : T?) {
+            let b = body_of(t, "target_arg_store")
+            t |> success(has(b, "+ 79"), "argument store kept: {b}")
+        }
+        t |> run("dead declaration init is stripped") @(t : T?) {
+            let b = body_of(t, "target_init_strip")
+            t |> success(!has(b, "* 83"), "dead init gone: {b}")
+            t |> success(has(b, "+ 1") && has(b, "+ 2"), "arm stores kept: {b}")
+        }
+        t |> run("init read on one path is kept") @(t : T?) {
+            let b = body_of(t, "target_init_live")
+            t |> success(has(b, "* 89"), "live init kept: {b}")
+        }
     }
 }
 
@@ -263,5 +365,20 @@ def test_dead_stores_behavior(t : T?) {
         var vb = 2
         let res = target_ptr(unsafe(addr(va)), unsafe(addr(vb)))
         t |> equal(*res, 2)
+    }
+    t |> run("chain values preserved") @(t : T?) {
+        t |> equal(target_field_overwrite(2), 55)
+        t |> equal(target_field_disjoint(1), 118)
+        t |> equal(target_field_partial(1), 140)
+        t |> equal(target_whole_read(1), 74)
+        t |> equal(target_init_strip(4), 5)
+        t |> equal(target_init_strip(-4), -2)
+        t |> equal(target_init_live(4), 7)
+        t |> equal(target_init_live(-4), -356)
+    }
+    t |> run("argument store lands in the caller") @(t : T?) {
+        var s : DseBody
+        target_arg_store(s, 1)
+        t |> equal(s.pos.x, 80)
     }
 }
