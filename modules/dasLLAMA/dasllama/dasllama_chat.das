@@ -4,6 +4,7 @@ module dasllama_chat shared public
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require dasllama/dasllama_tokenizer  // TokKind — disambiguate the "llama" chat template by backend
+require dasllama/dasllama_audio      // AudioTower + encoder: chat sessions can carry an audio tower
 require daslib/strings_boost  // join() to assemble a segment / the streamed reply in O(n)
 
 // The chat layer (layer 2). One engine drives every model: create_chat resolves the arch's chat
@@ -26,7 +27,9 @@ struct Message {
 }
 
 //! A chat conversation over a model: the KV-cache session, the resolved chat template, and the
-//! running transcript. A model serves many independent ChatSessions.
+//! running transcript. A model serves many independent ChatSessions. A session created with an
+//! audio tower (``create_chat(model, tower)``) also owns the tower + encoder scratch and can
+//! take ``add_user_audio`` — the soft tokens splice into the next turn's prefill.
 struct ChatSession {
     session : Session = Session()
     tmpl : ChatTemplate = ChatTemplate()
@@ -38,6 +41,10 @@ struct ChatSession {
     first : bool = true             // first turn emits add_bos + the system turn
     max_new : int64 = 256l          // per-reply token budget
     history : array<Message>
+    tower : AudioTower = AudioTower()     // d_model == 0 => text-only chat
+    enc : EncoderState = EncoderState()   // encoder scratch (sized once at create)
+    audio_rows : array<float>             // encoded soft tokens awaiting the next respond()
+    n_audio_rows : int64                  // row count in audio_rows (each tower.proj_dim wide)
 }
 
 // ===== Chat-template resolution =====
@@ -60,6 +67,22 @@ def private mistral_instruct_template() : ChatTemplate {
     var ct = ChatTemplate()
     ct.add_bos = true   // <s>
     ct.user.parts <- [chat_special("[INST]"), chat_text(" "), chat_content(), chat_text(" "), chat_special("[/INST]")]
+    ct.assistant_close.parts <- [chat_special("</s>")]   // [INST] wraps USER turns; assistant turns end with EOS
+    ct.stop <- ["</s>"]
+    return <- ct
+}
+
+// The Mistral v7-tekken template (Voxtral, Mistral-Small-3.x): [INST]content[/INST] with NO
+// spacing, [SYSTEM_PROMPT]…[/SYSTEM_PROMPT] system role. The GGUF stores the template NAME
+// ("mistral-v7-tekken"), not Jinja — detection matches the name. Audio spans open with
+// [BEGIN_AUDIO] and have no closing marker (the mtmd voxtral shape).
+def private mistral_v7_tekken_template() : ChatTemplate {
+    var ct = ChatTemplate()
+    ct.add_bos = true   // <s>
+    ct.system.parts <- [chat_special("[SYSTEM_PROMPT]"), chat_content(), chat_special("[/SYSTEM_PROMPT]")]
+    ct.user.parts <- [chat_special("[INST]"), chat_content(), chat_special("[/INST]")]
+    ct.assistant_close.parts <- [chat_special("</s>")]   // assistant turns close with EOS, not [/INST]
+    ct.audio_pre.parts <- [chat_special("[BEGIN_AUDIO]")]
     ct.stop <- ["</s>"]
     return <- ct
 }
@@ -85,6 +108,8 @@ def private detect_chat_template(m : Model; var out : ChatTemplate) : bool {
         out <- arch_chat("gemma2")
     } elif (contains(src, "<|end|>")) {           // Phi-3
         out <- arch_chat("phi3")
+    } elif (contains(src, "v7-tekken")) {         // Mistral v7-tekken BY NAME (Voxtral GGUFs store
+        out <- mistral_v7_tekken_template()       // the llama.cpp template alias, not Jinja)
     } elif (contains(src, "[INST]")) {            // Mistral instruct
         out <- mistral_instruct_template()
     } elif (contains(src, "<|user|>")) {          // Zephyr / TinyLlama-chat
@@ -156,6 +181,43 @@ def private render_prompt(m : Model; c : ChatSession; var out : array<int64>) {
     render_parts(m, c.tmpl.assistant_open.parts, "", out)
 }
 
+// Render an AUDIO turn's prefill as two token spans around the soft-token splice point:
+//   head = [BOS + system] + user parts before the content slot + audio_pre markers
+//   tail = audio_post markers + content + user parts after content + assistant_open
+// Splitting the text run at the audio span matches llama-mtmd-cli exactly — its text chunks
+// break at media boundaries, so BPE merges never cross the audio (session A's gated shape).
+def private render_prompt_audio(m : Model; c : ChatSession; var head : array<int64>; var tail : array<int64>) {
+    if (c.first && c.tmpl.add_bos) {
+        head |> push(bos_id(m))
+    }
+    var user_content = c.pending
+    if (c.first && !empty(c.system)) {
+        if (!empty(c.tmpl.system.parts)) {
+            render_parts(m, c.tmpl.system.parts, c.system, head)
+        } else {
+            user_content = "{c.system}\n\n{c.pending}"
+        }
+    }
+    var before : array<ChatPart>
+    var after : array<ChatPart>
+    var seen = false
+    for (p in c.tmpl.user.parts) {
+        if (p.kind == ChatPartKind.content) {
+            seen = true
+        } elif (seen) {
+            after |> push(p)
+        } else {
+            before |> push(p)
+        }
+    }
+    render_parts(m, before, "", head)
+    render_parts(m, c.tmpl.audio_pre.parts, "", head)
+    var tail_parts := c.tmpl.audio_post.parts
+    tail_parts |> push(chat_content())
+    tail_parts |> push_from(after, c.tmpl.assistant_open.parts)
+    render_parts(m, tail_parts, user_content, tail)
+}
+
 // ===== Public API =====
 
 //! Start a conversation over `model`. `system` is the system prompt (empty = none); `max_new` caps
@@ -169,16 +231,56 @@ def create_chat_(model : Model; system : string = ""; max_new : int64 = 256l) : 
             c.stop_ids |> push(id)
         }
     }
-    // the assistant turn terminates like a user turn: the user-template parts after the content slot
-    var seen = false
-    for (p in c.tmpl.user.parts) {
-        if (p.kind == ChatPartKind.content) {
-            seen = true
-        } elif (seen) {
-            c.close_parts |> push(p)
+    // how the assistant turn terminates: the template's explicit assistant_close, else the
+    // user-template parts after the content slot (right for chatml/llama-3-style templates)
+    if (!empty(c.tmpl.assistant_close.parts)) {
+        c.close_parts := c.tmpl.assistant_close.parts
+    } else {
+        var seen = false
+        for (p in c.tmpl.user.parts) {
+            if (p.kind == ChatPartKind.content) {
+                seen = true
+            } elif (seen) {
+                c.close_parts |> push(p)
+            }
         }
     }
     return <- c
+}
+
+//! Start an AUDIO-CAPABLE conversation: like create_chat, but the chat takes ownership of an
+//! audio tower (moved in) so ``add_user_audio`` can splice soft tokens into its turns. The
+//! tower must project into the decoder's embedding width (a mismatched decoder/mmproj pair
+//! panics here, not at respond time).
+def create_chat_(model : Model; var tower : AudioTower; system : string = ""; max_new : int64 = 256l) : ChatSession {
+    if (tower.proj_dim != model.config.dim) {
+        panic("dasLLAMA chat: mmproj projects to {tower.proj_dim} but the decoder is {model.config.dim}-wide — mismatched pair")
+    }
+    var c <- create_chat_(model, system, max_new)
+    c.enc <- make_encoder_state(tower)
+    c.tower <- tower
+    return <- c
+}
+
+//! Queue audio (16 kHz mono f32 PCM) for the next respond() — encoded to soft tokens NOW,
+//! spliced at the head of the next user turn (before its text, wrapped in the template's
+//! audio markers). Composes with add_user in the same turn; multiple clips concatenate.
+//! Call inside with_job_que() — the encoder threads its kernels.
+def add_user_audio_(var c : ChatSession; samples : array<float> | #) {
+    if (c.tower.d_model == 0l) {
+        panic("dasLLAMA chat: this chat has no audio tower — create it with create_chat(model, tower)")
+    }
+    let chunks <- log_mel_chunks(samples, c.tower.n_mel)
+    let rows = audio_tokens_per_chunk(c.tower)
+    let dim = c.tower.proj_dim
+    c.audio_rows |> reserve(int((c.n_audio_rows + int64(length(chunks)) * rows) * dim))
+    for (chunk in chunks) {
+        audio_encode(c.tower, c.enc, chunk)
+        for (i in range64(rows * dim)) {
+            c.audio_rows |> push(c.enc.out[i])
+        }
+    }
+    c.n_audio_rows += int64(length(chunks)) * rows
 }
 
 //! Render the next turn's prefill token ids — BOS + system on the first turn, then the user turn and
@@ -194,6 +296,31 @@ def add_user_(var c : ChatSession; text : string) {
     c.pending = text
     c.has_pending = true
     c.history |> push(Message(role = Role.user, content = text))
+}
+
+//! Inject a KNOWN assistant reply into the conversation WITHOUT generating: prefills the pending
+//! user turn and this assistant text into the KV cache, then closes the turn — exactly what respond
+//! does, but with a given reply instead of a sampled one. Use it to replay a prior transcript before
+//! respond() generates the final turn (e.g. a stateless OpenAI-style request that resends the whole
+//! history). Precondition: a user message is pending (call add_user first); a no-op otherwise. Text
+//! turns only — a pending audio turn is not replayed.
+def add_assistant_(m : Model; var c : ChatSession; text : string) {
+    if (!c.has_pending) {
+        return
+    }
+    var pre : array<int64>
+    render_prompt(m, c, pre)   // user turn + the assistant-open generation prompt
+    eval_(m, c.session, pre)
+    let body <- encode_(m, text, false, false)
+    eval_(m, c.session, body)
+    c.first = false
+    c.has_pending = false
+    c.pending = ""   // consumed — render_prompt_audio reads it gated only on n_audio_rows, so a
+                     // leftover would silently re-inject this text into a later audio-only turn
+    var close : array<int64>
+    render_parts(m, c.close_parts, "", close)
+    eval_(m, c.session, close)
+    c.history |> push(Message(role = Role.assistant, content = text))
 }
 
 //! `reply` with a leading `<think>…</think>` reasoning block removed (the Qwen3 thinking format) —
@@ -216,23 +343,52 @@ def strip_think(reply : string) : string {
 //! Timing is available afterwards via stats(c.session).
 def respond_(m : Model; var c : ChatSession; params : SamplingParams;
              blk : block<(piece : string) : bool>) : string {
-    if (!c.has_pending) {
+    if (!c.has_pending && c.n_audio_rows == 0l) {
         return ""
     }
-    var pre : array<int64>
-    render_prompt(m, c, pre)
-    c.first = false
-    c.has_pending = false
     // local clone so the streaming callback captures no part of `c` (c.session is passed to generate)
     var stops := c.stop_ids
     var reply_parts : array<string>
-    generate_(m, c.session, pre, params, c.max_new) $(id, piece) {
-        for (sid in stops) {
-            return false if (id == sid)
+    if (c.n_audio_rows > 0l) {
+        // audio turn: token spans around the soft-token splice, prefilled as embedding rows
+        var head : array<int64>
+        var tail : array<int64>
+        render_prompt_audio(m, c, head, tail)
+        let dim = m.config.dim
+        let n_head = int64(length(head))
+        let n_tail = int64(length(tail))
+        let npos = n_head + c.n_audio_rows + n_tail
+        var embd : array<float>
+        embd |> resize(int(npos * dim))
+        embed_text_rows(m, head, embd, 0l)
+        for (i in range64(c.n_audio_rows * dim)) {
+            embd[n_head * dim + i] = c.audio_rows[i]
         }
-        reply_parts |> push(piece)
-        return invoke(blk, piece)
+        embed_text_rows(m, tail, embd, n_head + c.n_audio_rows)
+        generate_embd_(m, c.session, embd, npos, params, c.max_new) $(id, piece) {
+            for (sid in stops) {
+                return false if (id == sid)
+            }
+            reply_parts |> push(piece)
+            return invoke(blk, piece)
+        }
+        c.audio_rows |> clear()
+        c.n_audio_rows = 0l
+    } else {
+        var pre : array<int64>
+        render_prompt(m, c, pre)
+        generate_(m, c.session, pre, params, c.max_new) $(id, piece) {
+            for (sid in stops) {
+                return false if (id == sid)
+            }
+            reply_parts |> push(piece)
+            return invoke(blk, piece)
+        }
     }
+    c.first = false
+    c.has_pending = false
+    c.pending = ""   // consumed — render_prompt_audio reads it gated only on n_audio_rows, so a
+                     // leftover would silently re-inject this text into a later audio-only turn
     // close the assistant turn so the next turn continues cleanly
     var close : array<int64>
     render_parts(m, c.close_parts, "", close)

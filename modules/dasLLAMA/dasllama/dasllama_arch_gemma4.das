@@ -36,5 +36,6 @@ def register_arch_gemma4() {
     d.chat.user.parts <- [chat_special("<|turn>"), chat_text("user\n"), chat_content(), chat_special("<turn|>"), chat_text("\n")]
     d.chat.assistant_open.parts <- [chat_special("<|turn>"), chat_text("model\n"), chat_special("<|channel>"), chat_text("thought\n"), chat_special("<channel|>")]
     d.chat.stop <- ["<turn|>", "<eos>"]
+    d.lcaps.system_prompt = false   // no system role — the chat layer folds it into the first user turn
     register_arch("gemma4", d)
 }

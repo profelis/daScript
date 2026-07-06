@@ -18,5 +18,18 @@ def register_arch_qwen2() {
     d.chat.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
     d.chat.assistant_open.parts <- [chat_special("<|im_start|>"), chat_text("assistant\n")]
     d.chat.stop <- ["<|im_end|>", "<|endoftext|>"]
+    // audio-capable qwen2 family (Qwen2-Audio, Qwen2.5-Omni) wraps the soft-token span in
+    // audio markers; renders only on audio turns, so text-only qwen2 vocabs never resolve these
+    d.chat.audio_pre.parts <- [chat_special("<|audio_bos|>")]
+    d.chat.audio_post.parts <- [chat_special("<|audio_eos|>")]
+    // Qwen2.5-Omni's decoder converts as `qwen2vl` — M-RoPE with rope.dimension_sections.
+    // For text + audio input every M-RoPE coordinate equals the linear position (mtmd's
+    // set_position_mrope_1d), which rotates each section by exactly the standard-rope angle,
+    // so the plain qwen2 forward is bit-identical. Vision input (unequal coords) is out of
+    // scope and would need real M-RoPE. (Clone the template BEFORE register_arch moves `d`.)
+    var dv = ArchDesc(name = "qwen2vl", configure = @@configure_qwen2)
+    dv.blocks = std_blocks()
+    dv.chat := d.chat
     register_arch("qwen2", d)
+    register_arch("qwen2vl", dv)
 }

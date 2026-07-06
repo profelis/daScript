@@ -35,6 +35,7 @@ let GGML_TYPE_F32 = 0
 let GGML_TYPE_F16 = 1
 let GGML_TYPE_Q4_0 = 2
 let GGML_TYPE_Q8_0 = 8
+let GGML_TYPE_BF16 = 30
 let GGML_TYPE_MXFP4 = 39
 
 // MXFP4 e2m1 magnitudes DOUBLED (nibble -> ±{0,.5,1,1.5,2,3,4,6}×2, OCP MX spec via ggml
@@ -44,11 +45,11 @@ let private MXFP4_KVALUES = fixed_array(0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
 
 // ===== little-endian byte readers =====
 
-def private rd_u16(b : array<uint8> | #; o : int64) : uint {
+def rd_u16(b : array<uint8> | #; o : int64) : uint {
     return uint(b[o]) | (uint(b[o + 1l]) << 8u)
 }
 
-def private rd_u32(b : array<uint8> | #; o : int64) : uint {
+def rd_u32(b : array<uint8> | #; o : int64) : uint {
     return uint(b[o]) | (uint(b[o + 1l]) << 8u) | (uint(b[o + 2l]) << 16u) | (uint(b[o + 3l]) << 24u)
 }
 
@@ -56,7 +57,7 @@ def private rd_u64(b : array<uint8> | #; o : int64) : uint64 {
     return uint64(rd_u32(b, o)) | (uint64(rd_u32(b, o + 4l)) << 32ul)
 }
 
-def private rd_i32(b : array<uint8> | #; o : int64) : int {
+def rd_i32(b : array<uint8> | #; o : int64) : int {
     return int(rd_u32(b, o))
 }
 
@@ -64,7 +65,7 @@ def private rd_i64(b : array<uint8> | #; o : int64) : int64 {
     return int64(rd_u64(b, o))
 }
 
-def private rd_f32(b : array<uint8> | #; o : int64) : float {
+def rd_f32(b : array<uint8> | #; o : int64) : float {
     return unsafe(reinterpret<float>(rd_u32(b, o)))
 }
 
@@ -97,6 +98,35 @@ def f16_to_f32(h : uint) : float {
         bits = sign | ((exp + 112u) << 23u) | (mant << 13u)
     }
     return unsafe(reinterpret<float>(bits))
+}
+
+//! Convert fp32 to IEEE-754 binary16 bits, round-to-nearest-even (matches ARM fcvt / x86
+//! F16C hardware conversion — what ggml's FP32_TO_FP16 compiles to on both oracles).
+def f32_to_f16(f : float) : uint {
+    let bits = unsafe(reinterpret<uint>(f))
+    let sign = (bits >> 16u) & 0x8000u
+    let absb = bits & 0x7FFFFFFFu
+    if (absb > 0x7F800000u) {          // nan -> quiet nan
+        return sign | 0x7E00u
+    }
+    if (absb >= 0x47800000u) {         // inf, or >= 65536 (overflows past f16 max)
+        return sign | 0x7C00u
+    }
+    if (absb >= 0x38800000u) {         // normal f16 range (>= 2^-14): rebias, RNE off 13 bits
+        let v = absb - 0x38000000u     // exponent field now f16-biased, aligned at bit 23
+        return sign | ((v + 0xFFFu + ((v >> 13u) & 1u)) >> 13u)  // mantissa carry -> inf is correct IEEE overflow
+    }
+    let e = absb >> 23u                // subnormal or zero: h = round(m·2^(e-126)) in 2^-24 units
+    let m = (absb & 0x7FFFFFu) | 0x800000u
+    if (e < 102u || (e == 102u && m == 0x800000u)) {  // below 2^-25, or exactly 2^-25 (tie to even 0)
+        return sign
+    }
+    let sh = 126u - e                  // e in [102,112] -> sh in [14,24]
+    let base = m >> sh
+    let rem = m & ((1u << sh) - 1u)
+    let half = 1u << (sh - 1u)
+    let up = rem > half || (rem == half && (base & 1u) == 1u)
+    return sign | (up ? base + 1u : base)  // carry into 0x0400 = smallest normal, also correct
 }
 
 // E8M0 block scale -> fp32 * 0.5 = 2^(e-128) (the half matches the doubled MXFP4_KVALUES).
@@ -444,6 +474,14 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             let src = temp_array(reinterpret<uint16?>(addr(bytes[base + src_off * 2l])), expect_n, type<uint16>)
             for (i in range64(expect_n)) {
                 dst[dst_off + i] = f16_to_f32(uint(src[i]))
+            }
+        }
+    } elif (gtype == GGML_TYPE_BF16) {
+        // bf16 is the top 16 bits of an f32 — the shift-up conversion is exact
+        unsafe {
+            let src = temp_array(reinterpret<uint16?>(addr(bytes[base + src_off * 2l])), expect_n, type<uint16>)
+            for (i in range64(expect_n)) {
+                dst[dst_off + i] = reinterpret<float>(uint(src[i]) << 16u)
             }
         }
     } elif (gtype == GGML_TYPE_Q8_0) {

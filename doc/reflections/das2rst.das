@@ -294,11 +294,11 @@ def private dasllama_type_stanza(f : FILE const?; lab : string; tname : string; 
 def document_module_dasllama(_root : string) {
     var mod = find_module("dasllama")
     var groups <- array<DocGroup>(
-        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|setup_dasllama_jobque)$%%),
+        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|setup_dasllama_jobque|caps)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
-        group_by_regex("Evaluation and sampling", mod, %regex~(eval|sample|set_seed|stats)$%%),
-        group_by_regex("Generation", mod, %regex~(generate)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|add_user|render_turn|respond)$%%)
+        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|sample|set_seed|stats)$%%),
+        group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
+        group_by_regex("Chat", mod, %regex~(create_chat|add_user|add_user_audio|add_assistant|render_turn|respond)$%%)
     )
     var hook = DocsHook()
     hook.afterEnums <- @(var f : FILE const?; _was_enums : bool) {
@@ -315,8 +315,12 @@ def document_module_dasllama(_root : string) {
             "Sampling knobs: ``temp`` (<= 0 selects greedy argmax), ``top_k`` (0 = no cutoff), and repetition ``penalty`` (1.0 = none) applied over the last ``penalty_last_n`` generated tokens. The defaults are greedy — ``SamplingParams()`` reproduces argmax exactly.")
         dasllama_type_stanza(f, "struct-dasllama_common-Stats", "Stats",
             "Timing of the last ``generate``/``respond`` call: ``n_prompt``/``n_gen`` token counts, ``ttft_s`` (seconds to first token), and ``prefill_tps``/``gen_tps`` throughput in tokens per second.")
+        dasllama_type_stanza(f, "struct-dasllama_common-LlmCaps",  "LlmCaps",
+            "What the model honestly supports at the chat layer, as returned by ``caps``: ``system_prompt`` is false for architectures with no system role (gemma), where the chat layer silently folds the system prompt into the first user turn. Grows as gaps surface.")
         dasllama_type_stanza(f, "struct-dasllama_chat-ChatSession", "ChatSession",
             "A conversation over a model: its ``session``, the resolved chat template, and the running transcript in ``history``. Create with ``create_chat``, then drive with ``add_user`` + ``respond``.")
+        dasllama_type_stanza(f, "struct-dasllama_audio-AudioTower", "AudioTower",
+            "A loaded audio encoder: Whisper-family encoder weights plus the model-specific projector tail, as produced by ``load_audio_tower`` from an mmproj GGUF. Pass it to ``create_chat`` to enable ``add_user_audio`` turns.")
     }
     document("dasLLAMA LLM inference: models, sessions, generation, chat", mod, "dasllama.rst", groups, hook)
 }

@@ -257,6 +257,21 @@ def test_chat_template_detection(t : T?) {
         t |> equal(detected_special("bos_token xx [INST] xx [/INST] eos_token"), "[INST]")
         t |> equal(detected_special("xx <|user|> xx eos_token xx"), "</s>")        // Zephyr: text markers
     }
+    t |> run("[INST]-family templates close the assistant turn with </s>, not the user tail") @(t : T?) {
+        // [INST]…[/INST] wraps USER turns only; the assistant's reply ends with EOS. The
+        // derived user-tail close (` [/INST]`) is wrong for this family — multi-turn history
+        // must render `… reply</s>[INST] next …`.
+        var m = Model()
+        m.chat_template_str = "bos_token xx [INST] xx [/INST] eos_token"
+        let ct <- chat_template(m)
+        t |> equal(length(ct.assistant_close.parts), 1, "v0.3 has an explicit assistant close")
+        t |> equal(ct.assistant_close.parts[0].s, "</s>")
+        var m2 = Model()
+        m2.chat_template_str = "mistral-v7-tekken"
+        let ct2 <- chat_template(m2)
+        t |> equal(length(ct2.assistant_close.parts), 1, "v7-tekken has an explicit assistant close")
+        t |> equal(ct2.assistant_close.parts[0].s, "</s>")
+    }
     t |> run("arch fallback when the GGUF carries no template") @(t : T?) {
         var m = Model()
         m.arch = "qwen2"
@@ -288,5 +303,34 @@ def test_chat_strip_think(t : T?) {
         t |> equal(strip_think(""), "")
         // a think tag mentioned mid-reply is content, not a reasoning block
         t |> equal(strip_think("use the <think> tag like this"), "use the <think> tag like this")
+    }
+}
+
+// ===== pending consumption (regression: an audio-only turn must not resurrect prior text) =====
+
+[test]
+def test_chat_pending_cleared_on_consume(t : T?) {
+    t |> run("respond()/add_assistant() clear the consumed user text (needs SmolLM2-135M)") @(t : T?) {
+        let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: {path} not present")
+            return
+        }
+        with_job_que() {
+            setup_dasllama_jobque()
+            var m <- load_capped(path)
+            var c = create_chat(m, "", 4l)   // max_new=4 — the state machine is under test, not the reply
+            add_user(c, "Count to three.")
+            let reply = respond(m, c, SamplingParams()) $(piece) => true
+            // pending must not survive its consumption: render_prompt_audio reads c.pending gated
+            // only on n_audio_rows, so a leftover here silently re-injects THIS text into a later
+            // audio-only turn's prompt
+            t |> equal(c.pending, "", "respond() cleared the consumed text (reply: '{reply}')")
+            add_user(c, "And now four.")
+            add_assistant(m, c, "One, two, three, four.")
+            t |> equal(c.pending, "", "add_assistant() cleared the consumed text")
+            delete c
+            delete m
+        }
     }
 }
