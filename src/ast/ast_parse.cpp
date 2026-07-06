@@ -210,7 +210,7 @@ namespace das {
                                 while ( src < src_end && (src[0]==' ' || src[0]=='\t') ) {
                                     src ++;
                                 }
-                                while ( src < src_end && (isalnumE(src[0]) || src[0]=='_' || src[0]=='/' || src[0]=='.') ) {
+                                while ( src < src_end && (isalnumE(src[0]) || src[0]=='_' || src[0]=='/' || src[0]=='.' || src[0]=='%') ) {
                                     reqGuard += *src ++;
                                 }
                                 while ( src < src_end && (src[0]==' ' || src[0]=='\t') ) {

@@ -16,6 +16,10 @@ require ?no_such_guard_pkg optional_require_fixture // guard absent, target RESO
 // while depending on an optional one (e.g. dasllama_math_gen guarding on llvm/daslib/llvm_tune).
 require ?daslib/fio optional_require_fixture_pathguard        // path guard resolves -> target loaded
 require ?daslib/no_such_file_xyz optional_require_fixture_skipme  // path guard unresolvable -> SKIPPED even though the target file resolves
+// %/-rooted guards: grammar-legal require_module_name forms the pre-parse require scanner must
+// scan identically to ast_requireModule (it once stopped at '%', mangling guard AND target)
+require ?%/tests/language/optional_require_fixture.das optional_require_fixture_pctguard  // %/ guard resolves -> target loaded
+require ?%/tests/language/no_such_file_xyz.das optional_require_fixture_pctskip  // %/ guard unresolvable -> SKIPPED, target file resolves
 
 [test]
 def test_optional_require_guard(t : T?) {
@@ -42,6 +46,20 @@ def test_optional_require_path_guard(t : T?) {
     t |> success(!typeinfo builtin_module_exists(optional_require_fixture_skipme))
     static_if (typeinfo builtin_module_exists(optional_require_fixture_skipme)) {
         this_symbol_must_never_resolve_xyz()
+    } else {
+        t |> success(true)
+    }
+}
+
+[test]
+def test_optional_require_pct_path_guard(t : T?) {
+    // %/-rooted path guard resolved: the target loaded and its symbols work
+    t |> equal(optional_require_fixture_pctguard::pctguard_marker(), 44)
+    t |> success(typeinfo builtin_module_exists(optional_require_fixture_pctguard))
+    // %/-rooted path guard unresolvable: skipped despite the target file existing on disk
+    t |> success(!typeinfo builtin_module_exists(optional_require_fixture_pctskip))
+    static_if (typeinfo builtin_module_exists(optional_require_fixture_pctskip)) {
+        this_symbol_must_never_resolve_pct_xyz()
     } else {
         t |> success(true)
     }
