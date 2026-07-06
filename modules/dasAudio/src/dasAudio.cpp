@@ -279,6 +279,7 @@ static bool g_audio_single_threaded = false;
 // captured data cross into a context safely (see the threading notes in the module docs).
 static ma_context g_capture_context;
 static bool g_capture_context_inited = false;
+static bool g_capture_context_is_null = false;   // which backend g_capture_context was built with (tracks g_force_null_backend)
 static ma_device g_capture_device;
 static ma_pcm_rb g_capture_rb;
 static bool g_capture_initialized = false;
@@ -291,16 +292,9 @@ static std::atomic<uint64_t> g_capture_overflow_frames { 0 };
 static vector<ma_device_info> g_capture_device_cache;
 
 void dasAudio_set_null_device ( bool enabled ) {
-    if ( enabled == g_force_null_backend ) return;
     g_force_null_backend = enabled;
-    // The persistent capture context was built for the old backend; drop it while idle so the next
-    // enumeration/record rebuilds it on the newly-selected backend. Skip if actively recording (the
-    // live device sits on this context) — toggling the backend mid-capture is a no-op until stop.
-    if ( g_capture_context_inited && !g_capture_initialized ) {
-        ma_context_uninit(&g_capture_context);
-        g_capture_context_inited = false;
-        g_capture_device_cache.clear();
-    }
+    // The capture context is rebuilt lazily in ensure_capture_context when its backend no longer
+    // matches this flag — so a toggle here (even mid-capture) takes effect on the next idle use.
 }
 
 bool dasAudio_is_single_threaded () {
@@ -393,6 +387,14 @@ bool dasAudio_init ( TFunc<void,TTemporary<TArray<float>>,int32_t,int32_t,float>
 // around rather than the transient (pContext==nullptr) form the playback path uses. Honors the
 // null-backend override so headless/CI runs enumerate+capture without real hardware.
 static bool ensure_capture_context () {
+    // If the cached context was built for a different backend than currently requested (e.g.
+    // sound_set_null_device was toggled since), drop it and rebuild — but only while idle; a live
+    // capture device holds this context, so a mismatch during recording waits until the next use.
+    if ( g_capture_context_inited && g_capture_context_is_null != g_force_null_backend && !g_capture_initialized ) {
+        ma_context_uninit(&g_capture_context);
+        g_capture_context_inited = false;
+        g_capture_device_cache.clear();
+    }
     if ( g_capture_context_inited ) return true;
     ma_result r;
     if ( g_force_null_backend ) {
@@ -406,6 +408,7 @@ static bool ensure_capture_context () {
         return false;
     }
     g_capture_context_inited = true;
+    g_capture_context_is_null = g_force_null_backend;
     return true;
 }
 
