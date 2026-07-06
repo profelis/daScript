@@ -856,18 +856,16 @@ def private token_prob(logits : array<float>; id : int) : float {
     return exp(logits[id] - m) / sum
 }
 
-//! Full greedy transcription (whisper_full's single-decoder temp-0 path, no_context):
-//! 30 s windows advanced by decoded timestamps (or whole windows when ``no_timestamps``),
-//! whisper.cpp's logit-filter suite and segment-splitting rules. Times in centiseconds.
-def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : DecoderState;
-                           samples : array<float> | #; lang : string;
-                           no_timestamps : bool = false; translate : bool = false) : array<WhisperSegment> {
-    var segments : array<WhisperSegment>
-    let lang_id = whisper_lang_id(lang)
-    if (lang_id < 0) {
-        panic("dasLLAMA whisper: unknown language '{lang}'")
-    }
-    let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
+// The window loop (whisper_full's single-decoder temp-0 path, no_context): 30 s windows
+// advanced by decoded timestamps (or whole windows when no_timestamps), whisper.cpp's
+// logit-filter suite and segment-splitting rules. Emits segments through ``blk`` as each
+// window completes, offset by ``t_base`` centiseconds; ``complete_only`` stops before a
+// window whose 3000 mel frames aren't all real audio (the drain path). Returns the mel
+// frames consumed (the final seek, clamped to n_len_org).
+def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var ds : DecoderState;
+                                   mel : WhisperMel; lang_id : int; no_timestamps, translate : bool;
+                                   t_base : int64; complete_only : bool;
+                                   blk : block<(seg : WhisperSegment)>) : int64 {
     let seek_end = mel.n_len_org
     let delta_min = 10l                  // ignore anything under 100 ms
     var seek = 0l
@@ -875,7 +873,7 @@ def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : Dec
     step |> resize(1)
     let n_max = int(w.n_text_ctx / 2l) - 4
 
-    while (seek + delta_min < seek_end) {
+    while (seek + delta_min < seek_end && (!complete_only || seek + AUDIO_CHUNK_FRAMES <= mel.n_len_org)) {
         let win <- whisper_mel_window(mel, seek)
         whisper_encode(w.enc, es, win)
         whisper_cross_kv(w, ds, es.xb)
@@ -963,11 +961,11 @@ def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : Dec
                 if (t.id > w.tok_beg) {
                     let t1 = seek + 2l * int64(t.tid - w.tok_beg)
                     if (!empty(text)) {
-                        var seg = WhisperSegment(t0 = t0, t1 = t1, text = text)
+                        var seg = WhisperSegment(t0 = t_base + t0, t1 = t_base + t1, text = text)
                         for (j in range(i0, i + 1)) {
                             seg.tokens |> push(toks[j].id)
                         }
-                        segments |> emplace(seg)
+                        blk |> invoke(seg)
                     }
                     text = ""
                     t0 = t1
@@ -980,11 +978,11 @@ def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : Dec
                 i++
             }
             if (!empty(text)) {
-                var seg = WhisperSegment(t0 = t0, t1 = seek + seek_delta, text = text)
+                var seg = WhisperSegment(t0 = t_base + t0, t1 = t_base + seek + seek_delta, text = text)
                 for (j in range(i0, result_len)) {
                     seg.tokens |> push(toks[j].id)
                 }
-                segments |> emplace(seg)
+                blk |> invoke(seg)
             }
         }
 
@@ -998,7 +996,124 @@ def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : Dec
         }
         seek += seek_delta
     }
+    return min(seek, mel.n_len_org)
+}
+
+//! Full greedy transcription into a segment array — the probe/test-facing form; the public
+//! ``transcribe``/session API below wraps the same window loop. Times in centiseconds.
+def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : DecoderState;
+                           samples : array<float> | #; lang : string;
+                           no_timestamps : bool = false; translate : bool = false) : array<WhisperSegment> {
+    var segments : array<WhisperSegment>
+    let lang_id = whisper_lang_id(lang)
+    if (lang_id < 0) {
+        panic("dasLLAMA whisper: unknown language '{lang}'")
+    }
+    let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
+    transcribe_mel_windows(w, es, ds, mel, lang_id, no_timestamps, translate, 0l, false) $(seg) {
+        segments |> emplace(seg)
+    }
     return <- segments
+}
+
+// ===== public API: sessions, one-shot, block, and push-chunks feed/drain =====
+
+//! One transcription stream over a loaded model: encoder/decoder scratch, language/task
+//! options, and the fed-but-not-yet-transcribed audio (the push-chunks rail). A model serves
+//! many sessions.
+struct WhisperSession {
+    es : EncoderState = EncoderState()
+    ds : DecoderState = DecoderState()
+    lang : string = "en"
+    translate : bool = false
+    no_timestamps : bool = false
+    pending : array<float>   // fed 16 kHz mono samples awaiting transcription
+    t_base : int64           // centiseconds already consumed off the front of the stream
+}
+
+def create_whisper_session(w : WhisperModel; lang : string = "en") : WhisperSession {
+    //! Create a session (encoder + decoder scratch) for ``w``. ``lang`` is the spoken language
+    //! ("en", "zh", ... — whisper's g_lang codes); set ``session.translate`` for
+    //! speech-to-English translation, ``session.no_timestamps`` to disable timestamp decoding.
+    if (whisper_lang_id(lang) < 0) {
+        panic("dasLLAMA whisper: unknown language '{lang}'")
+    }
+    var s = WhisperSession(lang = lang)
+    s.es <- make_encoder_state(w.enc)
+    s.ds <- make_decoder_state(w)
+    return <- s
+}
+
+def transcribe(w : WhisperModel; var s : WhisperSession; samples : array<float> | #;
+               blk : block<(seg : WhisperSegment)>) : int {
+    //! Transcribe ``samples`` (16 kHz mono f32 PCM), invoking the trailing block per segment as
+    //! each 30 s window completes. Segment times are centiseconds. Returns the segment count.
+    //! Does not touch the session's fed/pending stream — one-shot and push-chunks coexist.
+    var count = 0
+    let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
+    transcribe_mel_windows(w, s.es, s.ds, mel, whisper_lang_id(s.lang), s.no_timestamps, s.translate, 0l, false) $(seg) {
+        count++
+        blk |> invoke(seg)
+    }
+    return count
+}
+
+def transcribe(w : WhisperModel; var s : WhisperSession; samples : array<float> | #) : string {
+    //! One-shot: transcribe ``samples`` and return the full text (concatenated segments).
+    return build_string() $(writer) {
+        transcribe(w, s, samples) $(seg) {
+            writer |> write(seg.text)
+        }
+    }
+}
+
+def feed(var s : WhisperSession; samples : array<float> | #) {
+    //! Push a chunk of 16 kHz mono f32 PCM onto the session's stream. Pair with ``drain``
+    //! (transcribe complete 30 s windows) and ``flush`` (transcribe the remaining tail).
+    s.pending |> reserve(length(s.pending) + length(samples))
+    for (v in samples) {
+        s.pending |> push(v)
+    }
+}
+
+def drain(w : WhisperModel; var s : WhisperSession; blk : block<(seg : WhisperSegment)>) : int {
+    //! Transcribe every COMPLETE 30 s window of the fed stream, invoking the block per segment
+    //! (times are stream-absolute centiseconds). Consumed audio is dropped from the stream;
+    //! anything under a full window stays pending. Returns the segment count — 0 until at
+    //! least 30 s is buffered.
+    var count = 0
+    let mel <- log_mel_whisper(s.pending, w.filters, w.enc.n_mel)
+    let consumed = transcribe_mel_windows(w, s.es, s.ds, mel, whisper_lang_id(s.lang),
+                                          s.no_timestamps, s.translate, s.t_base, true) $(seg) {
+        count++
+        blk |> invoke(seg)
+    }
+    if (consumed > 0l) {
+        let keep = int64(length(s.pending)) - consumed * AUDIO_HOP
+        var rest : array<float>
+        rest |> resize(int(max(keep, 0l)))
+        for (i in range(int(max(keep, 0l)))) {
+            rest[i] = s.pending[int(consumed * AUDIO_HOP) + i]
+        }
+        s.pending <- rest
+        s.t_base += consumed
+    }
+    return count
+}
+
+def flush(w : WhisperModel; var s : WhisperSession; blk : block<(seg : WhisperSegment)>) : int {
+    //! Transcribe everything left on the fed stream (including the sub-30 s tail), then clear
+    //! it. The session stays usable — subsequent feeds continue the stream timeline.
+    var count = 0
+    let mel <- log_mel_whisper(s.pending, w.filters, w.enc.n_mel)
+    transcribe_mel_windows(w, s.es, s.ds, mel, whisper_lang_id(s.lang),
+                           s.no_timestamps, s.translate, s.t_base, false) $(seg) {
+        count++
+        blk |> invoke(seg)
+    }
+    s.t_base += mel.n_len_org
+    s.pending |> clear()
+    return count
 }
 
 //! Token ids -> text (raw byte concat; ids at/above eot have no bytes and are skipped).
