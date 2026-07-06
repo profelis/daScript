@@ -205,9 +205,9 @@ def log_mel_chunks(samples : array<float> | #; n_mel : int64) : array<MelChunk> 
         mmax = max(mmax, double(v))
     }
     mmax -= 8.0lf
-    for (i in range(length(mel))) {
-        let clamped = double(mel[i]) < mmax ? float(mmax) : mel[i]
-        mel[i] = float((double(clamped) + 4.0lf) / 4.0lf)
+    for (v in mel) {
+        let clamped = double(v) < mmax ? float(mmax) : v
+        v = float((double(clamped) + 4.0lf) / 4.0lf)
     }
 
     // full 3000-frame chunks only; the padded tail chunk is dropped (mtmd: "safe to ignore")

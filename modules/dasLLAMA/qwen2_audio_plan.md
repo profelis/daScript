@@ -81,12 +81,58 @@ resamples at decode time (`make_decoder(filename, rate, channels)` → 16 kHz mo
 - **F. Tests + docs**: suite tests (model-gated like existing dasLLAMA tests), README, ledger
   sweep.
 
-## Findings / open questions (updated as slices land)
+## Findings (all slices landed; end-to-end token parity 2026-07-05)
 
-- mel filterbank provenance in mtmd-audio.cpp (generated vs embedded) — pin at slice C.
-- exact STFT padding (center/reflect? final-chunk pad-to-30s?) — pin at slice C.
-- `<|AUDIO|>` / `<|audio_bos|>` / `<|audio_eos|>` ids in the converted decoder GGUF — slice A.
-- whether ggml's gelu_erf is table-driven or erff-exact in this checkout — slice D parity will say.
+- **Token-for-token parity** with `llama-mtmd-cli --temp 0` on both fixtures: jfk.wav
+  ("The spoken content in the audio is '而我最亲爱的美国同胞们' in Mandarin.") and
+  tools/mtmd/test-2.mp3 ("I hear a slow-tempo, ambient electronic track in Bb minor …") —
+  through miniaudio decode, mel, encoder, projector, splice, and the 7B q8 decoder.
+- mel filterbank is GENERATED in mtmd (librosa slaney formula, area-normed, fmax=sr/2) —
+  ported directly; mel gate vs `llama-mtmd-debug -p preproc --audio 440`: chunk 0 maxdiff
+  3.1e-05 (their radix-2 FFT vs our DFT-GEMM float order), silence chunk 3.6e-07.
+- padding pinned: zero-extend input to 31 s FIRST, then reflect-200 head + 30 s zeros + 200
+  tail; Hann periodic-400; mel_floor 2⁻²⁴ (`log10(1e-10)` tail branch is unreachable in the
+  whisper path); global max−8 clamp with the clamp value float-rounded before (x+4)/4.
+  EVERY ≤30 s clip yields TWO chunks (real + all-silence) — mtmd feeds both to the encoder
+  and the decoder sees 1500 audio positions; confirmed in mtmd-cli logs.
+- encoder gate: all-ones mel via `llama-mtmd-debug -p encode --audio one -n 3000` (`-n` is
+  MEL FRAMES there, raw samples are preproc-mode only). Upstream BUG found: the debug
+  audio path crashes (SIGBUS) — `clip_image_encode` drops `is_audio` when wrapping the
+  batch, sending the mel down the 3-channel vision copy. Local patch in the checkout
+  (clip.cpp, infer from single-channel buffer size); consider upstreaming.
+- mtmd/clip library logs are LOG_INF via their own logger — invisible without `--verbose`
+  (both dumps "silently missing" cost a debug cycle each).
+- numpy stage oracle (scratchpad np_encoder.py, ~60 lines off the f32 mmproj) reproduces
+  mtmd stats to ~1e-3 (their encoder runs flash-attn) — its stage dumps + the module's
+  `set_audio_encode_ref_dir` witness rail bisected the one real bug in minutes: layer
+  stride counted 7 d-vectors instead of 8, so each layer's fc2_b was clobbered by the next
+  layer's ln1_w (attention perfect, FFN tail wrong).
+- prompt shape (from mtmd-cli debug logs): NO system message — llama.cpp's C++ chatml
+  render does not inject the Jinja default. Exact stream:
+  `<|im_start|>user\n<|audio_bos|>` + 750×n_chunks embeddings + `<|audio_eos|>{text}<|im_end|>\n<|im_start|>assistant\n`,
+  ONE bos/eos pair around ALL chunks. ids: im_start 151644, im_end 151645, audio_bos
+  151647, audio_eos 151648, `<|AUDIO|>` 151646 (unused by mtmd's splice).
+- **tokenizer gap**: `encode(parse_special=true)` is still documented-unhonored, and BPE
+  add_special prepends BOS where llama.cpp's qwen2 adds none. The demo assembles specials
+  by id + per-segment text encodes (the chat layer's pattern). Follow-up: honor
+  parse_special in the tokenizer so multimodal drivers can tokenize rendered templates
+  directly.
+- decoder GGUF converts to plain `general.architecture = qwen2` (dim 4096, MHA 32/32) —
+  existing arch registration, zero decoder changes. `clip.audio.projection_dim` = 4096
+  read from the mmproj (do not assume 3584).
+
+## Performance ledger (arc-local; fold into API_REWORK.md at PR time)
+
+- fp32 encoder ≈ 18–19 s per 30 s chunk on M1 (~37 s for the standard 2 chunks; projections
+  ride threaded `matmul_batch`, attention parallel over 20 heads via `gemm_f32`). The fast
+  path: q8 the 6 GEMM families + projector at load (`quantize_weights` pattern) onto the
+  generated q8q8 kernels — expect the usual ~4× — plus threading the im2col/pack loops.
+  Tolerance-gate like flash-decode (witness vs fp32), token-parity revalidate.
+- the all-silence second chunk's 750 soft tokens are INPUT-INDEPENDENT (same mel floor
+  every ≤30 s clip) — cacheable per tower; halves encoder cost for short clips.
+- prefill 1518 pos (1500 audio) ≈ 16.4 s on M1 for the 7B q8 decoder (~93 t/s);
+  decode ~11 t/s — normal 7B-on-M1 numbers, no audio-specific cost.
+- mel/DFT-GEMM: single-threaded gemm_f32, ~0.13 s per clip — noise, leave.
 
 ## Performance ledger
 

@@ -40,6 +40,7 @@ modules/dasLLAMA/
     dasllama_tokenizer.das    #   SentencePiece tokenizer (Llama-2 family, Phi-3, Gemma)
     dasllama_bpe.das          #   byte-level BPE / tiktoken tokenizer (Llama-3 + Qwen2 pre-tokenizers)
     dasllama_common.das       #   engine core — Config / Model / Session, load + forward + generate + sample
+    dasllama_audio.das        #   audio tower — whisper mel frontend + encoder + qwen2a projector (soft-token splice)
     dasllama_arch_llama.das   #   Llama / Llama-2 / Llama-3 / TinyLlama arch (config + chat template)
     dasllama_arch_qwen2.das   #   Qwen2 arch  (per-arch: config setter + [init] registration)
     dasllama_arch_qwen3.das   #   Qwen3 arch (QK-norm)
@@ -56,7 +57,7 @@ modules/dasLLAMA/
     matmul/                   #   matmul kernel micro-bench ledger
   harness/                    # verification / eval test beds, per-box tuners, GGUF inspection tools
 tests/dasLLAMA/               # dastest [test] suites (model-gated ones self-skip)
-examples/dasLLAMA/            # runnable demos only — run.das (completion + stats), chat.das (REPL)
+examples/dasLLAMA/            # runnable demos only — run.das (completion + stats), chat.das (REPL), audio.das (audio chat)
 ```
 
 One require is the whole public API (docs: the `dasllama` page in the stdlib reference):
@@ -102,6 +103,7 @@ Legend: ✅ **verified token-for-token** vs the reference · 🚧 in progress ·
 | **Gemma-2-2B-it** | Q8_0 GGUF | Gemma2 (GeGLU, dual softcap, sliding window, sandwich norms, embed ×√dim) | SPM (GGUF) | ✅ | `llama.cpp` `simple_ids`, token-for-token; frozen fixture in `tests/dasLLAMA/test_parity.das`; SWA exercised on a 4k+ context |
 | **Gemma-3-1B / 4B-it** | Q8_0 GGUF | Gemma3 (Gemma-2 shape minus softcaps + QK-norm; 5:1 sliding:global layer pattern, dual RoPE θ 10k/1M, linear-8 position scale on the 4B's global layers) | SPM (GGUF) | ✅ | `llama.cpp` `simple_ids` / `harness/parity.sh`: both 40/40 token-for-token (frozen fixtures); sliding mask exercised on a ~900-token prompt (40/40) |
 | **Gemma-4-12B-it** | Q8_0 GGUF | Gemma4 (heterogeneous geometry: sliding layers 16Q/8KV heads of 256 vs global 16Q/1KV of 512, per-layer bool SWA pattern; p-RoPE freq factors on global layers only; weightless V-norm; V-from-K on global layers; unit attention scale; per-layer output scale; final softcap; suppressed-token logit bias) | SPM-style BPE (`gemma4`) | ✅ | `llama.cpp` `simple_ids` / `harness/parity.sh`: 40/40 token-for-token on the short counting prompt AND on a ~1490-token window-engaged prompt — the latter is the frozen fixture, encoded in-test through the gemma4 tokenizer (the short prompt's continuation drifts into the channel format on a near-tie, so it stays out of the suite); tokenizer 46/46 vs the `ggml-vocab-gemma-4` corpus |
+| **Qwen2-Audio-7B-Instruct** (audio input) | self-converted F16→Q8_0 + f32 mmproj (ggml-org publishes no pre-quant — convert with the in-tree `convert_hf_to_gguf.py`, decoder + `--mmproj`) | Qwen2 decoder untouched + whisper-large-v3 encoder tower (fp32: mel→conv×2→32 blocks→avg-pool→linear projector; soft tokens spliced at `<|audio_bos|>…<|audio_eos|>` via `forward_prefill_embd`) | BPE (qwen2 pre) | ✅ | `llama-mtmd-cli --temp 0`: token-for-token on jfk.wav AND tools/mtmd/test-2.mp3; encoder gated vs `llama-mtmd-debug` all-ones mel (test_audio.das); mel gated vs the 440 Hz preproc dump (3.1e-05) — rig + findings in `qwen2_audio_plan.md` |
 | **gpt-oss-20b** | MXFP4 GGUF → self-Q8 | gpt-oss (MoE: 32 experts top-4, softmax over the SELECTED weights, no shared expert; router + per-expert + QKV + output-projection biases; clamped SwiGLU `swiglu_oai`; per-head attention sinks; alternating 128-token SWA; YaRN rope factor 32 over a 4096 original context) | BPE (`gpt-4o` pre) | ✅ | `llama.cpp` `simple_ids` / `harness/parity.sh`: 40/40 token-for-token on the counting prompt AND on a 449-token window-engaged prompt encoded in-test through the gpt-4o pre-tokenizer (both frozen fixtures in `test_parity.das`); tokenizer verified id-for-id vs llama.cpp on counting / mixed-case-contraction / whitespace probes |
 
 Models are **not** checked into the repo — they live in `~/Work/llama.cpp/models/`
@@ -117,6 +119,10 @@ bin/daslang -jit examples/dasLLAMA/run.das -- ~/Work/llama.cpp/models/Llama-3.2-
 # Interactive chat — ONE REPL for every model; the arch registry picks the chat template + stop tokens
 bin/daslang -jit examples/dasLLAMA/chat.das -- ~/Work/llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
 bin/daslang -jit examples/dasLLAMA/chat.das -- ~/Work/llama.cpp/models/gemma-2-2b-it-Q8_0.gguf
+
+# Audio chat (Qwen2-Audio): whisper-encoder tower + soft-token splice into the qwen2 decoder
+bin/daslang -jit examples/dasLLAMA/audio.das -- ~/Work/llama.cpp/models/qwen2audio-7b-q8_0.gguf \
+    ~/Work/llama.cpp/models/qwen2audio-mmproj-f32.gguf ~/Work/llama.cpp/models/jfk.wav "What is being said in this audio?"
 
 # Token-for-token gates: test_forward (stories15M vs llama2.c) + test_parity (frozen llama.cpp
 # simple_ids fixtures: TinyLlama-v0.3, Llama-3.2-1B, gemma-2-2b) — model-gated cases self-skip
