@@ -610,6 +610,8 @@ int das_policies_set_bool ( das_policies * policies, das_bool_policy flag, int v
         case DAS_POLICY_NO_OPTIMIZATIONS:       p->no_optimizations = v; break;
         case DAS_POLICY_NO_INFER_TIME_FOLDING:  p->no_infer_time_folding = v; break;
         case DAS_POLICY_FAST_MATH:              p->fast_math = v; break;
+        case DAS_POLICY_DISABLE_DSE:            p->disable_dse = v; break;
+        case DAS_POLICY_DISABLE_CSE:            p->disable_cse = v; break;
         default: return 0;
     }
     return 1;

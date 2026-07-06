@@ -62,3 +62,5 @@ respond to a single global call — no need to enumerate channels.
    Full source: :download:`tutorials/dasAudio/10_global_controls.das <../../../../tutorials/dasAudio/10_global_controls.das>`
 
    Previous tutorial: :ref:`tutorial_dasAudio_playback_status`
+
+   Next tutorial: :ref:`tutorial_dasAudio_recording`

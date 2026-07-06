@@ -2564,6 +2564,8 @@ namespace das {
               << value.no_writing_to_nameless
               << value.no_optimizations
               << value.fast_math
+              << value.disable_dse
+              << value.disable_cse
               << value.no_infer_time_folding
               << value.fail_on_no_aot
               << value.fail_on_lack_of_aot_export

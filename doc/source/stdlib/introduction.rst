@@ -196,6 +196,7 @@ Audio
 * :doc:`audio <generated/audio>` — audio playback, mixing, 3D spatial audio, effects (C++ module, based on miniaudio)
 * :doc:`audio_boost <generated/audio_boost>` — audio convenience helpers: sound loading, bus routing, effect chains
 * :doc:`audio_wav <generated/audio_wav>` — WAV file reading and writing
+* :doc:`audio_record <generated/audio_record>` — microphone capture and record-to-WAV
 * :doc:`strudel_midi <generated/strudel_midi>` — MIDI file parsing and playback
 * :doc:`strudel_sf2 <generated/strudel_sf2>` — SoundFont 2 file parser for sample-based synthesis
 
