@@ -129,10 +129,10 @@ def build_mel_filterbank(n_mel, n_fft, sample_rate : int64) : array<float> {
     return <- out
 }
 
-// DFT twiddle matrix [n_fft][2·n_bins]: column 2k = cos(2πjk/n), column 2k+1 = −sin(2πjk/n).
-// XW[frames×n_fft] · B -> interleaved re/im rows, same table values as mtmd's sin/cos cache
-// (double theta, float trig).
-def private build_dft_twiddles(n_fft : int64) : array<float> {
+//! DFT twiddle matrix [n_fft][2·n_bins]: column 2k = cos(2πjk/n), column 2k+1 = −sin(2πjk/n).
+//! XW[frames×n_fft] · B -> interleaved re/im rows, same table values as mtmd's sin/cos cache
+//! (double theta, float trig). Shared by every mel flavor (whisper/mtmd here, qwen3a's module).
+def build_dft_twiddles(n_fft : int64) : array<float> {
     let n_bins = n_fft / 2l + 1l
     var cos_tab : array<float>
     var sin_tab : array<float>
@@ -393,6 +393,7 @@ struct AudioTower {
     proj_kind : AudioProjKind = AudioProjKind.qwen2a
     stack_factor : int64 = 1  // frame-concat width before the projector (ultravox 8, voxtral 4)
     mm1_out : int64 = 0l      // projector hidden width (ultravox: pre-swiglu, voxtral: pre-gelu)
+    has_k_bias : bool = false // qwen3a attention carries a k bias; whisper towers don't
     fblob : array<float>
     conv1_w_off : int64
     conv1_b_off : int64
@@ -435,6 +436,7 @@ struct LayerOffs {
     q_w : int64
     q_b : int64
     k_w : int64
+    k_b : int64   // whisper towers have no k bias — the slot stays zeroed and is skipped
     v_w : int64
     v_b : int64
     o_w : int64
@@ -457,6 +459,7 @@ def enc_layer_offsets(t : AudioTower; l : int64) : LayerOffs {
     r.q_w = o; o += d * d
     r.q_b = o; o += d
     r.k_w = o; o += d * d
+    r.k_b = o; o += d
     r.v_w = o; o += d * d
     r.v_b = o; o += d
     r.o_w = o; o += d * d
@@ -470,8 +473,8 @@ def enc_layer_offsets(t : AudioTower; l : int64) : LayerOffs {
     return r
 }
 
-// 4 square attn mats + 2 ffn mats + 8 d-vectors (ln1 w/b, q/v/o bias, ln2 w/b, fc2 bias) + fc1 bias
-def enc_layer_stride(d, ff : int64) : int64 => 4l * d * d + 2l * ff * d + 8l * d + ff
+// 4 square attn mats + 2 ffn mats + 9 d-vectors (ln1 w/b, q/k/v/o bias, ln2 w/b, fc2 bias) + fc1 bias
+def enc_layer_stride(d, ff : int64) : int64 => 4l * d * d + 2l * ff * d + 9l * d + ff
 
 //! LayerNorm row: o = (x − mean)/√(var + eps)·w + b, mean/var double-accumulated over the
 //! row (ggml_norm's exact shape; the decoder only has RMS so this is new). Population var.
@@ -736,9 +739,8 @@ def make_encoder_state(t : AudioTower) : EncoderState {
 
 // Non-causal blocked attention over gemm_f32, parallel across heads: per head, pack Q/Kᵀ/V,
 // then per ATTN_ENC_QB query rows score = Q·Kᵀ (scale + full-row softmax) and out = P·V.
-// No cache, no mask — every position sees all T positions.
-def private enc_attention(t : AudioTower; var s : EncoderState) {
-    let tt = t.n_ctx
+// No cache, no mask — every position sees all `tt` positions.
+def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
     let d = t.d_model
     let hs = d / t.n_head
     let scale = 1.0 / sqrt(float(hs))
@@ -891,7 +893,15 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     }
     diff_stage("after_conv_pos", s.x, tt * d)
 
-    // pre-LN transformer blocks
+    encoder_blocks(t, s, tt)
+}
+
+//! The pre-LN transformer block loop over ``npos`` positions of the residual stream in ``s.x``
+//! (token-major). Shared by the whisper conv frontend above and the qwen3a conv2d frontend —
+//! any frontend that leaves ``npos × d_model`` rows in ``s.x`` can run the blocks.
+def encoder_blocks(t : AudioTower; var s : EncoderState; npos : int64) {
+    let tt = npos
+    let d = t.d_model
     for (l in range64(t.n_layer)) {
         let lo = enc_layer_offsets(t, l)
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln1_w, lo.ln1_b, d, tt, t.eps)
@@ -899,14 +909,17 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
         mm_blob_b(s.kk, t.fblob, lo.k_w, s.xb, d, d, tt)
         mm_blob_b(s.vv, t.fblob, lo.v_w, s.xb, d, d, tt)
         add_bias_rows(s.qq, t.fblob, lo.q_b, d, tt)   // q bias
-        add_bias_rows(s.vv, t.fblob, lo.v_b, d, tt)   // v bias (k has none)
+        if (t.has_k_bias) {
+            add_bias_rows(s.kk, t.fblob, lo.k_b, d, tt)
+        }
+        add_bias_rows(s.vv, t.fblob, lo.v_b, d, tt)   // v bias
         if (l == 0l) {
             diff_stage("b0_ln1", s.xb, tt * d)
             diff_stage("b0_q", s.qq, tt * d)
             diff_stage("b0_k", s.kk, tt * d)
             diff_stage("b0_v", s.vv, tt * d)
         }
-        enc_attention(t, s)
+        enc_attention(t, s, tt)
         if (l == 0l) {
             diff_stage("b0_attnout", s.xb2, tt * d)
         }

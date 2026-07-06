@@ -209,9 +209,54 @@ def test_asr_surface(t : T?) {
         t |> success(!c.prompt, "no prompt conditioning")
         // "auto" on a multilingual model is accepted; a junk code still panics loudly
         let s <- create_session(m, "auto")
-        t |> equal(s.lang_id, -1, "auto defers detection")
+        t |> equal(s.w.lang_id, -1, "auto defers detection")
         delete m.whisper.dblob
         delete m.whisper.enc.fblob
+    }
+}
+
+[test]
+def test_qwen3a_tower(t : T?) {
+    t |> run("qwen3a tower: conv2d frontend + windowed encode matches mtmd on jfk") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(samples_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: mmproj-Qwen3-ASR-0.6B-bf16.gguf not present")
+            return
+        }
+        let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
+        if (length(samples) == 0) {
+            t |> success(true, "skipped: jfk.wav not present")
+            return
+        }
+        var tw <- load_qwen3a_tower(path)
+        t |> equal(tw.core.d_model, 896l, "d_model")
+        t |> equal(tw.core.n_layer, 18l, "layers")
+        t |> equal(tw.core.n_head, 14l, "heads")
+        t |> equal(tw.n_ch, 480l, "conv channels")
+        t |> equal(tw.proj_dim, 1024l, "proj_dim")
+        t |> success(tw.core.has_k_bias, "k bias")
+        let mel <- log_mel_qwen3a(samples, tw.core.n_mel)
+        t |> equal(mel.n_len, 1101l, "effective mel frames (11 s)")
+        var enc <- make_encoder_state(tw.core)
+        var cs = Qwen3aConvState()
+        with_job_que() {
+            setup_dasllama_jobque_()
+            let win <- qwen3a_mel_window(mel, 0l)
+            t |> equal(win.n_len, 800l, "window 0 padded frames")
+            qwen3a_encode(tw, enc, cs, win)
+        }
+        // llama-mtmd-cli MTMD_DEBUG_EMBEDDINGS (CPU, bf16 mmproj) on jfk window 0: token 0
+        // opens 0.043467 -0.015482 -0.032934 0.023813; our fp32 re-orders sit ~1e-4 off.
+        t |> success(abs(enc.out[0] - 0.043467) < 5e-3, "tok0[0]")
+        t |> success(abs(enc.out[1] + 0.015482) < 5e-3, "tok0[1]")
+        t |> success(abs(enc.out[2] + 0.032934) < 5e-3, "tok0[2]")
+        t |> success(abs(enc.out[3] - 0.023813) < 5e-3, "tok0[3]")
+        delete tw.core.fblob
+        delete tw.cblob
     }
 }
 

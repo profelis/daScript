@@ -96,7 +96,11 @@ first, wait for the merge, then this.
   mistral-v7-tekken template detected BY NAME) + `caps(Model) : LlmCaps` (gemma
   `system_prompt=false`). audio.das demo now runs through the facade — all three template
   families re-gated token-identical through the new path.
-- [ ] C. Qwen3-ASR 0.6B/1.7B
+- [x] C. Qwen3-ASR 0.6B/1.7B — ✅ transcripts byte-identical vs mtmd-cli: 0.6B on jfk.wav +
+  test-2.mp3, 1.7B on jfk.wav; encoder ≤1e-4 vs MTMD_DEBUG_EMBEDDINGS per-window token-0.
+  New: bf16 GGUF reads (exact), qwen3vl→qwen3 alias, `dasllama_qwen3a.das` encoder, ASR
+  dispatch (`AsrSession`, GGUF pair route `load_asr_model(path, mmproj)`, `detected_lang`,
+  `context` biasing → caps.prompt=true); transcribe.das takes the pair.
 - [ ] D. Parakeet-TDT 0.6b-v2 — .nemo downloaded
 - [ ] E. tutorials (not blocked on mic)
 - [ ] F. mic demo (Parakeet; after #3388 merges)
@@ -148,3 +152,12 @@ first, wait for the merge, then this.
   `[INST]` template's derived close is ` [/INST]` — wrong for multi-turn (should be
   `</s>`); untouched here, flagged for Boris. New module files must ALSO be listed in
   `modules/dasLLAMA/.das_module` (require-root registration is manifest-driven).
+- **Session C notes (qwen3a)**: the mmproj spells the projector key
+  `clip.audio.projector_type` (not `clip.projector_type`); `a.conv_out.bias` doesn't exist
+  (graph guards it); positions reset per chunk — only rows 0..12 of the stored 1500-row
+  table are ever used; the qwen3a mel flavor skips the 30 s tail entirely (manual 200-sample
+  reflection both ends, n_len = effective frames, windows zero-padded to 100-multiples with
+  RAW 0.0, and the max−8 clamp stays in double — no float round-trip like the mtmd whisper
+  flavor). Encoder matched the oracle first try at ≤7e-5. Qwen3-ASR responses are
+  `language {L}<asr_text>{text}` — parse, don't strip. Deep AsrModel/AsrSession struct
+  returns need `options stack = 65536` in user programs (transcribe.das hit the default).

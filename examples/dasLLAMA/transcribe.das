@@ -1,5 +1,6 @@
 options gen2
 options fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
+options stack = 65536      // the ASR model structs (decoder + tower) need a deeper stack
 
 require dasllama/dasllama         // the facade: load_asr_model / caps / create_session / transcribe
 require audio                     // miniaudio decode (any format) resampled to 16 kHz mono
@@ -8,9 +9,9 @@ require strings
 require math
 
 // Speech-to-text over the uniform ASR surface: any audio format miniaudio decodes goes in,
-// timestamped segments come out. load_asr_model sniffs the file format — today that means
-// stock ggerganov/whisper.cpp ggml-*.bin files (e.g. ggml-large-v3-turbo.bin), no conversion.
-// --lang auto detects the spoken language from the first audio (multilingual models).
+// segments come out. load_asr_model sniffs the file format — stock ggerganov/whisper.cpp
+// ggml-*.bin files (timestamped segments; --lang auto detects the language), or a Qwen3-ASR
+// GGUF decoder + its mmproj (one segment, the model reports the language; --context biases).
 //
 //   bin/daslang -jit examples/dasLLAMA/transcribe.das -- <ggml-model.bin> <audio-file>
 //                    [--lang <code>] [--translate] [--no-timestamps]
@@ -58,8 +59,10 @@ def fmt_ts(cs : int64) : string {
 def main {
     let cmd <- get_command_line_arguments()
     var model_path = ""
+    var mmproj_path = ""
     var audio_path = ""
-    var lang = "en"
+    var lang = ""
+    var context = ""
     var translate = false
     var no_timestamps = false
     var i = 1
@@ -67,12 +70,21 @@ def main {
         if (cmd[i] == "--lang" && i + 1 < length(cmd)) {
             lang = cmd[i + 1]
             i++
+        } elif (cmd[i] == "--context" && i + 1 < length(cmd)) {
+            context = cmd[i + 1]
+            i++
         } elif (cmd[i] == "--translate") {
             translate = true
         } elif (cmd[i] == "--no-timestamps") {
             no_timestamps = true
         } elif (ends_with(cmd[i], ".bin")) {
             model_path = cmd[i]
+        } elif (ends_with(cmd[i], ".gguf")) {
+            if (empty(model_path)) {
+                model_path = cmd[i]
+            } else {
+                mmproj_path = cmd[i]
+            }
         } elif (empty(model_path)) {
             // skip interpreter/script args before the model path
         } elif (empty(audio_path)) {
@@ -80,13 +92,16 @@ def main {
         }
         i++
     }
-    if (empty(model_path) || empty(audio_path)) {
-        print("usage: daslang -jit examples/dasLLAMA/transcribe.das -- <ggml-model.bin> <audio-file> [--lang <code>] [--translate] [--no-timestamps]\n")
+    if (empty(model_path) || empty(audio_path) || (ends_with(model_path, ".gguf") && empty(mmproj_path))) {
+        print("usage: daslang -jit examples/dasLLAMA/transcribe.das -- <ggml-model.bin | decoder.gguf mmproj.gguf> <audio-file> [--lang <code>] [--context <text>] [--translate] [--no-timestamps]\n")
         return
+    }
+    if (empty(lang)) {
+        lang = ends_with(model_path, ".gguf") ? "auto" : "en"
     }
 
     print("loading {model_path}\n")
-    var w <- load_asr_model(model_path)
+    var w <- (empty(mmproj_path) ? load_asr_model(model_path) : load_asr_model(model_path, mmproj_path))
     let c <- caps(w)
     print("model: {length(c.languages)} language(s), translate {c.translate ? "yes" : "no"}, {c.timestamps} timestamps\n")
     let samples <- load_audio_16k_mono(audio_path)
@@ -97,6 +112,7 @@ def main {
         var s <- create_session(w, lang)
         s.translate = translate
         s.no_timestamps = no_timestamps
+        s.context = context
         let t0 = ref_time_ticks()
         var n_seg = 0
         transcribe(w, s, samples) $(seg) {
@@ -108,6 +124,9 @@ def main {
             }
         }
         let dt = float(get_time_usec(t0)) / 1e6
+        if (!empty(s.detected_lang)) {
+            print("language: {s.detected_lang}\n")
+        }
         print("\n{n_seg} segment(s) in {dt} s ({float(length(samples)) / float(int(AUDIO_SAMPLE_RATE)) / dt}x realtime)\n")
     }
 }

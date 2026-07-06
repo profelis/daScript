@@ -35,6 +35,7 @@ let GGML_TYPE_F32 = 0
 let GGML_TYPE_F16 = 1
 let GGML_TYPE_Q4_0 = 2
 let GGML_TYPE_Q8_0 = 8
+let GGML_TYPE_BF16 = 30
 let GGML_TYPE_MXFP4 = 39
 
 // MXFP4 e2m1 magnitudes DOUBLED (nibble -> ±{0,.5,1,1.5,2,3,4,6}×2, OCP MX spec via ggml
@@ -473,6 +474,14 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             let src = temp_array(reinterpret<uint16?>(addr(bytes[base + src_off * 2l])), expect_n, type<uint16>)
             for (i in range64(expect_n)) {
                 dst[dst_off + i] = f16_to_f32(uint(src[i]))
+            }
+        }
+    } elif (gtype == GGML_TYPE_BF16) {
+        // bf16 is the top 16 bits of an f32 — the shift-up conversion is exact
+        unsafe {
+            let src = temp_array(reinterpret<uint16?>(addr(bytes[base + src_off * 2l])), expect_n, type<uint16>)
+            for (i in range64(expect_n)) {
+                dst[dst_off + i] = reinterpret<float>(uint(src[i]) << 16u)
             }
         }
     } elif (gtype == GGML_TYPE_Q8_0) {

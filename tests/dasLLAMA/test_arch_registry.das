@@ -19,8 +19,8 @@ def private has_content(turn : ChatTurn) : bool {
 
 [test]
 def test_arch_registry_populated(t : T?) {
-    t |> run("all ten arches self-register at [init]") @(t : T?) {
-        let expected <- ["llama", "qwen2", "qwen2vl", "qwen3", "phi3", "gemma2", "gemma3", "gemma4", "qwen2moe", "gpt-oss"]
+    t |> run("all eleven arches self-register at [init]") @(t : T?) {
+        let expected <- ["llama", "qwen2", "qwen2vl", "qwen3", "qwen3vl", "phi3", "gemma2", "gemma3", "gemma4", "qwen2moe", "gpt-oss"]
         for (name in expected) {
             t |> success(has_arch(name), "arch '{name}' registered")
         }
@@ -35,7 +35,7 @@ def test_llm_caps(t : T?) {
         for (name in ["gemma2", "gemma3", "gemma4"]) {
             t |> success(!arch_lcaps(name).system_prompt, "'{name}' system_prompt false")
         }
-        for (name in ["llama", "qwen2", "qwen2vl", "qwen3", "phi3", "qwen2moe", "gpt-oss"]) {
+        for (name in ["llama", "qwen2", "qwen2vl", "qwen3", "qwen3vl", "phi3", "qwen2moe", "gpt-oss"]) {
             t |> success(arch_lcaps(name).system_prompt, "'{name}' system_prompt true")
         }
     }
@@ -51,6 +51,9 @@ def test_audio_wrap_parts(t : T?) {
             t |> equal(length(ct.audio_post.parts), 1, "'{name}' audio_post")
             t |> equal(ct.audio_post.parts[0].s, "<|audio_eos|>")
         }
+        let q3 <- arch_chat("qwen3vl")
+        t |> equal(q3.audio_pre.parts[0].s, "<|audio_start|>", "qwen3vl audio_pre")
+        t |> equal(q3.audio_post.parts[0].s, "<|audio_end|>", "qwen3vl audio_post")
         let lt <- arch_chat("llama")
         t |> success(empty(lt.audio_pre.parts) && empty(lt.audio_post.parts), "llama-3: bare embeddings")
     }
@@ -59,7 +62,7 @@ def test_audio_wrap_parts(t : T?) {
 [test]
 def test_arch_chat_templates(t : T?) {
     t |> run("each arch has a well-formed chat template") @(t : T?) {
-        for (name in ["llama", "qwen2", "qwen2vl", "qwen3", "phi3", "gemma2", "gemma3", "gemma4", "qwen2moe", "gpt-oss"]) {
+        for (name in ["llama", "qwen2", "qwen2vl", "qwen3", "qwen3vl", "phi3", "gemma2", "gemma3", "gemma4", "qwen2moe", "gpt-oss"]) {
             let ct <- arch_chat(name)
             t |> success(length(ct.user.parts) > 0, "'{name}' user turn non-empty")
             t |> success(has_content(ct.user), "'{name}' user turn has a content slot")
