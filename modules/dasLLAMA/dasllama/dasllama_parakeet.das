@@ -11,6 +11,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_gguf
 require dasllama/dasllama_audio
 require dasllama/dasllama_quant
+require dasllama/dasllama_par
 
 // Parakeet-TDT (NVIDIA FastConformer + LSTM predictor + Token-and-Duration Transducer),
 // read from whisper.cpp's converted ggml bin. Oracle = whisper.cpp's in-tree parakeet-cli
@@ -733,6 +734,10 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
     posl |> resize(int(ww * d))
     var quh : array<float>
     quh |> resize(int(tt * dh))
+    var quh2 : array<float>
+    quh2 |> resize(int(tt * dh))
+    var vh : array<float>
+    vh |> resize(int(tt * dh))
     var kth : array<float>
     kth |> resize(int(dh * tt))
     var scores : array<float>
@@ -776,57 +781,85 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
         tp = ref_time_ticks()
         for (hi in range64(n_head)) {
             let hoff = hi * dh
-            // content scores: (Q + u_h) · Kᵀ
             unsafe {
-                for (t in range64(tt)) {
-                    for (j in range64(dh)) {
-                        quh[t * dh + j] = qq[t * d + hoff + j] + m.blob[lo.bias_u + hi * dh + j]
-                        kth[j * tt + t] = kk[t * d + hoff + j]
-                    }
-                }
-                for (i in range64(tt * tt)) {
-                    scores[i] = 0.0
-                }
-                gemm_f32(addr(scores[0]), addr(quh[0]), addr(kth[0]), tt, dh, tt)
-                // rel scores: (Q + v_h) · pos_hᵀ, gathered at w = (T−1) − q + k
-                for (t in range64(tt)) {
-                    for (j in range64(dh)) {
-                        quh[t * dh + j] = qq[t * d + hoff + j] + m.blob[lo.bias_v + hi * dh + j]
-                    }
-                }
-                for (w in range64(ww)) {
-                    for (j in range64(dh)) {
-                        post[j * ww + w] = posl[w * d + hoff + j]
-                    }
-                }
-                for (i in range64(tt * ww)) {
-                    relm[i] = 0.0
-                }
-                gemm_f32(addr(relm[0]), addr(quh[0]), addr(post[0]), tt, dh, ww)
-                for (q in range64(tt)) {
-                    let base = tt - 1l - q
-                    for (k in range64(tt)) {
-                        var s = (scores[q * tt + k] + relm[q * ww + base + k]) * scale
-                        if (k >= n_real) {
-                            s = -1e30
+                var qup = addr(quh[0])
+                var qvp = addr(quh2[0])
+                var ktp = addr(kth[0])
+                var vhp = addr(vh[0])
+                var pop = addr(post[0])
+                var scp = addr(scores[0])
+                var rlp = addr(relm[0])
+                var ohp = addr(oh[0])
+                var aop = addr(ao[0])
+                let qqp = reinterpret<float const?>(addr(qq[0]))
+                let kkp = reinterpret<float const?>(addr(kk[0]))
+                let vvp = reinterpret<float const?>(addr(vv[0]))
+                let plp = reinterpret<float const?>(addr(posl[0]))
+                let bup = reinterpret<float const?>(addr(m.blob[lo.bias_u + hi * dh]))
+                let bvp = reinterpret<float const?>(addr(m.blob[lo.bias_v + hi * dh]))
+                // transposed head views ((Q+u), (Q+v), Kᵀ, V_h, pos_hᵀ) — the row GEMMs read
+                // these in full, so they build before the compute dispatch
+                maybe_parallel_for(0, int(tt), lanes_for_work(tt * dh * 4l, 0)) $(rb, re) {
+                    unsafe {
+                        for (t in range64(int64(rb), int64(re))) {
+                            for (j in range64(dh)) {
+                                let qv = qqp[t * d + hoff + j]
+                                qup[t * dh + j] = qv + bup[j]
+                                qvp[t * dh + j] = qv + bvp[j]
+                                ktp[j * tt + t] = kkp[t * d + hoff + j]
+                                vhp[t * dh + j] = vvp[t * d + hoff + j]
+                            }
                         }
-                        scores[q * tt + k] = s
-                    }
-                    softmax(unsafe(addr(scores[q * tt])), tt)
-                }
-                // out_h = P · V_h
-                for (t in range64(tt)) {
-                    for (j in range64(dh)) {
-                        kth[t * dh + j] = vv[t * d + hoff + j]   // reuse kth as V_h [tt × dh]
                     }
                 }
-                for (i in range64(tt * dh)) {
-                    oh[i] = 0.0
+                maybe_parallel_for(0, int(ww), lanes_for_work(ww * dh, 0)) $(rb, re) {
+                    unsafe {
+                        for (w in range64(int64(rb), int64(re))) {
+                            for (j in range64(dh)) {
+                                pop[j * ww + w] = plp[w * d + hoff + j]
+                            }
+                        }
+                    }
                 }
-                gemm_f32(addr(oh[0]), addr(scores[0]), addr(kth[0]), tt, tt, dh)
-                for (t in range64(tt)) {
-                    for (j in range64(dh)) {
-                        ao[t * d + hoff + j] = oh[t * dh + j]
+                // content scores (Q+u)·Kᵀ + rel scores (Q+v)·pos_hᵀ (gathered at (T−1)−q+k) +
+                // softmax + P·V_h, threaded over query rows in 4-ROW BLOCKS: gemm_f32's 4×16
+                // tile / scalar-remainder split is row-position-dependent, so 4-aligned chunk
+                // starts keep every row's FMA order identical to the whole-matrix call —
+                // bit-exact at any lane count
+                let nblk4 = (tt + 3l) / 4l
+                maybe_parallel_for(0, int(nblk4), lanes_for_work(tt * dh * (2l * tt + ww), 0)) $(bb, be) {
+                    unsafe {
+                        let r0 = int64(bb) * 4l
+                        let r1 = min(int64(be) * 4l, tt)
+                        let nr = r1 - r0
+                        for (i in range64(r0 * tt, r1 * tt)) {
+                            scp[i] = 0.0
+                        }
+                        for (i in range64(r0 * ww, r1 * ww)) {
+                            rlp[i] = 0.0
+                        }
+                        gemm_f32(scp + r0 * tt, qup + r0 * dh, ktp, nr, dh, tt)
+                        gemm_f32(rlp + r0 * ww, qvp + r0 * dh, pop, nr, dh, ww)
+                        for (q in range64(r0, r1)) {
+                            let base = tt - 1l - q
+                            for (k in range64(tt)) {
+                                var s = (scp[q * tt + k] + rlp[q * ww + base + k]) * scale
+                                if (k >= n_real) {
+                                    s = -1e30
+                                }
+                                scp[q * tt + k] = s
+                            }
+                            softmax(scp + q * tt, tt)
+                        }
+                        for (i in range64(r0 * dh, r1 * dh)) {
+                            ohp[i] = 0.0
+                        }
+                        gemm_f32(ohp + r0 * dh, scp + r0 * tt, vhp, nr, tt, dh)
+                        for (t in range64(r0, r1)) {
+                            for (j in range64(dh)) {
+                                aop[t * d + hoff + j] = ohp[t * dh + j]
+                            }
+                        }
                     }
                 }
             }
@@ -841,27 +874,47 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
         tp = ref_time_ticks()
         layernorm_batch(xb, x, m.blob, lo.ncv_w, lo.ncv_b, d, tt, m.eps)
         pk_mm_rq(m, h, lo.pw1_w, xb, xqi, xsi, d, 2l * d, tt)
-        for (t in range64(tt)) {   // GLU: signal · σ(gate)
-            for (j in range64(d)) {
-                let sg = h[t * 2l * d + j]
-                let gt = h[t * 2l * d + d + j]
-                xb[t * d + j] = sg * (1.0 / (1.0 + exp(-gt)))
-            }
-        }
-        // depthwise conv1d k9 over time, pad (k−1)/2 both sides, then inference BN + silu
-        let kpad = (m.n_conv_kernel - 1l) / 2l
-        for (t in range64(tt)) {
-            for (j in range64(d)) {
-                var acc = 0.0
-                for (k in range64(m.n_conv_kernel)) {
-                    let src = t + k - kpad
-                    if (src >= 0l && src < tt) {
-                        acc += m.blob[lo.dw_w + j * m.n_conv_kernel + k] * xb[src * d + j]
+        unsafe {
+            let hp = reinterpret<float const?>(addr(h[0]))
+            var xbp = addr(xb[0])
+            var aop = addr(ao[0])
+            let dwp = reinterpret<float const?>(addr(m.blob[lo.dw_w]))
+            let bmp = reinterpret<float const?>(addr(m.blob[lo.bn_mean]))
+            let bvp2 = reinterpret<float const?>(addr(m.blob[lo.bn_var]))
+            let bwp = reinterpret<float const?>(addr(m.blob[lo.bn_w]))
+            let bbp = reinterpret<float const?>(addr(m.blob[lo.bn_b]))
+            let nk = m.n_conv_kernel
+            let kpad = (nk - 1l) / 2l   // depthwise pad (k−1)/2 both sides
+            maybe_parallel_for(0, int(tt), lanes_for_work(tt * d * 4l, 0)) $(rb, re) {
+                unsafe {
+                    for (t in range64(int64(rb), int64(re))) {   // GLU: signal · σ(gate)
+                        for (j in range64(d)) {
+                            let sg = hp[t * 2l * d + j]
+                            let gt = hp[t * 2l * d + d + j]
+                            xbp[t * d + j] = sg * (1.0 / (1.0 + exp(-gt)))
+                        }
                     }
                 }
-                let bn = (acc - m.blob[lo.bn_mean + j]) / sqrt(m.blob[lo.bn_var + j])
-                let bv = bn * m.blob[lo.bn_w + j] + m.blob[lo.bn_b + j]
-                ao[t * d + j] = bv * (1.0 / (1.0 + exp(-bv)))   // silu
+            }
+            // depthwise conv1d k9 over time (reads xb rows t±kpad — barrier from the GLU
+            // dispatch above), then inference BN + silu
+            maybe_parallel_for(0, int(tt), lanes_for_work(tt * d * (nk + 4l), 0)) $(rb, re) {
+                unsafe {
+                    for (t in range64(int64(rb), int64(re))) {
+                        for (j in range64(d)) {
+                            var acc = 0.0
+                            for (k in range64(nk)) {
+                                let src = t + k - kpad
+                                if (src >= 0l && src < tt) {
+                                    acc += dwp[j * nk + k] * xbp[src * d + j]
+                                }
+                            }
+                            let bn = (acc - bmp[j]) / sqrt(bvp2[j])
+                            let bv = bn * bwp[j] + bbp[j]
+                            aop[t * d + j] = bv * (1.0 / (1.0 + exp(-bv)))   // silu
+                        }
+                    }
+                }
             }
         }
         pk_mm_rq(m, xb, lo.pw2_w, ao, xqi, xsi, d, d, tt)
