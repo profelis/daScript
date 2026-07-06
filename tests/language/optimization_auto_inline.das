@@ -43,7 +43,22 @@ def chain_sum(src : array<int>; k : int; blk : block<(v : int) : int>) : int {
 }
 
 def multi_exit(src : array<int>; blk : block<(v : int) : int>) : int {
-    // two returns: single-exit gate declines this callee
+    // early guard + loop tail: return canonicalization synthesizes the else arm but
+    // cannot ternary-fold it (the arm is not a single return), so this stays
+    // multi-exit and the single-exit gate declines it
+    if (empty(src)) {
+        return -1
+    }
+    var total = 0
+    for (v in src) {
+        total += invoke(blk, v)
+    }
+    return total
+}
+
+def guarded_first(src : array<int>; blk : block<(v : int) : int>) : int {
+    // if/else-return pair: return canonicalization folds this to a single ternary
+    // return at patch time, which makes it a valid splice callee
     if (empty(src)) {
         return -1
     }
@@ -79,6 +94,11 @@ def target_chain(src : array<int>) : int {
 [export]
 def target_multi_exit(src : array<int>) : int {
     return src |> multi_exit() $(v) => v * 3
+}
+
+[export]
+def target_canonicalized(src : array<int>) : int {
+    return src |> guarded_first() $(v) => v * 3
 }
 
 [export]
@@ -131,6 +151,10 @@ def test_auto_inline_fired(t : T?) {
             let b = body_of(t, "target_multi_exit")
             t |> success(has(b, "multi_exit("), "call stays regular: {b}")
         }
+        t |> run("if/else-return callee canonicalizes and splices") @(t : T?) {
+            let b = body_of(t, "target_canonicalized")
+            t |> success(!has(b, "guarded_first("), "call is gone: {b}")
+        }
         t |> run("recursive callee declines") @(t : T?) {
             let b = body_of(t, "target_recursive")
             t |> success(has(b, "recursive_taker("), "call stays regular: {b}")
@@ -145,9 +169,11 @@ def test_auto_inline_behavior(t : T?) {
         t |> equal(target_auto(src), 30)
         t |> equal(target_void_auto(src), 10)
         t |> equal(target_chain(src), 114)
-        t |> equal(target_multi_exit(src), 3)
+        t |> equal(target_multi_exit(src), 30)
+        t |> equal(target_canonicalized(src), 3)
         let none : array<int>
         t |> equal(target_multi_exit(none), -1)
+        t |> equal(target_canonicalized(none), -1)
         t |> equal(target_recursive(src), 11)
     }
     t |> run("impure arguments evaluate once in call order") @(t : T?) {

@@ -1585,6 +1585,137 @@ namespace das {
             order.push_back(fn);
         }
 
+        // ----- return canonicalization (pre-pass) -----
+
+        // optimized builds canonicalize early-exit shapes before candidates are evaluated:
+        //  (1) tail-else synthesis: `if (c) { ...; return }` followed by a tail moves the
+        //      tail into a synthesized else arm (what CondFolding does for nested blocks
+        //      at optimize time; here it also covers the function's top block);
+        //  (2) `if (c) return a; else return b;` folds to `return c ? a : b`.
+        // together they turn early-exit bodies into the single-trailing-return shape the
+        // inliner requires. new nodes are untyped: the pass reports astChanged and the
+        // restarted infer legalizes them, the same protocol as a splice. the optimize-time
+        // CondFolding copy stays - it serves compiles this pre-pass never sees (auto
+        // inlining off) and macro-generated post-infer shapes.
+        class ReturnCanonicalization : public Visitor {
+        public:
+            bool changed = false;
+        protected:
+            virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
+            // extract `return ...` from an if arm: a naked return (an inner fold leaves one
+            // behind in an elif chain), or a block holding exactly one return. blocks with
+            // a finally section never qualify - the fold would drop it. CMRES makes stay
+            // behind: the make-local protocol doesn't survive under an Op3 arm
+            static ExprReturn * armReturn ( Expression * arm ) {
+                ExprReturn * ret = nullptr;
+                if ( arm->rtti_isReturn() ) {
+                    ret = static_cast<ExprReturn *>(arm);
+                } else if ( arm->rtti_isBlock() ) {
+                    auto blk = static_cast<ExprBlock *>(arm);
+                    if ( blk->list.size()==1 && blk->finalList.empty() && blk->list.back()->rtti_isReturn() ) {
+                        ret = static_cast<ExprReturn *>(blk->list.back());
+                    }
+                }
+                if ( ret && ret->subexpr && ret->subexpr->rtti_isMakeLocal() ) ret = nullptr;
+                return ret;
+            }
+            // the restarted infer expects parser shapes, where an if arm is a block. an
+            // inner fold leaves a naked return as the arm of an elif chain; when the outer
+            // if does not itself fold away, re-block the arm
+            static void reblockArm ( ExpressionPtr & arm ) {
+                if ( arm && arm->rtti_isReturn() ) {
+                    auto blk = new ExprBlock();
+                    blk->at = arm->at;
+                    blk->list.push_back(arm);
+                    arm = blk;
+                }
+            }
+            virtual ExpressionPtr visit ( ExprIfThenElse * expr ) override {
+                if ( expr->if_false && !expr->isStatic && !expr->doNotFold ) {
+                    ExprReturn * lr = armReturn(expr->if_true);
+                    ExprReturn * rr = armReturn(expr->if_false);
+                    if ( lr && rr && lr->moveSemantics==rr->moveSemantics ) {
+                        // a same-walk inner fold leaves untyped subexprs; decline those -
+                        // the arm folds on the next patch round, once infer has typed it.
+                        // return coercion is per-arm but ternary arms must match EACH OTHER,
+                        // and the merged arm loses per-arm coercions: `return derived?` vs
+                        // `return base?` stays an if, and so does `return null` (the null
+                        // literal to typed pointer coercion doesn't survive under an Op3 arm)
+                        if ( lr->subexpr && rr->subexpr
+                            && lr->subexpr->type && rr->subexpr->type
+                            && !lr->subexpr->type->isRef() && !rr->subexpr->type->isRef()
+                            && !lr->subexpr->type->isVoid()
+                            && !lr->subexpr->type->isVoidPointer() && !rr->subexpr->type->isVoidPointer()
+                            && lr->subexpr->type->isSameType(*rr->subexpr->type, RefMatters::no, ConstMatters::no, TemporaryMatters::yes) ) {
+                            auto ternary = new ExprOp3(expr->at, "?", expr->cond, lr->subexpr, rr->subexpr);
+                            auto ret = new ExprReturn(expr->at, ternary);
+                            ret->moveSemantics = lr->moveSemantics;
+                            changed = true;
+                            return ret;
+                        } else if ( !lr->subexpr && !rr->subexpr && inlinePure(expr->cond) ) {
+                            // both arms are bare returns and evaluating the cond does nothing
+                            changed = true;
+                            return lr;
+                        }
+                    }
+                }
+                reblockArm(expr->if_true);
+                reblockArm(expr->if_false);
+                return Visitor::visit(expr);
+            }
+            virtual ExpressionPtr visit ( ExprBlock * block ) override {
+                // a finally section references block locals BY NAME; nesting tail
+                // declarations under a synthesized else would hide them from it when
+                // infer re-resolves (the optimize-time copy of this transform survives
+                // only because post-infer references are by pointer)
+                if ( !block->finalList.empty() ) return Visitor::visit(block);
+                // tail-else synthesis, reversed order so one walk handles a whole batch
+                bool any = false;
+                for ( int i = int(block->list.size()) - 2; i>=0; i-- ) {
+                    auto expr = block->list[i];
+                    if ( !expr->rtti_isIfThenElse() ) continue;
+                    auto ite = static_cast<ExprIfThenElse *>(expr);
+                    if ( ite->if_false || ite->isStatic || ite->doNotFold || !ite->if_true->rtti_isBlock() ) continue;
+                    auto tb = static_cast<ExprBlock *>(ite->if_true);
+                    if ( tb->list.empty() ) continue;
+                    auto lastE = tb->list.back();
+                    if ( lastE->rtti_isReturn() || lastE->rtti_isBreak() || lastE->rtti_isContinue() ) {
+                        auto fb = new ExprBlock();
+                        fb->at = block->list[i+1]->at;
+                        fb->list.assign(block->list.begin()+i+1, block->list.end());
+                        ite->if_false = fb;
+                        block->list.resize(i+1);
+                        any = true;
+                    }
+                }
+                if ( any ) changed = true;
+                return Visitor::visit(block);
+            }
+        };
+
+        bool canonicalizeReturns ( Function * fn ) {
+            if ( !fn->body || !fn->body->rtti_isBlock() ) return false;
+            if ( fn->generator || fn->isTemplate ) return false;
+            // [inline] bodies stay untouched: their shape contract is fail-closed, and a
+            // multi-exit [inline] callee must be the same compile error at every -O level
+            if ( fn->mustInline ) return false;
+            // goto can target a label in a tail this pass would move into an else arm; the
+            // feature is rare enough that any use opts the whole function out
+            bool hasGotoOrLabel = false;
+            lookupExpressions(fn->body, [&](Expression * e) {
+                if ( e->rtti_isGoto() || e->rtti_isLabel() ) hasGotoOrLabel = true;
+            });
+            if ( hasGotoOrLabel ) return false;
+            bool any = false;
+            for ( int round = 0; round!=16; ++round ) {   // converges in 2-3; the cap is paranoia
+                ReturnCanonicalization pass;
+                fn->body = fn->body->visit(pass);
+                if ( !pass.changed ) break;
+                any = true;
+            }
+            return any;
+        }
+
     } // anonymous namespace
 
     bool Program::patchInline() {
@@ -1592,6 +1723,18 @@ namespace das {
         // best-effort inlining is an optimization: it stays out of unoptimized builds
         bool autoEnabled = getOptimize()
             && !options.getBoolOption("disable_auto_inline", policies.disable_auto_inline);
+        // canonicalize early-exit shapes ahead of candidacy: single exit is an inline shape
+        // requirement, and the rewrite must settle (re-infer) before anything splices on
+        // top of it. gated with auto inlining rather than bare optimization:
+        // `disable_auto_inline` is the one knob that promises "no patch-slot reshaping"
+        // to shape-pinning tests and macros
+        if ( autoEnabled && !failed() ) {
+            bool canon = false;
+            thisModule->functions.foreach([&](auto fn) {
+                canon |= canonicalizeReturns(fn);
+            });
+            if ( canon ) return true;
+        }
         // cheap gate: any [inline] function visible at all?
         bool anyInline = false;
         if ( mustEnabled ) {
