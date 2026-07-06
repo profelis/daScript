@@ -644,6 +644,11 @@ namespace das
         Expression() { gc_magic = GC_MAGIC_EXPRESSION; }
         Expression(const LineInfo & a) : at(a) { gc_magic = GC_MAGIC_EXPRESSION; }
         string describe() const;
+        // structural equality over value expressions (same computation over the same
+        // operands). NOT value equality by itself: folding `E op E` additionally
+        // requires E->noSideEffects at the call site. Unrecognized node classes
+        // conservatively compare unequal. Implemented in ast_same.cpp.
+        bool sameAs ( const Expression * other ) const;
         virtual ~Expression() {}
         friend DAS_API StringWriter& operator<< (StringWriter& stream, const Expression & func);
         virtual ExpressionPtr visit(Visitor & /*vis*/ )  { DAS_ASSERT(0); return this; };
@@ -1714,6 +1719,7 @@ namespace das
         bool optimizationBlockFolding(int32_t round);
         bool optimizationCondFolding(int32_t round);
         bool optimizationUnused(TextWriter & logs, int32_t round);
+        bool optimizationDeadStores(int32_t round);
         void buildAccessFlags(TextWriter & logs);
         bool verifyAndFoldContracts();
         void validateAst();

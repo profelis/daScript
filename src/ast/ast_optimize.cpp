@@ -34,6 +34,9 @@ namespace das {
             last = program->optimizationBlockFolding(optimizationRound);  if ( program->failed() ) break;  any |= last;
             if ( log ) logs << "BLOCK FOLDING:" << (last ? "optimized" : "nothing") << "\n";
             if ( logPass ) logs << *program;
+            last = program->optimizationDeadStores(optimizationRound);  if ( program->failed() ) break;  any |= last;
+            if ( log ) logs << "DEAD STORES:" << (last ? "optimized" : "nothing") << "\n";
+            if ( logPass ) logs << *program;
             // this is here again for a reason
             last = program->optimizationUnused(logs, optimizationRound);    if ( program->failed() ) break;  any |= last;
             if ( log ) logs << "REMOVE UNUSED:" << (last ? "optimized" : "nothing") << "\n";
