@@ -438,7 +438,7 @@ void dasAudio_finalize ( void ) {
 // RT-thread capture callback: append the just-captured interleaved f32 frames to the ring. Pure
 // C++ — no daScript, no allocation, no lock. On overflow (drain loop fell behind) the excess is
 // dropped and counted; recording never blocks the audio thread.
-void capture_callback ( ma_device *, void *, const void * pInput, ma_uint32 frameCount ) {
+static void capture_callback ( ma_device *, void *, const void * pInput, ma_uint32 frameCount ) {
     if ( !g_capture_initialized || pInput == nullptr ) return;
     const float * src = (const float *) pInput;
     ma_uint32 channels = (ma_uint32) g_capture_channels;

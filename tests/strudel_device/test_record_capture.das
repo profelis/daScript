@@ -63,3 +63,30 @@ def test_record_device_enumeration(t : T?) {
         }
     }
 }
+
+[test]
+def test_record_to_wav_roundtrip(t : T?) {
+    t |> run("null-backend record_to_wav writes a readable WAV of exactly the requested length") @(t : T?) {
+        sound_set_null_device(true)
+        defer() {
+            sound_set_null_device(false)
+        }
+        let tmp = create_temp_file_result("das_record_to_wav_test", ".wav")   // unique writable path, no cwd assumptions
+        if (!(tmp is value)) {
+            t |> failure("could not create a temp file")
+            return
+        }
+        let path = tmp as value
+        let rate = 16000
+        let seconds = 0.2
+        t |> success(record_to_wav(path, seconds, rate, 1), "record_to_wav should succeed on the null backend")
+        var samples : array<float>
+        var got_rate = 0
+        var got_channels = 0
+        t |> success(read_wav(path, samples, got_rate, got_channels), "the written WAV should be readable back")
+        t |> equal(got_rate, rate)
+        t |> equal(got_channels, 1)
+        t |> equal(length(samples), int(float(rate) * seconds))   // exact-length capping: 0.2s * 16000 = 3200 frames
+        remove(path)
+    }
+}
