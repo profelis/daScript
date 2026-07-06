@@ -141,7 +141,26 @@ f16→f32-converted weights.
 
 ## Findings
 
-(collect as slices land)
+- **W-A loader**: container parsed exactly as recon'd (probe vs python byte-level reference:
+  hparams, special ids, vocab, filterbank, permuted convs, deep-layer offsets). f32_to_f16
+  round-trips all 65536 f16 patterns and matches numpy RNE on every boundary case (65519.9 →
+  max, 65520 → inf, subnormal ties-to-even).
+- **W-B encoder**: vs the numpy stage oracle on jfk/tiny — mel maxdiff 4e-5 (DFT-GEMM float
+  order, same as the mtmd gate), ln_post output 7e-3 max over 576k elements. The fp16-LUT
+  gelu turns infinitesimal input diffs into one-fp16-ulp output flips at rounding boundaries
+  (e.g. 1.95e-3 at |x|≈3.4) — expected, benign, and why stage diffs are larger than qwen2a's.
+- **W-C decoder + greedy**: **large-v3-turbo (flagship): TOKEN-FOR-TOKEN with whisper-cli
+  greedy on jfk.wav** (26 text tokens + eot). tiny: 23/24 — the sole divergence is the first
+  comma, a genuine knife-edge (oracle p(",")=0.3465 vs runner-up " ask"; our logit gap
+  −0.050 the other way). whisper.cpp's own ARM CPU path computes every mul_mat as f16×f16
+  with fp16 vector accumulation (GGML_SIMD vfmaq_f16) and keeps K/V caches f16 (`itype`) —
+  its logits carry ~1e-2-scale noise vs exact f32 math, so sub-0.05-logit ties can land
+  either way per implementation. Not chased: mirroring fp16 accumulation would make our
+  compute strictly WORSE to match noise; the flagship gate is the arc's claim.
+- whisper-cli's `--debug-mode` mel dump is unreachable via whisper_full (the mel call
+  hardcodes debug=false) — numpy is the mel oracle.
+- `no_context` defaults to TRUE (whisper.h 5939) — stock cli does NOT carry rolling context
+  between windows; multi-window in notimestamps mode = independent windows.
 
 ## Performance ledger (arc-local; fold into API_REWORK.md at PR time)
 

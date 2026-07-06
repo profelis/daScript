@@ -2,6 +2,7 @@ options gen2
 
 module dasllama_whisper shared public
 
+require math
 require daslib/fio
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs
 require strings
@@ -390,6 +391,372 @@ def load_whisper_model(path : string) : WhisperModel {
 def whisper_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     audio_encode_blocks(t, s, mel)
     layernorm_batch(s.xb, s.x, t.fblob, t.lnp_w_off, t.lnp_b_off, t.d_model, t.n_ctx, t.eps)
+}
+
+// ===== decoder =====
+
+//! Decoder scratch + caches, sized once per model and reused across windows. Self-attn K/V
+//! caches and the per-window cross-attention memory are head-major; K is stored TRANSPOSED
+//! (``[hs][T]``) and pre-scaled by hs^-0.25 so attention scores are one gemm per head.
+struct DecoderState {
+    n_past : int64
+    kcache : array<float>   // [L][H][hs][Tmax]
+    vcache : array<float>   // [L][H][Tmax][hs]
+    kx : array<float>       // [L][H][hs][Ta] cross keys (from the encoder output, per window)
+    vx : array<float>       // [L][H][Ta][hs]
+    ckv_tmp : array<float>  // [Ta × d] cross k/v staging (token-major projection out)
+    x : array<float>        // residual [ncap × d]
+    xb : array<float>       // norm out [ncap × d]
+    xb2 : array<float>      // attention scatter out [ncap × d]
+    qq : array<float>       // [ncap × d]
+    kk : array<float>
+    vv : array<float>
+    h : array<float>        // mlp hidden [ncap × 4d]
+    hp : array<float>       // per-head q/out packs: [H × 2 × ncap × hs]
+    att : array<float>      // per-head scores [H × ncap × max(Tmax, Ta)]
+    x1 : array<float>       // [d] last-row staging for the tied-logits GEMV
+    logits : array<float>   // [n_vocab]
+}
+
+def make_decoder_state(w : WhisperModel) : DecoderState {
+    let d = w.n_text_state
+    let hh = w.n_text_head
+    let hs = d / hh
+    let tmax = w.n_text_ctx
+    let ta = w.enc.n_ctx
+    let ncap = tmax
+    var ds = DecoderState()
+    ds.kcache |> resize(int(w.n_text_layer * d * tmax))
+    ds.vcache |> resize(int(w.n_text_layer * d * tmax))
+    ds.kx |> resize(int(w.n_text_layer * d * ta))
+    ds.vx |> resize(int(w.n_text_layer * d * ta))
+    ds.ckv_tmp |> resize(int(ta * d))
+    ds.x |> resize(int(ncap * d))
+    ds.xb |> resize(int(ncap * d))
+    ds.xb2 |> resize(int(ncap * d))
+    ds.qq |> resize(int(ncap * d))
+    ds.kk |> resize(int(ncap * d))
+    ds.vv |> resize(int(ncap * d))
+    ds.h |> resize(int(ncap * 4l * d))
+    ds.hp |> resize(int(hh * 2l * ncap * hs))
+    ds.att |> resize(int(hh * ncap * max(tmax, ta)))
+    ds.x1 |> resize(int(d))
+    ds.logits |> resize(int(w.n_vocab))
+    return <- ds
+}
+
+//! Precompute the cross-attention memory for one encoded window (``enc_out`` =
+//! whisper_encode's ``s.xb``, ``n_ctx × d``): per layer K = W_k·enc (no bias, pre-scaled
+//! hs^-0.25), V = W_v·enc + b — whisper.cpp's build_graph_cross. Resets the sequence.
+def whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<float>) {
+    let d = w.n_text_state
+    let hh = w.n_text_head
+    let hs = d / hh
+    let ta = w.enc.n_ctx
+    let kscale = 1.0 / sqrt(sqrt(float(hs)))
+    for (l in range64(w.n_text_layer)) {
+        let lo = dec_layer_offsets(w, l)
+        mm_blob_b(ds.ckv_tmp, w.dblob, lo.ck_w, enc_out, d, d, ta)
+        for (h in range64(hh)) {
+            let base = ((l * hh + h) * hs) * ta
+            for (t in range64(ta)) {
+                for (j in range64(hs)) {
+                    ds.kx[base + j * ta + t] = ds.ckv_tmp[t * d + h * hs + j] * kscale
+                }
+            }
+        }
+        mm_blob_b(ds.ckv_tmp, w.dblob, lo.cv_w, enc_out, d, d, ta)
+        add_bias_rows(ds.ckv_tmp, w.dblob, lo.cv_b, d, ta)
+        for (h in range64(hh)) {
+            let base = ((l * hh + h) * ta) * hs
+            for (t in range64(ta)) {
+                for (j in range64(hs)) {
+                    ds.vx[base + t * hs + j] = ds.ckv_tmp[t * d + h * hs + j]
+                }
+            }
+        }
+    }
+    ds.n_past = 0l
+}
+
+def private scale_inplace(var x : array<float>; n : int64; s : float) {
+    for (i in range64(n)) {
+        x[i] *= s
+    }
+}
+
+// Self-attention over the K/V caches, causal (row r sees positions 0..p0+r), parallel over
+// heads. Scores need no extra scale — q and k rows were pre-scaled hs^-0.25 (whisper.cpp
+// order). The caches are gemm'd at full Tmax width; softmax is row-length-limited and the
+// tail probabilities are zeroed, so stale columns never contribute.
+def private dec_self_attn(w : WhisperModel; var ds : DecoderState; l, n, p0 : int64) {
+    let d = w.n_text_state
+    let hh = w.n_text_head
+    let hs = d / hh
+    let tmax = w.n_text_ctx
+    let tbig = max(tmax, w.enc.n_ctx)
+    unsafe {
+        let qp = reinterpret<float const?>(addr(ds.qq[0]))
+        let kcp = reinterpret<float const?>(addr(ds.kcache[0]))
+        let vcp = reinterpret<float const?>(addr(ds.vcache[0]))
+        var hpp = addr(ds.hp[0])
+        var attp = addr(ds.att[0])
+        var aop = addr(ds.xb2[0])
+        let ncap = w.n_text_ctx
+        maybe_parallel_for(0, int(hh), get_dispatch_lanes()) $(hb, he) {
+            unsafe {
+                for (h in range(hb, he)) {
+                    let hoff = int64(h) * hs
+                    var qh = hpp + int64(h) * 2l * ncap * hs
+                    var oh = qh + ncap * hs
+                    for (r in range64(n)) {
+                        for (j in range64(hs)) {
+                            qh[r * hs + j] = qp[r * d + hoff + j]
+                        }
+                    }
+                    let kt = kcp + (l * hh + int64(h)) * hs * tmax
+                    let vh = vcp + (l * hh + int64(h)) * tmax * hs
+                    var ah = attp + int64(h) * ncap * tbig
+                    for (i in range64(n * tmax)) {
+                        ah[i] = 0.0
+                    }
+                    gemm_f32(ah, qh, kt, n, hs, tmax)
+                    for (r in range64(n)) {
+                        var row = ah + r * tmax
+                        let len = p0 + r + 1l
+                        softmax(row, len)
+                        for (i in range64(len, tmax)) {
+                            row[i] = 0.0
+                        }
+                    }
+                    for (i in range64(n * hs)) {
+                        oh[i] = 0.0
+                    }
+                    gemm_f32(oh, ah, vh, n, tmax, hs)
+                    for (r in range64(n)) {
+                        for (j in range64(hs)) {
+                            aop[r * d + hoff + j] = oh[r * hs + j]
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Cross-attention against the per-window kx/vx memory: non-causal over all Ta positions,
+// scores scaled hs^-0.25 before softmax (the other hs^-0.25 half lives in the pre-scaled
+// keys — whisper.cpp's soft_max_ext(KQ, scale) split).
+def private dec_cross_attn(w : WhisperModel; var ds : DecoderState; l, n : int64) {
+    let d = w.n_text_state
+    let hh = w.n_text_head
+    let hs = d / hh
+    let ta = w.enc.n_ctx
+    let tbig = max(w.n_text_ctx, ta)
+    let sm_scale = 1.0 / sqrt(sqrt(float(hs)))
+    unsafe {
+        let qp = reinterpret<float const?>(addr(ds.qq[0]))
+        let kxp = reinterpret<float const?>(addr(ds.kx[0]))
+        let vxp = reinterpret<float const?>(addr(ds.vx[0]))
+        var hpp = addr(ds.hp[0])
+        var attp = addr(ds.att[0])
+        var aop = addr(ds.xb2[0])
+        let ncap = w.n_text_ctx
+        maybe_parallel_for(0, int(hh), get_dispatch_lanes()) $(hb, he) {
+            unsafe {
+                for (h in range(hb, he)) {
+                    let hoff = int64(h) * hs
+                    var qh = hpp + int64(h) * 2l * ncap * hs
+                    var oh = qh + ncap * hs
+                    for (r in range64(n)) {
+                        for (j in range64(hs)) {
+                            qh[r * hs + j] = qp[r * d + hoff + j]
+                        }
+                    }
+                    let kt = kxp + (l * hh + int64(h)) * hs * ta
+                    let vh = vxp + (l * hh + int64(h)) * ta * hs
+                    var ah = attp + int64(h) * ncap * tbig
+                    for (i in range64(n * ta)) {
+                        ah[i] = 0.0
+                    }
+                    gemm_f32(ah, qh, kt, n, hs, ta)
+                    for (r in range64(n)) {
+                        var row = ah + r * ta
+                        for (i in range64(ta)) {
+                            row[i] *= sm_scale
+                        }
+                        softmax(row, ta)
+                    }
+                    for (i in range64(n * hs)) {
+                        oh[i] = 0.0
+                    }
+                    gemm_f32(oh, ah, vh, n, ta, hs)
+                    for (r in range64(n)) {
+                        for (j in range64(hs)) {
+                            aop[r * d + hoff + j] = oh[r * hs + j]
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! Decode a batch of tokens at positions n_past..n_past+n-1 (prompt prefill and single-step
+//! generation share this path). Leaves next-token logits (for the LAST row, tied token
+//! embedding) in ``ds.logits`` and advances ``ds.n_past``.
+def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array<int> | #) {
+    let n = int64(length(tokens))
+    let d = w.n_text_state
+    let hh = w.n_text_head
+    let hs = d / hh
+    let tmax = w.n_text_ctx
+    let p0 = ds.n_past
+    if (n <= 0l) {
+        panic("whisper_decode_batch: empty batch")
+    }
+    if (p0 + n > tmax) {
+        panic("whisper_decode_batch: {p0}+{n} tokens exceed n_text_ctx {tmax}")
+    }
+
+    // token embedding + learned absolute position rows
+    for (r in range64(n)) {
+        let te = w.d_te_off + int64(tokens[int(r)]) * d
+        let pe = w.d_pe_off + (p0 + r) * d
+        for (j in range64(d)) {
+            ds.x[r * d + j] = w.dblob[te + j] + w.dblob[pe + j]
+        }
+    }
+
+    let kq_scale = 1.0 / sqrt(sqrt(float(hs)))
+    for (l in range64(w.n_text_layer)) {
+        let lo = dec_layer_offsets(w, l)
+
+        // self-attention (q and k pre-scaled hs^-0.25, k/v appended to the caches)
+        layernorm_batch(ds.xb, ds.x, w.dblob, lo.ln1_w, lo.ln1_b, d, n, w.eps)
+        mm_blob_b(ds.qq, w.dblob, lo.q_w, ds.xb, d, d, n)
+        add_bias_rows(ds.qq, w.dblob, lo.q_b, d, n)
+        scale_inplace(ds.qq, n * d, kq_scale)
+        mm_blob_b(ds.kk, w.dblob, lo.k_w, ds.xb, d, d, n)
+        scale_inplace(ds.kk, n * d, kq_scale)
+        mm_blob_b(ds.vv, w.dblob, lo.v_w, ds.xb, d, d, n)
+        add_bias_rows(ds.vv, w.dblob, lo.v_b, d, n)
+        for (r in range64(n)) {
+            for (h in range64(hh)) {
+                for (j in range64(hs)) {
+                    ds.kcache[((l * hh + h) * hs + j) * tmax + p0 + r] = ds.kk[r * d + h * hs + j]
+                    ds.vcache[((l * hh + h) * tmax + p0 + r) * hs + j] = ds.vv[r * d + h * hs + j]
+                }
+            }
+        }
+        dec_self_attn(w, ds, l, n, p0)
+        mm_blob_b(ds.xb, w.dblob, lo.o_w, ds.xb2, d, d, n)
+        add_bias_rows(ds.xb, w.dblob, lo.o_b, d, n)
+        add_inplace_rows(ds.x, ds.xb, n * d)
+
+        // cross-attention (q unscaled; keys pre-scaled; softmax applies the other half)
+        layernorm_batch(ds.xb, ds.x, w.dblob, lo.cln_w, lo.cln_b, d, n, w.eps)
+        mm_blob_b(ds.qq, w.dblob, lo.cq_w, ds.xb, d, d, n)
+        add_bias_rows(ds.qq, w.dblob, lo.cq_b, d, n)
+        dec_cross_attn(w, ds, l, n)
+        mm_blob_b(ds.xb, w.dblob, lo.co_w, ds.xb2, d, d, n)
+        add_bias_rows(ds.xb, w.dblob, lo.co_b, d, n)
+        add_inplace_rows(ds.x, ds.xb, n * d)
+
+        // mlp
+        layernorm_batch(ds.xb, ds.x, w.dblob, lo.ln2_w, lo.ln2_b, d, n, w.eps)
+        mm_blob_b(ds.h, w.dblob, lo.fc1_w, ds.xb, d, 4l * d, n)
+        add_bias_rows(ds.h, w.dblob, lo.fc1_b, 4l * d, n)
+        gelu_tanh_lut(ds.h, n * 4l * d)
+        mm_blob_b(ds.xb, w.dblob, lo.fc2_w, ds.h, 4l * d, d, n)
+        add_bias_rows(ds.xb, w.dblob, lo.fc2_b, d, n)
+        add_inplace_rows(ds.x, ds.xb, n * d)
+    }
+    ds.n_past += n
+
+    // final LN, then tied-embedding logits for the last row only (greedy single decoder)
+    layernorm_batch(ds.xb, ds.x, w.dblob, w.d_ln_w_off, w.d_ln_b_off, d, n, w.eps)
+    for (j in range64(d)) {
+        ds.x1[j] = ds.xb[(n - 1l) * d + j]
+    }
+    mm_blob_b(ds.logits, w.dblob, w.d_te_off, ds.x1, d, w.n_vocab, 1l)
+}
+
+// ===== greedy driver =====
+
+let private NEG_INF_LOGIT = -1e30
+
+// whisper.cpp's always-on logit filter suite (whisper_process_logits), v1 scope: notimestamps
+// mode. is_initial additionally suppresses eot and " " (suppress_blank, CLI default true).
+def private whisper_filter_logits(w : WhisperModel; var logits : array<float>; is_initial : bool; no_timestamps : bool) {
+    if (is_initial) {
+        logits[w.tok_eot] = NEG_INF_LOGIT
+        if (w.tok_space >= 0) {
+            logits[w.tok_space] = NEG_INF_LOGIT
+        }
+    }
+    logits[w.tok_not] = NEG_INF_LOGIT
+    if (no_timestamps) {
+        for (i in range(w.tok_beg, int(w.n_vocab))) {
+            logits[i] = NEG_INF_LOGIT
+        }
+    }
+    logits[w.tok_sot] = NEG_INF_LOGIT
+    logits[w.tok_nosp] = NEG_INF_LOGIT
+    logits[w.tok_solm] = NEG_INF_LOGIT   // tdrz disabled
+    logits[w.tok_translate] = NEG_INF_LOGIT
+    logits[w.tok_transcribe] = NEG_INF_LOGIT
+    logits[w.tok_prev] = NEG_INF_LOGIT
+    for (i in range(100)) {              // g_lang.size() is fixed at 100 in whisper.cpp
+        logits[w.tok_sot + 1 + i] = NEG_INF_LOGIT
+    }
+}
+
+def private argmax_logit(logits : array<float>) : int {
+    var best = 0
+    var bestv = logits[0]
+    for (i in range(1, length(logits))) {
+        if (logits[i] > bestv) {
+            bestv = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+//! Greedy no-timestamps transcription of one ≤30 s window (v1 driver): sot/lang/transcribe/
+//! notimestamps prompt, whisper.cpp's logit-filter suite, argmax until eot or the
+//! n_text_ctx/2−4 step cap. ``enc_out`` = whisper_encode's ``s.xb``. Returns text token ids.
+def whisper_greedy_window(w : WhisperModel; var ds : DecoderState; enc_out : array<float>; lang_id : int) : array<int> {
+    whisper_cross_kv(w, ds, enc_out)
+    let prompt <- [w.tok_sot, w.tok_sot + 1 + lang_id, w.tok_transcribe, w.tok_not]
+    whisper_decode_batch(w, ds, prompt)
+    var toks : array<int>
+    var step : array<int>
+    step |> resize(1)
+    let n_max = int(w.n_text_ctx / 2l) - 4
+    for (i in range(n_max)) {
+        whisper_filter_logits(w, ds.logits, i == 0, true)
+        let id = argmax_logit(ds.logits)
+        if (id == w.tok_eot) {
+            break
+        }
+        toks |> push(id)
+        step[0] = id
+        whisper_decode_batch(w, ds, step)
+    }
+    return <- toks
+}
+
+//! Token ids -> text (raw byte concat; ids at/above eot have no bytes and are skipped).
+def whisper_detokenize(w : WhisperModel; toks : array<int> | #) : string {
+    return build_string() $(writer) {
+        for (t in toks) {
+            if (t < w.tok_eot) {
+                writer |> write(w.vocab[t])
+            }
+        }
+    }
 }
 
 //! lang string ("en", "zh", ...) -> whisper language id (g_lang order). -1 when unknown.
