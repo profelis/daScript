@@ -14,9 +14,12 @@ require strings
 // from the fallback k1 tier (6) to the k2 tier (7).
 
 def private spawn_client(cmd : string; var lines : array<string>) : int {
+    // cmd.exe /c strips the first and last quote of a line that starts with a quote —
+    // wrap in a sacrificial outer pair on windows (same trap as the daspkg popen incident)
+    let full = get_platform_name() == "windows" ? "\"{cmd}\"" : cmd
     var rc : int
     unsafe {
-        rc = popen_timeout(cmd, 300.0) $(f) {
+        rc = popen_timeout(full, 300.0) $(f) {
             if (f == null) {
                 return
             }
