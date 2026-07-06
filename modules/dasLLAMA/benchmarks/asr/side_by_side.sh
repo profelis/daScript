@@ -62,7 +62,7 @@ for model in $MODELS; do
         for w in $files; do
             dur=$(afinfo "$w" 2>/dev/null | awk '/estimated duration/ { printf "%s", $3 }')
             ms=$(cli_run_ms "$model" "$w")
-            printf "cli\tggml-%s.bin\t%s\t%s\t%s\t%s\n" "$model" "$(basename "$w")" "$dur" "$rep" "$ms" |
+            printf "cli\t%s\t%s\t%s\t%s\t%s\n" "$(basename "$mpath")" "$(basename "$w")" "$dur" "$rep" "$ms" |
                 tee -a "$RAW"
         done
     done
