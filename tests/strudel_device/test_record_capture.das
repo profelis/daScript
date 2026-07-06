@@ -1,0 +1,65 @@
+options gen2
+options indenting = 4
+options persistent_heap
+options no_unused_function_arguments = false
+options no_unused_block_arguments = false
+
+require dastest/testing_boost
+require daslib/defer
+require audio/audio_record
+require audio
+require jobque
+require daslib/fio
+
+// Headless microphone-capture smoke test on miniaudio's NULL backend: the null device
+// feeds timer-paced silent frames, so start -> drain -> stop runs in CI with no real
+// hardware. Lives in this interpreter-only directory (gated off under --use-aot in
+// tests/.das_test) alongside the playback device tests — no capture device is AOT-driven,
+// matching the established "no device test is AOT'd" rule. Unlike playback, capture never
+// touches the mixer context (the RT callback only writes a lock-free C++ ring), so there is
+// no context race here; it is kept interp-only for consistency, not because of a known bug.
+
+[test]
+def test_record_capture_smoke(t : T?) {
+    t |> run("null-backend capture: start, drain silent frames, clean stop") @(t : T?) {
+        sound_set_null_device(true)
+        // reset the global null-backend flag on exit, so a later audio test in this process isn't forced onto it
+        defer() {
+            sound_set_null_device(false)
+        }
+        let before = count_jobque_leaks()
+        t |> success(sound_record_start(16000, 1, 16000, -1), "capture device should start on the null backend")
+        t |> success(sound_is_recording(), "should be recording after start")
+        var scratch : array<float>
+        scratch |> resize(16000)
+        var total = 0
+        for (_iter in range(30)) {   // ~600ms wall; the null device paces silent frames by run time
+            sleep(20u)
+            let n = sound_record_read(scratch)
+            t |> success(n >= 0, "record_read must never return a negative frame count")
+            total += n
+        }
+        t |> success(total > 0, "null backend should have produced capture frames")
+        t |> equal(sound_record_overflow_frames(), 0l)   // 1s ring drained every 20ms -> no overflow
+        sound_record_stop()
+        t |> success(!sound_is_recording(), "should not be recording after stop")
+        t |> equal(sound_record_available(), 0)          // device torn down -> nothing buffered
+        let after = count_jobque_leaks()
+        t |> equal(after, before)                        // capture allocates no jobque objects
+    }
+}
+
+[test]
+def test_record_device_enumeration(t : T?) {
+    t |> run("null-backend capture device enumeration") @(t : T?) {
+        sound_set_null_device(true)
+        defer() {
+            sound_set_null_device(false)
+        }
+        let devs <- sound_record_list_devices()
+        t |> equal(length(devs), sound_record_device_count())
+        for (d in devs) {
+            t |> success(d.index >= 0, "device index is non-negative")
+        }
+    }
+}

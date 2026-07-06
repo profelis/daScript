@@ -6,6 +6,8 @@
 #include "daScript/ast/ast_handle.h"
 #include "daScript/simulate/bind_enum.h"
 
+#include <atomic>
+
 // include vorbis extras before miniaudio
 #define STB_VORBIS_HEADER_ONLY
 #ifdef __forceinline
@@ -269,6 +271,26 @@ static bool g_null_context_inited = false;
 // initialized" rather than "what platform is this".
 static bool g_audio_single_threaded = false;
 
+// ---- capture (microphone) ----
+// A capture device independent of the playback device above: recording has its own lifecycle, so
+// it does not share g_device / g_mixer_context. The RT capture callback writes interleaved f32 into
+// g_capture_rb (a lock-free single-producer/single-consumer ring); scripts drain it on the main
+// thread via dasAudio_record_read. No daScript code runs on the audio thread — that is what lets
+// captured data cross into a context safely (see the threading notes in the module docs).
+static ma_context g_capture_context;
+static bool g_capture_context_inited = false;
+static ma_device g_capture_device;
+static ma_pcm_rb g_capture_rb;
+static bool g_capture_initialized = false;
+static int g_capture_rate = 0;
+static int g_capture_channels = 0;
+// Frames dropped because the ring was full when the callback tried to write (drain loop too slow).
+// Written on the audio thread, read on the main thread — atomic to stay data-race-clean under TSAN.
+static std::atomic<uint64_t> g_capture_overflow_frames { 0 };
+// Value-copies of the last capture enumeration, so device names/ids survive past the context-internal
+// buffer that ma_context_get_devices returns. Populated by dasAudio_record_device_count (main thread).
+static vector<ma_device_info> g_capture_device_cache;
+
 void dasAudio_set_null_device ( bool enabled ) {
     g_force_null_backend = enabled;
 }
@@ -358,16 +380,179 @@ bool dasAudio_init ( TFunc<void,TTemporary<TArray<float>>,int32_t,int32_t,float>
     return true;
 }
 
+// Bring up a persistent context for capture: enumeration hands back an opaque, context-owned
+// ma_device_id, and the device we later open on it must outlive that context — so we keep one
+// around rather than the transient (pContext==nullptr) form the playback path uses. Honors the
+// null-backend override so headless/CI runs enumerate+capture without real hardware.
+static bool ensure_capture_context () {
+    if ( g_capture_context_inited ) return true;
+    ma_result r;
+    if ( g_force_null_backend ) {
+        ma_backend nullBackend = ma_backend_null;
+        r = ma_context_init(&nullBackend, 1, nullptr, &g_capture_context);
+    } else {
+        r = ma_context_init(nullptr, 0, nullptr, &g_capture_context);
+    }
+    if ( r != MA_SUCCESS ) {
+        LOG(LogLevel::error) << "failed to init capture context.\n";
+        return false;
+    }
+    g_capture_context_inited = true;
+    return true;
+}
+
 void dasAudio_finalize ( void ) {
     if ( g_mixer_initialized ) {
         ma_device_uninit(&g_device);
         g_mixer_context.reset();
         g_mixer_initialized = false;
     }
+    // capture teardown, in case a script never called sound_record_stop
+    if ( g_capture_initialized ) {
+        ma_device_uninit(&g_capture_device);
+        g_capture_initialized = false;
+        ma_pcm_rb_uninit(&g_capture_rb);
+    }
+    if ( g_capture_context_inited ) {
+        ma_context_uninit(&g_capture_context);
+        g_capture_context_inited = false;
+    }
+    g_capture_device_cache.clear();
     if ( g_null_context_inited ) {
         ma_context_uninit(&g_null_context);
         g_null_context_inited = false;
     }
+}
+
+// RT-thread capture callback: append the just-captured interleaved f32 frames to the ring. Pure
+// C++ — no daScript, no allocation, no lock. On overflow (drain loop fell behind) the excess is
+// dropped and counted; recording never blocks the audio thread.
+void capture_callback ( ma_device *, void *, const void * pInput, ma_uint32 frameCount ) {
+    if ( !g_capture_initialized || pInput == nullptr ) return;
+    const float * src = (const float *) pInput;
+    ma_uint32 channels = (ma_uint32) g_capture_channels;
+    ma_uint32 framesLeft = frameCount;
+    ma_uint32 srcFrame = 0;
+    while ( framesLeft > 0 ) {
+        ma_uint32 chunk = framesLeft;
+        void * pWrite = nullptr;
+        if ( ma_pcm_rb_acquire_write(&g_capture_rb, &chunk, &pWrite) != MA_SUCCESS ) break;
+        if ( chunk == 0 ) {
+            ma_pcm_rb_commit_write(&g_capture_rb, 0);
+            g_capture_overflow_frames.fetch_add(framesLeft, std::memory_order_relaxed);
+            break;
+        }
+        memcpy(pWrite, src + (size_t)srcFrame * channels, (size_t)chunk * channels * sizeof(float));
+        ma_pcm_rb_commit_write(&g_capture_rb, chunk);
+        srcFrame += chunk;
+        framesLeft -= chunk;
+    }
+}
+
+bool dasAudio_record_start ( int32_t rate, int32_t channels, int32_t rb_frames, int32_t device_index, Context * context, LineInfoArg * at ) {
+    if ( g_capture_initialized ) context->throw_error_at(at, "already recording; call sound_record_stop first");
+    if ( rate <= 0 || channels <= 0 ) context->throw_error_at(at, "record rate and channels must be positive");
+    if ( rb_frames <= 0 ) rb_frames = rate;   // ~1s ring by default
+    if ( !ensure_capture_context() ) return false;
+    if ( ma_pcm_rb_init(ma_format_f32, (ma_uint32)channels, (ma_uint32)rb_frames, nullptr, nullptr, &g_capture_rb) != MA_SUCCESS ) {
+        LOG(LogLevel::error) << "failed to init capture ring buffer.\n";
+        return false;
+    }
+    ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
+    cfg.capture.format   = ma_format_f32;
+    cfg.capture.channels = (ma_uint32)channels;
+    cfg.sampleRate       = (ma_uint32)rate;
+    cfg.dataCallback     = capture_callback;
+    cfg.pUserData        = nullptr;
+    if ( device_index >= 0 ) {
+        // Re-enumerate for a fresh, valid id; the pointer only needs to survive until ma_device_init copies it.
+        ma_device_info * pCapture = nullptr;
+        ma_uint32 captureCount = 0;
+        if ( ma_context_get_devices(&g_capture_context, nullptr, nullptr, &pCapture, &captureCount) == MA_SUCCESS
+             && device_index < (int32_t)captureCount ) {
+            cfg.capture.pDeviceID = &pCapture[device_index].id;
+        } else {
+            LOG(LogLevel::error) << "capture device index out of range; falling back to default device.\n";
+        }
+    }
+    g_capture_overflow_frames.store(0, std::memory_order_relaxed);
+    if ( ma_device_init(&g_capture_context, &cfg, &g_capture_device) != MA_SUCCESS ) {
+        LOG(LogLevel::error) << "failed to open capture device.\n";
+        ma_pcm_rb_uninit(&g_capture_rb);
+        return false;
+    }
+    g_capture_rate = rate;
+    g_capture_channels = channels;
+    g_capture_initialized = true;   // set before start: the callback may fire immediately
+    if ( ma_device_start(&g_capture_device) != MA_SUCCESS ) {
+        LOG(LogLevel::error) << "failed to start capture device.\n";
+        g_capture_initialized = false;
+        ma_device_uninit(&g_capture_device);
+        ma_pcm_rb_uninit(&g_capture_rb);
+        return false;
+    }
+    return true;
+}
+
+void dasAudio_record_stop ( void ) {
+    if ( !g_capture_initialized ) return;
+    ma_device_uninit(&g_capture_device);   // stops the device and joins the audio thread
+    g_capture_initialized = false;
+    ma_pcm_rb_uninit(&g_capture_rb);
+}
+
+// Drain up to out's length of interleaved f32 from the ring into out; returns FRAMES read
+// (0 if not recording or nothing buffered). out is caller-sized; frames = out.size / channels.
+int32_t dasAudio_record_read ( TArray<float> & out, Context *, LineInfoArg * ) {
+    if ( !g_capture_initialized ) return 0;
+    ma_uint32 channels = (ma_uint32) g_capture_channels;
+    if ( channels == 0 || out.size == 0 ) return 0;
+    ma_uint32 wantFrames = (ma_uint32)(out.size / channels);
+    float * dst = (float *) out.data;
+    ma_uint32 framesRead = 0;
+    while ( framesRead < wantFrames ) {
+        ma_uint32 chunk = wantFrames - framesRead;
+        void * pRead = nullptr;
+        if ( ma_pcm_rb_acquire_read(&g_capture_rb, &chunk, &pRead) != MA_SUCCESS ) break;
+        if ( chunk == 0 ) { ma_pcm_rb_commit_read(&g_capture_rb, 0); break; }
+        memcpy(dst + (size_t)framesRead * channels, pRead, (size_t)chunk * channels * sizeof(float));
+        ma_pcm_rb_commit_read(&g_capture_rb, chunk);
+        framesRead += chunk;
+    }
+    return (int32_t) framesRead;
+}
+
+int32_t dasAudio_record_available ( void ) {
+    if ( !g_capture_initialized ) return 0;
+    return (int32_t) ma_pcm_rb_available_read(&g_capture_rb);
+}
+
+bool dasAudio_is_recording ( void ) {
+    return g_capture_initialized;
+}
+
+int64_t dasAudio_record_overflow_frames ( void ) {
+    return (int64_t) g_capture_overflow_frames.load(std::memory_order_relaxed);
+}
+
+int32_t dasAudio_record_device_count ( Context *, LineInfoArg * ) {
+    if ( !ensure_capture_context() ) return 0;
+    ma_device_info * pCapture = nullptr;
+    ma_uint32 captureCount = 0;
+    if ( ma_context_get_devices(&g_capture_context, nullptr, nullptr, &pCapture, &captureCount) != MA_SUCCESS ) return 0;
+    g_capture_device_cache.assign(pCapture, pCapture + captureCount);   // value-copy; ids survive next enumeration
+    return (int32_t) captureCount;
+}
+
+char * dasAudio_record_device_name ( int32_t index, Context * context, LineInfoArg * at ) {
+    if ( index < 0 || index >= (int32_t) g_capture_device_cache.size() ) return nullptr;
+    const char * name = g_capture_device_cache[index].name;
+    return context->allocateString(name, (uint64_t) strlen(name), at);
+}
+
+bool dasAudio_record_device_is_default ( int32_t index ) {
+    if ( index < 0 || index >= (int32_t) g_capture_device_cache.size() ) return false;
+    return g_capture_device_cache[index].isDefault != 0;
 }
 
 MA_API ma_result dasAudio_ma_resampler_init(const ma_resampler_config* pConfig, ma_resampler* pResampler) {
@@ -1034,6 +1219,25 @@ public:
             SideEffects::modifyExternal, "dasAudio_set_null_device")->args({"enabled"});
         addExtern<DAS_BIND_FUN(dasAudio_is_single_threaded)>(*this, lib, "audio_is_single_threaded",
             SideEffects::accessExternal, "dasAudio_is_single_threaded");
+        // ---- capture (microphone) ----
+        addExtern<DAS_BIND_FUN(dasAudio_record_start)>(*this, lib, "sound_record_start",
+            SideEffects::modifyExternal, "dasAudio_record_start")->args({"rate", "channels", "rb_frames", "device_index", "context", "at"});
+        addExtern<DAS_BIND_FUN(dasAudio_record_stop)>(*this, lib, "sound_record_stop",
+            SideEffects::modifyExternal, "dasAudio_record_stop");
+        addExtern<DAS_BIND_FUN(dasAudio_record_read)>(*this, lib, "sound_record_read",
+            SideEffects::modifyArgumentAndExternal, "dasAudio_record_read")->args({"out", "context", "at"});
+        addExtern<DAS_BIND_FUN(dasAudio_record_available)>(*this, lib, "sound_record_available",
+            SideEffects::accessExternal, "dasAudio_record_available");
+        addExtern<DAS_BIND_FUN(dasAudio_is_recording)>(*this, lib, "sound_is_recording",
+            SideEffects::accessExternal, "dasAudio_is_recording");
+        addExtern<DAS_BIND_FUN(dasAudio_record_overflow_frames)>(*this, lib, "sound_record_overflow_frames",
+            SideEffects::accessExternal, "dasAudio_record_overflow_frames");
+        addExtern<DAS_BIND_FUN(dasAudio_record_device_count)>(*this, lib, "sound_record_device_count",
+            SideEffects::modifyExternal, "dasAudio_record_device_count")->args({"context", "at"});
+        addExtern<DAS_BIND_FUN(dasAudio_record_device_name)>(*this, lib, "sound_record_device_name",
+            SideEffects::modifyExternal, "dasAudio_record_device_name")->args({"index", "context", "at"});
+        addExtern<DAS_BIND_FUN(dasAudio_record_device_is_default)>(*this, lib, "sound_record_device_is_default",
+            SideEffects::accessExternal, "dasAudio_record_device_is_default")->args({"index"});
         addExtern<DAS_BIND_FUN(dasAudio_mixerContext),SimNode_ExtFuncCallRef>(*this, lib, "mixer_context",
             SideEffects::modifyExternal, "dasAudio_mixerContext");
         // enums

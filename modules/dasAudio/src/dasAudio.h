@@ -48,6 +48,19 @@ namespace das {
     void dasAudio_finalize ( void );
     void dasAudio_set_null_device ( bool enabled );
     bool dasAudio_is_single_threaded ();
+
+    // ---- capture (microphone) ----
+    // Separate capture device + a lock-free ring (ma_pcm_rb): the RT callback only writes C++-owned
+    // memory (no daScript context on the audio thread); scripts drain on the main thread via record_read.
+    bool dasAudio_record_start ( int32_t rate, int32_t channels, int32_t rb_frames, int32_t device_index, Context * context, LineInfoArg * at );
+    void dasAudio_record_stop ( void );
+    int32_t dasAudio_record_read ( TArray<float> & out, Context * context, LineInfoArg * at );
+    int32_t dasAudio_record_available ( void );
+    bool dasAudio_is_recording ( void );
+    int64_t dasAudio_record_overflow_frames ( void );
+    int32_t dasAudio_record_device_count ( Context * context, LineInfoArg * at );
+    char * dasAudio_record_device_name ( int32_t index, Context * context, LineInfoArg * at );
+    bool dasAudio_record_device_is_default ( int32_t index );
     MA_API ma_result dasAudio_ma_resampler_init(const ma_resampler_config* pConfig, ma_resampler* pResampler);
     MA_API void dasAudio_ma_resampler_uninit(ma_resampler* pResampler);
     MA_API ma_result dasAudio_ma_channel_converter_init(const ma_channel_converter_config* pConfig, ma_channel_converter* pConverter);
