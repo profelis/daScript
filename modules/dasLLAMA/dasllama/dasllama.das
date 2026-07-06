@@ -142,6 +142,15 @@ def add_user(var chat : ChatSession; text : string) {
     add_user_(chat, text)
 }
 
+def add_assistant(model : Model; var chat : ChatSession; text : string) {
+    //! Inject a KNOWN assistant reply (no generation): prefill the pending user turn and ``text`` into
+    //! the KV cache, then close the turn — like ``respond`` but with a supplied reply. Replay a prior
+    //! transcript with alternating ``add_user`` / ``add_assistant`` calls, then ``respond`` the final
+    //! turn — the shape a stateless OpenAI-style server needs (the client resends the whole history
+    //! each request). Precondition: a user message is pending (``add_user`` first); a no-op otherwise.
+    add_assistant_(model, chat, text)
+}
+
 def add_user_audio(var chat : ChatSession; samples : array<float> | #) {
     //! Queue audio (16 kHz mono f32 PCM) for the next ``respond`` — encoded to soft tokens
     //! immediately, spliced at the head of the turn before any ``add_user`` text. Multiple clips
