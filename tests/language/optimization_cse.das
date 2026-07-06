@@ -183,7 +183,7 @@ struct CseBody {
 }
 
 def touch(var b : CseBody) {
-    b.pos.x += 1
+    b.pos.x ++
 }
 
 [export]
@@ -221,7 +221,7 @@ def target_index_kill(var arr : array<int>; i : int) : int {
 
 [export]
 def target_local_precision(x : int) : int {
-    var s1 = CseBody(pos = CsePoint(x = x, y = 0), id = 0)
+    let s1 = CseBody(pos = CsePoint(x = x, y = 0), id = 0)
     var s2 = CseBody(pos = CsePoint(x = x + 1, y = 0), id = 0)
     let a = s1.pos.x * 41
     s2.pos.x = 7  // a store through ANOTHER local cannot alias s1: the pair survives
@@ -422,7 +422,7 @@ def test_cse_behavior(t : T?) {
         var s = CseBody(pos = CsePoint(x = 2, y = 0), id = 0)
         t |> equal(target_arg_aliasing(s, s), 301)  // 5*43 + 2*43: the recompute observes the write
         var s2 = CseBody(pos = CsePoint(x = 2, y = 0), id = 0)
-        var s3 = CseBody(pos = CsePoint(x = 2, y = 0), id = 0)
+        let s3 = CseBody(pos = CsePoint(x = 2, y = 0), id = 0)
         t |> equal(target_arg_aliasing(s2, s3), 172)
     }
 }

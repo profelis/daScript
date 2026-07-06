@@ -186,6 +186,11 @@ namespace das {
             void checkFunc ( Function * fn ) {
                 if ( !fn || !privateSymbol.empty() ) return;
                 auto origin = fn->fromGeneric ? fn->fromGeneric : fn;
+                // instances are stamped private by instantiation, which keeps this gate
+                // deliberately conservative: a body calling ANY generic instance stays
+                // un-spliced across modules. Loosening it to origin-privateness re-fires
+                // hundreds of linq_fold_common splices and destabilizes the fold macro's
+                // shape assumptions - measure before widening
                 if ( fn->privateFunction || origin->privateFunction ) {
                     if ( fn->module==mod || origin->module==mod ) {
                         privateSymbol = origin->name;

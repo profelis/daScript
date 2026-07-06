@@ -218,7 +218,7 @@ def test_inline_behavior(t : T?) {
         t |> equal(target_lazy(41), 42);
     }
     t |> run("body with a block literal splices") @(t : T?) {
-        var arr <- [3, 9, 1, 7];
+        let arr <- [3, 9, 1, 7];
         t |> equal(gathered_sum(arr, 2), 19);
         t |> equal(gathered_sum(arr, 6), 16);
     }

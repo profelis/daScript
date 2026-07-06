@@ -44,7 +44,7 @@ def chain_sum(src : array<int>; k : int; blk : block<(v : int) : int>) : int {
 
 def multi_exit(src : array<int>; blk : block<(v : int) : int>) : int {
     // two returns: single-exit gate declines this callee
-    if (length(src) == 0) {
+    if (empty(src)) {
         return -1
     }
     return invoke(blk, src[0])
@@ -141,12 +141,12 @@ def test_auto_inline_fired(t : T?) {
 [test]
 def test_auto_inline_behavior(t : T?) {
     t |> run("values preserved") @(t : T?) {
-        var src <- [1, 2, 3, 4]
+        let src <- [1, 2, 3, 4]
         t |> equal(target_auto(src), 30)
         t |> equal(target_void_auto(src), 10)
         t |> equal(target_chain(src), 114)
         t |> equal(target_multi_exit(src), 3)
-        var none : array<int>
+        let none : array<int>
         t |> equal(target_multi_exit(none), -1)
         t |> equal(target_recursive(src), 11)
     }
