@@ -2,6 +2,9 @@ options gen2
 options indenting = 4
 options rtti
 options no_coverage
+// the post-inference tests pin the compiled comprehension shell (invoke of the
+// comprehension generator) - auto block inlining legitimately dissolves it
+options disable_auto_inline
 
 require daslib/ast
 require daslib/rtti

@@ -72,6 +72,29 @@ def recursive_taker(n : int; blk : block<(v : int) : int>) : int {
     return recursive_taker(n - 1, blk) + 1  // nolint:LINT010
 }
 
+struct LoHi {
+    lo : int
+    hi : int
+}
+
+def make_lohi(k : int; blk : block<(v : int) : int>) : LoHi {
+    // struct (refType) result, copy return: splices through the manufactured
+    // uninitialized result temp
+    let v = invoke(blk, k)
+    return LoHi(lo = v, hi = v * 10)
+}
+
+def doubled_of(src : array<int>; blk : block<(v : int) : int>) : array<int> {
+    // array result, move return: the trailing `return <-` becomes a move into the temp.
+    // deliberately a push loop, not a comprehension - the invoke must sit in a loop body
+    var r : array<int>
+    r |> reserve(length(src))
+    for (v in src) {
+        r |> push(invoke(blk, v))
+    }
+    return <- r
+}
+
 [export]
 def target_auto(src : array<int>) : int {
     return src |> transform_sum() $(v) => v * v
@@ -99,6 +122,23 @@ def target_multi_exit(src : array<int>) : int {
 [export]
 def target_canonicalized(src : array<int>) : int {
     return src |> guarded_first() $(v) => v * 3
+}
+
+[export]
+def target_struct_result(k : int) : int {
+    let p = make_lohi(k) $(v) => v + 1
+    return p.lo + p.hi
+}
+
+[export]
+def target_array_result(src : array<int>) : int {
+    var doubled <- src |> doubled_of() $(v) => v * 2
+    var sum = 0
+    for (v in doubled) {
+        sum += v
+    }
+    delete doubled
+    return sum
 }
 
 [export]
@@ -155,6 +195,15 @@ def test_auto_inline_fired(t : T?) {
             let b = body_of(t, "target_canonicalized")
             t |> success(!has(b, "guarded_first("), "call is gone: {b}")
         }
+        t |> run("struct-result callee splices through the result temp") @(t : T?) {
+            let b = body_of(t, "target_struct_result")
+            t |> success(!has(b, "make_lohi("), "call is gone: {b}")
+        }
+        t |> run("array-result callee splices, move return preserved") @(t : T?) {
+            let b = body_of(t, "target_array_result")
+            t |> success(!has(b, "doubled_of("), "call is gone: {b}")
+            t |> success(!has(b, "invoke("), "invoke devirtualized: {b}")
+        }
         t |> run("recursive callee declines") @(t : T?) {
             let b = body_of(t, "target_recursive")
             t |> success(has(b, "recursive_taker("), "call stays regular: {b}")
@@ -171,9 +220,12 @@ def test_auto_inline_behavior(t : T?) {
         t |> equal(target_chain(src), 114)
         t |> equal(target_multi_exit(src), 30)
         t |> equal(target_canonicalized(src), 3)
+        t |> equal(target_struct_result(4), 55)
+        t |> equal(target_array_result(src), 20)
         let none : array<int>
         t |> equal(target_multi_exit(none), -1)
         t |> equal(target_canonicalized(none), -1)
+        t |> equal(target_array_result(none), 0)
         t |> equal(target_recursive(src), 11)
     }
     t |> run("impure arguments evaluate once in call order") @(t : T?) {

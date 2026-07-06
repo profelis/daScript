@@ -192,7 +192,31 @@ namespace das {
                 // hundreds of linq_fold_common splices and destabilizes the fold macro's
                 // shape assumptions - measure before widening
                 if ( fn->privateFunction || origin->privateFunction ) {
-                    if ( fn->module==mod || origin->module==mod ) {
+                    // a private reference resolves after the splice only when it lives in
+                    // the DESTINATION module itself - a private instance in the callee's
+                    // module or any third module (a builtin generic instantiated there)
+                    // is unreachable from the caller's re-infer
+                    if ( fn->module!=dest && origin->module!=dest ) {
+                        privateSymbol = origin->name;
+                        return;
+                    }
+                }
+                // a generic INSTANCE call is name-mangled for the argument flavor it was
+                // instantiated with. tolerant instances (push, length) re-match after a
+                // splice, but an `explicit`-flavored parameter (==const generics: the
+                // clone family) locks the exact constness - substituting a non-const
+                // caller argument into a const-instantiated call stops the mangled name
+                // from matching. foreign-module instances decline outright (reachability),
+                // destination-module instances decline only on the explicit flavor
+                if ( fn->fromGeneric ) {
+                    bool explicitFlavor = false;
+                    for ( auto & arg : fn->arguments ) {
+                        if ( arg->type && (arg->type->explicitConst || arg->type->explicitRef) ) {
+                            explicitFlavor = true;
+                            break;
+                        }
+                    }
+                    if ( explicitFlavor || fn->module!=dest ) {
                         privateSymbol = origin->name;
                         return;
                     }
@@ -323,6 +347,12 @@ namespace das {
                     auto ait = rename->find(var->aka);
                     if ( ait != rename->end() ) var->aka = ait->second;
                 }
+                // a compiled (cross-module) callee has been through allocateStack, which
+                // aliases the returned local's storage to the function's CMRES slot. the
+                // spliced copy lives in the CALLER's frame, where that aliasing is stale -
+                // simulate would write the local through the caller's (possibly null)
+                // cmres. present virgin state; the caller's own allocation re-derives
+                var->aliasCMRES = false;
             }
             virtual void preVisit ( ExprFor * expr ) override {
                 Visitor::preVisit(expr);
@@ -573,7 +603,16 @@ namespace das {
                                                         // hoisting one would copy a non-copyable)
             if ( e->rtti_isTypeDecl() ) return true;    // type<...> witness: a compile-time tag
             if ( e->rtti_isUnsafe() ) return inlinePure(static_cast<ExprUnsafe *>(e)->body);
-            if ( e->rtti_isVar() ) return !static_cast<ExprVar *>(e)->isGlobalVariable();
+            if ( e->rtti_isVar() ) {
+                auto ev = static_cast<ExprVar *>(e);
+                // a manufactured, not-yet-resolved temp read (this pass's own __inl*
+                // vars, e.g. an earlier site's result temp): no flags, no type - reads
+                // as "global" and untyped, which would hoist it as an impure COPY.
+                // it is a plain local read - pure. everything else at patch time is
+                // resolved, so the flags can be trusted
+                if ( !ev->variable && !ev->type ) return true;
+                return !ev->isGlobalVariable();
+            }
             if ( e->rtti_isR2V() ) return inlinePure(static_cast<ExprRef2Value *>(e)->subexpr);
             if ( e->rtti_isField() ) return inlinePure(static_cast<ExprField *>(e)->value);
             if ( e->rtti_isSafeField() ) return inlinePure(static_cast<ExprSafeField *>(e)->value);
@@ -806,8 +845,15 @@ namespace das {
         const string & plainName = fn->fromGeneric ? fn->fromGeneric->name : fn->name;
         if ( !isPlainIdentifier(plainName) ) { err = "[inline] does not support operator overloads ('" + plainName + "')"; return false; }
         if ( fn->result && !fn->result->isVoid() ) {
-            if ( fn->result->ref || fn->result->isRefType() ) {
+            if ( fn->result->ref ) {
                 err = "[inline] result must be by-value (or void)";
+                return false;
+            }
+            // a refType result splices through a manufactured uninitialized (zeroed)
+            // temp that the trailing return fully writes before any read; a type whose
+            // C++ constructor must run cannot take that path
+            if ( fn->result->isRefType() && fn->result->hasNonTrivialCtor() ) {
+                err = "[inline] result type requires nontrivial construction";
                 return false;
             }
         }
@@ -869,15 +915,19 @@ namespace das {
     namespace {
 
         // a block literal the devirtualizer can splice in place: a plain in-frame block
-        // with a single-exit body and a by-value (or void) result. splicing dissolves the
-        // block boundary, so a break/continue not bound to a loop inside the body is out
+        // with a single-exit body and a non-reference (or void) result. splicing dissolves
+        // the block boundary, so a break/continue not bound to a loop inside the body is out
         bool checkDevirtShape ( ExprMakeBlock * mkb, string & why ) {
             if ( mkb->isLambda || mkb->isLocalFunction || !mkb->capture.empty() ) { why = "lambda literal"; return false; }
             if ( !mkb->block || !mkb->block->rtti_isBlock() ) { why = "no block body"; return false; }
             auto blk = static_cast<ExprBlock *>(mkb->block);
             bool isVoid = !blk->returnType || blk->returnType->isVoid();
-            if ( !isVoid && (blk->returnType->ref || blk->returnType->isRefType()) ) {
+            if ( !isVoid && blk->returnType->ref ) {
                 why = "result is not by-value";
+                return false;
+            }
+            if ( !isVoid && blk->returnType->isRefType() && blk->returnType->hasNonTrivialCtor() ) {
+                why = "result requires nontrivial construction";
                 return false;
             }
             for ( auto & arg : blk->arguments ) {
@@ -1185,7 +1235,12 @@ namespace das {
                 // ----- classify arguments -----
                 auto & stats = paramStats(body, *sa.params);
                 bool isVoid = subjResult==nullptr;
-                bool exprBody = body->list.size()==1 && body->list.back()->rtti_isReturn();
+                // a move return (`return <- x`) never substitutes as an expression: the
+                // substituted read would COPY where the callee moved (an error for
+                // non-copyables, a semantic change otherwise) - it takes the result-temp
+                // path, which preserves the move
+                bool exprBody = body->list.size()==1 && body->list.back()->rtti_isReturn()
+                    && !static_cast<ExprReturn *>(body->list.back())->moveSemantics;
                 bool writeFree = calleeFn ? calleeWriteFree(calleeFn) : false;  // a block body is judged unknown
                 das_hash_map<Variable *, ArgSub> paramSub;
                 vector<ExpressionPtr> temps;
@@ -1401,8 +1456,10 @@ namespace das {
                         string tname = "__inl" + to_string(inlineId) + "_low";
                         inlineId ++;
                         // a non-const temp: a `var p = <temp>` consumer of pointer type
-                        // rejects initialization from a const reference
-                        auto hoist = makeTemp(callLike->at, tname, lazy, false, false, false);
+                        // rejects initialization from a const reference. a non-copyable
+                        // lazy result (ternary of arrays) must move into the hoist
+                        bool viaMove = lazy->type && !lazy->type->canCopy();
+                        auto hoist = makeTemp(callLike->at, tname, lazy, false, false, viaMove);
                         ReplaceNode rn;
                         rn.what = lazy;
                         rn.with = new ExprVar(callLike->at, tname);
@@ -1423,14 +1480,20 @@ namespace das {
                     vector<ExpressionPtr> replacement;
                     replacement.push_back(makeUninitDecl(site.stmt->at, rootVar->name, lazy->type));
                     auto readT = [&]() { return new ExprVar(site.stmt->at, rootVar->name); };
+                    // the arm stores mirror the hoist's own init semantics: a temp that was
+                    // move-initialized (non-copyable lazy result) moves from the selected arm
+                    auto armStore = [&]( const LineInfo & at, Expression * src ) -> Expression * {
+                        if ( rootVar->init_via_move ) return new ExprMove(at, readT(), src);
+                        return new ExprCopy(at, readT(), src);
+                    };
                     if ( lazy->rtti_isOp3() ) {
                         auto op3 = static_cast<ExprOp3 *>(lazy);
                         auto thenBlk = new ExprBlock();
                         thenBlk->at = op3->at;
-                        thenBlk->list.push_back(new ExprCopy(op3->at, readT(), op3->left));
+                        thenBlk->list.push_back(armStore(op3->at, op3->left));
                         auto elseBlk = new ExprBlock();
                         elseBlk->at = op3->at;
-                        elseBlk->list.push_back(new ExprCopy(op3->at, readT(), op3->right));
+                        elseBlk->list.push_back(armStore(op3->at, op3->right));
                         replacement.push_back(new ExprIfThenElse(op3->at, op3->subexpr, thenBlk, elseBlk));
                     } else if ( lazy->rtti_isOp2() ) {
                         auto op2 = static_cast<ExprOp2 *>(lazy);
@@ -1533,8 +1596,13 @@ namespace das {
                         string resName = "__inl" + to_string(inlineId) + "_res";
                         splice.push_back(makeUninitDecl(callLike->at, resName, subjResult));
                         auto ret = static_cast<ExprReturn *>(trailing);
-                        bodyClone->list.push_back(new ExprCopy(ret->at,
-                            new ExprVar(ret->at, resName), ret->subexpr));
+                        // `return <- x` becomes a move into the result temp, `return x` a copy
+                        Expression * store = ret->moveSemantics
+                            ? static_cast<Expression *>(new ExprMove(ret->at,
+                                new ExprVar(ret->at, resName), ret->subexpr))
+                            : static_cast<Expression *>(new ExprCopy(ret->at,
+                                new ExprVar(ret->at, resName), ret->subexpr));
+                        bodyClone->list.push_back(store);
                         callReplacement = new ExprVar(callLike->at, resName);
                     }
                     splice.push_back(bodyClone->visit(rewriter));
@@ -1699,6 +1767,14 @@ namespace das {
             // [inline] bodies stay untouched: their shape contract is fail-closed, and a
             // multi-exit [inline] callee must be the same compile error at every -O level
             if ( fn->mustInline ) return false;
+            // only a function with a block parameter can ever be an auto splice callee
+            // (candidacy requires a block LITERAL argument), so canonicalizing anything
+            // else buys no splice and costs a re-infer round on every module that has one
+            bool hasBlockParam = false;
+            for ( auto & arg : fn->arguments ) {
+                if ( arg->type && arg->type->baseType==Type::tBlock ) { hasBlockParam = true; break; }
+            }
+            if ( !hasBlockParam ) return false;
             // goto can target a label in a tail this pass would move into an else arm; the
             // feature is rare enough that any use opts the whole function out
             bool hasGotoOrLabel = false;
