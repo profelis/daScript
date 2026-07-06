@@ -7,8 +7,8 @@
 namespace das {
 
     void optimizeProgram(Program * program, TextWriter & logs, ModuleGroup & libGroup) {
-        bool logOpt = program->options.getBoolOption("log_optimization",false);
-        bool logPass = program->options.getBoolOption("log_optimization_passes",false);
+        bool logOpt = program->options.getBoolOption("log_optimization", program->policies.log_optimization);
+        bool logPass = program->options.getBoolOption("log_optimization_passes", program->policies.log_optimization_passes);
         bool log = logOpt || logPass;
         bool any, last;
         int optimizationRound = 1;

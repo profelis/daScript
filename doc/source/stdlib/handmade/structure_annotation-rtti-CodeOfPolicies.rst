@@ -66,13 +66,18 @@ Allows float optimizations with major bit differences (x*0, x-x, reciprocal divi
 Disables the dead-store-elimination optimizer pass. Host-side counterpart of ``options disable_dse`` (the option overrides the policy).
 Disables the common-subexpression-elimination optimizer pass. Host-side counterpart of ``options disable_cse`` (the option overrides the policy).
 Disables ``[inline]`` splicing - annotated calls stay regular calls. The declaration-level contract checks (body shape, recursion through the inline graph, taking the address) still run; call-site splice checks do not apply, since nothing splices. Host-side counterpart of ``options disable_inline`` (the option overrides the policy).
+Disables automatic inlining: block-literal call sites stay regular calls and invoke-of-literal sites stay invokes. ``[inline]`` splicing is unaffected. Host-side counterpart of ``options disable_auto_inline`` (the option overrides the policy).
+Disables compile-time function evaluation (RunFolding of pure calls over constant arguments). Host-side counterpart of ``options disable_run`` (the option overrides the policy).
 Disables infer-time constant folding.
 Fails compilation if AOT is not available.
 Fails compilation if AOT export is not available.
 Log compile time.
 Log total compile time.
 Log detailed per-module compile-time breakdown. Each required module emits its own block with parse / infer (with pass count) / optimize / macro (in infer) / macro mods times plus function count. Also enables a separate ``simulate (...) took X, modName (fileName)`` line for every ``Program::simulate`` call and the top-level aggregate summary at the end of compilation. Wired to the daslang CLI flag ``-log-compile-time``.
+Log optimizer rewrites: per-pass fired/nothing lines plus inline/devirtualization sites and declines. Host-side counterpart of ``options log_optimization`` (the option overrides the policy).
+Log the AST after every optimizer pass (verbose). Host-side counterpart of ``options log_optimization_passes`` (the option overrides the policy).
 Disables fast call optimization.
+Fuses interpreter nodes into wider superinstructions at simulate time (on by default). Host-side counterpart of ``options fusion`` (the option overrides the policy).
 Reuse stack memory after variables go out of scope.
 Force in-scope for POD-like types.
 Log in-scope for POD-like types.

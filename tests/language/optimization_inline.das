@@ -103,6 +103,24 @@ def twice(x : auto) {
     return x + x;
 }
 
+def for_each_hlp(src : array<int>; blk : block<(v : int) : void>) {
+    for (v in src) {
+        invoke(blk, v);
+    }
+}
+
+[inline]
+def gathered_sum(src : array<int>; k : int) : int {
+    // a block literal in the body: stays in-frame, clones with the splice
+    var total = 0;
+    src |> for_each_hlp() $(v) {
+        if (v > k) {
+            total += v;
+        }
+    }
+    return total;
+}
+
 [export]
 def target_basic(x, y : int) : int {
     return add(x, y + 1); // inlines to x + (y + 1), zero temps
@@ -198,6 +216,11 @@ def test_inline_behavior(t : T?) {
         t |> equal(target_generic(21, 1.5), 45.0);
         t |> equal(target_while(5), 5);
         t |> equal(target_lazy(41), 42);
+    }
+    t |> run("body with a block literal splices") @(t : T?) {
+        var arr <- [3, 9, 1, 7];
+        t |> equal(gathered_sum(arr, 2), 19);
+        t |> equal(gathered_sum(arr, 6), 16);
     }
     t |> run("impure args evaluate once, in call order") @(t : T?) {
         g_log = "";
