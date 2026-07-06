@@ -3,7 +3,6 @@ options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%);
 
 require dasllama/dasllama       // the public facade: engine + arch registration + chat layer
 require dasllama/dasllama_audio // whisper-encoder tower + mel frontend
-require dasllama/dasllama_common
 require audio                   // miniaudio decode (any format) resampled to 16 kHz mono
 require daslib/jobque_boost
 require daslib/fio
@@ -131,21 +130,21 @@ def main {
 
         var s = create_session(m)
         let t_pre = ref_time_ticks()
-        eval_embd_(m, s, embd, npos)
+        eval_embd(m, s, embd, npos)
         print("prefill {npos} pos ({n_audio} audio) in {get_time_usec(t_pre) / 1000} ms\n---\n")
 
         let eot = special_id(m, "<|endoftext|>")
         var one : array<int64>
         one |> resize(1)
         for (_i in range(N_GEN)) {
-            let tok = sample_(s, SamplingParams())
+            let tok = sample(s, SamplingParams())
             if (tok == im_end || tok == eot) {
                 break
             }
-            fprint(fstdout(), piece_(m, tok))
+            fprint(fstdout(), piece(m, tok))
             fflush(fstdout())
             one[0] = tok
-            eval_(m, s, one)
+            eval(m, s, one)
         }
         print("\n")
     }

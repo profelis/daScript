@@ -71,6 +71,14 @@ def eval(model : Model; var session : Session; tokens : array<int64>) {
     eval_(model, session, tokens)
 }
 
+def eval_embd(model : Model; var session : Session; embd : array<float>; npos : int64) {
+    //! ``eval``'s embedding-input twin: prefill ``npos`` pre-built embedding rows (``npos × dim``,
+    //! token-major) at the session's current position and advance it. This is the multimodal splice
+    //! entry — fill text spans with ``embed_text_rows`` and media spans with an encoder tower's
+    //! soft tokens (see ``examples/dasLLAMA/audio.das``). Logits land in ``session.logits``.
+    eval_embd_(model, session, embd, npos)
+}
+
 def sample(var session : Session; params : SamplingParams) : int64 {
     //! Sample the next token from ``session.logits`` per ``params``: repetition penalty over the recent
     //! window, then temperature + top-k + softmax + CDF — or greedy argmax when ``params.temp <= 0``.
