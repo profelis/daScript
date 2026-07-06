@@ -40,6 +40,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | _aot_so_mod.das | *(helper)* #3212 fixture module — Outer holds Inner by value, declared Outer-first | |
 | t_invoke_void.das | AOT `invoke` dispatch — void-returning function pointer via AOT path | |
 | test_variant_alias_aot.das | AOT variant-alias codegen (#3269) — delete of handled variant alias, builtin push of a variant element | |
+| test_int64_ptr_index.das | AOT raw-pointer indexing by int64/uint64 (#3391) — at/safe_at through non-var (`T * const`), var (`T *`), and const-pointee pointers | |
 
 ## apply/
 

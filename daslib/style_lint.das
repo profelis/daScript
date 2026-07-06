@@ -2459,9 +2459,13 @@ class StyleLintVisitor : AstVisitor {
             mark_unsafe_in_stack()
             return
         }
-        if (bt == Type.tPointer && expr.subexpr._type.firstType != null) {
-            let inner = expr.subexpr._type.firstType.baseType
-            if (inner == Type.tTable || inner == Type.tArray || inner == Type.tPointer) {
+        if (bt == Type.tPointer) {
+            // mirror ast_infer_type visit(ExprSafeAt): through a pointer, only
+            // vector and fixed-array pointees index without unsafe — everything
+            // else (scalar/struct/table/array/pointer pointee, or unknown) is
+            // unsafe_pointer_safe_index / unsafe_*_safe_index territory
+            let inner = expr.subexpr._type.firstType
+            if (inner == null || !(inner.isVectorType || inner.baseType == Type.tFixedArray)) {
                 mark_unsafe_in_stack()
             }
         }
