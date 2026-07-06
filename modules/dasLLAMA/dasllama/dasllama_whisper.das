@@ -179,12 +179,14 @@ def private wt_read_conv_permuted(recs : table<string; WTensorRec>; b : array<ui
 //! supported). Verified against whisper.cpp's whisper_model_load, byte for byte.
 def load_whisper_model(path : string) : WhisperModel {
     var w = WhisperModel()
+    // the record walk runs until EOF, so it needs the true byte count — length(bytes) is
+    // int32 and wraps negative on >2 GB bins (large-v3); stat's st_size is 64-bit
+    let n_bytes = int64(stat(path).size)
     let f = fopen(path, "rb")
     if (f == null) {
         panic("dasLLAMA whisper: cannot open model '{path}'")
     }
     fmap(f) $(var bytes : array<uint8>#) {
-        let n_bytes = int64(length(bytes))
         var o = 0l
         if (rd_u32(bytes, o) != 0x67676d6cu) {
             panic("dasLLAMA whisper: bad magic in '{path}' (want ggml 0x67676d6c)")

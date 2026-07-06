@@ -161,6 +161,19 @@ f16→f32-converted weights.
   hardcodes debug=false) — numpy is the mel oracle.
 - `no_context` defaults to TRUE (whisper.h 5939) — stock cli does NOT carry rolling context
   between windows; multi-window in notimestamps mode = independent windows.
+- **Family sweep (jfk, +timestamps, greedy)**: tiny, base.en, small, medium, large-v3,
+  large-v3-turbo all TOKEN-FOR-TOKEN (base.en also validates the non-multilingual path —
+  no lang/task prompt tokens, unshifted special ids). base diverges at ONE step: the
+  force-timestamp rule's logsumexp-vs-max-text comparison lands 2e-4 logits apart
+  (35.469856 vs 35.469654) while the oracle's own p(" ask") = 0.495 — both engines sit
+  exactly on that rule's 50/50 threshold and fp16 noise across the 1500-token logsumexp
+  decides it; base is exact in `-nt` mode. Also: whisper.cpp's `-nt` segment t0 is garbage
+  (uninitialized tid=0 → t0 = 2·(0−beg) = −100728 cs) — ours reports 0; ignore t0 when
+  diffing `-nt` runs.
+- **>2 GB bins (large-v3)**: `length(bytes)` on the fmap'd array is int32 and wraps
+  negative at 3.1 GB, silently emptying the until-EOF record walk ("missing tensor" panic).
+  Fix: byte count from `stat(path).size` (64-bit st_size). Offset reads past 2^31 were
+  always fine (the 8.5 GB llama GGUF proved that rail).
 - **W-E timestamps + long-form**: turbo EXACT on jfk (+ts, [0→1040] one segment, identical
   tokens) and on jfk3 33 s long-form (3 windows/segments, identical offsets and token lists).
   tiny +ts on jfk also exact. Two rules beyond the filter suite were load-bearing:
@@ -180,8 +193,9 @@ f16→f32-converted weights.
 
 ## Performance ledger (arc-local; fold into API_REWORK.md at PR time)
 
-- Measured (M1, examples/dasLLAMA/transcribe.das, jfk 11 s): tiny 22× realtime;
-  **large-v3-turbo 0.49× realtime (22.5 s)** — almost all of it the fp32 encoder window.
+- Measured (M1, examples/dasLLAMA/transcribe.das, jfk 11 s, fp32): tiny 22×, base 10×,
+  small 2.6×, medium 0.85×, large-v3 0.42×, **large-v3-turbo 0.49× realtime** — almost all
+  of it the fp32 encoder window.
 - Turbo encoder = the qwen2a tower cost (fp32 ≈ 18–19 s per 30 s chunk on M1) — the q8
   encoder-GEMM path from the qwen2-audio ledger applies verbatim and is the headline item
   (expected ~4× → ~2× realtime turbo).
