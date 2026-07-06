@@ -242,8 +242,9 @@ def private resp_error(var resp : HttpResponse?; status : http_status; msg : str
 }
 
 def private tmpdir() : string {
-    let t = get_env_variable("TMPDIR")
-    return empty(t) ? "/tmp" : t
+    var err = ""
+    let d = temp_directory(err)   // fio: platform temp dir (Windows GetTempPath, POSIX $TMPDIR/tmp)
+    return empty(d) ? "/tmp" : d
 }
 
 // Decode an uploaded audio file (any format miniaudio handles) to 16 kHz mono f32 PCM — the ASR
