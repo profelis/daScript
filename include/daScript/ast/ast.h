@@ -1597,6 +1597,8 @@ namespace das
     // environment
         /*option*/ bool no_optimizations = false;                  // disable optimizations, regardless of settings
         /*option*/ bool fast_math = false;                         // allow float optimizations with major bit differences (x*0, x-x, rcp division, NaN-compare flips, reassociation); doubles stay bit-exact unless this is on
+        /*option*/ bool disable_dse = false;                       // disable the dead-store-elimination pass
+        /*option*/ bool disable_cse = false;                       // disable the common-subexpression-elimination pass
         /*option*/ bool no_infer_time_folding = false;             // disable infer-time constant folding
         bool fail_on_no_aot = true;                     // AOT link failure is error
         bool fail_on_lack_of_aot_export = false;        // remove_unused_symbols = false is missing in the module, which is passed to AOT

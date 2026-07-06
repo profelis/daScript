@@ -1275,8 +1275,6 @@ namespace das {
         "no_optimization",              Type::tBool,
         "fusion",                       Type::tBool,
         "remove_unused_symbols",        Type::tBool,
-        "disable_dse",                  Type::tBool,
-        "disable_cse",                  Type::tBool,
     // language
         "always_export_initializer",    Type::tBool,
         "infer_time_folding",           Type::tBool,

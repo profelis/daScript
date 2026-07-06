@@ -555,7 +555,7 @@ namespace das {
     // program
 
     bool Program::optimizationCSE(int32_t round) {
-        if ( options.getBoolOption("disable_cse", false) ) return false;
+        if ( options.getBoolOption("disable_cse", policies.disable_cse) ) return false;
         checkSideEffects();
         EliminateCse pass(round);
         visit(pass);
