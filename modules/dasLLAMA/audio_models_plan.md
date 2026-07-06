@@ -87,9 +87,9 @@ first, wait for the merge, then this.
 
 ## Status
 
-- [ ] A. Ultravox (1b + 8b) — mmprojs downloaded
-- [ ] A. Voxtral-Mini-3B — HF original downloading; self-convert pending
-- [ ] A. Qwen2.5-Omni 3B/7B — GGUFs downloading
+- [x] A. Ultravox (1b + 8b) — ✅ token-for-token: 1b on jfk.wav + test-2.mp3, 8b on jfk.wav
+- [x] A. Voxtral-Mini-3B — ✅ transcription prompt byte-identical (jfk); tokenizer id-for-id; decoder 40/40; encoder ≤5e-4; the two open-caption prompts each flip one 0.079/0.195-logit coin-flip (whisper-tiny/base precedent, not chased)
+- [x] A. Qwen2.5-Omni 3B/7B — ✅ token-for-token: 3B on jfk.wav + test-2.mp3, 7B on jfk.wav
 - [ ] B. API discussion + implementation
 - [ ] C. Qwen3-ASR 0.6B/1.7B
 - [ ] D. Parakeet-TDT 0.6b-v2 — .nemo downloaded
@@ -98,4 +98,42 @@ first, wait for the merge, then this.
 
 ## Findings
 
-(collect as sessions land)
+- **ggml's build_stack "padding" never materializes** — `GGML_PAD(total, stride)` is a
+  power-of-2 bitmask macro but the ultravox stride (n_embd·stack = 10240) isn't a power of
+  two, so `GGML_PAD(1920000, 10240) = 1921024`, and `1921024 / 10240 = 187` in the view's
+  int division. Net semantics: floor(n_pos/stack) full rows, ragged tail positions DROPPED
+  (4 positions ≈ 80 ms for ultravox, 2 for voxtral), zero-pad row never reaches the
+  projector. Matches clip_n_output_tokens' `ALIGN(3000,8)/8/2 = 187` only by this accident;
+  we implement the floor directly (`audio_tokens_per_chunk`).
+- **`clip.audio.projection_dim` lies for ultravox-1b** (says 4096; mm.a.mlp.2 projects into
+  the 2048-wide llama-3.2-1b decoder). Loader derives projector dims from the mm tensors.
+- **f16 mmproj vs fp32 parity**: published ultravox/omni mmprojs are f16; ggml's f16
+  mul_mat path (fp16 accumulate on ARM) drifts vs our fp32 → oracle runs use a local
+  f16→f32 re-encode of the mmproj (scratch script; conv weights MUST stay f16 — ggml's
+  clip conv/im2col path aborts on F32 kernels, which is also why the upstream converter
+  pins convs to f16 even at `--outtype f32`). Our side reads either dtype identically.
+- **Qwen2.5-Omni decoder is arch `qwen2vl` (M-RoPE)** — for text+audio input mtmd assigns
+  every M-RoPE coordinate the same linear position (`set_position_mrope_1d`), each rope
+  section rotates by exactly the standard angle, so plain qwen2 forward is bit-identical.
+  Registered `qwen2vl` as a qwen2 alias; vision input stays out of scope. Omni GGUFs also
+  omit `tokenizer.ggml.bos_token_id` entirely (BPE loader now tolerates that).
+- **tekken pre-tokenizer goes through llama.cpp's GENERIC wregex** (no custom splitter), so
+  the parity target is true ECMAScript alternation semantics of the case-structured
+  approximation — a non-cased run followed by ASCII uppercase ("你A") splits "你"|"A",
+  unlike gpt-4o's merged-run reduction which would take the whole run. No contractions,
+  single-digit \p{N}, '/' in the punct tail. `ignore_merges` (whole-word-first) was already
+  unconditional in our BPE.
+- **Voxtral upstream converter bug (patched locally in ~/Work/llama.cpp)**: conversion/llama.py's
+  tekken branch calls `_set_vocab_mistral()` without `return`, falling through to the
+  gpt2 vocab path which crashes on MistralCommonTokenizer. Upstream alongside the mtmd
+  `is_audio` one-liner.
+- mtmd-cli prompt shapes (all: audio marker PREPENDED when absent, add_special BOS rules):
+  ultravox = llama-3 render, NO audio delimiters, embeds inline; voxtral = `<s>[INST]`
+  `[BEGIN_AUDIO]` + embeds + text + `[/INST]` (v7-tekken, no spaces); omni = qwen2a's
+  chatml + `<|audio_bos|>/<|audio_eos|>` verbatim, no system message.
+- **Voxtral near-tie verdict method** (reusable): when a temp-0 gate diverges, walk our
+  greedy steps printing top-2 logit gaps. Voxtral jfk flipped at step 0 (gap 0.079 of ~24,
+  p≈0.52) and test-2 at step 30 (gap 0.195; ' headline' vs ' speaker'), while every
+  MATCHED step cleared gaps up to 12 logits and tokenizer/decoder/encoder each verified
+  independently (id-for-id / 40-40 / ≤5e-4). A prompt without a tie ("Transcribe the
+  speech.") matched byte-identical to the natural stop — that's the positive gate.

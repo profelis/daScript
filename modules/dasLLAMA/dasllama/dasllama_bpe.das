@@ -54,7 +54,8 @@ def load_bpe_tokenizer_gguf(path : string) : BpeTokenizer {
         let tok_model = gguf_has(m, "tokenizer.ggml.model") ? gguf_str(m, bytes, "tokenizer.ggml.model") : ""
         tk.pre = gguf_has(m, "tokenizer.ggml.pre") ? gguf_str(m, bytes, "tokenizer.ggml.pre") : tok_model
         tk.spm_space = tok_model == "gemma4"
-        tk.bos_id = gguf_int(m, bytes, "tokenizer.ggml.bos_token_id")
+        // Qwen2.5-Omni GGUFs omit bos_token_id entirely (qwen2 never adds BOS)
+        tk.bos_id = gguf_has(m, "tokenizer.ggml.bos_token_id") ? gguf_int(m, bytes, "tokenizer.ggml.bos_token_id") : -1l
         tk.eos_id = gguf_int(m, bytes, "tokenizer.ggml.eos_token_id")
         // the metadata key wins; absent, mirror llama.cpp's per-pre defaults (gpt-4o adds no BOS,
         // the llama-bpe family keeps it)
@@ -336,6 +337,105 @@ def private pretok_split_gpt4o(cpts : array<int>) : array<int> {
     return <- offs
 }
 
+// tekken pre-split (Mistral/Voxtral). llama.cpp has NO custom splitter for tekken — it runs the
+// generic std::wregex fallback on the case-structured approximation, so the parity target is TRUE
+// ECMAScript alternation semantics, not gpt-4o's merged-run reduction:
+//   [^\r\n\p{L}\p{N}]?(up* lo+ | up+ lo*) | \p{N} | <space>?[^\s\p{L}\p{N}]+[\r\n/]* | <ws rules>
+// where up/lo are the llama.cpp classes (letter minus ASCII a-z / minus A-Z, so non-cased scripts
+// are in BOTH). Alternative order matters: up*lo+ is tried FIRST with greedy backtracking, so a
+// non-cased run followed by ASCII uppercase ("你A") splits "你"|"A" (gpt-4o's reduction would take
+// the whole run). No contraction arm, single-digit \p{N} (qwen2 style), '/' in the punct tail.
+def private pretok_split_tekken(cpts : array<int>) : array<int> {
+    var offs : array<int>
+    let n = length(cpts)
+    var prev_end = 0
+    var pos = 0
+    while (pos < n) {
+        let cpt = cpts[pos]
+
+        // [^\r\n\p{L}\p{N}]?(up* lo+ | up+ lo*)
+        if (!(cpt == 13 || cpt == 10 || cpt_is_number(cpt))) {
+            if (cpt_is_letter(cpt) || uL(cpts, pos + 1)) {
+                var q = pos
+                if (!cpt_is_letter(cpt)) {
+                    q++   // the optional one-char non-letter prefix
+                }
+                var up = 0
+                while (uUp(cpts, q + up)) {
+                    up++
+                }
+                // alt1 up* lo+: greedy up-run backtracks until a lo char can start lo+
+                var split = up
+                while (split >= 0 && !uLo(cpts, q + split)) {
+                    split--
+                }
+                var e = q
+                if (split >= 0) {
+                    e = q + split
+                    while (uLo(cpts, e)) {
+                        e++
+                    }
+                } else {   // alt2 up+ lo*: up >= 1 guaranteed (first letter failed uLo => it's up)
+                    e = q + up
+                    while (uLo(cpts, e)) {
+                        e++
+                    }
+                }
+                pos = e
+                offs |> push(pos - prev_end); prev_end = pos
+                continue
+            }
+        }
+
+        // \p{N} — one digit per token
+        if (cpt_is_number(cpt)) {
+            pos++
+            offs |> push(pos - prev_end); prev_end = pos
+            continue
+        }
+
+        // <space>?[^\s\p{L}\p{N}]+[\r\n/]*
+        let probe = (cpt == 32) ? pos + 1 : pos
+        if (!(uW(cpts, probe) || uL(cpts, probe) || uN(cpts, probe))) {
+            if (cpt == 32) {
+                pos++
+            }
+            while (!(uW(cpts, pos) || uL(cpts, pos) || uN(cpts, pos)) && pos < n) {
+                pos++
+            }
+            var c2 = uC(cpts, pos)
+            while (c2 == 13 || c2 == 10 || c2 == 47) {
+                pos++
+                c2 = uC(cpts, pos)
+            }
+            offs |> push(pos - prev_end); prev_end = pos
+            continue
+        }
+
+        // remaining whitespace rules: \s*[\r\n]+ | \s+(?!\S) | \s+ (same as llama3)
+        var num_ws = 0
+        var last_rn = 0
+        while (uW(cpts, pos + num_ws)) {
+            let c2 = uC(cpts, pos + num_ws)
+            if (c2 == 13 || c2 == 10) {
+                last_rn = pos + num_ws + 1
+            }
+            num_ws++
+        }
+        if (last_rn > 0) {
+            pos = last_rn
+        } elif (num_ws > 1 && uC(cpts, pos + num_ws) != -1) {
+            pos += num_ws - 1
+        } elif (num_ws > 0) {
+            pos += num_ws
+        } else {
+            pos++  // no match — consume one codepoint
+        }
+        offs |> push(pos - prev_end); prev_end = pos
+    }
+    return <- offs
+}
+
 // ===== merge-rank BPE =====
 
 // Greedily merge the lowest-rank adjacent pair (leftmost on ties), in byte-unicode space.
@@ -448,11 +548,13 @@ def bpe_encode(tk : BpeTokenizer; text : string) : array<int64> {
     }
     var ids : array<int64>
     let cpts <- utf8_to_cpts(text)
-    // gpt-4o has its own case-structured split; qwen2 splits digits one-at-a-time (\p{N});
-    // llama3 / default groups up to three (\p{N}{1,3})
+    // gpt-4o and tekken have their own case-structured splits; qwen2 splits digits
+    // one-at-a-time (\p{N}); llama3 / default groups up to three (\p{N}{1,3})
     var offs : array<int>
     if (tk.pre == "gpt-4o") {
         offs <- pretok_split_gpt4o(cpts)
+    } elif (tk.pre == "tekken") {
+        offs <- pretok_split_tekken(cpts)
     } else {
         offs <- pretok_split(cpts, tk.pre != "qwen2")
     }

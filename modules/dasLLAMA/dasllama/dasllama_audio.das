@@ -370,7 +370,14 @@ def whisper_mel_window(m : WhisperMel; seek : int64) : MelChunk {
 
 // ===== Whisper encoder tower (fp32 bring-up; q8 fast path is ledgered) =====
 
-//! The audio tower: Whisper encoder weights + the Qwen2-Audio linear projector, all fp32 in
+//! Which projector tail maps encoder positions to decoder soft tokens (mtmd family names).
+enum AudioProjKind {
+    qwen2a      // avg-pool -> post-LN -> linear w+b (Qwen2-Audio; Qwen2.5-Omni audio is identical)
+    ultravox    // post-LN -> stack(8) -> RMS-pre -> mm1 -> swiglu_swapped -> RMS-mid -> mm2 (no biases)
+    voxtral     // avg-pool -> post-LN -> stack(4) -> mm1 -> gelu_erf -> mm2 (no biases)
+}
+
+//! The audio tower: Whisper encoder weights + a model-specific projector tail, all fp32 in
 //! one blob. Per-layer tensors sit at ``layers_off + l·layer_stride`` in the fixed order
 //! ``enc_layer_offsets`` computes — the loader lays them out, forward never touches names.
 struct AudioTower {
@@ -383,6 +390,9 @@ struct AudioTower {
     proj_dim : int64   // decoder embedding width the projector maps into (0 = no projector)
     gelu_tanh : bool = false  // whisper.cpp oracle uses the tanh-fp16-LUT gelu; mtmd uses erf
     eps : float = 1e-5
+    proj_kind : AudioProjKind = AudioProjKind.qwen2a
+    stack_factor : int64 = 1  // frame-concat width before the projector (ultravox 8, voxtral 4)
+    mm1_out : int64 = 0l      // projector hidden width (ultravox: pre-swiglu, voxtral: pre-gelu)
     fblob : array<float>
     conv1_w_off : int64
     conv1_b_off : int64
@@ -393,8 +403,28 @@ struct AudioTower {
     layer_stride : int64
     lnp_w_off : int64
     lnp_b_off : int64
-    proj_w_off : int64
-    proj_b_off : int64
+    proj_w_off : int64        // qwen2a: fc weight; ultravox/voxtral: mm1 weight
+    proj_b_off : int64        // qwen2a: fc bias
+    normpre_off : int64       // ultravox RMS-pre weight [d·stack]
+    normmid_off : int64       // ultravox RMS-mid weight [mm1_out/2]
+    mm2_w_off : int64         // ultravox/voxtral second projector matrix
+}
+
+def audio_has_avgpool(t : AudioTower) : bool => (
+    t.proj_kind == AudioProjKind.qwen2a || t.proj_kind == AudioProjKind.voxtral)
+
+//! Soft tokens one 30 s (3000-frame) mel chunk becomes after the projector — matches mtmd's
+//! clip_n_output_tokens: conv halves, avg-pool halves, stacking divides (floor: the ragged
+//! tail positions are DROPPED, mirroring ggml's build_stack view math — no zero-pad row).
+def audio_tokens_per_chunk(t : AudioTower) : int64 {
+    var n = t.n_ctx
+    if (audio_has_avgpool(t)) {
+        n /= 2l
+    }
+    if (t.stack_factor > 1l) {
+        n /= t.stack_factor
+    }
+    return n
 }
 
 // Per-layer tensor offsets inside fblob, in layout order. conv weights are stored PERMUTED
@@ -524,9 +554,10 @@ def private load_conv_permuted(m : GGUFMeta; bytes : array<uint8> | #; name : st
     }
 }
 
-//! Load a Qwen2-Audio (projector type ``qwen2a``) mmproj GGUF into an AudioTower: hparams from
-//! the ``clip.audio.*`` keys, every tensor fp32 into the blob in ``enc_layer_offsets`` order,
-//! conv weights permuted for im2col.
+//! Load an audio mmproj GGUF (projector ``qwen2a`` / ``qwen2.5o`` / ``ultravox`` / ``voxtral``)
+//! into an AudioTower: hparams from the ``clip.audio.*`` keys, every tensor fp32 into the blob
+//! in ``enc_layer_offsets`` order, conv weights permuted for im2col. Vision tensors in a
+//! combined omni mmproj are skipped (the loader only reads ``a.*`` / ``mm.a.*`` names).
 def load_audio_tower(path : string) : AudioTower {
     var t = AudioTower()
     let f = fopen(path, "rb")
@@ -536,8 +567,14 @@ def load_audio_tower(path : string) : AudioTower {
     fmap(f) $(var bytes : array<uint8>#) {
         let m <- parse_gguf_meta(bytes)
         let proj = gguf_str(m, bytes, "clip.projector_type")
-        if (proj != "qwen2a") {
-            panic("dasLLAMA: audio tower supports projector type 'qwen2a', got '{proj}'")
+        if (proj == "qwen2a" || proj == "qwen2.5o") {   // omni's audio side is qwen2a verbatim
+            t.proj_kind = AudioProjKind.qwen2a
+        } elif (proj == "ultravox") {
+            t.proj_kind = AudioProjKind.ultravox
+        } elif (proj == "voxtral") {
+            t.proj_kind = AudioProjKind.voxtral
+        } else {
+            panic("dasLLAMA: audio tower supports qwen2a/qwen2.5o/ultravox/voxtral projectors, got '{proj}'")
         }
         t.n_mel = gguf_int(m, bytes, "clip.audio.num_mel_bins")
         t.d_model = gguf_int(m, bytes, "clip.audio.embedding_length")
@@ -548,6 +585,9 @@ def load_audio_tower(path : string) : AudioTower {
         if (gguf_has(m, "clip.audio.attention.layer_norm_epsilon")) {
             t.eps = gguf_f32(m, bytes, "clip.audio.attention.layer_norm_epsilon")
         }
+        if (gguf_has(m, "clip.audio.projector.stack_factor")) {
+            t.stack_factor = gguf_int(m, bytes, "clip.audio.projector.stack_factor")
+        }
         let d = t.d_model
         let ff = t.n_ff
         let nm = t.n_mel
@@ -557,6 +597,21 @@ def load_audio_tower(path : string) : AudioTower {
             panic("dasLLAMA: a.position_embd.weight missing from mmproj")
         }
         t.n_ctx = m.tensors[pi].n_elem / d
+
+        // projector shapes from the tensors themselves — clip.audio.projection_dim lies for
+        // ultravox-1b (the GGUF says 4096; mm2 actually projects into the 2048-wide decoder)
+        var mm1_in = 0l
+        if (t.proj_kind != AudioProjKind.qwen2a) {
+            mm1_in = d * t.stack_factor
+            let i1 = gguf_find_tensor(m, "mm.a.mlp.1.weight")
+            let i2 = gguf_find_tensor(m, "mm.a.mlp.2.weight")
+            if (i1 < 0 || i2 < 0) {
+                panic("dasLLAMA: mm.a.mlp.1/2.weight missing from '{proj}' mmproj")
+            }
+            t.mm1_out = m.tensors[i1].n_elem / mm1_in
+            let mm2_in = t.proj_kind == AudioProjKind.ultravox ? t.mm1_out / 2l : t.mm1_out
+            t.proj_dim = m.tensors[i2].n_elem / mm2_in
+        }
 
         // fixed blob layout: convs, pos, per-layer region, post-ln, projector
         var o = 0l
@@ -570,8 +625,18 @@ def load_audio_tower(path : string) : AudioTower {
         o += t.n_layer * t.layer_stride
         t.lnp_w_off = o; o += d
         t.lnp_b_off = o; o += d
-        t.proj_w_off = o; o += t.proj_dim * d
-        t.proj_b_off = o; o += t.proj_dim
+        if (t.proj_kind == AudioProjKind.qwen2a) {
+            t.proj_w_off = o; o += t.proj_dim * d
+            t.proj_b_off = o; o += t.proj_dim
+        } elif (t.proj_kind == AudioProjKind.ultravox) {
+            t.normpre_off = o; o += mm1_in
+            t.proj_w_off = o; o += t.mm1_out * mm1_in
+            t.normmid_off = o; o += t.mm1_out / 2l
+            t.mm2_w_off = o; o += t.proj_dim * (t.mm1_out / 2l)
+        } else {   // voxtral
+            t.proj_w_off = o; o += t.mm1_out * mm1_in
+            t.mm2_w_off = o; o += t.proj_dim * t.mm1_out
+        }
         t.fblob |> resize(int(o))
 
         load_conv_permuted(m, bytes, "a.conv1d.1.weight", t.fblob, t.conv1_w_off, d, nm)
@@ -599,8 +664,20 @@ def load_audio_tower(path : string) : AudioTower {
         }
         gguf_read_tensor_f32(m, bytes, "a.post_ln.weight", t.fblob, t.lnp_w_off, d)
         gguf_read_tensor_f32(m, bytes, "a.post_ln.bias", t.fblob, t.lnp_b_off, d)
-        gguf_read_tensor_f32(m, bytes, "mm.a.fc.weight", t.fblob, t.proj_w_off, t.proj_dim * d)
-        gguf_read_tensor_f32(m, bytes, "mm.a.fc.bias", t.fblob, t.proj_b_off, t.proj_dim)
+        if (t.proj_kind == AudioProjKind.qwen2a) {
+            gguf_read_tensor_f32(m, bytes, "mm.a.fc.weight", t.fblob, t.proj_w_off, t.proj_dim * d)
+            gguf_read_tensor_f32(m, bytes, "mm.a.fc.bias", t.fblob, t.proj_b_off, t.proj_dim)
+        } elif (t.proj_kind == AudioProjKind.ultravox) {
+            let m1in = d * t.stack_factor
+            gguf_read_tensor_f32(m, bytes, "mm.a.norm_pre.weight", t.fblob, t.normpre_off, m1in)
+            gguf_read_tensor_f32(m, bytes, "mm.a.mlp.1.weight", t.fblob, t.proj_w_off, t.mm1_out * m1in)
+            gguf_read_tensor_f32(m, bytes, "mm.a.norm_mid.weight", t.fblob, t.normmid_off, t.mm1_out / 2l)
+            gguf_read_tensor_f32(m, bytes, "mm.a.mlp.2.weight", t.fblob, t.mm2_w_off, t.proj_dim * (t.mm1_out / 2l))
+        } else {   // voxtral
+            let m1in = d * t.stack_factor
+            gguf_read_tensor_f32(m, bytes, "mm.a.mlp.1.weight", t.fblob, t.proj_w_off, t.mm1_out * m1in)
+            gguf_read_tensor_f32(m, bytes, "mm.a.mlp.2.weight", t.fblob, t.mm2_w_off, t.proj_dim * t.mm1_out)
+        }
     }
     fclose(f)
     return <- t
@@ -621,7 +698,9 @@ struct EncoderState {
     att : array<float>   // per-head blocked scores [n_head × ATTN_ENC_QB × T]
     h : array<float>     // ffn hidden [T × ff]
     pooled : array<float>// [T/2 × d]
-    out : array<float>   // projected soft tokens [T/2 × proj_dim]
+    ph : array<float>    // projector hidden [rows × mm1_out] (ultravox/voxtral)
+    pg : array<float>    // ultravox swiglu output [rows × mm1_out/2]
+    out : array<float>   // projected soft tokens [tokens_per_chunk × proj_dim]
 }
 
 let ATTN_ENC_QB = 128l  // query rows per attention score block (15 MB att scratch at T=1500)
@@ -644,7 +723,14 @@ def make_encoder_state(t : AudioTower) : EncoderState {
     s.att |> resize(int(t.n_head * ATTN_ENC_QB * tt))
     s.h |> resize(int(tt * t.n_ff))
     s.pooled |> resize(int(tt / 2l * d))
-    s.out |> resize(int(tt / 2l * t.proj_dim))
+    let rows = audio_tokens_per_chunk(t)
+    if (t.proj_kind != AudioProjKind.qwen2a) {
+        s.ph |> resize(int(rows * t.mm1_out))
+        if (t.proj_kind == AudioProjKind.ultravox) {
+            s.pg |> resize(int(rows * t.mm1_out / 2l))
+        }
+    }
+    s.out |> resize(int(rows * t.proj_dim))
     return <- s
 }
 
@@ -842,24 +928,78 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     diff_stage("after_blocks", s.x, tt * d)
 }
 
-//! Run the Whisper encoder + Qwen2-Audio projector over one 30 s mel chunk. Output lands in
-//! ``s.out``: ``n_ctx/2`` soft tokens × ``proj_dim`` (750 × decoder-dim for whisper-large-v3).
+//! Per-row swiglu with ggml's swapped halves: out[r][i] = silu(x[r][half+i]) · x[r][i]
+//! (ultravox_model.py's SwiGLU — silu on the SECOND half, passthrough on the first).
+def swiglu_swapped_rows(var o : array<float>; x : array<float>; half, rows : int64) {
+    for (r in range64(rows)) {
+        for (i in range64(half)) {
+            o[r * half + i] = x[r * 2l * half + half + i]
+        }
+    }
+    silu(o, rows * half)
+    for (r in range64(rows)) {
+        for (i in range64(half)) {
+            o[r * half + i] *= x[r * 2l * half + i]
+        }
+    }
+}
+
+// RMS-norm each d-wide row in place against a weight vector in the blob (ultravox projector
+// norms use eps 1e-6 hardcoded in mtmd's whisper-enc graph, independent of the tower eps)
+def private rms_rows_blob(var x : array<float>; blob : array<float>; w_off, dim, rows : int64) {
+    unsafe {
+        var xp = addr(x[0])
+        let wp = reinterpret<float const?>(addr(blob[w_off]))
+        for (r in range64(rows)) {
+            rmsnorm(xp + r * dim, xp + r * dim, wp, dim, 1e-6)
+        }
+    }
+}
+
+//! Run the Whisper encoder + the model's projector tail over one 30 s mel chunk. Output lands
+//! in ``s.out``: ``audio_tokens_per_chunk`` soft tokens × ``proj_dim``. Stacking is a flat
+//! reinterpret of the token-major stream as rows of ``d·stack`` — floor rows, ragged tail
+//! positions dropped (ggml build_stack's view math; zero-padding never reaches the projector).
 def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     audio_encode_blocks(t, s, mel)
     let tt = t.n_ctx
     let d = t.d_model
+    let rows = audio_tokens_per_chunk(t)
 
-    // avg-pool pairs over time (BEFORE the post-LN — mtmd build_vit order), then ln_post
-    let tp = tt / 2l
-    for (p in range64(tp)) {
-        for (c in range64(d)) {
-            s.pooled[p * d + c] = 0.5 * (s.x[2l * p * d + c] + s.x[(2l * p + 1l) * d + c])
+    if (t.proj_kind == AudioProjKind.qwen2a) {
+        // avg-pool pairs over time (BEFORE the post-LN — mtmd build_vit order), then ln_post
+        let tp = tt / 2l
+        for (p in range64(tp)) {
+            for (c in range64(d)) {
+                s.pooled[p * d + c] = 0.5 * (s.x[2l * p * d + c] + s.x[(2l * p + 1l) * d + c])
+            }
         }
-    }
-    layernorm_batch(s.pooled, s.pooled, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tp, t.eps)
+        layernorm_batch(s.pooled, s.pooled, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tp, t.eps)
 
-    // projector: one linear into the decoder's embedding space
-    mm_blob_b(s.out, t.fblob, t.proj_w_off, s.pooled, d, t.proj_dim, tp)
-    add_bias_rows(s.out, t.fblob, t.proj_b_off, t.proj_dim, tp)
-    diff_stage("out", s.out, tp * t.proj_dim)
+        // projector: one linear into the decoder's embedding space
+        mm_blob_b(s.out, t.fblob, t.proj_w_off, s.pooled, d, t.proj_dim, tp)
+        add_bias_rows(s.out, t.fblob, t.proj_b_off, t.proj_dim, tp)
+    } elif (t.proj_kind == AudioProjKind.ultravox) {
+        // post-LN over all positions (no avg-pool), stacked rows straight off s.xb's memory
+        layernorm_batch(s.xb, s.x, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tt, t.eps)
+        let m1in = d * t.stack_factor
+        rms_rows_blob(s.xb, t.fblob, t.normpre_off, m1in, rows)   // RMS-pre on stacked rows
+        mm_blob_b(s.ph, t.fblob, t.proj_w_off, s.xb, m1in, t.mm1_out, rows)
+        swiglu_swapped_rows(s.pg, s.ph, t.mm1_out / 2l, rows)
+        rms_rows_blob(s.pg, t.fblob, t.normmid_off, t.mm1_out / 2l, rows)
+        mm_blob_b(s.out, t.fblob, t.mm2_w_off, s.pg, t.mm1_out / 2l, t.proj_dim, rows)
+    } else {   // voxtral: avg-pool -> post-LN -> stack -> mm1 -> gelu_erf -> mm2
+        let tp = tt / 2l
+        for (p in range64(tp)) {
+            for (c in range64(d)) {
+                s.pooled[p * d + c] = 0.5 * (s.x[2l * p * d + c] + s.x[(2l * p + 1l) * d + c])
+            }
+        }
+        layernorm_batch(s.pooled, s.pooled, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tp, t.eps)
+        let m1in = d * t.stack_factor
+        mm_blob_b(s.ph, t.fblob, t.proj_w_off, s.pooled, m1in, t.mm1_out, rows)
+        gelu_erf(s.ph, rows * t.mm1_out)
+        mm_blob_b(s.out, t.fblob, t.mm2_w_off, s.ph, t.mm1_out, t.proj_dim, rows)
+    }
+    diff_stage("out", s.out, rows * t.proj_dim)
 }

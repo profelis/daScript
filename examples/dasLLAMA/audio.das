@@ -9,10 +9,13 @@ require daslib/fio
 require strings
 require math
 
-// Audio chat over Qwen2-Audio: mel frontend -> whisper encoder tower -> soft tokens spliced
-// into the EXISTING qwen2 decoder at the audio placeholder (no cross-attention). The prompt
-// layout mirrors llama.cpp's mtmd-cli exactly (no system message, audio before the text):
-//   <|im_start|>user\n<|audio_bos|>[soft tokens]<|audio_eos|>{prompt}<|im_end|>\n<|im_start|>assistant\n
+// Audio chat over the whisper-tower families: mel frontend -> whisper encoder tower -> soft
+// tokens spliced into the EXISTING decoder at the audio placeholder (no cross-attention).
+// The projector kind in the mmproj picks the prompt shape, each mirroring llama.cpp's
+// mtmd-cli exactly (no system message, audio before the text):
+//   qwen2a/qwen2.5o: <|im_start|>user\n<|audio_bos|>[audio]<|audio_eos|>{prompt}<|im_end|>\n<|im_start|>assistant\n
+//   ultravox:        <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n[audio]{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+//   voxtral:         <s>[INST][BEGIN_AUDIO][audio]{prompt}[/INST]
 //
 //   bin/daslang -jit examples/dasLLAMA/audio.das -- <decoder.gguf> <mmproj.gguf> <audio-file> [prompt]
 
@@ -84,7 +87,7 @@ def main {
     if (tower.proj_dim != dim) {
         panic("mmproj projects to {tower.proj_dim} but the decoder is {dim}-wide — mismatched pair")
     }
-    let n_audio_tok = tower.n_ctx / 2l
+    let n_audio_tok = audio_tokens_per_chunk(tower)
 
     with_job_que() {
         setup_dasllama_jobque()
@@ -103,19 +106,47 @@ def main {
 
         // the mtmd-cli prompt shape, split around the audio span; specials by id + text runs
         // encoded per segment (the chat layer's pattern — BPE merges never cross specials)
-        let im_start = special_id(m, "<|im_start|>")
-        let im_end = special_id(m, "<|im_end|>")
         var prefix : array<int64>
-        prefix |> push(im_start)
-        prefix |> push_from(encode(m, "user\n", false, false))
-        prefix |> push(special_id(m, "<|audio_bos|>"))
         var suffix : array<int64>
-        suffix |> push(special_id(m, "<|audio_eos|>"))
-        suffix |> push_from(encode(m, prompt, false, false))
-        suffix |> push(im_end)
-        suffix |> push_from(encode(m, "\n", false, false))
-        suffix |> push(im_start)
-        suffix |> push_from(encode(m, "assistant\n", false, false))
+        var stops : array<int64>
+        if (tower.proj_kind == AudioProjKind.qwen2a) {
+            let im_start = special_id(m, "<|im_start|>")
+            let im_end = special_id(m, "<|im_end|>")
+            prefix |> push(im_start)
+            prefix |> push_from(encode(m, "user\n", false, false))
+            prefix |> push(special_id(m, "<|audio_bos|>"))
+            suffix |> push(special_id(m, "<|audio_eos|>"))
+            suffix |> push_from(encode(m, prompt, false, false))
+            suffix |> push(im_end)
+            suffix |> push_from(encode(m, "\n", false, false))
+            suffix |> push(im_start)
+            suffix |> push_from(encode(m, "assistant\n", false, false))
+            stops |> push(im_end)
+            stops |> push(special_id(m, "<|endoftext|>"))
+        } elif (tower.proj_kind == AudioProjKind.ultravox) {
+            let hdr_start = special_id(m, "<|start_header_id|>")
+            let hdr_end = special_id(m, "<|end_header_id|>")
+            let eot = special_id(m, "<|eot_id|>")
+            prefix |> push(special_id(m, "<|begin_of_text|>"))
+            prefix |> push(hdr_start)
+            prefix |> push_from(encode(m, "user", false, false))
+            prefix |> push(hdr_end)
+            prefix |> push_from(encode(m, "\n\n", false, false))
+            suffix |> push_from(encode(m, prompt, false, false))
+            suffix |> push(eot)
+            suffix |> push(hdr_start)
+            suffix |> push_from(encode(m, "assistant", false, false))
+            suffix |> push(hdr_end)
+            suffix |> push_from(encode(m, "\n\n", false, false))
+            stops |> push(eot)
+        } else {   // voxtral
+            prefix |> push(special_id(m, "<s>"))
+            prefix |> push(special_id(m, "[INST]"))
+            prefix |> push(special_id(m, "[BEGIN_AUDIO]"))
+            suffix |> push_from(encode(m, prompt, false, false))
+            suffix |> push(special_id(m, "[/INST]"))
+            stops |> push(special_id(m, "</s>"))
+        }
         let n_prefix = int64(length(prefix))
         let n_suffix = int64(length(suffix))
         let n_audio = int64(length(chunks)) * n_audio_tok
@@ -133,12 +164,15 @@ def main {
         eval_embd(m, s, embd, npos)
         print("prefill {npos} pos ({n_audio} audio) in {get_time_usec(t_pre) / 1000} ms\n---\n")
 
-        let eot = special_id(m, "<|endoftext|>")
         var one : array<int64>
         one |> resize(1)
         for (_i in range(N_GEN)) {
             let tok = sample(s, SamplingParams())
-            if (tok == im_end || tok == eot) {
+            var is_stop = false
+            for (st in stops) {
+                is_stop ||= tok == st
+            }
+            if (is_stop) {
                 break
             }
             fprint(fstdout(), piece(m, tok))
