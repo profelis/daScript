@@ -1,0 +1,125 @@
+options gen2
+options fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
+options stack = 65536      // the ASR model structs (decoder + tower) need a deeper stack
+
+require dasllama/dasllama
+require audio
+require daslib/clargs
+require daslib/jobque_boost
+require daslib/fio
+require strings
+require math
+
+// ASR speed bench: load once, transcribe each file --reps times, one BENCH line per rep.
+// Pairs with side_by_side.sh, which interleaves this against whisper-cli / parakeet-cli.
+//
+//   bin/daslang -jit modules/dasLLAMA/benchmarks/asr/asr_bench.das -- \
+//       --model ~/Work/whisper.cpp/models/ggml-tiny.bin --wav corpus/jfk.wav --reps 3
+
+[CommandLineArgs]
+struct BenchArgs {
+    @clarg_required
+    @clarg_short = "m"
+    @clarg_doc = "ASR model path (ggml-*.bin or GGUF decoder)"
+    model : string
+
+    @clarg_doc = "mmproj GGUF for two-file models (qwen3-asr)"
+    mmproj : string
+
+    @clarg_required
+    @clarg_short = "w"
+    @clarg_doc = "Audio file(s) to transcribe (repeatable)"
+    wav : array<string>
+
+    @clarg_short = "r"
+    @clarg_doc = "Timed repetitions per file (default 3)"
+    reps : int
+
+    @clarg_short = "l"
+    @clarg_doc = "Language (default en)"
+    lang : string
+
+    @clarg_doc = "Print the transcription text of the last rep"
+    text : bool
+
+    @clarg_short = "?"
+    @clarg_name = "show-help"
+    @clarg_doc = "Show this help and exit"
+    help : bool
+}
+
+// Decode any audio file miniaudio understands to 16 kHz mono f32 (transcribe.das rail).
+def load_audio_16k_mono(path : string) : array<float> {
+    var decoder = new ma_decoder
+    var config <- ma_decoder_config_init(ma_format.ma_format_f32, 1u, uint(AUDIO_SAMPLE_RATE))
+    if (ma_decoder_init_file(path, unsafe(addr(config)), decoder) != ma_result.MA_SUCCESS) {
+        panic("cannot open audio file '{path}'")
+    }
+    var out : array<float>
+    let chunk = 65536
+    var buf : array<float>
+    buf |> resize(chunk)
+    while (true) {
+        let got = int(ma_decoder_read_pcm_frames(decoder, unsafe(addr(buf[0])), uint64(chunk)))
+        break if (got <= 0)
+        out |> reserve(length(out) + got)
+        for (i in range(got)) {
+            out |> push(buf[i])
+        }
+        break if (got < chunk)
+    }
+    ma_decoder_uninit(decoder)
+    unsafe {
+        delete decoder
+    }
+    return <- out
+}
+
+[export]
+def main() : int {
+    var r <- parse_args(type<BenchArgs>)
+    if (r |> is_err) {
+        print("error: {r |> unwrap_err}\n\n")
+        print_help(get_command_info(type<BenchArgs>), "asr_bench")
+        return 1
+    }
+    let cfg <- r |> move_unwrap
+    if (cfg.help) {
+        print_help(get_command_info(type<BenchArgs>), "asr_bench")
+        return 0
+    }
+    if (!jit_enabled()) {
+        print("This benchmark is JIT-only — run with: daslang -jit <file>\n")
+        return 1
+    }
+    let reps = cfg.reps > 0 ? cfg.reps : 3
+    let lang = empty(cfg.lang) ? "en" : cfg.lang
+    let model_name = base_name(cfg.model)
+
+    let t_load = ref_time_ticks()
+    var m <- empty(cfg.mmproj) ? load_asr_model(cfg.model) : load_asr_model(cfg.model, cfg.mmproj)
+    let load_ms = double(get_time_usec(t_load)) / 1000.0lf
+    print("LOAD\t{model_name}\t{load_ms}\n")
+
+    with_job_que() {
+        for (path in cfg.wav) {
+            var samples <- load_audio_16k_mono(path)
+            let audio_s = double(length(samples)) / double(AUDIO_SAMPLE_RATE)
+            let wav_name = base_name(path)
+            var last_text = ""
+            for (rep in range(reps)) {
+                var s = create_session(m, lang)
+                let t0 = ref_time_ticks()
+                last_text = transcribe(m, s, samples)
+                let ms = double(get_time_usec(t0)) / 1000.0lf
+                let speed = audio_s / (ms / 1000.0lf)   // x realtime, higher is faster
+                print("BENCH\t{model_name}\t{wav_name}\t{audio_s}\t{rep}\t{ms}\t{speed}\n")
+            }
+            if (cfg.text) {
+                print("TEXT\t{wav_name}\t{last_text}\n")
+            }
+            delete samples
+        }
+    }
+    return 0
+}
