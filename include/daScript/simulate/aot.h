@@ -27,6 +27,31 @@
 #pragma GCC diagnostic ignored "-Wsizeof-pointer-memaccess"
 #endif
 
+// options fast_math: per-function fast-math region emitted by the AOT compiler
+// (daslib/aot_cpp.das) around every function of a fast_math program. float_control
+// guards mirror aot_builtin_math.h: clang only outside arm64/e2k/Nintendo, and not
+// on the versions where float_control is broken (<12, 17-18.1). Where no relaxed
+// mode is known-safe the macros are empty and the function stays precise.
+#if defined(__GNUC__) && !defined(__clang__)
+#define DAS_FAST_MATH_PUSH \
+    _Pragma("GCC push_options") \
+    _Pragma("GCC optimize (\"fast-math\")")
+#define DAS_FAST_MATH_POP \
+    _Pragma("GCC pop_options")
+#elif defined(_MSC_VER) && !defined(__clang__)
+#define DAS_FAST_MATH_PUSH __pragma(float_control(precise, off, push))
+#define DAS_FAST_MATH_POP  __pragma(float_control(pop))
+#elif defined(__clang__) && !defined(__arm64__) && !defined(__e2k__) && !defined(__NINTENDO__) \
+    && !(__clang_major__ < 12 || (__clang_major__ >= 17 && __clang_major__ <= 18))
+#define DAS_FAST_MATH_PUSH \
+    _Pragma("float_control(precise, off, push)")
+#define DAS_FAST_MATH_POP \
+    _Pragma("float_control(pop)")
+#else
+#define DAS_FAST_MATH_PUSH
+#define DAS_FAST_MATH_POP
+#endif
+
 namespace das {
 
     #define DAS_SETBOOLOR(a,b)  (([&]()->bool{ bool & A=((a)); A=A||((b)); return A; })())

@@ -1549,7 +1549,7 @@ class public CppAot : AstVisitor {
             write(*ss, "\n/*<<AOT_FUNC_BEGIN>>*/");
         }
         if (fastMath) {
-            write(*ss, "\n#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC push_options\n#pragma GCC optimize (\"fast-math\")\n#else\n#pragma float_control(precise, off, push)\n#endif");
+            write(*ss, "\nDAS_FAST_MATH_PUSH");  // guards live in simulate/aot.h, mirroring aot_builtin_math.h
         }
         write(*ss, "\ninline ");
         describeLocalCppType(ss, fn.result, cross_platform, CpptSubstitureRef.no, CpptSkipConst.yes);
@@ -1599,7 +1599,7 @@ class public CppAot : AstVisitor {
             write(*ss, "\n");
         }
         if (fastMath) {
-            write(*ss, "#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC pop_options\n#else\n#pragma float_control(pop)\n#endif\n");
+            write(*ss, "DAS_FAST_MATH_POP\n");
         }
         if (!empty(aot_filter_function) && (fn.name == aot_filter_function || aotFuncName(fn) == aot_filter_function)) {
             write(*ss, "/*<<AOT_FUNC_END>>*/\n");
