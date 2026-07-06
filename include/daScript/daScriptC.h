@@ -693,7 +693,8 @@ typedef enum das_bool_policy {
     DAS_POLICY_NO_INFER_TIME_FOLDING,            // Disable infer-time constant folding
     DAS_POLICY_FAST_MATH,                        // Allow float optimizations with major bit differences (x*0, x-x, rcp division, reassociation)
     DAS_POLICY_DISABLE_DSE,                      // Disable the dead-store-elimination pass
-    DAS_POLICY_DISABLE_CSE                       // Disable the common-subexpression-elimination pass
+    DAS_POLICY_DISABLE_CSE,                      // Disable the common-subexpression-elimination pass
+    DAS_POLICY_DISABLE_INLINE                    // Disable [inline] splicing (calls stay regular calls; declaration-level contract checks - shape, recursion, @@ - still lint, call-site splice checks do not apply)
 } das_bool_policy;
 
 // Integer policy fields (stack size, heap limits).

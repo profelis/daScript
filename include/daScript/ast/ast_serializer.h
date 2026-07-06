@@ -221,7 +221,7 @@ namespace das {
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
         static constexpr uint32_t getVersion () {
-            return 96;   // 96: CodeOfPolicies::disable_dse / disable_cse added
+            return 97;   // 97: Function::mustInline flag / CodeOfPolicies::disable_inline added
         }
 
         void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;

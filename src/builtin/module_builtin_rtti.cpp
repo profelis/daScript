@@ -993,6 +993,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(fast_math)>("fast_math");
             addField<DAS_BIND_MANAGED_FIELD(disable_dse)>("disable_dse");
             addField<DAS_BIND_MANAGED_FIELD(disable_cse)>("disable_cse");
+            addField<DAS_BIND_MANAGED_FIELD(disable_inline)>("disable_inline");
             addField<DAS_BIND_MANAGED_FIELD(no_infer_time_folding)>("no_infer_time_folding");
             addField<DAS_BIND_MANAGED_FIELD(fail_on_no_aot)>("fail_on_no_aot");
             addField<DAS_BIND_MANAGED_FIELD(fail_on_lack_of_aot_export)>("fail_on_lack_of_aot_export");

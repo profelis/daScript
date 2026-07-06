@@ -272,6 +272,28 @@ Optimization and AOT
 ``[jit]``
     Requests JIT compilation for this function.
 
+``[inline]``
+    Splices the function body into every direct call site during compilation, in every
+    execution tier (interpreter, JIT, AOT). This is a contract, not a hint: a function
+    shape the inliner can't splice (multiple returns, by-reference result, generators,
+    lambdas, class methods, block/lambda literals in the body, recursion through other
+    ``[inline]`` functions) is a compile-time error, as is taking the function's address
+    with ``@@`` or calling it from a global or field initializer:
+
+    .. code-block:: das
+
+        [inline]
+        def clamp01(x : float) : float {
+            return saturate(x);
+        }
+
+    Leaf arguments (constants and variables) substitute textually; pure single-use
+    arguments substitute in place; everything else binds a temporary at the call site,
+    preserving call-order evaluation of side effects. ``options disable_inline`` (or the
+    host-side ``CodeOfPolicies::disable_inline``) turns splicing off - calls stay regular
+    calls - while the declaration-level contract checks (body shape, recursion, ``@@``)
+    still run; call-site splice checks do not apply, since nothing splices.
+
 ``[hybrid]``
     Marks a function as an AOT hybrid — it can call interpreted code from AOT context.
 
