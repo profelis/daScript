@@ -10,6 +10,7 @@ require daslib/array_boost
 require dasllama/dasllama_math
 require dasllama/dasllama_gguf
 require dasllama/dasllama_audio
+require dasllama/dasllama_quant
 
 // Parakeet-TDT (NVIDIA FastConformer + LSTM predictor + Token-and-Duration Transducer),
 // read from whisper.cpp's converted ggml bin. Oracle = whisper.cpp's in-tree parakeet-cli
@@ -110,6 +111,11 @@ struct ParakeetModel {
     joint_pred_b : int64
     joint_net_w : int64
     joint_net_b : int64
+    // Q8 fast path (parakeet_quantize): whole-blob Q8_0 image; GEMM regions repacked for the
+    // active backend. blob stays resident for the fp32-only reads (norms/biases/convs/LSTM).
+    q8 : bool
+    qblob : array<int8>
+    qscales : array<float>
 }
 
 def private pk_layer_offsets(m : ParakeetModel; l : int64) : PkLayerOffs {
@@ -152,6 +158,84 @@ def private pk_layer_offsets(m : ParakeetModel; l : int64) : PkLayerOffs {
 // per-layer blob span: 8 d×d mats (q/k/v/o/pos + pw1(2) + pw2) + 4 ff×d mats + 16
 // d-vectors (norms ×8, u/v, bn ×4) + the depthwise kernel
 def private pk_layer_stride(d, ff, nk : int64) : int64 => 8l * d * d + 4l * ff * d + 16l * d + nk * d
+
+// repack one GEMM region for the active backend (scales index at woff/32, so woff must be 32-aligned)
+def private pk_repack(var m : ParakeetModel; woff, n, d : int64) {
+    if (woff % 32l != 0l) {
+        panic("parakeet q8: GEMM weight at {woff} is not 32-aligned")
+    }
+    repack_q8q8_weight(m.qblob, m.qscales, woff, n, d)
+}
+
+//! Quantize the encoder/joint GEMM weights to Q8_0 and switch parakeet_encode onto the generated
+//! q8q8 kernels (~the decoder's quantize_weights). The conv im2col stack (k=9 taps), depthwise
+//! kernels, LSTM, and joint_net stay fp32 — they are a few % of encode and off the q8 shapes.
+def parakeet_quantize(var m : ParakeetModel) {
+    var qt <- quantize_q8_0(m.blob, int64(length(m.blob)))
+    m.qblob <- qt.q
+    m.qscales <- qt.scales
+    m.q8 = true
+    if (select_matmul_backend_for_load()) {
+        let d = m.n_state
+        let ff = 4l * d
+        let nch = m.n_sub_ch
+        let w1 = (m.n_mel - 1l) / 2l + 1l
+        let w2 = (w1 - 1l) / 2l + 1l
+        let w3 = (w2 - 1l) / 2l + 1l
+        let feat = w3 * nch                       // pre_w input dim (encode's xf row width)
+        pk_repack(m, m.c3_w, nch, nch)
+        pk_repack(m, m.c6_w, nch, nch)
+        pk_repack(m, m.pre_w, feat, d)
+        for (l in range64(m.n_layer)) {
+            let lo = pk_layer_offsets(m, l)
+            pk_repack(m, lo.ff1a_w, d, ff)
+            pk_repack(m, lo.ff1b_w, ff, d)
+            pk_repack(m, lo.q_w, d, d)
+            pk_repack(m, lo.k_w, d, d)
+            pk_repack(m, lo.v_w, d, d)
+            pk_repack(m, lo.o_w, d, d)
+            pk_repack(m, lo.pos_w, d, d)
+            pk_repack(m, lo.pw1_w, d, 2l * d)
+            pk_repack(m, lo.pw2_w, d, d)
+            pk_repack(m, lo.ff2a_w, d, ff)
+            pk_repack(m, lo.ff2b_w, ff, d)
+        }
+        pk_repack(m, m.joint_enc_w, d, m.n_pred_dim)
+    }
+}
+
+// mm_blob_b with the q8 route: activation image (xq, xs) pre-quantized by the caller
+// (asr_requant_rows_q8) so q/k/v and repeat consumers share one requant.
+def private pk_mm(m : ParakeetModel; var y : array<float>; woff : int64; x : array<float>;
+                  xq : array<int8>; xs : array<float>; n, d, npos : int64) {
+    if (m.q8) {
+        array_view(m.qblob, woff, n * d) $(wq : array<int8>#) {
+            array_view(m.qscales, woff / 32l, n * d / 32l) $(ws : array<float>#) {
+                matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, npos)
+            }
+        }
+    } else {
+        mm_blob_b(y, m.blob, woff, x, n, d, npos)
+    }
+}
+
+// requant-and-multiply for single-consumer activations (scratch grows lazily)
+def private pk_mm_rq(m : ParakeetModel; var y : array<float>; woff : int64; x : array<float>;
+                     var xq : array<int8>; var xs : array<float>; n, d, npos : int64) {
+    if (m.q8) {
+        pk_requant(x, n, npos, xq, xs)
+    }
+    pk_mm(m, y, woff, x, xq, xs, n, d, npos)
+}
+
+def private pk_requant(x : array<float>; n, npos : int64; var xq : array<int8>; var xs : array<float>) {
+    let need = npos * n
+    if (int64(length(xq)) < need) {
+        xq |> resize(int(need))
+        xs |> resize(int(need / 32l))
+    }
+    asr_requant_rows_q8(x, n, npos, xq, xs)
+}
 
 // ===== bin container =====
 
@@ -556,7 +640,12 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
     let n_head = m.n_head
     let dh = d / n_head
 
+    // q8 activation scratch (one image reused across sites; q/k/v share one requant)
+    var xqi : array<int8>
+    var xsi : array<float>
+
     // conv subsampling ([time][mel] rows are already the [ih][iw][c=1] layout)
+    var tp = ref_time_ticks()
     var col : array<float>
     var y0 : array<float>
     var y2 : array<float>
@@ -571,14 +660,14 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
     let w2 = (w1 - 1l) / 2l + 1l               // 32
     let t2 = (t1 - 1l) / 2l + 1l
     y3 |> resize(int(t2 * w2 * nch))
-    mm_blob_b(y3, m.blob, m.c3_w, y2, nch, nch, t2 * w2)   // 1x1 conv = per-position channel mix
+    pk_mm_rq(m, y3, m.c3_w, y2, xqi, xsi, nch, nch, t2 * w2)   // 1x1 conv = per-position channel mix
     add_bias_rows(y3, m.blob, m.c3_b, nch, t2 * w2)
     pk_relu(y3)
     pk_conv2d_dw_s2(y5, y3, m.blob, m.c5_w, m.c5_b, w2, t2, nch)
     let w3 = (w2 - 1l) / 2l + 1l               // 16
     let t3 = (t2 - 1l) / 2l + 1l
     y6 |> resize(int(t3 * w3 * nch))
-    mm_blob_b(y6, m.blob, m.c6_w, y5, nch, nch, t3 * w3)
+    pk_mm_rq(m, y6, m.c6_w, y5, xqi, xsi, nch, nch, t3 * w3)
     add_bias_rows(y6, m.blob, m.c6_b, nch, t3 * w3)
     pk_relu(y6)
 
@@ -599,8 +688,10 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
     }
     var x : array<float>
     x |> resize(int(tt * d))
-    mm_blob_b(x, m.blob, m.pre_w, xf, feat, d, tt)
+    pk_mm_rq(m, x, m.pre_w, xf, xqi, xsi, feat, d, tt)
     add_bias_rows(x, m.blob, m.pre_b, d, tt)
+    asr_prof_add("pk.conv_subsample", tp)
+    tp = ref_time_ticks()
 
     // masked tail (padded mel frames past the real audio): none for full-clip encode when
     // ceil-per-stage == ceil(n/8); the oracle masks keys >= ceil(n_len_org/8)
@@ -619,6 +710,13 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
             pos_emb[w * d + 2l * k + 1l] = cos(theta)
         }
     }
+    // the rel-pos image is layer-invariant: one requant serves every layer's pos projection
+    var posq : array<int8>
+    var poss : array<float>
+    if (m.q8) {
+        pk_requant(pos_emb, d, ww, posq, poss)
+    }
+    asr_prof_add("pk.pos_emb", tp)
 
     // scratch
     var xb : array<float>
@@ -653,21 +751,29 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
         let lo = pk_layer_offsets(m, l)
 
         // FFN1 (macaron half)
+        tp = ref_time_ticks()
         layernorm_batch(xb, x, m.blob, lo.nf1_w, lo.nf1_b, d, tt, m.eps)
-        mm_blob_b(h, m.blob, lo.ff1a_w, xb, d, 4l * d, tt)
+        pk_mm_rq(m, h, lo.ff1a_w, xb, xqi, xsi, d, 4l * d, tt)
         silu(h, tt * 4l * d)
-        mm_blob_b(xb, m.blob, lo.ff1b_w, h, 4l * d, d, tt)
+        pk_mm_rq(m, xb, lo.ff1b_w, h, xqi, xsi, 4l * d, d, tt)
         for (i in range64(tt * d)) {
             x[i] += 0.5 * xb[i]
         }
+        asr_prof_add("pk.ffn", tp)
 
         // rel-pos attention
+        tp = ref_time_ticks()
         layernorm_batch(xb, x, m.blob, lo.nat_w, lo.nat_b, d, tt, m.eps)
-        mm_blob_b(qq, m.blob, lo.q_w, xb, d, d, tt)
-        mm_blob_b(kk, m.blob, lo.k_w, xb, d, d, tt)
-        mm_blob_b(vv, m.blob, lo.v_w, xb, d, d, tt)
-        // pos projection for this layer: [W × d]
-        mm_blob_b(posl, m.blob, lo.pos_w, pos_emb, d, d, ww)
+        if (m.q8) {   // q/k/v share the post-LN activation: one requant, three GEMMs
+            pk_requant(xb, d, tt, xqi, xsi)
+        }
+        pk_mm(m, qq, lo.q_w, xb, xqi, xsi, d, d, tt)
+        pk_mm(m, kk, lo.k_w, xb, xqi, xsi, d, d, tt)
+        pk_mm(m, vv, lo.v_w, xb, xqi, xsi, d, d, tt)
+        // pos projection for this layer: [W × d], against the hoisted layer-invariant image
+        pk_mm(m, posl, lo.pos_w, pos_emb, posq, poss, d, d, ww)
+        asr_prof_add("pk.attn_proj", tp)
+        tp = ref_time_ticks()
         for (hi in range64(n_head)) {
             let hoff = hi * dh
             // content scores: (Q + u_h) · Kᵀ
@@ -725,12 +831,16 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
                 }
             }
         }
-        mm_blob_b(xb, m.blob, lo.o_w, ao, d, d, tt)
+        asr_prof_add("pk.attn_heads", tp)
+        tp = ref_time_ticks()
+        pk_mm_rq(m, xb, lo.o_w, ao, xqi, xsi, d, d, tt)
         add_inplace_rows(x, xb, tt * d)
+        asr_prof_add("pk.attn_out", tp)
 
         // conv module
+        tp = ref_time_ticks()
         layernorm_batch(xb, x, m.blob, lo.ncv_w, lo.ncv_b, d, tt, m.eps)
-        mm_blob_b(h, m.blob, lo.pw1_w, xb, d, 2l * d, tt)
+        pk_mm_rq(m, h, lo.pw1_w, xb, xqi, xsi, d, 2l * d, tt)
         for (t in range64(tt)) {   // GLU: signal · σ(gate)
             for (j in range64(d)) {
                 let sg = h[t * 2l * d + j]
@@ -754,20 +864,23 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
                 ao[t * d + j] = bv * (1.0 / (1.0 + exp(-bv)))   // silu
             }
         }
-        mm_blob_b(xb, m.blob, lo.pw2_w, ao, d, d, tt)
+        pk_mm_rq(m, xb, lo.pw2_w, ao, xqi, xsi, d, d, tt)
         add_inplace_rows(x, xb, tt * d)
+        asr_prof_add("pk.conv_module", tp)
 
         // FFN2 (second macaron half)
+        tp = ref_time_ticks()
         layernorm_batch(xb, x, m.blob, lo.nf2_w, lo.nf2_b, d, tt, m.eps)
-        mm_blob_b(h, m.blob, lo.ff2a_w, xb, d, 4l * d, tt)
+        pk_mm_rq(m, h, lo.ff2a_w, xb, xqi, xsi, d, 4l * d, tt)
         silu(h, tt * 4l * d)
-        mm_blob_b(xb, m.blob, lo.ff2b_w, h, 4l * d, d, tt)
+        pk_mm_rq(m, xb, lo.ff2b_w, h, xqi, xsi, 4l * d, d, tt)
         for (i in range64(tt * d)) {
             x[i] += 0.5 * xb[i]
         }
 
         // per-layer post norm
         layernorm_batch(x, x, m.blob, lo.nout_w, lo.nout_b, d, tt, m.eps)
+        asr_prof_add("pk.ffn", tp)
     }
 
     enc_out <- x
@@ -857,7 +970,9 @@ def parakeet_tdt_decode(m : ParakeetModel; enc_out : array<float>; n_frames : in
     // precompute the joint's encoder projection for every frame [T × pred_dim]
     var encp : array<float>
     encp |> resize(int(n_frames * pd))
-    mm_blob_b(encp, m.blob, m.joint_enc_w, enc_out, d, pd, n_frames)
+    var xqi : array<int8>
+    var xsi : array<float>
+    pk_mm_rq(m, encp, m.joint_enc_w, enc_out, xqi, xsi, d, pd, n_frames)
     add_bias_rows(encp, m.blob, m.joint_enc_b, pd, n_frames)
 
     var s <- make_parakeet_pred_state(m)

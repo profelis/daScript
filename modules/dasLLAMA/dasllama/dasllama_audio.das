@@ -8,6 +8,7 @@ require daslib/array_boost
 require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
+require dasllama/dasllama_quant
 
 // Whisper-family audio frontend: 16 kHz mono PCM -> log-mel chunks, in two oracle-exact
 // flavors: log_mel_chunks mirrors llama.cpp mtmd (tools/mtmd/mtmd-audio.cpp, qwen2a tower),
@@ -518,6 +519,25 @@ def layernorm_batch(var out : array<float>; src : array<float>; blob : array<flo
     }
 }
 
+//! Threaded per-row Q8_0 requant of a token-major activation image — the audio-side twin of the
+//! decoder's requant_rows_q8 (private to dasllama_common). Feeds matmul_q8q8_batch/group3.
+def asr_requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>) {
+    let nb = n / 32l
+    unsafe {
+        let xp = reinterpret<float const?>(addr(x[0]))
+        var qp = addr(xqb[0])
+        var sp = addr(xsb[0])
+        maybe_parallel_for(0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let pp = int64(p)
+                    quantize_q8_0_into_ptr(xp + pp * n, n, qp, sp, pp * n, pp * nb)
+                }
+            }
+        }
+    }
+}
+
 //! y[p] += blob[b_off .. b_off+d) for every row (projection bias)
 def add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
     for (p in range64(npos)) {
@@ -835,6 +855,44 @@ def private diff_stage(name : string; x : array<float>; n : int64) {
         }
     }
     fclose(f)
+}
+
+// ===== ASR stage profiling rail =====
+// set_asr_prof(true) → the ASR encode/decode paths accumulate wall us per stage label;
+// asr_prof_report() prints totals sorted desc and resets. Harness-only, off by default.
+var g_asr_prof_on = false
+var private g_asr_prof : table<string; int64>
+var private g_asr_prof_hits : table<string; int64>
+
+def set_asr_prof(on : bool) {
+    g_asr_prof_on = on
+}
+
+//! Accumulate ``get_time_usec(t0)`` under ``name`` (no-op unless set_asr_prof(true)).
+def asr_prof_add(name : string; t0 : int64) {
+    if (!g_asr_prof_on) {
+        return
+    }
+    g_asr_prof[name] += int64(get_time_usec(t0))
+    g_asr_prof_hits[name]++
+}
+
+def asr_prof_report() {
+    var rows : array<tuple<name : string; us : int64>>
+    var total = 0l
+    for (k, v in keys(g_asr_prof), values(g_asr_prof)) {
+        rows |> push((name = k, us = v))
+        total += v
+    }
+    rows |> sort() $(a, b) => a.us > b.us
+    for (r in rows) {
+        let hits = g_asr_prof_hits?[r.name] ?? 0l
+        let pct = total > 0l ? double(r.us) * 100.0lf / double(total) : 0.0lf
+        print("PROF\t{r.name}\t{double(r.us) / 1000.0lf}\t{hits}\t{pct}\n")
+    }
+    print("PROF\ttotal\t{double(total) / 1000.0lf}\t\t\n")
+    clear(g_asr_prof)
+    clear(g_asr_prof_hits)
 }
 
 // t.gelu_tanh selects the oracle-exact activation flavor (see gelu_tanh_lut)

@@ -46,14 +46,20 @@ for model in $MODELS; do
     mpath=$(model_path "$model")
     [ -f "$mpath" ] || { echo "skip $model (no $mpath)"; continue; }
     wavs=""
-    for w in $CORPUS; do wavs="$wavs --wav $w"; done
+    files=""
+    for w in $CORPUS; do
+        [ -f "$w" ] || { echo "skip $w (missing — run make)"; continue; }
+        wavs="$wavs --wav $w"; files="$files $w"
+    done
     for rep in $(seq "$REPS"); do
         echo "== $model rep $rep: das =="
-        "$DAS_ROOT/bin/daslang" -jit asr_bench.das -- --model "$mpath" $wavs --reps 1 2>&1 |
+        das_out=$("$DAS_ROOT/bin/daslang" -jit asr_bench.das -- --model "$mpath" $wavs --reps 1 2>&1) ||
+            { echo "$das_out" | tail -5; echo "DAS RUN FAILED for $model"; exit 1; }
+        echo "$das_out" |
             awk -v rep="$rep" -F'\t' '$1=="BENCH" { printf "das\t%s\t%s\t%s\t%s\t%s\n", $2, $3, $4, rep, $6 }' |
             tee -a "$RAW"
         echo "== $model rep $rep: cli =="
-        for w in $CORPUS; do
+        for w in $files; do
             dur=$(afinfo "$w" 2>/dev/null | awk '/estimated duration/ { printf "%s", $3 }')
             ms=$(cli_run_ms "$model" "$w")
             printf "cli\tggml-%s.bin\t%s\t%s\t%s\t%s\n" "$model" "$(basename "$w")" "$dur" "$rep" "$ms" |

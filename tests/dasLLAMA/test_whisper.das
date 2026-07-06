@@ -304,6 +304,26 @@ def test_parakeet_oracle(t : T?) {
             t |> equal(segs[0].tokens[32], 841, "tok[32] '.'")
             t |> success(segs[0].text == "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.", "text")
             t |> equal(s.detected_lang, "en")
+
+            // the default load above ran the Q8 fast path — pin that set_asr_fp32 gives the
+            // bit-exact fp32 route AND that both routes stay token-identical (jfk; gb1 was
+            // verified 786/786 at the q8 landing)
+            set_asr_fp32(true)
+            var mf <- load_asr_model(path)
+            set_asr_fp32(false)
+            t |> success(!mf.pk.q8, "knob forces fp32")
+            t |> success(m.pk.q8, "default load is q8")
+            var sf <- create_session(mf)
+            var fsegs : array<TranscribeSegment>
+            transcribe(mf, sf, samples) $(seg) {
+                fsegs |> push_clone(seg)
+            }
+            t |> equal(length(fsegs), 1)
+            t |> equal(length(fsegs[0].tokens), length(segs[0].tokens), "q8/fp32 token count")
+            for (a, b in fsegs[0].tokens, segs[0].tokens) {
+                t |> equal(a, b, "q8/fp32 token")
+            }
+            delete mf.pk.blob
         }
         delete m.pk.blob
     }

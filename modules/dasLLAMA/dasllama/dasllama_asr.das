@@ -64,6 +64,15 @@ struct AsrSession {
     detected_lang : string = ""
 }
 
+// exact-fp32 knob for oracle rails: flip BEFORE load_asr_model to skip the Q8 fast path
+var private g_asr_force_fp32 = false
+
+//! Force the fp32 (bit-exact-with-oracle) path for models loaded AFTER this call — the
+//! default load quantizes the encoder GEMMs to Q8_0 (~4x on CPU, tolerance-gated).
+def set_asr_fp32(on : bool) {
+    g_asr_force_fp32 = on
+}
+
 //! Load an ASR model, sniffing the format: ggml-bin magic = whisper vs parakeet
 //! (disambiguated on vocab size: whisper >= 51864, parakeet ~1k); GGUF needs the model's
 //! mmproj too — use the two-argument overload. One loader, no family names.
@@ -93,6 +102,9 @@ def load_asr_model(path : string) : AsrModel {
     if (vocab < 8192) {   // parakeet bins carry a ~1k SPM vocab
         var pm = AsrModel(kind = AsrKind.parakeet)
         pm.pk <- load_parakeet_model(path)
+        if (!g_asr_force_fp32) {
+            parakeet_quantize(pm.pk)
+        }
         return <- pm
     }
     // whisper vocabs: 51864 (.en) / 51865 (multilingual) / 51866 (large-v3 family); anything
@@ -269,10 +281,16 @@ def private transcribe_qwen3a(m : AsrModel; var s : AsrSession; samples : array<
 // Parakeet transcription: full-clip FastConformer encode + TDT greedy, one segment.
 def private transcribe_parakeet(m : AsrModel; var s : AsrSession; samples : array<float> | #;
                                 blk : block<(seg : TranscribeSegment)>) : int {
+    var tp = ref_time_ticks()
     let mel <- parakeet_log_mel(samples, m.pk)
+    asr_prof_add("pk.mel", tp)
     var enc_out : array<float>
+    tp = ref_time_ticks()
     let tt = parakeet_encode(m.pk, mel, enc_out)
+    asr_prof_add("pk.encode_total", tp)
+    tp = ref_time_ticks()
     let toks <- parakeet_tdt_decode(m.pk, enc_out, tt)
+    asr_prof_add("pk.decode_total", tp)
     var seg = TranscribeSegment(t0 = 0l, t1 = int64(length(samples)) * 100l / AUDIO_SAMPLE_RATE,
         text = parakeet_detokenize(m.pk, toks))
     var plog_sum = 0.0lf
