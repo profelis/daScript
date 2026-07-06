@@ -659,13 +659,17 @@ void das_wss_stream ( Handle<hv::WebSocketServer> h, const char * url, Lambda lm
 
 static void post_writer_op ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w,
         std::function<void(hv::HttpResponseWriter*)> fn ) {
-    auto adapter = lookup_server(h);
+    // Hold the server's shared_ptr for the whole async op. respond/close capture the adapter to call
+    // release_writer inside fn, and the posted op may run on the connection loop after the handler has
+    // returned — capturing ssp keeps the adapter alive until the write executes (no use-after-free).
+    auto ssp = HandleRegistry<hv::WebSocketServer>::instance().lookup(h);
+    auto adapter = (WebServer_Adapter *) ssp.get();
     if ( !adapter || !w ) return;
     auto sp = adapter->find_writer(w);
     if ( !sp ) return;
     auto loop = adapter->loop();
     if ( loop ) {
-        loop->runInLoop([sp,fn](){ fn(sp.get()); });
+        loop->runInLoop([ssp,sp,fn](){ fn(sp.get()); });
     } else {
         fn(sp.get());
     }
