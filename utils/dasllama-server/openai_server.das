@@ -544,13 +544,17 @@ def run_server(port : int) {
         setup_dasllama_jobque()
         var server = new OpenAiServer()
         server->init(port)
-        server->start()
-        to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name})\n")
-        while (!g_should_stop) {
-            server->tick()
-            sleep(2u)
+        let rc = server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
+        if (rc != 0) {
+            to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
+        } else {
+            to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name})\n")
+            while (!g_should_stop) {
+                server->tick()
+                sleep(2u)
+            }
+            server->stop()
         }
-        server->stop()
         server->cleanup()
         unsafe {
             delete server
