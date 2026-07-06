@@ -502,6 +502,32 @@ public:
         lock_guard<mutex> guard(writer_lock);
         active_writers.erase(w);
     }
+    HttpResponseWriterPtr find_writer ( hv::HttpResponseWriter * w ) {
+        lock_guard<mutex> guard(writer_lock);
+        auto it = active_writers.find(w);
+        return it != active_writers.end() ? it->second : HttpResponseWriterPtr();
+    }
+    // Streaming route: an async (writer) handler. libhv hands us a live HttpResponseWriter and keeps
+    // the connection open until we End() it. The das handler runs on the tick thread (its context +
+    // job queue live there, like makeCtxHandler), so we hold the writer alive in active_writers and
+    // enqueue the das invocation to `que`; the das handler drives writes through the das_writer_* ops,
+    // each of which marshals the actual socket write back to this loop via runInLoop.
+    void STREAM ( const char * relative_path, Lambda lmb, Context * context, LineInfoArg * at ) {
+        lock_guard<mutex> guard(lock);
+        router.Any(relative_path, [this,context,at,lmb](const HttpRequestPtr & req, const HttpResponseWriterPtr & writer) {
+            {
+                lock_guard<mutex> wguard(writer_lock);
+                active_writers[writer.get()] = writer;
+            }
+            {
+                lock_guard<mutex> qguard(lock);
+                que.emplace_back([context,at,lmb,req,writer](){
+                    das_invoke_lambda<void>::invoke<HttpRequest*,hv::HttpResponseWriter*>(
+                        context, at, lmb, req.get(), writer.get());
+                });
+            }
+        });
+    }
 protected:
     HttpService router;
     WebSocketService service;
@@ -623,31 +649,78 @@ void das_wss_sse ( Handle<hv::WebSocketServer> h, const char * url, Lambda lmb, 
     if ( auto adapter = lookup_server(h) ) adapter->SSE(url, lmb, context, at);
 }
 
-// HttpResponseWriter operations
-
-int das_writer_end_headers ( hv::HttpResponseWriter * w, const char * key, const char * value ) {
-    if ( !w ) return -1;
-    return w->EndHeaders(key ? key : "", value ? value : "");
+void das_wss_stream ( Handle<hv::WebSocketServer> h, const char * url, Lambda lmb, Context * context, LineInfoArg * at ) {
+    if ( auto adapter = lookup_server(h) ) adapter->STREAM(url, lmb, context, at);
 }
 
-int das_writer_sse_event ( hv::HttpResponseWriter * w, const char * data, const char * event ) {
-    if ( !w ) return -1;
-    return w->SSEvent(data ? data : "", event ? event : "message");
+// HttpResponseWriter operations. Each marshals the real socket write onto the connection's event loop
+// via runInLoop (the writer is a SocketChannel with loop affinity; the das handler runs on the tick
+// thread) and captures the writer's shared_ptr so it outlives the async post.
+
+static void post_writer_op ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w,
+        std::function<void(hv::HttpResponseWriter*)> fn ) {
+    auto adapter = lookup_server(h);
+    if ( !adapter || !w ) return;
+    auto sp = adapter->find_writer(w);
+    if ( !sp ) return;
+    auto loop = adapter->loop();
+    if ( loop ) {
+        loop->runInLoop([sp,fn](){ fn(sp.get()); });
+    } else {
+        fn(sp.get());
+    }
 }
 
-int das_writer_write_chunked ( hv::HttpResponseWriter * w, const char * data, int32_t len ) {
-    if ( !w ) return -1;
-    return w->WriteChunked(data ? data : "", len);
+// Whole-body response through the writer (the non-streaming path): status + content-type + body, then
+// end + release. Lets one async (writer) route serve both streamed and buffered responses.
+int das_writer_respond ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, int32_t status,
+        const char * content_type, const char * body ) {
+    auto adapter = lookup_server(h);
+    std::string ct = content_type ? content_type : "application/json";
+    std::string b = body ? body : "";
+    int st = status;
+    post_writer_op(h, w, [adapter,w,st,ct,b](hv::HttpResponseWriter* wr){
+        wr->WriteStatus((http_status)st);
+        wr->WriteHeader("Content-Type", ct.c_str());
+        wr->End(b);
+        if ( adapter ) adapter->release_writer(w);
+    });
+    return 0;
 }
 
-int das_writer_end ( hv::HttpResponseWriter * w ) {
-    if ( !w ) return -1;
-    return w->End();
+// One SSE event: SSEvent(data, NULL) auto-sends the text/event-stream headers on first call and emits
+// exactly `data: <data>\n\n` (no event: line) — the OpenAI streaming wire format.
+int das_writer_sse_event ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * data, const char * event ) {
+    std::string d = data ? data : "";
+    std::string e = event ? event : "";
+    post_writer_op(h, w, [d,e](hv::HttpResponseWriter* wr){
+        wr->SSEvent(d, e.empty() ? nullptr : e.c_str());
+    });
+    return 0;
 }
 
-int das_writer_close ( hv::HttpResponseWriter * w ) {
-    if ( !w ) return -1;
-    return w->close(true);
+int das_writer_write_chunked ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * data ) {
+    std::string d = data ? data : "";
+    post_writer_op(h, w, [d](hv::HttpResponseWriter* wr){ wr->WriteChunked(d.c_str(), (int)d.size()); });
+    return 0;
+}
+
+int das_writer_end_headers ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * key, const char * value ) {
+    std::string k = key ? key : "";
+    std::string v = value ? value : "";
+    post_writer_op(h, w, [k,v](hv::HttpResponseWriter* wr){
+        wr->EndHeaders(k.empty() ? nullptr : k.c_str(), v.empty() ? nullptr : v.c_str());
+    });
+    return 0;
+}
+
+// Terminal for a streamed response: end the stream and release the writer.
+void das_writer_close ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w ) {
+    auto adapter = lookup_server(h);
+    post_writer_op(h, w, [adapter,w](hv::HttpResponseWriter* wr){
+        wr->End();
+        if ( adapter ) adapter->release_writer(w);
+    });
 }
 
 void das_writer_release ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w ) {
@@ -1423,22 +1496,25 @@ public:
         addExtern<DAS_BIND_FUN(das_wss_sse)> (*this, lib, "SSE",
             SideEffects::worstDefault, "das_wss_sse")
                 ->args({"server","url","lambda","context","at"})->unsafeOperation = true;
-        // HttpResponseWriter operations
+        addExtern<DAS_BIND_FUN(das_wss_stream)> (*this, lib, "STREAM",
+            SideEffects::worstDefault, "das_wss_stream")
+                ->args({"server","url","lambda","context","at"})->unsafeOperation = true;
+        // HttpResponseWriter operations (handle-first: they marshal the write onto the server loop)
+        addExtern<DAS_BIND_FUN(das_writer_respond)> (*this, lib, "respond",
+            SideEffects::worstDefault, "das_writer_respond")
+                ->args({"server","writer","status","content_type","body"});
         addExtern<DAS_BIND_FUN(das_writer_end_headers)> (*this, lib, "end_headers",
             SideEffects::worstDefault, "das_writer_end_headers")
-                ->args({"writer","key","value"});
+                ->args({"server","writer","key","value"});
         addExtern<DAS_BIND_FUN(das_writer_sse_event)> (*this, lib, "sse_event",
             SideEffects::worstDefault, "das_writer_sse_event")
-                ->args({"writer","data","event"});
+                ->args({"server","writer","data","event"});
         addExtern<DAS_BIND_FUN(das_writer_write_chunked)> (*this, lib, "write_chunked",
             SideEffects::worstDefault, "das_writer_write_chunked")
-                ->args({"writer","data","length"});
-        addExtern<DAS_BIND_FUN(das_writer_end)> (*this, lib, "end_response",
-            SideEffects::worstDefault, "das_writer_end")
-                ->args({"writer"});
+                ->args({"server","writer","data"});
         addExtern<DAS_BIND_FUN(das_writer_close)> (*this, lib, "close_writer",
             SideEffects::worstDefault, "das_writer_close")
-                ->args({"writer"});
+                ->args({"server","writer"});
         addExtern<DAS_BIND_FUN(das_writer_release)> (*this, lib, "release_writer",
             SideEffects::worstDefault, "das_writer_release")
                 ->args({"server","writer"});
