@@ -121,7 +121,7 @@ def main {
         }
         if (has_env_variable("DASLLAMA_WORKER_LIMIT")) {
             let wl = to_int(get_env_variable("DASLLAMA_WORKER_LIMIT"))
-            set_jobque_worker_limit(wl > 0 ? wl : -1)   // direct: we are inside the que already
+            set_jobque_worker_limit(wl)   // direct: we are inside the que already; 0 = caller-only, negative = unlimited (jobque semantics)
             print("worker limit override: {wl}\n")
         }
         // prefill (untimed)

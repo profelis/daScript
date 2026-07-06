@@ -359,7 +359,7 @@ the registry as `auto`). Stamped declarations don't get their own `apply`, so `[
 `sideEffectFlags.userScenario` itself (the P1 const-fold lesson).
 
 **Generator wiring decoupled (post-M3 follow-up, same day):** `llvm_user_modules` now does
-`require ?dasllama_gemm_gen dasllama/dasllama_gemm_register` (a new registration shim that
+`require ?dasllama/dasllama_gemm_gen dasllama/dasllama_gemm_register` (a new registration shim that
 requires the generator implementation). The optional-require guard grew a **target-file
 resolvability fallback** (C++: the collector in `ast_parse.cpp` + the parser statement in
 `parser_impl.cpp`): a guarded require also loads when the target's own file resolves — i.e.
