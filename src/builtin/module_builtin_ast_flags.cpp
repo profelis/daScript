@@ -65,7 +65,7 @@ namespace das {
     TypeDeclPtr makeExprAtFlags() {
         auto ft = new TypeDecl(Type::tBitfield);
         ft->alias = "ExprAtFlags";
-        ft->argNames = { "r2v", "r2cr", "write", "no_promotion", "under_clone", "under_deref" };
+        ft->argNames = { "r2v", "r2cr", "write", "no_promotion", "under_clone", "under_deref", "no_bound_check" };
         return ft;
     }
 

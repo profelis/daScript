@@ -4,7 +4,9 @@
 
 namespace das {
 
-    // Mark accesses noBoundCheck. Honors the [hint(unsafe_range_check)] manual override (the same hint the JIT reads).
-    void markNoBoundCheck ( Program * program, TextWriter & logs );
+    struct ProgramCfg;
+
+    // Mark provably-in-range ExprAt nodes noBoundCheck, using CFG range facts (opt-in via bound_check_elision).
+    void markNoBoundCheck ( Program * program, const ProgramCfg * pcfg, TextWriter & logs );
 
 }
