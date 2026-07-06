@@ -382,6 +382,16 @@ def load_whisper_model(path : string) : WhisperModel {
     return <- w
 }
 
+// ===== encoder =====
+
+//! Whisper encoder over one 30 s mel window: the shared tower core (conv frontend + pos +
+//! pre-LN blocks) + ln_post. Output lands in ``s.xb``: ``n_ctx × d_model`` — the memory the
+//! decoder's cross-attention reads (via whisper_cross_kv).
+def whisper_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
+    audio_encode_blocks(t, s, mel)
+    layernorm_batch(s.xb, s.x, t.fblob, t.lnp_w_off, t.lnp_b_off, t.d_model, t.n_ctx, t.eps)
+}
+
 //! lang string ("en", "zh", ...) -> whisper language id (g_lang order). -1 when unknown.
 def whisper_lang_id(lang : string) : int {
     let langs <- [
