@@ -263,6 +263,7 @@ def test_jobque_team(t : T?) {
             team_once_round(t, 2 * get_total_hw_jobs(), 4 * get_total_hw_jobs())   // wide: everyone
             team_sum_round(t, 2, 8)             // tiny again, right after the wide one
             team_storm(t, 5)
+            set_jobque_worker_spin(0)           // explicit: coverage must not depend on subtest order
             team_epoch_storm(t, 300)            // spin 0: gated workers park and re-wake per publish
             set_jobque_worker_spin(200)
             team_epoch_storm(t, 300)            // spin window: gated workers stay hot between ops

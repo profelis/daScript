@@ -1,1 +1,1 @@
-Returns true when a job queue is available to the current context, i.e. the code runs inside with_job_que and parallel dispatch can be used.
+Returns true when a job queue exists for the current process — inside a with_job_que block or after create_job_que — i.e. parallel dispatch can be used.
