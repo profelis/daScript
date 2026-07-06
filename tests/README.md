@@ -442,6 +442,14 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_missing_inherited.das | Completeness check catches missing inherited abstract methods | **expect** `30111` |
 | test_missing_method.das | Completeness check catches missing abstract methods | **expect** `30111` |
 
+## jit/
+
+| File | Description | Expects errors |
+|---|---|---|
+| bitfield64.das | 64-bit bitfield through the JIT — construction, pass/return, uint64 round-trip | |
+| lambda_return.das | Lambda returned from a function under the JIT | |
+| fast_math_specials.das | `options fast_math` stays value-safe for real infs — sigmoid/silu over the exp-overflow range (x64 rcp-NR NaN regression) | |
+
 ## jit_tests/
 
 50 files testing JIT compilation code generation. None have `expect` directives.

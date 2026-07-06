@@ -661,6 +661,8 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
     let w2 = (w1 - 1l) / 2l + 1l               // 32
     let t2 = (t1 - 1l) / 2l + 1l
     y3 |> resize(int(t2 * w2 * nch))
+    pk_scan("y0", y0, int64(length(y0)))
+    pk_scan("y2", y2, int64(length(y2)))
     pk_mm_rq(m, y3, m.c3_w, y2, xqi, xsi, nch, nch, t2 * w2)   // 1x1 conv = per-position channel mix
     add_bias_rows(y3, m.blob, m.c3_b, nch, t2 * w2)
     pk_relu(y3)
@@ -689,8 +691,10 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
     }
     var x : array<float>
     x |> resize(int(tt * d))
+    pk_scan("y6", y6, int64(length(y6)))
     pk_mm_rq(m, x, m.pre_w, xf, xqi, xsi, feat, d, tt)
     add_bias_rows(x, m.blob, m.pre_b, d, tt)
+    pk_scan("pre", x, int64(length(x)))
     asr_prof_add("pk.conv_subsample", tp)
     tp = ref_time_ticks()
 
@@ -764,6 +768,7 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
         for (i in range64(tt * d)) {
             x[i] += 0.5 * xb[i]
         }
+        pk_scan("L{l}.ffn1", x, tt * d)
         asr_prof_add("pk.ffn", tp)
 
         // rel-pos attention
@@ -868,6 +873,7 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
         tp = ref_time_ticks()
         pk_mm_rq(m, xb, lo.o_w, ao, xqi, xsi, d, d, tt)
         add_inplace_rows(x, xb, tt * d)
+        pk_scan("L{l}.attn", x, tt * d)
         asr_prof_add("pk.attn_out", tp)
 
         // conv module
@@ -919,6 +925,7 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
         }
         pk_mm_rq(m, xb, lo.pw2_w, ao, xqi, xsi, d, d, tt)
         add_inplace_rows(x, xb, tt * d)
+        pk_scan("L{l}.conv", x, tt * d)
         asr_prof_add("pk.conv_module", tp)
 
         // FFN2 (second macaron half)
@@ -933,6 +940,7 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
 
         // per-layer post norm
         layernorm_batch(x, x, m.blob, lo.nout_w, lo.nout_b, d, tt, m.eps)
+        pk_scan("L{l}.out", x, tt * d)
         asr_prof_add("pk.ffn", tp)
     }
 
@@ -999,6 +1007,41 @@ def private pk_predict(m : ParakeetModel; var s : ParakeetPredState; token : int
     }
     for (j in range64(pd)) {
         s.pred[j] += m.blob[m.joint_pred_b + j]
+    }
+}
+
+// NaN/Inf stage scan (debug rail, pairs with the fast_math x64 investigation): bit-pattern
+// detection — a float `v != v` check folds to false under fast_math's nnan, this survives.
+var g_pk_nan_scan = false
+
+def set_pk_nan_scan(on : bool) {
+    g_pk_nan_scan = on
+}
+
+def private pk_scan(tag : string; x : array<float>; n : int64) {
+    if (!g_pk_nan_scan) {
+        return
+    }
+    var nan = 0
+    var inf = 0
+    var first = -1
+    for (i in range(int(n))) {
+        let bits = unsafe(reinterpret<uint>(x[i]))
+        if ((bits & 0x7F800000u) == 0x7F800000u) {
+            if ((bits & 0x007FFFFFu) != 0u) {
+                nan++
+            } else {
+                inf++
+            }
+            if (first < 0) {
+                first = i
+            }
+        }
+    }
+    if (nan + inf > 0) {
+        print("pk_scan {tag}: nan={nan} inf={inf} first={first} of {n}\n")
+    } else {
+        print("pk_scan {tag}: clean ({n})\n")
     }
 }
 
