@@ -74,7 +74,7 @@ def set_asr_fp32(on : bool) {
 }
 
 //! Load an ASR model, sniffing the format: ggml-bin magic = whisper vs parakeet
-//! (disambiguated on vocab size: whisper >= 51864, parakeet ~1k); GGUF needs the model's
+//! (disambiguated on vocab size: whisper >= 51864, parakeet 1k/8k); GGUF needs the model's
 //! mmproj too — use the two-argument overload. One loader, no family names.
 def load_asr_model(path : string) : AsrModel {
     let f = fopen(path, "rb")
@@ -99,7 +99,7 @@ def load_asr_model(path : string) : AsrModel {
     if (magic != 0x67676d6cu) {
         panic("dasLLAMA asr: '{path}' is neither a GGUF nor a ggml bin")
     }
-    if (vocab < 8192) {   // parakeet bins carry a ~1k SPM vocab
+    if (vocab < 32768) {   // parakeet SPM vocabs: 1024 (v2, English) / 8192 (v3, 25-lang)
         var pm = AsrModel(kind = AsrKind.parakeet)
         pm.pk <- load_parakeet_model(path, !g_asr_force_fp32)
         return <- pm
@@ -135,6 +135,9 @@ def load_asr_model(path : string; mmproj : string) : AsrModel {
 //! multilingual models, segment timestamps. Qwen3-ASR: the model detects and reports the
 //! language itself (``detected_lang``), no timestamps, context biasing via
 //! ``AsrSession.context``.
+// v3 (25 European languages) carries an 8192-piece SPM vocab; v2 (English) 1024
+def private pk_is_multilingual(m : AsrModel) : bool => m.pk.n_vocab >= 8192l
+
 def caps(m : AsrModel) : AsrCaps {
     if (m.kind == AsrKind.qwen3a) {
         return <- AsrCaps(translate = false, timestamps = AsrTimestamps.none,
@@ -143,7 +146,13 @@ def caps(m : AsrModel) : AsrCaps {
     if (m.kind == AsrKind.parakeet) {
         var pc = AsrCaps(translate = false, timestamps = AsrTimestamps.segment,
                          streaming = false, prompt = false)
-        pc.languages <- ["en"]
+        if (pk_is_multilingual(m)) {
+            pc.languages <- ["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de",
+                             "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk",
+                             "sl", "es", "sv", "ru", "uk"]
+        } else {
+            pc.languages <- ["en"]
+        }
         return <- pc
     }
     var c = AsrCaps(translate = m.whisper.multilingual,
@@ -167,8 +176,12 @@ def create_session(m : AsrModel; lang : string = "en") : AsrSession {
     //! accepts "auto").
     var s = AsrSession()
     if (m.kind == AsrKind.parakeet) {
-        if (lang != "en" && lang != "auto") {
-            panic("dasLLAMA asr: this Parakeet model is English-only")
+        // parakeet has no language conditioning — the TDT decode transcribes whatever it
+        // hears; lang is validated against the model's set but otherwise unused
+        if (lang != "auto" && !has_value(caps(m).languages, lang)) {
+            panic(pk_is_multilingual(m) ?
+                "dasLLAMA asr: '{lang}' is not one of this Parakeet model's 25 languages" :
+                "dasLLAMA asr: this Parakeet model is English-only")
         }
         return <- s
     }
@@ -299,7 +312,9 @@ def private transcribe_parakeet(m : AsrModel; var s : AsrSession; samples : arra
     if (!empty(toks)) {
         seg.avg_logprob = float(plog_sum / double(length(toks)))
     }
-    s.detected_lang = "en"
+    if (!pk_is_multilingual(m)) {
+        s.detected_lang = "en"   // v3 transcribes without detecting/reporting a language
+    }
     blk |> invoke(seg)
     return 1
 }

@@ -330,6 +330,52 @@ def test_parakeet_oracle(t : T?) {
 }
 
 [test]
+def test_parakeet_v3_oracle(t : T?) {
+    t |> run("parakeet-TDT v3 (25-lang) greedy on jfk.wav is token-for-token with parakeet-cli") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v3-f32.bin")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: ggml-parakeet-tdt-0.6b-v3-f32.bin not present")
+            return
+        }
+        let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
+        if (length(samples) == 0) {
+            t |> success(true, "skipped: jfk.wav not present")
+            return
+        }
+        // the 8192-piece SPM vocab routes to parakeet AND flips the multilingual caps
+        var m <- load_asr_model(path)
+        let c <- caps(m)
+        t |> equal(length(c.languages), 25, "25 languages")
+        t |> equal(m.pk.n_vocab, 8192l, "vocab")
+        t |> success(m.pk.q8, "default load is q8")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var s <- create_session(m, "de")   // any of the 25; parakeet has no conditioning
+            var segs : array<TranscribeSegment>
+            transcribe(m, s, samples) $(seg) {
+                segs |> push_clone(seg)
+            }
+            // parakeet-cli -ng -ps (CPU, f32 self-convert): 38 tokens; the q8 default stays
+            // id-exact on jfk (durations too — gb1's 16/655 duration-only flips are the known
+            // q8 divergence, ids/text exact there as well)
+            t |> equal(length(segs), 1)
+            t |> equal(length(segs[0].tokens), 38, "token count")
+            t |> equal(segs[0].tokens[0], 1976, "tok[0] '▁And'")
+            t |> equal(segs[0].tokens[1], 547, "tok[1] '▁so'")
+            t |> equal(segs[0].tokens[36], 7893, "tok[36] 'y'")
+            t |> equal(segs[0].tokens[37], 7883, "tok[37] '.'")
+            t |> success(segs[0].text == "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.", "text")
+            t |> equal(s.detected_lang, "", "v3 does not report a language")
+        }
+        delete m.pk.blob
+    }
+}
+
+[test]
 def test_whisper_transcribe_oracle(t : T?) {
     t |> run("tiny greedy on jfk.wav is token-for-token with whisper-cli") @(t : T?) {
         if (!jit_enabled()) {
