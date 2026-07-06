@@ -98,3 +98,20 @@ def test_read_wav_bit_depths(t : T?) {
         }
     }
 }
+
+[test]
+def test_write_wav_guards(t : T?) {
+    t |> run("write_wav rejects invalid input and reports open failure") @(t : T?) {
+        let tmp = create_temp_file_result("das_write_wav_guard", ".wav")
+        if (!(tmp is value)) {
+            t |> failure("could not create a temp file")
+            return
+        }
+        let path = tmp as value
+        t |> success(!write_wav(path, [0.0, 0.5, -0.5], 44100u, 0), "rejects channels <= 0 (would divide by zero)")
+        t |> success(!write_wav(path, [0.0, 0.5, -0.5], 44100u, 2), "rejects a non-frame-aligned sample count")
+        t |> success(write_wav(path, [0.0, 0.5, -0.5, 0.25], 44100u, 2), "writes valid frame-aligned input")
+        t |> success(!write_wav("/nonexistent_dir_xyzzy_das/x.wav", [0.0], 44100u, 1), "returns false on an unwritable path")
+        remove(path)
+    }
+}

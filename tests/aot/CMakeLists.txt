@@ -187,12 +187,14 @@ IF(NOT DAS_SQLITE_DISABLED)
     list(FILTER AOT_SQL_CONFORMANCE_FILES EXCLUDE REGEX "/_")
 ENDIF()
 
-# AOT for strudel/audio module library files (required by strudel tests)
+# AOT for strudel/audio module library files (required by strudel tests;
+# audio_record is here for AOT-compile coverage of the capture module)
 SET(AOT_STRUDEL_MODULE_FILES)
 IF(NOT DAS_AUDIO_DISABLED)
     SET(AOT_STRUDEL_MODULE_FILES
         modules/dasAudio/audio/audio_boost.das
         modules/dasAudio/audio/audio_wav.das
+        modules/dasAudio/audio/audio_record.das
         modules/dasAudio/strudel/strudel_event.das
         modules/dasAudio/strudel/strudel_time.das
         modules/dasAudio/strudel/strudel_pattern.das

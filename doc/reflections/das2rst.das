@@ -117,6 +117,7 @@ require stbimage/stbimage_boost
 require stbimage/stbimage_ttf
 require audio/audio_boost
 require audio/audio_wav
+require audio/audio_record
 require strudel/strudel_event
 require strudel/strudel_time
 require strudel/strudel_live
@@ -1470,6 +1471,7 @@ def document_module_audio(_root : string) {
     var mod = get_module("audio")
     var groups <- array<DocGroup>(
         group_by_regex("Audio device", mod, %regex~(sound_initalize|sound_finalize|mixer_context|sound_set_null_device|audio_is_single_threaded)$%%),
+        group_by_regex("Capture", mod, %regex~(sound_record|sound_is_recording)%%),
         group_by_regex("Decoder", mod, %regex~ma_decoder%%),
         group_by_regex("Resampler", mod, %regex~ma_resampler%%),
         group_by_regex("Channel converter", mod, %regex~ma_channel_converter%%),
@@ -1515,6 +1517,14 @@ def document_module_audio_wav(_root : string) {
         group_by_regex("WAV I/O", mod, %regex~(read_wav|write_wav)$%%)
     )
     document("WAV file reading and writing", mod, "audio_wav.rst", groups)
+}
+
+def document_module_audio_record(_root : string) {
+    var mod = find_module("audio_record")
+    var groups <- array<DocGroup>(
+        group_by_regex("Recording", mod, %regex~(sound_record_list_devices|record_to_wav)$%%)
+    )
+    document("Microphone capture and record-to-WAV", mod, "audio_record.rst", groups)
 }
 
 def document_module_strudel_event(_root : string) {
@@ -1726,6 +1736,7 @@ def main {
     // document dasAudio daScript modules
     document_module_audio_boost(root)
     document_module_audio_wav(root)
+    document_module_audio_record(root)
     // document strudel modules
     document_module_strudel_event(root)
     document_module_strudel_time(root)

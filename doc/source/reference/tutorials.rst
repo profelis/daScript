@@ -430,6 +430,7 @@ Run any tutorial from the project root::
    tutorials/dasAudio_08_midi.rst
    tutorials/dasAudio_09_playback_status.rst
    tutorials/dasAudio_10_global_controls.rst
+   tutorials/dasAudio_11_recording.rst
 
 .. _tutorials_dasminfft:
 
