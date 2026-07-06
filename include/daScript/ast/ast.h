@@ -1600,13 +1600,18 @@ namespace das
         /*option*/ bool disable_dse = false;                       // disable the dead-store-elimination pass
         /*option*/ bool disable_cse = false;                       // disable the common-subexpression-elimination pass
         /*option*/ bool disable_inline = false;                    // disable the [inline] function inliner (calls stay regular calls; declaration-level contract checks - shape, recursion, @@ - still lint)
+        /*option*/ bool disable_auto_inline = false;               // disable automatic inlining of block-literal call sites and invoke-of-literal devirtualization ([inline] splicing is unaffected)
+        /*option*/ bool disable_run = false;                       // disable compile-time function evaluation (RunFolding of pure calls over constants)
         /*option*/ bool no_infer_time_folding = false;             // disable infer-time constant folding
         bool fail_on_no_aot = true;                     // AOT link failure is error
         bool fail_on_lack_of_aot_export = false;        // remove_unused_symbols = false is missing in the module, which is passed to AOT
         /*option*/ bool log_compile_time = false;                  // if true, then compile time will be printed at the end of the compilation
         /*option*/ bool log_total_compile_time = false;            // if true, then detailed compile time will be printed at the end of the compilation
         /*option*/ bool log_module_compile_time = false;           // if true, every required module logs its own parse / infer (with pass count) / optimize / macro (in infer) / macro mods breakdown + function count; also enables per-context simulate timing and the top-level aggregate summary (CLI: -log-compile-time)
+        /*option*/ bool log_optimization = false;                  // log optimizer rewrites (per-pass fired/nothing lines, inline/devirt sites and declines)
+        /*option*/ bool log_optimization_passes = false;           // log the AST after every optimizer pass (verbose)
         /*option*/ bool no_fast_call = false;                      // disable fastcall
+        /*option*/ bool fusion = true;                             // fuse interpreter nodes into wider superinstructions at simulate time
         /*option*/ bool scoped_stack_allocator = true;             // reuse stack memory after variables out of scope
         /*option*/ bool force_inscope_pod = false;                 // force in-scope for POD-like types
         /*option*/ bool log_inscope_pod = false;                   // log in-scope for POD-like types

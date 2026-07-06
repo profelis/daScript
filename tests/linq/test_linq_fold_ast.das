@@ -1,6 +1,7 @@
 options gen2
 options indenting = 4
 options rtti
+options disable_auto_inline    // this file pins linq-fold codegen shapes; splicing would dissolve them
 
 require daslib/ast
 require daslib/rtti

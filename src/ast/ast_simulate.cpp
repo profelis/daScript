@@ -3821,7 +3821,7 @@ namespace das
 #if DAS_FUSION
         if ( !folding ) {               // note: only run fusion when not folding
             DAS_ASSERTF(g_fusionContextFn, "fusion library not loaded, add call to NEED_FUSION macro.");
-            g_fusionContextFn(context, logs, options.getBoolOption("fusion",true));
+            g_fusionContextFn(context, logs, options.getBoolOption("fusion", policies.fusion));
             context.relocateCode(true); // this to get better estimate on relocated size. its fust enough
         }
 #else

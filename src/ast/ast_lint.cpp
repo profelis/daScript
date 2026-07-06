@@ -1289,8 +1289,7 @@ namespace das {
         "no_heap_array_literals",       Type::tBool,
     // logging
         "log",                          Type::tBool,
-        "log_optimization_passes",      Type::tBool,
-        "log_optimization",             Type::tBool,
+        // log_optimization / log_optimization_passes registered via CodeOfPolicies fields
         "log_stack",                    Type::tBool,
         "log_init",                     Type::tBool,
         "log_symbol_use",               Type::tBool,
@@ -1314,12 +1313,12 @@ namespace das {
     // optimization
         "optimize",                     Type::tBool,
         "no_optimization",              Type::tBool,
-        "fusion",                       Type::tBool,
+        // fusion registered via its CodeOfPolicies field
         "remove_unused_symbols",        Type::tBool,
     // language
         "always_export_initializer",    Type::tBool,
         "infer_time_folding",           Type::tBool,
-        "disable_run",                  Type::tBool,
+        // disable_run registered via its CodeOfPolicies field
         "indenting",                    Type::tInt,
         "no_unsafe_uninitialized_structures", Type::tBool,
     // version_2_syntax

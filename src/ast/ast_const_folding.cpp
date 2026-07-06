@@ -1488,7 +1488,7 @@ namespace das {
         visit(cfe);
         bool any = cfe.didAnything();
         if ( !cfe.needRun.empty() ) {
-            if ( !options.getBoolOption("disable_run",false) ) {
+            if ( !options.getBoolOption("disable_run", policies.disable_run) ) {
                 RunFolding rfe(this,cfe.needRun,round);
                 visit(rfe);
                 any |= rfe.didAnything();

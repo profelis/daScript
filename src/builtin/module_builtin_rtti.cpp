@@ -994,13 +994,18 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(disable_dse)>("disable_dse");
             addField<DAS_BIND_MANAGED_FIELD(disable_cse)>("disable_cse");
             addField<DAS_BIND_MANAGED_FIELD(disable_inline)>("disable_inline");
+            addField<DAS_BIND_MANAGED_FIELD(disable_auto_inline)>("disable_auto_inline");
+            addField<DAS_BIND_MANAGED_FIELD(disable_run)>("disable_run");
             addField<DAS_BIND_MANAGED_FIELD(no_infer_time_folding)>("no_infer_time_folding");
             addField<DAS_BIND_MANAGED_FIELD(fail_on_no_aot)>("fail_on_no_aot");
             addField<DAS_BIND_MANAGED_FIELD(fail_on_lack_of_aot_export)>("fail_on_lack_of_aot_export");
             addField<DAS_BIND_MANAGED_FIELD(log_compile_time)>("log_compile_time");
             addField<DAS_BIND_MANAGED_FIELD(log_total_compile_time)>("log_total_compile_time");
             addField<DAS_BIND_MANAGED_FIELD(log_module_compile_time)>("log_module_compile_time");
+            addField<DAS_BIND_MANAGED_FIELD(log_optimization)>("log_optimization");
+            addField<DAS_BIND_MANAGED_FIELD(log_optimization_passes)>("log_optimization_passes");
             addField<DAS_BIND_MANAGED_FIELD(no_fast_call)>("no_fast_call");
+            addField<DAS_BIND_MANAGED_FIELD(fusion)>("fusion");
             addField<DAS_BIND_MANAGED_FIELD(scoped_stack_allocator)>("scoped_stack_allocator");
             addField<DAS_BIND_MANAGED_FIELD(force_inscope_pod)>("force_inscope_pod");
             addField<DAS_BIND_MANAGED_FIELD(log_inscope_pod)>("log_inscope_pod");

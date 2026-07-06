@@ -5,44 +5,57 @@
 #include "daScript/ast/ast_expressions.h"
 #include "daScript/ast/ast_cfg.h"
 
+#include "ast_alias.h"
+
 namespace das {
 
     // ===== Dead-store elimination =====
-    // Removes a statement-level `x = <rhs>` when x is a plain by-value local with no
-    // aliasing uses, the rhs is pure, and no path from the store reaches a read of x
-    // before the next full overwrite. Liveness runs backward over the statement-level
-    // CFG (ast_cfg.h).
+    // Removes a statement-level `x = <rhs>` / `x.field.path = <rhs>` when the target is
+    // a chain (ast_alias.h) over a plain ExprLet local, the rhs is pure, and no path
+    // from the store reaches a read overlapping the chain before the next full
+    // overwrite. Also strips a dead pure declaration init (`var x = <rhs>` where every
+    // path overwrites x before reading it) down to the plain zero-init declaration.
+    // Liveness runs backward over the statement-level CFG (ast_cfg.h), one bit per
+    // stored chain.
     //
     // Soundness model (deliberately narrow):
-    //  * candidates are ExprLet locals of non-ref, non-refType types (the pass-by-value
-    //    world: workhorse scalars, pointers, enums, bitfields, ranges, vectors, string) -
-    //    ExprCopy on them is a plain value write with no copy hooks;
-    //  * every occurrence of a candidate must be a value read (r2v) or the left side of a
-    //    statement-level ExprCopy. Anything else (addr(), by-ref pass, field/index/swizzle
-    //    access, op-assign, ref binding, clone/move target) disqualifies the variable -
-    //    this is what rules out invisible aliases;
-    //  * a store inside an opaque statement (make-block body, unsafe block) is never a
-    //    removal candidate or a kill - any candidate mention inside an opaque statement
-    //    makes the variable live there (over-approximation, sound);
+    //  * bases are ExprLet locals (never arguments - argument writes are the caller's
+    //    to observe). Every occurrence of a base must be a value read (r2v), a
+    //    read-through (r2cr without write - const-ref passes, read chains), or on the
+    //    spine of a statement-level ExprCopy store; anything else (addr(), mutable-ref
+    //    pass, op-assign, move/clone, delete) disqualifies the variable. A local whose
+    //    every use is classified cannot escape, so no call can read it behind the
+    //    pass's back;
+    //  * removal candidates are stores through EXACT chains (fields only, no index or
+    //    swizzle links) whose target type is by-value - such an ExprCopy is a plain
+    //    value write with no copy hooks. A store through an inexact chain
+    //    (s.arr[i] = v) kills nothing and reads its exact prefix; a store to a chain
+    //    keeps every strict-prefix store alive (partial overwrite observes the rest);
+    //  * chain identity is the field-name path; two chains overlap when one path is a
+    //    prefix of the other (an inexact link truncates the known path, widening the
+    //    overlap conservatively);
+    //  * a store inside a make-block body is never a removal candidate or a kill - any
+    //    occurrence inside the owning statement makes the overlapped chains live there
+    //    (the body runs zero or more times during that statement, and blocks cannot
+    //    escape it);
     //  * functions carrying control flow the CFG does not model are skipped whole:
-    //    goto/label (also covers lowered generators), try/recover, and non-empty finally
-    //    (it also runs on an early return the CFG routes straight to exit).
-    // Local stores are unobservable after a panic (locals die with the frame; finally is
-    // skipped on panic by design), so removal needs no panic-path modeling.
+    //    goto/label (also covers lowered generators), try/recover, and non-empty
+    //    finally (it also runs on an early return the CFG routes straight to exit).
+    // Local stores are unobservable after a panic (locals die with the frame; finally
+    // is skipped on panic by design), so removal needs no panic-path modeling.
 
     namespace {
 
-        // one walk: (a) bail on constructs the CFG does not model, (b) collect candidate
-        // locals, (c) disqualify any variable with a use that is not a plain value read
-        // and not the lvalue of a statement-level assignment
+        // one walk: (a) bail on constructs the CFG does not model, (b) collect locals,
+        // (c) disqualify any variable with an occurrence that is neither a read nor on
+        // the spine of a statement-level store
         class DsePrescan : public Visitor {
         public:
             bool eligible = true;
-            vector<Variable *> locals;                  // ExprLet locals of by-value type, in order
-            das_hash_set<Variable *> disq;              // variables with an aliasing-capable use
-            das_hash_set<Variable *> storedVars;        // variables with at least one statement-level store
+            vector<Variable *> locals;                  // every non-ref ExprLet local, in order
+            das_hash_set<Variable *> disq;              // variables with an unclassified occurrence
+            das_hash_set<Expression *> storeSpines;     // nodes on statement-level ExprCopy store-left chains
         protected:
-            das_hash_set<Expression *> storeLefts;      // lvalue ExprVar nodes of statement-level copies
             Expression * curStmt = nullptr;
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             virtual void preVisit ( ExprBlock * blk ) override {
@@ -71,62 +84,134 @@ namespace das {
             }
             virtual void preVisit ( ExprCopy * expr ) override {
                 Visitor::preVisit(expr);
-                if ( expr==curStmt && expr->left->rtti_isVar() ) {
-                    storeLefts.insert(expr->left);
-                    storedVars.insert(((ExprVar *)expr->left)->variable);
+                if ( expr==curStmt ) {
+                    AliasChain ch;
+                    aliasChainOf(expr->left, ch, &storeSpines);
                 }
             }
             virtual void preVisitLet ( ExprLet * let, const VariablePtr & var, bool last ) override {
                 Visitor::preVisitLet(let, var, last);
-                if ( var->type && !var->type->ref && !var->type->isRefType() ) {
+                if ( var->type && !var->type->ref ) {
                     locals.push_back(var);
                 }
             }
             virtual void preVisit ( ExprVar * expr ) override {
                 Visitor::preVisit(expr);
-                if ( !expr->r2v && storeLefts.find(expr)==storeLefts.end() ) {
+                bool readOnly = expr->r2v || (expr->r2cr && !expr->write);
+                if ( !readOnly && storeSpines.find(expr)==storeSpines.end() ) {
                     disq.insert(expr->variable);
                 }
             }
         };
 
-        // collect candidate-variable mentions (any occurrence) in a subtree
-        class DseMentions : public Visitor {
+        struct DseChain {
+            Variable *              base = nullptr;
+            vector<const char *>    path;               // exact field path (candidates only)
+        };
+
+        // resolve chain occurrences in a subtree to candidate uses: every maximal chain
+        // rooted at a tracked base - reads and interior-block stores alike - touches
+        // the candidates its known prefix overlaps
+        class DseReads : public Visitor {
         public:
-            DseMentions ( const das_hash_map<Variable *,int> & idx, vector<int> & out )
-                : index(idx), uses(out) {}
+            DseReads ( const das_hash_map<Variable *, vector<int>> & bb, const vector<DseChain> & cs,
+                       vector<int> & out, const das_hash_set<Expression *> * skip )
+                : byBase(bb), chains(cs), uses(out), skipSpine(skip) {}
         protected:
-            virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
-            virtual void preVisit ( ExprVar * expr ) override {
-                Visitor::preVisit(expr);
-                auto it = index.find(expr->variable);
-                if ( it!=index.end() ) uses.push_back(it->second);
-            }
-        protected:
-            const das_hash_map<Variable *,int> & index;
+            const das_hash_map<Variable *, vector<int>> & byBase;
+            const vector<DseChain> & chains;
             vector<int> & uses;
+            const das_hash_set<Expression *> * skipSpine;
+            das_hash_set<Expression *> seen;
+            void chainRoot ( Expression * expr ) {
+                if ( seen.find(expr)!=seen.end() ) return;
+                if ( skipSpine && skipSpine->find(expr)!=skipSpine->end() ) return;
+                AliasChain ch;
+                if ( !aliasChainOf(expr, ch, &seen) ) return;
+                auto bit = byBase.find(ch.base);
+                if ( bit==byBase.end() ) return;
+                size_t rlen = aliasChainExactLen(ch.path);
+                for ( int ci : bit->second ) {
+                    auto & C = chains[ci];
+                    size_t n = das::min(rlen, C.path.size());
+                    if ( aliasPathAgree(ch.path, C.path, n) ) uses.push_back(ci);
+                }
+            }
+            virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
+            virtual void preVisit ( ExprVar * expr ) override     { Visitor::preVisit(expr); chainRoot(expr); }
+            virtual void preVisit ( ExprField * expr ) override   { Visitor::preVisit(expr); chainRoot(expr); }
+            virtual void preVisit ( ExprSwizzle * expr ) override { Visitor::preVisit(expr); chainRoot(expr); }
+            virtual void preVisit ( ExprAt * expr ) override      { Visitor::preVisit(expr); chainRoot(expr); }
+        };
+
+        struct DseLetInit {
+            int         cand = -1;
+            Variable *  var = nullptr;
         };
 
         struct DseStmt {
-            int killVar = -1;       // candidate index fully overwritten by this statement
-            bool rhsPure = false;   // store rhs carries no side effects (safe to not evaluate)
-            vector<int> uses;       // candidate mentions (store: rhs only; otherwise whole subtree)
+            vector<int> kills;          // candidates fully overwritten by this statement
+            vector<int> uses;           // candidates whose chains this statement touches
+            int         removeIdx = -1; // candidate this store establishes (removable when dead)
+            bool        rhsPure = false;
+            vector<DseLetInit> letInits;    // strippable declaration inits (removable when dead)
         };
 
-        void analyzeDeadStores ( Function * fn, das_hash_set<Expression *> & dead ) {
+        void analyzeDeadStores ( Function * fn, das_hash_set<Expression *> & dead,
+                                 das_hash_set<Variable *> & deadInits ) {
             DsePrescan scan;
             fn->body->visit(scan);
             if ( !scan.eligible ) return;
-            das_hash_map<Variable *,int> index;
+            das_hash_set<Variable *> bases;
             for ( auto v : scan.locals ) {
-                if ( scan.disq.find(v)!=scan.disq.end() ) continue;
-                if ( scan.storedVars.find(v)==scan.storedVars.end() ) continue;  // nothing to remove
-                int idx = int(index.size());
-                index[v] = idx;
+                if ( scan.disq.find(v)==scan.disq.end() ) bases.insert(v);
             }
-            if ( index.empty() ) return;
+            if ( bases.empty() ) return;
             Cfg cfg = buildCfg(fn);
-            size_t nw = (index.size() + 63) / 64;
+            // candidate enumeration: exact by-value chain stores, then strippable
+            // declaration inits of bases that carry at least one store
+            vector<DseChain> chains;
+            das_hash_map<Variable *, vector<int>> byBase;
+            auto findChain = [&]( Variable * base, const vector<const char *> & path ) -> int {
+                for ( int ci : byBase[base] ) {
+                    if ( chains[ci].path.size()==path.size()
+                        && aliasPathAgree(chains[ci].path, path, path.size()) ) return ci;
+                }
+                return -1;
+            };
+            auto storeTarget = [&]( Expression * stmt, AliasChain & ch, das_hash_set<Expression *> * spine ) -> bool {
+                if ( !stmt->rtti_isCopy() ) return false;
+                auto cp = static_cast<ExprCopy *>(stmt);
+                if ( !aliasChainOf(cp->left, ch, spine) ) return false;
+                return bases.find(ch.base)!=bases.end();
+            };
+            for ( auto b : cfg.blocks ) {
+                for ( auto stmt : b->stmts ) {
+                    AliasChain ch;
+                    if ( !storeTarget(stmt, ch, nullptr) ) continue;
+                    if ( !ch.exact ) continue;
+                    auto cp = static_cast<ExprCopy *>(stmt);
+                    if ( !cp->left->type || cp->left->type->isRefType() ) continue;
+                    if ( findChain(ch.base, ch.path)>=0 ) continue;
+                    int idx = int(chains.size());
+                    chains.push_back(DseChain{ch.base, ch.path});
+                    byBase[ch.base].push_back(idx);
+                }
+            }
+            if ( chains.empty() ) return;
+            vector<const char *> emptyPath;
+            for ( auto v : scan.locals ) {
+                if ( byBase.find(v)==byBase.end() ) continue;   // no stores: unused-var territory
+                if ( !v->init || v->init_via_move || v->init_via_clone ) continue;
+                if ( v->type->isRefType() ) continue;
+                if ( !v->init->noSideEffects ) continue;
+                if ( findChain(v, emptyPath)>=0 ) continue;
+                int idx = int(chains.size());
+                chains.push_back(DseChain{v, emptyPath});
+                byBase[v].push_back(idx);
+            }
+            // per-statement gen/kill resolution
+            size_t nw = (chains.size() + 63) / 64;
             struct BlockInfo {
                 vector<DseStmt>  stmts;
                 vector<uint64_t> liveIn, liveOut;
@@ -141,26 +226,57 @@ namespace das {
                 for ( size_t si=0, sis=b->stmts.size(); si!=sis; ++si ) {
                     auto stmt = b->stmts[si];
                     auto & SI = BI.stmts[si];
-                    if ( stmt->rtti_isCopy() ) {
-                        auto cp = (ExprCopy *) stmt;
-                        if ( cp->left->rtti_isVar() ) {
-                            auto it = index.find(((ExprVar *)cp->left)->variable);
-                            if ( it!=index.end() ) {
-                                SI.killVar = it->second;
-                                SI.rhsPure = cp->right->noSideEffects;
-                                DseMentions m(index, SI.uses);
-                                cp->right->visit(m);
-                                continue;
+                    das_hash_set<Expression *> spine;
+                    AliasChain ch;
+                    if ( storeTarget(stmt, ch, &spine) ) {
+                        size_t known = aliasChainExactLen(ch.path);
+                        for ( int ci : byBase[ch.base] ) {
+                            auto & C = chains[ci];
+                            if ( ch.exact ) {
+                                // full overwrite of every extension; a strict-prefix
+                                // store stays observable through the untouched rest
+                                if ( C.path.size()>=ch.path.size()
+                                    && aliasPathAgree(C.path, ch.path, ch.path.size()) ) {
+                                    SI.kills.push_back(ci);
+                                    if ( C.path.size()==ch.path.size() ) SI.removeIdx = ci;
+                                } else if ( C.path.size()<ch.path.size()
+                                    && aliasPathAgree(C.path, ch.path, C.path.size()) ) {
+                                    SI.uses.push_back(ci);
+                                }
+                            } else {
+                                // partial write through an unknown element: touches
+                                // everything its known prefix overlaps, kills nothing
+                                size_t n = das::min(known, C.path.size());
+                                if ( aliasPathAgree(ch.path, C.path, n) ) SI.uses.push_back(ci);
+                            }
+                        }
+                        SI.rhsPure = static_cast<ExprCopy *>(stmt)->right->noSideEffects;
+                    } else if ( stmt->rtti_isLet() ) {
+                        auto let = static_cast<ExprLet *>(stmt);
+                        for ( auto & pv : let->variables ) {
+                            auto bit = byBase.find(pv);
+                            if ( bit==byBase.end() ) continue;
+                            for ( int ci : bit->second ) {
+                                SI.kills.push_back(ci); // nothing before the declaration observes it
+                                if ( chains[ci].path.empty() && pv->init
+                                    && !pv->init_via_move && !pv->init_via_clone
+                                    && pv->init->noSideEffects ) {
+                                    SI.letInits.push_back(DseLetInit{ci, pv});
+                                }
                             }
                         }
                     }
-                    DseMentions m(index, SI.uses);
-                    stmt->visit(m);
+                    DseReads reads(byBase, chains, SI.uses, spine.empty() ? nullptr : &spine);
+                    stmt->visit(reads);
                 }
             }
             // backward liveness to fixpoint. blocks are numbered in creation order, so
             // reverse order approximates reverse topological order and converges fast
             vector<uint64_t> live(nw);
+            auto applyBackward = [&]( DseStmt & SI, vector<uint64_t> & lv ) {
+                for ( int k : SI.kills ) lv[k>>6] &= ~(1ull<<(k&63));
+                for ( int u : SI.uses ) lv[u>>6] |= 1ull<<(u&63);
+            };
             bool changed = true;
             while ( changed ) {
                 changed = false;
@@ -173,32 +289,38 @@ namespace das {
                         for ( size_t w=0; w!=nw; ++w ) BI.liveOut[w] |= sin[w];
                     }
                     live = BI.liveOut;
-                    for ( size_t si=BI.stmts.size(); si-->0; ) {
-                        auto & SI = BI.stmts[si];
-                        if ( SI.killVar>=0 ) live[SI.killVar>>6] &= ~(1ull<<(SI.killVar&63));
-                        for ( int u : SI.uses ) live[u>>6] |= 1ull<<(u&63);
-                    }
+                    for ( size_t si=BI.stmts.size(); si-->0; ) applyBackward(BI.stmts[si], live);
                     if ( live != BI.liveIn ) { BI.liveIn = live; changed = true; }
                 }
             }
-            // final scan: a store whose target is dead after it and whose rhs is pure is
-            // removed - it neither kills (target already dead) nor gens (rhs not evaluated),
-            // which lets a chain of dead stores fall in a single pass
+            // final scan: a store whose chain is dead after it and whose rhs is pure is
+            // removed - it neither kills (already dead) nor gens (rhs not evaluated),
+            // which lets a chain of dead stores fall in a single pass. a dead pure
+            // declaration init is stripped to the plain zero-init declaration
+            auto isDead = [&]( const vector<uint64_t> & lv, int ci ) {
+                return ((lv[ci>>6] >> (ci&63)) & 1)==0;
+            };
+            vector<uint64_t> liveInit(nw);
             for ( size_t bi=0, bis=cfg.blocks.size(); bi!=bis; ++bi ) {
                 auto b = cfg.blocks[bi];
                 auto & BI = binfo[bi];
                 live = BI.liveOut;
                 for ( size_t si=BI.stmts.size(); si-->0; ) {
                     auto & SI = BI.stmts[si];
-                    if ( SI.killVar>=0 ) {
-                        bool isLive = ((live[SI.killVar>>6] >> (SI.killVar&63)) & 1) != 0;
-                        if ( !isLive && SI.rhsPure ) {
-                            dead.insert(b->stmts[si]);
-                            continue;
-                        }
-                        live[SI.killVar>>6] &= ~(1ull<<(SI.killVar&63));
+                    if ( SI.removeIdx>=0 && SI.rhsPure && isDead(live, SI.removeIdx) ) {
+                        dead.insert(b->stmts[si]);
+                        continue;   // the statement vanishes whole: no kills, no uses
                     }
-                    for ( int u : SI.uses ) live[u>>6] |= 1ull<<(u&63);
+                    if ( !SI.letInits.empty() ) {
+                        // a later init in the same `let` may read an earlier variable -
+                        // judge deadness with the statement's own uses folded in
+                        liveInit = live;
+                        for ( int u : SI.uses ) liveInit[u>>6] |= 1ull<<(u&63);
+                        for ( auto & li : SI.letInits ) {
+                            if ( isDead(liveInit, li.cand) ) deadInits.insert(li.var);
+                        }
+                    }
+                    applyBackward(SI, live);
                 }
             }
         }
@@ -209,12 +331,14 @@ namespace das {
             using PassVisitor::visit;
         protected:
             das_hash_set<Expression *> dead;
+            das_hash_set<Variable *> deadInits;
             virtual bool canVisitFunction ( Function * fun ) override {
                 if ( fun->stub || fun->isTemplate || !funcIsDirty(fun) ) return false;
                 if ( !fun->body || !fun->body->rtti_isBlock() ) return false;
                 dead.clear();
-                analyzeDeadStores(fun, dead);
-                return !dead.empty();
+                deadInits.clear();
+                analyzeDeadStores(fun, dead, deadInits);
+                return !dead.empty() || !deadInits.empty();
             }
             virtual bool canVisitStructure ( Structure * ) override { return false; }
             virtual bool canVisitStructureFieldInit ( Structure * ) override { return false; }
@@ -228,6 +352,15 @@ namespace das {
                     return nullptr;
                 }
                 return Visitor::visitBlockExpression(block, expr);
+            }
+            virtual ExpressionPtr visit ( ExprLet * let ) override {
+                for ( auto & pv : let->variables ) {
+                    if ( deadInits.find(pv)!=deadInits.end() ) {
+                        pv->init = nullptr;
+                        reportFolding();
+                    }
+                }
+                return Visitor::visit(let);
             }
         };
     }

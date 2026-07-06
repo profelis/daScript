@@ -6,18 +6,33 @@
 
 namespace das {
 
-    // ===== [inline] splicing =====
+    // ===== [inline] splicing, automatic block inlining, invoke devirtualization =====
     // Runs in the patch slot (Program::patchAnnotations -> patchInline), after infer and
     // buildAccessFlags, before lint and optimize. Splices are syntax-level: cloned callee
     // statements land in the caller, the pass reports astChanged, and the compiler restarts
     // infer, which re-resolves every ExprVar by name and legalizes types/r2v/temporaries.
     //
-    // The contract is fail-closed: [inline] is a promise, not a hint. A callee shape the
-    // inliner can't splice is a compile error (annotation lint hook -> checkInlineShape,
-    // pointing at the declaration); a call site it can't host is a compile error reported
-    // here at the site. The pass has no size budgets and no decline paths. When a callee
-    // shape is bad the patch pass skips it SILENTLY and the lint hook reports it - both
-    // run on every compile, so a skip is never silent overall.
+    // Three site kinds, two contracts:
+    //  * [inline] calls (MUST): fail-closed. A callee shape the inliner can't splice is a
+    //    compile error (annotation lint hook -> checkInlineShape, pointing at the
+    //    declaration); a call site it can't host is a compile error reported here at the
+    //    site. No size budgets, no decline paths. When a callee shape is bad the patch
+    //    pass skips it SILENTLY and the lint hook reports it - both run on every compile,
+    //    so a skip is never silent overall.
+    //  * calls passing a block LITERAL argument (AUTO, optimized builds only): best-effort.
+    //    The literal is the user's signal; nobody promised anything, so every gate -
+    //    callee shape, unsafe in the body, recursion through the splice graph, private
+    //    symbols, call position - declines SILENTLY (counted, logged under
+    //    log_optimization). `options disable_auto_inline` (or the policy) turns it off.
+    //  * invoke of a block literal (DEVIRT, same best-effort contract): an invoke whose
+    //    block resolves to a same-function literal - directly or through a move-initialized,
+    //    never-rewritten local (which is what an auto-spliced callee leaves behind) -
+    //    splices the block body in place. Same-frame semantics make this a pure win: the
+    //    body already reads the caller's locals directly.
+    // The two halves converge over patch rounds: an auto splice moves the callee's invoke
+    // next to the literal, the next round devirtualizes it, and any block-literal calls
+    // inside the spliced body trigger further waves. Recursion through the combined graph
+    // is declined up front, so the rounds terminate.
     //
     // Argument substitution is three-tier:
     //  (A) leaf args (constants; variable reads) substitute textually, no temp. A by-value
@@ -64,22 +79,54 @@ namespace das {
 
         class InlineShapeScan : public Visitor {
         public:
+            InlineShapeScan ( bool blockLiteral = false ) : forBlockLiteral(blockLiteral) {}
             string reason;
             int returnCount = 0;
             Expression * lastTopLevelStmt = nullptr;
             Expression * misplacedReturn = nullptr;
             bool bad = false;
         protected:
+            bool forBlockLiteral;
+            int makeBlockDepth = 0;
+            int loopDepth = 0;
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             void flag ( const char * why ) { if ( !bad ) { bad = true; reason = why; } }
             virtual void preVisit ( ExprGoto * expr ) override { Visitor::preVisit(expr); flag("body contains goto"); }
             virtual void preVisit ( ExprLabel * expr ) override { Visitor::preVisit(expr); flag("body contains a label"); }
             virtual void preVisit ( ExprTryCatch * expr ) override { Visitor::preVisit(expr); flag("body contains try/recover"); }
             virtual void preVisit ( ExprYield * expr ) override { Visitor::preVisit(expr); flag("body contains yield"); }
-            virtual void preVisit ( ExprMakeBlock * expr ) override { Visitor::preVisit(expr); flag("body contains a block, lambda, or generator literal"); }
+            virtual void preVisit ( ExprFor * expr ) override { Visitor::preVisit(expr); loopDepth ++; }
+            virtual ExpressionPtr visit ( ExprFor * expr ) override { loopDepth --; return Visitor::visit(expr); }
+            virtual void preVisit ( ExprWhile * expr ) override { Visitor::preVisit(expr); loopDepth ++; }
+            virtual ExpressionPtr visit ( ExprWhile * expr ) override { loopDepth --; return Visitor::visit(expr); }
+            // splicing a block body inline dissolves the block boundary; a break/continue
+            // not bound to a loop inside the body would re-bind to the invoke site's loop
+            virtual void preVisit ( ExprBreak * expr ) override {
+                Visitor::preVisit(expr);
+                if ( forBlockLiteral && !makeBlockDepth && !loopDepth ) flag("body breaks out of the block");
+            }
+            virtual void preVisit ( ExprContinue * expr ) override {
+                Visitor::preVisit(expr);
+                if ( forBlockLiteral && !makeBlockDepth && !loopDepth ) flag("body continues out of the block");
+            }
+            virtual void preVisit ( ExprMakeBlock * expr ) override {
+                Visitor::preVisit(expr);
+                // a plain block literal stays in-frame and clones safely with the body;
+                // lambda and local-function literals lower to generated functions during
+                // infer, and cloning those post-infer is not safe
+                if ( expr->isLambda || expr->isLocalFunction || !expr->capture.empty() ) {
+                    flag("body contains a lambda literal");
+                }
+                makeBlockDepth ++;
+            }
+            virtual ExpressionPtr visit ( ExprMakeBlock * expr ) override {
+                makeBlockDepth --;
+                return Visitor::visit(expr);
+            }
             virtual void preVisit ( ExprMakeGenerator * expr ) override { Visitor::preVisit(expr); flag("body contains a generator"); }
             virtual void preVisit ( ExprReturn * expr ) override {
                 Visitor::preVisit(expr);
+                if ( makeBlockDepth ) return;   // a return inside a block literal exits the block
                 returnCount ++;
                 if ( expr != lastTopLevelStmt ) misplacedReturn = expr;
             }
@@ -99,8 +146,8 @@ namespace das {
 
         class ParamReadScan : public Visitor {
         public:
-            ParamReadScan ( Function * fn, ParamReadStats & st ) : stats(st) {
-                for ( auto & arg : fn->arguments ) params.insert(arg);
+            ParamReadScan ( const vector<VariablePtr> & paramVars, ParamReadStats & st ) : stats(st) {
+                for ( auto & arg : paramVars ) params.insert(arg);
             }
         protected:
             das_hash_set<Variable *> params;
@@ -111,6 +158,9 @@ namespace das {
             virtual ExpressionPtr visit ( ExprFor * expr ) override { loopDepth --; return Visitor::visit(expr); }
             virtual void preVisit ( ExprWhile * expr ) override { Visitor::preVisit(expr); loopDepth ++; }
             virtual ExpressionPtr visit ( ExprWhile * expr ) override { loopDepth --; return Visitor::visit(expr); }
+            // a block literal's body may run any number of times - reads inside count as under-loop
+            virtual void preVisit ( ExprMakeBlock * expr ) override { Visitor::preVisit(expr); loopDepth ++; }
+            virtual ExpressionPtr visit ( ExprMakeBlock * expr ) override { loopDepth --; return Visitor::visit(expr); }
             virtual void preVisit ( ExprVar * expr ) override {
                 Visitor::preVisit(expr);
                 if ( expr->variable && params.find(expr->variable)!=params.end() ) {
@@ -120,24 +170,65 @@ namespace das {
             }
         };
 
-        // ----- private-symbol scan (cross-module splice gate) -----
+        // ----- cross-module reference scan (splice gate) -----
+        // a spliced body re-resolves its calls and globals in the DESTINATION module:
+        // everything it references must be public and visible from there. generic
+        // instances are judged by their origin (instances do not carry the private flag)
 
         class PrivateUseScan : public Visitor {
         public:
-            PrivateUseScan ( Module * calleeModule ) : mod(calleeModule) {}
+            PrivateUseScan ( Module * calleeModule, Module * destModule )
+                : mod(calleeModule), dest(destModule) {}
             string privateSymbol;
         protected:
             Module * mod;
+            Module * dest;
+            void checkFunc ( Function * fn ) {
+                if ( !fn || !privateSymbol.empty() ) return;
+                auto origin = fn->fromGeneric ? fn->fromGeneric : fn;
+                // instances are stamped private by instantiation, which keeps this gate
+                // deliberately conservative: a body calling ANY generic instance stays
+                // un-spliced across modules. Loosening it to origin-privateness re-fires
+                // hundreds of linq_fold_common splices and destabilizes the fold macro's
+                // shape assumptions - measure before widening
+                if ( fn->privateFunction || origin->privateFunction ) {
+                    if ( fn->module==mod || origin->module==mod ) {
+                        privateSymbol = origin->name;
+                        return;
+                    }
+                }
+                if ( dest && origin->module && !dest->isVisibleDirectly(origin->module) ) {
+                    privateSymbol = origin->name;
+                }
+            }
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             virtual void preVisit ( ExprCall * expr ) override {
                 Visitor::preVisit(expr);
-                if ( expr->func && expr->func->privateFunction && expr->func->module==mod && privateSymbol.empty() ) {
-                    privateSymbol = expr->func->name;
-                }
+                checkFunc(expr->func);
+            }
+            virtual void preVisit ( ExprOp1 * expr ) override {
+                Visitor::preVisit(expr);
+                checkFunc(expr->func);
+            }
+            virtual void preVisit ( ExprOp2 * expr ) override {
+                Visitor::preVisit(expr);
+                checkFunc(expr->func);
+            }
+            virtual void preVisit ( ExprOp3 * expr ) override {
+                Visitor::preVisit(expr);
+                checkFunc(expr->func);
+            }
+            virtual void preVisit ( ExprAddr * expr ) override {
+                Visitor::preVisit(expr);
+                checkFunc(expr->func);
             }
             virtual void preVisit ( ExprVar * expr ) override {
                 Visitor::preVisit(expr);
-                if ( expr->variable && expr->variable->private_variable && privateSymbol.empty() ) {
+                if ( !expr->variable || !privateSymbol.empty() ) return;
+                if ( expr->variable->private_variable ) {
+                    privateSymbol = expr->variable->name;
+                } else if ( dest && expr->isGlobalVariable() && expr->variable->module
+                    && !dest->isVisibleDirectly(expr->variable->module) ) {
                     privateSymbol = expr->variable->name;
                 }
             }
@@ -169,6 +260,12 @@ namespace das {
             virtual void preVisit ( ExprFor * expr ) override {
                 Visitor::preVisit(expr);
                 for ( auto & var : expr->iteratorVariables ) renameVar(var->name, var->aka);
+            }
+            // block-literal arguments rename too: after the splice they sit in the caller's
+            // scope chain, and an unrenamed argument could shadow a caller local (an error)
+            virtual void preVisitBlockArgument ( ExprBlock * block, const VariablePtr & var, bool lastArg ) override {
+                Visitor::preVisitBlockArgument(block, var, lastArg);
+                renameVar(var->name, var->aka);
             }
         };
 
@@ -238,6 +335,15 @@ namespace das {
                     if ( rit != rename->end() ) var->name = rit->second;
                 }
             }
+            virtual void preVisitBlockArgument ( ExprBlock * block, const VariablePtr & var, bool lastArg ) override {
+                Visitor::preVisitBlockArgument(block, var, lastArg);
+                auto rit = rename->find(var->name);
+                if ( rit != rename->end() ) var->name = rit->second;
+                if ( !var->aka.empty() ) {
+                    auto ait = rename->find(var->aka);
+                    if ( ait != rename->end() ) var->aka = ait->second;
+                }
+            }
         };
 
         // replace one specific node (by identity) inside a statement
@@ -260,20 +366,51 @@ namespace das {
             int         index = -1;
         };
 
-        struct PlannedSite {
-            ExprCall *  call = nullptr;
-            Expression * stmt = nullptr;
-            StmtAnchor  anchor;
+        enum class SiteKind {
+            MustCall,   // call to an [inline] function: fail-closed contract, errors
+            AutoCall,   // call with a block-literal argument: best-effort, silent declines
+            Devirt      // invoke of a block literal (direct or let-bound): best-effort
         };
 
+        struct PlannedSite {
+            Expression * callLike = nullptr;    // ExprCall or ExprInvoke
+            Expression * stmt = nullptr;
+            StmtAnchor  anchor;
+            SiteKind    kind = SiteKind::MustCall;
+        };
+
+        // annotations other than inert markers may carry call-site semantics (verifyCall,
+        // transform, per-call codegen) that splicing the call away would bypass
+        bool annotatedCallee ( Function * fn, string & why ) {
+            for ( auto & ann : fn->annotations ) {
+                if ( !ann->annotation ) continue;
+                auto & nm = ann->annotation->name;
+                if ( nm=="export" || nm=="unused_argument" ) continue;
+                why = "annotated function [" + nm + "]";
+                return true;
+            }
+            return false;
+        }
+
+        bool autoEligibleCall ( ExprCall * call ) {
+            if ( !call->func || call->func->mustInline || call->func->builtIn ) return false;
+            if ( !call->func->body || call->func->isTemplate ) return false;
+            for ( auto & a : call->arguments ) {
+                if ( a->rtti_isMakeBlock() ) return true;
+            }
+            return false;
+        }
+
         // one walk per function: for every statement its (block, index) anchor, and
-        // every mustInline call site tagged with the statement that anchors it. a call
-        // in a while/elif condition is tagged with the while/if statement itself; the
+        // every splice site tagged with the statement that anchors it. a call in a
+        // while/elif condition is tagged with the while/if statement itself; the
         // splice step lowers those constructs first when statements are needed.
         class InlineCollect : public Visitor {
         public:
+            InlineCollect ( bool autoOn ) : autoEnabled(autoOn) {}
             vector<PlannedSite> sites;      // in visit order: within a block, increasing index
         protected:
+            bool autoEnabled;
             vector<StmtAnchor> blockStack;
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             virtual void preVisit ( ExprBlock * blk ) override {
@@ -288,21 +425,67 @@ namespace das {
                 Visitor::preVisitBlockExpression(block, expr);
                 if ( !blockStack.empty() && blockStack.back().block==block ) blockStack.back().index++;
             }
+            void plan ( Expression * expr, SiteKind kind ) {
+                // the anchoring statement is the innermost open block's CURRENT
+                // statement - not the last statement any nested block visited
+                // (an elif condition visits after the outer if's then-block)
+                PlannedSite site;
+                site.callLike = expr;
+                site.kind = kind;
+                if ( !blockStack.empty() && blockStack.back().index >= 0
+                    && blockStack.back().index < int(blockStack.back().block->list.size()) ) {
+                    site.anchor = blockStack.back();
+                    site.stmt = site.anchor.block->list[site.anchor.index];
+                }
+                sites.push_back(site);
+            }
             virtual void preVisit ( ExprCall * expr ) override {
                 Visitor::preVisit(expr);
                 if ( expr->func && expr->func->mustInline ) {
-                    // the anchoring statement is the innermost open block's CURRENT
-                    // statement - not the last statement any nested block visited
-                    // (an elif condition visits after the outer if's then-block)
-                    PlannedSite site;
-                    site.call = expr;
-                    if ( !blockStack.empty() && blockStack.back().index >= 0
-                        && blockStack.back().index < int(blockStack.back().block->list.size()) ) {
-                        site.anchor = blockStack.back();
-                        site.stmt = site.anchor.block->list[site.anchor.index];
-                    }
-                    sites.push_back(site);
+                    plan(expr, SiteKind::MustCall);
+                } else if ( autoEnabled && autoEligibleCall(expr) ) {
+                    plan(expr, SiteKind::AutoCall);
                 }
+            }
+            virtual void preVisit ( ExprInvoke * expr ) override {
+                Visitor::preVisit(expr);
+                if ( !autoEnabled || expr->isInvokeMethod || expr->arguments.empty() ) return;
+                Expression * a0 = expr->arguments[0];
+                if ( a0->rtti_isR2V() ) a0 = static_cast<ExprRef2Value *>(a0)->subexpr;
+                if ( a0->rtti_isMakeBlock() || a0->rtti_isVar() ) plan(expr, SiteKind::Devirt);
+            }
+        };
+
+        // let-bound block literals: a variable move-initialized from a block literal and
+        // never REBOUND still holds that literal at every invoke. write flags are fresh
+        // at patch time (buildAccessFlags runs right before patchAnnotations); an invoke
+        // stamps a write on its non-const block argument, but invoking cannot rebind the
+        // holder to a different literal, so arg0 occurrences stay clean for this purpose
+        class BlockBindingScan : public Visitor {
+        public:
+            das_hash_map<Variable *, ExprMakeBlock *> binding;
+            das_hash_set<Variable *> disq;
+        protected:
+            das_hash_set<Expression *> invokeArg0;
+            virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
+            virtual void preVisitLet ( ExprLet * let, const VariablePtr & var, bool last ) override {
+                Visitor::preVisitLet(let, var, last);
+                if ( var->init && var->init->rtti_isMakeBlock() ) {
+                    if ( binding.find(var)!=binding.end() ) disq.insert(var);  // paranoia: one binding only
+                    binding[var] = static_cast<ExprMakeBlock *>(var->init);
+                }
+            }
+            virtual void preVisit ( ExprInvoke * expr ) override {
+                Visitor::preVisit(expr);
+                if ( expr->arguments.empty() ) return;
+                Expression * a0 = expr->arguments[0];
+                if ( a0->rtti_isR2V() ) a0 = static_cast<ExprRef2Value *>(a0)->subexpr;
+                if ( a0->rtti_isVar() ) invokeArg0.insert(a0);
+            }
+            virtual void preVisit ( ExprVar * expr ) override {
+                Visitor::preVisit(expr);
+                if ( expr->variable && expr->write
+                    && invokeArg0.find(expr)==invokeArg0.end() ) disq.insert(expr->variable);
             }
         };
 
@@ -371,6 +554,8 @@ namespace das {
                 out.emplace_back(at->index, 0);
             } else if ( e->rtti_isCast() ) {
                 out.emplace_back(static_cast<ExprCast *>(e)->subexpr, 0);
+            } else if ( e->rtti_isUnsafe() ) {
+                out.emplace_back(static_cast<ExprUnsafe *>(e)->body, 0);
             }
         }
 
@@ -384,6 +569,10 @@ namespace das {
         bool inlinePure ( Expression * e ) {
             if ( !e ) return true;
             if ( e->rtti_isConstant() ) return true;
+            if ( e->rtti_isMakeBlock() ) return true;   // making a block writes nothing (and
+                                                        // hoisting one would copy a non-copyable)
+            if ( e->rtti_isTypeDecl() ) return true;    // type<...> witness: a compile-time tag
+            if ( e->rtti_isUnsafe() ) return inlinePure(static_cast<ExprUnsafe *>(e)->body);
             if ( e->rtti_isVar() ) return !static_cast<ExprVar *>(e)->isGlobalVariable();
             if ( e->rtti_isR2V() ) return inlinePure(static_cast<ExprRef2Value *>(e)->subexpr);
             if ( e->rtti_isField() ) return inlinePure(static_cast<ExprField *>(e)->value);
@@ -450,12 +639,23 @@ namespace das {
             return (fn->sideEffectFlags & writeMask)==0;
         }
 
+        // the arguments and parameters of one splice site: a direct call binds the whole
+        // argument list, an invoke binds arguments[1..] against the block's parameters
+        struct SiteArgs {
+            const vector<ExpressionPtr> *  args = nullptr;
+            size_t                         ofs = 0;
+            const vector<VariablePtr> *    params = nullptr;
+            size_t count () const { return params->size(); }
+            Expression * arg ( size_t i ) const { return (*args)[ofs+i]; }
+            const VariablePtr & param ( size_t i ) const { return (*params)[i]; }
+        };
+
         // for a callee that DOES write: a substituted argument may only read storage
         // the spliced body provably cannot touch - plain local by-value variables that
         // are not passed by mutable reference in this very call and whose address was
         // never taken. no field / index / deref reads at all (they may reach heap or
         // aliased storage). constants and operations over such leaves are fine
-        bool argReadsOnlyPrivateLocals ( Expression * e, ExprCall * call, Function * callee ) {
+        bool argReadsOnlyPrivateLocals ( Expression * e, const SiteArgs & sa ) {
             if ( !e ) return true;
             if ( e->rtti_isConstant() ) return true;
             if ( e->rtti_isVar() ) {
@@ -465,34 +665,34 @@ namespace das {
                 if ( v->variable->access_ref ) return false;    // address taken somewhere
                 auto vt = v->variable->type;
                 if ( vt && (vt->ref || vt->isRefType()) ) return false;
-                for ( size_t oi=0, ois=call->arguments.size(); oi!=ois; ++oi ) {
-                    auto & OP = callee->arguments[oi];
+                for ( size_t oi=0, ois=sa.count(); oi!=ois; ++oi ) {
+                    auto & OP = sa.param(oi);
                     bool oRef = OP->type->ref || OP->type->isRefType();
                     if ( !oRef || OP->type->constant ) continue;
-                    Expression * oleaf = call->arguments[oi];
+                    Expression * oleaf = sa.arg(oi);
                     if ( oleaf->rtti_isR2V() ) oleaf = static_cast<ExprRef2Value *>(oleaf)->subexpr;
                     if ( oleaf->rtti_isVar() && static_cast<ExprVar *>(oleaf)->variable==v->variable ) return false;
                 }
                 return true;
             }
-            if ( e->rtti_isR2V() ) return argReadsOnlyPrivateLocals(static_cast<ExprRef2Value *>(e)->subexpr, call, callee);
-            if ( e->rtti_isCast() ) return argReadsOnlyPrivateLocals(static_cast<ExprCast *>(e)->subexpr, call, callee);
-            if ( e->rtti_isOp1() ) return argReadsOnlyPrivateLocals(static_cast<ExprOp1 *>(e)->subexpr, call, callee);
+            if ( e->rtti_isR2V() ) return argReadsOnlyPrivateLocals(static_cast<ExprRef2Value *>(e)->subexpr, sa);
+            if ( e->rtti_isCast() ) return argReadsOnlyPrivateLocals(static_cast<ExprCast *>(e)->subexpr, sa);
+            if ( e->rtti_isOp1() ) return argReadsOnlyPrivateLocals(static_cast<ExprOp1 *>(e)->subexpr, sa);
             if ( e->rtti_isOp2() ) {
                 auto op = static_cast<ExprOp2 *>(e);
-                return argReadsOnlyPrivateLocals(op->left, call, callee)
-                    && argReadsOnlyPrivateLocals(op->right, call, callee);
+                return argReadsOnlyPrivateLocals(op->left, sa)
+                    && argReadsOnlyPrivateLocals(op->right, sa);
             }
             if ( e->rtti_isOp3() ) {
                 auto op = static_cast<ExprOp3 *>(e);
-                return argReadsOnlyPrivateLocals(op->subexpr, call, callee)
-                    && argReadsOnlyPrivateLocals(op->left, call, callee)
-                    && argReadsOnlyPrivateLocals(op->right, call, callee);
+                return argReadsOnlyPrivateLocals(op->subexpr, sa)
+                    && argReadsOnlyPrivateLocals(op->left, sa)
+                    && argReadsOnlyPrivateLocals(op->right, sa);
             }
             if ( e->rtti_isCall() ) {
                 auto c = static_cast<ExprCall *>(e);
                 for ( auto & a : c->arguments ) {
-                    if ( !argReadsOnlyPrivateLocals(a, call, callee) ) return false;
+                    if ( !argReadsOnlyPrivateLocals(a, sa) ) return false;
                 }
                 return true;
             }
@@ -515,7 +715,7 @@ namespace das {
             vector<Expression *> lazyOps;   // lazy ops on the path, outermost LAST (pushed on unwind)
         };
 
-        SitePosition findPath ( Expression * root, ExprCall * call, PathScan & scan ) {
+        SitePosition findPath ( Expression * root, Expression * call, PathScan & scan ) {
             if ( root==call ) return SitePosition::Eager;
             vector<pair<Expression *,int>> kids;
             childrenInEvalOrder(root, kids);
@@ -537,7 +737,7 @@ namespace das {
         // maximal impure subexpressions evaluated strictly before `call` within `root`,
         // in evaluation order. hoisting them (whole, internal laziness intact) keeps the
         // spliced arg temps from jumping ahead of earlier side effects
-        void collectImpurePrefix ( Expression * root, ExprCall * call, vector<Expression *> & prefix ) {
+        void collectImpurePrefix ( Expression * root, Expression * call, vector<Expression *> & prefix ) {
             if ( root==call ) return;
             vector<pair<Expression *,int>> kids;
             childrenInEvalOrder(root, kids);
@@ -560,6 +760,9 @@ namespace das {
             var->generated = true;
             var->type = new TypeDecl(Type::autoinfer);
             var->type->constant = isConst;
+            // autoinfer inherits constness from the init; a mutable temp initialized
+            // from a constant must strip it (the `-const` operator) or writes fail
+            var->type->removeConstant = !isConst;
             var->type->ref = isRef;
             var->init = init;
             var->init_via_move = viaMove;
@@ -612,7 +815,11 @@ namespace das {
             if ( !arg->type ) continue;
             if ( arg->type->temporary ) { err = "[inline] does not support temporary (#) parameter '" + arg->name + "'"; return false; }
             if ( arg->type->implicit ) { err = "[inline] does not support implicit parameter '" + arg->name + "'"; return false; }
+            // a smart-pointer argument temp would need inscope/move discipline the
+            // splicer does not manufacture (strict_smart_pointers rejects the copy)
+            if ( arg->type->smartPtr ) { err = "[inline] does not support smart-pointer parameter '" + arg->name + "'"; return false; }
         }
+        if ( fn->result && fn->result->smartPtr ) { err = "[inline] does not support a smart-pointer result"; return false; }
         auto body = static_cast<ExprBlock *>(fn->body);
         InlineShapeScan scan;
         scan.lastTopLevelStmt = body->list.empty() ? nullptr : body->list.back();
@@ -657,6 +864,58 @@ namespace das {
         return true;
     }
 
+    // ----- best-effort shape gates (auto inlining and devirtualization decline, never error) -----
+
+    namespace {
+
+        // a block literal the devirtualizer can splice in place: a plain in-frame block
+        // with a single-exit body and a by-value (or void) result. splicing dissolves the
+        // block boundary, so a break/continue not bound to a loop inside the body is out
+        bool checkDevirtShape ( ExprMakeBlock * mkb, string & why ) {
+            if ( mkb->isLambda || mkb->isLocalFunction || !mkb->capture.empty() ) { why = "lambda literal"; return false; }
+            if ( !mkb->block || !mkb->block->rtti_isBlock() ) { why = "no block body"; return false; }
+            auto blk = static_cast<ExprBlock *>(mkb->block);
+            bool isVoid = !blk->returnType || blk->returnType->isVoid();
+            if ( !isVoid && (blk->returnType->ref || blk->returnType->isRefType()) ) {
+                why = "result is not by-value";
+                return false;
+            }
+            for ( auto & arg : blk->arguments ) {
+                if ( !arg->type ) { why = "unresolved parameter"; return false; }
+                if ( arg->type->temporary ) { why = "temporary (#) parameter"; return false; }
+                if ( arg->type->implicit ) { why = "implicit parameter"; return false; }
+                if ( arg->type->smartPtr ) { why = "smart-pointer parameter"; return false; }
+            }
+            if ( blk->returnType && blk->returnType->smartPtr ) { why = "smart-pointer result"; return false; }
+            InlineShapeScan scan(true);
+            scan.lastTopLevelStmt = blk->list.empty() ? nullptr : blk->list.back();
+            blk->visit(scan);
+            if ( scan.bad ) { why = scan.reason; return false; }
+            if ( scan.misplacedReturn ) { why = "multiple exits"; return false; }
+            if ( !isVoid && scan.returnCount!=1 ) { why = "multiple exits"; return false; }
+            return true;
+        }
+
+        // recursion over the whole splice graph - [inline] calls and auto-eligible
+        // block-literal calls alike - would re-manufacture eligible sites every round
+        bool spliceGraphReaches ( Function * target, Function * cur, das_hash_set<Function *> & visited ) {
+            if ( !cur->body ) return false;
+            bool found = false;
+            lookupExpressions(cur->body, [&](Expression * expr) {
+                if ( found || !expr->rtti_isCall() ) return;
+                auto call = static_cast<ExprCall *>(expr);
+                if ( !call->func ) return;
+                if ( !call->func->mustInline && !autoEligibleCall(call) ) return;
+                if ( call->func==target ) { found = true; return; }
+                if ( visited.insert(call->func).second ) {
+                    if ( spliceGraphReaches(target, call->func, visited) ) found = true;
+                }
+            });
+            return found;
+        }
+
+    } // anonymous namespace
+
     // ----- the patch pass -----
 
     namespace {
@@ -665,10 +924,17 @@ namespace das {
             Program * program = nullptr;
             TextWriter * logs = nullptr;
             bool logOpt = false;
+            bool mustEnabled = true;
+            bool autoEnabled = false;
             bool changed = false;
-            int inlined = 0;
-            das_hash_map<Function *, ParamReadStats> statsCache;
+            int inlined = 0;        // [inline] sites
+            int inlinedAuto = 0;    // auto block-literal call sites
+            int devirted = 0;       // invoke-of-literal sites
+            int declined = 0;       // best-effort sites the pass passed on
+            das_hash_map<ExprBlock *, ParamReadStats> statsCache;
             das_hash_map<Function *, bool> shapeCache;
+            das_hash_map<Function *, pair<bool,string>> autoOkCache;
+            das_hash_map<ExprMakeBlock *, pair<bool,string>> devirtShapeCache;
             das_hash_map<Function *, string> privateUseCache;
 
             bool calleeShapeOk ( Function * fn ) {
@@ -680,19 +946,68 @@ namespace das {
                 return ok;
             }
 
-            const ParamReadStats & paramStats ( Function * fn ) {
-                auto it = statsCache.find(fn);
+            // best-effort callee gate: [inline]'s shape contract, plus no unsafe in the
+            // body (a spliced unsafe re-checks against the CALLER module's permissions),
+            // plus no recursion through the combined splice graph
+            bool autoCalleeOk ( Function * fn, string & why ) {
+                auto it = autoOkCache.find(fn);
+                if ( it != autoOkCache.end() ) { why = it->second.second; return it->second.first; }
+                bool ok = true;
+                if ( !checkInlineShape(fn, why) ) {
+                    ok = false;
+                } else if ( fn->unsafeOperation || fn->unsafeDeref || fn->hasUnsafe ) {
+                    // hasUnsafe is stamped by infer and survives foldUnsafe: a spliced
+                    // unsafe body would re-check against the caller's module, wrapper-less
+                    ok = false;
+                    why = "unsafe operation";
+                } else if ( annotatedCallee(fn, why) ) {
+                    ok = false;     // an annotation may carry call-site semantics
+                                    // (verifyCall & co) that a splice would bypass
+                } else {
+                    // a type<...> witness naming the generic's own alias (type<TT>) stays
+                    // symbolic in the instance body and cannot re-resolve after a splice
+                    bool aliasWitness = false;
+                    lookupExpressions(fn->body, [&](Expression * expr) {
+                        if ( aliasWitness || !expr->rtti_isTypeDecl() ) return;
+                        auto td = static_cast<ExprTypeDecl *>(expr);
+                        if ( td->typeexpr && td->typeexpr->isAutoOrAlias() ) aliasWitness = true;
+                    });
+                    if ( aliasWitness ) {
+                        ok = false;
+                        why = "body carries a generic type witness";
+                    } else {
+                        das_hash_set<Function *> visited;
+                        if ( spliceGraphReaches(fn, fn, visited) ) {
+                            ok = false;
+                            why = "recursive through the inline graph";
+                        }
+                    }
+                }
+                autoOkCache[fn] = pair<bool,string>(ok, why);
+                return ok;
+            }
+
+            bool devirtShapeOk ( ExprMakeBlock * mkb, string & why ) {
+                auto it = devirtShapeCache.find(mkb);
+                if ( it != devirtShapeCache.end() ) { why = it->second.second; return it->second.first; }
+                bool ok = checkDevirtShape(mkb, why);
+                devirtShapeCache[mkb] = pair<bool,string>(ok, why);
+                return ok;
+            }
+
+            const ParamReadStats & paramStats ( ExprBlock * body, const vector<VariablePtr> & params ) {
+                auto it = statsCache.find(body);
                 if ( it != statsCache.end() ) return it->second;
-                auto & st = statsCache[fn];
-                ParamReadScan scan(fn, st);
-                fn->body->visit(scan);
+                auto & st = statsCache[body];
+                ParamReadScan scan(params, st);
+                body->visit(scan);
                 return st;
             }
 
-            const string & privateUse ( Function * fn ) {
+            const string & privateUse ( Function * fn, Module * originModule ) {
                 auto it = privateUseCache.find(fn);
                 if ( it != privateUseCache.end() ) return it->second;
-                PrivateUseScan scan(fn->module);
+                PrivateUseScan scan(originModule, program->thisModule.get());
                 fn->body->visit(scan);
                 return privateUseCache[fn] = scan.privateSymbol;
             }
@@ -723,28 +1038,86 @@ namespace das {
                 program->error(what, "", "", at, CompilationError::invalid_annotation);
             }
 
-            void logSite ( Function * caller, ExprCall * call ) {
-                if ( logOpt && logs ) {
-                    *logs << "INLINE " << call->func->getMangledName() << " into "
-                          << caller->getMangledName() << " at " << call->at.describe() << "\n";
+            // a MUST site that can't splice fails the compile; a best-effort site
+            // declines silently (counted, logged under log_optimization)
+            void siteFail ( const PlannedSite & site, const string & what, const LineInfo & at ) {
+                if ( site.kind==SiteKind::MustCall ) {
+                    error(what, at);
+                } else {
+                    decline(site, what, at);
                 }
+            }
+
+            void decline ( const PlannedSite & site, const string & why, const LineInfo & at ) {
+                declined ++;
+                if ( logOpt && logs ) {
+                    *logs << (site.kind==SiteKind::Devirt ? "DEVIRT DECLINED at " : "AUTO-INLINE DECLINED at ")
+                          << at.describe() << ": " << why << "\n";
+                }
+            }
+
+            void completeSite ( const PlannedSite & site, Function * caller, const string & subjName ) {
+                switch ( site.kind ) {
+                    case SiteKind::MustCall: inlined ++; break;
+                    case SiteKind::AutoCall: inlinedAuto ++; break;
+                    case SiteKind::Devirt:   devirted ++; break;
+                }
+                if ( logOpt && logs ) {
+                    const char * verb = site.kind==SiteKind::MustCall ? "INLINE "
+                        : site.kind==SiteKind::AutoCall ? "AUTO-INLINE " : "DEVIRT ";
+                    *logs << verb << subjName << " into " << caller->getMangledName()
+                          << " at " << site.callLike->at.describe() << "\n";
+                }
+                changed = true;
             }
 
             void processFunction ( Function * fn );
         };
 
         void InlinePatch::processFunction ( Function * fn ) {
-            InlineCollect collect;
+            InlineCollect collect(autoEnabled);
             fn->body->visit(collect);
             if ( collect.sites.empty() ) return;
+            // let-bound block literals this function's invokes may resolve to
+            das_hash_map<Variable *, ExprMakeBlock *> bindings;
+            if ( autoEnabled ) {
+                BlockBindingScan bscan;
+                fn->body->visit(bscan);
+                for ( auto & kv : bscan.binding ) {
+                    if ( bscan.disq.find(kv.first)==bscan.disq.end() ) bindings[kv.first] = kv.second;
+                }
+            }
             int inlineId = nextInlineId(fn);
             // a splice shifts the indices of later statements in the same block
             das_hash_map<ExprBlock *, int> indexShift;
             for ( auto & site : collect.sites ) {
-                auto call = site.call;
-                auto callee = call->func;
+                auto callLike = site.callLike;
+                if ( site.kind==SiteKind::MustCall && !mustEnabled ) continue;
+                // ----- resolve the splice subject -----
+                Function * calleeFn = nullptr;          // MustCall / AutoCall
+                ExprMakeBlock * literal = nullptr;      // Devirt
+                string subjName;
+                if ( site.kind==SiteKind::Devirt ) {
+                    auto inv = static_cast<ExprInvoke *>(callLike);
+                    Expression * a0 = inv->arguments[0];
+                    if ( a0->rtti_isR2V() ) a0 = static_cast<ExprRef2Value *>(a0)->subexpr;
+                    if ( a0->rtti_isMakeBlock() ) {
+                        literal = static_cast<ExprMakeBlock *>(a0);
+                    } else if ( a0->rtti_isVar() ) {
+                        auto v = static_cast<ExprVar *>(a0);
+                        if ( v->variable ) {
+                            auto bit = bindings.find(v->variable);
+                            if ( bit!=bindings.end() ) literal = bit->second;
+                        }
+                    }
+                    if ( !literal ) continue;   // not a traceable block literal
+                    subjName = "block";
+                } else {
+                    calleeFn = static_cast<ExprCall *>(callLike)->func;
+                    subjName = calleeFn->name;
+                }
                 if ( !site.stmt || !site.anchor.block ) {
-                    error("can't inline " + callee->name + " here: the call is outside a function statement", call->at);
+                    siteFail(site, "can't inline " + subjName + " here: the call is outside a function statement", callLike->at);
                     continue;
                 }
                 int anchorIndex = site.anchor.index + indexShift[site.anchor.block];
@@ -759,38 +1132,66 @@ namespace das {
                     || site.anchor.block->list[anchorIndex] != site.stmt ) {
                     continue;
                 }
-                bool siteLive = exprContains(site.stmt, call);
+                bool siteLive = exprContains(site.stmt, callLike);
                 if ( !siteLive && site.stmt->rtti_isWhile() ) {
-                    siteLive = exprContains(static_cast<ExprWhile *>(site.stmt)->cond, call);
+                    siteLive = exprContains(static_cast<ExprWhile *>(site.stmt)->cond, callLike);
                 }
                 if ( !siteLive && site.stmt->rtti_isIfThenElse() ) {
                     auto lite = static_cast<ExprIfThenElse *>(site.stmt);
                     while ( lite->if_false && lite->if_false->rtti_isIfThenElse() ) {
                         auto inner = static_cast<ExprIfThenElse *>(lite->if_false);
-                        if ( exprContains(inner->cond, call) ) { siteLive = true; break; }
+                        if ( exprContains(inner->cond, callLike) ) { siteLive = true; break; }
                         lite = inner;
                     }
                 }
                 if ( !siteLive ) continue;
-                if ( !calleeShapeOk(callee) ) continue;             // lint reports at the declaration
-                if ( call->arguments.size() != callee->arguments.size() ) continue; // not fully inferred - defensive
-                if ( callee->module != program->thisModule.get() ) {
-                    auto & priv = privateUse(callee);
-                    if ( !priv.empty() ) {
-                        error("can't inline " + callee->name + " across modules: body uses private symbol '" + priv + "'", call->at);
-                        continue;
+                // ----- subject shape gates -----
+                ExprBlock * body = nullptr;
+                TypeDecl * subjResult = nullptr;    // null = void result
+                SiteArgs sa;
+                if ( site.kind==SiteKind::Devirt ) {
+                    string why;
+                    if ( !devirtShapeOk(literal, why) ) { decline(site, why, callLike->at); continue; }
+                    auto blk = static_cast<ExprBlock *>(literal->block);
+                    auto inv = static_cast<ExprInvoke *>(callLike);
+                    if ( inv->arguments.size() != blk->arguments.size()+1 ) { decline(site, "argument count mismatch", callLike->at); continue; }
+                    body = blk;
+                    if ( blk->returnType && !blk->returnType->isVoid() ) subjResult = blk->returnType;
+                    sa.args = &inv->arguments; sa.ofs = 1; sa.params = &blk->arguments;
+                } else {
+                    auto call = static_cast<ExprCall *>(callLike);
+                    if ( site.kind==SiteKind::MustCall ) {
+                        if ( !calleeShapeOk(calleeFn) ) continue;   // lint reports at the declaration
+                    } else {
+                        string why;
+                        if ( !autoCalleeOk(calleeFn, why) ) { decline(site, subjName + ": " + why, callLike->at); continue; }
                     }
+                    if ( call->arguments.size() != calleeFn->arguments.size() ) continue; // not fully inferred - defensive
+                    // a generic instance lives in the CALLER's module - judge its home
+                    // (and the reachability of its references) by the generic's origin
+                    Module * originModule = calleeFn->fromGeneric
+                        ? calleeFn->fromGeneric->module : calleeFn->module;
+                    if ( originModule != program->thisModule.get() ) {
+                        auto & priv = privateUse(calleeFn, originModule);
+                        if ( !priv.empty() ) {
+                            siteFail(site, "can't inline " + subjName + " across modules: body uses private symbol '" + priv + "'", callLike->at);
+                            continue;
+                        }
+                    }
+                    body = static_cast<ExprBlock *>(calleeFn->body);
+                    if ( calleeFn->result && !calleeFn->result->isVoid() ) subjResult = calleeFn->result;
+                    sa.args = &call->arguments; sa.ofs = 0; sa.params = &calleeFn->arguments;
                 }
                 // ----- classify arguments -----
-                auto & stats = paramStats(callee);
-                auto body = static_cast<ExprBlock *>(callee->body);
-                bool isVoid = !callee->result || callee->result->isVoid();
+                auto & stats = paramStats(body, *sa.params);
+                bool isVoid = subjResult==nullptr;
                 bool exprBody = body->list.size()==1 && body->list.back()->rtti_isReturn();
+                bool writeFree = calleeFn ? calleeWriteFree(calleeFn) : false;  // a block body is judged unknown
                 das_hash_map<Variable *, ArgSub> paramSub;
                 vector<ExpressionPtr> temps;
-                for ( size_t ai=0, ais=call->arguments.size(); ai!=ais; ++ai ) {
-                    auto & A = call->arguments[ai];
-                    auto & P = callee->arguments[ai];
+                for ( size_t ai=0, ais=sa.count(); ai!=ais; ++ai ) {
+                    Expression * A = sa.arg(ai);
+                    auto & P = sa.param(ai);
                     ArgSub sub;
                     bool byRefParam = P->type->ref || P->type->isRefType();
                     bool varParam = !P->type->constant;
@@ -800,21 +1201,46 @@ namespace das {
                     bool leafVar = leafA->rtti_isVar();
                     auto makeArgTemp = [&]( Expression * init, bool cnst, bool ref, bool viaMove ) {
                         string tname = "__inl" + to_string(inlineId) + "_arg_" + P->name;
-                        temps.push_back(makeTemp(call->at, tname, init, cnst, ref, viaMove));
+                        temps.push_back(makeTemp(callLike->at, tname, init, cnst, ref, viaMove));
                         sub.tempName = tname;
                     };
+                    if ( leafA->rtti_isTypeDecl() ) {
+                        // type<...> witness: a compile-time tag - a temp would "use" it
+                        sub.substitute = leafA;
+                        paramSub[P] = sub;
+                        continue;
+                    }
                     if ( byRefParam ) {
                         if ( leafVar ) {
                             sub.substitute = leafA;             // same aliasing as the call itself
+                        } else if ( leafA->rtti_isMakeBlock() ) {
+                            // a block literal read once outside loops substitutes textually,
+                            // keeping shapes a holder can't reproduce (temporary-typed block
+                            // parameters do not survive a `var <-` binding). multi-read and
+                            // under-loop literals bind a holder; devirtualization takes over
+                            int reads = 0;
+                            auto rit = stats.readCount.find(P);
+                            if ( rit != stats.readCount.end() ) reads = rit->second;
+                            bool underLoop = stats.readUnderLoop.find(P)!=stats.readUnderLoop.end();
+                            if ( reads<=1 && !underLoop ) {
+                                sub.substitute = leafA;
+                            } else {
+                                makeArgTemp(A->clone(), false, false, true);
+                            }
                         } else if ( A->type && A->type->ref ) {
                             // lvalue chain (field/index): bind a reference once, like the call did
                             auto init = A->clone();
                             init->alwaysSafe = true;            // generated binding to real storage
                             makeArgTemp(init, !varParam, true, false);
                         } else {
-                            // rvalue into a const-ref param: materialize the value
+                            // rvalue into a ref param: materialize the value. constness
+                            // follows the param (a var-ref param - e.g. a consumed iterator -
+                            // needs a mutable holder), and a block always binds `var`: a const
+                            // holder const-propagates into the invoke, rejecting the block's
+                            // own var parameters
                             bool nonCopyable = A->type && !A->type->canCopy();
-                            makeArgTemp(A->clone(), true, false, nonCopyable);
+                            bool blockValue = A->type && A->type->baseType==Type::tBlock;
+                            makeArgTemp(A->clone(), !varParam && !blockValue, false, nonCopyable);
                         }
                     } else if ( varParam ) {
                         // a mutable by-value param IS a local copy
@@ -829,10 +1255,10 @@ namespace das {
                         if ( av->variable ) {
                             for ( size_t oi=0; oi!=ais; ++oi ) {
                                 if ( oi==ai ) continue;
-                                auto & OP = callee->arguments[oi];
+                                auto & OP = sa.param(oi);
                                 bool oRef = OP->type->ref || OP->type->isRefType();
                                 if ( !oRef || OP->type->constant ) continue;
-                                Expression * oleaf = call->arguments[oi];
+                                Expression * oleaf = sa.arg(oi);
                                 if ( oleaf->rtti_isR2V() ) oleaf = static_cast<ExprRef2Value *>(oleaf)->subexpr;
                                 if ( oleaf->rtti_isVar() && static_cast<ExprVar *>(oleaf)->variable==av->variable ) {
                                     hazard = true;
@@ -842,7 +1268,7 @@ namespace das {
                             if ( !hazard && (av->isGlobalVariable() || av->variable->access_ref) ) {
                                 // a global, or a local whose address escaped: the spliced
                                 // body's writes could reach it, breaking snapshot semantics
-                                hazard = !calleeWriteFree(callee);
+                                hazard = !writeFree;
                             }
                         }
                         if ( hazard ) {
@@ -856,7 +1282,7 @@ namespace das {
                         auto rit = stats.readCount.find(P);
                         if ( rit != stats.readCount.end() ) reads = rit->second;
                         bool underLoop = stats.readUnderLoop.find(P)!=stats.readUnderLoop.end();
-                        bool orderSafe = calleeWriteFree(callee) || argReadsOnlyPrivateLocals(A, call, callee);
+                        bool orderSafe = writeFree || argReadsOnlyPrivateLocals(A, sa);
                         if ( reads<=1 && !underLoop && inlinePure(A) && orderSafe ) {
                             sub.substitute = A;
                         } else {
@@ -872,13 +1298,13 @@ namespace das {
                     InlineBodyRewriter rewriter;
                     rewriter.paramSub = &paramSub;
                     rewriter.rename = &rename;
-                    rewriter.tempAt = call->at;
+                    rewriter.tempAt = callLike->at;
                     auto ret = static_cast<ExprReturn *>(body->list.back());
                     ExpressionPtr callReplacement = nullptr;
                     if ( ret->subexpr ) {
                         callReplacement = ret->subexpr->clone()->visit(rewriter);
                     }
-                    if ( site.stmt==call ) {
+                    if ( site.stmt==callLike ) {
                         auto & list = site.anchor.block->list;
                         if ( callReplacement ) {
                             list[anchorIndex] = callReplacement;
@@ -888,29 +1314,27 @@ namespace das {
                         }
                     } else {
                         ReplaceNode rn;
-                        rn.what = call;
+                        rn.what = callLike;
                         rn.with = callReplacement;
                         if ( !callReplacement ) {
-                            error("can't inline void " + callee->name + " here: the call is not a statement", call->at);
+                            siteFail(site, "can't inline void " + subjName + " here: the call is not a statement", callLike->at);
                             continue;
                         }
                         auto & slot = site.anchor.block->list[anchorIndex];
                         slot = slot->visit(rn);
                         if ( !rn.done ) {
-                            error("internal error: inlined call not found in its statement", call->at);
+                            error("internal error: inlined call not found in its statement", callLike->at);
                             continue;
                         }
                     }
-                    logSite(fn, call);
-                    inlined ++;
+                    completeSite(site, fn, subjName);
                     inlineId ++;
-                    changed = true;
                     continue;
                 }
                 // ----- statements needed: check the position, lower if necessary -----
                 if ( site.stmt->rtti_isWhile() ) {
                     auto wh = static_cast<ExprWhile *>(site.stmt);
-                    if ( exprContains(wh->cond, call) && wh->body->rtti_isBlock() ) {
+                    if ( exprContains(wh->cond, callLike) && wh->body->rtti_isBlock() ) {
                         // while(C) -> while(true) { if (!(C)) break; ... } - the condition
                         // becomes a statement-anchored expression, next round splices there
                         auto brkBlock = new ExprBlock();
@@ -932,7 +1356,7 @@ namespace das {
                     bool lowered = false;
                     while ( ite->if_false && ite->if_false->rtti_isIfThenElse() ) {
                         auto inner = static_cast<ExprIfThenElse *>(ite->if_false);
-                        if ( exprContains(inner->cond, call) || exprContains(ite->if_false, call) ) {
+                        if ( exprContains(inner->cond, callLike) || exprContains(ite->if_false, callLike) ) {
                             auto blk = new ExprBlock();
                             blk->at = inner->at;
                             blk->list.push_back(ite->if_false);
@@ -948,13 +1372,13 @@ namespace das {
                     }
                 }
                 PathScan path;
-                auto pos = findPath(site.stmt, call, path);
+                auto pos = findPath(site.stmt, callLike, path);
                 if ( pos==SitePosition::NotFound ) {
-                    error("can't inline " + callee->name + " here: unsupported call position", call->at);
+                    siteFail(site, "can't inline " + subjName + " here: unsupported call position", callLike->at);
                     continue;
                 }
                 if ( pos==SitePosition::Unsupported ) {
-                    error("can't inline " + callee->name + " inside ?? or a safe-navigation suffix - hoist the call into its own statement", call->at);
+                    siteFail(site, "can't inline " + subjName + " inside ?? or a safe-navigation suffix - hoist the call into its own statement", callLike->at);
                     continue;
                 }
                 if ( pos==SitePosition::Lazy ) {
@@ -976,13 +1400,15 @@ namespace das {
                     if ( !rootVar ) {
                         string tname = "__inl" + to_string(inlineId) + "_low";
                         inlineId ++;
-                        auto hoist = makeTemp(call->at, tname, lazy, true, false, false);
+                        // a non-const temp: a `var p = <temp>` consumer of pointer type
+                        // rejects initialization from a const reference
+                        auto hoist = makeTemp(callLike->at, tname, lazy, false, false, false);
                         ReplaceNode rn;
                         rn.what = lazy;
-                        rn.with = new ExprVar(call->at, tname);
+                        rn.with = new ExprVar(callLike->at, tname);
                         list[anchorIndex] = list[anchorIndex]->visit(rn);
                         if ( !rn.done ) {
-                            error("internal error: lazy operator not found in its statement", call->at);
+                            error("internal error: lazy operator not found in its statement", callLike->at);
                             continue;
                         }
                         list.insert(list.begin()+anchorIndex, hoist);
@@ -991,7 +1417,7 @@ namespace das {
                         continue;
                     }
                     if ( !lazy->type ) {
-                        error("can't inline " + callee->name + " here: missing type on the lazy operator", call->at);
+                        siteFail(site, "can't inline " + subjName + " here: missing type on the lazy operator", callLike->at);
                         continue;
                     }
                     vector<ExpressionPtr> replacement;
@@ -1016,7 +1442,7 @@ namespace das {
                         if ( op2->op=="||" ) cond = new ExprOp1(op2->at, "!", cond);
                         replacement.push_back(new ExprIfThenElse(op2->at, cond, thenBlk, nullptr));
                     } else {
-                        error("can't inline " + callee->name + " here: unsupported lazy operator", call->at);
+                        siteFail(site, "can't inline " + subjName + " here: unsupported lazy operator", callLike->at);
                         continue;
                     }
                     list.erase(list.begin()+anchorIndex);
@@ -1027,26 +1453,38 @@ namespace das {
                 }
                 // ----- eager position: hoist the impure prefix, splice temps and body -----
                 vector<Expression *> prefix;
-                collectImpurePrefix(site.stmt, call, prefix);
+                collectImpurePrefix(site.stmt, callLike, prefix);
                 vector<ExpressionPtr> splice;
                 bool prefixFailed = false;
                 int preIdx = 0;
                 for ( auto pe : prefix ) {
                     if ( pe->type && pe->type->isVoid() ) {
                         // a void expression can only BE the statement, and then it has no prefix
-                        error("can't inline " + callee->name + " here: void expression in the evaluation prefix", call->at);
+                        siteFail(site, "can't inline " + subjName + " here: void expression in the evaluation prefix", callLike->at);
                         prefixFailed = true;
                         break;
                     }
                     string tname = "__inl" + to_string(inlineId) + "_pre" + to_string(preIdx++);
-                    splice.push_back(makeTemp(pe->at, tname, pe, true, false, false));
+                    // non-const temps throughout: the hoisted expression was a non-const
+                    // rvalue (or keeps its lvalue constness via the reference binding), and
+                    // a const temp read would no longer match var pointer params downstream
+                    if ( pe->type && pe->type->ref ) {
+                        // lvalue: bind a reference once - evaluation order and identity
+                        // both survive (writes through the temp land in the original place)
+                        pe->alwaysSafe = true;          // generated binding to real storage
+                        splice.push_back(makeTemp(pe->at, tname, pe, pe->type->constant, true, false));
+                    } else if ( pe->type && !pe->type->canCopy() ) {
+                        splice.push_back(makeTemp(pe->at, tname, pe, false, false, true));  // move the rvalue
+                    } else {
+                        splice.push_back(makeTemp(pe->at, tname, pe, false, false, false));
+                    }
                     ReplaceNode rn;
                     rn.what = pe;
                     rn.with = new ExprVar(pe->at, tname);
                     auto & slot = site.anchor.block->list[anchorIndex];
                     slot = slot->visit(rn);
                     if ( !rn.done ) {
-                        error("internal error: prefix expression not found in its statement", call->at);
+                        error("internal error: prefix expression not found in its statement", callLike->at);
                         prefixFailed = true;
                         break;
                     }
@@ -1057,12 +1495,15 @@ namespace das {
                 das_hash_map<string, string> rename;
                 LocalNameCollect names;
                 names.rename = &rename;
-                names.prefix = "__inl" + to_string(inlineId) + "_";
-                callee->body->visit(names);
+                // renamed locals live in the _l_ sub-namespace so a callee local named
+                // `res` (or `arg_x`, `pre0`, `low`) can never collide with the
+                // manufactured _res/_arg_*/_pre*/_low temps of the same site
+                names.prefix = "__inl" + to_string(inlineId) + "_l_";
+                body->visit(names);
                 InlineBodyRewriter rewriter;
                 rewriter.paramSub = &paramSub;
                 rewriter.rename = &rename;
-                rewriter.tempAt = call->at;
+                rewriter.tempAt = callLike->at;
                 ExpressionPtr callReplacement = nullptr;
                 if ( exprBody ) {
                     auto ret = static_cast<ExprReturn *>(body->list.back());
@@ -1070,7 +1511,19 @@ namespace das {
                         callReplacement = ret->subexpr->clone()->visit(rewriter);
                     }
                 } else {
-                    auto bodyClone = static_cast<ExprBlock *>(callee->body->clone());
+                    auto bodyClone = static_cast<ExprBlock *>(body->clone());
+                    if ( site.kind==SiteKind::Devirt ) {
+                        // the literal's parameters became substitutions and its result
+                        // becomes the result temp: the spliced copy is a plain scope block
+                        bodyClone->arguments.clear();
+                        bodyClone->annotations.clear();
+                        bodyClone->returnType = nullptr;
+                        bodyClone->isClosure = false;
+                        bodyClone->isLambdaBlock = false;
+                        bodyClone->hasReturn = false;
+                        bodyClone->copyOnReturn = false;
+                        bodyClone->moveOnReturn = false;
+                    }
                     ExpressionPtr trailing = nullptr;
                     if ( !bodyClone->list.empty() && bodyClone->list.back()->rtti_isReturn() ) {
                         trailing = bodyClone->list.back();
@@ -1078,11 +1531,11 @@ namespace das {
                     }
                     if ( !isVoid ) {
                         string resName = "__inl" + to_string(inlineId) + "_res";
-                        splice.push_back(makeUninitDecl(call->at, resName, callee->result));
+                        splice.push_back(makeUninitDecl(callLike->at, resName, subjResult));
                         auto ret = static_cast<ExprReturn *>(trailing);
                         bodyClone->list.push_back(new ExprCopy(ret->at,
                             new ExprVar(ret->at, resName), ret->subexpr));
-                        callReplacement = new ExprVar(call->at, resName);
+                        callReplacement = new ExprVar(callLike->at, resName);
                     }
                     splice.push_back(bodyClone->visit(rewriter));
                 }
@@ -1090,7 +1543,7 @@ namespace das {
                 list.insert(list.begin()+anchorIndex, splice.begin(), splice.end());
                 indexShift[site.anchor.block] += int(splice.size());
                 int stmtIndex = anchorIndex + int(splice.size());
-                if ( list[stmtIndex]==call ) {
+                if ( list[stmtIndex]==callLike ) {
                     // the call IS the statement
                     if ( callReplacement ) {
                         list[stmtIndex] = callReplacement;
@@ -1100,24 +1553,22 @@ namespace das {
                     }
                 } else {
                     ReplaceNode rn;
-                    rn.what = call;
+                    rn.what = callLike;
                     rn.with = callReplacement;
                     list[stmtIndex] = list[stmtIndex]->visit(rn);
                     if ( !rn.done ) {
-                        error("internal error: inlined call not found in its statement", call->at);
+                        error("internal error: inlined call not found in its statement", callLike->at);
                         continue;
                     }
                 }
-                logSite(fn, call);
-                inlined ++;
+                completeSite(site, fn, subjName);
                 inlineId ++;
-                changed = true;
             }
         }
 
-        // DFS postorder over the inline graph inside this module, [inline] functions
+        // DFS postorder over the splice graph inside this module, [inline] functions
         // first: a chain f -> g -> h splices already-inlined bodies in a single round
-        void orderInlineFunctions ( Module * thisMod, Function * fn,
+        void orderInlineFunctions ( Module * thisMod, Function * fn, bool autoOn,
                 vector<Function *> & order, das_hash_set<Function *> & seen ) {
             if ( !fn->body || fn->isTemplate || fn->stub ) return;
             if ( fn->module != thisMod ) return;
@@ -1125,8 +1576,9 @@ namespace das {
             lookupExpressions(fn->body, [&](Expression * expr) {
                 if ( expr->rtti_isCall() ) {
                     auto call = static_cast<ExprCall *>(expr);
-                    if ( call->func && call->func->mustInline ) {
-                        orderInlineFunctions(thisMod, call->func, order, seen);
+                    if ( !call->func ) return;
+                    if ( call->func->mustInline || (autoOn && autoEligibleCall(call)) ) {
+                        orderInlineFunctions(thisMod, call->func, autoOn, order, seen);
                     }
                 }
             });
@@ -1136,37 +1588,47 @@ namespace das {
     } // anonymous namespace
 
     bool Program::patchInline() {
-        if ( options.getBoolOption("disable_inline", policies.disable_inline) ) return false;
+        bool mustEnabled = !options.getBoolOption("disable_inline", policies.disable_inline);
+        // best-effort inlining is an optimization: it stays out of unoptimized builds
+        bool autoEnabled = getOptimize()
+            && !options.getBoolOption("disable_auto_inline", policies.disable_auto_inline);
         // cheap gate: any [inline] function visible at all?
         bool anyInline = false;
-        library.foreach([&](Module * mod) -> bool {
-            if ( !anyInline ) {
-                mod->functions.find_first([&](auto fn) {
-                    if ( fn->mustInline ) { anyInline = true; return true; }
-                    return false;
-                });
-            }
-            return true;
-        }, "*");
-        if ( !anyInline ) return false;
+        if ( mustEnabled ) {
+            library.foreach([&](Module * mod) -> bool {
+                if ( !anyInline ) {
+                    mod->functions.find_first([&](auto fn) {
+                        if ( fn->mustInline ) { anyInline = true; return true; }
+                        return false;
+                    });
+                }
+                return true;
+            }, "*");
+        }
+        if ( !anyInline && !autoEnabled ) return false;
         InlinePatch patch;
         patch.program = this;
         patch.logs = daScriptEnvironment::getBound()->g_compilerLog;
-        patch.logOpt = options.getBoolOption("log_optimization", false);
+        patch.logOpt = options.getBoolOption("log_optimization", policies.log_optimization);
+        patch.mustEnabled = mustEnabled && anyInline;
+        patch.autoEnabled = autoEnabled;
         vector<Function *> order;
         das_hash_set<Function *> seen;
         thisModule->functions.foreach([&](auto fn) {
-            if ( fn->mustInline ) orderInlineFunctions(thisModule.get(), fn, order, seen);
+            if ( fn->mustInline ) orderInlineFunctions(thisModule.get(), fn, autoEnabled, order, seen);
         });
         thisModule->functions.foreach([&](auto fn) {
-            orderInlineFunctions(thisModule.get(), fn, order, seen);
+            orderInlineFunctions(thisModule.get(), fn, autoEnabled, order, seen);
         });
         for ( auto fn : order ) {
             patch.processFunction(fn);
             if ( failed() ) break;
         }
-        if ( patch.logOpt && patch.logs && patch.inlined ) {
-            *patch.logs << "INLINE: " << patch.inlined << " call site(s) in module " << thisModule->name << "\n";
+        if ( patch.logOpt && patch.logs
+            && (patch.inlined || patch.inlinedAuto || patch.devirted || patch.declined) ) {
+            *patch.logs << "INLINE: " << patch.inlined << " must + " << patch.inlinedAuto
+                        << " auto + " << patch.devirted << " devirt site(s), "
+                        << patch.declined << " declined in module " << thisModule->name << "\n";
         }
         return patch.changed;
     }

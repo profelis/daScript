@@ -694,7 +694,12 @@ typedef enum das_bool_policy {
     DAS_POLICY_FAST_MATH,                        // Allow float optimizations with major bit differences (x*0, x-x, rcp division, reassociation)
     DAS_POLICY_DISABLE_DSE,                      // Disable the dead-store-elimination pass
     DAS_POLICY_DISABLE_CSE,                      // Disable the common-subexpression-elimination pass
-    DAS_POLICY_DISABLE_INLINE                    // Disable [inline] splicing (calls stay regular calls; declaration-level contract checks - shape, recursion, @@ - still lint, call-site splice checks do not apply)
+    DAS_POLICY_DISABLE_INLINE,                   // Disable [inline] splicing (calls stay regular calls; declaration-level contract checks - shape, recursion, @@ - still lint, call-site splice checks do not apply)
+    DAS_POLICY_DISABLE_AUTO_INLINE,              // Disable automatic inlining of block-literal call sites and invoke-of-literal devirtualization ([inline] splicing is unaffected)
+    DAS_POLICY_DISABLE_RUN,                      // Disable compile-time function evaluation (RunFolding of pure calls over constant arguments)
+    DAS_POLICY_LOG_OPTIMIZATION,                 // Log optimizer rewrites (per-pass fired/nothing lines, inline/devirt sites and declines)
+    DAS_POLICY_LOG_OPTIMIZATION_PASSES,          // Log the AST after every optimizer pass (verbose)
+    DAS_POLICY_FUSION                            // Fuse interpreter nodes into wider superinstructions at simulate time (default: on)
 } das_bool_policy;
 
 // Integer policy fields (stack size, heap limits).

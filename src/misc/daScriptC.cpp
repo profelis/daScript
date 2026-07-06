@@ -613,6 +613,11 @@ int das_policies_set_bool ( das_policies * policies, das_bool_policy flag, int v
         case DAS_POLICY_DISABLE_DSE:            p->disable_dse = v; break;
         case DAS_POLICY_DISABLE_CSE:            p->disable_cse = v; break;
         case DAS_POLICY_DISABLE_INLINE:         p->disable_inline = v; break;
+        case DAS_POLICY_DISABLE_AUTO_INLINE:    p->disable_auto_inline = v; break;
+        case DAS_POLICY_DISABLE_RUN:            p->disable_run = v; break;
+        case DAS_POLICY_LOG_OPTIMIZATION:       p->log_optimization = v; break;
+        case DAS_POLICY_LOG_OPTIMIZATION_PASSES: p->log_optimization_passes = v; break;
+        case DAS_POLICY_FUSION:                 p->fusion = v; break;
         default: return 0;
     }
     return 1;
