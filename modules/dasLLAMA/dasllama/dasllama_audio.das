@@ -819,10 +819,12 @@ def private diff_stage(name : string; x : array<float>; n : int64) {
     }
     fmap(f) $(var bytes : array<uint8>#) {
         var maxd = 0.0
-        var maxi = 0l
+        var maxi = 0
         unsafe {
             let rp = reinterpret<float?>(addr(bytes[0]))
-            for (i in range64(n)) {
+            // int loop: raw-pointer indexing by int64 is AOT-ambiguous (das_index<T*>::at
+            // only has int32/uint32 overloads); witness stages are far below 2^31 floats
+            for (i in range(int(n))) {
                 let d = abs(x[i] - rp[i])
                 if (d > maxd) {
                     maxd = d
