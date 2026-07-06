@@ -4,6 +4,7 @@ require dastest/testing_boost public
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default        // dot_mx4q8_scalar + the "portable" backend
 require dasllama/dasllama_math_aarch64_neon   // dot_mx4q8 (TBL+SDOT under arm64 JIT, scalar fallback elsewhere)
+require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — registers the "arm64-gen"/"x64-gen" repack tier when dasLLVM is mounted
 require math
 
 // MXFP4·Q8 kernels: the E8M0 scale decode, the dot leaves (scalar reference vs the NEON-intrinsic
@@ -161,8 +162,8 @@ def test_matmul_mx4q8(t : T?) {
             select_kernel_backend(saved)
         }
     }
-    t |> run("laneq: repack + interleaved GEMV matches the scalar leaf (incl. tail rows)") @(t : T?) {
-        if (!has_backend("arm64-laneq")) {   // registered on arm64 + JIT only
+    t |> run("gen tier: repack + interleaved GEMV matches the scalar leaf (incl. tail rows)") @(t : T?) {
+        if (!has_backend("arm64-gen")) {   // registered on arm64 + JIT (with dasLLVM) only
             return
         }
         // d = 6 = one 4-row group + 2 row-major tail rows
@@ -173,13 +174,13 @@ def test_matmul_mx4q8(t : T?) {
         var want : array<float>
         gemv_case(wn, we, xq, xs, want, 64l, 6l)
         let saved = active_kernel_backend()
-        pin_kernel_backend("arm64-laneq")
+        pin_kernel_backend("arm64-gen")
         repack_mx4_weight(wn, we, 0l, 64l, 6l)
         var y : array<float>
         y |> resize(6)
         matmul_mx4q8(y, wn, we, xq, xs, 64l, 6l)
         for (i in range(6)) {
-            close(t, y[i], want[i], 1e-6, "row {i} (arm64-laneq repacked)")
+            close(t, y[i], want[i], 1e-6, "row {i} (arm64-gen repacked)")
         }
         clear_kernel_backend_pin()
         if (saved != "") {

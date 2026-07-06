@@ -15,7 +15,7 @@ options gen2
 
 require dasllama/dasllama_math   // nolint:STYLE030 — side-effect: loads the *_template kernels for the cross-module scan
 require dasllama/dasllama_math_default   // nolint:STYLE030 — dot_q8q8_template lives here
-require dasllama/dasllama_math_aarch64_neon   // laneq4x4 template + backend registration (pin for the repack)
+require dasllama/dasllama_math_aarch64_neon   // laneq4x4 template (the repack backend "arm64-gen" registers via dasllama_common's math_gen require)
 require dasllama/dasllama_quant  // quantize templates + the Q4/Q8 reference quantizers
 require dasllama/dasllama_common // the runtime-knob getters (the profile's "runtime" section snapshots them)
 require dasllama/dasllama_tune   // [dasllama_grid] emitter
@@ -978,7 +978,10 @@ def bench_laneq4x4() : string {
     for (i in range(int(d * nb))) {
         refs[i] = wq.scales[i]
     }
-    pin_kernel_backend("arm64-laneq")             // activates the repack fn the next call uses
+    pin_kernel_backend("arm64-gen")               // activates the repack fn the next call uses; the
+                                                  // arm64 default stamp is mr=4 — byte-identical to
+                                                  // the laneq4x4 tile's expected interleave (the
+                                                  // correctness gate below catches any mr drift)
     repack_q8q8_weight(wq.q, wq.scales, 0l, n, d)
     var xf : array<float>
     xf |> resize(int(ntok * n))
@@ -1135,8 +1138,11 @@ def main {
     let runtime = JV((q8_token_block = get_q8_token_block(), q8_l2_budget = get_q8_l2_budget(),
         matmul_min_chunk_rows = get_matmul_min_chunk_rows(),
         matmul_min_chunk_rows_gemv = get_matmul_min_chunk_rows_gemv(),
-        matmul_par_threshold = get_matmul_par_threshold(), attn_par_threshold = get_attn_par_threshold(),
-        decode_attn_par_threshold = get_decode_attn_par_threshold(),
+        target_chunk_work = get_target_chunk_work(), gemv_lane_cap = get_gemv_lane_cap(),
+        batch_lane_cap = get_batch_lane_cap(), batch_grid_2d = get_batch_grid_2d(),
+        dispatch_worker_limit = get_dispatch_worker_limit(),
+        team_rank_gate = get_team_rank_gate(),   // -1 = unset (apply skips negatives; env/que default rules)
+        attn_par_threshold = get_attn_par_threshold(),
         requant_par_threshold = get_requant_par_threshold(), norm_par_threshold = get_norm_par_threshold(),
         rope_par_threshold = get_rope_par_threshold(), kv_store_par_threshold = get_kv_store_par_threshold(),
         act_par_threshold = get_act_par_threshold(), q8_chunks_per_job = get_q8_chunks_per_job(),

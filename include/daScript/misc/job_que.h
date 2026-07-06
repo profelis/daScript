@@ -124,7 +124,28 @@ namespace das {
         // Single dispatcher at a time.
         void setTeamMode ( bool on );
         bool getTeamMode () const { return mTeamMode.load(std::memory_order_relaxed) != 0; }
+        // Worker-pool limit (runtime dial): workers with threadIndex >= limit go DORMANT — they
+        // drift out of the spin loop at the next check and park WITHOUT joining the publish wake
+        // gate (no mParkedWorkers bump), so team publishes and fifo pushes never wake them; only
+        // setWorkerLimit raising the limit (or shutdown) does. A woken worker re-checks the limit
+        // before rejoining, so a wake racing a lower re-parks it dormant. Chunks are self-served
+        // and the caller drains solo if need be, so ANY limit (0 included) completes every
+        // dispatch — this is a performance dial (a tiny model's inline-dominated token runs
+        // faster with fewer awake workers), never a correctness knob. Negative = unlimited.
+        void setWorkerLimit ( int n );
+        int getWorkerLimit () const { return mWorkerLimit.load(std::memory_order_relaxed); }
         int getNumWorkers () const { return mThreadCount.load(); }
+        // Per-op worker participation gate (opt-in: DAS_JOBQUE_TEAM_RANK_GATE=1 or this setter):
+        // a team op admits only as many workers as its widest stage has chunks — limit-rank r
+        // serves only when r + 1 < maxChunks (the +1 reserves a lane for the caller, who always
+        // serves). Higher ranks consume the op's seq and keep spinning: they never touch the
+        // claim words, so a tiny op's rendezvous involves only the workers it can feed, and the
+        // next big op re-admits everyone at the cost of one relaxed load — no dormant kernel
+        // wake on the raise path (the asymmetry that makes a per-op setWorkerLimit unviable).
+        // Purely a performance dial: chunks self-serve and the caller drains, so any admit set
+        // completes every dispatch. Composes with setWorkerLimit (dormant stays dormant).
+        void setTeamRankGate ( bool on ) { mTeamRankGate.store(on ? 1 : 0, std::memory_order_relaxed); }
+        bool getTeamRankGate () const { return mTeamRankGate.load(std::memory_order_relaxed) != 0; }
         void teamParallelFor ( int numChunks, const JobChunk & work );   // work(chunkIndex, workerSlot); caller participates as slot getNumWorkers()
         // Multi-stage team dispatch: one rendezvous, numStages dependent phases. Every lane
         // (workers + caller) serves stage s chunks, then waits on that stage's remaining counter
@@ -137,6 +158,19 @@ namespace das {
             int numChunks;
         };
         void teamParallelForStages ( const TeamStage * stages, int numStages );
+        // Programmatic access to the DAS_TEAM_PROF aggregates (below) so probes can
+        // reset, run a dispatch storm, and snapshot without destroying the queue.
+        // All times are ns (ref_time_ticks deltas). Set/reset from the dispatching
+        // thread with no dispatch in flight — worker-side stores are gated on the
+        // same unsynchronized bool the env path uses.
+        struct TeamProfSnapshot {
+            uint64_t ops = 0, chunks = 0, callerChunks = 0, solo = 0;
+            uint64_t publishT = 0, serveT = 0, tailT = 0, totalT = 0;   // summed ns per phase
+            uint64_t reactT = 0, reactN = 0, lastT = 0, lastN = 0;      // worker claim latencies
+        };
+        void setTeamProf ( bool on ) { mTeamProf = on; }
+        void resetTeamProf ();
+        TeamProfSnapshot getTeamProf () const;
     protected:
         struct JobEntry {
             JobEntry( Job&& _function, JobCategory _category, JobPriority _priority) {
@@ -161,7 +195,7 @@ namespace das {
         void join();
         void job(int threadIndex);
         void submit(Job && job, JobCategory category, JobPriority priority);
-        bool runTeamChunks(int threadIndex, uint32_t & seqSeen);
+        bool runTeamChunks(int threadIndex, int limitRank, uint32_t & seqSeen);
     protected:
         condition_variable mCond;
         int mSleepMs;
@@ -200,6 +234,23 @@ namespace das {
         // (worker: parked++ then read seq; publisher: bump seq then read parked — all four seq_cst),
         // so either the worker sees the new op before sleeping or the publisher sees it parked.
         atomic<int32_t>  mParkedWorkers{0};
+        // worker-pool limit (see setWorkerLimit): limit-rank >= this ⇒ dormant. Dormant workers
+        // are deliberately NOT in mParkedWorkers — the publish wake gate must skip them — and
+        // they park on their OWN condvar: sharing mCond would let a dormant waiter absorb a
+        // push()/wake-propagation notify_one meant for an eligible parked worker (the token is
+        // consumed, the predicate re-sleeps it, the fifo job stalls), and every team-publish
+        // notify_all would kernel-wake the whole dormant pool just to re-sleep it. Only
+        // setWorkerLimit raising the limit (and shutdown) notifies mLimitCond.
+        atomic<int32_t>  mWorkerLimit{0x7fffffff};
+        condition_variable mLimitCond;   // dormant workers wait here (under mFifoMutex)
+        // worker-limit eligibility order (fixed at construction, DAS_JOBQUE_LIMIT_ORDER=spread):
+        // prefix (default) gates on the raw threadIndex; spread ranks workers along a
+        // golden-stride visit so every runtime limit L selects a near-uniform lattice over the
+        // creation order — which the OS's round-robin ideal-processor assignment maps loosely
+        // onto physical cores (CCD/CCX spread on chiplet parts).
+        bool             mLimitOrderSpread = false;
+        // per-op worker participation gate (see setTeamRankGate)
+        atomic<int32_t>  mTeamRankGate{0};
         // team dispatch anatomy profiler (env DAS_TEAM_PROF=1): per-op phase aggregates, dumped
         // at queue destruction. Caller-side counters except the two claim-timestamp slots;
         // worker stores happen only under the flag (they perturb the op being measured).

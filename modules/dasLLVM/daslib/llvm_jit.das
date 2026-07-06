@@ -13,6 +13,8 @@ module llvm_jit shared private
 require llvm/daslib/llvm_boost
 require llvm/daslib/llvm_jit_intrin
 require llvm/daslib/llvm_jit_common
+require llvm/daslib/llvm_jit_code
+require llvm/daslib/llvm_user_modules  // nolint:STYLE030 — side-effect require: [llvm_code] generator modules must be in THIS module's closure so their [init] registration runs in the context that reads the registry
 require llvm/daslib/llvm_dll_utils
 require daslib/ast_boost
 require daslib/templates_boost
@@ -652,6 +654,37 @@ class public LlvmJitVisitor : AstVisitor {
         let fnmna = uid.get_dll_fn_name(fun)
         build_llvm_function_pair(fnmna, isCMRES(fun), fun.arguments, fun.result, null, fun.annotations)
         thisFunc = null
+    }
+
+    // [llvm_code(name="key")] path: the registered das generator (llvm_jit_code registry, modules
+    // wired in via llvm_user_modules.das) emits the impl body wholesale; only the public wrapper
+    // comes from the signature. Returns true when the function is fully handled — generated, or
+    // hard-errored via failed(). Returns false when the generator declines: the caller falls
+    // through to normal body codegen, so the reference body is the fallback tier.
+    def try_llvm_code_function(fun : FunctionPtr) : bool {
+        register_user_llvm_code_generators()   // direct call: registrations land in THIS context's registry
+        let ann = find_llvm_code_annotation(fun)
+        let gen_name = llvm_code_generator_name(ann)
+        if (empty(gen_name)) {
+            failed("[llvm_code] on {fun.name}: missing name=\"...\" argument")
+            return true
+        }
+        if (!has_llvm_code_generator(gen_name)) {
+            failed("[llvm_code] on {fun.name}: no generator registered under '{gen_name}' — is its module required from llvm/daslib/llvm_user_modules.das?")
+            return true
+        }
+        let fnmna = uid.get_dll_fn_name(fun)
+        ffunc = LLVMGetNamedFunction(g_mod, fnmna.impl())
+        wfunc = LLVMGetNamedFunction(g_mod, fnmna.publ())
+        var gc = LlvmCodeCtx(jit = JitCtx(ctx = g_ctx, builder = g_builder, types = types),
+                             fn = fun, impl = ffunc, impl_type = g_fn_types[fnmna.impl()], ann = ann)
+        let generated = invoke_llvm_code_generator(gen_name, gc)
+        if (generated) {
+            build_wrapper_function(fnmna, fun.arguments, clone_type(fun.result), isCMRES(fun), null, fun.at)
+        }
+        ffunc = null
+        wfunc = null
+        return generated
     }
 
     def build_wrapper_function(fnmna : DllName; arguments : dasvector`ptr`Variable; var result : TypeDeclPtr; isCmres : bool; captureType : LLVMOpaqueType?; at : LineInfo) {
@@ -7523,10 +7556,18 @@ def public generate_llvm(ctx : Context?; types : PrimitiveTypes?; uids : UidNode
         globalVar |> LLVMSetInitializer(types.ConstI64(aot_hash))
     }
     var astVisitor = new LlvmJitVisitor(ctx, types, uids, flags, null, attrs)
-    make_visitor(*astVisitor) $(mv_adapter) {
-        astVisitor.adapter = mv_adapter
+    var handled_by_generator = false
+    if (find_llvm_code_annotation(fn) != null) {
         ast_gc_guard() {
-            visit(fn, astVisitor.adapter)
+            handled_by_generator = astVisitor->try_llvm_code_function(fn)
+        }
+    }
+    if (!handled_by_generator) {
+        make_visitor(*astVisitor) $(mv_adapter) {
+            astVisitor.adapter = mv_adapter
+            ast_gc_guard() {
+                visit(fn, astVisitor.adapter)
+            }
         }
     }
     if (!empty(g_errors)) {

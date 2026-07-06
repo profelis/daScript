@@ -148,7 +148,8 @@ let g_aarch64_intrin_lookup <- {
     "aarch64_neon::sdot4_w" => @@intrinsic_sdot4_w,
     "aarch64_neon::sdot4_laneq_w" => @@intrinsic_sdot4_laneq_w,
     "aarch64_neon::tbl16_lo" => @@intrinsic_tbl16,
-    "aarch64_neon::tbl16_hi" => @@intrinsic_tbl16
+    "aarch64_neon::tbl16_hi" => @@intrinsic_tbl16,
+    "aarch64_neon::smmla" => @@intrinsic_smmla
 }
 
 // x86-64 intrinsics (the llvm/x64_avx header) — same contract as the aarch64 table above, gated on
@@ -1596,6 +1597,33 @@ def intrinsic_sdot4_w(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array
     var fnTy = LLVMFunctionType(v4i32, fnArgTypes)
     var callArgs <- [arguments[0], wvec, xvec]
     return LLVMBuildCall2(ctx.builder, fnTy, decl, callArgs, "sdot4_w")
+}
+
+// Emitter for aarch64_neon::smmla (gated by g_aarch64_intrin_lookup, only reached on aarch64 with i8mm).
+// smmla(acc:int4; a,b:int8 const?):int4 emits one @llvm.aarch64.neon.smmla: a and b are each a 2×8 int8
+// matrix (v16i8 load, rows 0/1 at bytes 0..7/8..15); the 2×2 int32 product a·bᵀ accumulates into `acc`
+// laid out [a0·b0, a0·b1, a1·b0, a1·b1] — 32 int8 MACs/instr (2× sdot4), no horizontal reduce. The
+// aarch64_neon module's daslang body is the interp / AOT / non-ARM fallback. See dasllama_kernel_opt_findings.
+def intrinsic_smmla(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    let v16i8 = LLVMVectorType(ctx.types.t_int8, 16u)
+    let v4i32 = ctx.types.LLVMInt4Type()
+    var aptr = LLVMBuildPointerCast(ctx.builder, arguments[1], LLVMPointerType(v16i8, 0u), "")
+    var bptr = LLVMBuildPointerCast(ctx.builder, arguments[2], LLVMPointerType(v16i8, 0u), "")
+    var avec = LLVMBuildLoad2(ctx.builder, v16i8, aptr, "")
+    LLVMSetAlignment(avec, 1u)
+    var bvec = LLVMBuildLoad2(ctx.builder, v16i8, bptr, "")
+    LLVMSetAlignment(bvec, 1u)
+    let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.smmla")
+    var declTypes <- [v4i32, v16i8]                 // smmla is overloaded on result + operand vector types
+    var decl = LLVMGetIntrinsicDeclaration(g_mod, id, declTypes)
+    if (decl == null) {
+        failed_E(_expr, "missing intrinsic llvm.aarch64.neon.smmla (non-ARM / no i8mm target?)")
+        return null
+    }
+    var fnArgTypes2 <- [v4i32, v16i8, v16i8]
+    var fnTy2 = LLVMFunctionType(v4i32, fnArgTypes2)
+    var callArgs <- [arguments[0], avec, bvec]
+    return LLVMBuildCall2(ctx.builder, fnTy2, decl, callArgs, "smmla")
 }
 
 // Emitter for aarch64_neon::sdot4_laneq_w (gated by g_aarch64_intrin_lookup, only reached on

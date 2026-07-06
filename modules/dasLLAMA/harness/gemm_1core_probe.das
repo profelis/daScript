@@ -2,16 +2,18 @@ options gen2
 options persistent_heap
 options _jit_fast_math = true   // match the end-to-end config AND ggml's -O3 FP laxity (kernel-to-kernel fairness)
 
-// RAW single-core kernel throughput — no jobque, no threading, no pipeline. The production
-// matmul_q8q8_batch runs INLINE on the calling thread: matmul_par_threshold is pushed to infinity,
-// so maybe_parallel_for compiles to a plain invoke (no with_job_que anywhere in this file). This is
+// RAW single-core kernel throughput — no threading, no pipeline. The production
+// matmul_q8q8_batch runs INLINE on the calling thread: target_chunk_work is pushed to infinity,
+// so maybe_parallel_for compiles to a plain invoke; the que merely exists, idle (the dispatch
+// sites' chunk-count args read get_dispatch_lanes() eagerly, que-less boxes throw). This is
 // the kernel-to-kernel denominator against llama.cpp's ggml_vec_dot_q8_0_q8_0 measured the same way
 // (examples/kernel-bench in the llama.cpp tree). Interleaved best-of across backends per shape,
 // tolerance-gated vs portable. Run: daslang -jit gemm_1core_probe.das
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default
-require dasllama/dasllama_math_x64_avx
+require dasllama/dasllama_math_aarch64_neon
+require dasllama/dasllama_math_gen
 require dasllama/dasllama_quant
 require daslib/jobque_boost
 require daslib/fio
@@ -57,12 +59,6 @@ def bench_shape(name : string; n, d : int64; reps : int) {
     for (i in range64(d * nb)) {
         s[i] = qt.scales[i]
     }
-    // separate weight copy for the repack tier (repacks in place)
-    var qr := q
-    var sr := s
-    select_kernel_backend("x64-avx2-repack")
-    repack_q8q8_weight(qr, sr, 0l, n, d)
-
     var x : array<float>
     fillf(x, n)
     var xq : array<int8>
@@ -83,11 +79,33 @@ def bench_shape(name : string; n, d : int64; reps : int) {
         }
     }
 
-    let cands <- [Cand(name = "portable", repacked = false),
-        Cand(name = "x64-avx2", repacked = false),
-        Cand(name = "x64-avx2-acc8", repacked = false),
-        Cand(name = "x64-avx2-repack", repacked = true)]
+    // every backend registered on THIS host (x64 and arm64 tiers register platform-gated),
+    // portable first (it is the correctness reference below)
+    var names <- kernel_backend_names()
+    names |> sort()
+    var cands : array<Cand>
+    cands |> push(Cand(name = "portable", repacked = false))
+    for (nm in names) {
+        if (nm != "portable") {
+            cands |> push(Cand(name = nm, repacked = kernel_backend_needs_repack(nm)))
+        }
+    }
     let nc = length(cands)
+
+    // per-backend repacked weight copies (repack layouts differ across backends; repack is in place
+    // under the SELECTED backend's repack fn)
+    var qr : array<array<int8>>
+    var sr : array<array<float>>
+    qr |> resize(nc)
+    sr |> resize(nc)
+    for (ci in range(nc)) {
+        if (cands[ci].repacked) {
+            qr[ci] := q
+            sr[ci] := s
+            select_kernel_backend(cands[ci].name)
+            repack_q8q8_weight(qr[ci], sr[ci], 0l, n, d)
+        }
+    }
 
     var y : array<float>
     var yref : array<float>
@@ -102,7 +120,7 @@ def bench_shape(name : string; n, d : int64; reps : int) {
     for (ci in range(nc)) {
         select_kernel_backend(cands[ci].name)
         if (cands[ci].repacked) {
-            matmul_q8q8_batch(y, qr, sr, xqb, xsb, n, d, NTOK)
+            matmul_q8q8_batch(y, qr[ci], sr[ci], xqb, xsb, n, d, NTOK)
         } else {
             matmul_q8q8_batch(y, q, s, xqb, xsb, n, d, NTOK)
         }
@@ -113,10 +131,14 @@ def bench_shape(name : string; n, d : int64; reps : int) {
         }
     }
 
+    let gemv_reps = reps * int(NTOK) / 4
     var best : array<double>
+    var bestv : array<double>
     best |> resize(nc)
+    bestv |> resize(nc)
     for (ci in range(nc)) {
         best[ci] = 1.0e30lf
+        bestv[ci] = 1.0e30lf
     }
     for (_round in range(ROUNDS)) {
         for (ci in range(nc)) {
@@ -127,7 +149,7 @@ def bench_shape(name : string; n, d : int64; reps : int) {
             let t0 = ref_time_ticks()
             for (_rep in range(reps)) {
                 if (cands[ci].repacked) {
-                    matmul_q8q8_batch(y, qr, sr, xqb, xsb, n, d, NTOK)
+                    matmul_q8q8_batch(y, qr[ci], sr[ci], xqb, xsb, n, d, NTOK)
                 } else {
                     matmul_q8q8_batch(y, q, s, xqb, xsb, n, d, NTOK)
                 }
@@ -136,17 +158,31 @@ def bench_shape(name : string; n, d : int64; reps : int) {
             if (us < best[ci]) {
                 best[ci] = us
             }
+            let t1 = ref_time_ticks()
+            for (_rep in range(gemv_reps)) {
+                if (cands[ci].repacked) {
+                    matmul_q8q8(y, qr[ci], sr[ci], xq, xs, n, d)
+                } else {
+                    matmul_q8q8(y, q, s, xq, xs, n, d)
+                }
+            }
+            let usv = double(get_time_usec(t1))
+            if (usv < bestv[ci]) {
+                bestv[ci] = usv
+            }
         }
     }
 
     print("--- {name}  (n={n} d={d} ntok={NTOK}, x{reps}) ---\n")
     let macs = double(n * d * NTOK) * double(reps)
+    let macsv = double(n * d) * double(gemv_reps)
     for (ci in range(nc)) {
         if (!ok[ci]) {
             continue
         }
         let gmacs = macs / (best[ci] * 1000.0lf)
-        print("  {cands[ci].name}: {gmacs} GMAC/s  ({best[ci]} us best-of-{ROUNDS})\n")
+        let gmacsv = macsv / (bestv[ci] * 1000.0lf)
+        print("  {cands[ci].name}: batch {gmacs} GMAC/s  ({best[ci]} us best-of-{ROUNDS})   gemv {gmacsv} GMAC/s  ({bestv[ci]} us, x{gemv_reps})\n")
     }
 
     delete w
@@ -187,7 +223,7 @@ def focus_bench(be : string; shape : string; n, d, ntok : int64; forked : bool) 
         s[i] = qt.scales[i]
     }
     select_kernel_backend(be)
-    if (be == "x64-avx2-repack") {
+    if (kernel_backend_needs_repack(be)) {
         repack_q8q8_weight(q, s, 0l, n, d)
     }
     var x : array<float>
@@ -284,7 +320,7 @@ def focus_main {
         ntok = int64(to_int(get_env_variable("DASLLAMA_FOCUS_NTOK")))
     }
     if (has_env_variable("DASLLAMA_FOCUS_FORKED")) {
-        set_matmul_par_threshold(0l)   // always parallel — every call goes through parallel_for
+        set_target_chunk_work(1l)   // always parallel — every call goes through parallel_for
         with_job_que() {
             setup_dasllama_jobque_()
             if (has_env_variable("DAS_JOBQUE_JOIN_SPIN")) {
@@ -295,8 +331,11 @@ def focus_main {
             focus_bench(be, shape, n, d, ntok, true)
         }
     } else {
-        set_matmul_par_threshold(1l << 62l)
-        focus_bench(be, shape, n, d, ntok, false)
+        set_target_chunk_work(1l << 62l)
+        // the que must still EXIST (see main) — nothing dispatches at this target
+        with_job_que() {
+            focus_bench(be, shape, n, d, ntok, false)
+        }
     }
 }
 
@@ -310,10 +349,15 @@ def main {
         focus_main()
         return
     }
-    set_matmul_par_threshold(1l << 62l)   // never parallel: maybe_parallel_for runs the kernel inline, single core
-    print("single-core raw kernel throughput (inline, no jobque), ntok={NTOK}, best-of-{ROUNDS} interleaved\n\n")
-    bench_shape("kv  2048x512  ", 2048l, 512l, 8)
-    bench_shape("qo  2048x2048 ", 2048l, 2048l, 3)
-    bench_shape("w13 2048x5632 ", 2048l, 5632l, 1)
-    bench_shape("w2  5632x2048 ", 5632l, 2048l, 1)
+    set_target_chunk_work(1l << 62l)   // never parallel: maybe_parallel_for runs the kernel inline, single core
+    // a que must still EXIST: the chunk shapers read get_dispatch_lanes() eagerly even when
+    // maybe_parallel_for stays inline — production always has a que.
+    // Workers sit idle (nothing dispatches at this target), so the measurement stays 1-core.
+    with_job_que() {
+        print("single-core raw kernel throughput (inline, idle jobque), ntok={NTOK}, best-of-{ROUNDS} interleaved\n\n")
+        bench_shape("kv  2048x512  ", 2048l, 512l, 8)
+        bench_shape("qo  2048x2048 ", 2048l, 2048l, 3)
+        bench_shape("w13 2048x5632 ", 2048l, 5632l, 1)
+        bench_shape("w2  5632x2048 ", 5632l, 2048l, 1)
+    }
 }

@@ -5,7 +5,7 @@ require dastest/testing_boost
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default
 require dasllama/dasllama_math_aarch64_neon
-require dasllama/dasllama_math_x64_avx  // self-registers the x64 backends on x86-64 (nothing off-x64) — without it BOTH halves run portable here
+require dasllama/dasllama_math_gen  // registers the arm64-gen/x64-gen repack tier — without it the repack half runs portable
 require dasllama/dasllama_quant
 require daslib/jobque_boost
 require daslib/fio
@@ -132,7 +132,7 @@ def bench_gemm_iso(b : B?) {
             set_matmul_min_chunk_rows(mg)
             to_log(LOG_INFO, "min chunk rows override: {mg}\n")
         }
-        // backend pin for row-major A/Bs on one binary (e.g. x64-avx2 vs x64-avx2-acc8), same
+        // backend pin for row-major A/Bs on one binary (e.g. portable vs arm64-sdot), same
         // env contract as llama3_perf; the repack half below still switches to the repack tier
         if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
             pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
@@ -145,7 +145,7 @@ def bench_gemm_iso(b : B?) {
         bench_one("cls 2048x32000", 2048l, 32000l, 6, false)
 
         // switch to the arch's repack tier for the rest of the run; each shape repacks its own weight
-        let repack_backend = get_architecture_name() == "arm64" ? "arm64-laneq" : "x64-avx2-repack"
+        let repack_backend = get_architecture_name() == "arm64" ? "arm64-gen" : "x64-gen"
         select_kernel_backend(repack_backend)
         to_log(LOG_INFO, "=== {repack_backend} backend (tiled, interleaved repack) ===\n")
         bench_one("kv  2048x512  ", 2048l, 512l, 100, true)

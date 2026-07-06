@@ -27,8 +27,11 @@ modules/dasLLAMA/
   dasllama/                   # the module — require dasllama/<name>
     dasllama_math.das         #   numeric primitives + matmul/dot kernels (fp32, Q8, Q4) + Q8·Q8 kernel-backend registry
     dasllama_math_default.das #   the portable Q8·Q8 kernel backend (the fallback; platform backends out-rank it)
-    dasllama_math_aarch64_neon.das # arm64 SDOT + laneq-repack Q8·Q8 backends ([init]-registered; no-op off-ARM)
-    dasllama_math_x64_avx.das #   x86-64 dot32 (PMADDUBSW sign-trick, ymm) Q8·Q8 backends: row-major + grp4-repack (+2 pinnable experiments) ([init]-registered; no-op off-x64)
+    dasllama_math_aarch64_neon.das # arm64 SDOT row-major Q8·Q8 backend + the laneq dot leaves the gen tier composes ([init]-registered; no-op off-ARM)
+    dasllama_math_gen.das     #   the generated GEMM tier — registers "arm64-gen"/"x64-gen" (load-select repack backends; traversals read the stamped layout)
+    dasllama_gemm_schema.das  #   tune_perm grid + layout schema shared by the generator and the runtime
+    dasllama_gemm_gen.das     #   the GEMM tile generator (emits per-perm kernels under llvm_tune)
+    dasllama_gemm_register.das #  [tune] family registration — manifest > per-ISA fallback chain
     dasllama_par.das          #   maybe_parallel_for threading macro
     dasllama_tune.das         #   per-box kernel loop-hint tuner — [tuned] / [dasllama_grid] (see tune_for_this_box.md)
     dasllama_quant.das        #   Q8_0 / Q4_0 (de)quantization

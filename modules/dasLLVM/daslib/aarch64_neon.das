@@ -140,3 +140,29 @@ def sdot4_laneq_w(acc : int4; w : int4; x : int8 const?; lane : int) : int4 {
     }
     return r
 }
+
+//! Signed 8-bit matrix-multiply-accumulate (`SMMLA` / `@llvm.aarch64.neon.smmla`, ARMv8.6 i8mm):
+//! `a` and `b` are each a 2×8 int8 matrix (bytes 0..7 = row 0, 8..15 = row 1). Computes the 2×2 int32
+//! product `a · bᵀ` and adds it into the 4 lanes of `acc`, laid out `[a0·b0, a0·b1, a1·b0, a1·b1]` —
+//! 32 int8·int8 MACs (four length-8 dots) per call, twice SDOT's 16, with NO horizontal reduce. On an
+//! aarch64 JIT target this lowers to a single SMMLA; on every other target it is the scalar loop below.
+//! Pointers are passed pre-offset by the caller (16-wide unaligned loads).
+def smmla(acc : int4; a : int8 const?; b : int8 const?) : int4 {
+    var d00 = 0
+    var d01 = 0
+    var d10 = 0
+    var d11 = 0
+    unsafe {
+        for (k in range(8)) {
+            let a0 = int(a[k])
+            let a1 = int(a[8 + k])
+            let b0 = int(b[k])
+            let b1 = int(b[8 + k])
+            d00 += a0 * b0
+            d01 += a0 * b1
+            d10 += a1 * b0
+            d11 += a1 * b1
+        }
+    }
+    return acc + int4(d00, d01, d10, d11)
+}

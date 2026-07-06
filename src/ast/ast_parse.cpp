@@ -210,7 +210,7 @@ namespace das {
                                 while ( src < src_end && (src[0]==' ' || src[0]=='\t') ) {
                                     src ++;
                                 }
-                                while ( src < src_end && (isalnumE(src[0]) || src[0]=='_') ) {
+                                while ( src < src_end && (isalnumE(src[0]) || src[0]=='_' || src[0]=='/' || src[0]=='.' || src[0]=='%') ) {
                                     reqGuard += *src ++;
                                 }
                                 while ( src < src_end && (src[0]==' ' || src[0]=='\t') ) {
@@ -227,8 +227,19 @@ namespace das {
                                     mod += *src ++;
                                 }
                                 if ( isReq ) {
-                                    // guarded optional require whose guard module is absent — skip
-                                    if ( hasReqGuard && Module::requireEx(reqGuard, false)==nullptr ) {
+                                    // guarded optional require. Path guard (contains '/'): proceed only when
+                                    // the guard's OWN file resolves — the rail for pure-das packages (nothing
+                                    // C++ to guard on) and cross-package dependency witnesses. Plain-name
+                                    // guard: STRICT — proceed only when the guard module is registered (a
+                                    // linked C++ module); no target-resolvability fallback (module source
+                                    // dirs exist in every checkout regardless of build config). Otherwise —
+                                    // skip silently. Must match ast_requireModule (parser_impl.cpp).
+                                    if ( hasReqGuard && reqGuard.find('/')!=string::npos ) {
+                                        auto ginfo = access->getModuleInfo(reqGuard, fi->name);
+                                        if ( ginfo.fileName.empty() || !access->getFileInfo(ginfo.fileName) ) {
+                                            continue;
+                                        }
+                                    } else if ( hasReqGuard && Module::requireEx(reqGuard, false)==nullptr ) {
                                         continue;
                                     }
                                     bool isPublic = false;

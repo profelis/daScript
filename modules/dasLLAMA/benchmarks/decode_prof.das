@@ -38,8 +38,14 @@ struct Args {
     @clarg_doc = "Weight quant mode (default: q8)"
     quant : QuantMode = QuantMode.q8
 
-    @clarg_doc = "Override the decode-attention threading threshold (work units; 0 = always thread, -1 = keep default)"
-    attn_par : int = -1
+    @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; 1 = thread everything, -1 = keep default)"
+    target_work : int = -1
+
+    @clarg_doc = "Override the GEMV lane cap (0 = uncapped, -1 = keep default)"
+    gemv_cap : int = -1
+
+    @clarg_doc = "Override the batch lane cap (0 = uncapped, -1 = keep default)"
+    batch_cap : int = -1
 
     @clarg_doc = "Override the quantized-matmul oversplit factor (chunks per hw job; -1 = keep default)"
     chunks : int = -1
@@ -205,7 +211,7 @@ def main() {
     let p = max(int64(cfg.prefill), 8l)
     let n = max(int64(cfg.ngen), 1l)
     let p2 = int64(cfg.prefill2)
-    // backend pin for A/B on one binary (e.g. portable vs x64-avx2-repack) — must land BEFORE
+    // backend pin for A/B on one binary (e.g. portable vs x64-gen) — must land BEFORE
     // load_gguf: select_matmul_backend_for_load honors the pin at load, which decides repack
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
         pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
@@ -217,9 +223,17 @@ def main() {
     let c = t.config
     print("config: dim={c.dim} layers={c.n_layers} heads={c.n_heads}/{c.n_kv_heads} vocab={c.vocab_size} moe={c.moe}\n")
     print("active backend: {active_kernel_backend()}\n")
-    if (cfg.attn_par >= 0) {
-        set_decode_attn_par_threshold(int64(cfg.attn_par))
-        print("decode_attn_par_threshold override: {cfg.attn_par}\n")
+    if (cfg.target_work >= 1) {
+        set_target_chunk_work(int64(cfg.target_work))
+        print("target_chunk_work override: {cfg.target_work}\n")
+    }
+    if (cfg.gemv_cap >= 0) {
+        set_gemv_lane_cap(cfg.gemv_cap)
+        print("gemv_lane_cap override: {cfg.gemv_cap}\n")
+    }
+    if (cfg.batch_cap >= 0) {
+        set_batch_lane_cap(cfg.batch_cap)
+        print("batch_lane_cap override: {cfg.batch_cap}\n")
     }
     if (cfg.chunks >= 1) {
         set_q8_batch_chunks_per_job(cfg.chunks)
@@ -228,6 +242,12 @@ def main() {
     if (cfg.legacy_lanes) {
         set_dispatch_caller_lane(false)
         print("dispatch lanes: workers only (legacy)\n")
+    }
+    // A/B the fused per-block decode chains (default on; 0 = per-op dispatches) — same rail
+    // as emission_bench
+    if (has_env_variable("DASLLAMA_FUSED_DECODE")) {
+        set_fused_decode(get_env_variable("DASLLAMA_FUSED_DECODE") != "0")
+        print("fused decode override: {get_fused_decode()}\n")
     }
     run_profile(t, p, n, p2, cfg.team)
 }

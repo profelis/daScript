@@ -10,7 +10,7 @@ require dasllama/dasllama_math  // setup_dasllama_jobque_ + the runtime knob set
 
 // Re-measure the parallel-vs-single threshold and the job-splitting granularity on the REAL
 // TinyLlama-1.1B matmul shapes, with the current FAST job manager (cond-var waiter + fork pool).
-// The original g_matmul_par_threshold (2M) and num_jobs (2N) were tuned against the old, slower
+// The original 2M par threshold (now target_chunk_work's 2x boundary) and num_jobs (2N) were tuned against the old, slower
 // dispatcher and the stories15M toy shapes — both may have moved. Kernels are already
 // correctness-gated in bench_matmul.das (same code, different shapes), so this is perf-only.
 //

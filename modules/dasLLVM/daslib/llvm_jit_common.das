@@ -417,6 +417,48 @@ var public g_target_x64_avx2 = false
 var public g_target_x64_vnni256 = false
 var public g_target_x64_avx512bw = false
 var public g_target_x64_avx512vnni = false
+// AVX-VNNI-INT8 (VEX vpdpbssd — native s8×s8, no sign trick). No shipped silicon in the fleet
+// yet; lights up via cpuid on future boxes and via DAS_JIT_X64_FORCE_FEATURES for emission-only
+// verification today.
+var public g_target_x64_vnniint8 = false
+// AMX INT8 tiles (TDPBSSD — SPR/Genoa-X server silicon; the dasLLAMA amx tile family). Both
+// amx-tile and amx-int8 cpuid bits, hyphen-spelled like the LLVM target features so the force
+// env and llc -mattr take the same names. cpuid says nothing about the per-process XTILEDATA
+// grant — that runtime enable (Linux arch_prctl) lives in the family's witness companion.
+var public g_target_x64_amx = false
+
+// The JIT target OS is Linux: host platform on native runs, the triple's OS field on cross
+// targets. Gates emission that calls Linux-only externs (the amx witness's arch_prctl).
+var public g_target_os_linux = false
+
+// ARMv8.6 i8mm (SMMLA — 2×2 s8 matrix-multiply-accumulate; Apple M2/A15+, Graviton3+; M1 has
+// DotProd only). Host truth comes off LLVMGetHostCPUFeatures() ("+i8mm" — populated on Linux
+// aarch64; EMPTY on macOS, where features are implied by the CPU name), OR'd with
+// DAS_JIT_ARM64_FORCE_FEATURES — so on Apple silicon the env is the rail on BOTH the emitting
+// box and the executing box (same string = same DLL cache key, the no-linker-on-target recipe).
+// Cross aarch64 triples read the force string only, same contract as the x64 tiers above.
+var public g_target_arm64_i8mm = false
+
+def private arm64_forced_feature(name : string) : bool {
+    for (part in split(get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES"), ",")) {
+        if (part == name) {
+            return true
+        }
+    }
+    return false
+}
+
+// "+name" present in LLVM's host-features string (comma-separated "+feat"/"-feat" entries;
+// exact match on the enabled spelling, so a "-i8mm" entry never reads as support)
+def private host_llvm_feature(name : string) : bool {
+    let feats = LLVMGetHostCPUFeatures()
+    var found = false
+    for (part in split(feats, ",")) {
+        found ||= part == "+{name}"
+    }
+    LLVMDisposeMessage(feats)
+    return found
+}
 
 def private x64_forced_feature(name : string) : bool {
     for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")) {
@@ -431,8 +473,17 @@ def private x64_target_feature(name : string) : bool {
     return cpu_supports(name) || x64_forced_feature(name)
 }
 
-// The forced names as an LLVM target-feature append ("+avxvnni,+avx512bw"); the five matrix names
-// are spelled identically in cpuid and LLVM. Empty when the env is unset.
+// Tier truth per target kind: host targets read cpuid (OR'd with the emission-only force);
+// explicit cross-compile triples read the force string ONLY — the host's cpuid says nothing
+// about a cross target, so without DAS_JIT_X64_FORCE_FEATURES a cross x64 module gets no
+// AVX emission at all (today's behavior).
+def private x64_tier_feature(name : string; cross : bool) : bool {
+    return cross ? x64_forced_feature(name) : x64_target_feature(name)
+}
+
+// The forced names as an LLVM target-feature append ("+avxvnni,+avx512bw"); the matrix/tier names
+// (avx2, avxvnni, avx512f/bw/vl/vnni, avxvnniint8) are spelled identically in cpuid and LLVM.
+// Empty when the env is unset.
 def public x64_forced_plus_features() : string {
     let plus <- [for (part in split(get_env_variable("DAS_JIT_X64_FORCE_FEATURES"), ",")); "+{part}"; where !empty(part)]
     return join(plus, ",")
@@ -545,14 +596,27 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
         ? get_architecture_name() == "x86_64"
         : (starts_with(target_triple, "x86_64") || starts_with(target_triple, "amd64")))
     // AVX2 gate for the x64 intrinsic table (see the declaration comment): host targets take the
-    // running box's cpuid truth; cross targets get empty features, so no AVX2 emission there.
-    g_target_x64_avx2 = g_target_is_x64 && empty(target_triple) && cpu_supports("avx2")
+    // running box's cpuid truth. Explicit x64 cross triples take DAS_JIT_X64_FORCE_FEATURES as
+    // the ONLY tier truth (emission-only artifacts, never executed) — no env, no AVX emission,
+    // which keeps the pre-force cross behavior.
+    let x64_cross = g_target_is_x64 && !empty(target_triple)
+    g_target_x64_avx2 = g_target_is_x64 && (x64_cross ? x64_forced_feature("avx2") : cpu_supports("avx2"))
     // Matrix-tier gates (see the declaration comment): cpuid truth OR'd with the
-    // DAS_JIT_X64_FORCE_FEATURES emission-only override.
-    g_target_x64_vnni256 = g_target_x64_avx2 && (x64_target_feature("avxvnni")
-        || (x64_target_feature("avx512vnni") && x64_target_feature("avx512vl")))
-    g_target_x64_avx512bw = g_target_x64_avx2 && x64_target_feature("avx512f") && x64_target_feature("avx512bw")
-    g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_target_feature("avx512vnni")
+    // DAS_JIT_X64_FORCE_FEATURES emission-only override; forced-only on cross triples.
+    g_target_x64_vnni256 = g_target_x64_avx2 && (x64_tier_feature("avxvnni", x64_cross)
+        || (x64_tier_feature("avx512vnni", x64_cross) && x64_tier_feature("avx512vl", x64_cross)))
+    g_target_x64_avx512bw = g_target_x64_avx2 && x64_tier_feature("avx512f", x64_cross) && x64_tier_feature("avx512bw", x64_cross)
+    g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_tier_feature("avx512vnni", x64_cross)
+    g_target_x64_vnniint8 = g_target_x64_avx2 && x64_tier_feature("avxvnniint8", x64_cross)
+    g_target_x64_amx = g_target_is_x64 && x64_tier_feature("amx-tile", x64_cross) && x64_tier_feature("amx-int8", x64_cross)
+    // target OS truth (native = host platform; cross = the triple's OS field)
+    g_target_os_linux = (empty(target_triple)
+        ? get_platform_name() == "linux"
+        : find(target_triple, "linux") >= 0)
+    // aarch64 i8mm tier (see the g_target_arm64_i8mm declaration comment): host targets read
+    // LLVM's host-features string OR the arm force env; cross aarch64 triples the env only.
+    g_target_arm64_i8mm = g_target_is_aarch64 && (arm64_forced_feature("i8mm")
+        || (empty(target_triple) && host_llvm_feature("i8mm")))
     if (!(target_triple |> empty())) {
         // wasm32 target isn't always part of LLVMInitializeAllTargets in
         // prebuilt LLVM.dll — call the explicit wasm initializer when needed.
@@ -563,8 +627,12 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
         // archive is compiled with (see web/CMakeLists.txt). Required on wasm
         // so vec4f returns are v128-in-register on both sides; meaningless
         // (and potentially a target-machine-creation failure) on other
-        // cross-compile triples, so keep features empty there.
-        let features = g_target_is_wasm ? wasm_target_features() : ""
+        // cross-compile triples, so keep features empty there — except x64
+        // cross, where the DAS_JIT_X64_FORCE_FEATURES emission-only override
+        // is the tier truth (see the g_target_x64_* gates above) and must
+        // reach any codegen off this machine too.
+        let features = (g_target_is_wasm ? wasm_target_features()
+            : (x64_cross ? x64_forced_plus_features() : ""))
         with_target_machine(target_triple, "", features, cg_opt_level) $(targetMachine : LLVMTargetMachineRef) {
             let dl = LLVMCreateTargetDataLayout(targetMachine)
             LLVMSetModuleDataLayout(g_mod, dl)
@@ -1066,7 +1134,16 @@ def public with_default_target_machine(opt_level : uint; use_host_cpu : bool;
     // than trusting CPU-name recognition. (Verified: -mcpu=generic fails to select
     // SDOT; -mcpu=generic -mattr=+dotprod emits `sdot.4s`.)
     if (use_host_cpu && g_target_is_aarch64) {
-        let feats = empty(features_msg) ? "+dotprod" : "{features_msg},+dotprod"
+        var feats = empty(features_msg) ? "+dotprod" : "{features_msg},+dotprod"
+        // DAS_JIT_ARM64_FORCE_FEATURES (comma-separated aarch64 feature names, e.g. "i8mm"): the
+        // x64 rail's twin — lets a pre-i8mm host EMIT AND LINK an artifact for newer silicon (the
+        // DLL-cache key folds the string, so a forced artifact never cache-hits a normal run, and
+        // the same-env run on the target box cache-hits it without needing a linker there).
+        // Executing forced instructions on this host SIGILLs — pair with a skip-execution gate.
+        let forced_arm <- [for (part in split(get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES"), ",")); "+{part}"; where !empty(part)]
+        if (!empty(forced_arm)) {
+            feats = "{feats},{join(forced_arm, ",")}"
+        }
         with_target_machine(triple_msg, cpu_msg, feats, opt_level, blk)
     } elif (use_host_cpu && g_target_is_x64 && !empty(x64_forced_plus_features())) {
         // DAS_JIT_X64_FORCE_FEATURES emission-only override (see the g_target_x64_* declaration

@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x37ul   // x64_avx AVX kernel-matrix tiers (dot32*_vnni, dot64_acc16(_vnni), mx4_dequant64)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x3aul   // aarch64_neon::smmla (i8mm) JIT intrinsic
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -54,7 +54,10 @@ def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
         while (bb != null) {
             var inst = LLVMGetFirstInstruction(bb)
             while (inst != null) {
-                if (LLVMCanValueUseFastMathFlags(inst) != 0) {
+                // authored flags win: an [llvm_code] generator that sets explicit FMF (e.g.
+                // the GEMM fold's contract-without-reassoc, pinning its fold order across
+                // loop shapes) keeps them; the blanket stamp only fills unset instructions
+                if (LLVMCanValueUseFastMathFlags(inst) != 0 && LLVMGetFastMathFlags(inst) == 0u) {
                     LLVMSetFastMathFlags(inst, 0x7fu)   // reassoc|nnan|ninf|nsz|arcp|contract|afn
                 }
                 inst = LLVMGetNextInstruction(inst)
@@ -72,32 +75,35 @@ def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
 // kernel ([tuned] restamping a different perm from a changed box_profile.json) has an
 // IDENTICAL aot hash and would silently reuse a stale DLL. Fold them into the JIT-only
 // cache key here, alongside LLVM_JIT_CODEGEN_VERSION / g_jit_fast_math.
-class private LoopHintHashVisitor : AstVisitor {
-    h : uint64
-    def fold_args(args : AnnotationArgumentList) {
-        // Fold the ONE value field the arg's type says is live. bValue/iValue/fValue share a C++
-        // union — reading a non-live member is UB (a bool load of vectorize_width=8 aborts ubsan
-        // and lets clang -O2 miscompile: chunk workers died with SIGSEGV on linux Release CI).
-        // Type coverage stays total: any basicType re-keys the DLL via its own live field.
-        for (a in args) {
-            h = (h ^ hash(a.name)) * JIT_FNV_PRIME
-            h = (h ^ uint64(int(a.basicType))) * JIT_FNV_PRIME
-            if (a.basicType == Type.tBool) {
-                h = (h ^ (a.bValue ? 1ul : 0ul)) * JIT_FNV_PRIME
-            } elif (a.basicType == Type.tInt) {
-                h = (h ^ uint64(a.iValue)) * JIT_FNV_PRIME
-            } elif (a.basicType == Type.tFloat) {
-                h = (h ^ hash(a.fValue)) * JIT_FNV_PRIME
-            } elif (a.basicType == Type.tString) {
-                h = (h ^ hash(a.sValue)) * JIT_FNV_PRIME
-            }
+// Fold the ONE value field the arg's type says is live. bValue/iValue/fValue share a C++
+// union — reading a non-live member is UB (a bool load of vectorize_width=8 aborts ubsan
+// and lets clang -O2 miscompile: chunk workers died with SIGSEGV on linux Release CI).
+// Type coverage stays total: any basicType re-keys the DLL via its own live field.
+def private fold_annotation_args(args : AnnotationArgumentList; seed : uint64) : uint64 {
+    var h = seed
+    for (a in args) {
+        h = (h ^ hash(a.name)) * JIT_FNV_PRIME
+        h = (h ^ uint64(int(a.basicType))) * JIT_FNV_PRIME
+        if (a.basicType == Type.tBool) {
+            h = (h ^ (a.bValue ? 1ul : 0ul)) * JIT_FNV_PRIME
+        } elif (a.basicType == Type.tInt) {
+            h = (h ^ uint64(a.iValue)) * JIT_FNV_PRIME
+        } elif (a.basicType == Type.tFloat) {
+            h = (h ^ hash(a.fValue)) * JIT_FNV_PRIME
+        } elif (a.basicType == Type.tString) {
+            h = (h ^ hash(a.sValue)) * JIT_FNV_PRIME
         }
     }
+    return h
+}
+
+class private LoopHintHashVisitor : AstVisitor {
+    h : uint64
     def override preVisitExprFor(expr : ExprFor?) : void {
-        fold_args(expr.annotations)
+        h = fold_annotation_args(expr.annotations, h)
     }
     def override preVisitExprWhile(expr : ExprWhile?) : void {
-        fold_args(expr.annotations)
+        h = fold_annotation_args(expr.annotations, h)
     }
 }
 
@@ -116,13 +122,31 @@ def private fold_loop_hints(funcs : array<FunctionPtr>; seed : uint64) : uint64 
     return r
 }
 
+// [llvm_code] annotation args are generator parameters: they change the emitted IR without
+// touching the reference body, so the aot hash is blind to them — fold them like loop hints.
+// A change to the GENERATOR's own code is invisible to the key too: bump
+// LLVM_JIT_CODEGEN_VERSION when a generator's emission changes for fixed args (manual, by design).
+def private fold_llvm_code_hints(funcs : array<FunctionPtr>; seed : uint64) : uint64 {
+    var h = seed
+    for (fn in funcs) {
+        for (ann in fn.annotations) {
+            if (ann.annotation.name == "llvm_code") {
+                h = (h ^ hash("llvm_code")) * JIT_FNV_PRIME
+                h = fold_annotation_args(ann.arguments, h)
+            }
+        }
+    }
+    return h
+}
+
 def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : int;
-                     emit_prologue : bool; debug_info : bool) : string {
+                     emit_prologue : bool; debug_info : bool; target_triple : string) : string {
     var h = LLVM_JIT_CODEGEN_VERSION
     for (fn in funcs) {
         h = (h ^ get_function_aot_hash(fn)) * JIT_FNV_PRIME
     }
     h = fold_loop_hints(funcs, h)   // JIT-only loop tune hints (see LoopHintHashVisitor)
+    h = fold_llvm_code_hints(funcs, h)   // [llvm_code] generator params (annotation args)
     h = (h ^ uint64(opt_level)) * JIT_FNV_PRIME
     h = (h ^ uint64(size_level)) * JIT_FNV_PRIME
     h = (h ^ (emit_prologue ? 1ul : 0ul)) * JIT_FNV_PRIME
@@ -153,10 +177,25 @@ def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : i
     if (cpu_supports("avx512vnni")) {
         isa |= 16ul
     }
+    if (cpu_supports("avxvnniint8")) {
+        isa |= 32ul
+    }
     h = (h ^ isa) * JIT_FNV_PRIME
     let forced = get_env_variable("DAS_JIT_X64_FORCE_FEATURES")
     if (!empty(forced)) {
         h = (h ^ hash(forced)) * JIT_FNV_PRIME
+    }
+    // the aarch64 twin (DAS_JIT_ARM64_FORCE_FEATURES, e.g. "i8mm"): a forced artifact must never
+    // cache-hit a normal run — and the same-env run on the TARGET box must hit it exactly
+    let forced_arm = get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES")
+    if (!empty(forced_arm)) {
+        h = (h ^ hash(forced_arm)) * JIT_FNV_PRIME
+    }
+    // Cross-compile artifacts key on their triple: a --jit-target DLL must never
+    // cache-hit a host run of the same program (dlopen of a foreign-arch DLL), and
+    // vice versa.
+    if (!empty(target_triple)) {
+        h = (h ^ hash(target_triple)) * JIT_FNV_PRIME
     }
     return "{h}"
 }
@@ -271,7 +310,11 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     llvm_jit_intrin::g_jit_exe_mode = gen_exe
     defer() { llvm_jit_intrin::g_jit_exe_mode = false; }
     let exe_main = "main" // prog.policies.jit_entry_point |> empty() ? "main" : prog.policies.jit_entry_point
-    let use_dll = prog.policies.jit_dll_mode && das_is_dll_build() && !gen_exe
+    // --jit-compile-only: build + verify + optimize (+dump), write/load/install nothing —
+    // the program runs interpreted. Also bypasses the DLL cache probe below, so the
+    // generators always run (this is the cross-emission smoke rail).
+    let compile_only = cli_opts.compile_only |> unwrap_or(false)
+    let use_dll = prog.policies.jit_dll_mode && das_is_dll_build() && !gen_exe && !compile_only
     let opt_level = cli_opts.opt_level |> unwrap_or(prog.policies.jit_opt_level)
     let size_level = cli_opts.size_level |> unwrap_or(prog.policies.jit_size_level)
     let emit_prologue = prog.policies.emit_prologue
@@ -345,7 +388,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
         // jit_output_path explicitly or we're producing an exe, keep their path.
         var dll_hash_basename : string
         if (use_dll && config_out_path |> empty()) {
-            dll_hash_basename = jit_dll_basename(funcs, opt_level, size_level, emit_prologue, debug_info)
+            dll_hash_basename = jit_dll_basename(funcs, opt_level, size_level, emit_prologue, debug_info, target_triple)
             output_path = ".jitted_scripts/{prog.thisNamespace}/{dll_hash_basename}"
         }
         // Pass target_triple so init_jit can pin the module data layout
@@ -449,7 +492,9 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
                 reset_jit_globals_after_failure()
                 panic("Internal jit error. Failed to get IR for functions {fn_names}.\n")
             }
-            if (gen_wasm) {
+            if (compile_only) {
+                to_log(LOG_INFO, "LLVM JIT: compile-only — module built, optimized and verified; no artifact written, nothing installed\n")
+            } elif (gen_wasm) {
                 mkdir_rec(dir_name(output_path))
                 // path_to_linker is reused as the optional emcc override
                 // for the wasm link (mirrors how it's used for the host
@@ -483,7 +528,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
                 }
             }
         }
-        if (!gen_exe) {
+        if (!gen_exe && !compile_only) {
             for (fun in funcs) {
                 let mangled_name = get_mangled_name(fun)
                 let MNH = hash(mangled_name)
@@ -496,7 +541,10 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
                 }
             }
         }
-        var result = finalize_jit(use_dll, gen_exe, g_dynamic_lib_handle)
+        // compile-only takes the exe-style teardown: dispose the engine/context outright,
+        // never RunStaticConstructors on (or install from) a module that may target a
+        // foreign arch.
+        var result = finalize_jit(use_dll, gen_exe || compile_only, g_dynamic_lib_handle)
 
         set_jit_state(*ctx, result.dll, result.ee, result.ctx)
 

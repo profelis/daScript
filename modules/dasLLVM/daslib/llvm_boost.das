@@ -189,6 +189,7 @@ def LLVMIsVector3(typ : LLVMOpaqueType?) : bool {
     return (LLVMGetTypeKind(typ) == LLVMTypeKind.LLVMVectorTypeKind) && (LLVMGetVectorSize(typ) == 3u)
 }
 
+[unused_argument(name)]
 def LLVMBuildLoadVector3(builder : LLVMOpaqueBuilder?; var types : PrimitiveTypes?; var typ : LLVMOpaqueType?; ptr : LLVMOpaqueValue?; name : string) {
     verify(LLVMGetVectorSize(typ) == 3u)
     let elemT = LLVMGetElementType(typ)
@@ -203,13 +204,13 @@ def LLVMBuildLoadVector3(builder : LLVMOpaqueBuilder?; var types : PrimitiveType
 }
 
 def LLVMBuildLoad2Aligned(builder : LLVMOpaqueBuilder?; typ : LLVMOpaqueType?; ptr : LLVMOpaqueValue?; alignment : uint; name : string) {
-    let ld = LLVMBuildLoad2(builder, typ, ptr, name)
+    var ld = LLVMBuildLoad2(builder, typ, ptr, name)   // var: return a non-const handle (let would constify every caller's value chain)
     LLVMSetAlignment(ld, alignment)
     return ld
 }
 
 def LLVMBuildStoreAligned(builder : LLVMOpaqueBuilder?; val, ptr : LLVMOpaqueValue?; alignment : uint) {
-    let st = LLVMBuildStore(builder, val, ptr)
+    var st = LLVMBuildStore(builder, val, ptr)
     LLVMSetAlignment(st, alignment)
     return st
 }
@@ -221,7 +222,7 @@ def LLVMBuildStore2(builder : LLVMOpaqueBuilder?; var types : PrimitiveTypes?; t
 
 def LLVMBuildStore2Aligned(builder : LLVMOpaqueBuilder?; var types : PrimitiveTypes?; typ : LLVMOpaqueType?; val : LLVMOpaqueValue?; ptr : LLVMOpaqueValue?; alignment : uint) {
     let tptr = LLVMBuildPointerCast(builder, ptr, types.PointerType(typ), "")
-    let st = LLVMBuildStore(builder, val, tptr)
+    var st = LLVMBuildStore(builder, val, tptr)
     LLVMSetAlignment(st, alignment)
     return st
 }

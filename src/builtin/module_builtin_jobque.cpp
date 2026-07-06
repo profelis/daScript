@@ -740,6 +740,70 @@ namespace das {
         return g_jobQue && g_jobQue->getTeamMode();
     }
 
+    void set_jobque_worker_limit ( int32_t n, Context * context, LineInfoArg * at ) {
+        // Worker-pool limit (JobQue::setWorkerLimit): workers with index >= n go dormant —
+        // they leave the spin loop and the publish wake gate until the limit rises. A perf
+        // dial for inline-dominated workloads (tiny-model LLM decode); never a correctness
+        // knob — any limit completes every dispatch (chunks self-serve, the caller drains).
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->setWorkerLimit(n);
+    }
+
+    int32_t get_jobque_worker_limit ( Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        return g_jobQue->getWorkerLimit();
+    }
+
+    void set_jobque_team_rank_gate ( bool on, Context * context, LineInfoArg * at ) {
+        // Per-op worker participation gate (JobQue::setTeamRankGate): a team op admits only as
+        // many workers as it published chunks; higher ranks skip the rendezvous and keep
+        // spinning, one relaxed load away from being re-admitted by the next big op. A perf
+        // dial — any admit set completes every dispatch (chunks self-serve, the caller drains).
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->setTeamRankGate(on);
+    }
+
+    bool get_jobque_team_rank_gate ( Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        return g_jobQue->getTeamRankGate();
+    }
+
+    // team-prof programmatic rail (the DAS_TEAM_PROF aggregates): probes reset, run a
+    // dispatch storm, then read the phase averages — no queue destruction needed.
+    void set_jobque_team_prof ( bool on, Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->setTeamProf(on);
+    }
+
+    void reset_jobque_team_prof ( Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->resetTeamProf();
+    }
+
+    float4 get_jobque_team_prof ( Context * context, LineInfoArg * at ) {
+        // avg ns/op: {publish, caller-serve, join-tail, total}
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        auto s = g_jobQue->getTeamProf();
+        float n = s.ops ? float(s.ops) : 1.0f;
+        return float4{float(s.publishT) / n, float(s.serveT) / n, float(s.tailT) / n, float(s.totalT) / n};
+    }
+
+    int4 get_jobque_team_prof_counts ( Context * context, LineInfoArg * at ) {
+        // {ops, total chunks, caller-served chunks, solo ops (no worker claimed)}
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        auto s = g_jobQue->getTeamProf();
+        auto clampi = [](uint64_t v) -> int32_t { return v > 0x7fffffffull ? 0x7fffffff : int32_t(v); };
+        return int4{clampi(s.ops), clampi(s.chunks), clampi(s.callerChunks), clampi(s.solo)};
+    }
+
+    float2 get_jobque_team_prof_react ( Context * context, LineInfoArg * at ) {
+        // avg ns after publish: {first worker claim, last worker claim}
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        auto s = g_jobQue->getTeamProf();
+        return float2{s.reactN ? float(s.reactT) / float(s.reactN) : 0.0f,
+                      s.lastN ? float(s.lastT) / float(s.lastN) : 0.0f};
+    }
+
     void team_parallel_for_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
         if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
         int total = rangeEnd - rangeBegin;
@@ -893,6 +957,12 @@ namespace das {
 
     bool is_job_que_shutting_down () {
         return g_jobQueAvailable == 0;
+    }
+
+    bool is_job_que_available () {
+        // Non-throwing "does a queue exist" — the que-gated externs (get_total_hw_jobs etc.)
+        // throw instead. Lets dispatch shapers answer "1 lane, run inline" on a que-less process.
+        return g_jobQue != nullptr;
     }
 
     uint64_t count_jobque_leaks () {
@@ -1287,8 +1357,35 @@ namespace das {
             addExtern<DAS_BIND_FUN(set_jobque_team_mode)>(*this, lib,  "set_jobque_team_mode",
                 SideEffects::modifyExternal, "set_jobque_team_mode")
                     ->args({"on","context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_worker_limit)>(*this, lib,  "set_jobque_worker_limit",
+                SideEffects::modifyExternal, "set_jobque_worker_limit")
+                    ->args({"limit","context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_worker_limit)>(*this, lib,  "get_jobque_worker_limit",
+                SideEffects::accessExternal, "get_jobque_worker_limit")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_team_rank_gate)>(*this, lib,  "set_jobque_team_rank_gate",
+                SideEffects::modifyExternal, "set_jobque_team_rank_gate")
+                    ->args({"on","context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_team_rank_gate)>(*this, lib,  "get_jobque_team_rank_gate",
+                SideEffects::accessExternal, "get_jobque_team_rank_gate")
+                    ->args({"context","line"});
             addExtern<DAS_BIND_FUN(get_jobque_team_mode)>(*this, lib,  "get_jobque_team_mode",
                 SideEffects::accessExternal, "get_jobque_team_mode")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_team_prof)>(*this, lib,  "set_jobque_team_prof",
+                SideEffects::modifyExternal, "set_jobque_team_prof")
+                    ->args({"on","context","line"});
+            addExtern<DAS_BIND_FUN(reset_jobque_team_prof)>(*this, lib,  "reset_jobque_team_prof",
+                SideEffects::modifyExternal, "reset_jobque_team_prof")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_team_prof)>(*this, lib,  "get_jobque_team_prof",
+                SideEffects::accessExternal, "get_jobque_team_prof")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_team_prof_counts)>(*this, lib,  "get_jobque_team_prof_counts",
+                SideEffects::accessExternal, "get_jobque_team_prof_counts")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_team_prof_react)>(*this, lib,  "get_jobque_team_prof_react",
+                SideEffects::accessExternal, "get_jobque_team_prof_react")
                     ->args({"context","line"});
             addExtern<DAS_BIND_FUN(team_parallel_for_invoke)>(*this, lib,  "team_parallel_for_invoke",
                 SideEffects::modifyExternal, "team_parallel_for_invoke")
@@ -1323,6 +1420,8 @@ namespace das {
                     ->args({"block","context","line"});
             addExtern<DAS_BIND_FUN(is_job_que_shutting_down)>(*this, lib,  "is_job_que_shutting_down",
                 SideEffects::modifyExternal, "is_job_que_shutting_down");
+            addExtern<DAS_BIND_FUN(is_job_que_available)>(*this, lib,  "is_job_que_available",
+                SideEffects::accessExternal, "is_job_que_available");
             addExtern<DAS_BIND_FUN(count_jobque_leaks)>(*this, lib,  "count_jobque_leaks",
                 SideEffects::accessExternal, "count_jobque_leaks");
         }

@@ -2611,12 +2611,12 @@ namespace das {
         static __forceinline ResType invoke_cmres ( Context * __context__, LineInfo * __lineinfo__, const FirstArgType & blk, ArgType ...arg ) {
             char * classPtr = (char *)&blk;
             SimFunction* simFunc = ((Func *)(classPtr + methodOffset))->PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
             if ( simFunc->aotFunction ) {
                 using fnPtrType = ResType (*) ( Context *, const FirstArgType & blk, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__, blk, das::forward<ArgType>(arg)... );
             } else {
-                if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
                 typename remove_const<ResType>::type result;
                 vec4f arguments [] = { cast<FirstArgType>::from(blk), cast<ArgType>::from(arg)... };
                 __context__->callWithCopyOnReturn(simFunc, arguments, &result, __lineinfo__);
@@ -2657,6 +2657,10 @@ namespace das {
                 using fnPtrType = ResType (*) ( Context * );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__ );
+            } else if ( simFunc->jitFunction ) {
+                vec4f result = ((JitFunction) simFunc->jitFunction) ( __context__, nullptr, nullptr );
+                __context__->stopFlags = 0;
+                return cast<ResType>::to(result);
             } else {
                 vec4f result = __context__->callOrFastcall(simFunc, nullptr, __lineinfo__);
                 return cast<ResType>::to(result);
@@ -2671,6 +2675,11 @@ namespace das {
                 using fnPtrType = ResType (*) ( Context *, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__, das::forward<ArgType>(arg)... );
+            } else if ( simFunc->jitFunction ) {
+                vec4f arguments [] = { cast<ArgType>::from(arg)... };
+                vec4f result = ((JitFunction) simFunc->jitFunction) ( __context__, arguments, nullptr );
+                __context__->stopFlags = 0;
+                return cast<ResType>::to(result);
             } else {
                 vec4f arguments [] = { cast<ArgType>::from(arg)... };
                 vec4f result = __context__->callOrFastcall(simFunc, arguments, __lineinfo__);
@@ -2685,6 +2694,11 @@ namespace das {
                 using fnPtrType = ResType (*) ( Context * );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__ );
+            } else if ( simFunc->jitFunction ) {
+                typename remove_const<ResType>::type result;
+                ((JitFunction) simFunc->jitFunction) ( __context__, nullptr, &result );
+                __context__->stopFlags = 0;
+                return result;
             } else {
                 typename remove_const<ResType>::type result;
                 __context__->callWithCopyOnReturn(simFunc, nullptr, &result, __lineinfo__);
@@ -2696,12 +2710,17 @@ namespace das {
         static __forceinline ResType invoke_cmres ( Context * __context__, LineInfo * __lineinfo__, const Func & blk, ArgType ...arg ) {
             vec4f arguments [] = { cast<ArgType>::from(arg)... };
             SimFunction * simFunc = blk.PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
             if ( simFunc->aotFunction ) {
                 using fnPtrType = ResType (*) ( Context *, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__, das::forward<ArgType>(arg)... );
+            } else if ( simFunc->jitFunction ) {
+                typename remove_const<ResType>::type result;
+                ((JitFunction) simFunc->jitFunction) ( __context__, arguments, &result );
+                __context__->stopFlags = 0;
+                return result;
             } else {
-                if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
                 typename remove_const<ResType>::type result;
                 __context__->callWithCopyOnReturn(simFunc, arguments, &result, __lineinfo__);
                 return result;
@@ -2719,6 +2738,9 @@ namespace das {
                 using fnPtrType = void (*) ( Context * );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 (*fnPtr) ( __context__ );
+            } else if ( simFunc->jitFunction ) {
+                ((JitFunction) simFunc->jitFunction) ( __context__, nullptr, nullptr );
+                __context__->stopFlags = 0;
             } else {
                 __context__->callOrFastcall(simFunc, nullptr, __lineinfo__);
             }
@@ -2732,6 +2754,10 @@ namespace das {
                 using fnPtrType = void (*) ( Context *, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 (*fnPtr) ( __context__, das::forward<ArgType>(arg)... );
+            } else if ( simFunc->jitFunction ) {
+                vec4f arguments [] = { cast<ArgType>::from(arg)... };
+                ((JitFunction) simFunc->jitFunction) ( __context__, arguments, nullptr );
+                __context__->stopFlags = 0;
             } else {
                 vec4f arguments [] = { cast<ArgType>::from(arg)... };
                 __context__->callOrFastcall(simFunc, arguments, __lineinfo__);
@@ -2834,6 +2860,12 @@ namespace das {
                 using fnPtrType = ResType (*) ( Context *, void * );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__, blk.capture );
+            } else if ( simFunc->jitFunction ) {
+                vec4f arguments[1];
+                arguments[0] = cast<Lambda>::from(blk);
+                vec4f result = ((JitFunction) simFunc->jitFunction) ( __context__, arguments, nullptr );
+                __context__->stopFlags = 0;
+                return cast<ResType>::to(result);
             } else {
                 vec4f arguments[1];
                 arguments[0] = cast<Lambda>::from(blk);
@@ -2852,6 +2884,11 @@ namespace das {
                 using fnPtrType = ResType (*) ( Context *, void *, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__, blk.capture, das::forward<ArgType>(arg)... );
+            } else if ( simFunc->jitFunction ) {
+                vec4f arguments [] = { cast<void *>::from(blk.capture), (cast<ArgType>::from(arg))... };
+                vec4f result = ((JitFunction) simFunc->jitFunction) ( __context__, arguments, nullptr );
+                __context__->stopFlags = 0;
+                return cast<ResType>::to(result);
             } else {
                 vec4f arguments [] = { cast<void *>::from(blk.capture), (cast<ArgType>::from(arg))... };
                 vec4f result = __context__->callOrFastcall(simFunc, arguments, __lineinfo__);
@@ -2868,6 +2905,13 @@ namespace das {
                 using fnPtrType = ResType (*) ( Context *, void * );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__, blk.capture );
+            } else if ( simFunc->jitFunction ) {
+                typename remove_const<ResType>::type result;
+                vec4f arguments[1];
+                arguments[0] = cast<Lambda>::from(blk);
+                ((JitFunction) simFunc->jitFunction) ( __context__, arguments, &result );
+                __context__->stopFlags = 0;
+                return result;
             } else {
                 typename remove_const<ResType>::type result;
                 vec4f arguments[1];
@@ -2887,6 +2931,12 @@ namespace das {
                 using fnPtrType = ResType (*) ( Context *, void *, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__, blk.capture, das::forward<ArgType>(arg)... );
+            } else if ( simFunc->jitFunction ) {
+                vec4f arguments [] = { cast<void *>::from(blk.capture), (cast<ArgType>::from(arg))... };
+                typename remove_const<ResType>::type result;
+                ((JitFunction) simFunc->jitFunction) ( __context__, arguments, &result );
+                __context__->stopFlags = 0;
+                return result;
             } else {
                 vec4f arguments [] = { cast<void *>::from(blk.capture), (cast<ArgType>::from(arg))... };
                 typename remove_const<ResType>::type result;
@@ -2908,6 +2958,11 @@ namespace das {
                 using fnPtrType = void (*) ( Context *, void * );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 (*fnPtr) ( __context__, blk.capture );
+            } else if ( simFunc->jitFunction ) {
+                vec4f arguments[1];
+                arguments[0] = cast<Lambda>::from(blk);
+                ((JitFunction) simFunc->jitFunction) ( __context__, arguments, nullptr );
+                __context__->stopFlags = 0;
             } else {
                 vec4f arguments[1];
                 arguments[0] = cast<Lambda>::from(blk);
@@ -2925,6 +2980,10 @@ namespace das {
                 using fnPtrType = void (*) ( Context *, void *, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 (*fnPtr) ( __context__, blk.capture, das::forward<ArgType>(arg)... );
+            } else if ( simFunc->jitFunction ) {
+                vec4f arguments [] = { cast<void *>::from(blk.capture), (cast<ArgType>::from(arg))... };
+                ((JitFunction) simFunc->jitFunction) ( __context__, arguments, nullptr );
+                __context__->stopFlags = 0;
             } else {
                 vec4f arguments [] = { cast<void *>::from(blk.capture), (cast<ArgType>::from(arg))... };
                 __context__->callOrFastcall(simFunc, arguments, __lineinfo__);

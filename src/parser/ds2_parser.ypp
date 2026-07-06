@@ -815,8 +815,8 @@ require_module_name
     ;
 
 optional_require_guard
-    :                       { $$ = nullptr; }
-    |   '?' NAME[g]         { $$ = $g; }
+    :                                       { $$ = nullptr; }
+    |   '?' require_module_name[g]          { $$ = $g; }
     ;
 
 require_module

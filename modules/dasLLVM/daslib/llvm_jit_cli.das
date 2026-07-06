@@ -34,6 +34,10 @@ struct public JitCliOptions {
     @clarg_doc = "JIT: cross-compile target triple (use with -exe; e.g. wasm32-unknown-emscripten)"
     target : Option<string>
 
+    @clarg_name = "jit-compile-only"
+    @clarg_doc = "JIT: build + verify + optimize the module (print it with --jit-dump), then stop — no artifact written, no DLL loaded, no jitted function installed; the program runs interpreted. The cross-emission smoke rail (e.g. --jit-target=x86_64-unknown-linux-gnu with DAS_JIT_X64_FORCE_FEATURES)."
+    compile_only : Option<bool>
+
     @clarg_name = "jit-runtime-lib"
     @clarg_doc = "JIT: explicit path to libDaScript_runtime.a (wasm cross-compile); overrides auto-locate under web/output/lib/"
     runtime_lib : Option<string>

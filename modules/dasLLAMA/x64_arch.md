@@ -1,5 +1,13 @@
 # dasLLAMA on x64 — architecture handoff
 
+> **HISTORICAL (superseded 2026-07-04).** The hand x64 backends this doc describes
+> (`dasllama_math_x64_avx.das`: `x64-avx2*`, `x64-vnni*`, `x64-avx512*`) and the hand
+> `arm64-laneq` tier were DELETED — the generated GEMM family (`dasllama_math_gen.das`,
+> backends `arm64-gen`/`x64-gen`, tiles stamped by llvm_tune from manifest > per-ISA
+> fallback chain) proved 1.65-4.3× faster on silicon and is now the only repack tier.
+> The registry architecture, seam map, and measurement discipline below remain accurate;
+> the specific backend names/files do not.
+
 **Audience:** the instance bringing up x64 kernels on an x64 desktop. This doc is the map;
 `get_x64_going.md` is the step-by-step runbook; `tune_for_this_box.md` is the per-box tuning
 guide (read it *after* the kernels are correct). Line numbers are as of the PR #3340 tip —

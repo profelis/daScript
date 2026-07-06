@@ -7,9 +7,7 @@
   "norm_par_threshold": 256000,
   "attn_par_threshold": 100000,
   "act_par_threshold": 100000,
-  "decode_attn_par_threshold": 262144,
   "threads": 95,
-  "matmul_par_threshold": 2000000,
   "jobque_join_poll": 50,
   "kv_store_par_threshold": 256000,
   "q8_l2_budget": 4194304,
@@ -19,8 +17,7 @@
   "q8_token_block": 128,
   "matmul_min_chunk_rows": 16,
   "matmul_min_chunk_rows_gemv": 128,
-  "backend": "portable",
-  "batch_backend": "x64-avx512vnni"
+  "backend": "portable"
  },
  "rope_scaled_neox_tab": "plain",
  "softmax": "vec8",

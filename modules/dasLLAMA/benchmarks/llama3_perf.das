@@ -44,7 +44,7 @@ def main {
     if (!empty(args) && ends_with(args[length(args) - 1], ".gguf")) {
         path = args[length(args) - 1]
     }
-    // backend pin for A/B on one binary (e.g. x64-avx2 row-major vs x64-avx2-repack) — must land
+    // backend pin for A/B on one binary (e.g. portable row-major vs x64-gen) — must land
     // BEFORE load_gguf: select_matmul_backend_for_load honors the pin at load, which decides repack
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
         pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
@@ -97,12 +97,32 @@ def main {
             set_fused_decode(get_env_variable("DASLLAMA_FUSED_DECODE") != "0")
             print("fused decode override: {get_fused_decode()}\n")
         }
-        // threshold override — also the crude chain selector (attn chain gates at dim*(qd+2kv),
-        // ffn at dim*hidden; a value between them fuses the FFN only)
-        if (has_env_variable("DASLLAMA_MATMUL_PAR_THRESHOLD")) {
-            let mpt = to_int(get_env_variable("DASLLAMA_MATMUL_PAR_THRESHOLD"))
-            set_matmul_par_threshold(int64(mpt))
-            print("matmul par threshold override: {mpt}\n")
+        // work-target override — also the crude chain selector (attn chain gates at dim*(qd+2kv),
+        // ffn at dim*hidden; the fuse needs lanes_for_work(gate work) > 1, i.e. work >= 2*target)
+        if (has_env_variable("DASLLAMA_TARGET_CHUNK_WORK")) {
+            let tcw = to_int(get_env_variable("DASLLAMA_TARGET_CHUNK_WORK"))
+            set_target_chunk_work(int64(tcw))
+            print("target chunk work override: {tcw}\n")
+        }
+        if (has_env_variable("DASLLAMA_GEMV_LANE_CAP")) {
+            let glc = to_int(get_env_variable("DASLLAMA_GEMV_LANE_CAP"))
+            set_gemv_lane_cap(glc)
+            print("gemv lane cap override: {glc}\n")
+        }
+        if (has_env_variable("DASLLAMA_BATCH_LANE_CAP")) {
+            let blc = to_int(get_env_variable("DASLLAMA_BATCH_LANE_CAP"))
+            set_batch_lane_cap(blc)
+            print("batch lane cap override: {blc}\n")
+        }
+        if (has_env_variable("DASLLAMA_BATCH_GRID_2D")) {
+            let bg2 = to_int(get_env_variable("DASLLAMA_BATCH_GRID_2D"))
+            set_batch_grid_2d(bg2)
+            print("batch grid 2d override: {bg2}\n")
+        }
+        if (has_env_variable("DASLLAMA_WORKER_LIMIT")) {
+            let wl = to_int(get_env_variable("DASLLAMA_WORKER_LIMIT"))
+            set_jobque_worker_limit(wl)   // direct: we are inside the que already; 0 = caller-only, negative = unlimited (jobque semantics)
+            print("worker limit override: {wl}\n")
         }
         // prefill (untimed)
         var pos = 0l

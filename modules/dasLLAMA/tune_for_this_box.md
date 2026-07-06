@@ -16,11 +16,16 @@ finish it first; tuning an incorrect kernel is worse than pointless).
 | Axis | Knob | Bound when | Consumer |
 |---|---|---|---|
 | Kernel backend (ISA) | auto by priority; `pin_kernel_backend(name)` for A/B; loader picks repack backends; profile `runtime.backend` pins | runtime | `matmul_q8q8*` wrappers |
-| Batch backend (hybrid) | `select_batch_backend(name)` / profile `runtime.batch_backend` / env `DASLLAMA_PIN_BATCH_BACKEND` (benches) — overrides ONLY the batch-shaped slots (prefill GEMM + mx4 batch) from a layout-compatible donor, GEMV slots stay with `runtime.backend`. For boxes where decode and prefill prefer different backends (EPYC 9654: portable GEMV + acc8 batch). Survives load-time re-select | runtime | the batch matmul wrappers |
+| Batch backend (hybrid) | `select_batch_backend(name)` / profile `runtime.batch_backend` / env `DASLLAMA_PIN_BATCH_BACKEND` (benches) — overrides ONLY the batch-shaped slots (prefill GEMM + mx4 batch) from a layout-compatible donor, GEMV slots stay with `runtime.backend`. For boxes where decode and prefill prefer different backends (e.g. portable GEMV + a row-major donor's batch). Survives load-time re-select | runtime | the batch matmul wrappers |
 | Loop hints per kernel (`vectorize_width` × `unroll_count`) | `box_profile.json` flat keys, read at **compile time** by `[tuned]` | compile (JIT re-keys automatically) | all 16 `[tuned]` kernels: dot, axpy, add/mul/scale_inplace, copy_floats, softmax(+_sink), rmsnorm, dot_q4, dot_q8q8, dot_mx4q8, quantize_q8_0_into_ptr, rope_scaled_neox_tab, gemm_f32_uk_4x16, dot_q8q8_laneq4x4 |
+| Gen GEMM tile family (manifest) | `DAS_TUNE_MODE=tune gen_tune_probe` benches the `[tune_perm]` grid and writes the winner to `DAS_TUNE_MANIFEST` — **guarded by the e2e confirm pass**: a winner that diverges from the per-ISA fallback must beat it in a real-model prefill A/B (`DASLLAMA_CONFIRM_MODEL=<q8 gguf>`, interleaved, challenger needs >×1.02, else the fallback stays pinned). The guard exists because the 1-core fixture regime CAN crown an e2e loser (SPR: amx won the tile bench, lost prefill ~2×; M1: a +3.3%-iso shape made only +2.0% e2e — rejected) | compile (stamp at `[tune]`) | `q8q8_tile_gen` + companions (the gen batch/gemv kernels) |
 | Token block `TB` | `set_q8_token_block(n)` (default 128) / profile `runtime.q8_token_block` | runtime | the repack-tier batch kernel only |
 | L2 budget (TB cliff guard) | `set_q8_l2_budget(bytes)` (default 4 MB — provisional, one M1 Max) / profile `runtime.q8_l2_budget` | runtime | `effective_token_block(tb, n) = clamp(tb, 1, budget/n)` (dasllama_math.das) |
-| Threading thresholds | `set_matmul_par_threshold`, `set_decode_attn_par_threshold` (decode attention over heads — default 262144, the measured M1 Max crossover; sweep inline-vs-threaded at a few context depths to re-derive on a new box), + the six prefill-pass setters (`set_attn/requant/norm/rope/kv_store/act_par_threshold`) / profile `runtime.*_par_threshold` | runtime | every `maybe_parallel_for` gate — the crossovers encode the box's ~90µs (M1) job-dispatch cost |
+| Work-proportional dispatch | `set_target_chunk_work` (MACs per dispatch chunk, default 1M — lanes = clamp(work/target, 1, lanes); 1 lane = inline, so 2×target is the old 2M inline boundary) + `set_gemv_lane_cap` / `set_batch_lane_cap` (per-regime lane ceilings, 0 = uncapped — the GEMV cap is the box's DRAM knee, measured by `harness/team_probe.das`) / profile `runtime.target_chunk_work` / `runtime.gemv_lane_cap` / `runtime.batch_lane_cap` | runtime | every matmul dispatch (the `matmul_chunks*` shapers), the fused-chain gates, decode attention |
+| Worker-pool limit | `set_dispatch_worker_limit(n)` (0 = no limit) / profile `runtime.dispatch_worker_limit` — workers above the limit sleep DORMANT (out of the spin loop AND the publish wake gate; `get_dispatch_lanes()` sizes shapers to the live pool). The tiny-model dial: an inline-dominated decode token runs faster with fewer awake workers, and no chunk shaping recovers that (zen2 135M: T=8 176 t/s vs T=48 149) | runtime (applied by `setup_dasllama_jobque_`) | the whole jobque worker pool |
+| Per-op team rank gate | `set_team_rank_gate(v)` tri-state (-1 = unset/que default, 0 = off, 1 = on) / profile `runtime.team_rank_gate` — each team op admits only as many workers as its widest stage published chunks; gated ranks keep spinning, re-admitted by the next big op. Composes with full lanes (unlike the static limit): 135M T=48 emit +10% zen2 / +48% SPR, ≥1B neutral. ON for server-core boxes; heterogeneous P/E boxes (M1) keep it off — rank-static admission wobbles when low ranks land on slow cores. `DAS_JOBQUE_TEAM_RANK_GATE` env always wins over the profile (the A/B rail) | runtime (applied by `setup_dasllama_jobque_`) | every team dispatch |
+| 2-D batch chunk grid | `set_batch_grid_2d(v)` (0 = off/1-D, 1 = fine grid — ggml's 16-token cells, 2 = wave-aligned — token chunks rounded so rc·ntc is whole L-waves) / profile `runtime.batch_grid_2d` / env `DASLLAMA_BATCH_GRID_2D` (benches + parity, the A/B rail). The knob ARMS a per-dispatch auto-gate: 2-D engages only when the 1-D grain-capped chunk count starves the admitted lanes (rows/16 < L), so big GEMMs keep the weight-stationary 1-D walk. Bit-exact both ways. High-lane boxes only: zen2 T=48 135M pp512 +8-15% (aligned > fine every rep), 1B +3-4%, unstarved shapes untouched; M1-class (≤11 lanes) can never engage — keep 0 | runtime | the repack-tier batch GEMM (gen ts=4 walk) |
+| Threading thresholds (non-matmul) | the six prefill-pass setters (`set_attn/requant/norm/rope/kv_store/act_par_threshold`) / profile `runtime.*_par_threshold` | runtime | the norm/rope/kv/act/requant `maybe_parallel_for` gates — the crossovers encode the box's job-dispatch cost |
 | Chunks per hw job | `set_q8_chunks_per_job` (default 2) / `set_q4_chunks_per_job` (default 4) / profile `runtime.q{8,4}_chunks_per_job` | runtime | the quantized matmuls' row split |
 | Batch oversplit | `set_q8_batch_chunks_per_job` (default 4) / profile `runtime.q8_batch_chunks_per_job` — chunks = hw_jobs × this, so awake workers steal a straggler's remaining chunks (measured 3990X @32w: +9-14% on the fat shapes; the grp4 kernel floors at 4 groups/chunk — see the kernel note) | runtime | the x64 batch (prefill GEMM) kernels |
 | Jobque spin | `set_jobque_spin_us` (default 30000, worker spin-before-park) / `set_jobque_join_poll` (default 50, ggml's poll denomination: level×1024×128 relax-rounds at join before parking) / profile `runtime.jobque_spin_us`, `runtime.jobque_join_poll` — both applied by `setup_dasllama_jobque` inside the queue | runtime | every fork/join dispatch |
@@ -80,7 +85,7 @@ fallback perm (`vec8_u2` for most; dot_q8q8 ships `vec16`, dot_q4 `vec4_u4`, the
 
 ```json
 {"dot":"vec8_u2", "...":"...", "dot_q8q8":"vec16",
- "runtime":{"q8_token_block":128,"q8_l2_budget":4194304,"matmul_par_threshold":2000000,
+ "runtime":{"q8_token_block":128,"q8_l2_budget":4194304,"target_chunk_work":1000000,
             "attn_par_threshold":100000, "...":0, "q8_chunks_per_job":2,"threads":8}}
 ```
 
@@ -139,8 +144,8 @@ TB falls off hard once `TB × n` spills (+13% → +46%); the knee moves down as 
 `effective_token_block` guard as pure insurance (inert at defaults), **not** a per-shape TB
 map (there was ~0% to capture).
 
-**On x64:** the harness pins `arm64-laneq` and skips cleanly elsewhere — when an x64
-token-blocked kernel exists, generalize the pin (or copy the harness). Re-derive the budget
+**On x64:** the harness pins the gen repack tier (`arm64-gen` / `x64-gen`) and skips
+cleanly where it isn't registered. Re-derive the budget
 from the *measured* cliff, not the spec sheet: x64 cache hierarchy differs in kind (small
 private L2 per core + large shared L3, vs M1's big shared L2), so which level bounds the
 re-streamed slice is an empirical question. Expect the cliff shape, find its knee, set
@@ -194,7 +199,7 @@ other models. This is the kernel scoreboard; `prefill_perf.das` is the end-to-en
    recompile a consumer and confirm the `dasllama_tune:` log lines → re-run an end-to-end
    bench to see if it moved anything. **A "neutral" verdict here is only valid per-backend:
    `[tuned]` perms bite ONLY on the portable-tier kernels, so an intrinsic auto-backend
-   (e.g. `x64-avx2-repack`) masks the profile entirely. Run the backend ladder
+   (e.g. `x64-gen`) masks the profile entirely. Run the backend ladder
    (`DASLLAMA_PIN_BACKEND` per rung, profile ON, bracketed controls) before concluding —
    on the EPYC 9654 the profile was "neutral" under auto but +34% on portable
    (77→104 t/s), flipping portable from worst backend to best and beating auto by ~15%.

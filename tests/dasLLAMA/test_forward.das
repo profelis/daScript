@@ -178,20 +178,20 @@ def test_forward_threaded_decode_attention(t : T?) {
         let c = tr.config
         var s_thr <- make_run_state(c)
         var s_inl <- make_run_state(c)
-        let prev_thr = get_decode_attn_par_threshold()
+        let prev_thr = get_target_chunk_work()
         with_job_que() {
             // same token sequence through both sessions; heads write disjoint att/xb slices, so the
             // threaded head loop must be BIT-exact vs inline — any diff is a race, not a tolerance
-            set_decode_attn_par_threshold(0l)   // always thread
+            set_target_chunk_work(1l)   // always thread (every attention work count >= 2 lanes)
             for (p, tok in count(), PROMPT_ORACLE) {
                 forward(tr, s_thr, tok, int64(p))
             }
-            set_decode_attn_par_threshold(1l << 60l)   // never thread
+            set_target_chunk_work(1l << 60l)   // never thread (lanes_for_work == 1 -> inline)
             for (p, tok in count(), PROMPT_ORACLE) {
                 forward(tr, s_inl, tok, int64(p))
             }
         }
-        set_decode_attn_par_threshold(prev_thr)
+        set_target_chunk_work(prev_thr)
         var exact = true
         for (i in range64(c.vocab_size)) {
             if (s_thr.logits[i] != s_inl.logits[i]) {

@@ -1176,9 +1176,24 @@ namespace das {
 
     void ast_requireModule ( yyscan_t scanner, string * name, string * modalias, bool pub, const LineInfo & atName, string * guard ) {
         // Optional require `require ?guard target`: when the guard module is not available, skip the
-        // require entirely (no error). A present guard with a missing target still errors below.
+        // require entirely (no error) — WITHOUT resolving the target (matches the collector; a
+        // skipped require must not probe file paths). A present guard with a missing target still
+        // errors below.
         if ( guard ) {
-            bool guardAvailable = Module::requireEx(*guard, false) != nullptr;
+            // Path guard (contains '/'): availability = the guard's OWN file resolves — the rail for
+            // pure-das packages (nothing C++ to guard on) and cross-package dependencies the target's
+            // resolvability can't express. Plain-name guard: STRICT — the guard module is registered
+            // (a linked C++ module). No target-resolvability fallback: `require ?sqlite ...`-style
+            // guards mean "loaded only when <mod> is linked", and module source dirs are present in
+            // every checkout regardless of build config. Must match the require collector's rule
+            // (ast_parse.cpp getAllRequireReq).
+            bool guardAvailable;
+            if ( guard->find('/') != string::npos ) {
+                auto ginfo = yyextra->g_Access->getModuleInfo(*guard, yyextra->g_FileAccessStack.back()->name);
+                guardAvailable = !ginfo.fileName.empty() && yyextra->g_Access->getFileInfo(ginfo.fileName) != nullptr;
+            } else {
+                guardAvailable = Module::requireEx(*guard, false) != nullptr;
+            }
             delete guard;
             if ( !guardAvailable ) {
                 delete name;
