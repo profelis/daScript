@@ -274,7 +274,7 @@ def log_mel_whisper(samples : array<float> | #; filters : array<float>; n_mel : 
     for (i in range(int(n_in))) {
         padded[int(head) + i] = samples[i]
     }
-    let nref = min(head, max(n_in - 1l, 0l))               // whisper.cpp reads samples[1..200] unguarded
+    let nref = clamp(n_in - 1l, 0l, head)                  // whisper.cpp reads samples[1..200] unguarded
     for (i in range64(nref)) {
         padded[head - 1l - i] = samples[i + 1l]
     }
@@ -329,7 +329,7 @@ def log_mel_whisper(samples : array<float> | #; filters : array<float>; n_mel : 
             }
             while (k < n_bins) {
                 sum += double(power[k] * filters[j * n_bins + k])
-                k += 1l
+                k++
             }
             m.data[j * m.n_len + i] = float(log(max(sum, 1e-10lf)) * log10_e)
         }

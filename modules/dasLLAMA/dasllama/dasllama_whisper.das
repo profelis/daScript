@@ -856,6 +856,28 @@ def private token_prob(logits : array<float>; id : int) : float {
     return exp(logits[id] - m) / sum
 }
 
+// Build and emit one segment off toks[i0..i1) at [t0, t1] — text = concat of the text-range
+// token bytes; a segment with no text (bare timestamps) is dropped, whisper.cpp's rule.
+def private emit_segment(w : WhisperModel; toks : array<SampledTok>; i0, i1 : int; t0, t1 : int64;
+                         blk : block<(seg : WhisperSegment)>) {
+    let text = build_string() $(writer) {
+        for (j in range(i0, i1)) {
+            if (toks[j].id < w.tok_eot) {
+                writer |> write(w.vocab[toks[j].id])
+            }
+        }
+    }
+    if (empty(text)) {
+        return
+    }
+    var seg = WhisperSegment(t0 = t0, t1 = t1, text = text)
+    seg.tokens |> reserve(i1 - i0)
+    for (j in range(i0, i1)) {
+        seg.tokens |> push(toks[j].id)
+    }
+    blk |> invoke(seg)
+}
+
 // The window loop (whisper_full's single-decoder temp-0 path, no_context): 30 s windows
 // advanced by decoded timestamps (or whole windows when no_timestamps), whisper.cpp's
 // logit-filter suite and segment-splitting rules. Emits segments through ``blk`` as each
@@ -879,6 +901,7 @@ def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var 
         whisper_cross_kv(w, ds, es.xb)
 
         var prompt : array<int>
+        prompt |> reserve(4)
         prompt |> push(w.tok_sot)
         if (w.multilingual) {
             prompt |> push(w.tok_sot + 1 + lang_id)
@@ -891,6 +914,7 @@ def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var 
         let no_speech_prob = token_prob(ds.logits, w.tok_nosp)
 
         var toks : array<SampledTok>
+        toks |> reserve(n_max)
         var seek_delta = 100l * 30l      // full window unless a timestamp moves it
         var has_ts = false
         var result_len = 0
@@ -951,23 +975,12 @@ def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var 
         if (result_len > 0 && !is_no_speech) {
             var i0 = 0
             var t0 = seek + 2l * int64(toks[0].tid - w.tok_beg)
-            var text = ""
             var i = 0
             while (i < result_len) {
                 let t = toks[i]
-                if (t.id < w.tok_eot) {
-                    text = "{text}{w.vocab[t.id]}"
-                }
                 if (t.id > w.tok_beg) {
                     let t1 = seek + 2l * int64(t.tid - w.tok_beg)
-                    if (!empty(text)) {
-                        var seg = WhisperSegment(t0 = t_base + t0, t1 = t_base + t1, text = text)
-                        for (j in range(i0, i + 1)) {
-                            seg.tokens |> push(toks[j].id)
-                        }
-                        blk |> invoke(seg)
-                    }
-                    text = ""
+                    emit_segment(w, toks, i0, i + 1, t_base + t0, t_base + t1, blk)
                     t0 = t1
                     while (i + 1 < result_len && toks[i + 1].id > w.tok_beg) {
                         i++
@@ -977,13 +990,7 @@ def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var 
                 }
                 i++
             }
-            if (!empty(text)) {
-                var seg = WhisperSegment(t0 = t_base + t0, t1 = t_base + seek + seek_delta, text = text)
-                for (j in range(i0, result_len)) {
-                    seg.tokens |> push(toks[j].id)
-                }
-                blk |> invoke(seg)
-            }
+            emit_segment(w, toks, i0, result_len, t_base + t0, t_base + seek + seek_delta, blk)
         }
 
         // a window whose kept tokens end text-then-SINGLE-timestamp (no closing pair) covered
@@ -1011,7 +1018,7 @@ def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : Dec
     }
     let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
     transcribe_mel_windows(w, es, ds, mel, lang_id, no_timestamps, translate, 0l, false) $(seg) {
-        segments |> emplace(seg)
+        segments |> push_clone(seg)
     }
     return <- segments
 }

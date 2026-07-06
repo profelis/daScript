@@ -1,5 +1,5 @@
 options gen2
-options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
+options fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
 require dasllama/dasllama       // the public facade: engine + arch registration + chat layer
 require dasllama/dasllama_audio // whisper-encoder tower + mel frontend
