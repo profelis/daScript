@@ -104,8 +104,15 @@ first, wait for the merge, then this.
 - [x] D. Parakeet-TDT 0.6b-v2 — ✅ token-for-token vs parakeet-cli: jfk 33/33 + gb1 786/786
   (ids/frames/durations); full spec + the fp32-underflow duration-argmax finding in
   parakeet_plan.md; wired into load_asr_model (small-vocab ggml-bin route) + transcribe.das
-- [ ] E. tutorials (not blocked on mic)
-- [ ] F. mic demo (Parakeet; after #3388 merges)
+- [x] E. tutorials — 07_speech_to_text.das (ASR surface: sniffed loader, caps, segments,
+  auto-lang, feed/drain/flush; verified through whisper-tiny AND parakeet) +
+  08_audio_chat.das (create_chat(m,tower)/add_user_audio/respond + LlmCaps; verified
+  through ultravox-1b with a multi-turn follow-up); RST pages + toctree; sphinx -W green
+  (needed the master merge for #3388's audio_record stdlib page + a daslang rebuild)
+- [x] F. mic demo — examples/dasLLAMA/dictate.das: sound_record_* ring-buffer capture →
+  Parakeet with 2 s incremental re-transcription + final pass; verified END TO END with the
+  real microphone (live ambient audio transcribed). Any load_asr_model file works; Parakeet
+  is the latency pick.
 
 ## Findings
 
