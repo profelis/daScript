@@ -1,5 +1,4 @@
 options gen2
-options fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 options stack = 65536      // the ASR model structs (decoder + tower) need a deeper stack
 
 require dasllama/dasllama

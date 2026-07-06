@@ -1,5 +1,4 @@
 options gen2
-options fast_math = true
 options stack = 65536
 
 require dasllama/dasllama_asr
