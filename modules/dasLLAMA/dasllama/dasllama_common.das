@@ -4145,6 +4145,71 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
         }
         return
     }
+    forward_prefill_alloc(t, s, npos, start_pos)
+
+    // token embeddings -> residual stream x_b [npos x dim]
+    let dim = c.dim
+    let ts_embed = ref_time_ticks()
+    for (p in range64(npos)) {
+        embed_row(t, tokens[p], unsafe(addr(s.x_b[p * dim])))
+    }
+    if (c.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
+        scale_inplace(unsafe(addr(s.x_b[0])), c.embed_scale, npos * dim)
+    }
+    prof_add("embed", ts_embed)
+
+    forward_prefill_body(t, s, npos, start_pos)
+}
+
+//! Batched prefill from PRE-BUILT embeddings (npos × dim, token-major) instead of token ids —
+//! the multimodal splice entry: the caller fills ``embd`` from ``embed_text_rows`` for text
+//! spans and from the audio tower's projected soft tokens for media spans. Same KV/logits
+//! behavior as ``forward_prefill``. Embeddings go in as-is (no embed_scale — media embeddings
+//! are already in decoder space; text rows must be pre-scaled by the caller when the arch
+//! scales, matching llama.cpp's batch.embd semantics).
+def forward_prefill_embd(t : Model; var s : Session; embd : array<float>; npos, start_pos : int64) {
+    if (npos <= 0l) {
+        return
+    }
+    if (t.quant == QuantMode.q4) {
+        panic("forward_prefill_embd: q4 mode has no batched prefill path (use q8 or fp32)")
+    }
+    forward_prefill_alloc(t, s, npos, start_pos)
+    let dim = t.config.dim
+    let ts_embed = ref_time_ticks()
+    for (i in range64(npos * dim)) {
+        s.x_b[i] = embd[i]
+    }
+    prof_add("embed", ts_embed)
+    forward_prefill_body(t, s, npos, start_pos)
+}
+
+//! Fill ``dst[at*dim ..]`` with the embedding rows of ``tokens`` (embed_scale applied) — the
+//! text-span half of a multimodal prefill buffer.
+def embed_text_rows(t : Model; tokens : array<int64>; var dst : array<float>; at : int64) {
+    let dim = t.config.dim
+    let n = int64(length(tokens))
+    for (p in range64(n)) {
+        embed_row(t, tokens[p], unsafe(addr(dst[(at + p) * dim])))
+    }
+    if (t.config.embed_scale != 1.0) {
+        scale_inplace(unsafe(addr(dst[at * dim])), t.config.embed_scale, n * dim)
+    }
+}
+
+//! ``eval_``'s embedding-input twin: prefill ``npos`` embedding rows at the session cursor and
+//! advance it. Leaves ``s.logits`` = the last position's logits.
+def eval_embd_(t : Model; var s : Session; embd : array<float>; npos : int64) {
+    if (npos <= 0l) {
+        return
+    }
+    forward_prefill_embd(t, s, embd, npos, s.n_past)
+    s.n_past += npos
+}
+
+// batched-prefill scratch sizing, shared by the token and embedding entries
+def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : int64) {
+    let c = t.config
     let dim = c.dim
     let hidden = c.hidden_dim
     let kv_dim = max_kv_dim(c)         // scratch sizes to the larger layer class (gemma4: swa vs global)
@@ -4178,16 +4243,13 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     } else {
         s.att_b |> resize(n_heads * ATTN_BLOCK_Q * (start_pos + npos))
     }
+}
 
-    // token embeddings -> residual stream x_b [npos x dim]
-    let ts_embed = ref_time_ticks()
-    for (p in range64(npos)) {
-        embed_row(t, tokens[p], unsafe(addr(s.x_b[p * dim])))
-    }
-    if (c.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
-        scale_inplace(unsafe(addr(s.x_b[0])), c.embed_scale, npos * dim)
-    }
-    prof_add("embed", ts_embed)
+// the shared prefill core: rope table + layer stack + final norm/classifier, over a pre-filled
+// s.x_b residual stream (token or embedding sourced)
+def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : int64) {
+    let c = t.config
+    let dim = c.dim
 
     // Precompute the RoPE cos/sin table ONCE for this prefill (angle = pos*freq is identical across
     // every head and layer, so this replaces the per-head/per-layer pow/cos/sin recomputation with a
