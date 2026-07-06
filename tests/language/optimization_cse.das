@@ -152,6 +152,13 @@ def target_alias(x : int) : int {
 }
 
 [export]
+def target_ptr_factory(td : TypeDeclPtr) : bool {
+    let a = clone_type(td)
+    let b = clone_type(td) // pure but identity-producing: must stay a real call
+    return a != b
+}
+
+[export]
 def target_blockarg(x : int) : int {
     let a = x * 17
     var r = 0
@@ -252,6 +259,14 @@ def test_cse_fired(t : T?) {
         t |> run("make-block interiors are opaque") @(t : T?) {
             let b = body_of(t, "target_blockarg")
             t |> equal(count_of(b, "* 17"), 2)
+        }
+        t |> run("pointer factories are never merged") @(t : T?) {
+            // clone_type is side-effect-free but returns a FRESH node per call -
+            // reusing one evaluation would alias a uniquely-owned TypeDecl
+            let b = body_of(t, "target_ptr_factory")
+            t |> equal(count_of(b, "clone_type"), 2)
+            var td = new TypeDecl(baseType = Type.tInt)
+            t |> success(target_ptr_factory(td), "fresh clones are distinct")
         }
     }
 }

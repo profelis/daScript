@@ -26,6 +26,11 @@ namespace das {
     //  * candidate expressions are side-effect-free trees of Op1/Op2/Op3/Call/Cast/
     //    Swizzle over leaves and constants - no memory reads (field/at/deref), so a
     //    candidate's value can only change through a visible store to a leaf;
+    //  * pointer/handle-returning calls are excluded even when flagged pure: a
+    //    factory like clone_type returns a fresh, uniquely-owned node per
+    //    evaluation - value-equal is not identity-equal (found live in
+    //    daslib/linq_fold_common, where merging two clone_type calls aliased one
+    //    TypeDecl into two owners);
     //  * pairs (E -> t) come from `let t = E` and statement-level `t = E` where t is
     //    itself a clean local; a store to any leaf mentioned by E (or to t) kills the
     //    pair; make-block interiors neither generate pairs nor get rewritten;
@@ -145,6 +150,18 @@ namespace das {
             }
         };
 
+        // a side-effect-free call returning a pointer/handle may still be a FACTORY
+        // (clone_type & co return a fresh node each evaluation): results are
+        // value-equal but not identity-equal, and reuse would alias something the
+        // caller treats as uniquely owned. Builtin pointer operators (p + i) are
+        // arithmetic, not allocation, and stay eligible.
+        bool cseIdentityProducing ( Expression * e, Function * func ) {
+            if ( !e->type ) return true;
+            if ( !e->type->isPointer() && e->type->baseType!=Type::tHandle ) return false;
+            if ( e->rtti_isCall() ) return true;
+            return func && !func->builtIn;
+        }
+
         // whitelisted pure value tree over clean leaves and constants (no memory
         // reads); collects the leaf variables the tree mentions
         bool cseAllowedTree ( Expression * e, const das_hash_set<Variable *> & leaves, vector<Variable *> & mentions ) {
@@ -163,21 +180,26 @@ namespace das {
             if ( e->rtti_isCopy() || e->rtti_isClone() || e->rtti_isSequence() ) return false;
             if ( e->rtti_isOp3() ) {
                 auto op = static_cast<ExprOp3 *>(e);
+                if ( cseIdentityProducing(e, op->func) ) return false;
                 return cseAllowedTree(op->subexpr, leaves, mentions)
                     && cseAllowedTree(op->left, leaves, mentions)
                     && cseAllowedTree(op->right, leaves, mentions);
             }
             if ( e->rtti_isOp2() ) {    // ExprMove's write-flagged left is caught by the ExprVar rule
                 auto op = static_cast<ExprOp2 *>(e);
+                if ( cseIdentityProducing(e, op->func) ) return false;
                 return cseAllowedTree(op->left, leaves, mentions)
                     && cseAllowedTree(op->right, leaves, mentions);
             }
             if ( e->rtti_isOp1() ) {
-                return cseAllowedTree(static_cast<ExprOp1 *>(e)->subexpr, leaves, mentions);
+                auto op = static_cast<ExprOp1 *>(e);
+                if ( cseIdentityProducing(e, op->func) ) return false;
+                return cseAllowedTree(op->subexpr, leaves, mentions);
             }
             if ( e->rtti_isCall() ) {
                 auto c = static_cast<ExprCall *>(e);
                 if ( !c->func ) return false;
+                if ( cseIdentityProducing(e, c->func) ) return false;
                 for ( auto & arg : c->arguments ) {
                     if ( !cseAllowedTree(arg, leaves, mentions) ) return false;
                 }
