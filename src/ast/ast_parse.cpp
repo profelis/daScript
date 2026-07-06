@@ -6,6 +6,7 @@
 #include "daScript/ast/ast_expressions.h"
 #include "daScript/ast/ast_gc_report.h"
 #include "daScript/ast/ast_escape_analysis.h"
+#include "daScript/ast/ast_bound_check_elision.h"
 #include "daScript/misc/das_common.h"
 #include "daScript/simulate/aot_builtin_string.h"
 #include "daScript/simulate/aot_builtin_uriparser.h"
@@ -967,6 +968,7 @@ namespace das {
             // re-run the whole macro/pod/relocate infer leg for nothing
             if ( !program->failed() ) {
                 escapeAnalysis(program.get(), logs);
+                markNoBoundCheck(program.get(), logs);
                 if ( scopeFreeOptimization(program.get(), logs) ) {
                     inferTypesDirty(program.get(), logs, true);
                     if ( program->failed() ) {

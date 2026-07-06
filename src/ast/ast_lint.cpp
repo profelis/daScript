@@ -1287,6 +1287,8 @@ namespace das {
         "aot_prologue",                 Type::tBool,
     // codegen
         "no_heap_array_literals",       Type::tBool,
+    // optimization
+        "log_bound_check_elision",      Type::tBool,
     // logging
         "log",                          Type::tBool,
         "log_optimization_passes",      Type::tBool,

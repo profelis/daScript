@@ -1189,6 +1189,7 @@ SET(LIBDASCRIPT_COMPILER_SRC
     src/ast/ast_optimize.cpp
     src/ast/ast_const_folding.cpp
     src/ast/ast_block_folding.cpp
+    src/ast/ast_bound_check_elision.cpp
     src/ast/ast_unused.cpp
     src/ast/ast_lint.cpp
     src/ast/dyn_modules.cpp
