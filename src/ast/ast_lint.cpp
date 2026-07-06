@@ -419,6 +419,25 @@ namespace das {
         return false;
     }
 
+    // [inline] calls are spliced by the patch pass, which only reaches function bodies.
+    // global-variable and structure-field initializers evaluate outside any patched
+    // body, so a call there would silently stay a call - the contract errors instead
+    static ExprCall * findMustInlineCall ( Expression * root ) {
+        class Scan : public Visitor {
+        public:
+            ExprCall * found = nullptr;
+        protected:
+            virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
+            virtual void preVisit ( ExprCall * expr ) override {
+                Visitor::preVisit(expr);
+                if ( !found && expr->func && expr->func->mustInline ) found = expr;
+            }
+        };
+        Scan scan;
+        root->visit(scan);
+        return scan.found;
+    }
+
     class LintVisitor : public Visitor {
         bool checkOnlyFastAot;
         bool checkAotSideEffects;
@@ -542,6 +561,13 @@ namespace das {
                         decl.at, CompilationError::cant_field_class);
                 }
             }
+            if ( decl.init ) {
+                if ( auto badCall = findMustInlineCall(decl.init) ) {
+                    program->error("can't call [inline] function '" + badCall->func->name + "' in a field initializer",
+                        "field initializers evaluate outside inlined code; call a non-inline wrapper instead", "",
+                        badCall->at, CompilationError::invalid_annotation);
+                }
+            }
         }
         virtual void preVisitGlobalLet ( const VariablePtr & var ) override {
             Visitor::preVisitGlobalLet(var);
@@ -574,6 +600,13 @@ namespace das {
             if ( var->type->getSizeOf64()>0x7fffffff ) {
                 program->error("global variable '" + var->name + "' is too big", "", "",
                     var->at,CompilationError::exceeds_global);
+            }
+            if ( var->init ) {
+                if ( auto badCall = findMustInlineCall(var->init) ) {
+                    program->error("can't call [inline] function '" + badCall->func->name + "' in a global initializer",
+                        "global initializers evaluate outside inlined code; call a non-inline wrapper instead", "",
+                        badCall->at, CompilationError::invalid_annotation);
+                }
             }
         }
         virtual void preVisitGlobalLetInit ( const VariablePtr & var, Expression * that ) override {
@@ -737,6 +770,14 @@ namespace das {
                     program->error("dead write is prohibited by CodeOfPolicies", "\tin " + expr->describe(), "",
                         expr->at, CompilationError::cant_expression);
                 }
+            }
+        }
+        virtual void preVisit ( ExprAddr * expr ) override {
+            Visitor::preVisit(expr);
+            if ( expr->func && expr->func->mustInline ) {
+                program->error("can't take the address of [inline] function '" + expr->func->name + "'",
+                    "indirect calls can't inline; split it into an implementation function and an [inline] wrapper", "",
+                    expr->at, CompilationError::invalid_annotation);
             }
         }
         virtual void preVisit ( ExprCall * expr ) override {

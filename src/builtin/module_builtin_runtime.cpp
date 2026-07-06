@@ -115,6 +115,21 @@ namespace das
         };
     };
 
+    // [inline] - a contract, not a hint: every direct call site gets the body spliced in
+    // (Program::patchInline, ast_inline.cpp), and a shape the inliner can't handle is a
+    // compilation error reported here at lint (post-infer, so generics check per-instantiation)
+    struct InlineFunctionAnnotation : MarkFunctionAnnotation {
+        InlineFunctionAnnotation() : MarkFunctionAnnotation("inline") { }
+        virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, string &) override {
+            func->mustInline = true;
+            return true;
+        };
+        virtual bool lint(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &,
+                const AnnotationArgumentList &, string & err) override {
+            return checkInlineShape(func, err) && checkInlineRecursion(func, err);
+        }
+    };
+
     struct RequestNoDiscardFunctionAnnotation : MarkFunctionAnnotation {
         RequestNoDiscardFunctionAnnotation() : MarkFunctionAnnotation("nodiscard") { }
         virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, string &) override {
@@ -1976,6 +1991,7 @@ namespace das
         addAnnotation(new HintFunctionAnnotation());
         addAnnotation(new RequestJitFunctionAnnotation());
         addAnnotation(new RequestNoJitFunctionAnnotation());
+        addAnnotation(new InlineFunctionAnnotation());
         addAnnotation(new RequestNoDiscardFunctionAnnotation());
         addAnnotation(new DeprecatedFunctionAnnotation());
         addAnnotation(new AliasCMRESFunctionAnnotation());

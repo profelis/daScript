@@ -65,6 +65,7 @@ Disables all optimizations.
 Allows float optimizations with major bit differences (x*0, x-x, reciprocal division, NaN-compare flips, reassociation); also stamps JIT fast-math flags. Doubles stay bit-exact unless enabled.
 Disables the dead-store-elimination optimizer pass. Host-side counterpart of ``options disable_dse`` (the option overrides the policy).
 Disables the common-subexpression-elimination optimizer pass. Host-side counterpart of ``options disable_cse`` (the option overrides the policy).
+Disables ``[inline]`` splicing - annotated calls stay regular calls. The declaration-level contract checks (body shape, recursion through the inline graph, taking the address) still run; call-site splice checks do not apply, since nothing splices. Host-side counterpart of ``options disable_inline`` (the option overrides the policy).
 Disables infer-time constant folding.
 Fails compilation if AOT is not available.
 Fails compilation if AOT export is not available.
