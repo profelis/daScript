@@ -1065,6 +1065,14 @@ def create_session(w : WhisperModel; lang : string = "en") : WhisperSession {
         if (s.lang_id < 0) {
             panic("dasLLAMA whisper: unknown language '{lang}'")
         }
+        if (!w.multilingual && lang != "en") {
+            panic("dasLLAMA whisper: this model is English-only — lang=\"{lang}\" is not available")
+        }
+        // the language token is tok_sot+1+lang_id — an id past n_lang lands on the shifted
+        // task tokens (translate/transcribe) and silently corrupts the prompt
+        if (int64(s.lang_id) >= w.n_lang) {
+            panic("dasLLAMA whisper: this model has {w.n_lang} languages — '{lang}' (id {s.lang_id}) needs the large-v3 family")
+        }
     }
     s.es <- make_encoder_state(w.enc)
     s.ds <- make_decoder_state(w)

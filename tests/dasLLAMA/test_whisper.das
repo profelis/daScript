@@ -201,8 +201,11 @@ def test_asr_surface(t : T?) {
         var m <- load_asr_model(model_path)   // the sniff route: ggml magic + big vocab -> whisper
         t |> equal(m.whisper.n_vocab, 51865l, "loaded through the sniff")
         let c <- caps(m)
-        t |> equal(length(c.languages), 100, "multilingual: the full g_lang list")
+        // honest caps: tiny is a 99-language model (n_vocab 51865) — "yue" (id 99) only exists
+        // on the large-v3 family; advertising it here would build a colliding language token
+        t |> equal(length(c.languages), 99, "trimmed to the model's n_lang")
         t |> equal(c.languages[0], "en")
+        t |> equal(c.languages[98], "su", "list ends before yue")
         t |> success(c.translate, "translate")
         t |> success(c.timestamps == AsrTimestamps.segment, "segment timestamps")
         t |> success(!c.streaming, "no native streaming")

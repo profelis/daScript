@@ -121,9 +121,10 @@ def load_asr_model(path : string; mmproj : string) : AsrModel {
     return <- m
 }
 
-//! What this model supports. Whisper: 100 languages (or English-only for *.en models),
-//! translation on multilingual models, segment timestamps. Qwen3-ASR: the model detects and
-//! reports the language itself (``detected_lang``), no timestamps, context biasing via
+//! What this model supports. Whisper: the model's own language set (99, or 100 on the
+//! large-v3 family which adds Cantonese; English-only for *.en models), translation on
+//! multilingual models, segment timestamps. Qwen3-ASR: the model detects and reports the
+//! language itself (``detected_lang``), no timestamps, context biasing via
 //! ``AsrSession.context``.
 def caps(m : AsrModel) : AsrCaps {
     if (m.kind == AsrKind.qwen3a) {
@@ -142,6 +143,9 @@ def caps(m : AsrModel) : AsrCaps {
                     prompt = false)
     if (m.whisper.multilingual) {
         c.languages <- whisper_lang_list()
+        if (int64(length(c.languages)) > m.whisper.n_lang) {   // 99-lang models predate "yue"
+            c.languages |> resize(int(m.whisper.n_lang))
+        }
     } else {
         c.languages <- ["en"]
     }
