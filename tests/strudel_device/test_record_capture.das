@@ -88,5 +88,8 @@ def test_record_to_wav_roundtrip(t : T?) {
         t |> equal(got_channels, 1)
         t |> equal(length(samples), int(float(rate) * seconds))   // exact-length capping: 0.2s * 16000 = 3200 frames
         remove(path)
+        // a write failure must propagate: an unwritable output path returns false (not a silent success)
+        t |> success(!record_to_wav("/nonexistent_dir_xyzzy_das/rec.wav", 0.05, rate, 1),
+            "record_to_wav returns false when the WAV cannot be written")
     }
 }

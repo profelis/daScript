@@ -109,27 +109,31 @@ def read_wav_u32(data : array<uint8>; var cursor : int&) : uint {
     return v
 }
 
-def public write_wav(fname : string; samples : array<float>; sample_rate : uint = 44100u; channels : int = 2) {
-    //! Write float samples as a 16-bit PCM WAV file.
+def public write_wav(fname : string; samples : array<float>; sample_rate : uint = 44100u; channels : int = 2) : bool {
+    //! Write float samples as a 16-bit PCM WAV file. Returns false if the output file could not be opened for writing.
+    var wrote = false
     fopen(fname, "wb") $(f) {
-        if (f == null) return
-        let numFrames = length(samples) / channels
-        let dataSize = uint(numFrames * channels * 2)
-        fwrite(f, "RIFF")
-        fwrite(f, 36u + dataSize)
-        fwrite(f, "WAVE")
-        fwrite(f, "fmt ")
-        fwrite(f, 16u)
-        fwrite(f, uint16(1))
-        fwrite(f, uint16(channels))
-        fwrite(f, sample_rate)
-        fwrite(f, sample_rate * uint(channels) * 2u)
-        fwrite(f, uint16(channels * 2))
-        fwrite(f, uint16(16))
-        fwrite(f, "data")
-        fwrite(f, dataSize)
-        for (s in samples) {
-            fwrite(f, int16(clamp(s, -1.0, 1.0) * 32767.0))
+        if (f != null) {
+            wrote = true
+            let numFrames = length(samples) / channels
+            let dataSize = uint(numFrames * channels * 2)
+            fwrite(f, "RIFF")
+            fwrite(f, 36u + dataSize)
+            fwrite(f, "WAVE")
+            fwrite(f, "fmt ")
+            fwrite(f, 16u)
+            fwrite(f, uint16(1))
+            fwrite(f, uint16(channels))
+            fwrite(f, sample_rate)
+            fwrite(f, sample_rate * uint(channels) * 2u)
+            fwrite(f, uint16(channels * 2))
+            fwrite(f, uint16(16))
+            fwrite(f, "data")
+            fwrite(f, dataSize)
+            for (s in samples) {
+                fwrite(f, int16(clamp(s, -1.0, 1.0) * 32767.0))
+            }
         }
     }
+    return wrote
 }

@@ -32,8 +32,8 @@ def public sound_record_list_devices() : array<AudioDeviceInfo> {
 
 def public record_to_wav(fname : string; seconds : float; rate : int = 44100; channels : int = 1; device_index : int = -1) : bool {
     //! Record `seconds` of audio from the microphone into a 16-bit PCM WAV file. Blocks until done.
-    //! Returns false (and writes nothing) on invalid arguments, if a recording is already active, or
-    //! if the device fails to open, produces no audio, or stalls mid-capture.
+    //! Returns false (and writes nothing) on invalid arguments, if a recording is already active, if
+    //! the device fails to open, produces no audio, or stalls mid-capture, or if the WAV cannot be written.
     // invalid args or an already-active recording short-circuit before sound_record_start, so this never panics
     return false if (seconds <= 0.0 || rate <= 0 || channels <= 0 || sound_is_recording() || !sound_record_start(rate, channels, rate, device_index))
     var samples : array<float>
@@ -67,6 +67,5 @@ def public record_to_wav(fname : string; seconds : float; rate : int = 44100; ch
     sound_record_stop()
     // don't leave a partial/empty WAV: stalled mid-capture, or the device produced nothing
     return false if (!completed || got_frames == 0)
-    write_wav(fname, samples, uint(rate), channels)
-    return true
+    return write_wav(fname, samples, uint(rate), channels)   // false if the output path is unwritable
 }
