@@ -38,6 +38,20 @@ timestamps), Qwen3-ASR (LLM-style ASR), Parakeet (streaming transducer), and the
 audio-chat family (soft-token splice into chat sessions). Facade placement, segment/result
 shapes, naming. Then implement. Tutorials + mic example follow this.
 
+Settled so far (2026-07-06): uniform `load_asr_model(path[, mmproj])` — format sniffed
+(GGUF magic vs ggml-bin; whisper-vs-parakeet bins share the magic, disambiguate on
+n_vocab ≥ 51864 vs ~1k), per-family loaders demote to plumbing, one verb set with internal
+dispatch. `caps(m : AsrModel) : AsrCaps` (languages / translate / timestamps
+none-segment-word / streaming / prompt) — advisory; invalid options still panic loudly,
+never silently ignore.
+
+**Also in this session: `caps` for LLMs** (Boris: "it's on us regardless — buck stops
+here"). The known silent gap: gemma has no system role and the chat layer absorbs the
+system prompt without telling anyone. `caps(m : Model) : LlmCaps` declared by each arch
+registration (the registry already owns templates/stop tokens — caps live beside them):
+system_prompt support at minimum; grow honestly as gaps surface (audio-tower attach,
+thinking variants) rather than speculatively.
+
 ## Session C — Qwen3-ASR (0.6B dev, 1.7B validate)
 
 qwen3 decoder (registered) + a NEW audio encoder: mtmd's `qwen3a` graph — 128-mel input
