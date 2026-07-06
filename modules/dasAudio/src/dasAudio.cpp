@@ -282,7 +282,6 @@ static bool g_capture_context_inited = false;
 static ma_device g_capture_device;
 static ma_pcm_rb g_capture_rb;
 static bool g_capture_initialized = false;
-static int g_capture_rate = 0;
 static int g_capture_channels = 0;
 // Frames dropped because the ring was full when the callback tried to write (drain loop too slow).
 // Written on the audio thread, read on the main thread — atomic to stay data-race-clean under TSAN.
@@ -292,7 +291,16 @@ static std::atomic<uint64_t> g_capture_overflow_frames { 0 };
 static vector<ma_device_info> g_capture_device_cache;
 
 void dasAudio_set_null_device ( bool enabled ) {
+    if ( enabled == g_force_null_backend ) return;
     g_force_null_backend = enabled;
+    // The persistent capture context was built for the old backend; drop it while idle so the next
+    // enumeration/record rebuilds it on the newly-selected backend. Skip if actively recording (the
+    // live device sits on this context) — toggling the backend mid-capture is a no-op until stop.
+    if ( g_capture_context_inited && !g_capture_initialized ) {
+        ma_context_uninit(&g_capture_context);
+        g_capture_context_inited = false;
+        g_capture_device_cache.clear();
+    }
 }
 
 bool dasAudio_is_single_threaded () {
@@ -481,7 +489,6 @@ bool dasAudio_record_start ( int32_t rate, int32_t channels, int32_t rb_frames, 
         ma_pcm_rb_uninit(&g_capture_rb);
         return false;
     }
-    g_capture_rate = rate;
     g_capture_channels = channels;
     g_capture_initialized = true;   // set before start: the callback may fire immediately
     if ( ma_device_start(&g_capture_device) != MA_SUCCESS ) {
