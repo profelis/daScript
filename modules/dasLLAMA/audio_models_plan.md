@@ -74,11 +74,16 @@ joint net + TDT greedy loop (token+duration, frame-skipping). Oracle: whisper.cp
 has `parakeet-cli` BUILT in-tree (+ convert-parakeet-to-ggml.py, .nemo downloaded,
 test-parakeet-full-jfk as reference). Streaming-native — the natural mic-example backend.
 
-## Session E — mic example + tutorials
+## Session E — tutorials
 
-**Mic demo runs on Parakeet** (Boris's call — streaming-native, no 30 s window latency),
-so E depends on D, plus dasAudio capture (PR #3388) and the session-B API. Tutorials
-document the settled surface across ASR + audio-chat.
+NOT blocked on the mic demo: tutorials document the settled session-B surface across ASR
++ audio-chat as the model sessions land. Do these, then wait.
+
+## Session F — mic demo (Parakeet)
+
+**Runs on Parakeet** (Boris's call — streaming-native, no 30 s window latency). Separate
+section, gated: needs session D AND dasAudio capture (PR #3388) MERGED — do tutorials
+first, wait for the merge, then this.
 
 ## Status
 
@@ -87,8 +92,9 @@ document the settled surface across ASR + audio-chat.
 - [ ] A. Qwen2.5-Omni 3B/7B — GGUFs downloading
 - [ ] B. API discussion + implementation
 - [ ] C. Qwen3-ASR 0.6B/1.7B
-- [ ] D. Parakeet-TDT 0.6b-v2 — .nemo downloading
-- [ ] E. mic example + tutorials
+- [ ] D. Parakeet-TDT 0.6b-v2 — .nemo downloaded
+- [ ] E. tutorials (not blocked on mic)
+- [ ] F. mic demo (Parakeet; after #3388 merges)
 
 ## Findings
 
