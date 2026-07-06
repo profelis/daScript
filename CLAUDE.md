@@ -35,6 +35,8 @@ Same applies to lint/format: `mcp__daslang__lint` / `format_file`, not shell `bi
 
 Fall back to `Bash`/`Grep`/`Read` only when the MCP tool reports an error or the question is genuinely outside MCP coverage (RST prose, CMake, Python tooling).
 
+**Cross-tree guard (#3392):** when you work in a git worktree, MCP tool results and LSP diagnostics prepend a `CROSS-TREE WARNING` if you query a file **outside the server's own tree** — that answer used the *wrong* tree's module sources AND that binary's compiled-in C++ bindings, so it's likely stale (missing symbols, outdated signatures). Heed it, don't trust cross-tree output: run the session *inside* the worktree (its checked-in `.claude/skills/daslang-lsp` gives correct diagnostics; `daslang utils/mcp/setup.das -- --root <worktree>` bootstraps its MCP tools). A main-tree-rooted session can never give correct diagnostics for a worktree file.
+
 ## Skill Files (REQUIRED)
 
 Task-specific instructions are split into skill files under `skills/`. You MUST read the relevant skill file(s) before performing the corresponding task.
