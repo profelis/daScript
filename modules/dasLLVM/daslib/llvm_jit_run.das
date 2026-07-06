@@ -37,7 +37,8 @@ let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x37ul   // x64_avx AVX kernel-matrix ti
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
-// `options _jit_fast_math = true` stamps every FP instruction with all fast-math flags before opt — lets
+// `options fast_math = true` (or policies.fast_math; `_jit_fast_math` is a legacy alias) stamps every FP
+// instruction with all fast-math flags before opt — lets
 // reductions reassociate/vectorize and FP contract everywhere. NON-bit-exact, but this is the same FP
 // laxity llama.cpp/ggml already runs with (hand-coded FMA + ~2ulp poly exp + reassociated SIMD reductions;
 // ggml CPU is just -O3, no -ffast-math flag — it hand-writes the equivalent). Measured greedy-STABLE on
@@ -308,7 +309,8 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
 
     // Set global options
     LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS = prog._options |> find_arg("jit_vec3_ldu") ?as tBool ?? LLVM_JIT_ALLOW_UNALIGNED_VECTOR_READ_OUT_OF_BOUNDS_DEFAULT
-    g_jit_fast_math = prog._options |> find_arg("_jit_fast_math") ?as tBool ?? false
+    // `options fast_math` (or policies.fast_math) is the one knob; `_jit_fast_math` kept as a legacy alias
+    g_jit_fast_math = (prog._options |> find_arg("fast_math") ?as tBool ?? prog.policies.fast_math) || (prog._options |> find_arg("_jit_fast_math") ?as tBool ?? false)
 
     make_visitor(*disableJitVisitor) $(disableJitVisitorAdapter) {
         prog |> for_each_module() $(mod) {

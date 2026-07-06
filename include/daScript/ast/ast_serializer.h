@@ -220,8 +220,8 @@ namespace das {
         AstSerializer & operator << ( Module & module );
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
-        static constexpr uint32_t getVersion () { 
-            return 94;   // 94: Module::promotedRequire (shared-module canonical require identity) added
+        static constexpr uint32_t getVersion () {
+            return 95;   // 95: CodeOfPolicies::fast_math added
         }
 
         void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;
