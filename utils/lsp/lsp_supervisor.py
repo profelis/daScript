@@ -84,6 +84,22 @@ def find_compiler(init_options: dict) -> str | None:
     return shutil.which("daslang")
 
 
+def git_tree_root(start_dir: str | None) -> str | None:
+    """Nearest ancestor of start_dir holding a `.git` entry — a directory in the main tree,
+    a file in a linked worktree; os.path.exists catches both. None if none is found."""
+    if not start_dir:
+        return None
+    d = os.path.abspath(start_dir)
+    for _ in range(64):
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        up = os.path.dirname(d)
+        if up == d:
+            return None
+        d = up
+    return None
+
+
 class Server:
     def __init__(self):
         self.docs: dict[str, str] = {}
@@ -194,6 +210,11 @@ class Server:
         except Exception:
             tail = (err.decode("utf-8", "replace").strip() or text)[-400:]
             diags = [self.tool_diagnostic(f"daslang validate crashed: {tail}")]
+        # Flag cross-tree files: a clean compile in the WRONG worktree's binder is the most
+        # misleading case, so this is prepended even when diags is empty.
+        xt = self.crosstree_diagnostic(path)
+        if xt:
+            diags = [xt] + diags
         self.publish_if_current(uri, my_gen, diags)
 
     def publish_if_current(self, uri: str, my_gen: int, diags: list) -> None:
@@ -208,6 +229,41 @@ class Server:
         return {"range": {"start": {"line": 0, "character": 0},
                           "end": {"line": 0, "character": 1}},
                 "severity": 1, "source": "daslang-lsp", "message": message}
+
+    def crosstree_diagnostic(self, path: str) -> dict | None:
+        """Warning when `path` lives in a different git worktree than the daslang binary serving
+        it — that binary's compiled-in C++ bindings AND its module resolution come from its own
+        tree, so diagnostics here may be stale/wrong (missing symbols, outdated signatures).
+        Suppressed when -project_root is set and the file is under it (deliberate external-module
+        scoping)."""
+        binary_root = git_tree_root(os.path.dirname(self.compiler)) if self.compiler else None
+        file_root = git_tree_root(os.path.dirname(path))
+        if not binary_root or not file_root or binary_root == file_root:
+            return None
+        pr = self.init_options.get("project_root")
+        if pr:
+            # commonpath (normcased for Windows) handles the drive-root / trailing-separator / component-
+            # boundary edges a startswith(pr + sep) prefix check gets wrong; cross-drive -> ValueError.
+            try:
+                pr_abs = os.path.normcase(os.path.abspath(pr))
+                if os.path.commonpath([os.path.normcase(os.path.abspath(path)), pr_abs]) == pr_abs:
+                    return None
+            except ValueError:
+                pass
+        has = lambda rel: os.path.exists(os.path.join(file_root, rel))
+        if has("bin/daslang") or has("bin/daslang.exe"):
+            hint = (f"that worktree is bootstrapped — open a session rooted in {file_root}"
+                    if has(".mcp.json") else
+                    f"that worktree has a binary but no MCP config — run "
+                    f"`daslang utils/mcp/setup.das -- --root {file_root} --no-build`")
+        else:
+            hint = f"that worktree isn't bootstrapped — run `daslang utils/mcp/setup.das -- --root {file_root}`"
+        d = self.tool_diagnostic(
+            f"CROSS-TREE: this file is in a different git worktree ({file_root}) than the daslang "
+            f"binder serving it ({binary_root}). Diagnostics use that tree's module sources and its "
+            f"binary's compiled-in C++ bindings, so they may be STALE or wrong here. {hint}.")
+        d["severity"] = 2  # warning, not error
+        return d
 
     def write_overlay(self, uri: str | None) -> str | None:
         """Document-shadow text -> temp file for the subtool's --overlay flag.
