@@ -9,9 +9,10 @@ require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
 
-// Whisper-family audio frontend: 16 kHz mono PCM -> log-mel chunks, exactly mirroring
-// llama.cpp's mtmd_audio_preprocessor_whisper (tools/mtmd/mtmd-audio.cpp) so the encoder
-// sees oracle-identical input. The 400-point DFT is two GEMM columns of a precomputed
+// Whisper-family audio frontend: 16 kHz mono PCM -> log-mel chunks, in two oracle-exact
+// flavors: log_mel_chunks mirrors llama.cpp mtmd (tools/mtmd/mtmd-audio.cpp, qwen2a tower),
+// log_mel_whisper mirrors whisper.cpp's log_mel_spectrogram (different padding/floor/fill
+// rules — see whisper_plan.md). The 400-point DFT is two GEMM columns of a precomputed
 // twiddle matrix (minfft is pow2-only, and 400 = 2^4*25 is not) — see qwen2_audio_plan.md.
 
 let AUDIO_SAMPLE_RATE = 16000l
@@ -53,6 +54,29 @@ def gelu_erf(var x : float?; size : int64) {
 def gelu_erf(var x : array<float> | #; size : int64) {
     if (size <= 0l) return
     gelu_erf(unsafe(addr(x[0])), size)
+}
+
+//! whisper.cpp's ggml_gelu flavor (GGML_GELU_FP16): tanh approximation evaluated through an
+//! fp16 lookup table — input and output both round-trip through binary16, with ±10 clamps
+//! applied BEFORE the conversion. Bit-exact vs ggml's CPU path. In place over ``size``.
+def gelu_tanh_lut(var x : float?; size : int64) {
+    unsafe {
+        for (i in range64(size)) {
+            let v = x[i]
+            if (v <= -10.0) {
+                x[i] = 0.0
+            } elif (v < 10.0) {  // v >= 10 passes through unchanged
+                let xr = f16_to_f32(f32_to_f16(v))
+                let g = 0.5 * xr * (1.0 + tanh(0.79788456080286535587989211986876 * xr * (1.0 + 0.044715 * xr * xr)))
+                x[i] = f16_to_f32(f32_to_f16(g))
+            }
+        }
+    }
+}
+
+def gelu_tanh_lut(var x : array<float> | #; size : int64) {
+    if (size <= 0l) return
+    gelu_tanh_lut(unsafe(addr(x[0])), size)
 }
 
 //! Hann window of length ``n`` (periodic when ``periodic``), float-exact vs mtmd's
@@ -227,6 +251,123 @@ def log_mel_chunks(samples : array<float> | #; n_mel : int64) : array<MelChunk> 
     return <- chunks
 }
 
+//! Full-length whisper.cpp-style log-mel spectrogram: total frame count (audio + the 30 s
+//! zero tail), the real-audio frame count (``n_len_org`` = the driver's seek_end), and
+//! mel-major ``[n_mel][n_len]`` data.
+struct WhisperMel {
+    n_mel : int64
+    n_len : int64
+    n_len_org : int64
+    data : array<float>
+}
+
+//! whisper.cpp's ``log_mel_spectrogram`` — DIVERGES from the mtmd flavor above: reflect-200
+//! head from the RAW input (no 31 s pre-extend), 30 s zeros + 200 tail, n_len drops the last
+//! frame, frames past the real audio skip the FFT (every bin = log10(1e-10)), floor 1e-10,
+//! filterbank comes from the model file. Same global max−8 clamp + (x+4)/4.
+def log_mel_whisper(samples : array<float> | #; filters : array<float>; n_mel : int64) : WhisperMel {
+    let n_in = int64(length(samples))
+    let head = AUDIO_N_FFT / 2l                            // 200
+    let n_padded = n_in + AUDIO_SAMPLE_RATE * 30l + 2l * head
+    var padded : array<float>
+    padded |> resize(int(n_padded))                        // resize zero-fills (the whole tail)
+    for (i in range(int(n_in))) {
+        padded[int(head) + i] = samples[i]
+    }
+    let nref = min(head, max(n_in - 1l, 0l))               // whisper.cpp reads samples[1..200] unguarded
+    for (i in range64(nref)) {
+        padded[head - 1l - i] = samples[i + 1l]
+    }
+
+    var m = WhisperMel(n_mel = n_mel)
+    m.n_len = (n_padded - AUDIO_N_FFT) / AUDIO_HOP         // "remove the last frame"
+    m.n_len_org = 1l + (n_in + head - AUDIO_N_FFT) / AUDIO_HOP
+    m.data |> resize(int(n_mel * m.n_len))
+
+    // frames whose window starts inside the real (head-padded) audio get the FFT; the rest
+    // are pure zero-tail and fill with log10(1e-10) directly
+    let n_fft = AUDIO_N_FFT
+    let n_bins = n_fft / 2l + 1l
+    let n_compute = min((n_in + head) / AUDIO_HOP + 1l, m.n_len)
+    let hann <- build_hann_window(n_fft)
+    let twiddles <- build_dft_twiddles(n_fft)
+
+    var xw : array<float>
+    xw |> resize(int(n_compute * n_fft))
+    for (i in range64(n_compute)) {
+        let off = i * AUDIO_HOP
+        for (j in range64(n_fft)) {
+            xw[i * n_fft + j] = hann[j] * padded[off + j]
+        }
+    }
+    var reim : array<float>
+    reim |> resize(int(n_compute * n_bins * 2l))
+    gemm_f32(unsafe(addr(reim[0])), unsafe(addr(xw[0])), unsafe(addr(twiddles[0])),
+             n_compute, n_fft, n_bins * 2l)
+
+    // power -> mel: float products in groups of 4 summed in float, each group added to a
+    // double accumulator — whisper.cpp's exact unrolled accumulation
+    let log10_e = 0.43429448190325176lf
+    let fill = float(log(1e-10lf) * log10_e)
+    var power : array<float>
+    power |> resize(int(n_bins))
+    for (i in range64(n_compute)) {
+        for (k in range64(n_bins)) {
+            let re = reim[i * n_bins * 2l + k * 2l]
+            let im = reim[i * n_bins * 2l + k * 2l + 1l]
+            power[k] = re * re + im * im
+        }
+        for (j in range64(n_mel)) {
+            var sum = 0.0lf
+            var k = 0l
+            while (k + 3l < n_bins) {
+                sum += double(power[k] * filters[j * n_bins + k]
+                    + power[k + 1l] * filters[j * n_bins + k + 1l]
+                    + power[k + 2l] * filters[j * n_bins + k + 2l]
+                    + power[k + 3l] * filters[j * n_bins + k + 3l])
+                k += 4l
+            }
+            while (k < n_bins) {
+                sum += double(power[k] * filters[j * n_bins + k])
+                k += 1l
+            }
+            m.data[j * m.n_len + i] = float(log(max(sum, 1e-10lf)) * log10_e)
+        }
+    }
+    for (i in range64(n_compute, m.n_len)) {
+        for (j in range64(n_mel)) {
+            m.data[j * m.n_len + i] = fill
+        }
+    }
+
+    // global max−8 clamp + (x+4)/4, double math over float storage (same as the mtmd flavor)
+    var mmax = -1e20lf
+    for (v in m.data) {
+        mmax = max(mmax, double(v))
+    }
+    mmax -= 8.0lf
+    for (v in m.data) {
+        let clamped = double(v) < mmax ? float(mmax) : v
+        v = float((double(clamped) + 4.0lf) / 4.0lf)
+    }
+    return <- m
+}
+
+//! Slice one 3000-frame encoder window starting at mel frame ``seek``; frames past
+//! ``m.n_len`` zero-fill (whisper.cpp's conv-input copy).
+def whisper_mel_window(m : WhisperMel; seek : int64) : MelChunk {
+    var c = MelChunk(n_mel = m.n_mel, n_len = AUDIO_CHUNK_FRAMES)
+    c.data |> resize(int(m.n_mel * AUDIO_CHUNK_FRAMES))
+    let i0 = min(seek, m.n_len)
+    let i1 = min(seek + AUDIO_CHUNK_FRAMES, m.n_len)
+    for (j in range64(m.n_mel)) {
+        for (i in range64(i1 - i0)) {
+            c.data[j * AUDIO_CHUNK_FRAMES + i] = m.data[j * m.n_len + i0 + i]
+        }
+    }
+    return <- c
+}
+
 // ===== Whisper encoder tower (fp32 bring-up; q8 fast path is ledgered) =====
 
 //! The audio tower: Whisper encoder weights + the Qwen2-Audio linear projector, all fp32 in
@@ -239,7 +380,8 @@ struct AudioTower {
     n_layer : int64
     n_ff : int64
     n_ctx : int64      // encoder positions per chunk (1500 = 3000 mel frames / conv stride 2)
-    proj_dim : int64   // decoder embedding width the projector maps into
+    proj_dim : int64   // decoder embedding width the projector maps into (0 = no projector)
+    gelu_tanh : bool = false  // whisper.cpp oracle uses the tanh-fp16-LUT gelu; mtmd uses erf
     eps : float = 1e-5
     fblob : array<float>
     conv1_w_off : int64
@@ -324,8 +466,9 @@ def layernorm(var o : float?; x, w, b : float const?; size : int64; eps : float)
     }
 }
 
-// Threaded per-position layernorm over token-major rows (rms_batch's shape, LN math).
-def private layernorm_batch(var out : array<float>; src : array<float>; blob : array<float>; w_off, b_off, dim, npos : int64; eps : float) {
+//! Threaded per-position layernorm over token-major rows (rms_batch's shape, LN math),
+//! weight/bias read from ``blob`` at the given offsets.
+def layernorm_batch(var out : array<float>; src : array<float>; blob : array<float>; w_off, b_off, dim, npos : int64; eps : float) {
     unsafe {
         var op = addr(out[0])
         let ip = reinterpret<float const?>(addr(src[0]))
@@ -342,8 +485,8 @@ def private layernorm_batch(var out : array<float>; src : array<float>; blob : a
     }
 }
 
-// y[p] += blob[b_off .. b_off+d) for every row (projection bias)
-def private add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
+//! y[p] += blob[b_off .. b_off+d) for every row (projection bias)
+def add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
     for (p in range64(npos)) {
         for (i in range64(d)) {
             y[p * d + i] += blob[b_off + i]
@@ -351,15 +494,15 @@ def private add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, n
     }
 }
 
-// x += r, elementwise (residual)
-def private add_inplace_rows(var x : array<float>; r : array<float>; n : int64) {
+//! x += r, elementwise (residual)
+def add_inplace_rows(var x : array<float>; r : array<float>; n : int64) {
     for (i in range64(n)) {
         x[i] += r[i]
     }
 }
 
-// fp32 matmul against a blob region: Y [npos×d] = W[d×n]·X[npos×n] (threaded matmul_batch)
-def private mm_blob_b(var y : array<float>; blob : array<float>; woff : int64; x : array<float>; n, d, npos : int64) {
+//! fp32 matmul against a blob region: Y [npos×d] = W[d×n]·X[npos×n] (threaded matmul_batch)
+def mm_blob_b(var y : array<float>; blob : array<float>; woff : int64; x : array<float>; n, d, npos : int64) {
     array_view(blob, woff, n * d) $(w : array<float>#) {
         matmul_batch(y, w, x, n, d, npos)
     }
@@ -604,9 +747,20 @@ def private diff_stage(name : string; x : array<float>; n : int64) {
     fclose(f)
 }
 
-//! Run the Whisper encoder + Qwen2-Audio projector over one 30 s mel chunk. Output lands in
-//! ``s.out``: ``n_ctx/2`` soft tokens × ``proj_dim`` (750 × decoder-dim for whisper-large-v3).
-def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
+// t.gelu_tanh selects the oracle-exact activation flavor (see gelu_tanh_lut)
+def private enc_gelu(t : AudioTower; var x : array<float>; size : int64) {
+    if (t.gelu_tanh) {
+        gelu_tanh_lut(x, size)
+    } else {
+        gelu_erf(x, size)
+    }
+}
+
+//! The shared Whisper-encoder core over one 30 s mel chunk: conv frontend, +pos rows, all
+//! pre-LN transformer blocks. Leaves the residual stream in ``s.x`` (``n_ctx × d_model``);
+//! the model-specific tail (whisper: ln_post; qwen2a: pool → ln_post → projector) is the
+//! caller's.
+def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     if (mel.n_len != AUDIO_CHUNK_FRAMES || mel.n_mel != t.n_mel) {
         panic("audio_encode: mel chunk is {mel.n_mel}x{mel.n_len}, want {t.n_mel}x{AUDIO_CHUNK_FRAMES}")
     }
@@ -628,7 +782,7 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     }
     mm_blob_b(s.y1, t.fblob, t.conv1_w_off, s.x1, 3l * nm, d, tin)
     add_bias_rows(s.y1, t.fblob, t.conv1_b_off, d, tin)
-    gelu_erf(s.y1, tin * d)
+    enc_gelu(t, s.y1, tin * d)
 
     // conv2 k3 s2 same -> T = tin/2 positions
     for (i in range64(tt)) {
@@ -643,7 +797,7 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     }
     mm_blob_b(s.x, t.fblob, t.conv2_w_off, s.x2, 3l * d, d, tt)
     add_bias_rows(s.x, t.fblob, t.conv2_b_off, d, tt)
-    gelu_erf(s.x, tt * d)
+    enc_gelu(t, s.x, tt * d)
 
     // + learned/sinusoidal position rows (loaded from the mmproj)
     for (i in range64(tt * d)) {
@@ -677,7 +831,7 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln2_w, lo.ln2_b, d, tt, t.eps)
         mm_blob_b(s.h, t.fblob, lo.fc1_w, s.xb, d, t.n_ff, tt)
         add_bias_rows(s.h, t.fblob, lo.fc1_b, t.n_ff, tt)
-        gelu_erf(s.h, tt * t.n_ff)
+        enc_gelu(t, s.h, tt * t.n_ff)
         mm_blob_b(s.xb2, t.fblob, lo.fc2_w, s.h, t.n_ff, d, tt)
         add_bias_rows(s.xb2, t.fblob, lo.fc2_b, d, tt)
         add_inplace_rows(s.x, s.xb2, tt * d)
@@ -686,6 +840,14 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
         }
     }
     diff_stage("after_blocks", s.x, tt * d)
+}
+
+//! Run the Whisper encoder + Qwen2-Audio projector over one 30 s mel chunk. Output lands in
+//! ``s.out``: ``n_ctx/2`` soft tokens × ``proj_dim`` (750 × decoder-dim for whisper-large-v3).
+def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
+    audio_encode_blocks(t, s, mel)
+    let tt = t.n_ctx
+    let d = t.d_model
 
     // avg-pool pairs over time (BEFORE the post-LN — mtmd build_vit order), then ln_post
     let tp = tt / 2l
