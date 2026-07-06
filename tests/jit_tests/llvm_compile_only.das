@@ -20,7 +20,12 @@ def test_jit_compile_only(t : T?) {
     let args <- get_command_line_arguments()  // locked view — do not delete
     let bin = args[0]
     let client = "{get_this_module_dir()}/llvm_compile_only_client.das"
-    let cmd = "\"{bin}\" -jit \"{client}\" -- --jit-compile-only"
+    // cmd.exe /c strips the first and last quote of a line that starts with a quote —
+    // wrap in a sacrificial outer pair on windows (same trap as the daspkg popen incident)
+    var cmd = "\"{bin}\" -jit \"{client}\" -- --jit-compile-only"
+    if (get_platform_name() == "windows") {
+        cmd = "\"{cmd}\""
+    }
     var sawCompileOnly = false
     var sawResult = false
     var sawDllCache = false

@@ -235,7 +235,7 @@ namespace das {
     // program
 
     bool Program::optimizationDeadStores(int32_t round) {
-        if ( options.getBoolOption("disable_dse", false) ) return false;
+        if ( options.getBoolOption("disable_dse", policies.disable_dse) ) return false;
         checkSideEffects();
         EliminateDeadStores pass(round);
         visit(pass);
