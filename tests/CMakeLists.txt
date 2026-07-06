@@ -2,23 +2,26 @@
 # `cmake --build build --target run_tests_<mode>`. Added from the root via
 # add_subdirectory(tests) after daslang exists. The test_aot binary itself is
 # built by tests/aot/CMakeLists.txt, include()d from the root earlier.
-# Each mode has a primary target (fast path, --timeout 900) and an _isolated
-# variant (--isolated-mode --timeout 3600, one context per test). CI chains them
-# as the flaky-test retry: `ninja run_tests_X || ninja run_tests_X_isolated`.
+# Each mode has a primary target (fast path) and an _isolated variant
+# (--isolated-mode, one context per test). CI chains them as the flaky-test
+# retry: `ninja run_tests_X || ninja run_tests_X_isolated`.
 # cmake has no OR/retry primitive inside a single target, so the `||` lives in CI.
+# NOTE: --timeout is dastest's GLOBAL suite watchdog (wall clock for the whole
+# run), not per test. The interpreter pair is sized for the slowest lane,
+# windows-32 Debug on the 4-core hosted runner (~16 min as of 2026-07).
 if(NOT DAS_TOOLS_DISABLED)
     set(_DAS_DASTEST  ${PROJECT_SOURCE_DIR}/dastest/dastest.das)
     set(_DAS_TEST_DIR ${PROJECT_SOURCE_DIR}/tests)
     set(_DAS_TEST_COMMON --color --failures-only --test ${_DAS_TEST_DIR})
 
     add_custom_target(run_tests_interpreter
-        COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -- ${_DAS_TEST_COMMON} --timeout 900
+        COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -- ${_DAS_TEST_COMMON} --timeout 1800
         DEPENDS daslang
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMENT "Running tests (interpreter)"
     )
     add_custom_target(run_tests_interpreter_isolated
-        COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -- ${_DAS_TEST_COMMON} --isolated-mode --timeout 3600
+        COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -- ${_DAS_TEST_COMMON} --isolated-mode --timeout 5400
         DEPENDS daslang
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMENT "Running tests (interpreter, isolated retry)"
