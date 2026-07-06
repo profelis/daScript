@@ -599,13 +599,11 @@ namespace das {
         return static_cast<ExprConstBool *>(e)->getValue()==v;
     }
 
-    // both expressions read the same variable (cheap structural equality; a full
-    // Expression::sameAs comparator is a planned follow-up)
-    static bool sameVariableRead ( Expression * a, Expression * b ) {
-        if ( !a || !b || !a->rtti_isVar() || !b->rtti_isVar() ) return false;
-        auto va = static_cast<ExprVar *>(a);
-        auto vb = static_cast<ExprVar *>(b);
-        return va->variable && va->variable==vb->variable && !va->write && !vb->write && va->r2v==vb->r2v;
+    // both subtrees are the same pure computation: structural equality
+    // (Expression::sameAs) plus side-effect freedom, so dropping or deduplicating an
+    // evaluation cannot lose observable work. `E op E` folds route through here.
+    static bool samePureValue ( Expression * a, Expression * b ) {
+        return a && b && a->noSideEffects && a->sameAs(b);
     }
 
     // inf-safe finiteness check without <cmath>: inf-inf and NaN-NaN are NaN
@@ -954,7 +952,7 @@ namespace das {
                         if ( auto neg = makeNegate(expr, R) ) { reportFolding(); return neg; }
                     }
                     // x - x → 0: changes inf/NaN results → fast_math for FP
-                    if ( sameVariableRead(L, R) && valueChangeOk(bt) ) {
+                    if ( samePureValue(L, R) && valueChangeOk(bt) ) {
                         if ( auto z = makeZeroConst(expr) ) { reportFolding(); return z; }
                     }
                 } else if ( expr->op=="/" && isNumericFamily(bt) ) {
@@ -978,15 +976,15 @@ namespace das {
                         if ( (zr && L->noSideEffects) || (zl && R->noSideEffects) ) {
                             if ( auto z = makeZeroConst(expr) ) { reportFolding(); return z; }
                         }
-                        if ( sameVariableRead(L,R) ) { reportFolding(); return L; }
+                        if ( samePureValue(L,R) ) { reportFolding(); return L; }
                     } else if ( expr->op=="|" ) {
                         if ( zr && lbt==bt ) { reportFolding(); return L; }
                         if ( zl && rbt==bt ) { reportFolding(); return R; }
-                        if ( sameVariableRead(L,R) ) { reportFolding(); return L; }
+                        if ( samePureValue(L,R) ) { reportFolding(); return L; }
                     } else {
                         if ( zr && lbt==bt ) { reportFolding(); return L; }
                         if ( zl && rbt==bt ) { reportFolding(); return R; }
-                        if ( sameVariableRead(L,R) ) {
+                        if ( samePureValue(L,R) ) {
                             if ( auto z = makeZeroConst(expr) ) { reportFolding(); return z; }
                         }
                     }
@@ -1122,8 +1120,9 @@ namespace das {
                     }
                 }
             }
-            // c ? a : a → a for same-variable arms (cheap structural equality)
-            if ( expr->subexpr->noSideEffects && sameVariableRead(expr->left, expr->right) ) {
+            // c ? a : a → a for same-shape arms. Arm purity is NOT required — exactly one
+            // arm evaluates before and after the fold; only the dropped condition must be pure
+            if ( expr->subexpr->noSideEffects && expr->left->sameAs(expr->right) ) {
                 reportFolding();
                 return expr->left;
             }

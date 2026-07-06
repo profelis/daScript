@@ -96,6 +96,50 @@ def target_reassoc(f : float) : float {
     return (f + 1.0) + 2.0
 }
 
+// ===== Expression::sameAs powered folds (same-shape operands beyond bare vars) =====
+
+struct SamePair {
+    a : int
+    b : int
+}
+
+var g_side = 0
+
+def bump_side() : int {
+    g_side ++
+    return g_side
+}
+
+[export]
+def target_xor_self_field(s : SamePair) : int {
+    return s.a ^ s.a // nolint:LINT007 -- deliberate: the fold under test
+}
+
+[export]
+def target_sub_self_swizzle(v : int2) : int {
+    return v.x - v.x // nolint:LINT007 -- deliberate: the fold under test
+}
+
+[export]
+def target_and_self_at(arr : int[4]; i : int) : int {
+    return arr[i] & arr[i] // nolint:LINT007 -- deliberate: the fold under test
+}
+
+[export]
+def target_tern_same_arms(c : bool; s : SamePair) : int {
+    return c ? s.b : s.b // nolint:LINT008 -- deliberate: the fold under test
+}
+
+[export]
+def target_sub_self_impure() : int {
+    return bump_side() - bump_side() // nolint:LINT007 -- deliberate: impure operands must NOT fold
+}
+
+[export]
+def target_sub_self_float(f : float) : float {
+    return f - f // nolint:LINT007 -- deliberate: stays without fast_math (inf/NaN)
+}
+
 def has(s, sub : string) : bool {
     return find(s, sub, 0) >= 0
 }
@@ -183,5 +227,56 @@ def test_identity_folds_fired(t : T?) {
             let b = body_of(t, "target_reassoc")
             t |> success(has(b, "1f") && has(b, "2f"), "chain not regrouped: {b}")
         }
+    }
+}
+
+[test]
+def test_same_as_folds_fired(t : T?) {
+    ast_gc_guard() {
+        t |> run("s.a ^ s.a becomes the zero constant") @(t : T?) {
+            let b = body_of(t, "target_xor_self_field")
+            t |> success(!has(b, "^"), "no `^` survives: {b}")
+            t |> success(has(b, "return 0"), "constant zero returned: {b}")
+        }
+        t |> run("v.x - v.x becomes the zero constant") @(t : T?) {
+            let b = body_of(t, "target_sub_self_swizzle")
+            t |> success(!has(b, "-"), "no `-` survives: {b}")
+            t |> success(has(b, "return 0"), "constant zero returned: {b}")
+        }
+        t |> run("arr[i] & arr[i] keeps a single read") @(t : T?) {
+            let b = body_of(t, "target_and_self_at")
+            t |> success(!has(b, "&"), "no `&` survives: {b}")
+            t |> success(has(b, "arr[i]"), "single indexed read kept: {b}")
+        }
+        t |> run("c ? s.b : s.b collapses to the arm") @(t : T?) {
+            let b = body_of(t, "target_tern_same_arms")
+            t |> success(!has(b, "?"), "no ternary survives: {b}")
+            t |> success(has(b, "s.b"), "arm kept: {b}")
+        }
+        t |> run("impure same-shape operands do NOT fold") @(t : T?) {
+            let b = body_of(t, "target_sub_self_impure")
+            t |> success(has(b, "bump_side"), "calls kept: {b}")
+            t |> success(has(b, "-"), "subtract kept: {b}")
+        }
+        t |> run("f - f stays OFF without fast_math") @(t : T?) {
+            let b = body_of(t, "target_sub_self_float")
+            t |> success(has(b, "f - f"), "float self-sub not folded: {b}")
+        }
+    }
+}
+
+[test]
+def test_same_as_folds_behavior(t : T?) {
+    t |> run("values preserved") @(t : T?) {
+        t |> equal(target_xor_self_field(SamePair(a = 77, b = 5)), 0)
+        t |> equal(target_sub_self_swizzle(int2(9, 4)), 0)
+        t |> equal(target_and_self_at(fixed_array(3, 5, 7, 9), 2), 7)
+        t |> equal(target_tern_same_arms(true, SamePair(a = 1, b = 42)), 42)
+        t |> equal(target_tern_same_arms(false, SamePair(a = 1, b = 42)), 42)
+    }
+    t |> run("impure operands evaluate exactly twice") @(t : T?) {
+        g_side = 0
+        t |> equal(target_sub_self_impure(), -1)
+        t |> equal(g_side, 2)
     }
 }

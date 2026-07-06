@@ -24,6 +24,11 @@ def target_sub_self_f(f : float) : float {
 }
 
 [export]
+def target_sub_self_swizzle_f(v : float2) : float {
+    return v.x - v.x // nolint:LINT007 -- deliberate: sameAs-shape fold under fast_math
+}
+
+[export]
 def target_rcp(f : float) : float {
     return f / 4.0
 }
@@ -67,6 +72,10 @@ def test_fast_math_folds_fired(t : T?) {
         }
         t |> run("f-f becomes the zero constant") @(t : T?) {
             let b = body_of(t, "target_sub_self_f")
+            t |> success(!has(b, "-"), "no `-` survives: {b}")
+        }
+        t |> run("v.x-v.x becomes the zero constant") @(t : T?) {
+            let b = body_of(t, "target_sub_self_swizzle_f")
             t |> success(!has(b, "-"), "no `-` survives: {b}")
         }
         t |> run("f/4.0 becomes multiply by reciprocal") @(t : T?) {

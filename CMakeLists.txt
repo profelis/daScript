@@ -835,6 +835,7 @@ src/ast/ast_typedecl.cpp
 src/ast/ast_match.cpp
 src/ast/ast_module.cpp
 src/ast/ast_print.cpp
+src/ast/ast_same.cpp
 src/ast/ast_program.cpp
 src/ast/ast_allocate_stack.cpp
 src/ast/ast_gc_collect.cpp
