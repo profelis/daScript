@@ -72,6 +72,28 @@ def recursive_taker(n : int; blk : block<(v : int) : int>) : int {
     return recursive_taker(n - 1, blk) + 1  // nolint:LINT010
 }
 
+def iter_sum(var src : iterator<int>; blk : block<(v : int) : int>) : int {
+    // by-value-element iterator param: a generator argument is the same flavor
+    var total = 0
+    var v : int
+    while (next(src, v)) {
+        total += invoke(blk, v)
+    }
+    return total
+}
+
+def iter_sum_cref(var src : iterator<int const&>; blk : block<(v : int) : int>) : int {
+    // element-const iterator param: an each() argument is element-mutable - a legal
+    // call (variance), but the substitution would fork the body's instantiations,
+    // so the site declines
+    var total = 0
+    var v : int
+    while (next(src, v)) {
+        total += invoke(blk, v)
+    }
+    return total
+}
+
 struct LoHi {
     lo : int
     hi : int
@@ -152,6 +174,22 @@ def target_impure_args(a, b : int) : int {
     return transform_sum([side("a", a), side("b", b)]) $(v) => v * 2
 }
 
+[export]
+def target_flavor_match(n : int) : int {
+    var gen <- generator<int> {
+        for (i in range(n)) {
+            yield i
+        }
+        return false
+    }
+    return iter_sum(gen) $(v) => v + 1
+}
+
+[export]
+def target_flavor_mismatch(src : array<int>) : int {
+    return iter_sum_cref(unsafe(each(src))) $(v) => v + 1
+}
+
 def has(s, sub : string) : bool {
     return find(s, sub, 0) >= 0
 }
@@ -208,6 +246,14 @@ def test_auto_inline_fired(t : T?) {
             let b = body_of(t, "target_recursive")
             t |> success(has(b, "recursive_taker("), "call stays regular: {b}")
         }
+        t |> run("matching element flavor splices") @(t : T?) {
+            let b = body_of(t, "target_flavor_match")
+            t |> success(!has(b, "iter_sum("), "call is gone: {b}")
+        }
+        t |> run("element flavor change declines") @(t : T?) {
+            let b = body_of(t, "target_flavor_mismatch")
+            t |> success(has(b, "iter_sum_cref("), "call stays regular: {b}")
+        }
     }
 }
 
@@ -227,6 +273,8 @@ def test_auto_inline_behavior(t : T?) {
         t |> equal(target_canonicalized(none), -1)
         t |> equal(target_array_result(none), 0)
         t |> equal(target_recursive(src), 11)
+        t |> equal(target_flavor_match(4), 10)
+        t |> equal(target_flavor_mismatch(src), 14)
     }
     t |> run("impure arguments evaluate once in call order") @(t : T?) {
         g_log = ""

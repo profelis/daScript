@@ -21,9 +21,16 @@ namespace das {
     //    so a skip is never silent overall.
     //  * calls passing a block LITERAL argument (AUTO, optimized builds only): best-effort.
     //    The literal is the user's signal; nobody promised anything, so every gate -
-    //    callee shape, unsafe in the body, recursion through the splice graph, private
-    //    symbols, call position - declines SILENTLY (counted, logged under
+    //    callee shape, [unsafe_operation]/[unsafe_deref], recursion through the splice
+    //    graph, private symbols, call position - declines SILENTLY (counted, logged under
     //    log_optimization). `options disable_auto_inline` (or the policy) turns it off.
+    //    A plain unsafe body (hasUnsafe) splices: compiled callees lost their `unsafe { }`
+    //    wrappers to foldUnsafe and would re-error on the caller's re-infer, so the spliced
+    //    body rides the result-temp path under a generated statement-position ExprUnsafe -
+    //    later-round splices anchor INSIDE that block, keeping every hoisted temp within
+    //    its authorization region. The wrapper is generated: the no_unsafe policy and the
+    //    caller module's unsafe accounting don't see it (the rewriter also drops
+    //    userSaidItsSafe on callee-origin nodes - the callee's module already accounted).
     //  * invoke of a block literal (DEVIRT, same best-effort contract): an invoke whose
     //    block resolves to a same-function literal - directly or through a move-initialized,
     //    never-rewritten local (which is what an auto-spliced callee leaves behind) -
@@ -304,8 +311,18 @@ namespace das {
             das_hash_map<Variable *, ArgSub> * paramSub = nullptr;  // keyed by ORIGINAL callee param
             das_hash_map<string, string> * rename = nullptr;
             LineInfo tempAt;    // call site location for manufactured temp reads
+            bool clearUserUnsafe = false;   // splicing a function callee (not a devirt literal)
         protected:
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
+            virtual void preVisitExpression ( Expression * expr ) override {
+                Visitor::preVisitExpression(expr);
+                // callee-origin `unsafe(...)` stays authorized via alwaysSafe; dropping the
+                // user-said bit keeps the CALLER module's unsafe accounting (lint anyUnsafe,
+                // no_unsafe policy) unchanged by the splice - the callee's module already
+                // accounted for its own unsafe. substituted caller expressions are grafted
+                // after this visit and keep theirs
+                if ( clearUserUnsafe ) expr->userSaidItsSafe = false;
+            }
             virtual ExpressionPtr visit ( ExprVar * expr ) override {
                 // cloned ExprVar nodes still point at the ORIGINAL callee variables
                 // (ExprVar::clone copies the raw pointer) - param matching is exact
@@ -914,6 +931,47 @@ namespace das {
 
     namespace {
 
+        // a call (or invoke) passing a `#` argument where the resolved target's parameter
+        // is neither `#` nor implicit: it resolved through GENERIC leniency (an OR-type
+        // accepting `string const#` reuses the plain-string instance - the registry
+        // collapses the flavors), and the splice protocol's rename + re-infer re-matches
+        // it directly against the instance's strict signature and fails. a subtree
+        // carrying one cannot ride a splice
+        bool reinferFragile ( Expression * root ) {
+            bool fragile = false;
+            lookupExpressions(root, [&](Expression * e) {
+                if ( fragile ) return;
+                if ( e->rtti_isCall() ) {
+                    auto c = static_cast<ExprCall *>(e);
+                    if ( !c->func ) return;
+                    size_t n = das::min(c->arguments.size(), c->func->arguments.size());
+                    for ( size_t i=0; i!=n; ++i ) {
+                        auto & at = c->arguments[i]->type;
+                        auto & pt = c->func->arguments[i]->type;
+                        if ( at && pt && at->temporary && !pt->temporary && !pt->implicit ) {
+                            fragile = true;
+                            return;
+                        }
+                    }
+                } else if ( e->rtti_isInvoke() ) {
+                    auto inv = static_cast<ExprInvoke *>(e);
+                    if ( inv->arguments.empty() ) return;
+                    auto & bt = inv->arguments[0]->type;
+                    if ( !bt || bt->argTypes.empty() ) return;
+                    size_t n = das::min(inv->arguments.size()-1, bt->argTypes.size());
+                    for ( size_t i=0; i!=n; ++i ) {
+                        auto & at = inv->arguments[i+1]->type;
+                        auto & pt = bt->argTypes[i];
+                        if ( at && pt && at->temporary && !pt->temporary && !pt->implicit ) {
+                            fragile = true;
+                            return;
+                        }
+                    }
+                }
+            });
+            return fragile;
+        }
+
         // a block literal the devirtualizer can splice in place: a plain in-frame block
         // with a single-exit body and a non-reference (or void) result. splicing dissolves
         // the block boundary, so a break/continue not bound to a loop inside the body is out
@@ -937,6 +995,7 @@ namespace das {
                 if ( arg->type->smartPtr ) { why = "smart-pointer parameter"; return false; }
             }
             if ( blk->returnType && blk->returnType->smartPtr ) { why = "smart-pointer result"; return false; }
+            if ( reinferFragile(mkb) ) { why = "body carries a temporary-flavored call"; return false; }
             InlineShapeScan scan(true);
             scan.lastTopLevelStmt = blk->list.empty() ? nullptr : blk->list.back();
             blk->visit(scan);
@@ -996,20 +1055,24 @@ namespace das {
                 return ok;
             }
 
-            // best-effort callee gate: [inline]'s shape contract, plus no unsafe in the
-            // body (a spliced unsafe re-checks against the CALLER module's permissions),
-            // plus no recursion through the combined splice graph
+            // best-effort callee gate: [inline]'s shape contract, plus no recursion
+            // through the combined splice graph. a plain unsafe body (hasUnsafe) is fine:
+            // it splices under a generated `unsafe { }` wrapper
             bool autoCalleeOk ( Function * fn, string & why ) {
                 auto it = autoOkCache.find(fn);
                 if ( it != autoOkCache.end() ) { why = it->second.second; return it->second.first; }
                 bool ok = true;
                 if ( !checkInlineShape(fn, why) ) {
                     ok = false;
-                } else if ( fn->unsafeOperation || fn->unsafeDeref || fn->hasUnsafe ) {
-                    // hasUnsafe is stamped by infer and survives foldUnsafe: a spliced
-                    // unsafe body would re-check against the caller's module, wrapper-less
+                } else if ( fn->unsafeOperation || fn->unsafeDeref ) {
+                    // [unsafe_operation]/[unsafe_deref] carry call-site and runtime
+                    // semantics (re-infer re-stamps deref null-check elision from the
+                    // CALLER's unsafeDeref flag) that a splice would change
                     ok = false;
                     why = "unsafe operation";
+                } else if ( reinferFragile(fn->body) ) {
+                    ok = false;
+                    why = "body carries a temporary-flavored call";
                 } else if ( annotatedCallee(fn, why) ) {
                     ok = false;     // an annotation may carry call-site semantics
                                     // (verifyCall & co) that a splice would bypass
@@ -1238,12 +1301,17 @@ namespace das {
                 // a move return (`return <- x`) never substitutes as an expression: the
                 // substituted read would COPY where the callee moved (an error for
                 // non-copyables, a semantic change otherwise) - it takes the result-temp
-                // path, which preserves the move
+                // path, which preserves the move. an unsafe body also takes the result-temp
+                // path: its generated `unsafe { }` wrapper must be a statement, so that
+                // every later-round splice inside it anchors INSIDE the wrapper's block
+                // (nothing unsafe can hoist out of its authorization region)
                 bool exprBody = body->list.size()==1 && body->list.back()->rtti_isReturn()
-                    && !static_cast<ExprReturn *>(body->list.back())->moveSemantics;
+                    && !static_cast<ExprReturn *>(body->list.back())->moveSemantics
+                    && !(calleeFn && calleeFn->hasUnsafe);
                 bool writeFree = calleeFn ? calleeWriteFree(calleeFn) : false;  // a block body is judged unknown
                 das_hash_map<Variable *, ArgSub> paramSub;
                 vector<ExpressionPtr> temps;
+                bool argFlavorFail = false;
                 for ( size_t ai=0, ais=sa.count(); ai!=ais; ++ai ) {
                     Expression * A = sa.arg(ai);
                     auto & P = sa.param(ai);
@@ -1264,6 +1332,34 @@ namespace das {
                         sub.substitute = leafA;
                         paramSub[P] = sub;
                         continue;
+                    }
+                    // a substitution (or an inferred temp) carries the ARGUMENT's exact type
+                    // into the body, where the call boundary coerced it to the PARAM's type.
+                    // beyond top-level ref/const (which the machinery navigates), a flavor
+                    // change re-types the body: a `#` element re-types field reads past what
+                    // resolved instances accept, and an element-const change forks generic
+                    // instances (which today collide in the instance registry). best-effort
+                    // sites decline; MUST keeps its pre-existing contract
+                    if ( site.kind!=SiteKind::MustCall && A->type && P->type ) {
+                        auto stripTop = [](const TypeDecl * t) {
+                            auto c = new TypeDecl(*t);
+                            c->ref = false;
+                            c->constant = false;
+                            return c;
+                        };
+                        if ( !stripTop(A->type)->isSameType(*stripTop(P->type), RefMatters::yes,
+                                ConstMatters::yes, TemporaryMatters::yes, AllowSubstitute::no, false) ) {
+                            decline(site, subjName + ": argument '" + P->name + "' flavor '"
+                                + A->type->describe() + "' vs parameter '" + P->type->describe() + "'", callLike->at);
+                            argFlavorFail = true;
+                            break;
+                        }
+                    }
+                    // a spliced literal's locals rename and re-infer with the site
+                    if ( site.kind!=SiteKind::MustCall && leafA->rtti_isMakeBlock() && reinferFragile(leafA) ) {
+                        decline(site, subjName + ": block argument carries a temporary-flavored call", callLike->at);
+                        argFlavorFail = true;
+                        break;
                     }
                     if ( byRefParam ) {
                         if ( leafVar ) {
@@ -1346,6 +1442,7 @@ namespace das {
                     }
                     paramSub[P] = sub;
                 }
+                if ( argFlavorFail ) continue;
                 bool needStatements = !temps.empty() || !exprBody;
                 if ( !needStatements ) {
                     // ----- pure graft: no statements, no anchors, legal in any position -----
@@ -1354,6 +1451,7 @@ namespace das {
                     rewriter.paramSub = &paramSub;
                     rewriter.rename = &rename;
                     rewriter.tempAt = callLike->at;
+                    rewriter.clearUserUnsafe = calleeFn != nullptr;
                     auto ret = static_cast<ExprReturn *>(body->list.back());
                     ExpressionPtr callReplacement = nullptr;
                     if ( ret->subexpr ) {
@@ -1567,6 +1665,7 @@ namespace das {
                 rewriter.paramSub = &paramSub;
                 rewriter.rename = &rename;
                 rewriter.tempAt = callLike->at;
+                rewriter.clearUserUnsafe = calleeFn != nullptr;
                 ExpressionPtr callReplacement = nullptr;
                 if ( exprBody ) {
                     auto ret = static_cast<ExprReturn *>(body->list.back());
@@ -1605,7 +1704,18 @@ namespace das {
                         bodyClone->list.push_back(store);
                         callReplacement = new ExprVar(callLike->at, resName);
                     }
-                    splice.push_back(bodyClone->visit(rewriter));
+                    ExpressionPtr spliced = bodyClone->visit(rewriter);
+                    if ( calleeFn && calleeFn->hasUnsafe ) {
+                        // a compiled callee lost its `unsafe { }` wrappers to foldUnsafe, and
+                        // the spliced body re-infers in the caller: re-authorize it under a
+                        // generated wrapper. generated = invisible to the no_unsafe policy
+                        // and to the caller module's unsafe accounting (ast_lint.cpp)
+                        auto wrap = new ExprUnsafe(callLike->at);
+                        wrap->body = spliced;
+                        wrap->generated = true;
+                        spliced = wrap;
+                    }
+                    splice.push_back(spliced);
                 }
                 auto & list = site.anchor.block->list;
                 list.insert(list.begin()+anchorIndex, splice.begin(), splice.end());

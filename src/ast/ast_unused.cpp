@@ -208,6 +208,8 @@ namespace das {
             } else if ( expr->rtti_isR2V() ) {
                 auto rr = (ExprRef2Value *)expr;
                 propagateRead(rr->subexpr);
+            } else if ( expr->rtti_isUnsafe() ) {
+                propagateRead(((ExprUnsafe *) expr)->body);
             }
         }
         void propagateWrite ( Expression * expr ) {
@@ -266,6 +268,8 @@ namespace das {
                                     || call->func->firstArgReturnType) ) {
                     propagateWrite(call->arguments[0]);
                 }
+            } else if ( expr->rtti_isUnsafe() ) {
+                propagateWrite(((ExprUnsafe *) expr)->body);
             }
         }
         void propagateWriteViaCopyOrMove ( Expression * expr ) {
@@ -321,6 +325,8 @@ namespace das {
                                     || call->func->firstArgReturnType) ) {
                     propagateWriteViaCopyOrMove(call->arguments[0]);
                 }
+            } else if ( expr->rtti_isUnsafe() ) {
+                propagateWriteViaCopyOrMove(((ExprUnsafe *) expr)->body);
             }
         }
         // informational: argument appeared in a mutable-ref slot. peels the same shapes as
@@ -361,6 +367,8 @@ namespace das {
                                     || call->func->firstArgReturnType) ) {
                     propagatePassMutable(call->arguments[0]);
                 }
+            } else if ( expr->rtti_isUnsafe() ) {
+                propagatePassMutable(((ExprUnsafe *) expr)->body);
             }
         }
         void markPassMutableArguments ( const Function * fn, const vector<ExpressionPtr> & arguments ) {
