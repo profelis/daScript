@@ -315,6 +315,8 @@ def add_assistant_(m : Model; var c : ChatSession; text : string) {
     eval_(m, c.session, body)
     c.first = false
     c.has_pending = false
+    c.pending = ""   // consumed — render_prompt_audio reads it gated only on n_audio_rows, so a
+                     // leftover would silently re-inject this text into a later audio-only turn
     var close : array<int64>
     render_parts(m, c.close_parts, "", close)
     eval_(m, c.session, close)
@@ -385,6 +387,8 @@ def respond_(m : Model; var c : ChatSession; params : SamplingParams;
     }
     c.first = false
     c.has_pending = false
+    c.pending = ""   // consumed — render_prompt_audio reads it gated only on n_audio_rows, so a
+                     // leftover would silently re-inject this text into a later audio-only turn
     // close the assistant turn so the next turn continues cleanly
     var close : array<int64>
     render_parts(m, c.close_parts, "", close)

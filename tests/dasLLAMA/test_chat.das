@@ -305,3 +305,32 @@ def test_chat_strip_think(t : T?) {
         t |> equal(strip_think("use the <think> tag like this"), "use the <think> tag like this")
     }
 }
+
+// ===== pending consumption (regression: an audio-only turn must not resurrect prior text) =====
+
+[test]
+def test_chat_pending_cleared_on_consume(t : T?) {
+    t |> run("respond()/add_assistant() clear the consumed user text (needs SmolLM2-135M)") @(t : T?) {
+        let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: {path} not present")
+            return
+        }
+        with_job_que() {
+            setup_dasllama_jobque()
+            var m <- load_capped(path)
+            var c = create_chat(m, "", 4l)   // max_new=4 — the state machine is under test, not the reply
+            add_user(c, "Count to three.")
+            let reply = respond(m, c, SamplingParams()) $(piece) => true
+            // pending must not survive its consumption: render_prompt_audio reads c.pending gated
+            // only on n_audio_rows, so a leftover here silently re-injects THIS text into a later
+            // audio-only turn's prompt
+            t |> equal(c.pending, "", "respond() cleared the consumed text (reply: '{reply}')")
+            add_user(c, "And now four.")
+            add_assistant(m, c, "One, two, three, four.")
+            t |> equal(c.pending, "", "add_assistant() cleared the consumed text")
+            delete c
+            delete m
+        }
+    }
+}

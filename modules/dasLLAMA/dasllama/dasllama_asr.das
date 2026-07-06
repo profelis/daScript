@@ -72,6 +72,11 @@ def load_asr_model(path : string) : AsrModel {
     if (f == null) {
         panic("dasLLAMA asr: cannot open model '{path}'")
     }
+    // stat, not length(bytes): the fmap array's length() wraps int32 on >2GB files (whisper
+    // large-v3 / parakeet f32 bins), which would reject valid models here
+    if (stat(path).size < 8ul) {
+        panic("dasLLAMA asr: '{path}' is too short to be a model file ({stat(path).size} bytes)")
+    }
     var magic = 0u
     var vocab = 0
     fmap(f) $(var bytes : array<uint8>#) {

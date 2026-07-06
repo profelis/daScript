@@ -4198,6 +4198,9 @@ def forward_prefill_embd(t : Model; var s : Session; embd : array<float>; npos, 
     if (t.quant == QuantMode.q4) {
         panic("forward_prefill_embd: q4 mode has no batched prefill path (use q8 or fp32)")
     }
+    if (int64(length(embd)) < npos * t.config.dim) {
+        panic("forward_prefill_embd: embd has {length(embd)} floats — npos={npos} rows of dim={t.config.dim} need {npos * t.config.dim}")
+    }
     forward_prefill_alloc(t, s, npos, start_pos)
     let dim = t.config.dim
     let ts_embed = ref_time_ticks()
