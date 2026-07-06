@@ -2611,12 +2611,12 @@ namespace das {
         static __forceinline ResType invoke_cmres ( Context * __context__, LineInfo * __lineinfo__, const FirstArgType & blk, ArgType ...arg ) {
             char * classPtr = (char *)&blk;
             SimFunction* simFunc = ((Func *)(classPtr + methodOffset))->PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
             if ( simFunc->aotFunction ) {
                 using fnPtrType = ResType (*) ( Context *, const FirstArgType & blk, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
                 return (*fnPtr) ( __context__, blk, das::forward<ArgType>(arg)... );
             } else {
-                if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
                 typename remove_const<ResType>::type result;
                 vec4f arguments [] = { cast<FirstArgType>::from(blk), cast<ArgType>::from(arg)... };
                 __context__->callWithCopyOnReturn(simFunc, arguments, &result, __lineinfo__);
@@ -2710,6 +2710,7 @@ namespace das {
         static __forceinline ResType invoke_cmres ( Context * __context__, LineInfo * __lineinfo__, const Func & blk, ArgType ...arg ) {
             vec4f arguments [] = { cast<ArgType>::from(arg)... };
             SimFunction * simFunc = blk.PTR;
+            if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
             if ( simFunc->aotFunction ) {
                 using fnPtrType = ResType (*) ( Context *, ArgType... );
                 auto fnPtr = (fnPtrType) simFunc->aotFunction;
@@ -2720,7 +2721,6 @@ namespace das {
                 __context__->stopFlags = 0;
                 return result;
             } else {
-                if (!simFunc) __context__->throw_error_at(__lineinfo__, "invoke null function");
                 typename remove_const<ResType>::type result;
                 __context__->callWithCopyOnReturn(simFunc, arguments, &result, __lineinfo__);
                 return result;
