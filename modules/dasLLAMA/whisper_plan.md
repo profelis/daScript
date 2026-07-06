@@ -161,6 +161,22 @@ f16→f32-converted weights.
   hardcodes debug=false) — numpy is the mel oracle.
 - `no_context` defaults to TRUE (whisper.h 5939) — stock cli does NOT carry rolling context
   between windows; multi-window in notimestamps mode = independent windows.
+- **W-E timestamps + long-form**: turbo EXACT on jfk (+ts, [0→1040] one segment, identical
+  tokens) and on jfk3 33 s long-form (3 windows/segments, identical offsets and token lists).
+  tiny +ts on jfk also exact. Two rules beyond the filter suite were load-bearing:
+  - **single_timestamp_ending** (whisper.cpp PR #2629): kept tokens ending text-then-SINGLE
+    ts (no closing pair) skip the entire remaining chunk (`seek_delta = min(seek_end−seek,
+    3000)`) — without it a second phantom window transcribes the trailing applause.
+  - **closing pairs may be unequal** (segment-end ts, then next-segment-start ts, e.g.
+    TT_1069/TT_1092): every ts token updates seek_delta, the emission skip-loop re-bases t0
+    per consumed ts, and the window advances by the SECOND of the pair.
+  - the no-speech gate (nosp prob off raw prompt logits > 0.6 AND avg_logprobs over kept
+    tokens < −1.0) suppresses a window's segments; plog's normalizer is captured between the
+    main filter suite and the force-timestamp rule (their logprob order).
+  - v1 simplifications vs whisper_full (documented, all off the greedy-happy-path): the
+    "don't go back in time" and repetition-loop failures end the window instead of triggering
+    temperature fallback (fallback is disabled in the oracle runs anyway); entropy-based
+    failure (result_len > 32 && entropy < 2.4) not implemented.
 
 ## Performance ledger (arc-local; fold into API_REWORK.md at PR time)
 

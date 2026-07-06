@@ -682,14 +682,43 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
     mm_blob_b(ds.logits, w.dblob, w.d_te_off, ds.x1, d, w.n_vocab, 1l)
 }
 
-// ===== greedy driver =====
+// ===== greedy driver (whisper_full's single-decoder temp-0 path, fallback disabled) =====
 
 let private NEG_INF_LOGIT = -1e30
+let private MAX_INITIAL_TS = 1.0    // whisper.cpp default: first timestamp can't exceed 1 s
 
-// whisper.cpp's always-on logit filter suite (whisper_process_logits), v1 scope: notimestamps
-// mode. is_initial additionally suppresses eot and " " (suppress_blank, CLI default true).
-def private whisper_filter_logits(w : WhisperModel; var logits : array<float>; is_initial : bool; no_timestamps : bool) {
-    if (is_initial) {
+// driver trace (debug rail, set_audio_encode_ref_dir's sibling): per-window seek/no-speech
+// state and every sampled (id, tid, plog)
+var private g_whisper_trace = false
+
+def set_whisper_trace(on : bool) {
+    g_whisper_trace = on
+}
+
+//! One transcription segment: [t0, t1] in centiseconds (10 ms mel-frame units), the text,
+//! and the raw token ids (timestamp tokens and eot included, whisper.cpp's result_all shape).
+struct WhisperSegment {
+    t0 : int64
+    t1 : int64
+    text : string
+    tokens : array<int>
+}
+
+// One sampled token: greedy argmax id + the most probable timestamp token (whisper.cpp's
+// token_data.tid — segment boundaries read it even off text tokens).
+struct private SampledTok {
+    id : int
+    tid : int
+    plog : float
+}
+
+// whisper.cpp's whisper_process_logits filter suite, in its exact order. ``n_sampled`` /
+// ``last_id`` / ``penult_id`` describe the window's sampled-so-far state (pairs rule),
+// ``has_ts``/``seek_delta`` drive the non-decreasing rule.
+def private whisper_filter_logits(w : WhisperModel; var logits : array<float>; no_timestamps : bool;
+                                  n_sampled : int; last_id, penult_id : int; has_ts : bool; seek_delta : int64) {
+    let is_initial = n_sampled == 0
+    if (is_initial) {                    // suppress_blank (CLI default true)
         logits[w.tok_eot] = NEG_INF_LOGIT
         if (w.tok_space >= 0) {
             logits[w.tok_space] = NEG_INF_LOGIT
@@ -710,42 +739,266 @@ def private whisper_filter_logits(w : WhisperModel; var logits : array<float>; i
     for (i in range(100)) {              // g_lang.size() is fixed at 100 in whisper.cpp
         logits[w.tok_sot + 1 + i] = NEG_INF_LOGIT
     }
+    if (no_timestamps) {
+        return
+    }
+
+    // timestamps appear in pairs, except directly before eot
+    let last_was_ts = n_sampled > 0 && last_id >= w.tok_beg
+    let penult_was_ts = n_sampled < 2 || penult_id >= w.tok_beg
+    if (last_was_ts) {
+        if (penult_was_ts) {
+            for (i in range(w.tok_beg, int(w.n_vocab))) {
+                logits[i] = NEG_INF_LOGIT
+            }
+        } else {
+            for (i in range(w.tok_eot)) {
+                logits[i] = NEG_INF_LOGIT
+            }
+        }
+    }
+
+    // the initial timestamp can't exceed MAX_INITIAL_TS
+    if (is_initial) {
+        let precision = 30.0 / float(w.enc.n_ctx)
+        let tid0 = int(floor(MAX_INITIAL_TS / precision + 0.5))
+        for (i in range(w.tok_beg + tid0 + 1, int(w.n_vocab))) {
+            logits[i] = NEG_INF_LOGIT
+        }
+    }
+
+    // condition timestamps to be non-decreasing within the window
+    if (has_ts) {
+        let tid0 = int(seek_delta / 2l)
+        for (i in range(w.tok_beg, min(w.tok_beg + tid0, int(w.n_vocab)))) {
+            logits[i] = NEG_INF_LOGIT
+        }
+    }
+
 }
 
-def private argmax_logit(logits : array<float>) : int {
-    var best = 0
+// the last process_logits rule, applied AFTER the logprob normalizer is captured: if the
+// probability mass over timestamps beats every text token, force a timestamp. logprob
+// comparison == raw-logit comparison (log_softmax is a monotone shift).
+def private whisper_force_ts_rule(w : WhisperModel; var logits : array<float>) {
+    var ts_max = NEG_INF_LOGIT
+    for (i in range(w.tok_beg, int(w.n_vocab))) {
+        ts_max = max(ts_max, logits[i])
+    }
+    if (ts_max > NEG_INF_LOGIT * 0.5) {
+        var ts_lse = 0.0
+        for (i in range(w.tok_beg, int(w.n_vocab))) {
+            ts_lse += exp(logits[i] - ts_max)
+        }
+        let ts_logsumexp = log(ts_lse) + ts_max
+        var text_max = NEG_INF_LOGIT
+        for (i in range(w.tok_beg)) {
+            text_max = max(text_max, logits[i])
+        }
+        if (ts_logsumexp > text_max) {
+            for (i in range(w.tok_beg)) {
+                logits[i] = NEG_INF_LOGIT
+            }
+        }
+    }
+}
+
+// log-sum-exp over the current logits — the logprob normalizer whisper.cpp captures between
+// the main filter suite and the force-timestamp rule (plog = logit − this)
+def private logits_lse(logits : array<float>) : float {
+    var m = NEG_INF_LOGIT
+    for (v in logits) {
+        m = max(m, v)
+    }
+    var sum = 0.0
+    for (v in logits) {
+        sum += exp(v - m)
+    }
+    return log(sum) + m
+}
+
+// greedy argmax over all filtered logits + argmax over the timestamp region (tid); plog uses
+// the pre-force-ts normalizer ``lse`` (the sampled id is unbanned in both phases)
+def private sample_greedy(w : WhisperModel; logits : array<float>; lse : float) : SampledTok {
+    var r = SampledTok(id = 0, tid = w.tok_beg)
     var bestv = logits[0]
     for (i in range(1, length(logits))) {
         if (logits[i] > bestv) {
             bestv = logits[i]
-            best = i
+            r.id = i
         }
     }
-    return best
+    var bestts = logits[w.tok_beg]
+    for (i in range(w.tok_beg + 1, length(logits))) {
+        if (logits[i] > bestts) {
+            bestts = logits[i]
+            r.tid = i
+        }
+    }
+    if (r.id >= w.tok_beg) {
+        r.tid = r.id
+    }
+    r.plog = logits[r.id] - lse
+    return r
 }
 
-//! Greedy no-timestamps transcription of one ≤30 s window (v1 driver): sot/lang/transcribe/
-//! notimestamps prompt, whisper.cpp's logit-filter suite, argmax until eot or the
-//! n_text_ctx/2−4 step cap. ``enc_out`` = whisper_encode's ``s.xb``. Returns text token ids.
-def whisper_greedy_window(w : WhisperModel; var ds : DecoderState; enc_out : array<float>; lang_id : int) : array<int> {
-    whisper_cross_kv(w, ds, enc_out)
-    let prompt <- [w.tok_sot, w.tok_sot + 1 + lang_id, w.tok_transcribe, w.tok_not]
-    whisper_decode_batch(w, ds, prompt)
-    var toks : array<int>
+// softmax probability of one token id over RAW (pre-filter) logits — the no-speech gate
+// reads p[nosp] off the prompt decode before any filtering
+def private token_prob(logits : array<float>; id : int) : float {
+    var m = NEG_INF_LOGIT
+    for (v in logits) {
+        m = max(m, v)
+    }
+    var sum = 0.0
+    for (v in logits) {
+        sum += exp(v - m)
+    }
+    return exp(logits[id] - m) / sum
+}
+
+//! Full greedy transcription (whisper_full's single-decoder temp-0 path, no_context):
+//! 30 s windows advanced by decoded timestamps (or whole windows when ``no_timestamps``),
+//! whisper.cpp's logit-filter suite and segment-splitting rules. Times in centiseconds.
+def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : DecoderState;
+                           samples : array<float> | #; lang : string;
+                           no_timestamps : bool = false; translate : bool = false) : array<WhisperSegment> {
+    var segments : array<WhisperSegment>
+    let lang_id = whisper_lang_id(lang)
+    if (lang_id < 0) {
+        panic("dasLLAMA whisper: unknown language '{lang}'")
+    }
+    let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
+    let seek_end = mel.n_len_org
+    let delta_min = 10l                  // ignore anything under 100 ms
+    var seek = 0l
     var step : array<int>
     step |> resize(1)
     let n_max = int(w.n_text_ctx / 2l) - 4
-    for (i in range(n_max)) {
-        whisper_filter_logits(w, ds.logits, i == 0, true)
-        let id = argmax_logit(ds.logits)
-        if (id == w.tok_eot) {
-            break
+
+    while (seek + delta_min < seek_end) {
+        let win <- whisper_mel_window(mel, seek)
+        whisper_encode(w.enc, es, win)
+        whisper_cross_kv(w, ds, es.xb)
+
+        var prompt : array<int>
+        prompt |> push(w.tok_sot)
+        if (w.multilingual) {
+            prompt |> push(w.tok_sot + 1 + lang_id)
+            prompt |> push(translate ? w.tok_translate : w.tok_transcribe)
         }
-        toks |> push(id)
-        step[0] = id
-        whisper_decode_batch(w, ds, step)
+        if (no_timestamps) {
+            prompt |> push(w.tok_not)
+        }
+        whisper_decode_batch(w, ds, prompt)
+        let no_speech_prob = token_prob(ds.logits, w.tok_nosp)
+
+        var toks : array<SampledTok>
+        var seek_delta = 100l * 30l      // full window unless a timestamp moves it
+        var has_ts = false
+        var result_len = 0
+        for (i in range(n_max)) {
+            let n_sampled = length(toks)
+            let last_id = n_sampled > 0 ? toks[n_sampled - 1].id : -1
+            let penult_id = n_sampled > 1 ? toks[n_sampled - 2].id : -1
+            whisper_filter_logits(w, ds.logits, no_timestamps, n_sampled, last_id, penult_id, has_ts, seek_delta)
+            let lse = logits_lse(ds.logits)
+            if (!no_timestamps) {
+                whisper_force_ts_rule(w, ds.logits)
+            }
+            let t = sample_greedy(w, ds.logits, lse)
+            toks |> push(t)
+            if (g_whisper_trace) {
+                print("  [{i}] id {t.id} tid {t.tid} plog {t.plog} has_ts {has_ts} seek_delta {seek_delta}\n")
+            }
+
+            if (t.id > w.tok_beg) {      // timestamp token (strictly above <|0.00|>) moves the window
+                let seek_delta_new = 2l * int64(t.id - w.tok_beg)
+                if (has_ts && seek_delta > seek_delta_new && result_len < i) {
+                    break                // "do not go back in time" — whisper.cpp fails the decoder here
+                }
+                seek_delta = seek_delta_new
+                result_len = i + 1
+                has_ts = true
+            }
+            if (t.id == w.tok_eot || (has_ts && seek + seek_delta + delta_min >= seek_end)) {
+                if (result_len == 0 && !no_timestamps && seek + seek_delta + delta_min >= seek_end) {
+                    result_len = i + 1
+                }
+                if (no_timestamps) {     // single_segment/no_timestamps: keep everything
+                    result_len = i + 1
+                    seek_delta = 100l * 30l
+                }
+                break
+            }
+            step[0] = t.id
+            whisper_decode_batch(w, ds, step)
+        }
+
+        // the no-speech gate: a confident nosp read on the prompt logits + low avg logprob
+        // over the kept tokens drops the window's segments (whisper.cpp defaults 0.6 / −1.0)
+        var avg_logprobs = NEG_INF_LOGIT
+        if (result_len > 0) {
+            var sum = 0.0
+            for (i in range(result_len)) {
+                sum += toks[i].plog
+            }
+            avg_logprobs = sum / float(result_len)
+        }
+        let is_no_speech = no_speech_prob > 0.6 && avg_logprobs < -1.0
+        if (g_whisper_trace) {
+            print("window seek {seek} seek_end {seek_end}: {length(toks)} sampled, result_len {result_len}, seek_delta {seek_delta}, nosp {no_speech_prob}, avg_lp {avg_logprobs}, no_speech {is_no_speech}\n")
+        }
+
+        // split [0, result_len) into segments at timestamp tokens (whisper.cpp's emission loop)
+        if (result_len > 0 && !is_no_speech) {
+            var i0 = 0
+            var t0 = seek + 2l * int64(toks[0].tid - w.tok_beg)
+            var text = ""
+            var i = 0
+            while (i < result_len) {
+                let t = toks[i]
+                if (t.id < w.tok_eot) {
+                    text = "{text}{w.vocab[t.id]}"
+                }
+                if (t.id > w.tok_beg) {
+                    let t1 = seek + 2l * int64(t.tid - w.tok_beg)
+                    if (!empty(text)) {
+                        var seg = WhisperSegment(t0 = t0, t1 = t1, text = text)
+                        for (j in range(i0, i + 1)) {
+                            seg.tokens |> push(toks[j].id)
+                        }
+                        segments |> emplace(seg)
+                    }
+                    text = ""
+                    t0 = t1
+                    while (i + 1 < result_len && toks[i + 1].id > w.tok_beg) {
+                        i++
+                        t0 = seek + 2l * int64(toks[i].tid - w.tok_beg)
+                    }
+                    i0 = i + 1
+                }
+                i++
+            }
+            if (!empty(text)) {
+                var seg = WhisperSegment(t0 = t0, t1 = seek + seek_delta, text = text)
+                for (j in range(i0, result_len)) {
+                    seg.tokens |> push(toks[j].id)
+                }
+                segments |> emplace(seg)
+            }
+        }
+
+        // a window whose kept tokens end text-then-SINGLE-timestamp (no closing pair) covered
+        // everything it could hear — skip the entire remaining chunk (whisper.cpp PR #2629)
+        let single_ts_ending = (result_len > 1
+            && toks[result_len - 2].id < w.tok_beg
+            && toks[result_len - 1].id > w.tok_beg)
+        if (single_ts_ending) {
+            seek_delta = min(seek_end - seek, 100l * 30l)
+        }
+        seek += seek_delta
     }
-    return <- toks
+    return <- segments
 }
 
 //! Token ids -> text (raw byte concat; ids at/above eot have no bytes and are skipped).
