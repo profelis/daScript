@@ -12,6 +12,7 @@ module audio_record shared private
 require audio public
 require audio/audio_wav public
 require daslib/fio
+require math
 
 struct public AudioDeviceInfo {
     //! A capture (microphone) device, as returned by `sound_record_list_devices`.
@@ -31,7 +32,7 @@ def public sound_record_list_devices() : array<AudioDeviceInfo> {
 
 def public record_to_wav(fname : string; seconds : float; rate : int = 44100; channels : int = 1; device_index : int = -1) : bool {
     //! Record `seconds` of audio from the microphone into a 16-bit PCM WAV file. Blocks until done.
-    //! Returns false if the capture device fails to open or produces no audio.
+    //! Returns false (and writes nothing) if the device fails to open, produces no audio, or stalls mid-capture.
     if (!sound_record_start(rate, channels, rate, device_index)) {
         return false
     }
@@ -41,24 +42,30 @@ def public record_to_wav(fname : string; seconds : float; rate : int = 44100; ch
     let total_frames = int(float(rate) * seconds)
     var got_frames = 0
     var stall_ms = 0
+    var completed = true
     while (got_frames < total_frames) {
         let n = sound_record_read(scratch)
         if (n > 0) {
+            let take = min(n, total_frames - got_frames)   // cap to remaining — never overshoot `seconds`
             let base = length(samples)
-            samples |> resize(base + n * channels)
-            for (i in range(n * channels)) {
+            samples |> resize(base + take * channels)
+            for (i in range(take * channels)) {
                 samples[base + i] = scratch[i]
             }
-            got_frames += n
+            got_frames += take
             stall_ms = 0
         } else {
             sleep(5u)
             stall_ms += 5
-            break if (stall_ms > 2000)   // device produced nothing for ~2s — bail rather than hang
+            if (stall_ms > 2000) {   // device produced nothing for ~2s — treat as a mid-capture failure, don't hang
+                completed = false
+                break
+            }
         }
     }
     sound_record_stop()
-    return false if (got_frames == 0)   // device opened but produced nothing — don't leave an empty WAV behind
+    // don't leave a partial/empty WAV: stalled mid-capture, or the device produced nothing
+    return false if (!completed || got_frames == 0)
     write_wav(fname, samples, uint(rate), channels)
     return true
 }
