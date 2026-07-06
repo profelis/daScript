@@ -1,17 +1,16 @@
 options gen2
 options fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
-require dasllama/dasllama         // setup_dasllama_jobque
-require dasllama/dasllama_whisper // the transcribe API
-require dasllama/dasllama_audio   // AUDIO_SAMPLE_RATE
+require dasllama/dasllama         // the facade: load_asr_model / caps / create_session / transcribe
 require audio                     // miniaudio decode (any format) resampled to 16 kHz mono
 require daslib/jobque_boost
 require strings
 require math
 
-// Speech-to-text over a whisper.cpp model file: any audio format miniaudio decodes goes in,
-// timestamped segments come out. Models are the stock ggerganov/whisper.cpp ggml-*.bin files
-// (e.g. ggml-large-v3-turbo.bin) — no conversion step.
+// Speech-to-text over the uniform ASR surface: any audio format miniaudio decodes goes in,
+// timestamped segments come out. load_asr_model sniffs the file format — today that means
+// stock ggerganov/whisper.cpp ggml-*.bin files (e.g. ggml-large-v3-turbo.bin), no conversion.
+// --lang auto detects the spoken language from the first audio (multilingual models).
 //
 //   bin/daslang -jit examples/dasLLAMA/transcribe.das -- <ggml-model.bin> <audio-file>
 //                    [--lang <code>] [--translate] [--no-timestamps]
@@ -87,13 +86,15 @@ def main {
     }
 
     print("loading {model_path}\n")
-    var w <- load_whisper_model(model_path)
+    var w <- load_asr_model(model_path)
+    let c <- caps(w)
+    print("model: {length(c.languages)} language(s), translate {c.translate ? "yes" : "no"}, {c.timestamps} timestamps\n")
     let samples <- load_audio_16k_mono(audio_path)
     print("audio: {length(samples)} samples ({float(length(samples)) / float(int(AUDIO_SAMPLE_RATE))} s)\n")
 
     with_job_que() {
         setup_dasllama_jobque()
-        var s <- create_whisper_session(w, lang)
+        var s <- create_session(w, lang)
         s.translate = translate
         s.no_timestamps = no_timestamps
         let t0 = ref_time_ticks()

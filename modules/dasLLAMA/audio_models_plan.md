@@ -90,7 +90,12 @@ first, wait for the merge, then this.
 - [x] A. Ultravox (1b + 8b) — ✅ token-for-token: 1b on jfk.wav + test-2.mp3, 8b on jfk.wav
 - [x] A. Voxtral-Mini-3B — ✅ transcription prompt byte-identical (jfk); tokenizer id-for-id; decoder 40/40; encoder ≤5e-4; the two open-caption prompts each flip one 0.079/0.195-logit coin-flip (whisper-tiny/base precedent, not chased)
 - [x] A. Qwen2.5-Omni 3B/7B — ✅ token-for-token: 3B on jfk.wav + test-2.mp3, 7B on jfk.wav
-- [ ] B. API discussion + implementation
+- [x] B. API implementation — `load_asr_model` (sniffed) + `caps(AsrModel)` + `TranscribeSegment`
+  (+`avg_logprob`) + `lang="auto"` + `create_session` overload + facade chat-audio verbs
+  (`create_chat(m, tower)` / `add_user_audio`, per-template audio wraps incl. the NEW
+  mistral-v7-tekken template detected BY NAME) + `caps(Model) : LlmCaps` (gemma
+  `system_prompt=false`). audio.das demo now runs through the facade — all three template
+  families re-gated token-identical through the new path.
 - [ ] C. Qwen3-ASR 0.6B/1.7B
 - [ ] D. Parakeet-TDT 0.6b-v2 — .nemo downloaded
 - [ ] E. tutorials (not blocked on mic)
@@ -137,3 +142,9 @@ first, wait for the merge, then this.
   MATCHED step cleared gaps up to 12 logits and tokenizer/decoder/encoder each verified
   independently (id-for-id / 40-40 / ≤5e-4). A prompt without a tie ("Transcribe the
   speech.") matched byte-identical to the natural stop — that's the positive gate.
+- **Session B notes**: `register_arch` MOVES the ArchDesc — clone the template before
+  registering an alias. ChatTemplate gained `assistant_close` (v7-tekken assistant turns
+  close with `</s>`, not the user-tail heuristic). ⚠️ pre-existing: the v0.3 Mistral
+  `[INST]` template's derived close is ` [/INST]` — wrong for multi-turn (should be
+  `</s>`); untouched here, flagged for Boris. New module files must ALSO be listed in
+  `modules/dasLLAMA/.das_module` (require-root registration is manifest-driven).

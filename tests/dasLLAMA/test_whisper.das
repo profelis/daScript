@@ -4,6 +4,7 @@ options stack = 65536
 
 require dastest/testing_boost public
 require dasllama/dasllama_whisper
+require dasllama/dasllama_asr
 require dasllama/dasllama_audio
 require dasllama/dasllama_gguf
 require dasllama/dasllama_math   // setup_dasllama_jobque_
@@ -190,6 +191,31 @@ def test_whisper_loader(t : T?) {
 }
 
 [test]
+def test_asr_surface(t : T?) {
+    t |> run("load_asr_model sniffs the bin + caps report whisper honestly") @(t : T?) {
+        let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
+        if (!stat(model_path).is_valid) {
+            t |> success(true, "skipped: ggml-tiny.bin not present")
+            return
+        }
+        var m <- load_asr_model(model_path)   // the sniff route: ggml magic + big vocab -> whisper
+        t |> equal(m.whisper.n_vocab, 51865l, "loaded through the sniff")
+        let c <- caps(m)
+        t |> equal(length(c.languages), 100, "multilingual: the full g_lang list")
+        t |> equal(c.languages[0], "en")
+        t |> success(c.translate, "translate")
+        t |> success(c.timestamps == AsrTimestamps.segment, "segment timestamps")
+        t |> success(!c.streaming, "no native streaming")
+        t |> success(!c.prompt, "no prompt conditioning")
+        // "auto" on a multilingual model is accepted; a junk code still panics loudly
+        let s <- create_session(m, "auto")
+        t |> equal(s.lang_id, -1, "auto defers detection")
+        delete m.whisper.dblob
+        delete m.whisper.enc.fblob
+    }
+}
+
+[test]
 def test_whisper_transcribe_oracle(t : T?) {
     t |> run("tiny greedy on jfk.wav is token-for-token with whisper-cli") @(t : T?) {
         if (!jit_enabled()) {
@@ -209,8 +235,8 @@ def test_whisper_transcribe_oracle(t : T?) {
         var w <- load_whisper_model(model_path)
         with_job_que() {
             setup_dasllama_jobque_()
-            var s <- create_whisper_session(w)
-            var segs : array<WhisperSegment>
+            var s <- create_session(w)
+            var segs : array<TranscribeSegment>
             transcribe(w, s, samples) $(seg) {
                 segs |> push_clone(seg)
             }
@@ -232,7 +258,7 @@ def test_whisper_transcribe_oracle(t : T?) {
             t |> success(segs[0].text == " And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.", "text")
 
             // the push-chunks rail lands on the same result: feed in 2 chunks, flush
-            var s2 <- create_whisper_session(w)
+            var s2 <- create_session(w)
             let half = length(samples) / 2
             var part : array<float>
             part |> reserve(length(samples))
@@ -250,6 +276,20 @@ def test_whisper_transcribe_oracle(t : T?) {
                 flushed = "{flushed}{seg.text}"
             }
             t |> success(flushed == segs[0].text, "feed+flush == one-shot")
+
+            // every emitted segment carries a real confidence (greedy plogs are <= 0, and a
+            // clean read of jfk stays well above the no-speech −1.0 bar)
+            t |> success(segs[0].avg_logprob < 0.0 && segs[0].avg_logprob > -1.0, "avg_logprob in (-1, 0)")
+
+            // lang="auto" detects English on the same clip and lands on the identical text
+            var s3 <- create_session(w, "auto")
+            t |> equal(s3.lang_id, -1, "auto starts unresolved")
+            var auto_text = ""
+            transcribe(w, s3, samples) $(seg) {
+                auto_text = "{auto_text}{seg.text}"
+            }
+            t |> equal(s3.lang_id, 0, "detected en")
+            t |> success(auto_text == segs[0].text, "auto == en text")
         }
     }
 }

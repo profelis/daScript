@@ -30,6 +30,33 @@ def test_arch_registry_populated(t : T?) {
 }
 
 [test]
+def test_llm_caps(t : T?) {
+    t |> run("per-arch LlmCaps: gemma has no system role, everyone else does") @(t : T?) {
+        for (name in ["gemma2", "gemma3", "gemma4"]) {
+            t |> success(!arch_lcaps(name).system_prompt, "'{name}' system_prompt false")
+        }
+        for (name in ["llama", "qwen2", "qwen2vl", "qwen3", "phi3", "qwen2moe", "gpt-oss"]) {
+            t |> success(arch_lcaps(name).system_prompt, "'{name}' system_prompt true")
+        }
+    }
+}
+
+[test]
+def test_audio_wrap_parts(t : T?) {
+    t |> run("audio span markers: qwen2 family wraps, llama splices bare") @(t : T?) {
+        for (name in ["qwen2", "qwen2vl"]) {
+            let ct <- arch_chat(name)
+            t |> equal(length(ct.audio_pre.parts), 1, "'{name}' audio_pre")
+            t |> equal(ct.audio_pre.parts[0].s, "<|audio_bos|>")
+            t |> equal(length(ct.audio_post.parts), 1, "'{name}' audio_post")
+            t |> equal(ct.audio_post.parts[0].s, "<|audio_eos|>")
+        }
+        let lt <- arch_chat("llama")
+        t |> success(empty(lt.audio_pre.parts) && empty(lt.audio_post.parts), "llama-3: bare embeddings")
+    }
+}
+
+[test]
 def test_arch_chat_templates(t : T?) {
     t |> run("each arch has a well-formed chat template") @(t : T?) {
         for (name in ["llama", "qwen2", "qwen2vl", "qwen3", "phi3", "gemma2", "gemma3", "gemma4", "qwen2moe", "gpt-oss"]) {

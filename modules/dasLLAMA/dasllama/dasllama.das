@@ -15,6 +15,8 @@ module dasllama shared public
 
 require dasllama/dasllama_transformer public   // the engine + arch registry; every arch [init] fires
 require dasllama/dasllama_chat public          // layer 2: chat sessions over the same engine
+require dasllama/dasllama_audio public         // audio tower (mel frontend + whisper encoder + projectors)
+require dasllama/dasllama_asr public           // uniform ASR surface (whisper today; parakeet/qwen3-asr land behind the same sniff)
 require dasllama/dasllama_math                 // setup_dasllama_jobque_ (engine-level, wrapped below, not re-exported)
 
 // This facade owns the good names; the engine spells each wrapped function with a trailing
@@ -108,6 +110,15 @@ def generate(model : Model; var session : Session; prompt : array<int64>; params
     return generate_(model, session, prompt, params, max_tokens, blk)
 }
 
+def generate_embd(model : Model; var session : Session; embd : array<float>; npos : int64;
+                  params : SamplingParams; max_tokens : int64;
+                  blk : block<(id : int64; piece : string) : bool>) : int64 {
+    //! ``generate``'s embedding-prefill twin: prefill ``npos`` pre-built embedding rows (the
+    //! multimodal splice — see ``eval_embd``), then stream-sample exactly like ``generate``. The
+    //! chat layer's audio turns run on this; use it directly for custom multimodal prompts.
+    return generate_embd_(model, session, embd, npos, params, max_tokens, blk)
+}
+
 // ===== Chat =====
 
 def create_chat(model : Model; system : string = ""; max_new : int64 = 256l) : ChatSession {
@@ -117,9 +128,33 @@ def create_chat(model : Model; system : string = ""; max_new : int64 = 256l) : C
     return <- create_chat_(model, system, max_new)
 }
 
+def create_chat(model : Model; var tower : AudioTower; system : string = ""; max_new : int64 = 256l) : ChatSession {
+    //! Start an AUDIO-CAPABLE conversation: the chat takes ownership of ``tower`` (moved in — load
+    //! one with ``load_audio_tower``) so ``add_user_audio`` can splice audio into its turns. The
+    //! prompt shape around the audio span comes from the model's chat template (qwen2-family audio
+    //! markers, llama-3 bare embeddings, voxtral ``[BEGIN_AUDIO]``). Panics on a mismatched
+    //! decoder/mmproj pair.
+    return <- create_chat_(model, tower, system, max_new)
+}
+
 def add_user(var chat : ChatSession; text : string) {
     //! Queue a user message for the next ``respond``.
     add_user_(chat, text)
+}
+
+def add_user_audio(var chat : ChatSession; samples : array<float> | #) {
+    //! Queue audio (16 kHz mono f32 PCM) for the next ``respond`` — encoded to soft tokens
+    //! immediately, spliced at the head of the turn before any ``add_user`` text. Multiple clips
+    //! concatenate. Needs a chat created with ``create_chat(model, tower)``; call inside
+    //! ``with_job_que()`` (the encoder threads its kernels).
+    add_user_audio_(chat, samples)
+}
+
+def caps(model : Model) : LlmCaps {
+    //! What ``model`` honestly supports at the chat layer (see LlmCaps) — e.g. gemma has no system
+    //! role, so the chat layer folds the system prompt into the first user turn; ``system_prompt``
+    //! is false there so callers can surface it instead of being silently absorbed.
+    return caps_(model)
 }
 
 def render_turn(model : Model; chat : ChatSession) : array<int64> {

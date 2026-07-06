@@ -42,6 +42,7 @@ modules/dasLLAMA/
     dasllama_common.das       #   engine core — Config / Model / Session, load + forward + generate + sample
     dasllama_audio.das        #   audio tower — whisper mel frontends + encoder core + qwen2a projector (soft-token splice)
     dasllama_whisper.das      #   whisper-proper ASR — ggml-bin loader, cross-attn decoder, greedy driver, transcribe API
+    dasllama_asr.das          #   uniform ASR surface — load_asr_model (format-sniffed), caps(), family-free verbs
     dasllama_arch_llama.das   #   Llama / Llama-2 / Llama-3 / TinyLlama arch (config + chat template)
     dasllama_arch_qwen2.das   #   Qwen2 arch  (per-arch: config setter + [init] registration)
     dasllama_arch_qwen3.das   #   Qwen3 arch (QK-norm)

@@ -266,13 +266,26 @@ struct ChatTurn {
 
 //! Per-arch chat template. `user` frames a user message; `assistant_open` is the generation prompt;
 //! `stop` lists the special-token spellings that end a turn. `system` is empty for arches with no
-//! system role (folded into the first user turn, e.g. Gemma).
+//! system role (folded into the first user turn, e.g. Gemma). `audio_pre`/`audio_post` frame an
+//! audio soft-token span at the head of the user content (empty = bare embeddings, the mtmd
+//! ultravox shape); they render only when a turn actually carries audio.
 struct ChatTemplate {
     add_bos : bool = false                    // prepend the tokenizer BOS at conversation start
     system : ChatTurn = ChatTurn()
     user : ChatTurn = ChatTurn()
     assistant_open : ChatTurn = ChatTurn()
+    assistant_close : ChatTurn = ChatTurn()   // empty = derive from the user turn's tail parts
+    audio_pre : ChatTurn = ChatTurn()
+    audio_post : ChatTurn = ChatTurn()
     stop : array<string>
+}
+
+//! What a decoder honestly supports at the chat layer — declared by each arch registration,
+//! queried via ``caps(model)``. First honest entry: gemma has no system role, so the chat layer
+//! silently folds the system prompt into the first user turn; ``system_prompt = false`` surfaces
+//! that. Grows as gaps surface, not speculatively.
+struct LlmCaps {
+    system_prompt : bool = true
 }
 
 // Sets the Config flags for one architecture. Runs before dim/vocab are known, so the loader
@@ -286,6 +299,7 @@ struct ArchDesc {
     configure : ConfigureFn
     blocks : ArchBlocks = ArchBlocks()
     chat : ChatTemplate = ChatTemplate()
+    lcaps : LlmCaps = LlmCaps()
 }
 
 struct private LayoutSizes {
@@ -608,6 +622,16 @@ def arch_chat(name : string) : ChatTemplate {
     var out = ChatTemplate()
     out := g_arch_registry[name].chat
     return <- out
+}
+
+//! `name`'s declared LLM capabilities (see LlmCaps).
+def arch_lcaps(name : string) : LlmCaps {
+    return key_exists(g_arch_registry, name) ? g_arch_registry[name].lcaps : LlmCaps()
+}
+
+//! The loaded model's declared LLM capabilities (its arch registration's LlmCaps).
+def caps_(m : Model) : LlmCaps {
+    return arch_lcaps(m.arch)
 }
 
 // Look the arch up, apply its config flags, and copy its (copyable) block kernels onto the model.
@@ -4454,6 +4478,40 @@ def generate_(t : Model; var s : Session; prompt : array<int64>; params : Sampli
     eval_(t, s, prompt)
     s.stat_prefill_us = int64(get_time_usec(t_pre))
     s.stat_n_prefill = int64(length(prompt))
+    var one : array<int64>
+    one |> resize(1)
+    var nout = 0l
+    var got_first = false
+    let t_gen = ref_time_ticks()
+    for (_step in range64(max_tokens)) {
+        let tok = sample_(s, params)
+        if (!got_first) {   // time-to-first-token spans the prefill + the first forward
+            s.stat_ttft_us = int64(get_time_usec(t_pre))
+            got_first = true
+        }
+        if (!invoke(blk, tok, piece_(t, tok))) {
+            break
+        }
+        nout++
+        s.recent |> push(tok)
+        one[0] = tok
+        eval_(t, s, one)
+    }
+    s.stat_gen_us = int64(get_time_usec(t_gen))
+    s.stat_n_gen = nout
+    return nout
+}
+
+//! generate_'s embedding-prefill twin: prefill `npos` pre-built embedding rows (the multimodal
+//! splice — see eval_embd_), then stream-sample exactly like generate_. The chat layer's audio
+//! turns run through this.
+def generate_embd_(t : Model; var s : Session; embd : array<float>; npos : int64; params : SamplingParams;
+                   max_tokens : int64; blk : block<(id : int64; piece : string) : bool>) : int64 {
+    s.recent |> clear()
+    let t_pre = ref_time_ticks()
+    eval_embd_(t, s, embd, npos)
+    s.stat_prefill_us = int64(get_time_usec(t_pre))
+    s.stat_n_prefill = npos
     var one : array<int64>
     one |> resize(1)
     var nout = 0l
