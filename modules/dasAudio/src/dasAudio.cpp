@@ -536,6 +536,7 @@ int64_t dasAudio_record_overflow_frames ( void ) {
 }
 
 int32_t dasAudio_record_device_count ( Context *, LineInfoArg * ) {
+    g_capture_device_cache.clear();   // a failed enumeration must not leave stale devices readable by name/is_default
     if ( !ensure_capture_context() ) return 0;
     ma_device_info * pCapture = nullptr;
     ma_uint32 captureCount = 0;

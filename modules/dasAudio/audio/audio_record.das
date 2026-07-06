@@ -10,7 +10,7 @@ module audio_record shared private
 //! separately (e.g. via the `ma_resampler_*` bindings) if you need a different format.
 
 require audio public
-require audio_wav public
+require audio/audio_wav public
 require daslib/fio
 
 struct public AudioDeviceInfo {
@@ -58,6 +58,7 @@ def public record_to_wav(fname : string; seconds : float; rate : int = 44100; ch
         }
     }
     sound_record_stop()
+    return false if (got_frames == 0)   // device opened but produced nothing — don't leave an empty WAV behind
     write_wav(fname, samples, uint(rate), channels)
-    return got_frames > 0
+    return true
 }

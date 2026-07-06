@@ -69,6 +69,27 @@ def record_clip() : bool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Section 3 — Read the recording back
+// ──────────────────────────────────────────────────────────────────────────
+//
+// read_wav (from audio/audio_wav) decodes the file we just wrote, so we can
+// confirm the round-trip: same channel count, and a sample count that matches
+// the duration we asked for.
+
+def verify_clip() {
+    print("\n=== Section 3: Read {OUT_FILE} back ===\n")
+    var samples : array<float>
+    var rate = 0
+    var channels = 0
+    if (!read_wav(OUT_FILE, samples, rate, channels)) {
+        print("  could not read {OUT_FILE} (was it recorded?)\n")
+        return
+    }
+    let seconds = float(length(samples) / channels) / float(rate)
+    print("  {length(samples)} samples, {channels}ch @ {rate}Hz = {seconds} seconds\n")
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Section 4 — The manual capture loop (what record_to_wav does inside)
 // ──────────────────────────────────────────────────────────────────────────
 //
@@ -100,27 +121,6 @@ def manual_capture() {
     }
     sound_record_stop()
     print("  captured {frames} frames, peak amplitude {peak}, dropped {sound_record_overflow_frames()} frames\n")
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// Section 3 — Read the recording back
-// ──────────────────────────────────────────────────────────────────────────
-//
-// read_wav (from audio/audio_wav) decodes the file we just wrote, so we can
-// confirm the round-trip: same channel count, and a sample count that matches
-// the duration we asked for.
-
-def verify_clip() {
-    print("\n=== Section 3: Read {OUT_FILE} back ===\n")
-    var samples : array<float>
-    var rate = 0
-    var channels = 0
-    if (!read_wav(OUT_FILE, samples, rate, channels)) {
-        print("  could not read {OUT_FILE} (was it recorded?)\n")
-        return
-    }
-    let seconds = float(length(samples) / channels) / float(rate)
-    print("  {length(samples)} samples, {channels}ch @ {rate}Hz = {seconds} seconds\n")
 }
 
 [export]
