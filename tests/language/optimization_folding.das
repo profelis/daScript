@@ -32,6 +32,37 @@ def only_finally {
     }
 }
 
+def void_return_impure {
+    if (side_b()) { // nolint:LINT009 -- deliberate: equivalent void arms are the fold under test
+        return
+    } else {
+        return
+    }
+}
+
+def elif_grade(x : int) : int {
+    if (x > 10) {
+        return 3
+    } elif (x > 5) {
+        return 2
+    } elif (x > 0) {
+        return 1
+    } else {
+        return 0
+    }
+}
+
+def defer_in_arm(c : bool) : int {
+    if (c) {
+        defer() {
+            g_calls++
+        }
+        return 1
+    } else {
+        return 2
+    }
+}
+
 [test]
 def test_mul_identities(t : T?) {
     t |> run("x*1 and 1*x") @(t : T?) {
@@ -189,6 +220,36 @@ def test_finalizer_only_function_still_runs(t : T?) {
     // call, silently dropping the defer's side effect under optimization
     g_calls = 0
     only_finally()
+    t |> equal(g_calls, 1)
+}
+
+[test]
+def test_cond_fold_keeps_impure_cond(t : T?) {
+    // regression: `if (impure()) return; else return;` folded to a bare return,
+    // silently dropping the condition's side effect
+    g_calls = 0
+    void_return_impure()
+    t |> equal(g_calls, 1)
+}
+
+[test]
+def test_elif_chain_values(t : T?) {
+    // the elif chain folds to nested ternaries (shape proof in optimization_fold_shape.das);
+    // every branch must keep its value
+    t |> equal(elif_grade(11), 3)
+    t |> equal(elif_grade(7), 2)
+    t |> equal(elif_grade(1), 1)
+    t |> equal(elif_grade(-5), 0)
+}
+
+[test]
+def test_cond_fold_keeps_arm_finally(t : T?) {
+    // regression: an arm holding one return plus a finally section (defer) used to
+    // fold to a ternary return, silently dropping the finally
+    g_calls = 0
+    t |> equal(defer_in_arm(true), 1)
+    t |> equal(g_calls, 1)
+    t |> equal(defer_in_arm(false), 2)
     t |> equal(g_calls, 1)
 }
 
