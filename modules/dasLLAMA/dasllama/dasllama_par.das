@@ -47,13 +47,16 @@ def private mpf_par_arm(beginE, endE, njE, blkE : ExpressionPtr; at : LineInfo) 
     let rbT = make_unique_private_name("mpf_trb", at)
     let reT = make_unique_private_name("mpf_tre", at)
     return <- qmacro_block_to_array() {
-        count_parallel_dispatch($e(njE))   // dispatch observability (dasllama_math)
+        // num_jobs evaluates ONCE on the taken path: the pass-through counter profiles the
+        // exact value the dispatch receives (callers pass shaper CALLS — a separate
+        // count_parallel_dispatch($e(njE)) statement would run the shaper twice and could
+        // profile a different chunk count than it dispatches)
         if (get_jobque_team_mode()) {
-            team_parallel_for($e(beginE), $e(endE), $e(njE)) <| @($i(rbT) : int; $i(reT) : int) {
+            team_parallel_for($e(beginE), $e(endE), count_parallel_dispatch_thru($e(njE))) <| @($i(rbT) : int; $i(reT) : int) {
                 invoke($e(blkE), $i(rbT), $i(reT))
             }
         } else {
-            parallel_for($e(beginE), $e(endE), $e(njE)) <| $($i(rbN), $i(reN), $i(wgN)) {
+            parallel_for($e(beginE), $e(endE), count_parallel_dispatch_thru($e(njE))) <| $($i(rbN), $i(reN), $i(wgN)) {
                 invoke($e(blkE), $i(rbN), $i(reN))
                 $i(wgN) |> notify_and_release
             }

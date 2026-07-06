@@ -596,6 +596,12 @@ def count_parallel_dispatch(njobs : int) {
     g_disp_count++
     g_disp_chunks += int64(njobs)
 }
+// pass-through flavor for maybe_parallel_for: profiles the exact value the dispatch receives
+// while keeping num_jobs a single evaluation (callers pass shaper calls)
+def count_parallel_dispatch_thru(njobs : int) : int {
+    count_parallel_dispatch(njobs)
+    return njobs
+}
 def count_inline_run() {
     g_disp_inline++
 }

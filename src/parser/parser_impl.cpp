@@ -1175,9 +1175,10 @@ namespace das {
     }
 
     void ast_requireModule ( yyscan_t scanner, string * name, string * modalias, bool pub, const LineInfo & atName, string * guard ) {
-        auto info = yyextra->g_Access->getModuleInfo(*name, yyextra->g_FileAccessStack.back()->name);
         // Optional require `require ?guard target`: when the guard module is not available, skip the
-        // require entirely (no error). A present guard with a missing target still errors below.
+        // require entirely (no error) — WITHOUT resolving the target (matches the collector; a
+        // skipped require must not probe file paths). A present guard with a missing target still
+        // errors below.
         if ( guard ) {
             // Path guard (contains '/'): availability = the guard's OWN file resolves — the rail for
             // pure-das packages (nothing C++ to guard on) and cross-package dependencies the target's
@@ -1200,6 +1201,7 @@ namespace das {
                 return;
             }
         }
+        auto info = yyextra->g_Access->getModuleInfo(*name, yyextra->g_FileAccessStack.back()->name);
         if ( auto mod = yyextra->g_Program->addModule(info.moduleName) ) {
             yyextra->g_Program->allRequireDecl.push_back(make_tuple(mod,*name,info.fileName,pub,atName));
             yyextra->g_Program->thisModule->addDependency(mod, pub);

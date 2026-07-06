@@ -19,6 +19,9 @@ OUT=${1:-/tmp/gen_arm64_emission}
 mkdir -p "$OUT"
 
 echo "== native compile-only dump (DAS_JIT_ARM64_FORCE_FEATURES=i8mm) =="
+# gen_x64_emission_probe.das is architecture-NEUTRAL despite the name (it compiles the whole
+# [tune] grid; per-ISA behavior comes from the force-features env) — both emission checks
+# deliberately share it so the grids can't drift apart.
 DAS_TUNE_MODE=test DAS_JIT_ARM64_FORCE_FEATURES=i8mm \
     "$ROOT/bin/daslang" -jit "$ROOT/modules/dasLLAMA/harness/gen_x64_emission_probe.das" \
     -- --jit-compile-only --jit-dump > "$OUT/dump.txt" 2>&1
