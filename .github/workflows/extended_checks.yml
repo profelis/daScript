@@ -339,6 +339,13 @@ jobs:
       run: |
         set -eux
         $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/mcp/test_tools.das
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/mcp/test_crosstree_guard.das
+
+    - name: "Test LSP cross-tree guard (python)"
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        python3 utils/lsp/test_crosstree_guard.py
 
     # Self-binders for dasClangBind + dasLLVM bindings live on the mingw
     # worker (build.yml build_windows_mingw) — see comment on the linux

@@ -325,7 +325,10 @@ def handle_tools_call(reg : array<ToolDef>; id_json : string; params : JsonValue
     let project = get_string_arg(args, "project")
     let project_root = get_string_arg(args, "project_root")
     var load_modules <- get_string_array_arg(args, "load_modules")
-    return jsonrpc::response(id_json, run_tool(handler, name, main_thread, arg1, arg2, arg3, arg4, arg5, arg6, project, project_root, load_modules))
+    let tool_result = run_tool(handler, name, main_thread, arg1, arg2, arg3, arg4, arg5, arg6, project, project_root, load_modules)
+    // Flag cross-tree file queries: if `file` is an absolute path outside this server's root, the
+    // result was produced against the wrong tree's modules + compiled bindings and may be stale.
+    return jsonrpc::response(id_json, guard_crosstree(tool_result, get_string_arg(args, "file"), project_root))
 }
 
 // ── JSON-RPC dispatcher ──────────────────────────────────────────────
