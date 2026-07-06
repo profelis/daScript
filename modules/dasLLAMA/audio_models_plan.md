@@ -101,7 +101,9 @@ first, wait for the merge, then this.
   New: bf16 GGUF reads (exact), qwen3vl→qwen3 alias, `dasllama_qwen3a.das` encoder, ASR
   dispatch (`AsrSession`, GGUF pair route `load_asr_model(path, mmproj)`, `detected_lang`,
   `context` biasing → caps.prompt=true); transcribe.das takes the pair.
-- [ ] D. Parakeet-TDT 0.6b-v2 — .nemo downloaded
+- [x] D. Parakeet-TDT 0.6b-v2 — ✅ token-for-token vs parakeet-cli: jfk 33/33 + gb1 786/786
+  (ids/frames/durations); full spec + the fp32-underflow duration-argmax finding in
+  parakeet_plan.md; wired into load_asr_model (small-vocab ggml-bin route) + transcribe.das
 - [ ] E. tutorials (not blocked on mic)
 - [ ] F. mic demo (Parakeet; after #3388 merges)
 

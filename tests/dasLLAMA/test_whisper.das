@@ -261,6 +261,52 @@ def test_qwen3a_tower(t : T?) {
 }
 
 [test]
+def test_parakeet_oracle(t : T?) {
+    t |> run("parakeet-TDT greedy on jfk.wav is token-for-token with parakeet-cli") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v2-f32.bin")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: ggml-parakeet-tdt-0.6b-v2-f32.bin not present")
+            return
+        }
+        let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
+        if (length(samples) == 0) {
+            t |> success(true, "skipped: jfk.wav not present")
+            return
+        }
+        // through the uniform ASR surface: the sniff routes a small-vocab ggml bin to parakeet
+        var m <- load_asr_model(path)
+        let c <- caps(m)
+        t |> equal(length(c.languages), 1, "English-only")
+        t |> success(c.timestamps == AsrTimestamps.segment, "segment timestamps")
+        t |> equal(m.pk.n_vocab, 1024l, "vocab")
+        t |> equal(m.pk.n_layer, 24l, "layers")
+        t |> equal(m.pk.durations[4], 4, "tdt durations")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var s <- create_session(m)
+            var segs : array<TranscribeSegment>
+            transcribe(m, s, samples) $(seg) {
+                segs |> push_clone(seg)
+            }
+            // parakeet-cli -ng -ps (CPU, f32 self-convert): 33 tokens, these exact ends
+            t |> equal(length(segs), 1)
+            t |> equal(length(segs[0].tokens), 33, "token count")
+            t |> equal(segs[0].tokens[0], 123, "tok[0] '▁And'")
+            t |> equal(segs[0].tokens[1], 96, "tok[1] '▁so'")
+            t |> equal(segs[0].tokens[31], 353, "tok[31] 'ry'")
+            t |> equal(segs[0].tokens[32], 841, "tok[32] '.'")
+            t |> success(segs[0].text == "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.", "text")
+            t |> equal(s.detected_lang, "en")
+        }
+        delete m.pk.blob
+    }
+}
+
+[test]
 def test_whisper_transcribe_oracle(t : T?) {
     t |> run("tiny greedy on jfk.wav is token-for-token with whisper-cli") @(t : T?) {
         if (!jit_enabled()) {

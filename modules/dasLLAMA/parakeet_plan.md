@@ -118,4 +118,21 @@ from parakeet_decode :2451.
 
 ## Findings
 
-(collect)
+- **GATES GREEN: jfk.wav 33/33 and gb1 786/786 token-for-token** (ids, frames, dur_idx,
+  dur_val) vs `parakeet-cli -ng -ps`, first try on jfk; gb1 needed the underflow fix below.
+- **The duration argmax MUST mirror the oracle's fp32 softmax underflow.** The oracle
+  argmaxes durations over log(softmax(full row)); duration relative mass sits ~e⁻¹¹⁰, so
+  exp(logit − max) flushes to 0.0f wherever it drops under the fp32 denormal floor
+  (~e⁻¹⁰³), log() gives −inf, and the strict-> argmax over five −infs DEFAULTS TO INDEX 0.
+  An analytic logit-space argmax picks the TRUE winner and diverged at 16/786 gb1 steps
+  (always oracle=0 vs ours>0 — one-directional, the tell). Fix: argmax over
+  float(exp(logit − row_max)) — denormals order correctly where they survive, ties at 0.0
+  fall to index 0. Diagnosed with a PARAKEET_TRACE_DUR env-gated fprintf patched into the
+  local whisper.cpp parakeet_decode (kept in the checkout, env-gated, harmless).
+- The checked-in tests/parakeet-expected-gb1-output.txt does NOT match the v2 model's live
+  output (the whisper.cpp test defaults to a v3 bin) — gate against the LIVE parakeet-cli
+  run, not the fixture file.
+- gb1.ogg fetched from the wikimedia URL in whisper.cpp's Makefile; converted to
+  samples/gb1.wav (ffmpeg 16k mono s16).
+- Deep AsrModel struct returns need `options stack = 65536` in user programs (same as
+  session C's finding — transcribe.das carries it).

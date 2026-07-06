@@ -10,6 +10,7 @@ require dasllama/dasllama_gguf   // rd_u32 for the magic sniff
 require dasllama/dasllama_audio  // EncoderState (the qwen3a tower's scratch)
 require dasllama/dasllama_whisper public
 require dasllama/dasllama_qwen3a public
+require dasllama/dasllama_parakeet public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — the qwen3a decoder is a full LLM; umbrella fires arch [init]s
 
 // The uniform ASR surface: one loader that sniffs the file format, one verb set that
@@ -26,6 +27,7 @@ enum AsrTimestamps {
 enum private AsrKind {
     whisper
     qwen3a
+    parakeet
 }
 
 //! What a loaded ASR model honestly supports — advisory (invalid options still panic loudly
@@ -44,6 +46,7 @@ struct AsrModel {
     whisper : WhisperModel = WhisperModel()
     dec : Model = Model()              // qwen3a: the qwen3 decoder LLM
     q3t : Qwen3aTower = Qwen3aTower()  // qwen3a: the chunked audio encoder
+    pk : ParakeetModel = ParakeetModel()
 }
 
 //! One transcription stream over an AsrModel: per-backend scratch plus the shared options.
@@ -82,8 +85,10 @@ def load_asr_model(path : string) : AsrModel {
     if (magic != 0x67676d6cu) {
         panic("dasLLAMA asr: '{path}' is neither a GGUF nor a ggml bin")
     }
-    if (vocab < 32768) {
-        panic("dasLLAMA asr: ggml bin with a {vocab}-token vocab looks like Parakeet — not supported yet")
+    if (vocab < 32768) {   // parakeet bins carry a ~1k SPM vocab; whisper >= 51864
+        var pm = AsrModel(kind = AsrKind.parakeet)
+        pm.pk <- load_parakeet_model(path)
+        return <- pm
     }
     var m = AsrModel(kind = AsrKind.whisper)
     m.whisper <- load_whisper_model(path)
@@ -115,6 +120,12 @@ def caps(m : AsrModel) : AsrCaps {
         return <- AsrCaps(translate = false, timestamps = AsrTimestamps.none,
                           streaming = false, prompt = true)
     }
+    if (m.kind == AsrKind.parakeet) {
+        var pc = AsrCaps(translate = false, timestamps = AsrTimestamps.segment,
+                         streaming = false, prompt = false)
+        pc.languages <- ["en"]
+        return <- pc
+    }
     var c = AsrCaps(translate = m.whisper.multilingual,
                     timestamps = AsrTimestamps.segment,
                     streaming = false,
@@ -132,6 +143,12 @@ def create_session(m : AsrModel; lang : string = "en") : AsrSession {
     //! or "auto" to detect (whisper multilingual models; Qwen3-ASR always detects — it only
     //! accepts "auto").
     var s = AsrSession()
+    if (m.kind == AsrKind.parakeet) {
+        if (lang != "en" && lang != "auto") {
+            panic("dasLLAMA asr: this Parakeet model is English-only")
+        }
+        return <- s
+    }
     if (m.kind == AsrKind.qwen3a) {
         if (lang != "auto") {
             panic("dasLLAMA asr: Qwen3-ASR detects the language itself — create the session with lang=\"auto\"")
@@ -235,6 +252,29 @@ def private transcribe_qwen3a(m : AsrModel; var s : AsrSession; samples : array<
     return 1
 }
 
+// Parakeet transcription: full-clip FastConformer encode + TDT greedy, one segment.
+def private transcribe_parakeet(m : AsrModel; var s : AsrSession; samples : array<float> | #;
+                                blk : block<(seg : TranscribeSegment)>) : int {
+    let mel <- parakeet_log_mel(samples, m.pk)
+    var enc_out : array<float>
+    let tt = parakeet_encode(m.pk, mel, enc_out)
+    let toks <- parakeet_tdt_decode(m.pk, enc_out, tt)
+    var seg = TranscribeSegment(t0 = 0l, t1 = int64(length(samples)) * 100l / AUDIO_SAMPLE_RATE,
+        text = parakeet_detokenize(m.pk, toks))
+    var plog_sum = 0.0lf
+    seg.tokens |> reserve(length(toks))
+    for (t in toks) {
+        seg.tokens |> push(t.id)
+        plog_sum += double(t.plog)
+    }
+    if (!empty(toks)) {
+        seg.avg_logprob = float(plog_sum / double(length(toks)))
+    }
+    s.detected_lang = "en"
+    blk |> invoke(seg)
+    return 1
+}
+
 def transcribe(m : AsrModel; var s : AsrSession; samples : array<float> | #;
                blk : block<(seg : TranscribeSegment)>) : int {
     //! Transcribe ``samples`` (16 kHz mono f32 PCM), one ``TranscribeSegment`` per trailing-block
@@ -242,6 +282,9 @@ def transcribe(m : AsrModel; var s : AsrSession; samples : array<float> | #;
     //! emits ONE segment (no timestamps) and fills ``detected_lang``.
     if (m.kind == AsrKind.qwen3a) {
         return transcribe_qwen3a(m, s, samples, blk)
+    }
+    if (m.kind == AsrKind.parakeet) {
+        return transcribe_parakeet(m, s, samples, blk)
     }
     s.w.translate = s.translate
     s.w.no_timestamps = s.no_timestamps
