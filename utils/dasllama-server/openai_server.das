@@ -6,6 +6,7 @@ module openai_server
 require dasllama/dasllama       // the public facade — the ONLY dasLLAMA surface this tool touches
 require dashv/dashv_boost public
 require daslib/json_boost
+require daslib/defer            // defer() { delete js } — free the parsed request JSON on every exit path
 require daslib/jobque_boost
 require daslib/strings_boost    // join()
 require daslib/fio              // sleep(), path_join, base_name, remove, get_env_variable
@@ -144,8 +145,8 @@ struct private OaiErr {
     error : OaiErrDetail
 }
 
-// request shape — only the text fields; content-as-array (multimodal) and union `stop` are handled
-// off the raw JsonValue tree in the handler.
+// request shape — text fields only. Multimodal content arrays and the request's `stop` field are NOT
+// read: content is parsed as a plain string, and stop sequences are not honored.
 struct private OaiReqMessage {
     role : string
     content : string
@@ -292,10 +293,11 @@ def private handle_models(var resp : HttpResponse?) : http_status {
 // relative to the forward). Decoder-only-as-embedder — RAG-grade vectors, not a dedicated model.
 def private handle_embeddings(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
     var perr = ""
-    let js = read_json(string(req.body), perr)
+    var js = read_json(string(req.body), perr)
     if (js == null) {
         return resp_error(resp, http_status.BAD_REQUEST, "invalid JSON: {perr}")
     }
+    defer() { unsafe { delete js } }
     let iv = js?["input"]
     if (iv == null) {
         return resp_error(resp, http_status.BAD_REQUEST, "'input' is required (a string or array of strings)")
@@ -331,11 +333,12 @@ def private handle_embeddings(var req : HttpRequest?; var resp : HttpResponse?) 
 
 def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
     var perr = ""
-    let js = read_json(string(req.body), perr)
+    var js = read_json(string(req.body), perr)
     if (js == null) {
         bad_request(srv, writer, "invalid JSON: {perr}")
         return
     }
+    defer() { unsafe { delete js } }
     let msgs_v = js?["messages"]
     if (msgs_v == null || !(msgs_v.value is _array)) {
         bad_request(srv, writer, "'messages' must be an array")
@@ -403,11 +406,12 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
 
 def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
     var perr = ""
-    let js = read_json(string(req.body), perr)
+    var js = read_json(string(req.body), perr)
     if (js == null) {
         bad_request(srv, writer, "invalid JSON: {perr}")
         return
     }
+    defer() { unsafe { delete js } }
     let prompt = js?["prompt"] ?? ""
     if (empty(prompt)) {
         bad_request(srv, writer, "'prompt' must be a non-empty string")
@@ -534,6 +538,7 @@ class OpenAiServer : HvWebServer {
 //! job queue so the facade's kernels thread, then ticks. Call after ``set_model`` (and optionally
 //! ``set_asr``).
 def run_server(port : int) {
+    g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once
     with_job_que() {
         setup_dasllama_jobque()
         var server = new OpenAiServer()

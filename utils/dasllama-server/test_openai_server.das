@@ -22,8 +22,7 @@ require math                                            // sqrt
 let TEST_PORT = 18099
 
 def private models_dir() : string {
-    let env = get_env_variable("DASLLAMA_MODELS_DIR")
-    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models" : env
+    return get_env_variable("DASLLAMA_MODELS_DIR")   // empty -> MODEL_PATH is relative -> the test skips
 }
 let MODEL_PATH = path_join(models_dir(), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf")
 
