@@ -340,6 +340,16 @@ jobs:
         set -eux
         $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/mcp/test_tools.das
 
+    - name: "Test dasllama-server"
+      # OpenAI-compatible server conformance test. Model-gated + JIT-only, so it
+      # skips cleanly here (no GGUF, no -jit) — the value is the compile guard:
+      # it exercises the dasHV + dasAudio + dasllama facade surface the server
+      # reaches, catching any API/module breakage in CI.
+      if: matrix.target == 'linux'
+      run: |
+        set -eux
+        $BIN/daslang _dasroot_/dastest/dastest.das -- --color --failures-only --test ./utils/dasllama-server/test_openai_server.das
+
     # Self-binders for dasClangBind + dasLLVM bindings live on the mingw
     # worker (build.yml build_windows_mingw) — see comment on the linux
     # build step above for why dasClangBind can't be enabled here.

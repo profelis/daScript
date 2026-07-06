@@ -264,6 +264,7 @@ Run from the project root, always with ``-jit``::
    tutorials/dasLLAMA_06_add_an_arch.rst
    tutorials/dasLLAMA_07_speech_to_text.rst
    tutorials/dasLLAMA_08_audio_chat.rst
+   tutorials/dasLLAMA_09_embeddings.rst
 
 .. _tutorials_dasopenai:
 

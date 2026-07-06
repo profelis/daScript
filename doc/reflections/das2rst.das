@@ -241,7 +241,7 @@ def document_module_dashv(_root : string) {
         group_by_regex("WebSocket server lifecycle", mod, %regex~(make_web_socket_server|destroy_web_socket_server|start|stop)$%%),
         group_by_regex("WebSocket channel send", mod, %regex~(send)$%%),
         group_by_regex("Handle operations", mod, %regex~(is_alive|==|!=)$%%),
-        group_by_regex("HTTP route registration", mod, %regex~(GET|POST|PUT|DELETE|PATCH|HEAD|ANY|SSE)$%%),
+        group_by_regex("HTTP route registration", mod, %regex~(GET|POST|PUT|DELETE|PATCH|HEAD|ANY|SSE|STREAM)$%%),
         group_by_regex("HTTP server configuration", mod, %regex~(STATIC|allow_cors|set_document_root|set_home_page|set_index_of|set_error_page)$%%),
         group_by_regex("HTTP response helpers", mod, %regex~(TEXT_PLAIN|JSON|REDIRECT|SERVE_FILE|DATA|set_header|set_content_type)$%%),
         group_by_regex("HTTP client requests", mod, %regex~(request|request_cb|status_message)$%%),
@@ -298,6 +298,7 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
         group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
+        group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Chat", mod, %regex~(create_chat|add_user|add_user_audio|add_assistant|render_turn|respond)$%%)
     )
     var hook = DocsHook()

@@ -9,8 +9,9 @@ the live-reload application host, the test framework, the code coverage
 tool, the lint checker, the package manager, the MCP server for AI
 coding assistants, the LSP server for editors and AI diagnostics, the
 cross-file duplicate-function detector and its AI judge, the runtime
-profiler and memory-leak tracker, and a cheat sheet for every built-in
-leak-detection mechanism.
+profiler and memory-leak tracker, the OpenAI-compatible dasLLAMA
+inference server, and a cheat sheet for every built-in leak-detection
+mechanism.
 
 .. toctree::
    :maxdepth: 2
@@ -25,4 +26,5 @@ leak-detection mechanism.
    utils/detect_dupe.rst
    utils/find_dupe.rst
    utils/profiler.rst
+   utils/dasllama_server.rst
    utils/memory_leak_detection.rst

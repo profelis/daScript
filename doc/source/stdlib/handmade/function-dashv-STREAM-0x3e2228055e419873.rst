@@ -1,0 +1,1 @@
+Registers a streaming HTTP route: the handler runs on the server's tick thread and drives an HttpResponseWriter to emit Server-Sent Events, chunked data, or one buffered body. The same route serves both streaming and non-streaming responses.
