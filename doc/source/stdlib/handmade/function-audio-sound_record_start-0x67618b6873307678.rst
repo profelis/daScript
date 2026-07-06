@@ -1,1 +1,1 @@
-Open the capture (microphone) device and begin recording interleaved float samples into a ring buffer. rb_frames sizes the ring buffer; device_index selects an input (-1 = system default). Returns false if the device cannot be opened.
+Open the capture (microphone) device and begin recording interleaved float samples into a ring buffer. rb_frames sizes the ring buffer; device_index selects an input (-1 = system default). Returns false if the device cannot be opened. Panics if called while already recording, or if rate or channels are not positive.

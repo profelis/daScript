@@ -51,7 +51,7 @@ namespace das {
 
     // ---- capture (microphone) ----
     // Separate capture device + a lock-free ring (ma_pcm_rb): the RT callback only writes C++-owned
-    // memory (no daScript context on the audio thread); scripts drain on the main thread via record_read.
+    // memory (no daScript context on the audio thread); scripts drain on the main thread via sound_record_read.
     bool dasAudio_record_start ( int32_t rate, int32_t channels, int32_t rb_frames, int32_t device_index, Context * context, LineInfoArg * at );
     void dasAudio_record_stop ( void );
     int32_t dasAudio_record_read ( TArray<float> & out, Context * context, LineInfoArg * at );
