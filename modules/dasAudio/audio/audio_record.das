@@ -40,6 +40,7 @@ def public record_to_wav(fname : string; seconds : float; rate : int = 44100; ch
     var scratch : array<float>
     scratch |> resize(rate * channels)   // ~1s drain buffer
     let total_frames = int(float(rate) * seconds)
+    samples |> reserve(total_frames * channels)   // final size is known up front — reserve once, no intermediate reallocs
     var got_frames = 0
     var stall_ms = 0
     var completed = true
