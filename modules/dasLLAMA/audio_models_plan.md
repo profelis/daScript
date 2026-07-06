@@ -38,12 +38,19 @@ timestamps), Qwen3-ASR (LLM-style ASR), Parakeet (streaming transducer), and the
 audio-chat family (soft-token splice into chat sessions). Facade placement, segment/result
 shapes, naming. Then implement. Tutorials + mic example follow this.
 
-Settled so far (2026-07-06): uniform `load_asr_model(path[, mmproj])` — format sniffed
-(GGUF magic vs ggml-bin; whisper-vs-parakeet bins share the magic, disambiguate on
-n_vocab ≥ 51864 vs ~1k), per-family loaders demote to plumbing, one verb set with internal
-dispatch. `caps(m : AsrModel) : AsrCaps` (languages / translate / timestamps
-none-segment-word / streaming / prompt) — advisory; invalid options still panic loudly,
-never silently ignore.
+**ALL DECISIONS SETTLED (Boris, 2026-07-06) — session B is now pure implementation:**
+- Uniform `load_asr_model(path[, mmproj])` — format sniffed (GGUF magic vs ggml-bin;
+  whisper-vs-parakeet bins share the magic, disambiguate on n_vocab ≥ 51864 vs ~1k),
+  per-family loaders demote to plumbing, one verb set with internal dispatch. NO family
+  names in the public API.
+- `caps(m : AsrModel) : AsrCaps` (languages / translate / timestamps none-segment-word /
+  streaming / prompt) — advisory; invalid options still panic loudly, never silently ignore.
+- Chat-audio verbs live on the facade (`dasllama.das`): `create_chat(m, tower)` (tower
+  attached at creation), `add_user_audio(chat, samples)` composing with `add_user(text)`
+  in one turn; splice inside render/respond, per-model wiring in the arch registry.
+- `WhisperSegment` → shared `TranscribeSegment` + `avg_logprob : float`.
+- `lang = "auto"` (whisper language detect, one extra prompt decode) implemented here.
+- `create_whisper_session` → `create_session` overload.
 
 **Also in this session: `caps` for LLMs** (Boris: "it's on us regardless — buck stops
 here"). The known silent gap: gemma has no system role and the chat layer absorbs the
@@ -69,7 +76,9 @@ test-parakeet-full-jfk as reference). Streaming-native — the natural mic-examp
 
 ## Session E — mic example + tutorials
 
-Needs dasAudio capture (PR #3388) merged and the session-B API settled.
+**Mic demo runs on Parakeet** (Boris's call — streaming-native, no 30 s window latency),
+so E depends on D, plus dasAudio capture (PR #3388) and the session-B API. Tutorials
+document the settled surface across ASR + audio-chat.
 
 ## Status
 
