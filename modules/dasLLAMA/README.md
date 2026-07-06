@@ -60,7 +60,8 @@ modules/dasLLAMA/
     matmul/                   #   matmul kernel micro-bench ledger
   harness/                    # verification / eval test beds, per-box tuners, GGUF inspection tools
 tests/dasLLAMA/               # dastest [test] suites (model-gated ones self-skip)
-examples/dasLLAMA/            # runnable demos only — run.das (completion + stats), chat.das (REPL), audio.das (audio chat), transcribe.das (speech-to-text)
+examples/dasLLAMA/            # runnable demos only — run.das (completion + stats), chat.das (REPL), audio.das (audio chat), transcribe.das (speech-to-text), dictate.das (live mic -> text)
+tutorials/dasLLAMA/           # the guided series — 01 generate ... 06 add an arch, 07 speech-to-text, 08 audio chat
 ```
 
 One require is the whole public API (docs: the `dasllama` page in the stdlib reference):
