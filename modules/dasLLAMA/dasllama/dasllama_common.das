@@ -4234,6 +4234,69 @@ def eval_embd_(t : Model; var s : Session; embd : array<float>; npos : int64) {
     s.n_past += npos
 }
 
+//! Mean-pooled, L2-normalized sentence embedding for ``tokens`` into ``out`` (``dim`` floats): the
+//! decoder's last-layer hidden state (post-final RMSNorm) averaged over every position, then unit-
+//! normalized. Runs one forward over ``s`` from position 0 (pass a FRESH session — no KV history is
+//! assumed and the cache is left filled). A decoder-only model used as an embedder gives RAG-grade
+//! vectors, not a dedicated embedding model.
+def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int64; var out : array<float>) {
+    let c = t.config
+    let dim = c.dim
+    out |> resize(dim)
+    for (i in range64(dim)) {
+        out[i] = 0.0
+    }
+    if (npos <= 0l) {
+        return
+    }
+    if (t.quant != QuantMode.q4 && npos > 1l) {
+        // batched prefill fills s.x_b (npos × dim residual) and leaves it intact; the body norms only
+        // the last position, so re-apply the final RMSNorm to EVERY position and accumulate.
+        forward_prefill(t, s, tokens, npos, 0l)
+        for (p in range64(npos)) {
+            array_view(s.x_b, p * dim, dim) $(var xv : array<float>#) {
+                rms_at(s.xb, t, t.rms_final_off, xv, dim)
+            }
+            for (i in range64(dim)) {
+                out[i] += s.xb[i]
+            }
+        }
+    } else {
+        // q4 (no batched prefill) or a single token: per-token forward leaves s.xb = post-final-norm hidden.
+        for (p in range64(npos)) {
+            forward(t, s, tokens[p], p)
+            for (i in range64(dim)) {
+                out[i] += s.xb[i]
+            }
+        }
+    }
+    // mean over positions, then L2-normalize
+    let inv = 1.0 / float(npos)
+    var ss = 0.0
+    for (i in range64(dim)) {
+        out[i] *= inv
+        ss += out[i] * out[i]
+    }
+    let rn = ss > 0.0 ? 1.0 / sqrt(ss) : 0.0
+    for (i in range64(dim)) {
+        out[i] *= rn
+    }
+}
+
+//! Mean-pooled, L2-normalized sentence embedding of ``text`` (``dim`` floats): tokenize with the
+//! model's tokenizer (BOS per the tokenizer), run one forward over a fresh session, then average the
+//! decoder's last-layer hidden state (post-final RMSNorm) over positions and unit-normalize. A
+//! decoder-only model used as an embedder yields RAG-grade vectors — good for retrieval/similarity,
+//! not a substitute for a dedicated embedding model.
+def embed_(m : Model; text : string) : array<float> {
+    var s <- create_session_(m)
+    let tokens = encode_(m, text)
+    var out : array<float>
+    embed_forward(m, s, tokens, int64(length(tokens)), out)
+    delete s
+    return <- out
+}
+
 // batched-prefill scratch sizing, shared by the token and embedding entries
 def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : int64) {
     let c = t.config

@@ -171,6 +171,25 @@ struct private OaiVerboseTranscription {
     segments : array<OaiVerboseSegment>
 }
 
+// /v1/embeddings response shapes.
+struct private OaiEmbedding {
+    @rename = "object" _object : string
+    embedding : array<float>
+    index : int
+}
+
+struct private OaiEmbUsage {
+    prompt_tokens : int64
+    total_tokens : int64
+}
+
+struct private OaiEmbeddingList {
+    @rename = "object" _object : string
+    data : array<OaiEmbedding>
+    model : string
+    usage : OaiEmbUsage
+}
+
 // ===== Helpers =====
 
 def private next_id(prefix : string) : string {
@@ -266,6 +285,48 @@ def private handle_models(var resp : HttpResponse?) : http_status {
         list.data |> push(OaiModel(id = "{g_model_name}-asr", _object = "model", created = created_ts(), owned_by = "dasllama"))
     }
     return resp |> JSON(sprint_json(list, false), http_status.OK)
+}
+
+// /v1/embeddings: mean-pooled, L2-normalized sentence embeddings over the facade `embed` verb.
+// `input` is a string or an array of strings; usage is counted via the facade `encode` (cheap
+// relative to the forward). Decoder-only-as-embedder — RAG-grade vectors, not a dedicated model.
+def private handle_embeddings(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+    var perr = ""
+    let js = read_json(string(req.body), perr)
+    if (js == null) {
+        return resp_error(resp, http_status.BAD_REQUEST, "invalid JSON: {perr}")
+    }
+    let iv = js?["input"]
+    if (iv == null) {
+        return resp_error(resp, http_status.BAD_REQUEST, "'input' is required (a string or array of strings)")
+    }
+    var inputs : array<string>
+    if (iv.value is _array) {
+        inputs <- from_JV(iv, type<array<string>>)
+    } else {
+        let single = iv ?? ""
+        if (empty(single)) {
+            return resp_error(resp, http_status.BAD_REQUEST, "'input' must be a non-empty string or array of strings")
+        }
+        inputs |> push(single)
+    }
+    if (empty(inputs)) {
+        return resp_error(resp, http_status.BAD_REQUEST, "'input' is empty")
+    }
+
+    var out = OaiEmbeddingList(_object = "list", model = g_model_name)
+    out.data |> reserve(length(inputs))
+    var prompt_tokens = 0l
+    var idx = 0
+    for (text in inputs) {
+        let toks <- encode(g_model, text, true, false)
+        prompt_tokens += int64(length(toks))
+        var vec = embed(g_model, text)
+        out.data |> emplace(OaiEmbedding(_object = "embedding", embedding <- vec, index = idx))
+        idx ++
+    }
+    out.usage = OaiEmbUsage(prompt_tokens = prompt_tokens, total_tokens = prompt_tokens)
+    return resp |> JSON(sprint_json(out, false), http_status.OK)
 }
 
 def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
@@ -458,6 +519,9 @@ class OpenAiServer : HvWebServer {
         }
         POST("/v1/audio/translations") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_transcription(req, resp, true)
+        }
+        POST("/v1/embeddings") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            return handle_embeddings(req, resp)
         }
         POST("/shutdown") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             g_should_stop = true
