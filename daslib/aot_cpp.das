@@ -1373,6 +1373,7 @@ class public CppAot : AstVisitor {
     prologue : bool = false;
     solidContext : bool = false;
     cross_platform : bool = false;
+    fastMath : bool = false;       // options fast_math / policies.fast_math: wrap each function in fast-math pragmas
     aot_filter_function : string;  // when set, emit markers around matching function
 
     cachedTi = new DebugVarCache()
@@ -1547,6 +1548,9 @@ class public CppAot : AstVisitor {
         if (!empty(aot_filter_function) && (fn.name == aot_filter_function || aotFuncName(fn) == aot_filter_function)) {
             write(*ss, "\n/*<<AOT_FUNC_BEGIN>>*/");
         }
+        if (fastMath) {
+            write(*ss, "\n#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC push_options\n#pragma GCC optimize (\"fast-math\")\n#else\n#pragma float_control(precise, off, push)\n#endif");
+        }
         write(*ss, "\ninline ");
         describeLocalCppType(ss, fn.result, cross_platform, CpptSubstitureRef.no, CpptSkipConst.yes);
         write(*ss, " {aotFuncName(fn)} ( Context * __context__");
@@ -1593,6 +1597,9 @@ class public CppAot : AstVisitor {
             write(*ss, "}\n");
         } else {
             write(*ss, "\n");
+        }
+        if (fastMath) {
+            write(*ss, "#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC pop_options\n#else\n#pragma float_control(pop)\n#endif\n");
         }
         if (!empty(aot_filter_function) && (fn.name == aot_filter_function || aotFuncName(fn) == aot_filter_function)) {
             write(*ss, "/*<<AOT_FUNC_END>>*/\n");
@@ -4390,7 +4397,8 @@ def public run_aot(prog : Program?; var pctx : Context?; cop : CodeOfPolicies) :
                                                     program.getDebugger,
                                             solidContext = program.policies.solid_context ||
                                                     (program._options |> find_arg("solid_context") ?as tBool ?? false),
-                                            cross_platform = cop.cross_platform)
+                                            cross_platform = cop.cross_platform,
+                                            fastMath = program._options |> find_arg("fast_math") ?as tBool ?? program.policies.fast_math)
                 cpp_aot.helper.cross_platform = cop.cross_platform;
                 make_visitor(*cpp_aot) $(adapter) {
                     cpp_aot.adapter := adapter
@@ -4468,6 +4476,7 @@ def public run_aot_function(prog : Program?; var pctx : Context?; cop : CodeOfPo
                                         solidContext = program.policies.solid_context ||
                                                 (program._options |> find_arg("solid_context") ?as tBool ?? false),
                                         cross_platform = cop.cross_platform,
+                                        fastMath = program._options |> find_arg("fast_math") ?as tBool ?? program.policies.fast_math,
                                         aot_filter_function = func_name)
             cpp_aot.helper.cross_platform = cop.cross_platform;
             make_visitor(*cpp_aot) $(adapter) {
