@@ -249,7 +249,7 @@ def document_module_dashv(_root : string) {
         group_by_regex("Request configuration", mod, %regex~(set_basic_auth|set_bearer_token_auth|set_timeout|set_connect_timeout|allow_redirect|set_param|get_param|each_param)$%%),
         group_by_regex("Cookies", mod, %regex~(add_cookie|get_cookie|each_cookie)$%%),
         group_by_regex("Form data", mod, %regex~(set_form_data|set_form_file|get_form_data|each_form_field|save_form_file|set_url_encoded|get_url_encoded)$%%),
-        group_by_regex("SSE response writer", mod, %regex~(sse_event|end_headers|write_chunked|end_response|close_writer|release_writer)$%%)
+        group_by_regex("SSE response writer", mod, %regex~(respond|sse_event|end_headers|write_chunked|close_writer|release_writer)$%%)
     )
     document("HTTP and WebSocket library (libhv)", mod, "dashv.rst", groups)
 }

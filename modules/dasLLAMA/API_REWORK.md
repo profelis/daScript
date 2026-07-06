@@ -239,8 +239,12 @@ pending merge). We also declare `ArchBlocks` + its typedefs *before* `Model` in 
 defensive ordering (legitimate on its own; emission is source-order for non-recursed structs) that keeps
 the AOT green on this branch before that PR lands, and can stay after.
 
-**Below the line (demonstrations):** an OpenAI-compatible server `/example` (the acceptance
-test — if it builds with no reach into internals, the API is right), tool use.
+**Below the line (demonstrations):** ✅ an OpenAI-compatible server — `utils/dasllama-server/` (the
+acceptance test: it builds reaching **only** public facade verbs, so the API is right). Chat +
+completions (SSE + buffered), audio transcriptions/translations, and **`/v1/embeddings`** (mean-pooled,
+L2-normalized, over the new facade `embed` → engine `embed_forward` hidden-state path) all ship, with a
+model-gated conformance test (`test_openai_server.das`) driving it over the real dashv HTTP client.
+**Remaining:** tool / function calling — parked as the next follow-up.
 
 ## Model-support plan — the T1/T2 waves *(agreed 2026-07-01)*
 
@@ -339,6 +343,18 @@ gets a note HERE instead of being acted on mid-wave — the model waves optimize
 and coverage; this ledger is the backlog for the perf pass that follows them. Every entry says
 what it costs today and what the fix would change.
 
+- **Embeddings path (spotted building `/v1/embeddings`, 2026-07-06).** Two small items, neither
+  chased: (1) `embed_forward` takes approach A — reuse `forward_prefill` then re-norm every
+  position — which pays **one wasted last-position classifier GEMM** (vocab×dim) per embed call,
+  because `forward_prefill` always runs the final norm+classifier on the last token. Fix would be
+  to split the transformer stack out of `forward_prefill_body` (a `forward_prefill_stack` helper)
+  and call it directly, skipping the classifier; cost is one GEMM against a whole forward, so
+  negligible until embeddings are hot. (2) The server's `/v1/embeddings` calls facade `embed`
+  per input, which **creates + deletes a full KV-cache session per input** — for a batch of N
+  strings that's N session allocations. Fix: a dedicated reused embed session in the server (the
+  facade would need a session-taking `embed` overload, or the server reaches the public
+  `embed_forward` primitive — but that breaks the facade-only invariant, so the overload is the
+  clean path). Both are backlog; the server is serial and embeddings are low-frequency.
 - **✅ SHIPPED + SILICON-ADJUDICATED (zen2, 2026-07-05): 2-D batch chunk space (row-units ×
   token-blocks).** Landed as `batch_grid_2d` (0 = 1-D / 1 = fine grid, ggml's 16-token cells /
   2 = wave-aligned, rc·ntc = whole L-waves); the knob arms a per-dispatch auto-gate (engages only
