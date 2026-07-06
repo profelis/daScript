@@ -1,5 +1,6 @@
 options gen2
 options rtti
+options no_coverage
 
 require daslib/ast
 require daslib/rtti
@@ -184,8 +185,9 @@ def body_of(t : T?; nm : string) : string {
         }
     }
     t |> success(!empty(body), "target function found")
-    // the coverage lane (dastest --cov-path) injects add_func_coverage/add_line_coverage
-    // statements whose arguments collide with the substrings asserted here — drop them
+    // this module opts out of coverage injection (options no_coverage above) — injected
+    // add_line_coverage calls would make pure user callees impure and defeat the pass
+    // under the coverage lane; the filter below stays as a belt for injected statements
     let clean <- [for (ln in split(body, "\n")); ln; where !(ln |> has("coverage("))]
     return join(clean, "\n")
 }
