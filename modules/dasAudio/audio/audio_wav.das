@@ -110,7 +110,10 @@ def read_wav_u32(data : array<uint8>; var cursor : int&) : uint {
 }
 
 def public write_wav(fname : string; samples : array<float>; sample_rate : uint = 44100u; channels : int = 2) : bool {
-    //! Write float samples as a 16-bit PCM WAV file. Returns false if the output file could not be opened for writing.
+    //! Write float samples as a 16-bit PCM WAV file. Returns false on invalid input (channels <= 0, or a
+    //! sample count that isn't a whole number of frames) or if the output file could not be opened for writing.
+    // reject non-positive channels (avoids /0) and ragged input (header dataSize must match the samples written)
+    return false if (channels <= 0 || length(samples) % channels != 0)
     var wrote = false
     fopen(fname, "wb") $(f) {
         if (f != null) {
