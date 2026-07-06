@@ -35,7 +35,7 @@ transcript each turn.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/v1/models` | Lists the served model (and `-asr` if loaded) |
+| `GET`  | `/v1/models` | Lists the served model (and `--asr` if loaded) |
 | `POST` | `/v1/chat/completions` | Chat; `stream: true` → SSE, else buffered |
 | `POST` | `/v1/completions` | Raw completion; `stream: true` → SSE, else buffered |
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |

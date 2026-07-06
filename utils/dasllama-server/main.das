@@ -50,6 +50,8 @@ def pick_quant(s : string) : QuantMode {
         return QuantMode.fp32
     } elif (s == "q4") {
         return QuantMode.q4
+    } elif (!empty(s) && s != "q8") {
+        to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q4)\n")
     }
     return QuantMode.q8
 }
@@ -68,8 +70,8 @@ def main {
         return
     }
 
-    let port = cfg.port != 0 ? cfg.port : 8080
-    let ctx = cfg.ctx != 0 ? int64(cfg.ctx) : 4096l
+    let port = cfg.port > 0 ? cfg.port : 8080     // non-positive (incl. a stray negative) -> default
+    let ctx = cfg.ctx > 0 ? int64(cfg.ctx) : 4096l   // guard: a negative ctx would make seq_len < 0
 
     print("loading {cfg.model} ...\n")
     var m <- load_model(cfg.model, pick_quant(cfg.quant))

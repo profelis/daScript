@@ -14,9 +14,9 @@ require strings
 require math
 require audio                   // miniaudio decoder: any uploaded audio format -> 16 kHz mono f32
 
-// An OpenAI-compatible HTTP server over the dasLLAMA facade. It reaches only public verbs
-// (load_model / create_chat / add_user / add_assistant / respond / transcribe) — the acceptance
-// test for the API: if it builds with no reach into the engine internals, the facade is complete.
+// An OpenAI-compatible HTTP server over the dasLLAMA facade. It reaches only public facade verbs —
+// no engine internals — which is the acceptance test for the API: if a full OpenAI surface builds
+// without reaching into the engine, the facade is complete.
 // One process, one context, one in-flight request (serialized on the tick thread).
 
 // ===== Served state (set once at startup; handlers run serially on the tick thread) =====
