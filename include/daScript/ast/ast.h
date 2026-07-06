@@ -1720,6 +1720,7 @@ namespace das
         bool optimizationCondFolding(int32_t round);
         bool optimizationUnused(TextWriter & logs, int32_t round);
         bool optimizationDeadStores(int32_t round);
+        bool optimizationCSE(int32_t round);
         void buildAccessFlags(TextWriter & logs);
         bool verifyAndFoldContracts();
         void validateAst();
