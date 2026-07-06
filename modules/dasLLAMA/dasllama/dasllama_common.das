@@ -4270,6 +4270,7 @@ def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int6
             }
         }
     }
+    s.n_past = npos   // KV now holds npos positions (start_pos was 0) — keep the session cursor consistent
     // mean over positions, then L2-normalize
     let inv = 1.0 / float(npos)
     var ss = 0.0
