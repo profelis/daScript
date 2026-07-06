@@ -257,6 +257,21 @@ def test_chat_template_detection(t : T?) {
         t |> equal(detected_special("bos_token xx [INST] xx [/INST] eos_token"), "[INST]")
         t |> equal(detected_special("xx <|user|> xx eos_token xx"), "</s>")        // Zephyr: text markers
     }
+    t |> run("[INST]-family templates close the assistant turn with </s>, not the user tail") @(t : T?) {
+        // [INST]…[/INST] wraps USER turns only; the assistant's reply ends with EOS. The
+        // derived user-tail close (` [/INST]`) is wrong for this family — multi-turn history
+        // must render `… reply</s>[INST] next …`.
+        var m = Model()
+        m.chat_template_str = "bos_token xx [INST] xx [/INST] eos_token"
+        let ct <- chat_template(m)
+        t |> equal(length(ct.assistant_close.parts), 1, "v0.3 has an explicit assistant close")
+        t |> equal(ct.assistant_close.parts[0].s, "</s>")
+        var m2 = Model()
+        m2.chat_template_str = "mistral-v7-tekken"
+        let ct2 <- chat_template(m2)
+        t |> equal(length(ct2.assistant_close.parts), 1, "v7-tekken has an explicit assistant close")
+        t |> equal(ct2.assistant_close.parts[0].s, "</s>")
+    }
     t |> run("arch fallback when the GGUF carries no template") @(t : T?) {
         var m = Model()
         m.arch = "qwen2"

@@ -48,7 +48,10 @@ def main {
     let c <- caps(m)
     let lang = !empty(c.languages) && length(c.languages) == 1 ? c.languages[0] : "auto"
 
-    if (!sound_record_start(RATE, 1, RATE * 30, -1)) {
+    // ring sized to the whole take (+ slack): a slow decoder blocks the drain loop for its
+    // full decode, and audio landing meanwhile must fit in the ring or it drops (whisper's
+    // 30 s-padded decode showed exactly that; parakeet never gets close)
+    if (!sound_record_start(RATE, 1, int(seconds * float(RATE)) + RATE * 5, -1)) {
         panic("could not open the capture device (no microphone, or access denied)")
     }
     print("recording {seconds} s — speak!\n\n")
