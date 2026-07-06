@@ -56,7 +56,13 @@ def main():
         text = ""
         for rep in range(1, args.reps + 1):
             t0 = time.perf_counter()
-            text = model.recognize(wav)
+            try:
+                text = model.recognize(wav)
+            except Exception as e:
+                # the exports bake a max input length (hp0x2 overflows the rel-pos
+                # table); an over-long clip is a missing cell, not a dead sweep
+                print(f"SKIP\t{name}\t{base}\t{type(e).__name__}: {str(e).splitlines()[-1][:120]}")
+                break
             ms = (time.perf_counter() - t0) * 1000.0
             print(f"BENCH\t{name}\t{base}\t{dur:.3f}\t{rep}\t{ms:.3f}\t{dur * 1000.0 / ms:.3f}")
         if args.text:
