@@ -101,10 +101,7 @@ def load_asr_model(path : string) : AsrModel {
     }
     if (vocab < 8192) {   // parakeet bins carry a ~1k SPM vocab
         var pm = AsrModel(kind = AsrKind.parakeet)
-        pm.pk <- load_parakeet_model(path)
-        if (!g_asr_force_fp32) {
-            parakeet_quantize(pm.pk)
-        }
+        pm.pk <- load_parakeet_model(path, !g_asr_force_fp32)
         return <- pm
     }
     // whisper vocabs: 51864 (.en) / 51865 (multilingual) / 51866 (large-v3 family); anything
