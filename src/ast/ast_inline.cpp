@@ -1125,9 +1125,9 @@ namespace das {
                 return privateUseCache[fn] = scan.privateSymbol;
             }
 
-            // next free __inl counter in this function; names are function-scoped and
+            // next free __inl counter across a subtree; names are function-scoped and
             // later rounds keep splicing into the same function, so continue the sequence
-            int nextInlineId ( Function * fn ) {
+            int nextInlineIdIn ( Expression * body ) {
                 int mx = 0;
                 auto consider = [&]( const string & name ) {
                     if ( name.compare(0, 5, "__inl")==0 ) {
@@ -1135,7 +1135,7 @@ namespace das {
                         if ( id >= mx ) mx = id + 1;
                     }
                 };
-                lookupExpressions(fn->body, [&](Expression * expr) {
+                lookupExpressions(body, [&](Expression * expr) {
                     if ( expr->rtti_isLet() ) {
                         auto let = static_cast<ExprLet *>(expr);
                         for ( auto & v : let->variables ) consider(v->name);
@@ -1146,6 +1146,7 @@ namespace das {
                 });
                 return mx;
             }
+            int nextInlineId ( Function * fn ) { return nextInlineIdIn(fn->body); }
 
             void error ( const string & what, const LineInfo & at ) {
                 program->error(what, "", "", at, CompilationError::invalid_annotation);
@@ -1295,6 +1296,16 @@ namespace das {
                     if ( calleeFn->result && !calleeFn->result->isVoid() ) subjResult = calleeFn->result;
                     sa.args = &call->arguments; sa.ofs = 0; sa.params = &calleeFn->arguments;
                 }
+                // a callee body may itself contain manufactured __inl locals (interiors
+                // splice before their callers within a round, and the counter is
+                // function-scoped) - the site id must clear those too, or the rename map
+                // captures this site's synthesized names (the result store would retarget
+                // the callee's interior temp: a wrong-type error, or worse, a silent
+                // uninitialized read when the types happen to agree)
+                {
+                    int calleeNext = nextInlineIdIn(body);
+                    if ( calleeNext > inlineId ) inlineId = calleeNext;
+                }
                 // ----- classify arguments -----
                 auto & stats = paramStats(body, *sa.params);
                 bool isVoid = subjResult==nullptr;
@@ -1341,11 +1352,13 @@ namespace das {
                     // instances (which today collide in the instance registry). best-effort
                     // sites decline; MUST keeps its pre-existing contract
                     if ( site.kind!=SiteKind::MustCall && A->type && P->type ) {
+                        // gc_local: comparison-only temporaries, freed at scope exit
+                        // instead of lingering on the gc root until the next sweep
                         auto stripTop = [](const TypeDecl * t) {
                             auto c = new TypeDecl(*t);
                             c->ref = false;
                             c->constant = false;
-                            return c;
+                            return gc_local<TypeDecl>(c);
                         };
                         if ( !stripTop(A->type)->isSameType(*stripTop(P->type), RefMatters::yes,
                                 ConstMatters::yes, TemporaryMatters::yes, AllowSubstitute::no, false) ) {

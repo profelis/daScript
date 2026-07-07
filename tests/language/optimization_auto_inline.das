@@ -117,6 +117,47 @@ def doubled_of(src : array<int>; blk : block<(v : int) : int>) : array<int> {
     return <- r
 }
 
+typedef OptInt = tuple<_has : bool; _v : int>
+typedef ResOptInt = tuple<_ok : bool; _v2 : OptInt; _err : string>
+
+def inner_probe(k : int; blk : block<(v : int) : int>) : ResOptInt {
+    var res : ResOptInt
+    res._ok = invoke(blk, k) > 0
+    res._v2._has = res._ok
+    res._v2._v = k * 3
+    res._err = "e"
+    return <- res
+}
+
+def outer_probe(k : int; blk : block<(v : int) : int>) : OptInt {
+    // the LITERAL interior call splices first, planting manufactured __inl0_* locals
+    // in this body; splicing IT next must not let the rename map capture the new
+    // site's synthesized result store (the interior temp has a DIFFERENT type here -
+    // a captured store was error 30941 "can only move compatible type")
+    var r <- inner_probe(k, $(x) => invoke(blk, x) + 1)
+    if (!r._ok) {
+        panic("unexpected")
+    }
+    return <- r._v2
+}
+
+def inner_same(k : int; blk : block<(v : int) : int>) : OptInt {
+    var res : OptInt
+    res._has = true
+    res._v = invoke(blk, k) * 3
+    return <- res
+}
+
+def outer_same(k : int; blk : block<(v : int) : int>) : OptInt {
+    // same shape with MATCHING result types: a captured store compiled silently and
+    // read the outer temp uninitialized - the behavioral check pins the values
+    var r <- inner_same(k, $(x) => invoke(blk, x) + 1)
+    if (!r._has) {
+        panic("unexpected")
+    }
+    return <- r
+}
+
 [export]
 def target_auto(src : array<int>) : int {
     return src |> transform_sum() $(v) => v * v
@@ -190,6 +231,18 @@ def target_flavor_mismatch(src : array<int>) : int {
     return iter_sum_cref(unsafe(each(src))) $(v) => v + 1
 }
 
+[export]
+def target_nested_res(k : int) : int {
+    let o <- outer_probe(k) $(v) => v + 1
+    return o._has ? o._v : -1
+}
+
+[export]
+def target_nested_same(k : int) : int {
+    let o <- outer_same(k) $(v) => v + 1
+    return o._has ? o._v : -1
+}
+
 def has(s, sub : string) : bool {
     return find(s, sub, 0) >= 0
 }
@@ -254,6 +307,14 @@ def test_auto_inline_fired(t : T?) {
             let b = body_of(t, "target_flavor_mismatch")
             t |> success(has(b, "iter_sum_cref("), "call stays regular: {b}")
         }
+        t |> run("callee with interior splice splices again without capture") @(t : T?) {
+            let b = body_of(t, "target_nested_res")
+            t |> success(!has(b, "outer_probe("), "outer call is gone: {b}")
+            t |> success(!has(b, "inner_probe("), "interior call is gone: {b}")
+            let b2 = body_of(t, "target_nested_same")
+            t |> success(!has(b2, "outer_same("), "outer call is gone: {b2}")
+            t |> success(!has(b2, "inner_same("), "interior call is gone: {b2}")
+        }
     }
 }
 
@@ -275,6 +336,8 @@ def test_auto_inline_behavior(t : T?) {
         t |> equal(target_recursive(src), 11)
         t |> equal(target_flavor_match(4), 10)
         t |> equal(target_flavor_mismatch(src), 14)
+        t |> equal(target_nested_res(5), 15)
+        t |> equal(target_nested_same(4), 18)
     }
     t |> run("impure arguments evaluate once in call order") @(t : T?) {
         g_log = ""
