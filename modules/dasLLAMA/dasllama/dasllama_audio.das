@@ -405,11 +405,54 @@ struct WhisperMel {
     data : array<float>
 }
 
+// per-frame stack buffers in log_mel_whisper are sized for the fixed 400-pt whisper DFT
+let private MEL_DFT_N = 400
+let private MEL_DFT_BINS = 201
+
+//! Hoisted whisper-mel tables (build once at model load): Hann-400 window + the DFT twiddle
+//! matrix TRANSPOSED to ``[2·n_bins][n_fft]`` so each spectrum bin is two contiguous ``dot``
+//! rows (the per-frame matvec form in log_mel_whisper). Same table values as
+//! build_dft_twiddles, transposed layout.
+struct WhisperMelPlan {
+    n_fft : int64 = 0l
+    hann : array<float>
+    twt : array<float>   // [2·n_bins][n_fft]: row 2k = cos(2πjk/n), row 2k+1 = −sin(2πjk/n)
+}
+
+def build_whisper_mel_plan(n_fft : int64) : WhisperMelPlan {
+    if (n_fft != int64(MEL_DFT_N)) {
+        panic("build_whisper_mel_plan: log_mel_whisper stack frames are sized for {MEL_DFT_N}-pt DFT, got {n_fft}")
+    }
+    var p = WhisperMelPlan(n_fft = n_fft)
+    p.hann <- build_hann_window(n_fft)
+    let n_bins = n_fft / 2l + 1l
+    var cos_tab : array<float>
+    var sin_tab : array<float>
+    cos_tab |> resize(int(n_fft))
+    sin_tab |> resize(int(n_fft))
+    for (i in range64(n_fft)) {
+        let theta = 2.0lf * DBL_PI * double(i) / double(n_fft)
+        cos_tab[i] = cos(float(theta))
+        sin_tab[i] = sin(float(theta))
+    }
+    p.twt |> resize(int(2l * n_bins * n_fft))
+    for (k in range64(n_bins)) {
+        for (j in range64(n_fft)) {
+            let idx = (j * k) % n_fft
+            p.twt[(2l * k) * n_fft + j] = cos_tab[idx]
+            p.twt[(2l * k + 1l) * n_fft + j] = -sin_tab[idx]
+        }
+    }
+    delete cos_tab
+    delete sin_tab
+    return <- p
+}
+
 //! whisper.cpp's ``log_mel_spectrogram`` — DIVERGES from the mtmd flavor above: reflect-200
 //! head from the RAW input (no 31 s pre-extend), 30 s zeros + 200 tail, n_len drops the last
 //! frame, frames past the real audio skip the FFT (every bin = log10(1e-10)), floor 1e-10,
 //! filterbank comes from the model file. Same global max−8 clamp + (x+4)/4.
-def log_mel_whisper(samples : array<float> | #; filters : array<float>; n_mel : int64) : WhisperMel {
+def log_mel_whisper(samples : array<float> | #; plan : WhisperMelPlan; filters : array<float>; n_mel : int64) : WhisperMel {
     let n_in = int64(length(samples))
     let head = AUDIO_N_FFT / 2l                            // 200
     let n_padded = n_in + AUDIO_SAMPLE_RATE * 30l + 2l * head
@@ -428,54 +471,50 @@ def log_mel_whisper(samples : array<float> | #; filters : array<float>; n_mel : 
     m.n_len_org = 1l + (n_in + head - AUDIO_N_FFT) / AUDIO_HOP
     m.data |> resize(int(n_mel * m.n_len))
 
-    // frames whose window starts inside the real (head-padded) audio get the FFT; the rest
+    // frames whose window starts inside the real (head-padded) audio get the DFT; the rest
     // are pure zero-tail and fill with log10(1e-10) directly
     let n_fft = AUDIO_N_FFT
     let n_bins = n_fft / 2l + 1l
     let n_compute = min((n_in + head) / AUDIO_HOP + 1l, m.n_len)
-    let hann <- build_hann_window(n_fft)
-    let twiddles <- build_dft_twiddles(n_fft)
-
-    var xw : array<float>
-    xw |> resize(int(n_compute * n_fft))
-    for (i in range64(n_compute)) {
-        let off = i * AUDIO_HOP
-        for (j in range64(n_fft)) {
-            xw[i * n_fft + j] = hann[j] * padded[off + j]
-        }
+    if (plan.n_fft != n_fft) {
+        panic("log_mel_whisper: plan is {plan.n_fft}-pt, want {n_fft} — build_whisper_mel_plan(AUDIO_N_FFT)")
     }
-    var reim : array<float>
-    reim |> resize(int(n_compute * n_bins * 2l))
-    gemm_f32(unsafe(addr(reim[0])), unsafe(addr(xw[0])), unsafe(addr(twiddles[0])),
-             n_compute, n_fft, n_bins * 2l)
-
-    // power -> mel: float products in groups of 4 summed in float, each group added to a
-    // double accumulator — whisper.cpp's exact unrolled accumulation
     let log10_e = 0.43429448190325176lf
     let fill = float(log(1e-10lf) * log10_e)
-    var power : array<float>
-    power |> resize(int(n_bins))
-    for (i in range64(n_compute)) {
-        for (k in range64(n_bins)) {
-            let re = reim[i * n_bins * 2l + k * 2l]
-            let im = reim[i * n_bins * 2l + k * 2l + 1l]
-            power[k] = re * re + im * im
-        }
-        for (j in range64(n_mel)) {
-            var sum = 0.0lf
-            var k = 0l
-            while (k + 3l < n_bins) {
-                sum += double(power[k] * filters[j * n_bins + k]
-                    + power[k + 1l] * filters[j * n_bins + k + 1l]
-                    + power[k + 2l] * filters[j * n_bins + k + 2l]
-                    + power[k + 3l] * filters[j * n_bins + k + 3l])
-                k += 4l
+
+    // per-frame window + DFT matvec (two tuned dots per bin against the transposed twiddle
+    // rows) + mel dot, threaded over frames (independent — bit-exact at any lane count);
+    // scratch is a per-worker stack frame, so a 9-minute clip no longer materializes the
+    // ~170 MB [frames × n_fft] + [frames × 2·n_bins] images the GEMM form needed
+    let n_len = m.n_len
+    unsafe {
+        let pdd = reinterpret<float const?>(addr(padded[0]))
+        let hw = reinterpret<float const?>(addr(plan.hann[0]))
+        let twt = reinterpret<float const?>(addr(plan.twt[0]))
+        let flt = reinterpret<float const?>(addr(filters[0]))
+        var md = addr(m.data[0])
+        maybe_parallel_for(0, int(n_compute), lanes_for_work(n_compute * n_fft * n_bins * 2l, 0)) $(rb, re) {
+            var xwin : float[MEL_DFT_N]    // windowed samples, stack-resident
+            var pw : float[MEL_DFT_BINS]   // power spectrum
+            unsafe {
+                var xp = addr(xwin[0])
+                var pp = addr(pw[0])
+                for (i in range64(int64(rb), int64(re))) {
+                    let off = i * AUDIO_HOP
+                    for (j in range64(n_fft)) {
+                        xp[j] = hw[j] * pdd[off + j]
+                    }
+                    for (k in range64(n_bins)) {
+                        let sre = dot(twt + (2l * k) * n_fft, xp, n_fft)
+                        let sim = dot(twt + (2l * k + 1l) * n_fft, xp, n_fft)
+                        pp[k] = sre * sre + sim * sim
+                    }
+                    for (jm in range64(n_mel)) {
+                        let sum = double(dot(flt + jm * n_bins, pp, n_bins))
+                        md[jm * n_len + i] = float(log(max(sum, 1e-10lf)) * log10_e)
+                    }
+                }
             }
-            while (k < n_bins) {
-                sum += double(power[k] * filters[j * n_bins + k])
-                k++
-            }
-            m.data[j * m.n_len + i] = float(log(max(sum, 1e-10lf)) * log10_e)
         }
     }
     for (i in range64(n_compute, m.n_len)) {

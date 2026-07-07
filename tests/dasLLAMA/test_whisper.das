@@ -169,9 +169,10 @@ def test_whisper_mel(t : T?) {
     t |> run("whisper-flavor mel: frame math and silence fill") @(t : T?) {
         // stand-in filterbank (the real one loads from the model file)
         let fb <- build_mel_filterbank(80l, 400l, 16000l)
+        let plan <- build_whisper_mel_plan(400l)
         var silence : array<float>
         silence |> resize(16000)          // 1 s of zeros
-        let m <- log_mel_whisper(silence, fb, 80l)
+        let m <- log_mel_whisper(silence, plan, fb, 80l)
         t |> equal(m.n_len, (16000l + 480000l) / 160l)                    // no +1: last frame dropped
         t |> equal(m.n_len_org, 1l + (16000l + 200l - 400l) / 160l)       // real-audio frames
         // all-silence spectrogram: every value is ((-10) + 4)/4 = -1.5 after clamp+scale
@@ -185,9 +186,10 @@ def test_whisper_mel(t : T?) {
     }
     t |> run("window slice zero-fills past n_len") @(t : T?) {
         let fb <- build_mel_filterbank(80l, 400l, 16000l)
+        let plan <- build_whisper_mel_plan(400l)
         var silence : array<float>
         silence |> resize(16000)
-        let m <- log_mel_whisper(silence, fb, 80l)
+        let m <- log_mel_whisper(silence, plan, fb, 80l)
         let win <- whisper_mel_window(m, m.n_len - 10l)
         t |> equal(win.n_len, 3000l)
         t |> success(win.data[0] == -1.5, "first 10 frames real")
