@@ -1184,9 +1184,11 @@ def public write_dll(mod : LLVMOpaqueModule?; out_path : string; path_to_dascrip
     }
 }
 
-def public write_exe(mod : LLVMOpaqueModule?; out_path : string; path_to_dascript_lib, path_to_linker, linker_string : string; link_whole_lib : bool) {
-    // Standalone exe: must run on any compatible CPU, keep generic.
-    with_default_target_machine(3u, false) $(targetMachine : LLVMTargetMachineRef) {
+def public write_exe(mod : LLVMOpaqueModule?; out_path : string; path_to_dascript_lib, path_to_linker, linker_string : string; link_whole_lib : bool; use_host_cpu : bool) {
+    // Standalone exe: generic (redistributable) by default, but a local-use build carrying
+    // tuner-generated kernels targets the current box (use_host_cpu) so its host-specific IR
+    // (e.g. AVX2) can be legalized — the generic target aborts codegen on it otherwise.
+    with_default_target_machine(3u, use_host_cpu) $(targetMachine : LLVMTargetMachineRef) {
         let error : string?
         let file = add_obj_extension(out_path)
         let filetype = LLVMCodeGenFileType.LLVMObjectFile

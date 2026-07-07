@@ -144,6 +144,18 @@ def private fold_llvm_code_hints(funcs : array<FunctionPtr>; seed : uint64) : ui
     return h
 }
 
+// True when the program emits any [llvm_code] generated kernel (a tuner-stamped or hand-written
+// generator body). Such kernels emit host-specific IR (e.g. AVX2 256-bit ops) that a generic
+// x86-64 exe target cannot legalize — so a -exe carrying them must target the current box.
+def private has_generated_kernel(funcs : array<FunctionPtr>) : bool {
+    for (fn in funcs) {
+        for (ann in fn.annotations) {
+            if (ann.annotation.name == "llvm_code") return true
+        }
+    }
+    return false
+}
+
 def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : int;
                      emit_prologue : bool; debug_info : bool; target_triple : string) : string {
     var h = LLVM_JIT_CODEGEN_VERSION
@@ -473,7 +485,15 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
             if (g_jit_fast_math) {
                 apply_fast_math_to_module(g_mod)   // EXPERIMENT: stamp all FP ops fast (non-bit-exact ceiling)
             }
-            optimize_llvm_module(opt_level |> uint(), size_level |> uint(), LLVM_INLINE_THRESHOLD, !gen_exe)
+            // A -exe carrying tuner-generated ([llvm_code]) kernels is a local-use artifact: those
+            // kernels emit host-specific IR the generic exe target can't legalize, so target the
+            // current box (CPU + features). A -exe with only reference bodies stays generic/
+            // redistributable. (JIT always targets the host — its artifact runs here.)
+            let exe_host_cpu = gen_exe && has_generated_kernel(funcs)
+            if (exe_host_cpu) {
+                to_log(LOG_INFO, "LLVM EXE: targeting the current box (CPU + features) — the build carries tuner-generated kernels\n")
+            }
+            optimize_llvm_module(opt_level |> uint(), size_level |> uint(), LLVM_INLINE_THRESHOLD, !gen_exe || exe_host_cpu)
             if (dump_ir) {
                 // Let's remove unused attributes before we print IR.
                 var pmo = LLVMCreatePassBuilderOptions()
@@ -507,7 +527,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
                 write_wasm(g_mod, output_path, target_triple, path_to_linker, jit_has_externals, runtime_lib_override, emit_object)
             } elif (gen_exe) {
                 mkdir_rec(dir_name(output_path))
-                write_exe(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB)
+                write_exe(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB, exe_host_cpu)
             } elif (use_dll) {
                 mkdir_rec(dir_name(output_path))
                 write_dll(g_mod, output_path, path_to_shared_lib, path_to_linker, linker_string, LINK_WHOLE_LIB)
