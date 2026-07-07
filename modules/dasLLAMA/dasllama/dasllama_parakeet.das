@@ -7,7 +7,9 @@ require daslib/fio
 require strings
 require daslib/strings_boost
 require daslib/array_boost
-require dasllama/dasllama_math
+require dasllama/dasllama_math public   // TODO(lambda-vis): public only so the mel worker's dot() resolves from facade
+                                        // consumers — lifted lambdas in generics drop the origin-module scope
+                                        // (see isVisibleFunc/fromGeneric); revert to plain require once fixed
 require dasllama/dasllama_gguf
 require dasllama/dasllama_audio
 require dasllama/dasllama_quant
