@@ -553,21 +553,80 @@ def whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<fl
     for (l in range64(w.n_text_layer)) {
         let lo = dec_layer_offsets(w, l)
         wm_mm(w, ds.ckv_tmp, lo.ck_w, enc_out, ds.xqi, ds.xsi, d, d, ta)
-        for (h in range64(hh)) {
-            let base = ((l * hh + h) * hs) * ta
-            for (t in range64(ta)) {
-                for (j in range64(hs)) {
-                    ds.kx[base + j * ta + t] = ds.ckv_tmp[t * d + h * hs + j] * kscale
+        // kx: 4x4 register-blocked transpose, t-block outer so the 4 source rows stream
+        // contiguously; threaded over t-blocks — pure scatter, bit-exact under any chunking
+        // (cross_kv_bench: 3.5-4.5x over the scalar form even single-lane)
+        unsafe {
+            let sp = reinterpret<float const?>(addr(ds.ckv_tmp[0]))
+            var op = addr(ds.kx[l * d * ta])
+            let nblk = ta / 4l
+            maybe_parallel_for(0, int(nblk), lanes_for_work(ta * d, 0)) $(bb, be) {
+                unsafe {
+                    for (blk in range64(int64(bb), int64(be))) {
+                        let t = blk * 4l
+                        let r0 = sp + t * d
+                        let r1 = sp + (t + 1l) * d
+                        let r2 = sp + (t + 2l) * d
+                        let r3 = sp + (t + 3l) * d
+                        for (h in range64(hh)) {
+                            let hoff = h * hs
+                            let base = h * hs * ta + t
+                            var j = 0l
+                            while (j + 3l < hs) {
+                                let a = (*reinterpret<float4 const?>(r0 + hoff + j)) * kscale
+                                let b = (*reinterpret<float4 const?>(r1 + hoff + j)) * kscale
+                                let c = (*reinterpret<float4 const?>(r2 + hoff + j)) * kscale
+                                let e = (*reinterpret<float4 const?>(r3 + hoff + j)) * kscale
+                                *reinterpret<float4?>(op + base + j * ta) = float4(a.x, b.x, c.x, e.x)
+                                *reinterpret<float4?>(op + base + (j + 1l) * ta) = float4(a.y, b.y, c.y, e.y)
+                                *reinterpret<float4?>(op + base + (j + 2l) * ta) = float4(a.z, b.z, c.z, e.z)
+                                *reinterpret<float4?>(op + base + (j + 3l) * ta) = float4(a.w, b.w, c.w, e.w)
+                                j += 4l
+                            }
+                            while (j < hs) {   // hs tail (whisper hs=64; generic safety)
+                                op[base + j * ta] = r0[hoff + j] * kscale
+                                op[base + j * ta + 1l] = r1[hoff + j] * kscale
+                                op[base + j * ta + 2l] = r2[hoff + j] * kscale
+                                op[base + j * ta + 3l] = r3[hoff + j] * kscale
+                                j++
+                            }
+                        }
+                    }
+                }
+            }
+            for (t in range64(nblk * 4l, ta)) {   // t tail (ta=1500 is 4-aligned; generic safety)
+                for (h in range64(hh)) {
+                    for (j in range64(hs)) {
+                        op[h * hs * ta + j * ta + t] = sp[t * d + h * hs + j] * kscale
+                    }
                 }
             }
         }
         wm_mm(w, ds.ckv_tmp, lo.cv_w, enc_out, ds.xqi, ds.xsi, d, d, ta)
         add_bias_rows(ds.ckv_tmp, w.dblob, lo.cv_b, d, ta)
-        for (h in range64(hh)) {
-            let base = ((l * hh + h) * ta) * hs
-            for (t in range64(ta)) {
-                for (j in range64(hs)) {
-                    ds.vx[base + t * hs + j] = ds.ckv_tmp[t * d + h * hs + j]
+        // vx: t-major f4 copy — each source row streams once, hh contiguous hs-chunks fan
+        // out; threaded over t (cross_kv_bench: 4.3-5.1x single-lane)
+        unsafe {
+            let sp = reinterpret<float const?>(addr(ds.ckv_tmp[0]))
+            var op = addr(ds.vx[l * d * ta])
+            maybe_parallel_for(0, int(ta), lanes_for_work(ta * d, 0)) $(tb, te) {
+                unsafe {
+                    for (t in range64(int64(tb), int64(te))) {
+                        let src = sp + t * d
+                        for (h in range64(hh)) {
+                            var dst = op + h * ta * hs + t * hs
+                            let hoff = h * hs
+                            var j = 0l
+                            while (j + 3l < hs) {
+                                *reinterpret<float4?>(dst + j) = *reinterpret<float4 const?>(src + hoff + j)
+                                j += 4l
+                            }
+                            while (j < hs) {
+                                dst[j] = src[hoff + j]
+                                j++
+                            }
+                        }
+                    }
                 }
             }
         }
