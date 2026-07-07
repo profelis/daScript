@@ -1025,7 +1025,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
         tp = ref_time_ticks()
         layernorm_batch(st.xb, st.x, m.blob, lo.nf1_w, lo.nf1_b, d, tt, m.eps)
         pk_mm_rq(m, st.h, lo.ff1a_w, st.xb, st.xqi, st.xsi, d, 4l * d, tt)
-        silu(st.h, tt * 4l * d)
+        silu4(st.h, tt * 4l * d)
         pk_mm_rq(m, st.xb, lo.ff1b_w, st.h, st.xqi, st.xsi, 4l * d, d, tt)
         for (i in range64(tt * d)) {
             st.x[i] += 0.5 * st.xb[i]
@@ -1222,7 +1222,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
         tp = ref_time_ticks()
         layernorm_batch(st.xb, st.x, m.blob, lo.nf2_w, lo.nf2_b, d, tt, m.eps)
         pk_mm_rq(m, st.h, lo.ff2a_w, st.xb, st.xqi, st.xsi, d, 4l * d, tt)
-        silu(st.h, tt * 4l * d)
+        silu4(st.h, tt * 4l * d)
         pk_mm_rq(m, st.xb, lo.ff2b_w, st.h, st.xqi, st.xsi, 4l * d, d, tt)
         for (i in range64(tt * d)) {
             st.x[i] += 0.5 * st.xb[i]

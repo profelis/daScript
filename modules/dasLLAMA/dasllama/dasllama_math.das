@@ -1525,6 +1525,30 @@ def swiglu_oai4(var g : float?; u : float const?; size : int64) {
     }
 }
 
+//! Vectorized SiLU: x[i] = x[i] · σ(x[i]) in place, float4 with exp4; ~4x the scalar silu
+//! (which pays a libm expf per element). ~2 ulp, NOT bit-exact — scalar silu stays the
+//! reference the chat-model oracles pin; ungated conformer FFNs (parakeet) call this form.
+def silu4(var x : float?; size : int64) {
+    let one = float4(1.0, 1.0, 1.0, 1.0)
+    unsafe {
+        var x4 = reinterpret<float4?>(x)
+        let n4 = size / 4l
+        for (k in range64(n4)) {
+            let v = x4[k]
+            let arg = clamp(-v, EXP4_LO, EXP4_HI)
+            x4[k] = v / (one + exp4(arg))
+        }
+        for (i in range64(n4 * 4l, size)) {
+            let v = x[i]
+            x[i] = v / (1.0 + exp(-v))
+        }
+    }
+}
+def silu4(var x : array<float> | #; size : int64) {
+    if (size <= 0) return
+    silu4(unsafe(addr(x[0])), size)
+}
+
 //! Logit soft-capping (Gemma2): x = cap * tanh(x / cap), elementwise over the first `size`.
 //! Smoothly bounds values to (-cap, cap). Applied to attention scores (cap 50) after the
 //! 1/sqrt(head_size) scale and before softmax, and to the final classifier logits (cap 30).
