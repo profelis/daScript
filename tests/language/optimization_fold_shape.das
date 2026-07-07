@@ -1,5 +1,6 @@
 options gen2
 options rtti
+options no_coverage // shape pins: injected coverage calls legitimately block the folds
 
 require daslib/ast
 require daslib/rtti
