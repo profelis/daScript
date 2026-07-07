@@ -697,19 +697,30 @@ def private restamp_fn(var fn : FunctionPtr; mod : Module?; manifest : table<str
     delete comps
 }
 
-def private restamp_program(manifest : table<string; string>; mpath : string; var errors : das_string) {
+// scopeName restricts the walk to modules bound to that scope — a scope's manifest must not
+// stamp another library's same-named kernel (the keys are bare function names). "" walks the
+// whole program: the explicit overrides (DAS_TUNE_MANIFEST env, app [tune_manifest]) keep
+// program-wide semantics by design.
+def private restamp_program(manifest : table<string; string>; mpath : string; scopeName : string; var errors : das_string) {
     program_for_each_module(compiling_program()) $(mod) {
-        var tuned : array<FunctionPtr>
-        for_each_function(mod, "") $(fn) {
-            for (ann in fn.annotations) {
-                if (ann.annotation.name == "tune") {
-                    tuned |> push(fn)
-                    break
+        var skip = false
+        if (!empty(scopeName)) {
+            let modName = "{mod.name}"
+            skip = !(g_scopes |> key_exists(modName)) || g_scopes[modName].scopeName != scopeName
+        }
+        if (!skip) {
+            var tuned : array<FunctionPtr>
+            for_each_function(mod, "") $(fn) {
+                for (ann in fn.annotations) {
+                    if (ann.annotation.name == "tune") {
+                        tuned |> push(fn)
+                        break
+                    }
                 }
             }
-        }
-        for (fn in tuned) {
-            restamp_fn(fn, mod, manifest, mpath, errors)
+            for (fn in tuned) {
+                restamp_fn(fn, mod, manifest, mpath, errors)
+            }
         }
     }
 }
@@ -752,7 +763,7 @@ class private TuneManifestAnnotation : AstFunctionAnnotation {
         var found = false
         var manifest <- read_manifest(mpath, found)
         if (found) {
-            restamp_program(manifest, mpath, errors)
+            restamp_program(manifest, mpath, "", errors)
         }
         delete manifest
         return empty(errors)
@@ -942,8 +953,11 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
         if (force && empty(g_scopes)) {
             print("llvm_tune: --tune requested but no [tune_scope] is declared by any required library\n")
         }
+        // snapshot: values() locks the table for the loop's duration, and the body's restamp
+        // reads g_scopes (the [] op is insert-capable — it trips the lock even on hits)
+        var scopes <- [for (scope in values(g_scopes)); scope]
         var seen : table<string>
-        for (scope in values(g_scopes)) {
+        for (scope in scopes) {
             continue if (seen |> key_exists(scope.scopeName))
             seen |> insert(scope.scopeName)
             var found = false
@@ -958,7 +972,7 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
                     var found2 = false
                     var fresh <- read_manifest(scope.manifestPath, found2)
                     if (found2) {
-                        restamp_program(fresh, scope.manifestPath, errors)
+                        restamp_program(fresh, scope.manifestPath, scope.scopeName, errors)
                     } else {
                         errors := "[tune_policy]: tuner for scope '{scope.scopeName}' produced no manifest at {scope.manifestPath}"
                     }
@@ -999,6 +1013,7 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
             break if (!empty(errors))
         }
         delete seen
+        delete scopes
         // the runtime status table: one tune_status_add per [tune] function, reflecting every
         // restamp above (the rows are read off the final AST, not banked during stamping)
         if (empty(errors)) {
