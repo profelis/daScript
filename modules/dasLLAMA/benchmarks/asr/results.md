@@ -116,9 +116,29 @@ LibriSpeech test-clean, 25 short clips (best-of-2, per-clip latency — the dict
 M1 shape then: cli (AMX-backed GEMMs) led until ~9 min, where das reached parity — the
 gap was the dispatch handicap, not the kernels (see the 2026-07-07 section).
 
-## zen2 EPYC, both sides 16 threads (`DAS_JOBQUE_THREADS=16` / `-t 16`), 3 reps — 2026-07-06
-(das rows PRE-dispatch-fix — carry the same fifo handicap, magnified by 16 lanes; das-only
-re-sweep pending next box round)
+## zen2 EPYC, both sides 16 threads, 3 reps — 2026-07-07 (STANDING; das re-sweep @ `17abcd32d`)
+
+das side re-run only (cli rows = the 2026-07-06 standing TSV results_parakeet_zen2_t16.tsv;
+new das rows in results_pk_zen2_t16_jo.tsv). Same dispatch-fix + silu4_batch + gemm_f32_jo
+stack as the M1 round; `tune_kernels` run on the box first (box_profile.json refreshed —
+winners matched the shipped per-ISA fallback defaults, deltas within box noise).
+
+parakeet-tdt-0.6b-v2 (f32 bin), das vs parakeet-cli (plain AVX2, no AMX):
+
+| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT |
+|---|---|---|---|---|---|---|
+| jfk.wav | 11 | 419 | 666 | **0.63x** | 26.2 | 16.5 |
+| jfk3.wav | 33 | 1133 | 1782 | **0.64x** | 29.1 | 18.5 |
+| gb1.wav | 199 | 10277 | 17052 | **0.60x** | 19.3 | 11.7 |
+| hp0.wav | 273 | 15339 | 29698 | **0.52x** | 17.8 | 9.2 |
+| hp0x2.wav | 547 | 44789 | 95549 | **0.47x** | 12.2 | 5.7 |
+
+zen2 shape: das now leads every row — the old "crossover ≈ 2.5-3 min" died with the
+dispatch fix (jfk was 3.02x, now 0.63x: the fifo cost scaled with 16 lanes and hit short
+clips hardest). v3 + onnx columns on zen2 still pending (box needs the v3 bin + an
+onnxruntime venv).
+
+## zen2 EPYC — 2026-07-06 (SUPERSEDED das rows; cli STANDING BASELINE source)
 
 parakeet-tdt-0.6b-v2 (f32 bin), das vs parakeet-cli (plain AVX2, no AMX):
 
