@@ -218,6 +218,8 @@ namespace das {
 
         void findMatchingFunctionsAndGenerics(MatchingFunctions &resultFunctions, MatchingFunctions &resultGenerics, const string &name, const vector<TypeDeclPtr> &types, bool inferBlock = false, bool visCheck = true) const;
 
+        Function * lockedNameGenericOrigin(const string &name, const MatchingFunctions &functions) const;
+
         bool trySeedTupleShorthand(ExprLooksLikeCall *expr, bool visCheck);
 
         void reportDualFunctionNotFound(const string &name, const string &extra,

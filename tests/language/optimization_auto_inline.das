@@ -84,8 +84,8 @@ def iter_sum(var src : iterator<int>; blk : block<(v : int) : int>) : int {
 
 def iter_sum_cref(var src : iterator<int const&>; blk : block<(v : int) : int>) : int {
     // element-const iterator param: an each() argument is element-mutable - a legal
-    // call (variance), but the substitution would fork the body's instantiations,
-    // so the site declines
+    // call (variance), but the substitution would hand the optimizer a const view
+    // of mutable storage (a soundness boundary, not registry debt), so the site declines
     var total = 0
     var v : int
     while (next(src, v)) {

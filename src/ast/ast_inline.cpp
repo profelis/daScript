@@ -210,11 +210,13 @@ namespace das {
                 }
                 // a generic INSTANCE call is name-mangled for the argument flavor it was
                 // instantiated with. tolerant instances (push, length) re-match after a
-                // splice, but an `explicit`-flavored parameter (==const generics: the
-                // clone family) locks the exact constness - substituting a non-const
-                // caller argument into a const-instantiated call stops the mangled name
-                // from matching. foreign-module instances decline outright (reachability),
-                // destination-module instances decline only on the explicit flavor
+                // splice - and a re-typed locked call now falls back to its origin
+                // generic - but an `explicit`-flavored parameter (==const generics: the
+                // clone family) marks a body TYPED against a locked constness view;
+                // splicing one under the caller's optimizer scope is a soundness
+                // boundary (see the flavor gates in processFunction). foreign-module
+                // instances decline outright (reachability), destination-module
+                // instances decline only on the explicit flavor
                 if ( fn->fromGeneric ) {
                     bool explicitFlavor = false;
                     for ( auto & arg : fn->arguments ) {
@@ -932,10 +934,11 @@ namespace das {
     namespace {
 
         // a call (or invoke) passing a `#` argument where the resolved target's parameter
-        // is neither `#` nor implicit: it resolved through GENERIC leniency (an OR-type
-        // accepting `string const#` reuses the plain-string instance - the registry
-        // collapses the flavors), and the splice protocol's rename + re-infer re-matches
-        // it directly against the instance's strict signature and fails. a subtree
+        // is neither `#` nor implicit. the binding is tolerated on the original node (the
+        // genericFunction short-circuit) and the locked-name fallback re-resolves it after
+        // a splice - but a spliced `#` view of container storage runs under the CALLER's
+        // optimizer scope, where the temp's real lifetime is no longer fenced by the call
+        // boundary (proven value corruption: linq's lazy group_by pipeline). a subtree
         // carrying one cannot ride a splice
         bool reinferFragile ( Expression * root ) {
             bool fragile = false;
@@ -1347,10 +1350,14 @@ namespace das {
                     // a substitution (or an inferred temp) carries the ARGUMENT's exact type
                     // into the body, where the call boundary coerced it to the PARAM's type.
                     // beyond top-level ref/const (which the machinery navigates), a flavor
-                    // change re-types the body: a `#` element re-types field reads past what
-                    // resolved instances accept, and an element-const change forks generic
-                    // instances (which today collide in the instance registry). best-effort
-                    // sites decline; MUST keeps its pre-existing contract
+                    // change is a SOUNDNESS boundary, not just a registry artifact: an
+                    // element-const view of mutable storage spliced inline hands the
+                    // optimizer const types it is licensed to trust (proven value
+                    // miscompile: linq's lazy group_by pipeline lost bucket elements),
+                    // and an already-typed block literal cannot re-match a re-typed
+                    // parameter (block argTypes compare strictly on re-infer). the
+                    // locked-name fallback heals RESOLUTION, not these; best-effort
+                    // sites decline, MUST keeps its pre-existing contract
                     if ( site.kind!=SiteKind::MustCall && A->type && P->type ) {
                         // gc_local: comparison-only temporaries, freed at scope exit
                         // instead of lingering on the gc root until the next sweep
@@ -1375,13 +1382,12 @@ namespace das {
                         break;
                     }
                     if ( byRefParam ) {
-                        // a substitution must not change the argument's CONST VIEW: body
-                        // subtrees may carry calls already resolved to ==const-flavored
-                        // instances (the `:=` clone family), and the splice re-infer
-                        // re-matches those against the instance's locked constness - a
-                        // non-const var replacing a const param read re-types them and
-                        // hard-fails (registry collapses the flavors). when the param is
-                        // more const than the leaf, bind a const reference instead
+                        // a substitution must not change the argument's CONST VIEW: the
+                        // body was typed against the param's constness, and a non-const
+                        // var replacing a const param read re-types body subtrees the
+                        // optimizer already trusts (the `:=` clone family being the
+                        // proven case). when the param is more const than the leaf,
+                        // bind a const reference instead
                         bool sameConstView = !P->type->constant || (leafA->type && leafA->type->constant);
                         if ( leafVar && sameConstView ) {
                             sub.substitute = leafA;             // same aliasing as the call itself
