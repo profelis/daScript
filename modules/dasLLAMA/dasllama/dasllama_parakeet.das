@@ -327,20 +327,31 @@ def private pk_requant(x : array<float>; n, npos : int64; var xq : array<int8>; 
     asr_requant_rows_q8(x, n, npos, xq, xs)
 }
 
-// conv taps arrive [ch][3][3] (dw, torch) / [cout][9] (c0, im2col order); the f4 kernels
-// want tap-major [9][ch]
-def private pk_conv_tap_major(var blob : array<float>; off, ch : int64) {
+// conv taps arrive [ch][3][3] (dw, torch) / [cout][9] (c0, im2col order) / [ch][k]
+// (conformer depthwise); the f4 kernels want tap-major [ntap][ch]
+def private pk_conv_tap_major(var blob : array<float>; off, ch, ntap : int64) {
     var tmp : array<float>
-    tmp |> resize(int(ch * 9l))
+    tmp |> resize(int(ch * ntap))
     for (c in range64(ch)) {
-        for (tap in range64(9l)) {
-            tmp[tap * ch + c] = blob[off + c * 9l + tap]
+        for (tap in range64(ntap)) {
+            tmp[tap * ch + c] = blob[off + c * ntap + tap]
         }
     }
     for (i, v in count(), tmp) {
         blob[off + int64(i)] = v
     }
     delete tmp
+}
+
+// inference BN folded to per-channel scale/shift at load: y = acc·scale + shift with
+// scale = γ/sqrt(σ²), shift = β − μ·scale. bn_w/bn_b slots take scale/shift; the
+// mean/var slots stay as read (dead after the fold).
+def private pk_fold_bn(var blob : array<float>; w, b, mean, vr, d : int64) {
+    for (j in range64(d)) {
+        let s = blob[w + j] / sqrt(blob[vr + j])
+        blob[w + j] = s
+        blob[b + j] -= blob[mean + j] * s
+    }
 }
 
 // ===== bin container =====
@@ -551,15 +562,15 @@ def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
 
         var wscratch : array<float>   // q8 transcode staging, one GEMM tensor at a time
         pk_read(recs, bytes, "encoder.pre_encode.conv.0.weight", m.blob, m.c0_w, nch * 9l)
-        pk_conv_tap_major(m.blob, m.c0_w, nch)   // c0 kernel reads tap-major too
+        pk_conv_tap_major(m.blob, m.c0_w, nch, 9l)   // c0 kernel reads tap-major too
         pk_read(recs, bytes, "encoder.pre_encode.conv.0.bias", m.blob, m.c0_b, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.2.weight", m.blob, m.c2_w, nch * 9l)
-        pk_conv_tap_major(m.blob, m.c2_w, nch)
+        pk_conv_tap_major(m.blob, m.c2_w, nch, 9l)
         pk_read(recs, bytes, "encoder.pre_encode.conv.2.bias", m.blob, m.c2_b, nch)
         pk_read_gemm(recs, bytes, "encoder.pre_encode.conv.3.weight", m, wscratch, m.c3_w, nch * nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.3.bias", m.blob, m.c3_b, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.5.weight", m.blob, m.c5_w, nch * 9l)
-        pk_conv_tap_major(m.blob, m.c5_w, nch)
+        pk_conv_tap_major(m.blob, m.c5_w, nch, 9l)
         pk_read(recs, bytes, "encoder.pre_encode.conv.5.bias", m.blob, m.c5_b, nch)
         pk_read_gemm(recs, bytes, "encoder.pre_encode.conv.6.weight", m, wscratch, m.c6_w, nch * nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.6.bias", m.blob, m.c6_b, nch)
@@ -584,10 +595,12 @@ def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
             pk_read(recs, bytes, "encoder.layers.{l}.norm_conv.bias", m.blob, lo.ncv_b, d)
             pk_read_gemm(recs, bytes, "encoder.layers.{l}.conv.pointwise_conv1.weight", m, wscratch, lo.pw1_w, 2l * d * d)
             pk_read(recs, bytes, "encoder.layers.{l}.conv.depthwise_conv.weight", m.blob, lo.dw_w, m.n_conv_kernel * d)
+            pk_conv_tap_major(m.blob, lo.dw_w, d, m.n_conv_kernel)   // [d][k] -> [k][d] for the f4 row core
             pk_read(recs, bytes, "encoder.layers.{l}.conv.batch_norm.weight", m.blob, lo.bn_w, d)
             pk_read(recs, bytes, "encoder.layers.{l}.conv.batch_norm.bias", m.blob, lo.bn_b, d)
             pk_read(recs, bytes, "encoder.layers.{l}.conv.batch_norm.running_mean", m.blob, lo.bn_mean, d)
             pk_read(recs, bytes, "encoder.layers.{l}.conv.batch_norm.running_var", m.blob, lo.bn_var, d)
+            pk_fold_bn(m.blob, lo.bn_w, lo.bn_b, lo.bn_mean, lo.bn_var, d)
             pk_read_gemm(recs, bytes, "encoder.layers.{l}.conv.pointwise_conv2.weight", m, wscratch, lo.pw2_w, d * d)
             pk_read(recs, bytes, "encoder.layers.{l}.norm_feed_forward2.weight", m.blob, lo.nf2_w, d)
             pk_read(recs, bytes, "encoder.layers.{l}.norm_feed_forward2.bias", m.blob, lo.nf2_b, d)
@@ -1133,17 +1146,24 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
             let hp = reinterpret<float const?>(addr(st.h[0]))
             var xbp = addr(st.xb[0])
             var aop = addr(st.ao[0])
-            let dwp = reinterpret<float const?>(addr(m.blob[lo.dw_w]))
-            let bmp = reinterpret<float const?>(addr(m.blob[lo.bn_mean]))
-            let bvp2 = reinterpret<float const?>(addr(m.blob[lo.bn_var]))
-            let bwp = reinterpret<float const?>(addr(m.blob[lo.bn_w]))
-            let bbp = reinterpret<float const?>(addr(m.blob[lo.bn_b]))
+            let dwp = reinterpret<float const?>(addr(m.blob[lo.dw_w]))     // tap-major [k][d] since load
+            let scp = reinterpret<float const?>(addr(m.blob[lo.bn_w]))     // folded BN scale (pk_fold_bn)
+            let shp = reinterpret<float const?>(addr(m.blob[lo.bn_b]))     // folded BN shift
             let nk = m.n_conv_kernel
             let kpad = (nk - 1l) / 2l   // depthwise pad (k−1)/2 both sides
+            let one = float4(1.0, 1.0, 1.0, 1.0)
+            let n4 = d / 4l
             maybe_parallel_for(0, int(tt), lanes_for_work(tt * d * 4l, 0)) $(rb, re) {
                 unsafe {
-                    for (t in range64(int64(rb), int64(re))) {   // GLU: signal · σ(gate)
-                        for (j in range64(d)) {
+                    for (t in range64(int64(rb), int64(re))) {   // GLU: signal · σ(gate), float4 exp4
+                        let sgp = reinterpret<float4 const?>(hp + t * 2l * d)
+                        let gtp = reinterpret<float4 const?>(hp + t * 2l * d + d)
+                        var o4 = reinterpret<float4?>(xbp + t * d)
+                        for (k in range64(n4)) {
+                            let arg = clamp(-gtp[k], EXP4_LO, EXP4_HI)
+                            o4[k] = sgp[k] / (one + exp4(arg))
+                        }
+                        for (j in range64(n4 * 4l, d)) {   // tail (d % 4 != 0 models only)
                             let sg = hp[t * 2l * d + j]
                             let gt = hp[t * 2l * d + d + j]
                             xbp[t * d + j] = sg * (1.0 / (1.0 + exp(-gt)))
@@ -1152,21 +1172,42 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                 }
             }
             // depthwise conv1d k9 over time (reads xb rows t±kpad — barrier from the GLU
-            // dispatch above), then inference BN + silu
+            // dispatch above), folded BN + silu; f4 row core on the all-taps-in-range
+            // interior when k==9, guarded scalar rows otherwise (borders / odd k / odd d)
+            let f4ok = nk == 9l && n4 * 4l == d
             maybe_parallel_for(0, int(tt), lanes_for_work(tt * d * (nk + 4l), 0)) $(rb, re) {
                 unsafe {
                     for (t in range64(int64(rb), int64(re))) {
-                        for (j in range64(d)) {
-                            var acc = 0.0
-                            for (k in range64(nk)) {
-                                let src = t + k - kpad
-                                if (src >= 0l && src < tt) {
-                                    acc += dwp[j * nk + k] * xbp[src * d + j]
-                                }
+                        if (f4ok && t >= kpad && t < tt - kpad) {
+                            var j = 0l
+                            while (j < d) {
+                                let base = (t - 4l) * d + j
+                                var acc = (*reinterpret<float4 const?>(xbp + base)) * (*reinterpret<float4 const?>(dwp + j))
+                                acc = mad(*reinterpret<float4 const?>(xbp + base + d), *reinterpret<float4 const?>(dwp + d + j), acc)
+                                acc = mad(*reinterpret<float4 const?>(xbp + base + 2l * d), *reinterpret<float4 const?>(dwp + 2l * d + j), acc)
+                                acc = mad(*reinterpret<float4 const?>(xbp + base + 3l * d), *reinterpret<float4 const?>(dwp + 3l * d + j), acc)
+                                acc = mad(*reinterpret<float4 const?>(xbp + base + 4l * d), *reinterpret<float4 const?>(dwp + 4l * d + j), acc)
+                                acc = mad(*reinterpret<float4 const?>(xbp + base + 5l * d), *reinterpret<float4 const?>(dwp + 5l * d + j), acc)
+                                acc = mad(*reinterpret<float4 const?>(xbp + base + 6l * d), *reinterpret<float4 const?>(dwp + 6l * d + j), acc)
+                                acc = mad(*reinterpret<float4 const?>(xbp + base + 7l * d), *reinterpret<float4 const?>(dwp + 7l * d + j), acc)
+                                acc = mad(*reinterpret<float4 const?>(xbp + base + 8l * d), *reinterpret<float4 const?>(dwp + 8l * d + j), acc)
+                                let bv4 = mad(acc, *reinterpret<float4 const?>(scp + j), *reinterpret<float4 const?>(shp + j))
+                                let arg = clamp(-bv4, EXP4_LO, EXP4_HI)
+                                *reinterpret<float4?>(aop + t * d + j) = bv4 / (one + exp4(arg))
+                                j += 4l
                             }
-                            let bn = (acc - bmp[j]) / sqrt(bvp2[j])
-                            let bv = bn * bwp[j] + bbp[j]
-                            aop[t * d + j] = bv * (1.0 / (1.0 + exp(-bv)))   // silu
+                        } else {
+                            for (j in range64(d)) {
+                                var acc = 0.0
+                                for (k in range64(nk)) {
+                                    let src = t + k - kpad
+                                    if (src >= 0l && src < tt) {
+                                        acc += dwp[k * d + j] * xbp[src * d + j]
+                                    }
+                                }
+                                let bv = acc * scp[j] + shp[j]
+                                aop[t * d + j] = bv * (1.0 / (1.0 + exp(-bv)))   // silu
+                            }
                         }
                     }
                 }
