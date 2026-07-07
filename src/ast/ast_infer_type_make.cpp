@@ -125,6 +125,12 @@ namespace das {
                                             pFnFin->classParent = func->classParent;
                                             DAS_ASSERT(pFnFin->classParent);
                                         }
+                                        // generator outlined from a generic instance keeps the generic's origin,
+                                        // so its body resolves names from the module the code was written in
+                                        if (func && func->fromGeneric) {
+                                            pFn->fromGeneric = func->getOrigin();
+                                            pFnFin->fromGeneric = pFn->fromGeneric;
+                                        }
                                         reportAstChanged();
                                         auto ms = generateLambdaMakeStruct(ls, pFn, pFnFin, cl.capt, expr->capture, expr->at, expr->captureAt, program);
                                         // each ( [[ ]]] )
@@ -253,6 +259,12 @@ namespace das {
                                         pFnFin->classParent = func->classParent;
                                         DAS_ASSERT(pFnFin->classParent);
                                     }
+                                    // lambda outlined from a generic instance keeps the generic's origin,
+                                    // so its body resolves names from the module the code was written in
+                                    if (func && func->fromGeneric) {
+                                        pFn->fromGeneric = func->getOrigin();
+                                        pFnFin->fromGeneric = pFn->fromGeneric;
+                                    }
                                     reportAstChanged();
                                     auto ms = generateLambdaMakeStruct(ls, pFn, pFnFin, cl.capt, expr->capture, expr->at, expr->captureAt, program);
                                     return ms;
@@ -283,10 +295,12 @@ namespace das {
             } else {
                 string lname = generateNewLocalFunctionName(block->at);
                 auto pFn = generateLocalFunction(lname, block);
-                if (func) {
-                    if (auto origin = func->getOriginPtr()) {
-                        pFn->fromGeneric = getOrCreateDummy(origin->module);
-                    }
+                // local function outlined from a generic instance keeps the generic's origin (a
+                // getOrCreateDummy(origin->module) here mutates a foreign module's generics map
+                // with a function nothing roots — the per-pass AST GC guts it, and the next
+                // program to look it up crashes on the husk's null module)
+                if (func && func->fromGeneric) {
+                    pFn->fromGeneric = func->getOrigin();
                 }
                 if (program->addFunction(pFn)) {
                     reportAstChanged();
