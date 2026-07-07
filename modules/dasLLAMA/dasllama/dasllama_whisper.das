@@ -636,6 +636,7 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
     let kq_scale = 1.0 / sqrt(sqrt(float(hs)))
     for (l in range64(w.n_text_layer)) {
         let lo = dec_layer_offsets(w, l)
+        var td = ref_time_ticks()
 
         // self-attention (q and k pre-scaled hs^-0.25, k/v appended to the caches)
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.ln1_w, lo.ln1_b, d, n, w.eps)
@@ -658,6 +659,8 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
         mm_blob_b(ds.xb, w.dblob, lo.o_w, ds.xb2, d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.o_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
+        asr_prof_add("wh.dec.self", td)
+        td = ref_time_ticks()
 
         // cross-attention (q unscaled; keys pre-scaled; softmax applies the other half)
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.cln_w, lo.cln_b, d, n, w.eps)
@@ -667,6 +670,8 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
         mm_blob_b(ds.xb, w.dblob, lo.co_w, ds.xb2, d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.co_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
+        asr_prof_add("wh.dec.cross", td)
+        td = ref_time_ticks()
 
         // mlp
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.ln2_w, lo.ln2_b, d, n, w.eps)
@@ -676,15 +681,18 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
         mm_blob_b(ds.xb, w.dblob, lo.fc2_w, ds.h, 4l * d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.fc2_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
+        asr_prof_add("wh.dec.ffn", td)
     }
     ds.n_past += n
 
     // final LN, then tied-embedding logits for the last row only (greedy single decoder)
+    let tl = ref_time_ticks()
     layernorm_batch(ds.xb, ds.x, w.dblob, w.d_ln_w_off, w.d_ln_b_off, d, n, w.eps)
     for (j in range64(d)) {
         ds.x1[j] = ds.xb[(n - 1l) * d + j]
     }
     mm_blob_b(ds.logits, w.dblob, w.d_te_off, ds.x1, d, w.n_vocab, 1l)
+    asr_prof_add("wh.dec.logits", tl)
 }
 
 // ===== greedy driver (whisper_full's single-decoder temp-0 path, fallback disabled) =====
@@ -908,8 +916,13 @@ def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var 
 
     while (seek + delta_min < seek_end && (!complete_only || seek + AUDIO_CHUNK_FRAMES <= mel.n_len_org)) {
         let win <- whisper_mel_window(mel, seek)
+        var tw = ref_time_ticks()
         whisper_encode(w.enc, es, win)
+        asr_prof_add("wh.encode_total", tw)
+        tw = ref_time_ticks()
         whisper_cross_kv(w, ds, es.xb)
+        asr_prof_add("wh.cross_kv", tw)
+        tw = ref_time_ticks()
 
         var prompt : array<int>
         prompt |> reserve(4)
@@ -966,6 +979,7 @@ def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var 
             step[0] = t.id
             whisper_decode_batch(w, ds, step)
         }
+        asr_prof_add("wh.decode_total", tw)
 
         // the no-speech gate: a confident nosp read on the prompt logits + low avg logprob
         // over the kept tokens drops the window's segments (whisper.cpp defaults 0.6 / −1.0)
@@ -1024,7 +1038,9 @@ def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : Dec
                            no_timestamps : bool = false; translate : bool = false) : array<TranscribeSegment> {
     var segments : array<TranscribeSegment>
     var lang_id = whisper_lang_id(lang)
+    let tm = ref_time_ticks()
     let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
+    asr_prof_add("wh.mel", tm)
     if (lang == "auto") {
         lang_id = whisper_detect_language(w, es, ds, mel)
     } elif (lang_id < 0) {
@@ -1118,7 +1134,9 @@ def transcribe(w : WhisperModel; var s : WhisperSession; samples : array<float> 
     //! each 30 s window completes. Segment times are centiseconds. Returns the segment count.
     //! Does not touch the session's fed/pending stream — one-shot and push-chunks coexist.
     var count = 0
+    let tm = ref_time_ticks()
     let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
+    asr_prof_add("wh.mel", tm)
     let lang_id = resolve_lang_id(w, s, mel)
     transcribe_mel_windows(w, s.es, s.ds, mel, lang_id, s.no_timestamps, s.translate, 0l, false) $(seg) {
         count++

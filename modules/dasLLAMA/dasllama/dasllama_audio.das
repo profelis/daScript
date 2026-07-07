@@ -80,6 +80,66 @@ def gelu_tanh_lut(var x : array<float> | #; size : int64) {
     gelu_tanh_lut(unsafe(addr(x[0])), size)
 }
 
+// The ACTUAL f16 lookup table (ggml's ggml_table_gelu_f16 shape): the middle branch of
+// gelu_tanh_lut is pure f16-domain — idx = f32_to_f16(v) determines the result exactly —
+// so one 65536-entry table replaces a libm tanh + two f16 round-trips per element.
+// Bit-exact vs the computed form by construction (entries ARE the computed form); the
+// suite proves it exhaustively over all f16 patterns. Built once, on first batch call
+// (main thread, before any dispatch captures the pointer).
+var private g_gelu_lut : array<float>
+
+def private gelu_lut_ensure() {
+    if (!empty(g_gelu_lut)) {
+        return
+    }
+    g_gelu_lut |> resize(65536)
+    for (h in range(65536)) {
+        let xr = f16_to_f32(uint(h))
+        // EVERY finite pattern gets the middle-branch value: an fp32 input just under 10.0
+        // passes the v < 10.0 branch but ROUNDS UP to the f16 pattern of 10.0, so boundary
+        // patterns are reachable — an unbuilt entry there returns 0 where the computed form
+        // returns ~10 (caught by the near-boundary sweep in the exhaustive suite test)
+        if ((unsafe(reinterpret<uint>(xr)) & 0x7F800000u) != 0x7F800000u) {   // finite (not inf/nan)
+            let g = 0.5 * xr * (1.0 + tanh(0.79788456080286535587989211986876 * xr * (1.0 + 0.044715 * xr * xr)))
+            g_gelu_lut[h] = f16_to_f32(f32_to_f16(g))
+        }
+    }
+}
+
+//! gelu_tanh_lut over a token-major image (npos rows × d): the middle branch reads the
+//! precomputed f16 table, rows split across lanes. Elementwise ⇒ bit-identical to the
+//! whole-image computed form at any lane count.
+def gelu_tanh_lut_batch(var x : array<float> | #; d, npos : int64) {
+    gelu_lut_ensure()
+    unsafe {
+        var xp = addr(x[0])
+        let lp = reinterpret<float const?>(addr(g_gelu_lut[0]))
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 8l, 0)) $(rb, re) {
+            unsafe {
+                for (i in range64(int64(rb) * d, int64(re) * d)) {
+                    let v = xp[i]
+                    if (v <= -10.0) {
+                        xp[i] = 0.0
+                    } elif (v < 10.0) {   // v >= 10 passes through unchanged
+                        xp[i] = lp[int(f32_to_f16(v))]
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! gelu_erf over a token-major image (npos rows × d), rows split across lanes. Elementwise
+//! ⇒ bit-identical to the whole-image call at any lane count.
+def gelu_erf_batch(var x : array<float> | #; d, npos : int64) {
+    unsafe {
+        var xp = addr(x[0])
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 16l, 0)) $(rb, re) {
+            gelu_erf(unsafe(xp + int64(rb) * d), int64(re - rb) * d)
+        }
+    }
+}
+
 //! Hann window of length ``n`` (periodic when ``periodic``), float-exact vs mtmd's
 //! ``fill_hann_window``: 0.5·(1 − cos(2πi/denom)) with denom = n (periodic) / n−1.
 def build_hann_window(n : int64; periodic : bool = true) : array<float> {
@@ -1089,12 +1149,13 @@ def asr_prof_report() {
     clear(g_asr_prof_hits)
 }
 
-// t.gelu_tanh selects the oracle-exact activation flavor (see gelu_tanh_lut)
-def private enc_gelu(t : AudioTower; var x : array<float>; size : int64) {
+// t.gelu_tanh selects the oracle-exact activation flavor (see gelu_tanh_lut); threaded
+// flavor dispatch for row images (both flavors elementwise ⇒ bit-exact at any lane count)
+def private enc_gelu_batch(t : AudioTower; var x : array<float>; d, npos : int64) {
     if (t.gelu_tanh) {
-        gelu_tanh_lut(x, size)
+        gelu_tanh_lut_batch(x, d, npos)
     } else {
-        gelu_erf(x, size)
+        gelu_erf_batch(x, d, npos)
     }
 }
 
@@ -1110,6 +1171,7 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     let tt = t.n_ctx
     let d = t.d_model
     let nm = t.n_mel
+    let tc = ref_time_ticks()
 
     // conv1 k3 s1 same: im2col column (dk, c) — matches the loader's weight permute
     for (i in range64(tin)) {
@@ -1124,7 +1186,7 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     }
     mm_blob_b(s.y1, t.fblob, t.conv1_w_off, s.x1, 3l * nm, d, tin)
     add_bias_rows(s.y1, t.fblob, t.conv1_b_off, d, tin)
-    enc_gelu(t, s.y1, tin * d)
+    enc_gelu_batch(t, s.y1, d, tin)
 
     // conv2 k3 s2 same -> T = tin/2 positions
     for (i in range64(tt)) {
@@ -1139,12 +1201,13 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     }
     tw_mm_rq(t, s.x, t.conv2_w_off, s.x2, s.xqi, s.xsi, 3l * d, d, tt)
     add_bias_rows(s.x, t.fblob, t.conv2_b_off, d, tt)
-    enc_gelu(t, s.x, tt * d)
+    enc_gelu_batch(t, s.x, d, tt)
 
     // + learned/sinusoidal position rows (loaded from the mmproj)
     for (i in range64(tt * d)) {
         s.x[i] += t.fblob[t.pos_off + i]
     }
+    asr_prof_add("enc.conv", tc)
     diff_stage("after_conv_pos", s.x, tt * d)
 
     encoder_blocks(t, s, tt)
@@ -1158,6 +1221,7 @@ def encoder_blocks(t : AudioTower; var s : EncoderState; npos : int64) {
     let d = t.d_model
     for (l in range64(t.n_layer)) {
         let lo = enc_layer_offsets(t, l)
+        var te = ref_time_ticks()
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln1_w, lo.ln1_b, d, tt, t.eps)
         tw_requant(t, s.xb, d, tt, s.xqi, s.xsi)   // q/k/v share the post-LN activation: one requant
         tw_mm(t, s.qq, lo.q_w, s.xb, s.xqi, s.xsi, d, d, tt)
@@ -1168,27 +1232,38 @@ def encoder_blocks(t : AudioTower; var s : EncoderState; npos : int64) {
             add_bias_rows(s.kk, t.fblob, lo.k_b, d, tt)
         }
         add_bias_rows(s.vv, t.fblob, lo.v_b, d, tt)   // v bias
+        asr_prof_add("enc.attn_proj", te)
         if (l == 0l) {
             diff_stage("b0_ln1", s.xb, tt * d)
             diff_stage("b0_q", s.qq, tt * d)
             diff_stage("b0_k", s.kk, tt * d)
             diff_stage("b0_v", s.vv, tt * d)
         }
+        te = ref_time_ticks()
         enc_attention(t, s, tt)
+        asr_prof_add("enc.attn_heads", te)
         if (l == 0l) {
             diff_stage("b0_attnout", s.xb2, tt * d)
         }
+        te = ref_time_ticks()
         tw_mm_rq(t, s.xb, lo.o_w, s.xb2, s.xqi, s.xsi, d, d, tt)
         add_bias_rows(s.xb, t.fblob, lo.o_b, d, tt)
         add_inplace_rows(s.x, s.xb, tt * d)
+        asr_prof_add("enc.attn_out", te)
 
+        te = ref_time_ticks()
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln2_w, lo.ln2_b, d, tt, t.eps)
         tw_mm_rq(t, s.h, lo.fc1_w, s.xb, s.xqi, s.xsi, d, t.n_ff, tt)
         add_bias_rows(s.h, t.fblob, lo.fc1_b, t.n_ff, tt)
-        enc_gelu(t, s.h, tt * t.n_ff)
+        asr_prof_add("enc.ffn.fc1", te)
+        te = ref_time_ticks()
+        enc_gelu_batch(t, s.h, t.n_ff, tt)
+        asr_prof_add("enc.ffn.gelu", te)
+        te = ref_time_ticks()
         tw_mm_rq(t, s.xb2, lo.fc2_w, s.h, s.xqi, s.xsi, t.n_ff, d, tt)
         add_bias_rows(s.xb2, t.fblob, lo.fc2_b, d, tt)
         add_inplace_rows(s.x, s.xb2, tt * d)
+        asr_prof_add("enc.ffn.fc2", te)
         if (l == 0l) {
             diff_stage("after_block0", s.x, tt * d)
         }

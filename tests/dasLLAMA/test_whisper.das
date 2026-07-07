@@ -105,6 +105,66 @@ def test_gelu_tanh_lut(t : T?) {
 }
 
 [test]
+def test_gelu_lut_batch_exhaustive(t : T?) {
+    t |> run("gelu_tanh_lut_batch == gelu_tanh_lut for EVERY finite f16 input") @(t : T?) {
+        // every f16 pattern as an input row; the batch (table) form must reproduce the
+        // computed form bit-for-bit — the table entries ARE the computed middle branch,
+        // this proves the branch structure and clamps line up too
+        var a : array<float>
+        var b : array<float>
+        a |> resize(65536)
+        for (h in range(65536)) {
+            a[h] = f16_to_f32(uint(h))
+        }
+        var keep : array<float>
+        keep |> reserve(65536)
+        for (v in a) {
+            if (v == v && v < 1e30 && v > -1e30) {   // finite only (nan/inf never reach gelu)
+                keep |> push(v)
+            }
+        }
+        let n = length(keep)
+        b |> resize(n)
+        for (i in range(n)) {
+            b[i] = keep[i]
+        }
+        gelu_tanh_lut(keep, int64(n))
+        gelu_tanh_lut_batch(b, int64(n), 1l)   // one row: pure table path, no threading
+        var bad = 0
+        for (x, y in keep, b) {
+            if (x != y) {
+                bad++
+            }
+        }
+        t |> success(bad == 0, "all {n} finite f16 patterns bit-equal ({bad} differ)")
+    }
+    t |> run("gelu_tanh_lut_batch == gelu_tanh_lut on fp32 inputs BETWEEN f16 patterns") @(t : T?) {
+        // exact-f16 inputs never exercise f32->f16 rounding — a dense fp32 sweep across
+        // (-10.5, 10.5) does, including the values that round UP to the +-10.0 boundary
+        // patterns (the bug class: unbuilt table entry read through the v < 10.0 branch)
+        let n = 200001
+        var a : array<float>
+        var b : array<float>
+        a |> resize(n)
+        b |> resize(n)
+        for (i in range(n)) {
+            let v = -10.5 + float(i) * 1.05e-4
+            a[i] = v
+            b[i] = v
+        }
+        gelu_tanh_lut(a, int64(n))
+        gelu_tanh_lut_batch(b, int64(n), 1l)
+        var bad = 0
+        for (x, y in a, b) {
+            if (x != y) {
+                bad++
+            }
+        }
+        t |> success(bad == 0, "dense sweep bit-equal ({bad} of {n} differ)")
+    }
+}
+
+[test]
 def test_whisper_mel(t : T?) {
     t |> run("whisper-flavor mel: frame math and silence fill") @(t : T?) {
         // stand-in filterbank (the real one loads from the model file)
