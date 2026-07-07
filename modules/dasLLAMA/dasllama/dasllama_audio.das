@@ -758,31 +758,52 @@ def asr_requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<int8>
 }
 
 //! y[p] += blob[b_off .. b_off+d) for every row (projection bias). float4 bulk + scalar
-//! tail — elementwise adds in the same order, bit-exact vs the scalar loop.
+//! tail, threaded over rows (gemv lane cap — pure streaming) — elementwise adds in the
+//! same per-element order, bit-exact vs the scalar loop at any lane count.
 def add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
+    if (npos <= 0l || d <= 0l) return
     let d4 = d - d % 4l
     unsafe {
         var yp = addr(y[0])
         let bp = reinterpret<float const?>(addr(blob[b_off]))
-        for (p in range64(npos)) {
-            let row = p * d
-            var i = 0l
-            while (i < d4) {
-                *reinterpret<float4?>(yp + row + i) = (*reinterpret<float4 const?>(yp + row + i)) + (*reinterpret<float4 const?>(bp + i))
-                i += 4l
-            }
-            while (i < d) {
-                yp[row + i] += bp[i]
-                i++
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d, get_gemv_lane_cap())) $(rb, re) {
+            unsafe {
+                for (p in range64(int64(rb), int64(re))) {
+                    let row = p * d
+                    var i = 0l
+                    while (i < d4) {
+                        *reinterpret<float4?>(yp + row + i) = (*reinterpret<float4 const?>(yp + row + i)) + (*reinterpret<float4 const?>(bp + i))
+                        i += 4l
+                    }
+                    while (i < d) {
+                        yp[row + i] += bp[i]
+                        i++
+                    }
+                }
             }
         }
     }
 }
 
-//! x += r, elementwise (residual)
+//! x += r, elementwise (residual). float4 bulk in 4-aligned threaded chunks + scalar tail
+//! (gemv lane cap — pure streaming) — bit-exact vs the scalar loop at any lane count.
 def add_inplace_rows(var x : array<float>; r : array<float>; n : int64) {
-    for (i in range64(n)) {
-        x[i] += r[i]
+    if (n <= 0l) return
+    let nblk = n / 4l
+    unsafe {
+        var xp = addr(x[0])
+        let rp = reinterpret<float const?>(addr(r[0]))
+        maybe_parallel_for(0, int(nblk), lanes_for_work(n, get_gemv_lane_cap())) $(bb, be) {
+            unsafe {
+                for (b in range64(int64(bb), int64(be))) {
+                    let i = b * 4l
+                    *reinterpret<float4?>(xp + i) = (*reinterpret<float4 const?>(xp + i)) + (*reinterpret<float4 const?>(rp + i))
+                }
+            }
+        }
+        for (i in range64(nblk * 4l, n)) {
+            xp[i] += rp[i]
+        }
     }
 }
 
@@ -1325,17 +1346,33 @@ def encoder_blocks(t : AudioTower; var s : EncoderState; npos : int64) {
         asr_prof_add("enc.attn_out", te)
 
         te = ref_time_ticks()
+        var tf = ref_time_ticks()
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln2_w, lo.ln2_b, d, tt, t.eps)
-        tw_mm_rq(t, s.h, lo.fc1_w, s.xb, s.xqi, s.xsi, d, t.n_ff, tt)
+        asr_prof_add("enc.ffn.fc1.ln", tf)
+        tf = ref_time_ticks()
+        tw_requant(t, s.xb, d, tt, s.xqi, s.xsi)
+        asr_prof_add("enc.ffn.fc1.rq", tf)
+        tf = ref_time_ticks()
+        tw_mm(t, s.h, lo.fc1_w, s.xb, s.xqi, s.xsi, d, t.n_ff, tt)
+        asr_prof_add("enc.ffn.fc1.mm", tf)
+        tf = ref_time_ticks()
         add_bias_rows(s.h, t.fblob, lo.fc1_b, t.n_ff, tt)
+        asr_prof_add("enc.ffn.fc1.bias", tf)
         asr_prof_add("enc.ffn.fc1", te)
         te = ref_time_ticks()
         enc_gelu_batch(t, s.h, t.n_ff, tt)
         asr_prof_add("enc.ffn.gelu", te)
         te = ref_time_ticks()
-        tw_mm_rq(t, s.xb2, lo.fc2_w, s.h, s.xqi, s.xsi, t.n_ff, d, tt)
+        tf = ref_time_ticks()
+        tw_requant(t, s.h, t.n_ff, tt, s.xqi, s.xsi)
+        asr_prof_add("enc.ffn.fc2.rq", tf)
+        tf = ref_time_ticks()
+        tw_mm(t, s.xb2, lo.fc2_w, s.h, s.xqi, s.xsi, t.n_ff, d, tt)
+        asr_prof_add("enc.ffn.fc2.mm", tf)
+        tf = ref_time_ticks()
         add_bias_rows(s.xb2, t.fblob, lo.fc2_b, d, tt)
         add_inplace_rows(s.x, s.xb2, tt * d)
+        asr_prof_add("enc.ffn.fc2.bias", tf)
         asr_prof_add("enc.ffn.fc2", te)
         if (l == 0l) {
             diff_stage("after_block0", s.x, tt * d)
