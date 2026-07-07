@@ -957,27 +957,45 @@ def private whisper_filter_logits(w : WhisperModel; var logits : array<float>; n
 
 }
 
+// f4 sum of exp(x[i] − m): exp4 fast-path with a −80 clamp so banned NEG_INF_LOGIT entries
+// stay in range (each contributes e⁻⁸⁰ ≈ 1.8e-35 instead of scalar-exp's exact 0 — nothing
+// at fp32 next to the ≥ 1 max-entry term). Two lane accumulators (exp4 ~7x, see dasllama_math).
+def private exp_sum4(p : float const?; n : int64; m : float) : float {
+    unsafe {
+        let pf4 = reinterpret<float4 const?>(p)
+        let mm = float4(m, m, m, m)
+        let lo = float4(-80.0, -80.0, -80.0, -80.0)
+        var acc0 = float4(0.0, 0.0, 0.0, 0.0)
+        var acc1 = acc0
+        let n8 = n / 8l
+        for (k in 0l..n8) {
+            acc0 += exp4(max(pf4[2l * k] - mm, lo))
+            acc1 += exp4(max(pf4[2l * k + 1l] - mm, lo))
+        }
+        let acc = acc0 + acc1
+        var sum = acc.x + acc.y + acc.z + acc.w
+        for (i in n8 * 8l .. n) {
+            sum += exp(max(p[i] - m, -80.0))
+        }
+        return sum
+    }
+}
+
 // the last process_logits rule, applied AFTER the logprob normalizer is captured: if the
 // probability mass over timestamps beats every text token, force a timestamp. logprob
 // comparison == raw-logit comparison (log_softmax is a monotone shift).
 def private whisper_force_ts_rule(w : WhisperModel; var logits : array<float>) {
-    var ts_max = NEG_INF_LOGIT
-    for (i in range(w.tok_beg, int(w.n_vocab))) {
-        ts_max = max(ts_max, logits[i])
-    }
-    if (ts_max > NEG_INF_LOGIT * 0.5) {
-        var ts_lse = 0.0
-        for (i in range(w.tok_beg, int(w.n_vocab))) {
-            ts_lse += exp(logits[i] - ts_max)
-        }
-        let ts_logsumexp = log(ts_lse) + ts_max
-        var text_max = NEG_INF_LOGIT
-        for (i in range(w.tok_beg)) {
-            text_max = max(text_max, logits[i])
-        }
-        if (ts_logsumexp > text_max) {
-            for (i in range(w.tok_beg)) {
-                logits[i] = NEG_INF_LOGIT
+    let n_ts = int64(length(logits)) - int64(w.tok_beg)
+    unsafe {
+        let p = reinterpret<float const?>(addr(logits[0]))
+        let ts_max = hmax(p + int64(w.tok_beg), n_ts)   // bit-identical to the scalar max fold
+        if (ts_max > NEG_INF_LOGIT * 0.5) {
+            let ts_logsumexp = log(exp_sum4(p + int64(w.tok_beg), n_ts, ts_max)) + ts_max
+            let text_max = hmax(p, int64(w.tok_beg))
+            if (ts_logsumexp > text_max) {
+                for (i in range(w.tok_beg)) {
+                    logits[i] = NEG_INF_LOGIT
+                }
             }
         }
     }
@@ -986,26 +1004,27 @@ def private whisper_force_ts_rule(w : WhisperModel; var logits : array<float>) {
 // log-sum-exp over the current logits — the logprob normalizer whisper.cpp captures between
 // the main filter suite and the force-timestamp rule (plog = logit − this)
 def private logits_lse(logits : array<float>) : float {
-    var m = NEG_INF_LOGIT
-    for (v in logits) {
-        m = max(m, v)
+    let n = int64(length(logits))
+    unsafe {
+        let p = reinterpret<float const?>(addr(logits[0]))
+        let m = hmax(p, n)
+        return log(exp_sum4(p, n, m)) + m
     }
-    var sum = 0.0
-    for (v in logits) {
-        sum += exp(v - m)
-    }
-    return log(sum) + m
 }
 
 // greedy argmax over all filtered logits + argmax over the timestamp region (tid); plog uses
-// the pre-force-ts normalizer ``lse`` (the sampled id is unbanned in both phases)
+// the pre-force-ts normalizer ``lse`` (the sampled id is unbanned in both phases). Full argmax
+// = hmax + first-index-at-max scan — identical to the strict-> scalar fold (earliest max wins).
 def private sample_greedy(w : WhisperModel; logits : array<float>; lse : float) : SampledTok {
     var r = SampledTok(id = 0, tid = w.tok_beg)
-    var bestv = logits[0]
-    for (i in range(1, length(logits))) {
-        if (logits[i] > bestv) {
-            bestv = logits[i]
-            r.id = i
+    unsafe {
+        let p = reinterpret<float const?>(addr(logits[0]))
+        let bestv = hmax(p, int64(length(logits)))
+        for (i in range64(int64(length(logits)))) {
+            if (p[i] == bestv) {
+                r.id = int(i)
+                break
+            }
         }
     }
     var bestts = logits[w.tok_beg]
@@ -1025,15 +1044,12 @@ def private sample_greedy(w : WhisperModel; logits : array<float>; lse : float) 
 // softmax probability of one token id over RAW (pre-filter) logits — the no-speech gate
 // reads p[nosp] off the prompt decode before any filtering
 def private token_prob(logits : array<float>; id : int) : float {
-    var m = NEG_INF_LOGIT
-    for (v in logits) {
-        m = max(m, v)
+    let n = int64(length(logits))
+    unsafe {
+        let p = reinterpret<float const?>(addr(logits[0]))
+        let m = hmax(p, n)
+        return exp(logits[id] - m) / exp_sum4(p, n, m)
     }
-    var sum = 0.0
-    for (v in logits) {
-        sum += exp(v - m)
-    }
-    return exp(logits[id] - m) / sum
 }
 
 // Build and emit one segment off toks[i0..i1) at [t0, t1] — text = concat of the text-range
