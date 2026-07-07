@@ -38,6 +38,10 @@ struct SuiteCtx {
     debugger : bool = false
     keep_alive : bool = false
     stackOnException : bool = false
+    disable_cse : bool = false
+    disable_dse : bool = false
+    disable_inline : bool = false
+    disable_auto_inline : bool = false
 
     // Testing-related options.
     testNames : array<string>
@@ -95,6 +99,10 @@ def SuiteCtx(args : DastestArgs) : SuiteCtx {
     ctx.keep_alive = args.keep_alive
     ctx.debugger = args.debugger
     ctx.stackOnException = args.stack_on_exception
+    ctx.disable_cse = args.disable_cse
+    ctx.disable_dse = args.disable_dse
+    ctx.disable_inline = args.disable_inline
+    ctx.disable_auto_inline = args.disable_auto_inline
     let bench_format = args.bench_format
     if (bench_format == "go") {
         ctx.bench_format = BenchmarkOutputFormat.go_export
@@ -170,6 +178,10 @@ def test_file(file_name : string; var ctx : SuiteCtx; var file_ctx : FileCtx) : 
             cop.jit_enabled = jit_enabled()
             cop.debugger = ctx.debugger
             cop.keep_alive = ctx.keep_alive
+            cop.disable_cse = ctx.disable_cse
+            cop.disable_dse = ctx.disable_dse
+            cop.disable_inline = ctx.disable_inline
+            cop.disable_auto_inline = ctx.disable_auto_inline
             if (jit_enabled()) {
                 access |> add_extra_module("just_in_time", "{get_das_root()}/daslib/just_in_time.das")
             }
