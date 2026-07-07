@@ -77,6 +77,18 @@ TSV (all sides): `results_pk_zen2_t16_v3.tsv`. onnx = ORT `intra_op=16`.
 
 TSVs: das `results_pk_ls_m1_t8_jo.tsv`, cli/onnx `results_pk_ls_m1_t8_p0.tsv`.
 
+### Apple M1 Max, 8 threads, whisper tiny — all three sides 2026-07-08 @ `cb26a05d0`, interleaved
+
+| side | mean ms | p50 | p95 |
+|---|---|---|---|
+| das tiny | 130 | 130 | **153** |
+| cli tiny | 129 | 129 | 167 |
+| onnx tiny-int8 | 431 | 421 | 528 |
+
+TSV (all sides): `results_wh_ls_m1_t8.tsv`. das is at parity with AMX whisper-cli on
+short-clip latency (and ahead at p95), 3.2x faster than onnx-int8. (whisper-tiny p50 130
+vs parakeet v2 183 — tiny is the quicker dictation model, parakeet the stronger one.)
+
 ## Whisper — das vs whisper-cli (`-bs 1 -bo 1 -nf -ng`)
 
 das = tower q8 + threaded gelu table (`d25a46542`) + decoder q8 (`cb20e2954`) + the
@@ -87,25 +99,28 @@ bandwidth, not requant; ffn mm now runs ~84% of the aggregate lane estimate). Re
 profiled lever: tower attention head-unit raggedness (tiny 6 / turbo 20 units vs lane
 count — dominates encode).
 
-### Apple M1 Max, 8 threads — both sides 2026-07-07 @ `da4254be9`, interleaved, best-of-2
+### Apple M1 Max, 8 threads — das/onnx 2026-07-08 @ `cb26a05d0` (Parsec off); cli TSV 2026-07-07
 
-das rows predate decoder q8 (`cb20e2954`) and the opt pass (`8c10b930e`) — re-sweep
-pending a Parsec-off window.
+| model | file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
+|---|---|---|---|---|---|---|---|
+| tiny | jfk.wav | 11 | 125 | 122 | 463 | 1.03x | **0.27x** |
+| tiny | jfk3.wav | 33 | 274 | 298 | - | **0.92x** | - |
+| tiny | gb1.wav | 199 | 1289 | 1672 | - | **0.77x** | - |
+| tiny | hp0.wav | 273 | 1664 | 2102 | - | **0.79x** | - |
+| tiny | hp0x2.wav | 547 | 3318 | 4836 | - | **0.69x** | - |
+| large-v3-turbo | jfk.wav | 11 | 2875 | 2150 | 2406 | 1.34x | 1.19x |
+| large-v3-turbo | jfk3.wav | 33 | 5866 | 4494 | - | 1.31x | - |
+| large-v3-turbo | gb1.wav | 199 | 24095 | 25415 | - | **0.95x** | - |
+| large-v3-turbo | hp0.wav | 273 | 35681 | 32878 | - | 1.09x | - |
+| large-v3-turbo | hp0x2.wav | 547 | 68290 | 64621 | - | 1.06x | - |
 
-| model | file | audio s | das ms | cli ms | das/cli |
-|---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 193 | 122 | 1.58x |
-| tiny | jfk3.wav | 33 | 451 | 298 | 1.52x |
-| tiny | gb1.wav | 199 | 2336 | 1672 | 1.40x |
-| tiny | hp0.wav | 273 | 2972 | 2102 | 1.41x |
-| tiny | hp0x2.wav | 547 | 5932 | 4836 | 1.23x |
-| large-v3-turbo | jfk.wav | 11 | 3311 | 2150 | 1.54x |
-| large-v3-turbo | jfk3.wav | 33 | 6972 | 4494 | 1.55x |
-| large-v3-turbo | gb1.wav | 199 | 29782 | 25415 | 1.17x |
-| large-v3-turbo | hp0.wav | 273 | 41934 | 32878 | 1.28x |
-| large-v3-turbo | hp0x2.wav | 547 | 80689 | 64621 | 1.25x |
-
-TSV (both sides): `results_wh_m1_t8.tsv`.
+TSVs: das `results_wh_m1_t8_whopt.tsv` (best-of-2), cli side of `results_wh_m1_t8.tsv`,
+onnx `results_wh_m1_t8_onnx.tsv` (jfk-only — single-window adapter). Decoder q8 + the
+opt pass + threaded bias cut the das side 35-45% vs the 2026-07-07 rows: tiny now beats
+AMX cli on every row past jfk (jfk itself is parity) and turbo wins gb1 with hp0/hp0x2
+near parity — short clips remain cli's (fixed per-window encode against AMX GEMMs).
+Clean-window stage (per rep, jfk): tiny encode 95.5 (attn_heads 52.6 = 55%), decode 24.0,
+cross_kv 5.6; turbo encode 2781 (attn_heads 1277), decode 107, cross_kv 41.
 
 ### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `cb26a05d0` (opt pass + threaded bias); cli TSV 2026-07-07
 
@@ -146,6 +161,10 @@ net-neutral here (logits/cross_kv wins vs cache-hot per-layer GEMV losses — no
 
 ## Changelog
 
+- 2026-07-08 (Parsec-off window): M1 whisper das re-sweep @ `cb26a05d0` (-35-45% vs the
+  07-07 rows — tiny beats AMX cli on 4 of 5 rows) + NEW baselines: M1 whisper onnx-int8
+  jfk columns, LibriSpeech whisper-tiny 3-way. Parakeet das re-check: within noise of the
+  standing 07-07 rows (no table change).
 - 2026-07-08 `cb26a05d0`: threaded bias/residual row passes (the "fc1/fc2 q8 rate gap" —
   sub-buckets showed single-threaded bias bandwidth, not requant); zen2 turbo -3-5%.
 - 2026-07-08 `8c10b930e`: whisper parakeet-parity opt pass (per-frame threaded mel `a19a9d5ec`,
