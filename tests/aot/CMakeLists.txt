@@ -549,6 +549,7 @@ list(FILTER AOT_LANGUAGE_TEST_FILES EXCLUDE REGEX "/_")
 SET(AOT_LANGUAGE_MODULE_FILES
     tests/language/_glob.das
     tests/language/_helper_foo.das
+    tests/language/_inline_unsafe_helper.das
     tests/language/_operators_derived.das
     tests/language/_operators_parent.das
 )
