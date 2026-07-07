@@ -176,6 +176,23 @@ What a model needs to "just work" today:
 | Chat | per-arch data-driven templates in the registry + one segment-accumulation renderer (`dasllama_chat`) — reproduces the reference prefills token-for-token (`test_chat.das`); the template is auto-detected by sniffing the GGUF's embedded `tokenizer.chat_template` (never executed), falling back to the arch heuristic; Qwen3-style `<think>` blocks are stripped from chat history (`strip_think`); Gemma-4 uses its channel-based turn format (`<|turn>` / `<turn|>`, non-thinking opener closes an empty `thought` channel); gpt-oss uses the Harmony-lite template (`<|start|>role<|message|>...<|end|>`, replies end at `<|return|>` / `<|call|>`, channel markers render in decoded text as in llama.cpp) |
 | Performance | KV cache, SIMD + JobQue-threaded matmul, activation-quant Q8·Q8 behind a pluggable kernel-backend registry (ARM SDOT/laneq today — `x64_arch.md` for the x64 mirror), flash-attention batched prefill, per-box kernel tuning (`tune_for_this_box.md`) |
 
+## Optimization guidelines
+
+Non-negotiable rules for anything on a hot path (per-token, per-frame, per-layer — anything
+that runs per unit of work rather than per load):
+
+1. **Dynamic memory allocation on a hot path does not exist.** No `resize`/`push`/`reserve`/
+   `new`/array literals per call — every buffer lives in a passed 'decoder'-style state
+   struct (`RunState`, `ParakeetState`, `EncoderState`, ...) owned by the session, grown
+   reserve-exact when a bigger shape arrives, never shrunk, allocated zero times in steady
+   state. No module-global scratch — state is passed explicitly. Corollary: reused scratch
+   is not zero-initialized like a fresh array — zero explicitly wherever the code relied on
+   fresh-allocation zeros, and reset carried state (LSTM h/c) per utterance.
+2. **If it's not local, the pointer is brought local.** Inner loops never chase struct
+   fields, blob offsets, or array handles — hoist `addr(state.arr[0])` / `addr(m.blob[off])`
+   into locals before the loop and index through those (`var p` for writable, the const
+   model gives read-only otherwise).
+
 ## Known **not** yet supported
 
 So there's no ambiguity about what will fail:

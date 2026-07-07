@@ -86,6 +86,7 @@ struct ParakeetModel {
     durations : array<int>
     filters : array<float>     // [n_mel][n_fb]
     window : array<float>      // STFT window from the file
+    twiddles : array<float>    // DFT-as-GEMM twiddle matrix [n_fft × (n_fft/2+1)·2], built at load
     vocab : array<string>
     blob : array<float>
     // pre-encode conv stack
@@ -212,6 +213,86 @@ def private pk_repack_all(var m : ParakeetModel) {
         pk_repack(m, lo.ff2b_w, ff, d)
     }
     pk_repack(m, m.joint_enc_w, d, m.n_pred_dim)
+}
+
+// ===== per-session scratch =====
+
+//! LSTM predictor state (h/c per layer) + the projected prediction vector.
+struct ParakeetPredState {
+    h : array<float>       // [n_layers × pred_dim]
+    c : array<float>
+    pred : array<float>    // joint.pred projection of the last hidden [pred_dim]
+    gates : array<float>   // scratch [4 × pred_dim]: ih part
+    gates2 : array<float>  // scratch [4 × pred_dim]: hh part
+    xin : array<float>     // scratch [pred_dim]: layer input
+    hbuf : array<float>    // scratch [pred_dim]: current layer's h (matmul takes plain arrays)
+}
+
+//! Every hot-path buffer of the parakeet pipeline — mel, conv subsampling, encoder,
+//! requant images, and the TDT decode — so a transcribe allocates NOTHING per call.
+//! Arrays grow reserve-exact when a longer clip arrives and never shrink; a
+//! default-constructed value is ready to use (first call sizes it).
+struct ParakeetState {
+    // mel
+    mel : WhisperMel = WhisperMel()
+    pre : array<float>
+    padded : array<float>
+    xw : array<float>
+    reim : array<float>
+    power : array<float>
+    // conv subsampling
+    col : array<float>
+    y0 : array<float>
+    y2 : array<float>
+    y3 : array<float>
+    y5 : array<float>
+    y6 : array<float>
+    xf : array<float>
+    // encoder residual (holds the final encoder rows after the last layer) + scratch
+    x : array<float>
+    xb : array<float>
+    h : array<float>
+    qq : array<float>
+    kk : array<float>
+    vv : array<float>
+    pos_emb : array<float>
+    posq : array<int8>
+    poss : array<float>
+    posl : array<float>
+    quh : array<float>
+    quh2 : array<float>
+    vh : array<float>
+    kth : array<float>
+    scores : array<float>
+    relm : array<float>
+    post : array<float>
+    oh : array<float>
+    ao : array<float>
+    // q8 activation image (q/k/v share one requant; decode reuses it)
+    xqi : array<int8>
+    xsi : array<float>
+    // decode
+    encp : array<float>
+    joint : array<float>
+    logits : array<float>
+    toks : array<ParakeetToken>
+    pred : ParakeetPredState = ParakeetPredState()
+}
+
+// grow-only, reserve-exact (resize alone rounds the backing alloc up to pow2 — 2x waste
+// on the multi-MB encoder scratch)
+def private pk_ensure(var a : array<float>; n : int64) {
+    if (int64(length(a)) < n) {
+        a |> reserve(int(n))
+        a |> resize(int(n))
+    }
+}
+
+def private pk_ensure(var a : array<int8>; n : int64) {
+    if (int64(length(a)) < n) {
+        a |> reserve(int(n))
+        a |> resize(int(n))
+    }
 }
 
 // mm_blob_b with the q8 route: activation image (xq, xs) pre-quantized by the caller
@@ -342,6 +423,7 @@ def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
         m.n_durations = int64(rd_i32(bytes, o)); o += 4l
         m.n_max_tokens = int64(rd_i32(bytes, o)); o += 4l
         m.blank_id = int(m.n_vocab)
+        m.twiddles <- build_dft_twiddles(m.n_fft)
 
         // mel filterbank
         let fb_mel = int64(rd_i32(bytes, o)); o += 4l
@@ -521,77 +603,85 @@ def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
 //! NATURAL log(sum + 2⁻²⁴), then per-feature mean/std normalization computed over the
 //! valid frames only (Bessel n−1, std + 1e-5) and applied to all. FRAME-major
 //! ``[n_len][n_mel]``.
-def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel) : WhisperMel {
+def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel; var st : ParakeetState) {
     let n_in = int64(length(samples))
-    var pre : array<float>
-    pre |> resize(int(n_in))
+    pk_ensure(st.pre, n_in)
     for (i in range(int(n_in))) {
-        pre[i] = samples[i]
+        st.pre[i] = samples[i]
     }
     var pi = n_in - 1l
     while (pi > 0l) {   // backward in place: x[i] -= 0.97·x[i−1]
-        pre[pi] -= 0.97 * pre[pi - 1l]
+        st.pre[pi] -= 0.97 * st.pre[pi - 1l]
         pi--
     }
     let pad = m.n_fft / 2l
     let n_padded = n_in + 2l * pad
-    var padded : array<float>
-    padded |> resize(int(n_padded))
+    pk_ensure(st.padded, n_padded)
+    for (i in range(int(pad))) {   // zero head pad (scratch is reused, not fresh)
+        st.padded[i] = 0.0
+    }
     for (i in range(int(n_in))) {
-        padded[int(pad) + i] = pre[i]
+        st.padded[int(pad) + i] = st.pre[i]
+    }
+    for (i in range64(n_in + pad, n_padded)) {   // zero tail pad
+        st.padded[i] = 0.0
     }
 
-    var mel = WhisperMel(n_mel = m.n_mel)
-    mel.n_len = (n_padded - m.n_fft) / PARAKEET_HOP + 1l
-    mel.n_len_org = mel.n_len
-    mel.data |> resize(int(mel.n_len * m.n_mel))
+    st.mel.n_mel = m.n_mel
+    st.mel.n_len = (n_padded - m.n_fft) / PARAKEET_HOP + 1l
+    st.mel.n_len_org = st.mel.n_len
+    pk_ensure(st.mel.data, st.mel.n_len * m.n_mel)
 
     let n_fft = m.n_fft
     let n_bins = n_fft / 2l + 1l
     let wsz = int64(length(m.window))
     let wpad = (n_fft - wsz) / 2l
-    let twiddles <- build_dft_twiddles(n_fft)
 
-    var xw : array<float>
-    xw |> resize(int(mel.n_len * n_fft))
-    for (i in range64(mel.n_len)) {
+    // windowed frames as GEMM rows: only [wpad, wpad+wsz) carries signal — zero the whole
+    // image first since the scratch is reused
+    pk_ensure(st.xw, st.mel.n_len * n_fft)
+    for (i in range64(st.mel.n_len * n_fft)) {
+        st.xw[i] = 0.0
+    }
+    for (i in range64(st.mel.n_len)) {
         let off = i * PARAKEET_HOP
         let n_do = min(wsz, n_padded - off)   // window applied at [wpad, wpad+wsz)
         for (j in range64(n_do)) {
             if (off + wpad + j < n_padded) {
-                xw[i * n_fft + wpad + j] = m.window[j] * padded[off + wpad + j]
+                st.xw[i * n_fft + wpad + j] = m.window[j] * st.padded[off + wpad + j]
             }
         }
     }
-    var reim : array<float>
-    reim |> resize(int(mel.n_len * n_bins * 2l))
-    gemm_f32(unsafe(addr(reim[0])), unsafe(addr(xw[0])), unsafe(addr(twiddles[0])),
-             mel.n_len, n_fft, n_bins * 2l)
+    pk_ensure(st.reim, st.mel.n_len * n_bins * 2l)
+    for (i in range64(st.mel.n_len * n_bins * 2l)) {   // gemm_f32 ACCUMULATES — zero the reused C
+        st.reim[i] = 0.0
+    }
+    gemm_f32(unsafe(addr(st.reim[0])), unsafe(addr(st.xw[0])), unsafe(addr(m.twiddles[0])),
+             st.mel.n_len, n_fft, n_bins * 2l)
 
     let mel_eps = 5.960464477539063e-08lf
-    var power : array<float>
-    power |> resize(int(n_bins))
-    for (i in range64(mel.n_len)) {
+    pk_ensure(st.power, n_bins)
+    for (i in range64(st.mel.n_len)) {
         for (k in range64(n_bins)) {
-            let re = reim[i * n_bins * 2l + k * 2l]
-            let im = reim[i * n_bins * 2l + k * 2l + 1l]
-            power[k] = re * re + im * im
+            let re = st.reim[i * n_bins * 2l + k * 2l]
+            let im = st.reim[i * n_bins * 2l + k * 2l + 1l]
+            st.power[k] = re * re + im * im
         }
         for (j in range64(m.n_mel)) {
             var sum = 0.0lf
             var k = 0l
             while (k + 3l < n_bins) {
-                sum += double(power[k] * m.filters[j * n_bins + k]
-                    + power[k + 1l] * m.filters[j * n_bins + k + 1l]
-                    + power[k + 2l] * m.filters[j * n_bins + k + 2l]
-                    + power[k + 3l] * m.filters[j * n_bins + k + 3l])
+                sum += double(st.power[k] * m.filters[j * n_bins + k]
+                    + st.power[k + 1l] * m.filters[j * n_bins + k + 1l]
+                    + st.power[k + 2l] * m.filters[j * n_bins + k + 2l]
+                    + st.power[k + 3l] * m.filters[j * n_bins + k + 3l])
                 k += 4l
             }
             while (k < n_bins) {
-                sum += double(power[k] * m.filters[j * n_bins + k])
+                sum += double(st.power[k] * m.filters[j * n_bins + k])
                 k++
             }
-            mel.data[i * m.n_mel + j] = float(log(sum + mel_eps))
+            st.mel.data[i * m.n_mel + j] = float(log(sum + mel_eps))
         }
     }
 
@@ -600,20 +690,19 @@ def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel) : WhisperMel
     for (j in range64(m.n_mel)) {
         var sum = 0.0lf
         for (i in range64(valid)) {
-            sum += double(mel.data[i * m.n_mel + j])
+            sum += double(st.mel.data[i * m.n_mel + j])
         }
         let mean = sum / double(valid)
         var sq = 0.0lf
         for (i in range64(valid)) {
-            let dv = double(mel.data[i * m.n_mel + j]) - mean
+            let dv = double(st.mel.data[i * m.n_mel + j]) - mean
             sq += dv * dv
         }
         let denom = sqrt(sq / (double(valid) - 1.0lf)) + 1e-5lf
-        for (i in range64(mel.n_len)) {
-            mel.data[i * m.n_mel + j] = float((double(mel.data[i * m.n_mel + j]) - mean) / denom)
+        for (i in range64(st.mel.n_len)) {
+            st.mel.data[i * m.n_mel + j] = float((double(st.mel.data[i * m.n_mel + j]) - mean) / denom)
         }
     }
-    return <- mel
 }
 
 // ===== conv subsampling =====
@@ -626,7 +715,7 @@ def private pk_conv2d_s2(var out : array<float>; var col : array<float>;
     let oh = (ih - 1l) / 2l + 1l
     let kdim = cin * 9l
     let rows = oh * ow
-    col |> resize(int(rows * kdim))
+    pk_ensure(col, rows * kdim)
     for (oy in range64(oh)) {
         for (ox in range64(ow)) {
             let r = (oy * ow + ox) * kdim
@@ -643,7 +732,7 @@ def private pk_conv2d_s2(var out : array<float>; var col : array<float>;
             }
         }
     }
-    out |> resize(int(rows * cout))
+    pk_ensure(out, rows * cout)
     mm_blob_b(out, blob, w_off, col, kdim, cout, rows)
     add_bias_rows(out, blob, b_off, cout, rows)
 }
@@ -653,7 +742,7 @@ def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : arr
                             w_off, b_off : int64; iw, ih, ch : int64) {
     let ow = (iw - 1l) / 2l + 1l
     let oh = (ih - 1l) / 2l + 1l
-    out |> resize(int(oh * ow * ch))
+    pk_ensure(out, oh * ow * ch)
     for (oy in range64(oh)) {
         for (ox in range64(ow)) {
             let r = (oy * ow + ox) * ch
@@ -676,9 +765,9 @@ def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : arr
     }
 }
 
-def private pk_relu(var x : array<float>) {
-    for (v in x) {
-        v = max(v, 0.0)
+def private pk_relu(var x : array<float>; n : int64) {   // explicit count: scratch is oversized
+    for (i in range64(n)) {
+        x[i] = max(x[i], 0.0)
     }
 }
 
@@ -688,45 +777,36 @@ def private pk_relu(var x : array<float>) {
 //! 24 conformer blocks (macaron FFN halves, rel-pos attention with u/v biases, GLU +
 //! depthwise-conv + inference-BN module, per-layer post norm). Global attention only —
 //! clips past the oracle's 8192-frame local-attention switch panic (see parakeet_plan.md).
-//! Returns the encoder output rows (token-major ``[T × n_state]``) and sets ``n_frames``.
-def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<float>) : int64 {
+//! Reads the mel from ``st.mel``; the encoder rows (token-major ``[T × n_state]``) are left
+//! in ``st.x``. Returns the frame count.
+def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
     let d = m.n_state
     let nch = m.n_sub_ch
     let n_head = m.n_head
     let dh = d / n_head
 
-    // q8 activation scratch (one image reused across sites; q/k/v share one requant)
-    var xqi : array<int8>
-    var xsi : array<float>
-
     // conv subsampling ([time][mel] rows are already the [ih][iw][c=1] layout)
     var tp = ref_time_ticks()
-    var col : array<float>
-    var y0 : array<float>
-    var y2 : array<float>
-    var y3 : array<float>
-    var y5 : array<float>
-    var y6 : array<float>
-    pk_conv2d_s2(y0, col, mel.data, m.blob, m.c0_w, m.c0_b, m.n_mel, mel.n_len, 1l, nch)
-    pk_relu(y0)
+    let t1 = (st.mel.n_len - 1l) / 2l + 1l
     let w1 = (m.n_mel - 1l) / 2l + 1l          // 64
-    let t1 = (mel.n_len - 1l) / 2l + 1l
-    pk_conv2d_dw_s2(y2, y0, m.blob, m.c2_w, m.c2_b, w1, t1, nch)
+    pk_conv2d_s2(st.y0, st.col, st.mel.data, m.blob, m.c0_w, m.c0_b, m.n_mel, st.mel.n_len, 1l, nch)
+    pk_relu(st.y0, t1 * w1 * nch)
+    pk_conv2d_dw_s2(st.y2, st.y0, m.blob, m.c2_w, m.c2_b, w1, t1, nch)
     let w2 = (w1 - 1l) / 2l + 1l               // 32
     let t2 = (t1 - 1l) / 2l + 1l
-    y3 |> resize(int(t2 * w2 * nch))
-    pk_scan("y0", y0, int64(length(y0)))
-    pk_scan("y2", y2, int64(length(y2)))
-    pk_mm_rq(m, y3, m.c3_w, y2, xqi, xsi, nch, nch, t2 * w2)   // 1x1 conv = per-position channel mix
-    add_bias_rows(y3, m.blob, m.c3_b, nch, t2 * w2)
-    pk_relu(y3)
-    pk_conv2d_dw_s2(y5, y3, m.blob, m.c5_w, m.c5_b, w2, t2, nch)
+    pk_ensure(st.y3, t2 * w2 * nch)
+    pk_scan("y0", st.y0, t1 * w1 * nch)
+    pk_scan("y2", st.y2, t2 * w2 * nch)
+    pk_mm_rq(m, st.y3, m.c3_w, st.y2, st.xqi, st.xsi, nch, nch, t2 * w2)   // 1x1 conv = per-position channel mix
+    add_bias_rows(st.y3, m.blob, m.c3_b, nch, t2 * w2)
+    pk_relu(st.y3, t2 * w2 * nch)
+    pk_conv2d_dw_s2(st.y5, st.y3, m.blob, m.c5_w, m.c5_b, w2, t2, nch)
     let w3 = (w2 - 1l) / 2l + 1l               // 16
     let t3 = (t2 - 1l) / 2l + 1l
-    y6 |> resize(int(t3 * w3 * nch))
-    pk_mm_rq(m, y6, m.c6_w, y5, xqi, xsi, nch, nch, t3 * w3)
-    add_bias_rows(y6, m.blob, m.c6_b, nch, t3 * w3)
-    pk_relu(y6)
+    pk_ensure(st.y6, t3 * w3 * nch)
+    pk_mm_rq(m, st.y6, m.c6_w, st.y5, st.xqi, st.xsi, nch, nch, t3 * w3)
+    add_bias_rows(st.y6, m.blob, m.c6_b, nch, t3 * w3)
+    pk_relu(st.y6, t3 * w3 * nch)
 
     // features per time row: v[f + w3·c] = y6[t][f][c]; then pre_out into the residual stream
     let tt = t3
@@ -734,80 +814,60 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
         panic("dasLLAMA parakeet: {tt} encoder frames crosses the local-attention switch — clip audio to under ~10.9 minutes")
     }
     let feat = w3 * nch
-    var xf : array<float>
-    xf |> resize(int(tt * feat))
+    pk_ensure(st.xf, tt * feat)
     for (t in range64(tt)) {
         for (fr in range64(w3)) {
             for (c in range64(nch)) {
-                xf[t * feat + fr + w3 * c] = y6[(t * w3 + fr) * nch + c]
+                st.xf[t * feat + fr + w3 * c] = st.y6[(t * w3 + fr) * nch + c]
             }
         }
     }
-    var x : array<float>
-    x |> resize(int(tt * d))
-    pk_scan("y6", y6, int64(length(y6)))
-    pk_mm_rq(m, x, m.pre_w, xf, xqi, xsi, feat, d, tt)
-    add_bias_rows(x, m.blob, m.pre_b, d, tt)
-    pk_scan("pre", x, int64(length(x)))
+    pk_ensure(st.x, tt * d)
+    pk_scan("y6", st.y6, t3 * w3 * nch)
+    pk_mm_rq(m, st.x, m.pre_w, st.xf, st.xqi, st.xsi, feat, d, tt)
+    add_bias_rows(st.x, m.blob, m.pre_b, d, tt)
+    pk_scan("pre", st.x, tt * d)
     asr_prof_add("pk.conv_subsample", tp)
     tp = ref_time_ticks()
 
     // masked tail (padded mel frames past the real audio): none for full-clip encode when
     // ceil-per-stage == ceil(n/8); the oracle masks keys >= ceil(n_len_org/8)
-    let n_real = (mel.n_len_org + m.subsampling - 1l) / m.subsampling
+    let n_real = (st.mel.n_len_org + m.subsampling - 1l) / m.subsampling
 
     // rel-pos embedding table [W × d], interleaved (sin,cos) pairs; W = 2T−1
     let ww = 2l * tt - 1l
-    var pos_emb : array<float>
-    pos_emb |> resize(int(ww * d))
+    pk_ensure(st.pos_emb, ww * d)
     for (w in range64(ww)) {
         let rel = double(tt - 1l - w)
         for (k in range64(d / 2l)) {
             let freq = exp(-(double(k * 2l) * log(10000.0lf) / double(d)))
             let theta = float(freq * rel)
-            pos_emb[w * d + 2l * k] = sin(theta)
-            pos_emb[w * d + 2l * k + 1l] = cos(theta)
+            st.pos_emb[w * d + 2l * k] = sin(theta)
+            st.pos_emb[w * d + 2l * k + 1l] = cos(theta)
         }
     }
     // the rel-pos image is layer-invariant: one requant serves every layer's pos projection
-    var posq : array<int8>
-    var poss : array<float>
     if (m.q8) {
-        pk_requant(pos_emb, d, ww, posq, poss)
+        pk_requant(st.pos_emb, d, ww, st.posq, st.poss)
     }
     asr_prof_add("pk.pos_emb", tp)
 
     // scratch
-    var xb : array<float>
-    xb |> resize(int(tt * d))
-    var h : array<float>
-    h |> resize(int(tt * 4l * d))
-    var qq : array<float>
-    qq |> resize(int(tt * d))
-    var kk : array<float>
-    kk |> resize(int(tt * d))
-    var vv : array<float>
-    vv |> resize(int(tt * d))
-    var posl : array<float>
-    posl |> resize(int(ww * d))
-    var quh : array<float>
-    quh |> resize(int(tt * dh))
-    var quh2 : array<float>
-    quh2 |> resize(int(tt * dh))
-    var vh : array<float>
-    vh |> resize(int(tt * dh))
-    var kth : array<float>
-    kth |> resize(int(dh * tt))
-    var scores : array<float>
-    scores |> resize(int(tt * tt))
-    var relm : array<float>
-    relm |> resize(int(tt * ww))
-    var post : array<float>
-    post |> resize(int(dh * ww))
-    var oh : array<float>
-    oh |> resize(int(tt * dh))
-    var ao : array<float>
-    ao |> resize(int(tt * d))
+    pk_ensure(st.xb, tt * d)
+    pk_ensure(st.h, tt * 4l * d)
+    pk_ensure(st.qq, tt * d)
+    pk_ensure(st.kk, tt * d)
+    pk_ensure(st.vv, tt * d)
+    pk_ensure(st.posl, ww * d)
+    pk_ensure(st.quh, tt * dh)
+    pk_ensure(st.quh2, tt * dh)
+    pk_ensure(st.vh, tt * dh)
+    pk_ensure(st.kth, dh * tt)
+    pk_ensure(st.scores, tt * tt)
+    pk_ensure(st.relm, tt * ww)
+    pk_ensure(st.post, dh * ww)
+    pk_ensure(st.oh, tt * dh)
+    pk_ensure(st.ao, tt * d)
     let scale = 1.0 / sqrt(float(dh))
 
     for (l in range64(m.n_layer)) {
@@ -815,45 +875,45 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
 
         // FFN1 (macaron half)
         tp = ref_time_ticks()
-        layernorm_batch(xb, x, m.blob, lo.nf1_w, lo.nf1_b, d, tt, m.eps)
-        pk_mm_rq(m, h, lo.ff1a_w, xb, xqi, xsi, d, 4l * d, tt)
-        silu(h, tt * 4l * d)
-        pk_mm_rq(m, xb, lo.ff1b_w, h, xqi, xsi, 4l * d, d, tt)
+        layernorm_batch(st.xb, st.x, m.blob, lo.nf1_w, lo.nf1_b, d, tt, m.eps)
+        pk_mm_rq(m, st.h, lo.ff1a_w, st.xb, st.xqi, st.xsi, d, 4l * d, tt)
+        silu(st.h, tt * 4l * d)
+        pk_mm_rq(m, st.xb, lo.ff1b_w, st.h, st.xqi, st.xsi, 4l * d, d, tt)
         for (i in range64(tt * d)) {
-            x[i] += 0.5 * xb[i]
+            st.x[i] += 0.5 * st.xb[i]
         }
-        pk_scan("L{l}.ffn1", x, tt * d)
+        pk_scan("L{l}.ffn1", st.x, tt * d)
         asr_prof_add("pk.ffn", tp)
 
         // rel-pos attention
         tp = ref_time_ticks()
-        layernorm_batch(xb, x, m.blob, lo.nat_w, lo.nat_b, d, tt, m.eps)
+        layernorm_batch(st.xb, st.x, m.blob, lo.nat_w, lo.nat_b, d, tt, m.eps)
         if (m.q8) {   // q/k/v share the post-LN activation: one requant, three GEMMs
-            pk_requant(xb, d, tt, xqi, xsi)
+            pk_requant(st.xb, d, tt, st.xqi, st.xsi)
         }
-        pk_mm(m, qq, lo.q_w, xb, xqi, xsi, d, d, tt)
-        pk_mm(m, kk, lo.k_w, xb, xqi, xsi, d, d, tt)
-        pk_mm(m, vv, lo.v_w, xb, xqi, xsi, d, d, tt)
+        pk_mm(m, st.qq, lo.q_w, st.xb, st.xqi, st.xsi, d, d, tt)
+        pk_mm(m, st.kk, lo.k_w, st.xb, st.xqi, st.xsi, d, d, tt)
+        pk_mm(m, st.vv, lo.v_w, st.xb, st.xqi, st.xsi, d, d, tt)
         // pos projection for this layer: [W × d], against the hoisted layer-invariant image
-        pk_mm(m, posl, lo.pos_w, pos_emb, posq, poss, d, d, ww)
+        pk_mm(m, st.posl, lo.pos_w, st.pos_emb, st.posq, st.poss, d, d, ww)
         asr_prof_add("pk.attn_proj", tp)
         tp = ref_time_ticks()
         for (hi in range64(n_head)) {
             let hoff = hi * dh
             unsafe {
-                var qup = addr(quh[0])
-                var qvp = addr(quh2[0])
-                var ktp = addr(kth[0])
-                var vhp = addr(vh[0])
-                var pop = addr(post[0])
-                var scp = addr(scores[0])
-                var rlp = addr(relm[0])
-                var ohp = addr(oh[0])
-                var aop = addr(ao[0])
-                let qqp = reinterpret<float const?>(addr(qq[0]))
-                let kkp = reinterpret<float const?>(addr(kk[0]))
-                let vvp = reinterpret<float const?>(addr(vv[0]))
-                let plp = reinterpret<float const?>(addr(posl[0]))
+                var qup = addr(st.quh[0])
+                var qvp = addr(st.quh2[0])
+                var ktp = addr(st.kth[0])
+                var vhp = addr(st.vh[0])
+                var pop = addr(st.post[0])
+                var scp = addr(st.scores[0])
+                var rlp = addr(st.relm[0])
+                var ohp = addr(st.oh[0])
+                var aop = addr(st.ao[0])
+                let qqp = reinterpret<float const?>(addr(st.qq[0]))
+                let kkp = reinterpret<float const?>(addr(st.kk[0]))
+                let vvp = reinterpret<float const?>(addr(st.vv[0]))
+                let plp = reinterpret<float const?>(addr(st.posl[0]))
                 let bup = reinterpret<float const?>(addr(m.blob[lo.bias_u + hi * dh]))
                 let bvp = reinterpret<float const?>(addr(m.blob[lo.bias_v + hi * dh]))
                 // transposed head views ((Q+u), (Q+v), Kᵀ, V_h, pos_hᵀ) — the row GEMMs read
@@ -925,19 +985,19 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
         }
         asr_prof_add("pk.attn_heads", tp)
         tp = ref_time_ticks()
-        pk_mm_rq(m, xb, lo.o_w, ao, xqi, xsi, d, d, tt)
-        add_inplace_rows(x, xb, tt * d)
-        pk_scan("L{l}.attn", x, tt * d)
+        pk_mm_rq(m, st.xb, lo.o_w, st.ao, st.xqi, st.xsi, d, d, tt)
+        add_inplace_rows(st.x, st.xb, tt * d)
+        pk_scan("L{l}.attn", st.x, tt * d)
         asr_prof_add("pk.attn_out", tp)
 
         // conv module
         tp = ref_time_ticks()
-        layernorm_batch(xb, x, m.blob, lo.ncv_w, lo.ncv_b, d, tt, m.eps)
-        pk_mm_rq(m, h, lo.pw1_w, xb, xqi, xsi, d, 2l * d, tt)
+        layernorm_batch(st.xb, st.x, m.blob, lo.ncv_w, lo.ncv_b, d, tt, m.eps)
+        pk_mm_rq(m, st.h, lo.pw1_w, st.xb, st.xqi, st.xsi, d, 2l * d, tt)
         unsafe {
-            let hp = reinterpret<float const?>(addr(h[0]))
-            var xbp = addr(xb[0])
-            var aop = addr(ao[0])
+            let hp = reinterpret<float const?>(addr(st.h[0]))
+            var xbp = addr(st.xb[0])
+            var aop = addr(st.ao[0])
             let dwp = reinterpret<float const?>(addr(m.blob[lo.dw_w]))
             let bmp = reinterpret<float const?>(addr(m.blob[lo.bn_mean]))
             let bvp2 = reinterpret<float const?>(addr(m.blob[lo.bn_var]))
@@ -977,54 +1037,48 @@ def parakeet_encode(m : ParakeetModel; mel : WhisperMel; var enc_out : array<flo
                 }
             }
         }
-        pk_mm_rq(m, xb, lo.pw2_w, ao, xqi, xsi, d, d, tt)
-        add_inplace_rows(x, xb, tt * d)
-        pk_scan("L{l}.conv", x, tt * d)
+        pk_mm_rq(m, st.xb, lo.pw2_w, st.ao, st.xqi, st.xsi, d, d, tt)
+        add_inplace_rows(st.x, st.xb, tt * d)
+        pk_scan("L{l}.conv", st.x, tt * d)
         asr_prof_add("pk.conv_module", tp)
 
         // FFN2 (second macaron half)
         tp = ref_time_ticks()
-        layernorm_batch(xb, x, m.blob, lo.nf2_w, lo.nf2_b, d, tt, m.eps)
-        pk_mm_rq(m, h, lo.ff2a_w, xb, xqi, xsi, d, 4l * d, tt)
-        silu(h, tt * 4l * d)
-        pk_mm_rq(m, xb, lo.ff2b_w, h, xqi, xsi, 4l * d, d, tt)
+        layernorm_batch(st.xb, st.x, m.blob, lo.nf2_w, lo.nf2_b, d, tt, m.eps)
+        pk_mm_rq(m, st.h, lo.ff2a_w, st.xb, st.xqi, st.xsi, d, 4l * d, tt)
+        silu(st.h, tt * 4l * d)
+        pk_mm_rq(m, st.xb, lo.ff2b_w, st.h, st.xqi, st.xsi, 4l * d, d, tt)
         for (i in range64(tt * d)) {
-            x[i] += 0.5 * xb[i]
+            st.x[i] += 0.5 * st.xb[i]
         }
 
         // per-layer post norm
-        layernorm_batch(x, x, m.blob, lo.nout_w, lo.nout_b, d, tt, m.eps)
-        pk_scan("L{l}.out", x, tt * d)
+        layernorm_batch(st.x, st.x, m.blob, lo.nout_w, lo.nout_b, d, tt, m.eps)
+        pk_scan("L{l}.out", st.x, tt * d)
         asr_prof_add("pk.ffn", tp)
     }
 
-    enc_out <- x
+    // the encoder rows stay in st.x — the TDT decode reads them from there
     return tt
 }
 
 // ===== prediction network + joint + TDT greedy =====
 
-//! LSTM predictor state (h/c per layer) + the projected prediction vector.
-struct ParakeetPredState {
-    h : array<float>       // [n_layers × pred_dim]
-    c : array<float>
-    pred : array<float>    // joint.pred projection of the last hidden [pred_dim]
-    gates : array<float>   // scratch [4 × pred_dim]: ih part
-    gates2 : array<float>  // scratch [4 × pred_dim]: hh part
-    xin : array<float>     // scratch [pred_dim]: layer input
-    hbuf : array<float>    // scratch [pred_dim]: current layer's h (matmul takes plain arrays)
-}
-
-def make_parakeet_pred_state(m : ParakeetModel) : ParakeetPredState {
-    var s = ParakeetPredState()
-    s.h |> resize(int(m.n_pred_layers * m.n_pred_dim))
-    s.c |> resize(int(m.n_pred_layers * m.n_pred_dim))
-    s.pred |> resize(int(m.n_pred_dim))
-    s.gates |> resize(int(4l * m.n_pred_dim))
-    s.gates2 |> resize(int(4l * m.n_pred_dim))
-    s.xin |> resize(int(m.n_pred_dim))
-    s.hbuf |> resize(int(m.n_pred_dim))
-    return <- s
+// size the predictor state and zero the LSTM h/c (a fresh utterance starts from zeros;
+// the scratch fields are written before every read)
+def private pk_pred_reset(m : ParakeetModel; var s : ParakeetPredState) {
+    let pd = m.n_pred_dim
+    pk_ensure(s.h, m.n_pred_layers * pd)
+    pk_ensure(s.c, m.n_pred_layers * pd)
+    pk_ensure(s.pred, pd)
+    pk_ensure(s.gates, 4l * pd)
+    pk_ensure(s.gates2, 4l * pd)
+    pk_ensure(s.xin, pd)
+    pk_ensure(s.hbuf, pd)
+    for (i in range64(m.n_pred_layers * pd)) {
+        s.h[i] = 0.0
+        s.c[i] = 0.0
+    }
 }
 
 // advance the LSTM stack for `token` and refresh s.pred (gates packed [i,f,o,g])
@@ -1106,58 +1160,54 @@ def set_parakeet_trace(on : bool) {
     g_parakeet_trace = on
 }
 
-//! Greedy TDT decode over the encoder output — whisper.cpp's parakeet_decode loop, token
-//! for token: joint softmax over the full (vocab+blank+durations) row, argmax token +
-//! argmax duration, blank advances time without predicting, non-blank feeds the LSTM,
-//! duration 0 caps at n_max_tokens per frame.
-def parakeet_tdt_decode(m : ParakeetModel; enc_out : array<float>; n_frames : int64) : array<ParakeetToken> {
-    var out : array<ParakeetToken>
+//! Greedy TDT decode over the encoder rows in ``st.x`` — whisper.cpp's parakeet_decode
+//! loop, token for token: joint softmax over the full (vocab+blank+durations) row, argmax
+//! token + argmax duration, blank advances time without predicting, non-blank feeds the
+//! LSTM, duration 0 caps at n_max_tokens per frame. Tokens are left in ``st.toks``.
+def parakeet_tdt_decode(m : ParakeetModel; var st : ParakeetState; n_frames : int64) {
+    st.toks |> clear()
     let d = m.n_state
     let pd = m.n_pred_dim
     let n_logits = m.n_vocab + 1l + m.n_durations
     let n_tok_logits = int(m.n_vocab + 1l)
 
     // precompute the joint's encoder projection for every frame [T × pred_dim]
-    var encp : array<float>
-    encp |> resize(int(n_frames * pd))
-    var xqi : array<int8>
-    var xsi : array<float>
-    pk_mm_rq(m, encp, m.joint_enc_w, enc_out, xqi, xsi, d, pd, n_frames)
-    add_bias_rows(encp, m.blob, m.joint_enc_b, pd, n_frames)
+    pk_ensure(st.encp, n_frames * pd)
+    pk_mm_rq(m, st.encp, m.joint_enc_w, st.x, st.xqi, st.xsi, d, pd, n_frames)
+    add_bias_rows(st.encp, m.blob, m.joint_enc_b, pd, n_frames)
 
-    var s <- make_parakeet_pred_state(m)
-    pk_predict(m, s, m.blank_id)
+    pk_pred_reset(m, st.pred)
+    pk_predict(m, st.pred, m.blank_id)
 
-    var joint : array<float>
-    joint |> resize(int(pd))
-    var logits : array<float>
-    logits |> resize(int(n_logits))
+    pk_ensure(st.joint, pd)
+    pk_ensure(st.logits, n_logits)
 
     var t = 0l
     var emitted = 0
     while (t < n_frames) {
         for (j in range64(pd)) {
-            let v = encp[t * pd + j] + s.pred[j]
-            joint[j] = max(v, 0.0)   // relu
+            let v = st.encp[t * pd + j] + st.pred.pred[j]
+            st.joint[j] = max(v, 0.0)   // relu
         }
-        mm_blob_b(logits, m.blob, m.joint_net_w, joint, pd, n_logits, 1l)
+        mm_blob_b(st.logits, m.blob, m.joint_net_w, st.joint, pd, n_logits, 1l)
         for (i in range64(n_logits)) {
-            logits[i] += m.blob[m.joint_net_b + i]
+            st.logits[i] += m.blob[m.joint_net_b + i]
         }
         // log-softmax over the WHOLE row (the oracle's plog normalizer includes durations)
-        var mx = logits[0]
-        for (v in logits) {
-            mx = max(mx, v)
+        // — explicit n_logits bounds: the scratch arrays are oversized on reuse
+        var mx = st.logits[0]
+        for (i in range64(1l, n_logits)) {
+            mx = max(mx, st.logits[i])
         }
         var lse = 0.0lf
-        for (v in logits) {
-            lse += double(exp(v - mx))
+        for (i in range64(n_logits)) {
+            lse += double(exp(st.logits[i] - mx))
         }
         let logz = float(log(lse)) + mx
 
         var best = 0
         for (i in range(1, n_tok_logits)) {
-            if (logits[i] > logits[best]) {
+            if (st.logits[i] > st.logits[best]) {
                 best = i
             }
         }
@@ -1167,9 +1217,9 @@ def parakeet_tdt_decode(m : ParakeetModel; enc_out : array<float>; n_frames : in
         // its strict-> argmax over five −infs then defaults to index 0. Analytic logit
         // comparison would pick the TRUE argmax and diverge — mirror the underflow.
         var bdur = 0
-        var bdp = exp(logits[n_tok_logits] - mx)
+        var bdp = exp(st.logits[n_tok_logits] - mx)
         for (i in range(1, int(m.n_durations))) {
-            let dp = exp(logits[n_tok_logits + i] - mx)
+            let dp = exp(st.logits[n_tok_logits + i] - mx)
             if (dp > bdp) {
                 bdp = dp
                 bdur = i
@@ -1179,7 +1229,7 @@ def parakeet_tdt_decode(m : ParakeetModel; enc_out : array<float>; n_frames : in
         if (g_parakeet_trace) {
             print("  t={t} tok={best} durp=[")
             for (i in range(int(m.n_durations))) {
-                print("{exp(logits[n_tok_logits + i] - mx)} ")
+                print("{exp(st.logits[n_tok_logits + i] - mx)} ")
             }
             print("] -> {bdur}\n")
         }
@@ -1194,15 +1244,15 @@ def parakeet_tdt_decode(m : ParakeetModel; enc_out : array<float>; n_frames : in
         }
 
         // token probability renormalized over the token slice (the oracle's create_token_data)
-        let plog = logits[best] - logz
+        let plog = st.logits[best] - logz
         var tok_sum = 0.0lf
         for (i in range(n_tok_logits)) {
-            tok_sum += double(exp(logits[i] - logz))
+            tok_sum += double(exp(st.logits[i] - logz))
         }
-        out |> push(ParakeetToken(id = best, dur_idx = bdur, dur = dur, frame = t,
+        st.toks |> push(ParakeetToken(id = best, dur_idx = bdur, dur = dur, frame = t,
             p = float(double(exp(plog)) / tok_sum), plog = plog))
 
-        pk_predict(m, s, best)
+        pk_predict(m, st.pred, best)
         if (dur > 0) {
             t += int64(dur)
             emitted = 0
@@ -1214,7 +1264,6 @@ def parakeet_tdt_decode(m : ParakeetModel; enc_out : array<float>; n_frames : in
             }
         }
     }
-    return <- out
 }
 
 //! SPM detokenize: ▁ becomes a space, except while the transcript is still empty inside the

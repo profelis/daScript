@@ -58,6 +58,7 @@ struct AsrSession {
     qctx : Session = Session()
     qenc : EncoderState = EncoderState()
     qcs : Qwen3aConvState = Qwen3aConvState()
+    pkst : ParakeetState = ParakeetState()   // parakeet hot-path scratch — zero allocation per transcribe
     translate : bool = false
     no_timestamps : bool = false
     context : string = ""
@@ -292,25 +293,24 @@ def private transcribe_qwen3a(m : AsrModel; var s : AsrSession; samples : array<
 def private transcribe_parakeet(m : AsrModel; var s : AsrSession; samples : array<float> | #;
                                 blk : block<(seg : TranscribeSegment)>) : int {
     var tp = ref_time_ticks()
-    let mel <- parakeet_log_mel(samples, m.pk)
+    parakeet_log_mel(samples, m.pk, s.pkst)
     asr_prof_add("pk.mel", tp)
-    var enc_out : array<float>
     tp = ref_time_ticks()
-    let tt = parakeet_encode(m.pk, mel, enc_out)
+    let tt = parakeet_encode(m.pk, s.pkst)
     asr_prof_add("pk.encode_total", tp)
     tp = ref_time_ticks()
-    let toks <- parakeet_tdt_decode(m.pk, enc_out, tt)
+    parakeet_tdt_decode(m.pk, s.pkst, tt)
     asr_prof_add("pk.decode_total", tp)
     var seg = TranscribeSegment(t0 = 0l, t1 = int64(length(samples)) * 100l / AUDIO_SAMPLE_RATE,
-        text = parakeet_detokenize(m.pk, toks))
+        text = parakeet_detokenize(m.pk, s.pkst.toks))
     var plog_sum = 0.0lf
-    seg.tokens |> reserve(length(toks))
-    for (t in toks) {
+    seg.tokens |> reserve(length(s.pkst.toks))
+    for (t in s.pkst.toks) {
         seg.tokens |> push(t.id)
         plog_sum += double(t.plog)
     }
-    if (!empty(toks)) {
-        seg.avg_logprob = float(plog_sum / double(length(toks)))
+    if (!empty(s.pkst.toks)) {
+        seg.avg_logprob = float(plog_sum / double(length(s.pkst.toks)))
     }
     if (!pk_is_multilingual(m)) {
         s.detected_lang = "en"   // v3 transcribes without detecting/reporting a language
