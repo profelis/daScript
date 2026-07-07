@@ -328,6 +328,21 @@ def private pk_requant(x : array<float>; n, npos : int64; var xq : array<int8>; 
     asr_requant_rows_q8(x, n, npos, xq, xs)
 }
 
+// dw taps arrive [ch][3][3] (torch layout); the f4 dw kernel wants tap-major [9][ch]
+def private pk_dw_tap_major(var blob : array<float>; off, ch : int64) {
+    var tmp : array<float>
+    tmp |> resize(int(ch * 9l))
+    for (c in range64(ch)) {
+        for (tap in range64(9l)) {
+            tmp[tap * ch + c] = blob[off + c * 9l + tap]
+        }
+    }
+    for (i, v in count(), tmp) {
+        blob[off + int64(i)] = v
+    }
+    delete tmp
+}
+
 // ===== bin container =====
 
 // whisper-bin-style tensor records: i32 n_dims, i32 name_len, i32 ftype; i32 dims (ne
@@ -538,10 +553,12 @@ def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
         pk_read(recs, bytes, "encoder.pre_encode.conv.0.weight", m.blob, m.c0_w, nch * 9l)
         pk_read(recs, bytes, "encoder.pre_encode.conv.0.bias", m.blob, m.c0_b, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.2.weight", m.blob, m.c2_w, nch * 9l)
+        pk_dw_tap_major(m.blob, m.c2_w, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.2.bias", m.blob, m.c2_b, nch)
         pk_read_gemm(recs, bytes, "encoder.pre_encode.conv.3.weight", m, wscratch, m.c3_w, nch * nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.3.bias", m.blob, m.c3_b, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.5.weight", m.blob, m.c5_w, nch * 9l)
+        pk_dw_tap_major(m.blob, m.c5_w, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.5.bias", m.blob, m.c5_b, nch)
         pk_read_gemm(recs, bytes, "encoder.pre_encode.conv.6.weight", m, wscratch, m.c6_w, nch * nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.6.bias", m.blob, m.c6_b, nch)
@@ -750,29 +767,69 @@ def private pk_conv2d_s2(var out : array<float>; var col : array<float>;
     add_bias_rows(out, blob, b_off, cout, rows)
 }
 
-// depthwise conv2d k3 s2 p1: per-channel 3x3 kernel (w flat [c][kh][kw])
+// guarded single position of the depthwise 3x3 (borders where a tap falls off the image)
+def private pk_dw_pos(var op : float?; xp, wp, bp : float const?; oy, ox, iw, ih, ch, ow : int64) {
+    let o = (oy * ow + ox) * ch
+    unsafe {
+        for (c in range64(ch)) {
+            var acc = 0.0
+            for (kh in range64(3l)) {
+                let iy = oy * 2l - 1l + kh
+                if (iy >= 0l && iy < ih) {
+                    for (kw in range64(3l)) {
+                        let ix = ox * 2l - 1l + kw
+                        if (ix >= 0l && ix < iw) {
+                            acc += wp[(kh * 3l + kw) * ch + c] * xp[(iy * iw + ix) * ch + c]
+                        }
+                    }
+                }
+            }
+            op[o + c] = acc + bp[c]
+        }
+    }
+}
+
+// depthwise conv2d k3 s2 p1, w tap-major [9][ch] (repacked at load): float4 over the
+// contiguous channel axis, 9 taps unrolled, guarded borders (isolated bench: 7.2x scalar)
 def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : array<float>;
                             w_off, b_off : int64; iw, ih, ch : int64) {
     let ow = (iw - 1l) / 2l + 1l
     let oh = (ih - 1l) / 2l + 1l
+    let oy_end = (ih - 2l) / 2l + 1l   // last oy with iy=2*oy+1 in bounds, exclusive
+    let ox_end = (iw - 2l) / 2l + 1l
+    let rs = iw * ch
     pk_ensure(out, oh * ow * ch)
-    for (oy in range64(oh)) {
-        for (ox in range64(ow)) {
-            let r = (oy * ow + ox) * ch
-            for (c in range64(ch)) {
-                var acc = 0.0
-                for (kh in range64(3l)) {
-                    let iy = oy * 2l - 1l + kh
-                    if (iy >= 0l && iy < ih) {
-                        for (kw in range64(3l)) {
-                            let ix = ox * 2l - 1l + kw
-                            if (ix >= 0l && ix < iw) {
-                                acc += blob[w_off + (c * 3l + kh) * 3l + kw] * x[(iy * iw + ix) * ch + c]
-                            }
-                        }
-                    }
+    unsafe {
+        var op = addr(out[0])
+        let xp = reinterpret<float const?>(addr(x[0]))
+        let wp = reinterpret<float const?>(addr(blob[w_off]))
+        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        for (oy in range64(1l, oy_end)) {
+            for (ox in range64(1l, ox_end)) {
+                let x0 = ((oy * 2l - 1l) * iw + ox * 2l - 1l) * ch
+                let o = (oy * ow + ox) * ch
+                var c = 0l
+                while (c < ch) {
+                    var acc = (*reinterpret<float4 const?>(xp + x0 + c)) * (*reinterpret<float4 const?>(wp + c))
+                    acc = mad(*reinterpret<float4 const?>(xp + x0 + ch + c), *reinterpret<float4 const?>(wp + ch + c), acc)
+                    acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * ch + c), *reinterpret<float4 const?>(wp + 2l * ch + c), acc)
+                    acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + c), *reinterpret<float4 const?>(wp + 3l * ch + c), acc)
+                    acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + ch + c), *reinterpret<float4 const?>(wp + 4l * ch + c), acc)
+                    acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + 2l * ch + c), *reinterpret<float4 const?>(wp + 5l * ch + c), acc)
+                    acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + c), *reinterpret<float4 const?>(wp + 6l * ch + c), acc)
+                    acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + ch + c), *reinterpret<float4 const?>(wp + 7l * ch + c), acc)
+                    acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + 2l * ch + c), *reinterpret<float4 const?>(wp + 8l * ch + c), acc)
+                    *reinterpret<float4?>(op + o + c) = acc + *reinterpret<float4 const?>(bp + c)
+                    c += 4l
                 }
-                out[r + c] = acc + blob[b_off + c]
+            }
+        }
+        for (oy in range64(oh)) {
+            let interior_y = oy >= 1l && oy < oy_end
+            for (ox in range64(ow)) {
+                if (!interior_y || ox == 0l || ox >= ox_end) {
+                    pk_dw_pos(op, xp, wp, bp, oy, ox, iw, ih, ch, ow)
+                }
             }
         }
     }
