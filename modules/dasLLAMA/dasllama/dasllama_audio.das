@@ -448,28 +448,53 @@ def build_whisper_mel_plan(n_fft : int64) : WhisperMelPlan {
     return <- p
 }
 
+// exact-length grow for reused mel scratch: reserve once (exact), resize every call —
+// length stays exact so `for (v in arr)` loops and array-bound reads stay valid on reuse
+def private mel_sized(var a : array<float>; n : int64) {
+    if (int64(capacity(a)) < n) {
+        a |> reserve(int(n))
+    }
+    a |> resize(int(n))
+}
+
 //! whisper.cpp's ``log_mel_spectrogram`` — DIVERGES from the mtmd flavor above: reflect-200
 //! head from the RAW input (no 31 s pre-extend), 30 s zeros + 200 tail, n_len drops the last
 //! frame, frames past the real audio skip the FFT (every bin = log10(1e-10)), floor 1e-10,
-//! filterbank comes from the model file. Same global max−8 clamp + (x+4)/4.
+//! filterbank comes from the model file. Same global max−8 clamp + (x+4)/4. Returning form —
+//! the ``var padded``/``var m`` overload below reuses session scratch (zero per-transcribe
+//! alloc).
 def log_mel_whisper(samples : array<float> | #; plan : WhisperMelPlan; filters : array<float>; n_mel : int64) : WhisperMel {
+    var padded : array<float>
+    var m = WhisperMel(n_mel = n_mel)
+    log_mel_whisper(samples, plan, filters, n_mel, padded, m)
+    delete padded
+    return <- m
+}
+
+def log_mel_whisper(samples : array<float> | #; plan : WhisperMelPlan; filters : array<float>; n_mel : int64;
+                    var padded : array<float>; var m : WhisperMel) {
     let n_in = int64(length(samples))
     let head = AUDIO_N_FFT / 2l                            // 200
     let n_padded = n_in + AUDIO_SAMPLE_RATE * 30l + 2l * head
-    var padded : array<float>
-    padded |> resize(int(n_padded))                        // resize zero-fills (the whole tail)
-    for (i in range(int(n_in))) {
-        padded[int(head) + i] = samples[i]
-    }
+    mel_sized(padded, n_padded)
     let nref = clamp(n_in - 1l, 0l, head)                  // whisper.cpp reads samples[1..200] unguarded
+    for (i in range64(head - nref)) {                      // scratch is reused, not fresh: zero every region
+        padded[i] = 0.0
+    }
     for (i in range64(nref)) {
         padded[head - 1l - i] = samples[i + 1l]
     }
+    for (i in range(int(n_in))) {
+        padded[int(head) + i] = samples[i]
+    }
+    for (i in range64(head + n_in, n_padded)) {            // 30 s zero tail (+200)
+        padded[i] = 0.0
+    }
 
-    var m = WhisperMel(n_mel = n_mel)
+    m.n_mel = n_mel
     m.n_len = (n_padded - AUDIO_N_FFT) / AUDIO_HOP         // "remove the last frame"
     m.n_len_org = 1l + (n_in + head - AUDIO_N_FFT) / AUDIO_HOP
-    m.data |> resize(int(n_mel * m.n_len))
+    mel_sized(m.data, n_mel * m.n_len)
 
     // frames whose window starts inside the real (head-padded) audio get the DFT; the rest
     // are pure zero-tail and fill with log10(1e-10) directly
@@ -533,22 +558,31 @@ def log_mel_whisper(samples : array<float> | #; plan : WhisperMelPlan; filters :
         let clamped = double(v) < mmax ? float(mmax) : v
         v = float((double(clamped) + 4.0lf) / 4.0lf)
     }
-    return <- m
 }
 
 //! Slice one 3000-frame encoder window starting at mel frame ``seek``; frames past
-//! ``m.n_len`` zero-fill (whisper.cpp's conv-input copy).
+//! ``m.n_len`` zero-fill (whisper.cpp's conv-input copy). Returning form — the ``var c``
+//! overload reuses session scratch (zero per-window alloc).
 def whisper_mel_window(m : WhisperMel; seek : int64) : MelChunk {
-    var c = MelChunk(n_mel = m.n_mel, n_len = AUDIO_CHUNK_FRAMES)
-    c.data |> resize(int(m.n_mel * AUDIO_CHUNK_FRAMES))
+    var c = MelChunk()
+    whisper_mel_window(m, seek, c)
+    return <- c
+}
+
+def whisper_mel_window(m : WhisperMel; seek : int64; var c : MelChunk) {
+    c.n_mel = m.n_mel
+    c.n_len = AUDIO_CHUNK_FRAMES
+    mel_sized(c.data, m.n_mel * AUDIO_CHUNK_FRAMES)
     let i0 = min(seek, m.n_len)
     let i1 = min(seek + AUDIO_CHUNK_FRAMES, m.n_len)
     for (j in range64(m.n_mel)) {
         for (i in range64(i1 - i0)) {
             c.data[j * AUDIO_CHUNK_FRAMES + i] = m.data[j * m.n_len + i0 + i]
         }
+        for (i in range64(i1 - i0, AUDIO_CHUNK_FRAMES)) {   // scratch is reused: zero the tail explicitly
+            c.data[j * AUDIO_CHUNK_FRAMES + i] = 0.0
+        }
     }
-    return <- c
 }
 
 // ===== Whisper encoder tower (fp32 bring-up; q8 fast path is ledgered) =====
