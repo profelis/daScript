@@ -77,17 +77,18 @@ TSV (all sides): `results_pk_zen2_t16_v3.tsv`. onnx = ORT `intra_op=16`.
 
 TSVs: das `results_pk_ls_m1_t8_jo.tsv`, cli/onnx `results_pk_ls_m1_t8_p0.tsv`.
 
-### Apple M1 Max, 8 threads, whisper tiny — all three sides 2026-07-08 @ `cb26a05d0`, interleaved
+### Apple M1 Max, 8 threads, whisper tiny — das 2026-07-08 @ `cab95ee9c`; cli/onnx TSV 2026-07-08
 
 | side | mean ms | p50 | p95 |
 |---|---|---|---|
-| das tiny | 130 | 130 | **153** |
+| das tiny | **117** | **117** | **139** |
 | cli tiny | 129 | 129 | 167 |
 | onnx tiny-int8 | 431 | 421 | 528 |
 
-TSV (all sides): `results_wh_ls_m1_t8.tsv`. das is at parity with AMX whisper-cli on
-short-clip latency (and ahead at p95), 3.2x faster than onnx-int8. (whisper-tiny p50 130
-vs parakeet v2 183 — tiny is the quicker dictation model, parakeet the stronger one.)
+TSVs: das `results_wh_ls_m1_t8_attnidx.tsv` (best-of-2), cli/onnx sides of
+`results_wh_ls_m1_t8.tsv`. das now leads AMX whisper-cli on short-clip latency (p50 0.91x,
+p95 0.83x), 3.6x faster than onnx-int8. (whisper-tiny p50 117 vs parakeet v2 183 — tiny is
+the quicker dictation model, parakeet the stronger one.)
 
 ## Whisper — das vs whisper-cli (`-bs 1 -bo 1 -nf -ng`)
 
@@ -98,28 +99,29 @@ passes (`cb26a05d0`) + flattened tower attention (`cab95ee9c`: (head × query-bl
 units over the slot-indexed team dispatch — killed the head-unit raggedness that
 dominated encode; bit-exact, fingerprints byte-identical).
 
-### Apple M1 Max, 8 threads — das/onnx 2026-07-08 @ `cb26a05d0` (Parsec off); cli TSV 2026-07-07
+### Apple M1 Max, 8 threads — das 2026-07-08 @ `cab95ee9c` (flattened tower attention, Parsec off); cli TSV 2026-07-07
 
 | model | file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
 |---|---|---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 125 | 122 | 463 | 1.03x | **0.27x** |
-| tiny | jfk3.wav | 33 | 274 | 298 | - | **0.92x** | - |
-| tiny | gb1.wav | 199 | 1289 | 1672 | - | **0.77x** | - |
-| tiny | hp0.wav | 273 | 1664 | 2102 | - | **0.79x** | - |
-| tiny | hp0x2.wav | 547 | 3318 | 4836 | - | **0.69x** | - |
-| large-v3-turbo | jfk.wav | 11 | 2875 | 2150 | 2406 | 1.34x | 1.19x |
-| large-v3-turbo | jfk3.wav | 33 | 5866 | 4494 | - | 1.31x | - |
-| large-v3-turbo | gb1.wav | 199 | 24095 | 25415 | - | **0.95x** | - |
-| large-v3-turbo | hp0.wav | 273 | 35681 | 32878 | - | 1.09x | - |
-| large-v3-turbo | hp0x2.wav | 547 | 68290 | 64621 | - | 1.06x | - |
+| tiny | jfk.wav | 11 | 112 | 122 | 463 | **0.92x** | **0.24x** |
+| tiny | jfk3.wav | 33 | 246 | 298 | - | **0.82x** | - |
+| tiny | gb1.wav | 199 | 1173 | 1672 | - | **0.70x** | - |
+| tiny | hp0.wav | 273 | 1523 | 2102 | - | **0.72x** | - |
+| tiny | hp0x2.wav | 547 | 3001 | 4836 | - | **0.62x** | - |
+| large-v3-turbo | jfk.wav | 11 | 2629 | 2150 | 2406 | 1.22x | 1.09x |
+| large-v3-turbo | jfk3.wav | 33 | 5331 | 4494 | - | 1.19x | - |
+| large-v3-turbo | gb1.wav | 199 | 21891 | 25415 | - | **0.86x** | - |
+| large-v3-turbo | hp0.wav | 273 | 32420 | 32878 | - | **0.99x** | - |
+| large-v3-turbo | hp0x2.wav | 547 | 62128 | 64621 | - | **0.96x** | - |
 
-TSVs: das `results_wh_m1_t8_whopt.tsv` (best-of-2), cli side of `results_wh_m1_t8.tsv`,
-onnx `results_wh_m1_t8_onnx.tsv` (jfk-only — single-window adapter). Decoder q8 + the
-opt pass + threaded bias cut the das side 35-45% vs the 2026-07-07 rows: tiny now beats
-AMX cli on every row past jfk (jfk itself is parity) and turbo wins gb1 with hp0/hp0x2
-near parity — short clips remain cli's (fixed per-window encode against AMX GEMMs).
-Clean-window stage (per rep, jfk): tiny encode 95.5 (attn_heads 52.6 = 55%), decode 24.0,
-cross_kv 5.6; turbo encode 2781 (attn_heads 1277), decode 107, cross_kv 41.
+TSVs: das `results_wh_m1_t8_attnidx.tsv` (best-of-2), cli side of `results_wh_m1_t8.tsv`,
+onnx `results_wh_m1_t8_onnx.tsv` (jfk-only — single-window adapter). The flattened tower
+attention took the das side another ~9-10% on every row: **tiny now beats AMX cli on ALL
+FIVE rows** (jfk was the last holdout at 1.03x) and turbo wins every row past jfk3
+(hp0 0.99x, hp0x2 0.96x — both were cli's). Clean-window stage (per rep, jfk): tiny
+encode 81.7 (attn_heads 40.4 — the 6-units-on-8-lanes floor is gone; 1.30x on the bucket
+vs the 1.33x theoretical), decode 23.3, cross_kv 5.6; turbo encode 2540 (attn_heads 1048,
+1.22x on the bucket), decode 107, cross_kv 41.
 
 ### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `cab95ee9c` (flattened tower attention); cli TSV 2026-07-07
 
@@ -165,8 +167,9 @@ tiny's next wall is decode (~59 ms/rep vs encode 114); decoder q8 stays net-neut
   new slot-indexed team dispatch (jobque `team_parallel_for_indexed` `9f7b10288` +
   `maybe_parallel_for_indexed` `3800b2aa4`) — bit-exact (pre/post fingerprints
   byte-identical, 6 model×wav combos, q8+fp32). zen2 das re-sweep: tiny -14-24%
-  (cli parity short, leads long), turbo -12-14% (0.45-0.58x). M1 re-sweep pending a
-  Parsec window.
+  (cli parity short, leads long), turbo -12-14% (0.45-0.58x). M1 re-sweep (Parsec off):
+  das -9-10% every row — whisper tiny beats AMX cli on all five corpus rows + LibriSpeech
+  (p50 117 vs 129), turbo wins everything past jfk3.
 - 2026-07-08 (Parsec-off window): M1 whisper das re-sweep @ `cb26a05d0` (-35-45% vs the
   07-07 rows — tiny beats AMX cli on 4 of 5 rows) + NEW baselines: M1 whisper onnx-int8
   jfk columns, LibriSpeech whisper-tiny 3-way. Parakeet das re-check: within noise of the
