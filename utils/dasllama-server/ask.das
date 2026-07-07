@@ -5,12 +5,11 @@ options stack = 262144   // the forward chain runs deep
 //
 //   bin/daslang -jit utils/dasllama-server/ask.das -- --model <model.gguf> --prompt "..." [--max-tokens 256]
 //
-// It shares this box's tune winners with the server and every other dasLLAMA app: NO tune
+// It shares this box's tune winners with the server and every other dasLLAMA app: NO scope
 // declaration of its own — requiring dasLLAMA pulls in the [tune_scope], so ask reads the same
-// <das_root>/dasllama.tune.json. The policy here is "error" (the dev flavor): an untuned box
-// refuses to run and prints the exact tuner command, rather than tuning inline — a batch tool
-// shouldn't surprise a script with a multi-minute tune. Tune once (e.g. start the server, or
-// run ask with --tune), and every sibling is tuned.
+// <das_root>/dasllama.tune.json. The policy is "auto" (like the server): the first run on an
+// untuned box tunes and relaunches, then completes; --tune forces a re-tune. Tune once (any of
+// the three tools), and every sibling is tuned.
 
 require dasllama/dasllama       // load_model / generate / the shared [tune_scope]
 require llvm/daslib/llvm_tune   // [tune_policy] + tune_status

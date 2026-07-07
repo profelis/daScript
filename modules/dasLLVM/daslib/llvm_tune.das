@@ -852,9 +852,11 @@ def private cli_forces_tune() : bool {
 // so the command never starts with a quote (cmd.exe strips a leading quote)
 def private tuner_cmd(scope : TuneScope) : string {
     let win = get_platform_name() == "windows"
+    // quote the env values: <das_root> (hence the manifest path) can contain spaces — on POSIX
+    // an unquoted VAR=/a b/x.json splits the assignment; Windows `set "VAR=..."` is the safe form.
     let envs = (win ?
-        "set DAS_TUNE_MODE=tune&& set DAS_TUNE_MANIFEST={scope.manifestPath}&& " :
-        "DAS_TUNE_MODE=tune DAS_TUNE_MANIFEST={scope.manifestPath} ")
+        "set \"DAS_TUNE_MODE=tune\"&& set \"DAS_TUNE_MANIFEST={scope.manifestPath}\"&& " :
+        "DAS_TUNE_MODE=tune DAS_TUNE_MANIFEST=\"{scope.manifestPath}\" ")
     return "{envs}\"{get_das_exe()}\" -jit \"{scope.tunerPath}\" -dasroot \"{get_das_root()}\""
 }
 
