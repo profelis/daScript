@@ -25,11 +25,11 @@ writes the manifest, and relaunches itself with the winners; thereafter it serve
 logs the tune status at startup. `--tune` forces a re-tune; `DAS_TUNE_POLICY=error` skips
 per-start tuning while developing (it prints the tuner command instead).
 
-The sibling CLI tools share the same manifest with no tune declaration of their own:
-`ask` (prompt → completion, `policy=error` — a batch tool refuses to run untuned rather than
-surprising a script with a multi-minute tune) and `wav2txt` (audio → text, no policy — it
-silently runs whatever's tuned, or the generic per-ISA fallback). Tune once, and every dasLLAMA
-app on the box is tuned.
+Two sibling CLI tools share the same manifest — no per-app scope declaration, since requiring
+dasLLAMA pulls in its `[tune_scope]`: `ask` (prompt → completion, reporting ttft + prefill/decode
+t/s) and `wav2txt` (audio → text, reporting decode/transcribe time + real-time factor). Both carry
+the same `[tune_policy(missing = "auto")]`, so whichever of the three you run first tunes the box
+and the rest are instant. Tune once, and every dasLLAMA app on the box is tuned.
 
 This zero-config path covers only the **gen GEMM manifest** (`gen_tune_probe`). The
 `[tuned]` loop-hint kernels (`box_profile.json`, below), the backend/thread/token-block runtime

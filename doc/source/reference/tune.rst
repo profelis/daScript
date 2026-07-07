@@ -220,13 +220,14 @@ Runtime status — ``tune_status()``
 ``tune_status()`` returns one row per ``[tune]`` function — its winning suffix,
 the source (``manifest`` / ``fallback`` / ``reference``), the scope, and the
 manifest path. It is populated when the application declares ``[tune_policy]``.
-Log it at startup as the "am I tuned?" surface:
+``log_tune_status("myapp")`` is the ready-made "am I tuned?" surface — it logs
+the table at ``LOG_INFO`` (``<n>/<total> kernels tuned for this box``, one line
+per function, plus a ``--tune`` hint when any kernel is on a non-manifest tier),
+and is a no-op when the table is empty. Call it at startup:
 
 .. code-block:: das
 
-    for (s in tune_status()) {
-        to_log(LOG_INFO, "  {s.fname}: {s.suffix} ({s.source})\n")
-    }
+    log_tune_status("myapp")   // or iterate tune_status() yourself
 
 Writing a harness
 =================

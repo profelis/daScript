@@ -91,11 +91,15 @@ re-tune. ``DAS_TUNE_POLICY=error`` skips per-start tuning while developing (it
 prints the tuner command instead of running it).
 
 The winners live at ``<das_root>/dasllama.tune.json`` and are shared by every
-dasLLAMA application on the box. Two sibling CLI tools ship alongside the
-server and read the same manifest with no tune declaration of their own:
-``ask`` (a one-shot ``--prompt`` → completion) and ``wav2txt`` (an ``--file``
-audio → transcript). See :ref:`tune` for the framework, and
-``modules/dasLLAMA/tune_for_this_box.md`` for the measurement discipline.
+dasLLAMA application on the box — no per-app scope declaration, since requiring
+dasLLAMA pulls in its ``[tune_scope]``. Two sibling CLI tools ship alongside
+the server, each with the same ``[tune_policy(missing = "auto")]`` and reading
+the same manifest: ``ask`` (a one-shot ``--prompt`` → completion, reporting
+ttft and prefill/decode t/s) and ``wav2txt`` (an ``--file`` audio → transcript,
+reporting decode/transcribe time and the real-time factor). Whichever of the
+three you run first tunes the box; the rest are then instant. See :ref:`tune`
+for the framework, and ``modules/dasLLAMA/tune_for_this_box.md`` for the
+measurement discipline.
 
 
 Endpoints
