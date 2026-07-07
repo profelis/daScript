@@ -35,6 +35,9 @@ struct ProbeArgs {
     @clarg_doc = "Profiled repetitions (default 1)"
     reps : int
 
+    @clarg_doc = "Pin fp32 weights (set_asr_fp32) — A/B the q8 default"
+    fp32 : bool
+
     @clarg_short = "?"
     @clarg_name = "show-help"
     @clarg_doc = "Show this help and exit"
@@ -91,6 +94,7 @@ def main() : int {
         print("JIT-only — run with: daslang -jit <file>\n")
         return 1
     }
+    set_asr_fp32(cfg.fp32)
     var m <- empty(cfg.mmproj) ? load_asr_model(cfg.model) : load_asr_model(cfg.model, cfg.mmproj)
     let samples <- load_audio_16k_mono(cfg.wav)
     let reps = cfg.reps > 0 ? cfg.reps : 1

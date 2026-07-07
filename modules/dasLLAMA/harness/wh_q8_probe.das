@@ -2,11 +2,12 @@ options gen2
 options persistent_heap
 options stack = 65536
 
-// whisper q8 tower gate: q8-vs-fp32 token streams for one (model, wav) — run per numeric
-// change alongside the suite's tiny oracle. Timestamp tokens (id >= tok_beg) are counted
-// separately: greedy near-ties flip segment-split timestamps first (base on jfk: fp32 emits
-// an extra mid-segment 50744, word tokens identical) — the accepted class, like parakeet's
-// duration-only jitter. WORD flips are the real q8 quality signal.
+// whisper q8 gate (tower + decoder): q8-vs-fp32 token streams for one (model, wav) — run per
+// numeric change alongside the suite's tiny oracle. Timestamp tokens (id >= tok_beg) are
+// counted separately: greedy near-ties flip segment-split timestamps first — the accepted
+// class, like parakeet's duration-only jitter. WORD flips are the real q8 quality signal;
+// adjudicate each with a teacher-forced top-2-gap probe before accepting (decoder-q8 base
+// on jfk: one comma dropped on a 0.018-logit fp32 top-2 near-tie — accepted).
 //
 //   bin/daslang -jit modules/dasLLAMA/harness/wh_q8_probe.das -- <model.bin> <audio.wav>
 
@@ -72,7 +73,7 @@ def main() {
         let tq <- collect(mq, samples)
         let tf <- collect(mf, samples)
         // timestamps (>= tok_beg) flip on near-tie segment splits — compare word streams
-        let beg = int(mq.whisper.tok_beg)
+        let beg = mq.whisper.tok_beg
         var wq : array<int>
         var wf : array<int>
         for (tk in tq) {
