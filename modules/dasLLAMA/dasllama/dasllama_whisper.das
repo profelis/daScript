@@ -9,6 +9,7 @@ require strings
 require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
+require dasllama/dasllama_quant
 require dasllama/dasllama_audio
 
 // Whisper-proper ASR: reads ggerganov/whisper.cpp ggml-*.bin models directly (drop-in HF
@@ -44,6 +45,9 @@ struct WhisperModel {
     filters : array<float>   // mel filterbank [n_mel][201], loaded from the file
     enc : AudioTower = AudioTower()
     dblob : array<float>
+    dq8 : bool = false        // decoder GEMMs quantized: dqblob/dqscales carry the Q8_0 image
+    dqblob : array<int8>      // whole-dblob-shaped Q8_0 quants (GEMM regions repacked in place)
+    dqscales : array<float>   // per-32-block scales, indexed at woff/32
     d_pe_off : int64
     d_te_off : int64
     d_ln_w_off : int64
@@ -115,6 +119,80 @@ def dec_layer_offsets(w : WhisperModel; l : int64) : DecLayerOffs {
 
 // 8 square mats + 2 mlp mats (4d·d each) + 13 d-vectors + fc1 bias (4d)
 def dec_layer_stride(d : int64) : int64 => 16l * d * d + 17l * d
+
+// ===== decoder Q8 rail (the tower recipe on dblob: whole-blob Q8_0 image + per-region repack) =====
+
+// repack one decoder GEMM region for the active backend — tw_repack's twin (scales index at
+// woff/32 ⇒ woff must be 32-aligned); an n%32!=0 region stays fp32, wm_mm falls back per
+// call on the same condition
+def private wm_repack(var w : WhisperModel; woff, n, d : int64) {
+    if (n % 32l != 0l) {
+        return
+    }
+    if (woff % 32l != 0l) {
+        panic("whisper decoder q8: GEMM weight at {woff} is not 32-aligned")
+    }
+    repack_q8q8_weight(w.dqblob, w.dqscales, woff, n, d)
+}
+
+//! Quantize the decoder's GEMM weights to Q8_0: the tied token embedding (read as the
+//! [n_vocab × d] logits GEMV weight; embedding-row lookups keep reading fp32 dblob) +
+//! per-layer self/cross q/k/v/o + fc1/fc2. dqblob/dqscales mirror dblob offsets; non-GEMM
+//! slots (pe rows, norms, biases) are quantized-but-unread.
+def whisper_dec_quantize(var w : WhisperModel) {
+    let total = int64(length(w.dblob)) & ~31l
+    w.dqblob |> resize(int(total))
+    w.dqscales |> resize(int(total / 32l))
+    quantize_q8_0_into(w.dblob, total, w.dqblob, w.dqscales, 0l, 0l)
+    w.dq8 = true
+    if (!select_matmul_backend_for_load()) {
+        return   // row-major backend reads the flat Q8_0 image as-is
+    }
+    let d = w.n_text_state
+    wm_repack(w, w.d_te_off, d, w.n_vocab)
+    for (l in range64(w.n_text_layer)) {
+        let lo = dec_layer_offsets(w, l)
+        wm_repack(w, lo.q_w, d, d)
+        wm_repack(w, lo.k_w, d, d)
+        wm_repack(w, lo.v_w, d, d)
+        wm_repack(w, lo.o_w, d, d)
+        wm_repack(w, lo.cq_w, d, d)
+        wm_repack(w, lo.ck_w, d, d)
+        wm_repack(w, lo.cv_w, d, d)
+        wm_repack(w, lo.co_w, d, d)
+        wm_repack(w, lo.fc1_w, d, 4l * d)
+        wm_repack(w, lo.fc2_w, 4l * d, d)
+    }
+}
+
+// q8 route for a decoder GEMM: activation image (xq, xs) pre-quantized by the caller so
+// q/k/v (and every layer's ck/cv off one encode) share one requant; falls back to the fp32
+// blob when the region wasn't quantizable (same n%32 condition as wm_repack)
+def private wm_mm(w : WhisperModel; var y : array<float>; woff : int64; x : array<float>;
+                  xq : array<int8>; xs : array<float>; n, d, npos : int64) {
+    if (w.dq8 && n % 32l == 0l) {
+        array_view(w.dqblob, woff, n * d) $(wq : array<int8>#) {
+            array_view(w.dqscales, woff / 32l, n * d / 32l) $(ws : array<float>#) {
+                matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, npos)
+            }
+        }
+    } else {
+        mm_blob_b(y, w.dblob, woff, x, n, d, npos)
+    }
+}
+
+def private wm_requant(w : WhisperModel; x : array<float>; n, npos : int64; var xq : array<int8>; var xs : array<float>) {
+    if (w.dq8 && n % 32l == 0l) {
+        asr_requant_rows_q8(x, n, npos, xq, xs)
+    }
+}
+
+// requant-and-multiply for single-consumer activations
+def private wm_mm_rq(w : WhisperModel; var y : array<float>; woff : int64; x : array<float>;
+                     var xq : array<int8>; var xs : array<float>; n, d, npos : int64) {
+    wm_requant(w, x, n, npos, xq, xs)
+    wm_mm(w, y, woff, x, xq, xs, n, d, npos)
+}
 
 // ===== ggml bin container parsing =====
 
@@ -385,6 +463,9 @@ def load_whisper_model(path : string; q8 : bool = false) : WhisperModel {
         wt_read(recs, bytes, "decoder.ln.bias", w.dblob, w.d_ln_b_off, dd)
     }
     fclose(f)
+    if (q8) {
+        whisper_dec_quantize(w)
+    }
     return <- w
 }
 
@@ -421,6 +502,8 @@ struct DecoderState {
     att : array<float>      // per-head scores [H × ncap × max(Tmax, Ta)]
     x1 : array<float>       // [d] last-row staging for the tied-logits GEMV
     logits : array<float>   // [n_vocab]
+    xqi : array<int8>       // q8 requant image [max(Ta × d, ncap × 4d)] (empty on fp32 decoders)
+    xsi : array<float>      // per-32-block scales for xqi
 }
 
 def make_decoder_state(w : WhisperModel) : DecoderState {
@@ -447,6 +530,11 @@ def make_decoder_state(w : WhisperModel) : DecoderState {
     ds.att |> resize(int(hh * ncap * max(tmax, ta)))
     ds.x1 |> resize(int(d))
     ds.logits |> resize(int(w.n_vocab))
+    if (w.dq8) {   // largest requant image any decoder GEMM feeds (cross k/v enc_out Ta×d, mlp h ncap×4d)
+        let need = max(ta * d, ncap * 4l * d)
+        ds.xqi |> resize(int(need))
+        ds.xsi |> resize(int(need / 32l))
+    }
     return <- ds
 }
 
@@ -459,9 +547,10 @@ def whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<fl
     let hs = d / hh
     let ta = w.enc.n_ctx
     let kscale = 1.0 / sqrt(sqrt(float(hs)))
+    wm_requant(w, enc_out, d, ta, ds.xqi, ds.xsi)   // every layer's ck & cv share this one requant
     for (l in range64(w.n_text_layer)) {
         let lo = dec_layer_offsets(w, l)
-        mm_blob_b(ds.ckv_tmp, w.dblob, lo.ck_w, enc_out, d, d, ta)
+        wm_mm(w, ds.ckv_tmp, lo.ck_w, enc_out, ds.xqi, ds.xsi, d, d, ta)
         for (h in range64(hh)) {
             let base = ((l * hh + h) * hs) * ta
             for (t in range64(ta)) {
@@ -470,7 +559,7 @@ def whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<fl
                 }
             }
         }
-        mm_blob_b(ds.ckv_tmp, w.dblob, lo.cv_w, enc_out, d, d, ta)
+        wm_mm(w, ds.ckv_tmp, lo.cv_w, enc_out, ds.xqi, ds.xsi, d, d, ta)
         add_bias_rows(ds.ckv_tmp, w.dblob, lo.cv_b, d, ta)
         for (h in range64(hh)) {
             let base = ((l * hh + h) * ta) * hs
@@ -640,12 +729,13 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
 
         // self-attention (q and k pre-scaled hs^-0.25, k/v appended to the caches)
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.ln1_w, lo.ln1_b, d, n, w.eps)
-        mm_blob_b(ds.qq, w.dblob, lo.q_w, ds.xb, d, d, n)
+        wm_requant(w, ds.xb, d, n, ds.xqi, ds.xsi)   // q/k/v share the post-LN activation: one requant
+        wm_mm(w, ds.qq, lo.q_w, ds.xb, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.qq, w.dblob, lo.q_b, d, n)
         scale_inplace(ds.qq, n * d, kq_scale)
-        mm_blob_b(ds.kk, w.dblob, lo.k_w, ds.xb, d, d, n)
+        wm_mm(w, ds.kk, lo.k_w, ds.xb, ds.xqi, ds.xsi, d, d, n)
         scale_inplace(ds.kk, n * d, kq_scale)
-        mm_blob_b(ds.vv, w.dblob, lo.v_w, ds.xb, d, d, n)
+        wm_mm(w, ds.vv, lo.v_w, ds.xb, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.vv, w.dblob, lo.v_b, d, n)
         for (r in range64(n)) {
             for (h in range64(hh)) {
@@ -656,7 +746,7 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
             }
         }
         dec_self_attn(w, ds, l, n, p0)
-        mm_blob_b(ds.xb, w.dblob, lo.o_w, ds.xb2, d, d, n)
+        wm_mm_rq(w, ds.xb, lo.o_w, ds.xb2, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.o_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
         asr_prof_add("wh.dec.self", td)
@@ -664,10 +754,10 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
 
         // cross-attention (q unscaled; keys pre-scaled; softmax applies the other half)
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.cln_w, lo.cln_b, d, n, w.eps)
-        mm_blob_b(ds.qq, w.dblob, lo.cq_w, ds.xb, d, d, n)
+        wm_mm_rq(w, ds.qq, lo.cq_w, ds.xb, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.qq, w.dblob, lo.cq_b, d, n)
         dec_cross_attn(w, ds, l, n)
-        mm_blob_b(ds.xb, w.dblob, lo.co_w, ds.xb2, d, d, n)
+        wm_mm_rq(w, ds.xb, lo.co_w, ds.xb2, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.co_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
         asr_prof_add("wh.dec.cross", td)
@@ -675,10 +765,10 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
 
         // mlp
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.ln2_w, lo.ln2_b, d, n, w.eps)
-        mm_blob_b(ds.h, w.dblob, lo.fc1_w, ds.xb, d, 4l * d, n)
+        wm_mm_rq(w, ds.h, lo.fc1_w, ds.xb, ds.xqi, ds.xsi, d, 4l * d, n)
         add_bias_rows(ds.h, w.dblob, lo.fc1_b, 4l * d, n)
         gelu_tanh_lut(ds.h, n * 4l * d)
-        mm_blob_b(ds.xb, w.dblob, lo.fc2_w, ds.h, 4l * d, d, n)
+        wm_mm_rq(w, ds.xb, lo.fc2_w, ds.h, ds.xqi, ds.xsi, 4l * d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.fc2_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
         asr_prof_add("wh.dec.ffn", td)
@@ -691,7 +781,7 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
     for (j in range64(d)) {
         ds.x1[j] = ds.xb[(n - 1l) * d + j]
     }
-    mm_blob_b(ds.logits, w.dblob, w.d_te_off, ds.x1, d, w.n_vocab, 1l)
+    wm_mm_rq(w, ds.logits, w.d_te_off, ds.x1, ds.xqi, ds.xsi, d, w.n_vocab, 1l)
     asr_prof_add("wh.dec.logits", tl)
 }
 
