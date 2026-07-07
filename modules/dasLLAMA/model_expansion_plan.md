@@ -53,7 +53,29 @@ four remain. Order inside the wave = cheapest first, each gated before the next 
    `test_parity_gemma4_31b` (reuses GEMMA4_12B_GEN — identical counting continuation) +
    README matrix row. Committed on `bbatkin/model-expansion` (`19d7712cd`). Source:
    `ggml-org/gemma-4-31B-it-GGUF` (Q8 + bf16 mmproj), direct GGUF.
-2. **gemma-4-26B-A4B MoE — 🎯 NEXT. PROBED 2026-07-07; a real MoE slice (medium).**
+2. **gemma-4-26B-A4B MoE — ✅ DONE 2026-07-07. Real MoE slice; ~17 tok/s decode (M1 Max, 4B active).**
+   Shipped: config `moe_optional`/`moe_dense_shexp` (arch is MoE only when the file ships experts) +
+   5 new fblob regions (router scale, per-expert down scale, `pre/post_ffw_norm_1/2`); loader splits
+   the fused `ffn_gate_up_exps` into the existing we1(gate)/we3(up) stacks at load (block-aligned Q8
+   slices) + allocates/loads the dense shared expert (`ffn_gate/up/down` → w1/w3/w2 even with
+   n_expert>0); forward `gemma4_moe_ffn` (custom router → select → per-expert down scale folded into
+   the routed weights → `moe_experts_apply` → sandwich norms → dense-shared-expert sum), reusing the
+   extracted `moe_experts_apply` (from `moe_ffn_core`) + `dense_ffn_inplace` (from `ffn_dense_decode`)
+   so qwen2moe/gpt-oss/dense are byte-unchanged (full sweep 33/34 confirms). `gemma4_blocks()`
+   dispatches dense (12B/31B) vs MoE (26B) by expert count.
+   **KEY LESSON — MoE routing is near-tie-brittle.** The router RMS feeds a DISCRETE top-8-of-128
+   pick; ggml accumulates it in `ggml_float` (double). With float, dasLLAMA flips experts at router
+   near-ties even where the reference is *confident* → real O(1) miscounts. Fix = double-accumulate
+   ONLY the router sum-of-squares (2816 adds/layer, non-hot — matches ggml; every GEMM + the residual
+   stream stay float; approved by Boris: "double in a hot loop would be a problem, this isn't"). That
+   removed the systematic flips (counting 3→1 miss). The survivor is a GENUINE near-tie: verified vs
+   llama.cpp's per-step logit margins, the 26B's own top-1/top-2 gap is ~0.5–2.2 at counting steps
+   12/26/32/38 — a coin-flip no float engine can pin. So NO 40-token prompt holds token-for-token
+   (counting 34/40, days 16, prose/repetition worse — the "long" matches are repetition loops).
+   Fixture = the counting prompt capped at its confident 11-token head (`GEMMA4_26B_GEN`); correctness
+   proven separately via the margin analysis, not the fixture length. Diagnostic tooling:
+   `harness/oracle` `simple_ids_margin`/`simple_ids_multi` (per-step logit margins + multi-prompt).
+   ~~PROBED 2026-07-07; a real MoE slice (medium).~~
    Header: gemma4 arch, 30 layers, embd 2816, ff 2112, 16Q / [8×5,2]KV heads, **128 experts
    top-8**, expert_ff 704, softcap 30, SWA 1024, PLE off, shared_kv 0. The gemma4 MoE
    (`src/models/gemma4.cpp` `is_moe_layer` branch, lines ~291-344) is **two parallel branches

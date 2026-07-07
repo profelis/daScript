@@ -116,6 +116,12 @@ struct Config {
     moe_gate : MoeGate = MoeGate.softmax  // router probability function
     norm_topk_prob : bool = false      // renormalize the selected top-k weights to sum 1 ({arch}.expert_weights_norm)
     expert_weights_scale : float = 0.0 // scale on the routed weights; 0/1 = off (DeepSeek {arch}.expert_weights_scale)
+    // gemma4 MoE (a dense/routed hybrid): the arch is MoE only when the file ships experts (12B/31B
+    // are dense, 26B-A4B is MoE) and its shape differs from qwen2moe — a parallel DENSE shared expert,
+    // fused gate_up expert stacks, three extra sandwich norms, and a custom-normalized router. Both
+    // flags are loader-detected; `moe_dense_shexp` gates the whole gemma4-family MoE shape.
+    moe_optional : bool = false        // arch MAY be MoE — read expert keys only if the file carries them (gemma4)
+    moe_dense_shexp : bool = false     // shared expert is a DENSE parallel FFN + gemma4 sandwich norms + custom router
     // gpt-oss (all loader-detected from tensor presence, except the norm-name flag which the arch sets)
     attn_sinks : bool = false          // per-head sink logit joins the attention softmax denominator
     attn_out_bias : bool = false       // additive bias on the attention output projection
@@ -210,6 +216,14 @@ struct Model {
     // stacks (expert-major within each layer) and the shared-expert 2D weights -> big-weight blob
     router_off : int64      // fblob: layers x n_expert x dim
     shexp_gate_off : int64  // fblob: layers x dim (one sigmoid-gate vector per layer)
+    // gemma4 MoE (valid when config.moe_dense_shexp): the custom router's learned per-channel input
+    // scale + the per-expert down-output scale, plus the routed branch's sandwich norms. The dense
+    // parallel shared expert reuses the w1/w2/w3 offsets (allocated even though n_expert > 0). All fblob.
+    moe_router_scale_off : int64  // ffn_gate_inp.scale:  layers x dim
+    moe_down_scale_off : int64    // ffn_down_exps.scale: layers x n_expert
+    rms_pre_ffn2_off : int64      // pre_ffw_norm_2  (routed pre-norm):  layers x dim
+    rms_post_ffn1_off : int64     // post_ffw_norm_1 (dense post-norm):  layers x dim
+    rms_post_ffn2_off : int64     // post_ffw_norm_2 (routed post-norm): layers x dim
     // gpt-oss MoE biases (fblob, valid per the config.moe_*_bias flags): router logits bias +
     // per-expert gate/down/up biases (expert-major within each layer, like the we* stacks)
     router_b_off : int64    // fblob: layers x n_expert
@@ -379,6 +393,18 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             t.web3_off = fo
             fo += layers * c.n_expert * c.n_ff_exp
         }
+        if (c.moe_dense_shexp) {  // gemma4: router input scale + per-expert down scale + routed sandwich norms
+            t.moe_router_scale_off = fo
+            fo += layers * dim
+            t.moe_down_scale_off = fo
+            fo += layers * c.n_expert
+            t.rms_pre_ffn2_off = fo
+            fo += layers * dim
+            t.rms_post_ffn1_off = fo
+            fo += layers * dim
+            t.rms_post_ffn2_off = fo
+            fo += layers * dim
+        }
     }
     t.rms_final_off = fo
     fo += dim
@@ -448,6 +474,14 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             wo += layers * she
             t.wsh3_off = wo
             wo += layers * she
+        }
+        if (c.moe_dense_shexp) {  // gemma4: the DENSE parallel shared expert (plain ffn gate/up/down)
+            t.w1_off = wo
+            wo += layers * dim * hidden
+            t.w2_off = wo
+            wo += layers * hidden * dim
+            t.w3_off = wo
+            wo += layers * dim * hidden
         }
     } else {
         t.w1_off = wo
@@ -681,6 +715,11 @@ def private repack_q8_weights(var t : Model) {
                 repack_q8q8_weight(t.qblob, t.qscales, t.wsh2_off + l * she, c.n_ff_shexp, dim)
                 repack_q8q8_weight(t.qblob, t.qscales, t.wsh3_off + l * she, dim, c.n_ff_shexp)
             }
+            if (c.moe_dense_shexp) {  // gemma4: the dense parallel shared expert repacks like a plain FFN
+                repack_q8q8_weight(t.qblob, t.qscales, t.w1_off + l * dim * hidden, dim, hidden)
+                repack_q8q8_weight(t.qblob, t.qscales, t.w2_off + l * hidden * dim, hidden, dim)
+                repack_q8q8_weight(t.qblob, t.qscales, t.w3_off + l * dim * hidden, dim, hidden)
+            }
         } else {
             repack_q8q8_weight(t.qblob, t.qscales, t.w1_off + l * dim * hidden, dim, hidden)
             repack_q8q8_weight(t.qblob, t.qscales, t.w2_off + l * hidden * dim, hidden, dim)
@@ -837,6 +876,11 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 && gguf_int(m, bytes, "{arch}.embedding_length_per_layer_input") > 0l) {
             panic("dasLLAMA: per-layer embeddings (Gemma-4 E-series PLE) are not yet supported")
         }
+        // gemma4 is MoE only when the file carries experts (12B/31B dense, 26B-A4B MoE)
+        if (t.config.moe_optional
+                && gguf_has(m, "{arch}.expert_count") && gguf_int(m, bytes, "{arch}.expert_count") > 0l) {
+            t.config.moe = true
+        }
         if (t.config.moe) {
             // MoE geometry from metadata (qwen2moe A2.7B: 60 experts, top-4, 1408-wide experts
             // + a 5632-wide shared expert)
@@ -888,6 +932,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             // pair always ships together, so probing ffn_up_exps.bias covers all three stacks
             t.config.moe_router_bias = gguf_find_tensor(m, "blk.0.ffn_gate_inp.bias") >= 0
             t.config.moe_exps_bias = gguf_find_tensor(m, "blk.0.ffn_up_exps.bias") >= 0
+            // gemma4 family: a DENSE parallel shared expert (plain ffn_gate/up/down alongside the routed
+            // experts) plus the fused gate_up stacks + sandwich norms + custom router that ride with it
+            t.config.moe_dense_shexp = gguf_find_tensor(m, "blk.0.ffn_gate.weight") >= 0
         } elif (gguf_has(m, "{arch}.expert_count") && gguf_int(m, bytes, "{arch}.expert_count") > 0l) {
             panic("dasLLAMA: MoE expert blocks are not supported for arch '{arch}'")
         }
@@ -1040,6 +1087,14 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             if (t.config.layer_out_scale) {  // gemma4: one output scalar per layer
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.layer_output_scale.weight", t.fblob, t.out_scale_off + l, 1l)
             }
+            if (t.config.moe_dense_shexp) {  // gemma4 MoE: custom-router scale, per-expert down scale, routed sandwich norms
+                let ne = t.config.n_expert
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.ffn_gate_inp.scale", t.fblob, t.moe_router_scale_off + l * dim, dim)
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.ffn_down_exps.scale", t.fblob, t.moe_down_scale_off + l * ne, ne)
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.pre_ffw_norm_2.weight", t.fblob, t.rms_pre_ffn2_off + l * dim, dim)
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.post_ffw_norm_1.weight", t.fblob, t.rms_post_ffn1_off + l * dim, dim)
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.post_ffw_norm_2.weight", t.fblob, t.rms_post_ffn2_off + l * dim, dim)
+            }
             if (t.config.attn_sinks) {  // gpt-oss: one sink logit per head
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.attn_sinks.weight", t.fblob, t.sinks_off + l * n_heads, n_heads)
             }
@@ -1087,6 +1142,18 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                     gguf_transcode_mx4(m, bytes, "blk.{l}.ffn_gate_exps.weight", t.mxq, t.mxs, mo1 / 2l, mo1 / 32l, ne * ege)
                     gguf_transcode_mx4(m, bytes, "blk.{l}.ffn_down_exps.weight", t.mxq, t.mxs, mo2 / 2l, mo2 / 32l, ne * ege)
                     gguf_transcode_mx4(m, bytes, "blk.{l}.ffn_up_exps.weight", t.mxq, t.mxs, mo3 / 2l, mo3 / 32l, ne * ege)
+                } elif (t.config.moe_dense_shexp) {
+                    // gemma4: experts ship FUSED as ffn_gate_up_exps {dim, 2*nfe, ne} — expert-major,
+                    // each [2*nfe x dim] with rows [0..nfe) = gate, [nfe..2*nfe) = up. Split per expert
+                    // (block-aligned Q8 slices, ege is a multiple of 32) into the separate we1(gate)/
+                    // we3(up) stacks the routed GEMM seam expects; ffn_down_exps loads whole.
+                    for (e in range64(ne)) {
+                        let dst = (l * ne + e) * ege
+                        let src = e * 2l * ege
+                        load_big(m, bytes, "blk.{l}.ffn_gate_up_exps.weight", t, t.we1_off + dst, ege, scratch, src)
+                        load_big(m, bytes, "blk.{l}.ffn_gate_up_exps.weight", t, t.we3_off + dst, ege, scratch, src + ege)
+                    }
+                    load_big(m, bytes, "blk.{l}.ffn_down_exps.weight", t, t.we2_off + l * ne * ege, ne * ege, scratch)
                 } else {
                     load_big(m, bytes, "blk.{l}.ffn_gate_exps.weight", t, t.we1_off + l * ne * ege, ne * ege, scratch)
                     load_big(m, bytes, "blk.{l}.ffn_down_exps.weight", t, t.we2_off + l * ne * ege, ne * ege, scratch)
@@ -1104,6 +1171,11 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                     load_big(m, bytes, "blk.{l}.ffn_gate_shexp.weight", t, t.wsh1_off + l * she, she, scratch)
                     load_big(m, bytes, "blk.{l}.ffn_down_shexp.weight", t, t.wsh2_off + l * she, she, scratch)
                     load_big(m, bytes, "blk.{l}.ffn_up_shexp.weight", t, t.wsh3_off + l * she, she, scratch)
+                }
+                if (t.config.moe_dense_shexp) {  // gemma4: the DENSE parallel shared expert (plain ffn gate/up/down)
+                    load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_off + l * dim * hidden, dim * hidden, scratch)
+                    load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_off + l * dim * hidden, dim * hidden, scratch)
+                    load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_off + l * hidden * dim, hidden * dim, scratch)
                 }
             } elif (t.config.fused_qkv) {
                 load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w1_off + l * dim * hidden, dim * hidden, scratch, 0l)
@@ -1284,6 +1356,7 @@ struct Session {
     moe_w : array<float>        // the selected top-k weights (n_expert_used)
     moe_idx : array<int64>      // the selected top-k expert ids (n_expert_used)
     moe_acc : array<float>      // weighted expert-output accumulator (dim)
+    moe_ao : array<float>       // gemma4 MoE: attn_out held while its two branches read three norms of it (dim; moe_dense_shexp only)
     // decode dispatch-fuse scratch: all k routed experts' projections run as region-list GEMVs
     moe_offs : array<int64>     // packed (weight, activation) element-offset pairs (2 per region)
     moe_boffs : array<int64>    // per-region fblob bias offsets for the biased groupn forms (k)
@@ -1344,6 +1417,9 @@ def make_run_state(c : Config) : Session {
         s.moe_w |> resize(c.n_expert_used)
         s.moe_idx |> resize(c.n_expert_used)
         s.moe_acc |> resize(c.dim)
+        if (c.moe_dense_shexp) {   // gemma4: attn_out survives both branches' three norms
+            s.moe_ao |> resize(c.dim)
+        }
         s.moe_xq |> resize(c.dim)
         s.moe_xs |> resize(c.dim / 32l)
         s.moe_offs |> resize(2l * c.n_expert_used)
@@ -2649,19 +2725,13 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
 }
 
 // ffn-norm → gated FFN (act(W1·x) * (W3·x)) → down-proj(+post-norm) → residual.
-def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
-    if (fused_ffn_ok(t)) {
-        ffn_chain_decode(t, s, l)
-        return
-    }
+// Dense gated FFN kernel, in place: reads the pre-normed activation in s.xb, writes act(W1·xb)·(W3·xb)
+// projected through W2 back into s.xb. Weights at the per-layer w1/w2/w3 offsets (hidden = c.hidden_dim).
+// Shared by ffn_dense_decode and gemma4's dense parallel shared expert.
+def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
     let c = t.config
     let dim = c.dim
     let hidden = c.hidden_dim
-    // ffn rmsnorm
-    let ts_norm1 = ref_time_ticks()
-    rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
-    prof_add("norm", ts_norm1)
-    // gated FFN: hb = act(W1·xb) * (W3·xb) — silu (SwiGLU) or gelu (GeGLU, Gemma2)
     let ts_ffn = ref_time_ticks()
     if (t.quant == QuantMode.q8) {
         // gate+up share the activation: ONE quantize + ONE region-list dispatch into ffn_gu's
@@ -2694,6 +2764,21 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
         mm(s.xb, t, t.w2_off + l * hidden * dim, s.hb, s.xq, s.xs, hidden, dim)
         prof_add("mm_ffn", ts_ffn2)
     }
+}
+
+def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
+    if (fused_ffn_ok(t)) {
+        ffn_chain_decode(t, s, l)
+        return
+    }
+    let c = t.config
+    let dim = c.dim
+    // ffn rmsnorm
+    let ts_norm1 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
+    prof_add("norm", ts_norm1)
+    // gated FFN: hb = act(W1·xb) * (W3·xb) — silu (SwiGLU) or gelu (GeGLU, Gemma2)
+    dense_ffn_inplace(t, s, l)
     let ts_resid1 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm before the residual add
         rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
@@ -2782,20 +2867,15 @@ def private moe_shexp_gate(t : Model; l : int64; x : array<float> | #) : float {
     return 1.0 / (1.0 + exp(-gl))
 }
 
-def private moe_ffn_core(t : Model; var s : Session; l : int64) {
+// Routed experts, given the pre-normed input in s.xb and the top-k selection already in s.moe_idx /
+// s.moe_w: s.moe_acc = Σ_j w_j · FFN_e_j(xb), each expert the standard gated-FFN shape. Shared by
+// qwen2moe / gpt-oss (via moe_ffn_core) and gemma4 (which folds its per-expert down scale into
+// s.moe_w before the call). The router + select + any shared-expert steps live in the callers.
+def private moe_experts_apply(t : Model; var s : Session; l : int64) {
     let c = t.config
     let dim = c.dim
     let ne = c.n_expert
     let k = c.n_expert_used
-    // router logits (fp32 weights + optional bias), then the shared select
-    let ts_route = ref_time_ticks()
-    mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb, dim, ne)
-    if (c.moe_router_bias) {
-        add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
-    }
-    moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
-    prof_add("moe_route", ts_route)
-    // routed experts: acc = Σ w_j · FFN_e(xb), each expert the standard gated-FFN shape
     for (i in range64(dim)) {
         s.moe_acc[i] = 0.0
     }
@@ -2915,8 +2995,26 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
             prof_add("moe_reduce", ts_red)
         }
     }
+}
+
+// MoE FFN core (qwen2moe / gpt-oss): router logits on the rmsnormed activation in s.xb -> softmax /
+// sigmoid select -> routed experts (moe_experts_apply) -> optional sigmoid-gated shared expert.
+// Leaves the combined output in s.moe_acc; callers add the post-norm / residual / layer-out scale.
+def private moe_ffn_core(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let ne = c.n_expert
+    let ts_route = ref_time_ticks()
+    mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb, dim, ne)
+    if (c.moe_router_bias) {
+        add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
+    }
+    moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
+    prof_add("moe_route", ts_route)
+    moe_experts_apply(t, s, l)
     // shared expert, gated by a sigmoid scalar from its per-layer gate vector
     if (c.n_ff_shexp > 0l) {
+        let pre_q8 = t.quant == QuantMode.q8
         let ts_sh = ref_time_ticks()
         let g = moe_shexp_gate(t, l, s.xb)
         let nsh = c.n_ff_shexp
@@ -2943,6 +3041,102 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
             s.moe_acc[i] += g * s.xb2[i]
         }
         prof_add("mm_shexp", ts_sh)
+    }
+}
+
+// gemma4 MoE router input: weightless RMSNorm(attn_out) × (1/√dim) × ffn_gate_inp_s, into s.xb2.
+// Distinct from the plain-matmul routers: the RMS is over attn_out (not the shared-expert pre-norm),
+// weightless, then scaled by 1/√n_embd and a learned per-channel scale before the ffn_gate_inp matmul.
+def private gemma4_router_tmp(t : Model; var s : Session; l : int64) {
+    let dim = t.config.dim
+    // Sum of squares in DOUBLE, matching ggml_rms_norm (`ggml_float` is `double`; ggml then casts
+    // mean/scale back to float). This RMS is the input to the DISCRETE top-8 expert selection, where
+    // a float sum's drift over 2816 terms flips which expert wins at a router near-tie — and a wrong
+    // expert shifts the layer output by O(1), miscounting even where the reference is confident. It's
+    // the ONE double op in the pass (2816 adds/layer, not a hot GEMM); every GEMM + norm stays float.
+    var ss = 0.0lf
+    for (i in range64(dim)) {
+        ss += double(s.moe_ao[i] * s.moe_ao[i])
+    }
+    let scale = 1.0 / sqrt(float(ss / double(dim)) + t.config.norm_eps)
+    let inv_d = 1.0 / sqrt(float(dim))
+    array_view(t.fblob, t.moe_router_scale_off + l * dim, dim) $(sc : array<float>#) {
+        for (i in range64(dim)) {
+            s.xb2[i] = s.moe_ao[i] * scale * inv_d * sc[i]
+        }
+    }
+}
+
+// gemma4 MoE layer (26B-A4B): two parallel branches of the residual stream in s.moe_ao, SUMMED.
+//  routed  = post_ffw_norm_2( Σ_j w_j · GeGLU_e_j( pre_ffw_norm_2(attn_out) ) ), custom-normed router,
+//            softmax top-k renormalized, per-expert down scale folded into w_j
+//  dense   = post_ffw_norm_1( GeGLU( ffn_norm(attn_out) ) )   — a full dense shared expert, always on
+// leaves post_ffw_norm(routed + dense) in s.moe_acc; the caller adds the residual + layer-output scale.
+def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let ne = c.n_expert
+    let k = c.n_expert_used
+    // routed branch — input, custom router, select, per-expert down scale, experts, post-norm
+    rms_at(s.xb, t, t.rms_pre_ffn2_off + l * dim, s.moe_ao, dim)
+    let ts_route = ref_time_ticks()
+    gemma4_router_tmp(t, s, l)
+    mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb2, dim, ne)
+    moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
+    for (j in range64(k)) {   // ggml scales each expert's down output by ffn_down_exps_s — fold it into w_j
+        s.moe_w[j] *= t.fblob[t.moe_down_scale_off + l * ne + s.moe_idx[j]]
+    }
+    prof_add("moe_route", ts_route)
+    moe_experts_apply(t, s, l)
+    rms_at(s.moe_acc, t, t.rms_post_ffn2_off + l * dim, s.moe_acc, dim)
+    // dense parallel shared expert (its own pre/post norms), into s.xb
+    let ts_sh = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.moe_ao, dim)
+    dense_ffn_inplace(t, s, l)
+    rms_at(s.xb, t, t.rms_post_ffn1_off + l * dim, s.xb, dim)
+    prof_add("mm_shexp", ts_sh)
+    // combine then the shared post_ffw_norm on the sum
+    for (i in range64(dim)) {
+        s.moe_acc[i] += s.xb[i]
+    }
+    rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
+}
+
+// gemma4 FFN decode: dense (12B/31B) or the parallel dense-shared + routed MoE (26B-A4B) by expert count.
+def private ffn_gemma4_decode(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    if (c.n_expert <= 0l) {
+        ffn_dense_decode(t, s, l)
+        return
+    }
+    let dim = c.dim
+    copy_floats(s.x, 0l, s.moe_ao, 0l, dim)
+    gemma4_moe_ffn(t, s, l)
+    let ts_resid = ref_time_ticks()
+    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
+    if (c.layer_out_scale) {
+        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
+    }
+    prof_add("act_resid", ts_resid)
+}
+
+// gemma4 FFN prefill: dense delegates; MoE runs the per-token core over each position's residual row.
+def private ffn_gemma4_prefill(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    if (c.n_expert <= 0l) {
+        ffn_dense_prefill(t, s, l, npos)
+        return
+    }
+    let dim = c.dim
+    for (p in range64(npos)) {
+        copy_floats(s.x_b, p * dim, s.moe_ao, 0l, dim)
+        gemma4_moe_ffn(t, s, l)
+        for (i in range64(dim)) {
+            s.x_b[p * dim + i] += s.moe_acc[i]
+        }
+    }
+    if (c.layer_out_scale) {
+        scale_inplace(unsafe(addr(s.x_b[0])), t.fblob[t.out_scale_off + l], npos * dim)
     }
 }
 
@@ -4659,4 +4853,11 @@ def std_blocks() : ArchBlocks {
 def moe_blocks() : ArchBlocks {
     return ArchBlocks(attn_decode = @@attention_std_decode, ffn_decode = @@ffn_moe_decode,
                       attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_moe_prefill)
+}
+
+//! gemma4's block set: standard attention + a FFN that dispatches per file — dense (12B/31B) or the
+//! parallel dense-shared + routed MoE (26B-A4B) by expert count, so ONE gemma4 registration covers both.
+def gemma4_blocks() : ArchBlocks {
+    return ArchBlocks(attn_decode = @@attention_std_decode, ffn_decode = @@ffn_gemma4_decode,
+                      attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_gemma4_prefill)
 }

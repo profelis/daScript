@@ -448,6 +448,38 @@ def test_parity_gemma4_31b(t : T?) {
     }
 }
 
+// gemma-4-26B-A4B-it Q8 — the gemma4 arch's MoE member (30 layers, embd 2816, 16Q/[8×5,2]KV heads;
+// 128 experts top-8, expert_ff 704; PLE off, softcap 30, SWA 1024). Every layer sums two parallel
+// branches: a DENSE shared expert (ffn_norm → GeGLU → post_ffw_norm_1) and routed experts
+// (pre_ffw_norm_2 → softmax top-8-renormalized → post_ffw_norm_2), with a custom-normalized router
+// (weightless-RMS(attn_out) × 1/√dim × ffn_gate_inp_s), fused gate_up expert stacks split at load,
+// and a per-expert down-output scale.
+//
+// The continuation is capped at 11 tokens (the dense 12B/31B run the full 40). Unlike a dense model,
+// this MoE routes a DISCRETE top-8-of-128 per layer, so at a router near-tie dasLLAMA's float
+// residual stream can land on the other side of the coin-flip from llama.cpp and pick a different
+// expert — a real O(1) output shift. That is NOT a forward bug: verified against llama.cpp's own
+// per-step logit margins, the divergences sit exactly where the *oracle itself* is near-tied (top-1
+// vs top-2 gap ~0.5–2.2 at counting steps 12/26/32/38). The router-input RMS is double-accumulated
+// to match ggml (`ggml_float`), which removes the SYSTEMATIC flips (steps where the oracle is
+// confident); what remains is irreducible near-tie sensitivity no float engine can pin. The first 11
+// counting tokens are all oracle-confident (gap >6) and match token-for-token. Details:
+// modules/dasLLAMA/model_expansion_plan.md (Wave G2). Large-tier (~26 GB): DASLLAMA_PARITY_FULL=1.
+let GEMMA4_26B_GEN <- [236743l, 236800l, 236778l, 236770l, 236764l, 236743l, 236800l, 236778l, 236778l, 236764l, 236743l]
+
+[test]
+def test_parity_gemma4_26b(t : T?) {
+    t |> run("gemma4 MoE forward (gemma-4-26B-A4B-it Q8: dense shared expert + routed top-8-of-128)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-26B-A4B-it-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_26B_GEN), "gemma4-26b token-for-token")
+    }
+}
+
 // gpt-oss-20b (arch "gpt-oss", native-MXFP4 expert planes — attn/cls Q8) — the wave-5 stack: per-head
 // attention sinks, YaRN rope (factor 32 / 4096), alternating 128-token SWA, softmax-after-top-k
 // routing with router + per-expert + QKV + output-projection biases, clamped SwiGLU. Counting
