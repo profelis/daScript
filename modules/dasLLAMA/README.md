@@ -192,6 +192,13 @@ that runs per unit of work rather than per load):
    fields, blob offsets, or array handles — hoist `addr(state.arr[0])` / `addr(m.blob[off])`
    into locals before the loop and index through those (`var p` for writable, the const
    model gives read-only otherwise).
+3. **Optimize before threading.** A kernel reaches its best single-lane form first —
+   right algorithm, then loop form — and only then gets a `maybe_parallel_for`. Threading
+   a bad kernel just burns more cores on the same waste.
+4. **Loop forms are decided in isolated benchmarks, not by eye.** For a hot loop, build
+   the `[tune]`-marked scalar template AND a hand-float4 version, bench them head-to-head
+   standalone (the tune rig / a dedicated microbench, NOT end-to-end transcribe) — commit
+   the winner. "To know for sure."
 
 ## Known **not** yet supported
 
