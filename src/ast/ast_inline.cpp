@@ -1375,8 +1375,23 @@ namespace das {
                         break;
                     }
                     if ( byRefParam ) {
-                        if ( leafVar ) {
+                        // a substitution must not change the argument's CONST VIEW: body
+                        // subtrees may carry calls already resolved to ==const-flavored
+                        // instances (the `:=` clone family), and the splice re-infer
+                        // re-matches those against the instance's locked constness - a
+                        // non-const var replacing a const param read re-types them and
+                        // hard-fails (registry collapses the flavors). when the param is
+                        // more const than the leaf, bind a const reference instead
+                        bool sameConstView = !P->type->constant || (leafA->type && leafA->type->constant);
+                        if ( leafVar && sameConstView ) {
                             sub.substitute = leafA;             // same aliasing as the call itself
+                        } else if ( leafVar ) {
+                            // const-widened var: bind the const reference explicitly - a bare
+                            // var arg often carries no ref flag, and falling through would
+                            // materialize (and MOVE a non-copyable) instead of aliasing
+                            auto init = A->clone();
+                            init->alwaysSafe = true;            // generated binding to real storage
+                            makeArgTemp(init, true, true, false);
                         } else if ( leafA->rtti_isMakeBlock() ) {
                             // a block literal read once outside loops substitutes textually,
                             // keeping shapes a holder can't reproduce (temporary-typed block
@@ -1392,7 +1407,8 @@ namespace das {
                                 makeArgTemp(A->clone(), false, false, true);
                             }
                         } else if ( A->type && A->type->ref ) {
-                            // lvalue chain (field/index): bind a reference once, like the call did
+                            // lvalue chain (field/index), or a var whose const view the
+                            // param widens: bind a reference once, like the call did
                             auto init = A->clone();
                             init->alwaysSafe = true;            // generated binding to real storage
                             makeArgTemp(init, !varParam, true, false);

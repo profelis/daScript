@@ -117,6 +117,16 @@ def doubled_of(src : array<int>; blk : block<(v : int) : int>) : array<int> {
     return <- r
 }
 
+def clone_taker(n : int; blk : block<(data : array<uint8>) : void>) {
+    // const block param + non-const local arg: the devirt substitution must keep the
+    // param's const view (bind a const ref), or the literal's `pixels := m` - already
+    // resolved to a ==const-flavored clone instance - re-types and hard-fails 30341
+    var arr : array<uint8>
+    arr |> resize(n)
+    invoke(blk, arr)
+    delete arr
+}
+
 typedef OptInt = tuple<_has : bool; _v : int>
 typedef ResOptInt = tuple<_ok : bool; _v2 : OptInt; _err : string>
 
@@ -232,6 +242,17 @@ def target_flavor_mismatch(src : array<int>) : int {
 }
 
 [export]
+def target_clone_from_param(n : int) : int {
+    var pixels : array<uint8>
+    clone_taker(n) $(m) {
+        pixels := m
+    }
+    let l = length(pixels)
+    delete pixels
+    return l
+}
+
+[export]
 def target_nested_res(k : int) : int {
     let o <- outer_probe(k) $(v) => v + 1
     return o._has ? o._v : -1
@@ -307,6 +328,10 @@ def test_auto_inline_fired(t : T?) {
             let b = body_of(t, "target_flavor_mismatch")
             t |> success(has(b, "iter_sum_cref("), "call stays regular: {b}")
         }
+        t |> run("const-view-preserving substitution keeps := splice-safe") @(t : T?) {
+            let b = body_of(t, "target_clone_from_param")
+            t |> success(!has(b, "clone_taker("), "call is gone: {b}")
+        }
         t |> run("callee with interior splice splices again without capture") @(t : T?) {
             let b = body_of(t, "target_nested_res")
             t |> success(!has(b, "outer_probe("), "outer call is gone: {b}")
@@ -338,6 +363,7 @@ def test_auto_inline_behavior(t : T?) {
         t |> equal(target_flavor_mismatch(src), 14)
         t |> equal(target_nested_res(5), 15)
         t |> equal(target_nested_same(4), 18)
+        t |> equal(target_clone_from_param(4), 4)
     }
     t |> run("impure arguments evaluate once in call order") @(t : T?) {
         g_log = ""
