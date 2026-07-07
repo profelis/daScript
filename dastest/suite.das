@@ -580,7 +580,7 @@ def private run_queued_benchmarks(var suite_ctx : SuiteCtx; var file_ctx : FileC
 }
 
 [export]
-def private bench_on_start_impl(var suite_ctx : SuiteCtx; var benchmarking : B?; var file_ctx : FileCtx; func_type, name, sub_name : string) {
+def private bench_on_start_impl(suite_ctx : SuiteCtx; var benchmarking : B?; file_ctx : FileCtx; func_type, name, sub_name : string) {
     let is_first_bench = !benchmarking.started
     benchmarking.started = true
     benchmarking.current_sub_name = sub_name
@@ -606,7 +606,7 @@ def private bench_on_start_impl(var suite_ctx : SuiteCtx; var benchmarking : B?;
 }
 
 [export]
-def private bench_on_finished_impl(var suite_ctx : SuiteCtx; var benchmarking : B?; stats : BenchmarkRunStats) {
+def private bench_on_finished_impl(suite_ctx : SuiteCtx; var benchmarking : B?; stats : BenchmarkRunStats) {
     let n = stats.n
     let time_ns = stats.time_ns
     let allocs = stats.allocs
