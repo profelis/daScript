@@ -1,9 +1,11 @@
 options gen2
 options rtti
+options no_coverage // shape pins: injected coverage calls legitimately block the folds
 
 require daslib/ast
 require daslib/rtti
 require daslib/ast_boost
+require daslib/defer
 require dastest/testing_boost public
 require strings
 require daslib/strings_boost
@@ -140,6 +142,51 @@ def target_sub_self_float(f : float) : float {
     return f - f // nolint:LINT007 -- deliberate: stays without fast_math (inf/NaN)
 }
 
+// ===== CondFolding: if/else-return => ternary =====
+
+[export]
+def target_elif_chain(x : int) : int {
+    if (x > 10) {
+        return 3
+    } elif (x > 5) {
+        return 2
+    } elif (x > 0) {
+        return 1
+    } else {
+        return 0
+    }
+}
+
+[export]
+def target_void_return_pure(b : bool) {
+    if (b) { // nolint:LINT009 -- deliberate: equivalent void arms are the fold under test
+        return
+    } else {
+        return
+    }
+}
+
+[export]
+def target_void_return_impure() {
+    if (bump_side() > 0) { // nolint:LINT009 -- deliberate: equivalent void arms are the fold under test
+        return
+    } else {
+        return
+    }
+}
+
+[export]
+def target_defer_in_arm(c : bool) : int {
+    if (c) {
+        defer() {
+            g_side++
+        }
+        return 1
+    } else {
+        return 2
+    }
+}
+
 def has(s, sub : string) : bool {
     return find(s, sub, 0) >= 0
 }
@@ -261,6 +308,34 @@ def test_same_as_folds_fired(t : T?) {
         t |> run("f - f stays OFF without fast_math") @(t : T?) {
             let b = body_of(t, "target_sub_self_float")
             t |> success(has(b, "f - f"), "float self-sub not folded: {b}")
+        }
+    }
+}
+
+[test]
+def test_cond_folds_fired(t : T?) {
+    ast_gc_guard() {
+        t |> run("elif chain of returns collapses fully") @(t : T?) {
+            // regression: the inner fold leaves a naked ExprReturn as if_false, which
+            // the outer level used to reject (rtti_isBlock) — jamming after one level
+            let b = body_of(t, "target_elif_chain")
+            t |> success(!has(b, "if"), "no `if` survives: {b}")
+            t |> success(has(b, "?"), "ternary chain present: {b}")
+        }
+        t |> run("void arms with pure cond fold away") @(t : T?) {
+            let b = body_of(t, "target_void_return_pure")
+            t |> success(!has(b, "if"), "no `if` survives: {b}")
+        }
+        t |> run("void arms with impure cond keep the call") @(t : T?) {
+            // regression: this used to fold to a bare return, dropping the call
+            let b = body_of(t, "target_void_return_impure")
+            t |> success(has(b, "bump_side"), "condition side effect kept: {b}")
+        }
+        t |> run("arm with a finally section does not fold") @(t : T?) {
+            // regression: `if (c) { return 1 } finally { ... } else { return 2 }` — the
+            // shape defer() leaves — used to fold to a ternary, dropping the finally
+            let b = body_of(t, "target_defer_in_arm")
+            t |> success(has(b, "finally"), "finally section kept: {b}")
         }
     }
 }

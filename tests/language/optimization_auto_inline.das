@@ -43,7 +43,22 @@ def chain_sum(src : array<int>; k : int; blk : block<(v : int) : int>) : int {
 }
 
 def multi_exit(src : array<int>; blk : block<(v : int) : int>) : int {
-    // two returns: single-exit gate declines this callee
+    // early guard + loop tail: return canonicalization synthesizes the else arm but
+    // cannot ternary-fold it (the arm is not a single return), so this stays
+    // multi-exit and the single-exit gate declines it
+    if (empty(src)) {
+        return -1
+    }
+    var total = 0
+    for (v in src) {
+        total += invoke(blk, v)
+    }
+    return total
+}
+
+def guarded_first(src : array<int>; blk : block<(v : int) : int>) : int {
+    // if/else-return pair: return canonicalization folds this to a single ternary
+    // return at patch time, which makes it a valid splice callee
     if (empty(src)) {
         return -1
     }
@@ -55,6 +70,102 @@ def recursive_taker(n : int; blk : block<(v : int) : int>) : int {
         return invoke(blk, 0)
     }
     return recursive_taker(n - 1, blk) + 1  // nolint:LINT010
+}
+
+def iter_sum(var src : iterator<int>; blk : block<(v : int) : int>) : int {
+    // by-value-element iterator param: a generator argument is the same flavor
+    var total = 0
+    var v : int
+    while (next(src, v)) {
+        total += invoke(blk, v)
+    }
+    return total
+}
+
+def iter_sum_cref(var src : iterator<int const&>; blk : block<(v : int) : int>) : int {
+    // element-const iterator param: an each() argument is element-mutable - a legal
+    // call (variance), but the substitution would fork the body's instantiations,
+    // so the site declines
+    var total = 0
+    var v : int
+    while (next(src, v)) {
+        total += invoke(blk, v)
+    }
+    return total
+}
+
+struct LoHi {
+    lo : int
+    hi : int
+}
+
+def make_lohi(k : int; blk : block<(v : int) : int>) : LoHi {
+    // struct (refType) result, copy return: splices through the manufactured
+    // uninitialized result temp
+    let v = invoke(blk, k)
+    return LoHi(lo = v, hi = v * 10)
+}
+
+def doubled_of(src : array<int>; blk : block<(v : int) : int>) : array<int> {
+    // array result, move return: the trailing `return <-` becomes a move into the temp.
+    // deliberately a push loop, not a comprehension - the invoke must sit in a loop body
+    var r : array<int>
+    r |> reserve(length(src))
+    for (v in src) {
+        r |> push(invoke(blk, v))
+    }
+    return <- r
+}
+
+def clone_taker(n : int; blk : block<(data : array<uint8>) : void>) {
+    // const block param + non-const local arg: the devirt substitution must keep the
+    // param's const view (bind a const ref), or the literal's `pixels := m` - already
+    // resolved to a ==const-flavored clone instance - re-types and hard-fails 30341
+    var arr : array<uint8>
+    arr |> resize(n)
+    invoke(blk, arr)
+    delete arr
+}
+
+typedef OptInt = tuple<_has : bool; _v : int>
+typedef ResOptInt = tuple<_ok : bool; _v2 : OptInt; _err : string>
+
+def inner_probe(k : int; blk : block<(v : int) : int>) : ResOptInt {
+    var res : ResOptInt
+    res._ok = invoke(blk, k) > 0
+    res._v2._has = res._ok
+    res._v2._v = k * 3
+    res._err = "e"
+    return <- res
+}
+
+def outer_probe(k : int; blk : block<(v : int) : int>) : OptInt {
+    // the LITERAL interior call splices first, planting manufactured __inl0_* locals
+    // in this body; splicing IT next must not let the rename map capture the new
+    // site's synthesized result store (the interior temp has a DIFFERENT type here -
+    // a captured store was error 30941 "can only move compatible type")
+    var r <- inner_probe(k, $(x) => invoke(blk, x) + 1)
+    if (!r._ok) {
+        panic("unexpected")
+    }
+    return <- r._v2
+}
+
+def inner_same(k : int; blk : block<(v : int) : int>) : OptInt {
+    var res : OptInt
+    res._has = true
+    res._v = invoke(blk, k) * 3
+    return <- res
+}
+
+def outer_same(k : int; blk : block<(v : int) : int>) : OptInt {
+    // same shape with MATCHING result types: a captured store compiled silently and
+    // read the outer temp uninitialized - the behavioral check pins the values
+    var r <- inner_same(k, $(x) => invoke(blk, x) + 1)
+    if (!r._has) {
+        panic("unexpected")
+    }
+    return <- r
 }
 
 [export]
@@ -82,6 +193,28 @@ def target_multi_exit(src : array<int>) : int {
 }
 
 [export]
+def target_canonicalized(src : array<int>) : int {
+    return src |> guarded_first() $(v) => v * 3
+}
+
+[export]
+def target_struct_result(k : int) : int {
+    let p = make_lohi(k) $(v) => v + 1
+    return p.lo + p.hi
+}
+
+[export]
+def target_array_result(src : array<int>) : int {
+    var doubled <- src |> doubled_of() $(v) => v * 2
+    var sum = 0
+    for (v in doubled) {
+        sum += v
+    }
+    delete doubled
+    return sum
+}
+
+[export]
 def target_recursive(src : array<int>) : int {
     return recursive_taker(length(src)) $(v) => v + 7
 }
@@ -90,6 +223,45 @@ def target_recursive(src : array<int>) : int {
 def target_impure_args(a, b : int) : int {
     // call-order evaluation of impure arguments must survive the splice
     return transform_sum([side("a", a), side("b", b)]) $(v) => v * 2
+}
+
+[export]
+def target_flavor_match(n : int) : int {
+    var gen <- generator<int> {
+        for (i in range(n)) {
+            yield i
+        }
+        return false
+    }
+    return iter_sum(gen) $(v) => v + 1
+}
+
+[export]
+def target_flavor_mismatch(src : array<int>) : int {
+    return iter_sum_cref(unsafe(each(src))) $(v) => v + 1
+}
+
+[export]
+def target_clone_from_param(n : int) : int {
+    var pixels : array<uint8>
+    clone_taker(n) $(m) {
+        pixels := m
+    }
+    let l = length(pixels)
+    delete pixels
+    return l
+}
+
+[export]
+def target_nested_res(k : int) : int {
+    let o <- outer_probe(k) $(v) => v + 1
+    return o._has ? o._v : -1
+}
+
+[export]
+def target_nested_same(k : int) : int {
+    let o <- outer_same(k) $(v) => v + 1
+    return o._has ? o._v : -1
 }
 
 def has(s, sub : string) : bool {
@@ -131,9 +303,42 @@ def test_auto_inline_fired(t : T?) {
             let b = body_of(t, "target_multi_exit")
             t |> success(has(b, "multi_exit("), "call stays regular: {b}")
         }
+        t |> run("if/else-return callee canonicalizes and splices") @(t : T?) {
+            let b = body_of(t, "target_canonicalized")
+            t |> success(!has(b, "guarded_first("), "call is gone: {b}")
+        }
+        t |> run("struct-result callee splices through the result temp") @(t : T?) {
+            let b = body_of(t, "target_struct_result")
+            t |> success(!has(b, "make_lohi("), "call is gone: {b}")
+        }
+        t |> run("array-result callee splices, move return preserved") @(t : T?) {
+            let b = body_of(t, "target_array_result")
+            t |> success(!has(b, "doubled_of("), "call is gone: {b}")
+            t |> success(!has(b, "invoke("), "invoke devirtualized: {b}")
+        }
         t |> run("recursive callee declines") @(t : T?) {
             let b = body_of(t, "target_recursive")
             t |> success(has(b, "recursive_taker("), "call stays regular: {b}")
+        }
+        t |> run("matching element flavor splices") @(t : T?) {
+            let b = body_of(t, "target_flavor_match")
+            t |> success(!has(b, "iter_sum("), "call is gone: {b}")
+        }
+        t |> run("element flavor change declines") @(t : T?) {
+            let b = body_of(t, "target_flavor_mismatch")
+            t |> success(has(b, "iter_sum_cref("), "call stays regular: {b}")
+        }
+        t |> run("const-view-preserving substitution keeps := splice-safe") @(t : T?) {
+            let b = body_of(t, "target_clone_from_param")
+            t |> success(!has(b, "clone_taker("), "call is gone: {b}")
+        }
+        t |> run("callee with interior splice splices again without capture") @(t : T?) {
+            let b = body_of(t, "target_nested_res")
+            t |> success(!has(b, "outer_probe("), "outer call is gone: {b}")
+            t |> success(!has(b, "inner_probe("), "interior call is gone: {b}")
+            let b2 = body_of(t, "target_nested_same")
+            t |> success(!has(b2, "outer_same("), "outer call is gone: {b2}")
+            t |> success(!has(b2, "inner_same("), "interior call is gone: {b2}")
         }
     }
 }
@@ -145,10 +350,20 @@ def test_auto_inline_behavior(t : T?) {
         t |> equal(target_auto(src), 30)
         t |> equal(target_void_auto(src), 10)
         t |> equal(target_chain(src), 114)
-        t |> equal(target_multi_exit(src), 3)
+        t |> equal(target_multi_exit(src), 30)
+        t |> equal(target_canonicalized(src), 3)
+        t |> equal(target_struct_result(4), 55)
+        t |> equal(target_array_result(src), 20)
         let none : array<int>
         t |> equal(target_multi_exit(none), -1)
+        t |> equal(target_canonicalized(none), -1)
+        t |> equal(target_array_result(none), 0)
         t |> equal(target_recursive(src), 11)
+        t |> equal(target_flavor_match(4), 10)
+        t |> equal(target_flavor_mismatch(src), 14)
+        t |> equal(target_nested_res(5), 15)
+        t |> equal(target_nested_same(4), 18)
+        t |> equal(target_clone_from_param(4), 4)
     }
     t |> run("impure arguments evaluate once in call order") @(t : T?) {
         g_log = ""

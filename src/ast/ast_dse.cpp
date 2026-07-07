@@ -13,17 +13,20 @@ namespace das {
     // Removes a statement-level `x = <rhs>` / `x.field.path = <rhs>` when the target is
     // a chain (ast_alias.h) over a plain ExprLet local, the rhs is pure, and no path
     // from the store reaches a read overlapping the chain before the next full
-    // overwrite. Also strips a dead pure declaration init (`var x = <rhs>` where every
-    // path overwrites x before reading it) down to the plain zero-init declaration.
-    // Liveness runs backward over the statement-level CFG (ast_cfg.h), one bit per
-    // stored chain.
+    // overwrite. A dead store with an IMPURE rhs keeps the rhs as a bare statement
+    // (the store dies, the call stays). Also strips a dead pure declaration init
+    // (`var x = <rhs>` where every path overwrites x before reading it) down to the
+    // plain zero-init declaration. Liveness runs backward over the statement-level
+    // CFG (ast_cfg.h), one bit per stored chain.
     //
     // Soundness model (deliberately narrow):
     //  * bases are ExprLet locals (never arguments - argument writes are the caller's
     //    to observe). Every occurrence of a base must be a value read (r2v), a
-    //    read-through (r2cr without write - const-ref passes, read chains), or on the
-    //    spine of a statement-level ExprCopy store; anything else (addr(), mutable-ref
-    //    pass, op-assign, move/clone, delete) disqualifies the variable. A local whose
+    //    read-through (r2cr without write - const-ref passes, read chains), on the
+    //    spine of a statement-level ExprCopy store, or on the left spine of a
+    //    statement-level op-assign / increment (read-modify-write: uses its chains,
+    //    kills nothing, never a removal candidate); anything else (addr(), mutable-ref
+    //    pass, move/clone, delete) disqualifies the variable. A local whose
     //    every use is classified cannot escape, so no call can read it behind the
     //    pass's back;
     //  * removal candidates are stores through EXACT chains (fields only, no index or
@@ -46,15 +49,21 @@ namespace das {
 
     namespace {
 
+        bool isOpAssign ( const string & op ) {
+            return op=="+=" || op=="-=" || op=="*=" || op=="/=" || op=="%="
+                || op=="&=" || op=="|=" || op=="^=" || op=="||=" || op=="&&=" || op=="^^="
+                || op=="<<=" || op==">>=" || op=="<<<=" || op==">>>=";
+        }
+
         // one walk: (a) bail on constructs the CFG does not model, (b) collect locals,
         // (c) disqualify any variable with an occurrence that is neither a read nor on
-        // the spine of a statement-level store
+        // the spine of a statement-level store / op-assign
         class DsePrescan : public Visitor {
         public:
             bool eligible = true;
             vector<Variable *> locals;                  // every non-ref ExprLet local, in order
             das_hash_set<Variable *> disq;              // variables with an unclassified occurrence
-            das_hash_set<Expression *> storeSpines;     // nodes on statement-level ExprCopy store-left chains
+            das_hash_set<Expression *> storeSpines;     // nodes on statement-level store-left / op-assign-left chains
         protected:
             Expression * curStmt = nullptr;
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
@@ -87,6 +96,21 @@ namespace das {
                 if ( expr==curStmt ) {
                     AliasChain ch;
                     aliasChainOf(expr->left, ch, &storeSpines);
+                }
+            }
+            virtual void preVisit ( ExprOp2 * expr ) override {
+                Visitor::preVisit(expr);
+                if ( expr==curStmt && isOpAssign(expr->op) ) {
+                    AliasChain ch;
+                    aliasChainOf(expr->left, ch, &storeSpines);
+                }
+            }
+            virtual void preVisit ( ExprOp1 * expr ) override {
+                Visitor::preVisit(expr);
+                if ( expr==curStmt && (expr->op=="++" || expr->op=="--"
+                    || expr->op=="+++" || expr->op=="---") ) {
+                    AliasChain ch;
+                    aliasChainOf(expr->subexpr, ch, &storeSpines);
                 }
             }
             virtual void preVisitLet ( ExprLet * let, const VariablePtr & var, bool last ) override {
@@ -158,6 +182,7 @@ namespace das {
         };
 
         void analyzeDeadStores ( Function * fn, das_hash_set<Expression *> & dead,
+                                 das_hash_set<Expression *> & deadKeepRhs,
                                  das_hash_set<Variable *> & deadInits ) {
             DsePrescan scan;
             fn->body->visit(scan);
@@ -307,9 +332,16 @@ namespace das {
                 live = BI.liveOut;
                 for ( size_t si=BI.stmts.size(); si-->0; ) {
                     auto & SI = BI.stmts[si];
-                    if ( SI.removeIdx>=0 && SI.rhsPure && isDead(live, SI.removeIdx) ) {
-                        dead.insert(b->stmts[si]);
-                        continue;   // the statement vanishes whole: no kills, no uses
+                    if ( SI.removeIdx>=0 && isDead(live, SI.removeIdx) ) {
+                        if ( SI.rhsPure ) {
+                            dead.insert(b->stmts[si]);
+                            continue;   // the statement vanishes whole: no kills, no uses
+                        }
+                        // impure rhs: the store dies, the rhs stays as a bare statement -
+                        // no kills (the write is gone), uses stay (the rhs still evaluates)
+                        deadKeepRhs.insert(b->stmts[si]);
+                        for ( int u : SI.uses ) live[u>>6] |= 1ull<<(u&63);
+                        continue;
                     }
                     if ( !SI.letInits.empty() ) {
                         // a later init in the same `let` may read an earlier variable -
@@ -331,14 +363,16 @@ namespace das {
             using PassVisitor::visit;
         protected:
             das_hash_set<Expression *> dead;
+            das_hash_set<Expression *> deadKeepRhs;
             das_hash_set<Variable *> deadInits;
             virtual bool canVisitFunction ( Function * fun ) override {
                 if ( fun->stub || fun->isTemplate || !funcIsDirty(fun) ) return false;
                 if ( !fun->body || !fun->body->rtti_isBlock() ) return false;
                 dead.clear();
+                deadKeepRhs.clear();
                 deadInits.clear();
-                analyzeDeadStores(fun, dead, deadInits);
-                return !dead.empty() || !deadInits.empty();
+                analyzeDeadStores(fun, dead, deadKeepRhs, deadInits);
+                return !dead.empty() || !deadKeepRhs.empty() || !deadInits.empty();
             }
             virtual bool canVisitStructure ( Structure * ) override { return false; }
             virtual bool canVisitStructureFieldInit ( Structure * ) override { return false; }
@@ -350,6 +384,10 @@ namespace das {
                 if ( dead.find(expr)!=dead.end() ) {
                     reportFolding();
                     return nullptr;
+                }
+                if ( deadKeepRhs.find(expr)!=deadKeepRhs.end() ) {
+                    reportFolding();
+                    return static_cast<ExprCopy *>(expr)->right;
                 }
                 return Visitor::visitBlockExpression(block, expr);
             }

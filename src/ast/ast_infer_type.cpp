@@ -950,6 +950,10 @@ namespace das {
     }
     ExpressionPtr InferTypes::visit(ExprUnsafe *expr) {
         unsafeDepth--;
+        // an expression-position wrapper (macro-made) carries its body's type; the
+        // parser's statement-position `unsafe { }` wraps a statement block and stays untyped
+        if (expr->body->type)
+            expr->type = new TypeDecl(*expr->body->type);
         return Visitor::visit(expr);
     }
     Expression *InferTypes::findLabel(int32_t label) const {

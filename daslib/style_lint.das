@@ -740,7 +740,7 @@ class StyleLintVisitor : AstVisitor {
     }
 
     def override preVisitExprIfThenElse(ifte : ExprIfThenElse?) : void {
-        if (ifte.if_flags.isStatic) return
+        if (ifte.if_flags.isStatic || ifte.genFlags.generated) return  // macro-made ifs are not user style
         // STYLE010: if (true) { ... }
         var cond = ifte.cond
         if (cond is ExprConstBool) {
@@ -826,7 +826,7 @@ class StyleLintVisitor : AstVisitor {
         for (i in range(n - 1)) {
             let cur = blk.list[i]
             let nxt = blk.list[i + 1]
-            if (!(cur is ExprIfThenElse)) continue
+            if (!(cur is ExprIfThenElse) || cur.genFlags.generated || nxt.genFlags.generated) continue  // macro-made guards skip
             let outer_if = cur as ExprIfThenElse
             if (outer_if.if_false != null) continue
             let outer_term = single_terminator_body(outer_if.if_true)
