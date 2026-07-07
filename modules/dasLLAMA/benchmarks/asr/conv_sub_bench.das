@@ -38,6 +38,9 @@ struct BenchArgs {
     @clarg_doc = "Run the c0 conv loop-form variants head-to-head instead of the breakdown"
     c0 : bool
 
+    @clarg_doc = "Run the permute + bias/relu epilogue variants instead of the breakdown"
+    tail : bool
+
     @clarg_short = "?"
     @clarg_name = "show-help"
     @clarg_doc = "Show this help and exit"
@@ -370,11 +373,167 @@ def bench_c0(ih : int64; rounds : int) {
     print("  fused_f4 (single-lane):                     {best_f4 / 1000.0lf} ms  ({best_cur / best_f4}x)\n")
 }
 
+// ===== permute + bias/relu epilogue variants =====
+
+// pointer-hoisted, c-outer: writes a contiguous 16-float run per (t, c), reads stride-nch
+def permute_ptr(var xf : array<float>; y6 : array<float>; tt, w3, nch : int64) {
+    let feat = w3 * nch
+    unsafe {
+        var fp = addr(xf[0])
+        let yp = reinterpret<float const?>(addr(y6[0]))
+        for (t in range64(tt)) {
+            let yb = t * feat
+            let fb = t * feat
+            for (c in range64(nch)) {
+                var o = fb + w3 * c
+                var yi = yb + c
+                for (_fr in range64(w3)) {
+                    fp[o] = yp[yi]
+                    o++
+                    yi += nch
+                }
+            }
+        }
+    }
+}
+
+// float4 over c (contiguous reads), scatter 4 strided writes per group of 4 fr
+def permute_f4(var xf : array<float>; y6 : array<float>; tt, w3, nch : int64) {
+    let feat = w3 * nch
+    unsafe {
+        var fp = addr(xf[0])
+        let yp = reinterpret<float const?>(addr(y6[0]))
+        for (t in range64(tt)) {
+            let yb = t * feat
+            let fb = t * feat
+            for (fr in range64(w3)) {
+                let yr = yb + fr * nch
+                let fo = fb + fr
+                var c = 0l
+                while (c < nch) {
+                    let v = *reinterpret<float4 const?>(yp + yr + c)
+                    fp[fo + w3 * c] = v.x
+                    fp[fo + w3 * (c + 1l)] = v.y
+                    fp[fo + w3 * (c + 2l)] = v.z
+                    fp[fo + w3 * (c + 3l)] = v.w
+                    c += 4l
+                }
+            }
+        }
+    }
+}
+
+// fused bias+relu, float4 (replaces the add_bias_rows + relu passes after the q8 1x1s)
+def bias_relu_f4(var y : array<float>; b : array<float>; d, npos : int64) {
+    unsafe {
+        var yp = addr(y[0])
+        let bp = reinterpret<float const?>(addr(b[0]))
+        let zero = float4(0.0)
+        for (p in range64(npos)) {
+            let row = p * d
+            var i = 0l
+            while (i < d) {
+                let v = (*reinterpret<float4 const?>(yp + row + i)) + (*reinterpret<float4 const?>(bp + i))
+                *reinterpret<float4?>(yp + row + i) = max(v, zero)
+                i += 4l
+            }
+        }
+    }
+}
+
+def bench_tail(frames : int64; rounds : int) {
+    let t1 = (frames - 1l) / 2l + 1l
+    let t2 = (t1 - 1l) / 2l + 1l
+    let tt = (t2 - 1l) / 2l + 1l
+    let feat = 16l * NCH
+    print("\n--- permute variants: tt={tt} [t][16][256] -> [t][4096] ---\n")
+    var y6 : array<float>
+    var xf_cur : array<float>
+    var xf_v : array<float>
+    sized(y6, tt * feat)
+    sized(xf_cur, tt * feat)
+    sized(xf_v, tt * feat)
+    fill_sin(y6, 1.5, 0.171)
+    permute_cur(xf_cur, y6, tt, 16l, NCH)
+    permute_ptr(xf_v, y6, tt, 16l, NCH)
+    var ok_ptr = true
+    for (i in range64(tt * feat)) {
+        ok_ptr &&= xf_v[i] == xf_cur[i]
+    }
+    permute_f4(xf_v, y6, tt, 16l, NCH)
+    var ok_f4 = true
+    for (i in range64(tt * feat)) {
+        ok_f4 &&= xf_v[i] == xf_cur[i]
+    }
+    let g_ptr = ok_ptr ? "bit-exact" : "MISMATCH"
+    let g_f4 = ok_f4 ? "bit-exact" : "MISMATCH"
+    print("  gate: ptr {g_ptr}, f4 {g_f4}\n")
+    var best_cur = 1.0e30lf
+    var best_ptr = 1.0e30lf
+    var best_f4 = 1.0e30lf
+    for (_round in range(rounds)) {
+        var t0 = ref_time_ticks()
+        permute_cur(xf_cur, y6, tt, 16l, NCH)
+        best_cur = min(best_cur, double(get_time_usec(t0)))
+        t0 = ref_time_ticks()
+        permute_ptr(xf_v, y6, tt, 16l, NCH)
+        best_ptr = min(best_ptr, double(get_time_usec(t0)))
+        t0 = ref_time_ticks()
+        permute_f4(xf_v, y6, tt, 16l, NCH)
+        best_f4 = min(best_f4, double(get_time_usec(t0)))
+    }
+    print("  cur: {best_cur / 1000.0lf} ms | ptr: {best_ptr / 1000.0lf} ms ({best_cur / best_ptr}x) | f4: {best_f4 / 1000.0lf} ms ({best_cur / best_f4}x)\n")
+
+    print("\n--- bias+relu epilogue: d=256, npos={t2 * 32l} (c3 shape) ---\n")
+    let npos = t2 * 32l
+    var yy0 : array<float>
+    var yy : array<float>
+    var yv : array<float>
+    var bb : array<float>
+    sized(yy0, npos * NCH)
+    sized(yy, npos * NCH)
+    sized(yv, npos * NCH)
+    sized(bb, NCH)
+    fill_sin(yy0, 1.5, 0.211)
+    fill_sin(bb, 0.1, 0.31)
+    copy_from(yy, yy0)
+    add_bias_rows(yy, bb, 0l, NCH, npos)
+    relu_cur(yy, npos * NCH)
+    copy_from(yv, yy0)
+    bias_relu_f4(yv, bb, NCH, npos)
+    var ok = true
+    for (i in range64(npos * NCH)) {
+        ok &&= yv[i] == yy[i]
+    }
+    let g_fus = ok ? "bit-exact" : "MISMATCH"
+    print("  gate: fused_f4 {g_fus}\n")
+    var best_sep = 1.0e30lf
+    var best_fus = 1.0e30lf
+    for (_round in range(rounds)) {
+        copy_from(yy, yy0)
+        var t0 = ref_time_ticks()
+        add_bias_rows(yy, bb, 0l, NCH, npos)
+        relu_cur(yy, npos * NCH)
+        best_sep = min(best_sep, double(get_time_usec(t0)))
+        copy_from(yv, yy0)
+        t0 = ref_time_ticks()
+        bias_relu_f4(yv, bb, NCH, npos)
+        best_fus = min(best_fus, double(get_time_usec(t0)))
+    }
+    print("  bias+relu separate: {best_sep / 1000.0lf} ms | fused_f4: {best_fus / 1000.0lf} ms ({best_sep / best_fus}x)\n")
+}
+
 // ===== bench plumbing =====
 
 def sized(var a : array<float>; n : int64) {
     a |> reserve(int(n))
     a |> resize(int(n))
+}
+
+def copy_from(var dst : array<float>; src : array<float>) {
+    for (i, v in count(), src) {
+        dst[i] = v
+    }
 }
 
 def fill_sin(var a : array<float>; scale, step : float) {
@@ -665,6 +824,8 @@ def main() : int {
             bench_dw(32l, t2, rounds)   // c5 shape
         } elif (a.c0) {
             bench_c0(frames, rounds)
+        } elif (a.tail) {
+            bench_tail(frames, rounds)
         } else {
             run_bench(frames, rounds)
         }

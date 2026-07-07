@@ -621,11 +621,24 @@ def asr_requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<int8>
     }
 }
 
-//! y[p] += blob[b_off .. b_off+d) for every row (projection bias)
+//! y[p] += blob[b_off .. b_off+d) for every row (projection bias). float4 bulk + scalar
+//! tail — elementwise adds in the same order, bit-exact vs the scalar loop.
 def add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
-    for (p in range64(npos)) {
-        for (i in range64(d)) {
-            y[p * d + i] += blob[b_off + i]
+    let d4 = d - d % 4l
+    unsafe {
+        var yp = addr(y[0])
+        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        for (p in range64(npos)) {
+            let row = p * d
+            var i = 0l
+            while (i < d4) {
+                *reinterpret<float4?>(yp + row + i) = (*reinterpret<float4 const?>(yp + row + i)) + (*reinterpret<float4 const?>(bp + i))
+                i += 4l
+            }
+            while (i < d) {
+                yp[row + i] += bp[i]
+                i++
+            }
         }
     }
 }

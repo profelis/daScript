@@ -863,9 +863,54 @@ def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : arr
     }
 }
 
-def private pk_relu(var x : array<float>; n : int64) {   // explicit count: scratch is oversized
-    for (i in range64(n)) {
-        x[i] = max(x[i], 0.0)
+// feature permute xf[t][fr + w3*c] = y6[t][fr][c]: float4 over the contiguous c axis,
+// 4 strided scalar stores per group (bench: 2.85x the scalar 3-loop)
+def private pk_xf_permute(var xf : array<float>; y6 : array<float>; tt, w3, nch : int64) {
+    let feat = w3 * nch
+    unsafe {
+        var fp = addr(xf[0])
+        let yp = reinterpret<float const?>(addr(y6[0]))
+        for (t in range64(tt)) {
+            let base = t * feat
+            for (fr in range64(w3)) {
+                let yr = base + fr * nch
+                let fo = base + fr
+                var c = 0l
+                while (c < nch) {
+                    let v = *reinterpret<float4 const?>(yp + yr + c)
+                    fp[fo + w3 * c] = v.x
+                    fp[fo + w3 * (c + 1l)] = v.y
+                    fp[fo + w3 * (c + 2l)] = v.z
+                    fp[fo + w3 * (c + 3l)] = v.w
+                    c += 4l
+                }
+            }
+        }
+    }
+}
+
+// fused bias+relu over rows (the 1x1 conv epilogues) — one float4 pass instead of the
+// add_bias_rows + relu pair re-streaming the image (bench: 11.8x); explicit npos: scratch
+// is oversized
+def private pk_bias_relu(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
+    let d4 = d - d % 4l
+    unsafe {
+        var yp = addr(y[0])
+        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        let zero = float4(0.0)
+        for (p in range64(npos)) {
+            let row = p * d
+            var i = 0l
+            while (i < d4) {
+                let v = (*reinterpret<float4 const?>(yp + row + i)) + (*reinterpret<float4 const?>(bp + i))
+                *reinterpret<float4?>(yp + row + i) = max(v, zero)
+                i += 4l
+            }
+            while (i < d) {
+                yp[row + i] = max(yp[row + i] + bp[i], 0.0)
+                i++
+            }
+        }
     }
 }
 
@@ -895,15 +940,13 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
     pk_scan("y0", st.y0, t1 * w1 * nch)
     pk_scan("y2", st.y2, t2 * w2 * nch)
     pk_mm_rq(m, st.y3, m.c3_w, st.y2, st.xqi, st.xsi, nch, nch, t2 * w2)   // 1x1 conv = per-position channel mix
-    add_bias_rows(st.y3, m.blob, m.c3_b, nch, t2 * w2)
-    pk_relu(st.y3, t2 * w2 * nch)
+    pk_bias_relu(st.y3, m.blob, m.c3_b, nch, t2 * w2)
     pk_conv2d_dw_s2(st.y5, st.y3, m.blob, m.c5_w, m.c5_b, w2, t2, nch)
     let w3 = (w2 - 1l) / 2l + 1l               // 16
     let t3 = (t2 - 1l) / 2l + 1l
     pk_ensure(st.y6, t3 * w3 * nch)
     pk_mm_rq(m, st.y6, m.c6_w, st.y5, st.xqi, st.xsi, nch, nch, t3 * w3)
-    add_bias_rows(st.y6, m.blob, m.c6_b, nch, t3 * w3)
-    pk_relu(st.y6, t3 * w3 * nch)
+    pk_bias_relu(st.y6, m.blob, m.c6_b, nch, t3 * w3)
 
     // features per time row: v[f + w3·c] = y6[t][f][c]; then pre_out into the residual stream
     let tt = t3
@@ -912,13 +955,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
     }
     let feat = w3 * nch
     pk_ensure(st.xf, tt * feat)
-    for (t in range64(tt)) {
-        for (fr in range64(w3)) {
-            for (c in range64(nch)) {
-                st.xf[t * feat + fr + w3 * c] = st.y6[(t * w3 + fr) * nch + c]
-            }
-        }
-    }
+    pk_xf_permute(st.xf, st.y6, tt, w3, nch)
     pk_ensure(st.x, tt * d)
     pk_scan("y6", st.y6, t3 * w3 * nch)
     pk_mm_rq(m, st.x, m.pre_w, st.xf, st.xqi, st.xsi, feat, d, tt)
