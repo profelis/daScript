@@ -10,6 +10,7 @@ require daslib/ast_boost
 require daslib/templates_boost
 require daslib/fio
 require daslib/strings_boost
+require daslib/command_line
 require strings
 require llvm/daslib/llvm_code public
 
@@ -28,6 +29,12 @@ require llvm/daslib/llvm_code public
 //!  - tune / test: stamp the full grid as `<name>__<suffix>` clones plus a `<name>_variants()`
 //!    registry; a harness benches them (tune, then `tune_manifest_set` the winner) or
 //!    bit-exact-gates every variant against the reference row (test).
+//!
+//! Per-box sharing + UX rail: a library declares `[tune_scope(name=, tuner=)]` (manifest at
+//! `<das_root>/<name>.tune.json`, shared by every app that requires it); an app declares
+//! `[tune_policy(missing = fallback|warn|error|auto|restart)]`; `--tune` after `--` on the
+//! app's command line forces a fresh tuner run. Standalone builds (`llvm-jit -exe`, AOT) are
+//! tune-free by contract — see `tune_standalone_gate`.
 
 // ===== manifest + mode =====
 
@@ -37,18 +44,32 @@ def tune_mode() : string {
     return empty(m) ? "normal" : m
 }
 
-// runtime copy of the app's [tune_manifest] declaration, set by the injected [init]
+//! True when this compile produces a standalone artifact — `llvm-jit -exe`
+//! (`policies.jit_exe_mode`), AOT C++ generation (`policies.aot_module`), or an AOT-consuming
+//! run (`policies.aot`). Tune is a per-box, compile-at-startup concept, so under this gate
+//! every tune annotation is inert: no manifest/scope reads, no stamps (`fallback=` included),
+//! no policy, no injected checks — only the reference-row `<name>_variants()` registries are
+//! emitted so harness code still compiles. AOT soundness depends on the gate covering BOTH
+//! the generating and the consuming compile: per-box stamps would desync their AOT hashes.
+def tune_standalone_gate() : bool {
+    return (compiling_program().policies.jit_exe_mode
+        || compiling_program().policies.aot
+        || compiling_program().policies.aot_module)
+}
+
+// runtime copy of the program's manifest declaration, set by the injected [init]s — a
+// library [tune_scope] first, then (root module inits run last) an app [tune_manifest]
 var private g_runtime_manifest = ""
 
-//! Runtime hook the `[tune_manifest]`-injected [init] calls; harnesses that manage their own
-//! manifest location can also call it directly before using the get/set APIs.
+//! Runtime hook the `[tune_manifest]`/`[tune_scope]`-injected [init]s call; harnesses that
+//! manage their own manifest location can also call it directly before using the get/set APIs.
 def set_tune_manifest_runtime_path(p : string) {
     g_runtime_manifest = p
 }
 
 //! The tune manifest location: `DAS_TUNE_MANIFEST` env override, else the app's
-//! `[tune_manifest]` declaration, else "" — no manifest. Per-app opt-in by design: a shared
-//! default file would let unrelated apps stomp each other's winners.
+//! `[tune_manifest]` declaration, else the library's `[tune_scope]` per-box file, else "" —
+//! no manifest.
 def tune_manifest_path() : string {
     let env = get_env_variable("DAS_TUNE_MANIFEST")
     if (!empty(env)) return env
@@ -92,6 +113,27 @@ def tune_manifest_set(fname : string; suffix : string) : bool {
     let ok = fwrite(path, sprint_json(tab, true))
     delete tab
     return ok
+}
+
+// ===== [tune_scope] data — library-owned per-box scope =====
+
+// one registered scope: a per-box manifest at <das_root>/<name>.tune.json plus the harness
+// that produces it
+struct private TuneScope {
+    scopeName : string
+    manifestPath : string
+    tunerPath : string   // resolved against the declaring file; "" = no tuner declared
+}
+
+// declaring module name -> scope. [tune] applies in that module resolve their manifest here
+// when no DAS_TUNE_MANIFEST env is set; [tune_policy] drives tuner runs off the same bank.
+var private g_scopes : table<string; TuneScope>
+
+def private scope_manifest_for(modName : string) : string {
+    if (g_scopes |> key_exists(modName)) {
+        return g_scopes[modName].manifestPath
+    }
+    return ""
 }
 
 // ===== the perm grid =====
@@ -418,6 +460,21 @@ class private TuneAnnotation : AstFunctionAnnotation {
             delete comps
             return false
         }
+        // standalone artifacts (-exe, AOT) are tune-free by contract — reference bodies only,
+        // registries emitted so harness code compiles. Overrides grid modes too: a stale
+        // DAS_TUNE_MODE env must not leak variant stubs into a shipped binary.
+        if (tune_standalone_gate()) {
+            let noPerms : array<TunePerm>
+            var gok = emit_registry(compiling_module(), func, noPerms, errors)
+            for (c in comps) {
+                if (gok) {
+                    gok = emit_registry(compiling_module(), c.fn, noPerms, errors)
+                }
+            }
+            delete perms
+            delete comps
+            return gok
+        }
         let mode = tune_mode()
         if (mode == "tune" || mode == "test") {
             let ok = stamp_grid(func, genKey, perms, comps, errors)
@@ -431,16 +488,21 @@ class private TuneAnnotation : AstFunctionAnnotation {
             delete comps
             return false
         }
-        // normal: manifest entry > fallback= > reference. A manifest with no entry for this
-        // function falls back to the declared fallback= (a manifest written before a kernel
-        // family landed must not silently drop that family to the reference tier); an
-        // explicit "reference" entry forces the original body. An app's [tune_manifest]
-        // declaration lives in the root module, which compiles after every library [tune] —
-        // its apply re-stamps the tuned functions from the declared manifest (see
-        // TuneManifestAnnotation below).
+        // normal: manifest entry > fallback= > reference. The manifest is the env override
+        // when set, else the declaring module's [tune_scope] per-box file. A manifest with
+        // no entry for this function falls back to the declared fallback= (a manifest written
+        // before a kernel family landed must not silently drop that family to the reference
+        // tier); an explicit "reference" entry forces the original body. An app's
+        // [tune_manifest] declaration lives in the root module, which compiles after every
+        // library [tune] — its apply re-stamps the tuned functions from the declared manifest
+        // (see TuneManifestAnnotation below).
         let fname = "{func.name}"
         var manifestFound = false
-        var manifest <- read_manifest(get_env_variable("DAS_TUNE_MANIFEST"), manifestFound)
+        var mpath = get_env_variable("DAS_TUNE_MANIFEST")
+        if (empty(mpath)) {
+            mpath = scope_manifest_for("{compiling_module().name}")
+        }
+        var manifest <- read_manifest(mpath, manifestFound)
         var suffix = ""
         if (manifestFound) {
             suffix = manifest?[fname] ?? ""
@@ -483,7 +545,7 @@ class private TuneAnnotation : AstFunctionAnnotation {
                     for (c in comps) {
                         stamp_llvm_code(c.fn, c.genkey, p)
                     }
-                    print("llvm_tune: {fname} <- {suffix} ({fromManifest ? tune_manifest_path() : "fallback"})\n")
+                    print("llvm_tune: {fname} <- {suffix} ({fromManifest ? mpath : "fallback"})\n")
                     ok = true
                     break
                 }
@@ -512,7 +574,8 @@ class private TuneAnnotation : AstFunctionAnnotation {
 
 // ===== [tune_manifest] — the app's per-app manifest declaration =====
 
-// [init] in the declaring module so the runtime write API targets the declared file
+// [init] in the declaring module so the runtime write API targets the declared file; shared
+// by [tune_manifest] (root module) and [tune_scope] (library module) — one per module
 def private inject_runtime_path_init(mpath : string; var errors : das_string) : bool {
     var fn = qmacro_function("`tune`manifest`runtime`init") $() : void {
         set_tune_manifest_runtime_path($v(mpath))
@@ -520,7 +583,7 @@ def private inject_runtime_path_init(mpath : string; var errors : das_string) : 
     fn |> append_annotation("$", "init")
     fn.flags.generated = true
     if (!(compiling_module() |> add_function(fn))) {
-        errors := "[tune_manifest]: duplicate declaration (only one per program)"
+        errors := "[tune_manifest]/[tune_scope]: duplicate declaration (one per module)"
         return false
     }
     return true
@@ -627,6 +690,8 @@ def private restamp_program(manifest : table<string; string>; mpath : string; va
 class private TuneManifestAnnotation : AstFunctionAnnotation {
     def override apply(var func : FunctionPtr; var group : ModuleGroup;
                        args : AnnotationArgumentList; var errors : das_string) : bool {
+        // standalone artifacts are tune-free by contract — no init injection, no restamp
+        if (tune_standalone_gate()) return true
         let nv = find_arg(args, "name")
         if (!(nv is tString) || empty(nv as tString)) {
             errors := "[tune_manifest] on {func.name}: name=\"<app name>\" is required"
@@ -651,6 +716,210 @@ class private TuneManifestAnnotation : AstFunctionAnnotation {
             restamp_program(manifest, mpath, errors)
         }
         delete manifest
+        return empty(errors)
+    }
+}
+
+// ===== [tune_scope] / [tune_policy] — the per-box UX rail =====
+
+def private resolve_decl_path(declFile : string; p : string) : string {
+    return is_absolute(p) ? p : path_join(dir_name(declFile), p)
+}
+
+//! `[tune_scope(name = "mylib", tuner = "harness.das")]` on a (dummy) struct in the library
+//! module that owns the `[tune]` functions, declared ABOVE them: opts that module's kernels
+//! into a per-box shared manifest at `<das_root>/<name>.tune.json` — every app requiring the
+//! library shares the same winners with no app-side declaration. `tuner=` (optional) names
+//! the harness that produces the manifest, resolved against the declaring file;
+//! `[tune_policy]` and `--tune` run it. `DAS_TUNE_MANIFEST` still overrides everything; an
+//! app `[tune_manifest]` still re-stamps on top (its entries win, missing entries keep the
+//! scope winners). Also points the runtime write API (`tune_manifest_set`) at the scope file,
+//! so a manual `DAS_TUNE_MODE=tune` harness run lands winners in the right place by default.
+[structure_macro(name = "tune_scope")]
+class private TuneScopeAnnotation : AstStructureAnnotation {
+    def override apply(var st : StructurePtr; var group : ModuleGroup;
+                       args : AnnotationArgumentList; var errors : das_string) : bool {
+        if (tune_standalone_gate()) return true
+        let nv = find_arg(args, "name")
+        if (!(nv is tString) || empty(nv as tString)) {
+            errors := "[tune_scope]: name=\"<scope name>\" is required"
+            return false
+        }
+        let sname = nv as tString
+        var tuner = ""
+        let tv = find_arg(args, "tuner")
+        if (tv is tString) {
+            tuner = resolve_decl_path(string(st.at.fileInfo.name), tv as tString)
+        }
+        let mpath = path_join(get_das_root(), "{sname}.tune.json")
+        // overwrite, not error: shared-module macro state persists across compiles in one process
+        g_scopes["{compiling_module().name}"] = TuneScope(scopeName = sname, manifestPath = mpath, tunerPath = tuner)
+        return inject_runtime_path_init(mpath, errors)
+    }
+}
+
+// `--tune` after `--` on the app's command line — visible at macro time (the compiler argv
+// carries the script args)
+def private cli_forces_tune() : bool {
+    var r = false
+    var afterDD = false
+    // NO delete: the builtin aliases a process-global Array header (locked), not a copy
+    var argv <- get_command_line_arguments()
+    for (a in argv) {
+        if (afterDD && a == "--tune") {
+            r = true
+        }
+        if (a == "--") {
+            afterDD = true
+        }
+    }
+    return r
+}
+
+// the exact command a user (or the auto path) runs to tune one scope; the env prefix leads
+// so the command never starts with a quote (cmd.exe strips a leading quote)
+def private tuner_cmd(scope : TuneScope) : string {
+    let win = get_platform_name() == "windows"
+    let envs = (win ?
+        "set DAS_TUNE_MODE=tune&& set DAS_TUNE_MANIFEST={scope.manifestPath}&& " :
+        "DAS_TUNE_MODE=tune DAS_TUNE_MANIFEST={scope.manifestPath} ")
+    return "{envs}\"{get_das_exe()}\" -jit \"{scope.tunerPath}\" -dasroot \"{get_das_root()}\""
+}
+
+// spawn the scope's tuner to completion, relaying its output; works from macro context
+// (policy=auto/--tune, during the root-module compile) and from runtime (policy=restart)
+def private run_scope_tuner(scope : TuneScope) : bool {
+    let tmp = path_join(get_das_root(), "_tune_{scope.scopeName}_out.txt")
+    let cmd = "{tuner_cmd(scope)} > \"{tmp}\" 2>&1"
+    print("llvm_tune: tuning scope '{scope.scopeName}' -> {scope.manifestPath}\nllvm_tune: {cmd}\n")
+    unsafe(popen(cmd) $(_f) {})
+    let outp = fread(tmp)
+    remove(tmp)
+    print("{outp}\n")
+    return true
+}
+
+//! Runtime half of `[tune_policy(missing = "restart")]` — injected as a guard at the top of
+//! the app's `main`. When the scope manifest is missing: runs the tuner NOW, prints the
+//! restart banner, and returns true so main returns immediately (the winners are
+//! compile-time stamps — this process compiled without them). False = manifest present,
+//! carry on.
+def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : string) : bool {
+    if (fexist(manifestPath)) {
+        return false
+    }
+    print("llvm_tune: scope '{scopeName}' is untuned on this box\n")
+    if (empty(tunerPath)) {
+        print("llvm_tune: no tuner declared — produce {manifestPath} with the library's tuner, then restart\n")
+        return true
+    }
+    run_scope_tuner(TuneScope(scopeName = scopeName, manifestPath = manifestPath, tunerPath = tunerPath))
+    if (fexist(manifestPath)) {
+        print("llvm_tune: scope '{scopeName}' tuned -> {manifestPath}\nllvm_tune: restart to apply the winners\n")
+    } else {
+        print("llvm_tune: tuner produced no manifest at {manifestPath}\n")
+    }
+    return true
+}
+
+//! `[tune_policy(missing = "...")]` on the app's `main` (any function in the root file): what
+//! to do about `[tune_scope]`s whose per-box manifest is missing at compile time —
+//!   fallback: stamp `fallback=` silently (the default everywhere, also without this annotation)
+//!   warn:    loud compile-time banner with the exact tuner command
+//!   error:   fail the compile with the same message — the dev mode
+//!   auto:    run the scope's tuner NOW (child process), re-stamp from the fresh manifest, and
+//!            continue — first start tunes, then serves
+//!   restart: tune at app startup instead (injected [init]), then exit asking for a restart
+//! `--tune` after `--` on the app's command line forces the auto path even when the manifest
+//! exists (re-tune). `DAS_TUNE_POLICY` env overrides the declared value (CI kill switch:
+//! `DAS_TUNE_POLICY=fallback`). Grid modes (`DAS_TUNE_MODE=tune`/`test` — also the recursion
+//! guard for the spawned tuner), a `DAS_TUNE_MANIFEST` env override, and standalone builds
+//! (`-exe`, AOT) skip policy entirely.
+[function_macro(name = "tune_policy")]
+class private TunePolicyAnnotation : AstFunctionAnnotation {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup;
+                       args : AnnotationArgumentList; var errors : das_string) : bool {
+        // standalone builds are tune-free; grid-mode children manage their own manifest (and
+        // the spawned tuner compiles in tune mode — the recursion guard); a DAS_TUNE_MANIFEST
+        // env override means the user drives manually
+        if (tune_standalone_gate() || tune_mode() != "normal"
+                || !empty(get_env_variable("DAS_TUNE_MANIFEST"))) {
+            return true
+        }
+        var policy = "warn"
+        let mv = find_arg(args, "missing")
+        if (mv is tString) {
+            policy = mv as tString
+        }
+        let penv = get_env_variable("DAS_TUNE_POLICY")
+        if (!empty(penv)) {
+            policy = penv
+        }
+        if (policy != "fallback" && policy != "warn" && policy != "error" && policy != "auto" && policy != "restart") {
+            errors := "[tune_policy] on {func.name}: missing=\"{policy}\" — use fallback | warn | error | auto | restart"
+            return false
+        }
+        let force = cli_forces_tune()
+        if (force && empty(g_scopes)) {
+            print("llvm_tune: --tune requested but no [tune_scope] is declared by any required library\n")
+        }
+        var seen : table<string>
+        for (scope in values(g_scopes)) {
+            continue if (seen |> key_exists(scope.scopeName))
+            seen |> insert(scope.scopeName)
+            var found = false
+            var manifest <- read_manifest(scope.manifestPath, found)
+            delete manifest
+            continue if (found && !force)
+            if (force || policy == "auto") {
+                if (empty(scope.tunerPath)) {
+                    errors := "[tune_policy]: scope '{scope.scopeName}' declares no tuner= — cannot {force ? "--tune" : "auto-tune"}; produce {scope.manifestPath} manually"
+                } else {
+                    run_scope_tuner(scope)
+                    var found2 = false
+                    var fresh <- read_manifest(scope.manifestPath, found2)
+                    if (found2) {
+                        restamp_program(fresh, scope.manifestPath, errors)
+                    } else {
+                        errors := "[tune_policy]: tuner for scope '{scope.scopeName}' produced no manifest at {scope.manifestPath}"
+                    }
+                    delete fresh
+                }
+            } elif (policy == "error") {
+                errors := "[tune_policy]: scope '{scope.scopeName}' is untuned on this box — run: {empty(scope.tunerPath) ? "<no tuner declared>" : tuner_cmd(scope)} (or start with --tune)"
+            } elif (policy == "warn") {
+                print("llvm_tune: WARNING scope '{scope.scopeName}' is untuned on this box (fallback stamps in effect)\nllvm_tune: run: {empty(scope.tunerPath) ? "<no tuner declared>" : tuner_cmd(scope)} (or start with --tune)\n")
+            } elif (policy == "restart") {
+                // prepend a graceful guard to the annotated function (main) — a hard exit()
+                // from an [init] would skip environment shutdown (g_envTotal FATAL at exit)
+                if (!(func.body is ExprBlock)) {
+                    errors := "[tune_policy]: restart — {func.name} has no body block"
+                } elif (func.result.baseType != Type.tVoid && func.result.baseType != Type.tInt
+                        && func.result.baseType != Type.autoinfer) {
+                    // autoinfer = undeclared result, void by convention for main
+                    errors := "[tune_policy]: restart — {func.name} must return void or int"
+                } else {
+                    var guard : ExpressionPtr
+                    if (func.result.baseType == Type.tInt) {
+                        guard = qmacro_expr() {
+                            if (tune_restart_needed($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath))) {
+                                return 3
+                            }
+                        }
+                    } else {
+                        guard = qmacro_expr() {
+                            if (tune_restart_needed($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath))) {
+                                return
+                            }
+                        }
+                    }
+                    var blk = unsafe(reinterpret<ExprBlock?>(func.body))
+                    blk.list |> push(guard, 0)
+                }
+            }
+            break if (!empty(errors))
+        }
+        delete seen
         return empty(errors)
     }
 }
