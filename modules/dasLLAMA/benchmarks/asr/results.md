@@ -8,25 +8,77 @@ also parakeet-cli's calibrated best; `-t 10` regresses on E-core stragglers), ze
 das lanes via `DAS_THREADS`/`DAS_JOBQUE_THREADS`, cli `-t`, onnx ORT `intra_op` (engine-level
 `onnx_bench.py` driving onnx-asr directly — no HTTP; the mil-ad server hardcodes intra_op=4,
 so the server itself is slower than this column). Corpus: `make` (+ `make librispeech`).
-das = `bbatkin/audio-perf` @ `c7f1c9c8a`, parakeet q8 encoder default.
+das = `bbatkin/audio-perf` @ `52cf2e741`, parakeet q8 encoder default.
 
 Correctness on these rows: das fp32 is token-for-token with parakeet-cli (v2 jfk 33/33 +
 gb1 786/786; v3 jfk 38/38 + gb1 655/655 — ids, frames, dur idx+val). das q8 (the path
-benched here) is id/text-exact vs fp32 on both models; v3 gb1 flips 16/655 duration picks
-(≤4-frame transient timestamp drift). onnx-int8 changes TEXT vs fp32 (e.g. jfk "for you,
-ask" → "for you. Ask") — its int8 is not output-preserving.
+benched here) is id/text-exact vs fp32 on both models; gb1 shows a handful of duration-pick
+flips (v2 12 / v3 14 tuple lines, ≤4-frame transient timestamp drift, ids/text exact).
+onnx-int8 changes TEXT vs fp32 (e.g. jfk "for you, ask" → "for you. Ask") — its int8 is
+not output-preserving.
 
 Note: whisper.cpp links ggml-blas → on macOS the "CPU" oracle's f32 GEMMs ride
 **Accelerate/AMX**; on zen2 it's plain AVX2. That coprocessor is why the M1 story below
 differs from zen2. (Earlier M1 tables in this doc's history ran cli at its as-shipped
 `-t 4` default — that handicapped cli ~20-30%; superseded by the matched-8T tables.)
 
-## M1 (8P+2E), all sides 8 threads, Parsec OFF — 2026-07-06 (STANDING BASELINE)
+## M1 (8P+2E), all sides 8 threads, Parsec OFF — 2026-07-07 (STANDING; das re-sweep @ `52cf2e741`)
 
-das = phase-0 zero-alloc + mel-FFT (`f09bd8bdc`). This round re-ran cli/onnx with Parsec
-off and is the standing baseline for those sides — later rounds re-bench das ONLY against
-these TSVs (results_pk_m1_t8_p0.tsv / results_pk_ls_m1_t8_p0.tsv). Parsec residency was
-worth up to ~15% noise on the earlier same-day round (cli jfk spread v2-vs-v3 407/352
+das side re-run only, per the method: cli/onnx numbers come from the 2026-07-06 standing
+TSVs (results_pk_m1_t8_p0.tsv / results_pk_ls_m1_t8_p0.tsv); new das rows in
+results_pk_m1_t8_jo.tsv / results_pk_ls_m1_t8_jo.tsv. What changed since the previous
+round: `asr_bench` had been running BARE `with_job_que()` — no `setup_dasllama_jobque()` —
+so every prior das row measured the ~10us/job fifo fork/join instead of the shipped team
+dispatch (2.2x end-to-end on jfk; ALL pre-2026-07-07 das rows carry that handicap, cli/onnx
+rows are unaffected). On top of the fix: silu4_batch (threaded FFN silu) and gemm_f32_jo
+(jj-outer attention tile walk, gb1 attn blocks −20%). Output-parity unchanged — pk_gate
+4-way F32-vs-cli EXACT.
+
+parakeet-tdt-0.6b-**v2** (f32 bin), das (3 reps) vs parakeet-cli (stored):
+
+| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT |
+|---|---|---|---|---|---|---|
+| jfk.wav | 11 | 207 | 339 | **0.61x** | 53.0 | 32.5 |
+| jfk3.wav | 33 | 638 | 749 | **0.85x** | 51.7 | 44.1 |
+| gb1.wav | 199 | 5928 | 6635 | **0.89x** | 33.5 | 30.0 |
+| hp0.wav | 273 | 9455 | 11041 | **0.86x** | 28.9 | 24.8 |
+| hp0x2.wav | 547 | 28874 | 38021 | **0.76x** | 18.9 | 14.4 |
+
+parakeet-tdt-0.6b-**v3** (f32 bin), das (3 reps) vs parakeet-cli vs ONNX-Runtime int8 (stored):
+
+| file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx | das xRT | cli xRT | onnx xRT |
+|---|---|---|---|---|---|---|---|---|---|
+| jfk.wav | 11 | 218 | 344 | 468 | **0.63x** | **0.47x** | 50.5 | 32.0 | 23.5 |
+| jfk3.wav | 33 | 678 | 773 | 931 | **0.88x** | **0.73x** | 48.7 | 42.7 | 35.5 |
+| gb1.wav | 199 | 6046 | 6725 | 7215 | **0.90x** | **0.84x** | 32.9 | 29.6 | 27.5 |
+| hp0.wav | 273 | 9706 | 11123 | 11563 | **0.87x** | **0.84x** | 28.2 | 24.6 | 23.6 |
+| hp0x2.wav | 547 | 29455 | 38078 | - | **0.77x** | - | 18.6 | 14.4 | - |
+
+LibriSpeech test-clean, 25 short clips (best-of-2, per-clip latency — the dictation case):
+
+| side | mean ms | p50 | p95 |
+|---|---|---|---|
+| das v2 | **182** | **183** | **304** |
+| cli v2 | 314 | 310 | 446 |
+| das v3 | **191** | **194** | **321** |
+| cli v3 | 320 | 319 | 453 |
+| onnx-int8 v3 | 396 | 398 | 529 |
+
+M1 shape: das now leads every row on both models — short-clip dictation included (p50
+1.7x faster than AMX cli, 2.1x faster than onnx-int8). Stage profile per rep (v2 jfk |
+v2 gb1, `asr_stage_probe` post-fix): ffn 82|1373, attn_heads 34|3071 (blocks 17|2706,
+pack+pos 17|365), attn_proj 23|370, conv_module 26|308, decode 23|511, conv_sub 10|128,
+attn_out 8|123, mel 2.7|34, pos_emb 1.6|36. Next levers: gb1 = attn_heads blocks (fp32
+GEMM+softmax, ~224 GMAC/s aggregate ≈ 90% of the 8-lane scaling ceiling) and decode
+(f4-lse, v3-weighted); jfk = the attn pack/pos hoist (~17ms of 34).
+
+## M1 — 2026-07-06 (SUPERSEDED das rows; cli/onnx STANDING BASELINE source)
+
+das = phase-0 zero-alloc + mel-FFT (`f09bd8bdc`), PRE-dispatch-fix — the das rows below
+measured the degraded fifo dispatch and are kept only as the session-history record. The
+cli/onnx rows remain the standing baseline TSVs (results_pk_m1_t8_p0.tsv /
+results_pk_ls_m1_t8_p0.tsv) that later das-only rounds compare against. Parsec residency
+was worth up to ~15% noise on the earlier same-day round (cli jfk spread v2-vs-v3 407/352
 then, 339/344 now); >2-3% run-to-run swings mean other software, not thermals.
 
 parakeet-tdt-0.6b-**v2** (f32 bin), das vs parakeet-cli, 3 reps:
@@ -61,15 +113,12 @@ LibriSpeech test-clean, 25 short clips (best-of-2, per-clip latency — the dict
 | cli v3 | 320 | 319 | 453 |
 | onnx-int8 v3 | 396 | 398 | 529 |
 
-M1 shape: cli (AMX-backed GEMMs) leads until ~9 min, where das reaches parity (v2 1.02x)
-and takes its first M1 win (v3 0.99x). Short clips remain ~1.9x. Stage profile per rep
-(v2 jfk | v2 gb1, `asr_stage_probe`): ffn 206|2271, conv_module 127|494, attn_proj
-113|463, attn_heads 77|3967, conv_sub 61|1021 (single-threaded), attn_out 33|144,
-decode 25|548 (v3 45|807 — 8198-row joint), mel 4.8|60 (post-FFT; was 33|181),
-pos_emb 1.7|36. Next levers in order: conv_subsample, decode, pos_emb; attn_heads is
-the quadratic bulk (23% on gb1) — ledger, not a quick pass.
+M1 shape then: cli (AMX-backed GEMMs) led until ~9 min, where das reached parity — the
+gap was the dispatch handicap, not the kernels (see the 2026-07-07 section).
 
 ## zen2 EPYC, both sides 16 threads (`DAS_JOBQUE_THREADS=16` / `-t 16`), 3 reps — 2026-07-06
+(das rows PRE-dispatch-fix — carry the same fifo handicap, magnified by 16 lanes; das-only
+re-sweep pending next box round)
 
 parakeet-tdt-0.6b-v2 (f32 bin), das vs parakeet-cli (plain AVX2, no AMX):
 
