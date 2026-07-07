@@ -206,6 +206,12 @@ that runs per unit of work rather than per load):
    Same trap for isolated Q8 GEMM benches: a model load selects the repack backend tier
    (`select_matmul_backend_for_load`), so a bench that skips the load step times the slower
    hand backend unless it selects the tier itself (3x on M1: arm64-gen 900 vs sdot 300 GMAC/s).
+6. **Work units, not structural units.** When a stage's natural unit count is near the lane
+   count (per-head, per-expert, ...), flatten to finer units — a handful of units on N lanes
+   is a built-in makespan floor (whisper tiny: 6 head-units on 8 lanes = 25% idle; turbo 20
+   on 16 = ragged second wave). If each unit needs scratch, don't size it per unit —
+   dispatch with `maybe_parallel_for_indexed` and index per-slot scratch sized
+   `get_dispatch_slot_bound()` (tower attention is the reference consumer).
 
 ## Known **not** yet supported
 
