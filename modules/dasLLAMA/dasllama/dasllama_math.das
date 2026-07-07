@@ -212,6 +212,14 @@ def public get_dispatch_lanes() : int {
     return live + (g_dispatch_caller_lane ? 1 : 0)
 }
 
+def public get_dispatch_slot_bound() : int {
+    // exclusive upper bound on the slot maybe_parallel_for_indexed hands its block — size
+    // per-slot scratch to this. The caller participates as the LAST slot (get_total_hw_jobs()),
+    // and a worker limit only shrinks the live set: dormant workers keep their high slot
+    // numbers, so the bound stays pool-sized regardless of the limit
+    return is_job_que_available() ? get_total_hw_jobs() + 1 : 1
+}
+
 // Min grain for matmul row splits (ggml-cpu.c mul_mat chunk_size = 16): without it a fixed
 // lanes×oversplit chunk count shatters a small matmul into sub-grain work items on many-core
 // boxes (EPYC 9654: kv 2048x512 GEMM 2.5x slower at 192 lanes than at 48). 0 disables.
