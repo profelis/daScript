@@ -479,6 +479,9 @@ struct AudioTower {
     mm1_out : int64 = 0l      // projector hidden width (ultravox: pre-swiglu, voxtral: pre-gelu)
     has_k_bias : bool = false // qwen3a attention carries a k bias; whisper towers don't
     fblob : array<float>
+    q8 : bool = false         // encoder GEMMs quantized: qblob/qscales carry the Q8_0 image
+    qblob : array<int8>       // whole-fblob-shaped Q8_0 quants (GEMM regions repacked in place)
+    qscales : array<float>    // per-32-block scales, indexed at woff/32
     conv1_w_off : int64
     conv1_b_off : int64
     conv2_w_off : int64
@@ -657,6 +660,88 @@ def mm_blob_b(var y : array<float>; blob : array<float>; woff : int64; x : array
     }
 }
 
+// ===== tower Q8 rail (parakeet's v1 recipe: whole-blob Q8_0 image + per-GEMM-region repack) =====
+
+// repack one GEMM region for the active backend (scales index at woff/32 ⇒ woff must be
+// 32-aligned); a region whose contraction width is not a 32-multiple stays fp32 — tw_mm
+// falls back per call on the same condition, so plane and route can never disagree
+def private tw_repack(var t : AudioTower; woff, n, d : int64) {
+    if (n % 32l != 0l) {
+        return
+    }
+    if (woff % 32l != 0l) {
+        panic("audio tower q8: GEMM weight at {woff} is not 32-aligned")
+    }
+    repack_q8q8_weight(t.qblob, t.qscales, woff, n, d)
+}
+
+//! Quantize the tower's GEMM weights to Q8_0: conv2 + per-layer q/k/v/o + fc1/fc2 + projector
+//! mats. conv1 stays fp32 (its 3·n_mel contraction is not a 32-multiple on 80-mel models).
+//! qblob/qscales mirror fblob offsets; non-GEMM slots (biases, norms, pos rows) are
+//! quantized-but-unread — fblob stays the fp32 truth for them.
+def tower_quantize(var t : AudioTower) {
+    let total = int64(length(t.fblob)) & ~31l   // GEMM regions are 32-aligned and 32-sized; a ragged blob tail can't be one
+    t.qblob |> resize(int(total))
+    t.qscales |> resize(int(total / 32l))
+    quantize_q8_0_into(t.fblob, total, t.qblob, t.qscales, 0l, 0l)
+    t.q8 = true
+    if (!select_matmul_backend_for_load()) {
+        return   // row-major backend reads the flat Q8_0 image as-is
+    }
+    let d = t.d_model
+    let ff = t.n_ff
+    tw_repack(t, t.conv2_w_off, 3l * d, d)
+    for (l in range64(t.n_layer)) {
+        let lo = enc_layer_offsets(t, l)
+        tw_repack(t, lo.q_w, d, d)
+        tw_repack(t, lo.k_w, d, d)
+        tw_repack(t, lo.v_w, d, d)
+        tw_repack(t, lo.o_w, d, d)
+        tw_repack(t, lo.fc1_w, d, ff)
+        tw_repack(t, lo.fc2_w, ff, d)
+    }
+    if (t.proj_dim > 0l) {   // whisper .bin towers have no projector
+        if (t.proj_kind == AudioProjKind.qwen2a) {
+            tw_repack(t, t.proj_w_off, d, t.proj_dim)
+        } elif (t.proj_kind == AudioProjKind.ultravox) {
+            tw_repack(t, t.proj_w_off, d * t.stack_factor, t.mm1_out)
+            tw_repack(t, t.mm2_w_off, t.mm1_out / 2l, t.proj_dim)
+        } else {   // voxtral
+            tw_repack(t, t.proj_w_off, d * t.stack_factor, t.mm1_out)
+            tw_repack(t, t.mm2_w_off, t.mm1_out, t.proj_dim)
+        }
+    }
+}
+
+// q8 route for a tower GEMM: activation image (xq, xs) pre-quantized by the caller so q/k/v
+// share one requant (asr_requant_rows_q8); falls back to the fp32 blob when the region wasn't
+// quantizable (same n%32 condition as tw_repack)
+def private tw_mm(t : AudioTower; var y : array<float>; woff : int64; x : array<float>;
+                  xq : array<int8>; xs : array<float>; n, d, npos : int64) {
+    if (t.q8 && n % 32l == 0l) {
+        array_view(t.qblob, woff, n * d) $(wq : array<int8>#) {
+            array_view(t.qscales, woff / 32l, n * d / 32l) $(ws : array<float>#) {
+                matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, npos)
+            }
+        }
+    } else {
+        mm_blob_b(y, t.fblob, woff, x, n, d, npos)
+    }
+}
+
+def private tw_requant(t : AudioTower; x : array<float>; n, npos : int64; var xq : array<int8>; var xs : array<float>) {
+    if (t.q8 && n % 32l == 0l) {
+        asr_requant_rows_q8(x, n, npos, xq, xs)
+    }
+}
+
+// requant-and-multiply for single-consumer activations
+def private tw_mm_rq(t : AudioTower; var y : array<float>; woff : int64; x : array<float>;
+                     var xq : array<int8>; var xs : array<float>; n, d, npos : int64) {
+    tw_requant(t, x, n, npos, xq, xs)
+    tw_mm(t, y, woff, x, xq, xs, n, d, npos)
+}
+
 // Read a conv1d weight (GGUF flat [c_out][c_in][k], k contiguous — torch layout) permuted to
 // the im2col order W'[o][dk·C + c].
 def private load_conv_permuted(m : GGUFMeta; bytes : array<uint8> | #; name : string;
@@ -677,7 +762,7 @@ def private load_conv_permuted(m : GGUFMeta; bytes : array<uint8> | #; name : st
 //! into an AudioTower: hparams from the ``clip.audio.*`` keys, every tensor fp32 into the blob
 //! in ``enc_layer_offsets`` order, conv weights permuted for im2col. Vision tensors in a
 //! combined omni mmproj are skipped (the loader only reads ``a.*`` / ``mm.a.*`` names).
-def load_audio_tower(path : string) : AudioTower {
+def load_audio_tower(path : string; q8 : bool = false) : AudioTower {
     var t = AudioTower()
     let f = fopen(path, "rb")
     if (f == null) {
@@ -799,6 +884,9 @@ def load_audio_tower(path : string) : AudioTower {
         }
     }
     fclose(f)
+    if (q8) {
+        tower_quantize(t)
+    }
     return <- t
 }
 
@@ -820,6 +908,8 @@ struct EncoderState {
     ph : array<float>    // projector hidden [rows × mm1_out] (ultravox/voxtral)
     pg : array<float>    // ultravox swiglu output [rows × mm1_out/2]
     out : array<float>   // projected soft tokens [tokens_per_chunk × proj_dim]
+    xqi : array<int8>    // q8 requant image [T × max(3d, ff)] (empty on fp32 towers)
+    xsi : array<float>   // per-32-block scales for xqi
 }
 
 let ATTN_ENC_QB = 128l  // query rows per attention score block (15 MB att scratch at T=1500)
@@ -850,6 +940,14 @@ def make_encoder_state(t : AudioTower) : EncoderState {
         }
     }
     s.out |> resize(int(rows * t.proj_dim))
+    if (t.q8) {   // largest requant image any tower GEMM feeds (conv2 3d / fc2 ff / projector mats)
+        var need = tt * max(3l * d, t.n_ff)
+        if (t.proj_dim > 0l && t.proj_kind != AudioProjKind.qwen2a) {
+            need = max(need, rows * max(d * t.stack_factor, t.mm1_out))
+        }
+        s.xqi |> resize(int(need))
+        s.xsi |> resize(int(need / 32l))
+    }
     return <- s
 }
 
@@ -1039,7 +1137,7 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
             }
         }
     }
-    mm_blob_b(s.x, t.fblob, t.conv2_w_off, s.x2, 3l * d, d, tt)
+    tw_mm_rq(t, s.x, t.conv2_w_off, s.x2, s.xqi, s.xsi, 3l * d, d, tt)
     add_bias_rows(s.x, t.fblob, t.conv2_b_off, d, tt)
     enc_gelu(t, s.x, tt * d)
 
@@ -1061,9 +1159,10 @@ def encoder_blocks(t : AudioTower; var s : EncoderState; npos : int64) {
     for (l in range64(t.n_layer)) {
         let lo = enc_layer_offsets(t, l)
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln1_w, lo.ln1_b, d, tt, t.eps)
-        mm_blob_b(s.qq, t.fblob, lo.q_w, s.xb, d, d, tt)
-        mm_blob_b(s.kk, t.fblob, lo.k_w, s.xb, d, d, tt)
-        mm_blob_b(s.vv, t.fblob, lo.v_w, s.xb, d, d, tt)
+        tw_requant(t, s.xb, d, tt, s.xqi, s.xsi)   // q/k/v share the post-LN activation: one requant
+        tw_mm(t, s.qq, lo.q_w, s.xb, s.xqi, s.xsi, d, d, tt)
+        tw_mm(t, s.kk, lo.k_w, s.xb, s.xqi, s.xsi, d, d, tt)
+        tw_mm(t, s.vv, lo.v_w, s.xb, s.xqi, s.xsi, d, d, tt)
         add_bias_rows(s.qq, t.fblob, lo.q_b, d, tt)   // q bias
         if (t.has_k_bias) {
             add_bias_rows(s.kk, t.fblob, lo.k_b, d, tt)
@@ -1079,15 +1178,15 @@ def encoder_blocks(t : AudioTower; var s : EncoderState; npos : int64) {
         if (l == 0l) {
             diff_stage("b0_attnout", s.xb2, tt * d)
         }
-        mm_blob_b(s.xb, t.fblob, lo.o_w, s.xb2, d, d, tt)
+        tw_mm_rq(t, s.xb, lo.o_w, s.xb2, s.xqi, s.xsi, d, d, tt)
         add_bias_rows(s.xb, t.fblob, lo.o_b, d, tt)
         add_inplace_rows(s.x, s.xb, tt * d)
 
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln2_w, lo.ln2_b, d, tt, t.eps)
-        mm_blob_b(s.h, t.fblob, lo.fc1_w, s.xb, d, t.n_ff, tt)
+        tw_mm_rq(t, s.h, lo.fc1_w, s.xb, s.xqi, s.xsi, d, t.n_ff, tt)
         add_bias_rows(s.h, t.fblob, lo.fc1_b, t.n_ff, tt)
         enc_gelu(t, s.h, tt * t.n_ff)
-        mm_blob_b(s.xb2, t.fblob, lo.fc2_w, s.h, t.n_ff, d, tt)
+        tw_mm_rq(t, s.xb2, lo.fc2_w, s.h, s.xqi, s.xsi, t.n_ff, d, tt)
         add_bias_rows(s.xb2, t.fblob, lo.fc2_b, d, tt)
         add_inplace_rows(s.x, s.xb2, tt * d)
         if (l == 0l) {
@@ -1146,17 +1245,17 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
         layernorm_batch(s.pooled, s.pooled, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tp, t.eps)
 
         // projector: one linear into the decoder's embedding space
-        mm_blob_b(s.out, t.fblob, t.proj_w_off, s.pooled, d, t.proj_dim, tp)
+        tw_mm_rq(t, s.out, t.proj_w_off, s.pooled, s.xqi, s.xsi, d, t.proj_dim, tp)
         add_bias_rows(s.out, t.fblob, t.proj_b_off, t.proj_dim, tp)
     } elif (t.proj_kind == AudioProjKind.ultravox) {
         // post-LN over all positions (no avg-pool), stacked rows straight off s.xb's memory
         layernorm_batch(s.xb, s.x, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tt, t.eps)
         let m1in = d * t.stack_factor
         rms_rows_blob(s.xb, t.fblob, t.normpre_off, m1in, rows)   // RMS-pre on stacked rows
-        mm_blob_b(s.ph, t.fblob, t.proj_w_off, s.xb, m1in, t.mm1_out, rows)
+        tw_mm_rq(t, s.ph, t.proj_w_off, s.xb, s.xqi, s.xsi, m1in, t.mm1_out, rows)
         swiglu_swapped_rows(s.pg, s.ph, t.mm1_out / 2l, rows)
         rms_rows_blob(s.pg, t.fblob, t.normmid_off, t.mm1_out / 2l, rows)
-        mm_blob_b(s.out, t.fblob, t.mm2_w_off, s.pg, t.mm1_out / 2l, t.proj_dim, rows)
+        tw_mm_rq(t, s.out, t.mm2_w_off, s.pg, s.xqi, s.xsi, t.mm1_out / 2l, t.proj_dim, rows)
     } else {   // voxtral: avg-pool -> post-LN -> stack -> mm1 -> gelu_erf -> mm2
         let tp = tt / 2l
         for (p in range64(tp)) {
@@ -1166,9 +1265,9 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
         }
         layernorm_batch(s.pooled, s.pooled, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tp, t.eps)
         let m1in = d * t.stack_factor
-        mm_blob_b(s.ph, t.fblob, t.proj_w_off, s.pooled, m1in, t.mm1_out, rows)
+        tw_mm_rq(t, s.ph, t.proj_w_off, s.pooled, s.xqi, s.xsi, m1in, t.mm1_out, rows)
         gelu_erf(s.ph, rows * t.mm1_out)
-        mm_blob_b(s.out, t.fblob, t.mm2_w_off, s.ph, t.mm1_out, t.proj_dim, rows)
+        tw_mm_rq(t, s.out, t.mm2_w_off, s.ph, s.xqi, s.xsi, t.mm1_out, t.proj_dim, rows)
     }
     diff_stage("out", s.out, rows * t.proj_dim)
 }

@@ -111,7 +111,7 @@ def load_asr_model(path : string) : AsrModel {
         panic("dasLLAMA asr: '{path}' has n_vocab {vocab} — matches neither whisper (51864-51866) nor parakeet (~1k)")
     }
     var m = AsrModel(kind = AsrKind.whisper)
-    m.whisper <- load_whisper_model(path)
+    m.whisper <- load_whisper_model(path, !g_asr_force_fp32)
     return <- m
 }
 

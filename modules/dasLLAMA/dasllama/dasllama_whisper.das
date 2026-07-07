@@ -177,7 +177,7 @@ def private wt_read_conv_permuted(recs : table<string; WTensorRec>; b : array<ui
 
 //! Load a whisper.cpp ggml-*.bin model (f32/f16 tensor types; quantized whisper bins are not
 //! supported). Verified against whisper.cpp's whisper_model_load, byte for byte.
-def load_whisper_model(path : string) : WhisperModel {
+def load_whisper_model(path : string; q8 : bool = false) : WhisperModel {
     var w = WhisperModel()
     // the record walk runs until EOF, so it needs the true byte count — length(bytes) is
     // int32 and wraps negative on >2 GB bins (large-v3); stat's st_size is 64-bit
@@ -335,6 +335,9 @@ def load_whisper_model(path : string) : WhisperModel {
         }
         wt_read(recs, bytes, "encoder.ln_post.weight", t.fblob, t.lnp_w_off, d)
         wt_read(recs, bytes, "encoder.ln_post.bias", t.fblob, t.lnp_b_off, d)
+        if (q8) {
+            tower_quantize(t)
+        }
         w.enc <- t
 
         // decoder blob

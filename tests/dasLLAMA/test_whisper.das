@@ -453,3 +453,60 @@ def test_whisper_transcribe_oracle(t : T?) {
         }
     }
 }
+
+[test]
+def test_whisper_q8_gate(t : T?) {
+    t |> run("tiny q8 tower (the load_asr_model default) stays token-identical to fp32 on jfk") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
+        if (!stat(model_path).is_valid) {
+            t |> success(true, "skipped: ggml-tiny.bin not present")
+            return
+        }
+        let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
+        if (length(samples) == 0) {
+            t |> success(true, "skipped: jfk.wav not present")
+            return
+        }
+        var m <- load_asr_model(model_path)     // the asr-surface default: q8 tower
+        set_asr_fp32(true)
+        var mf <- load_asr_model(model_path)    // knob-pinned fp32 (the oracle route)
+        set_asr_fp32(false)
+        t |> success(m.whisper.enc.q8, "default load is q8")
+        t |> success(!mf.whisper.enc.q8, "knob forces fp32")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var s <- create_session(m)
+            var segs : array<TranscribeSegment>
+            transcribe(m, s, samples) $(seg) {
+                segs |> push_clone(seg)
+            }
+            var sf <- create_session(mf)
+            var fsegs : array<TranscribeSegment>
+            transcribe(mf, sf, samples) $(seg) {
+                fsegs |> push_clone(seg)
+            }
+            t |> equal(length(segs), length(fsegs), "segment count")
+            var mismatches = 0
+            var total = 0
+            for (a, b in segs, fsegs) {
+                t |> equal(length(a.tokens), length(b.tokens), "token count per segment")
+                for (x, y in a.tokens, b.tokens) {
+                    total++
+                    if (x != y) {
+                        mismatches++
+                    }
+                }
+                t |> success(a.text == b.text, "q8/fp32 text")
+            }
+            t |> success(mismatches == 0, "q8/fp32 token-identical ({mismatches}/{total} flips)")
+        }
+        delete m.whisper.dblob
+        delete m.whisper.enc.fblob
+        delete mf.whisper.dblob
+        delete mf.whisper.enc.fblob
+    }
+}
