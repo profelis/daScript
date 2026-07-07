@@ -49,17 +49,22 @@ struct Wav2TxtArgs {
 }
 
 [export, tune_policy(missing = "auto")]
-def main {
+def main : int {
+    // inference on the interpreter is uselessly slow — require the JIT (or a jit -exe build)
+    if (!jit_enabled() && !is_standalone_exe()) {
+        to_log(LOG_ERROR, "wav2txt: run under the JIT — bin/daslang -jit utils/dasllama-server/wav2txt.das -- ...\n")
+        return 1
+    }
     var r <- parse_args(type<Wav2TxtArgs>)
     if (r |> is_err) {
         print("error: {r |> unwrap_err}\n\n")
         print_help(get_command_info(type<Wav2TxtArgs>), "wav2txt")
-        return
+        return 1
     }
     let cfg <- r |> move_unwrap
     if (cfg.help) {
         print_help(get_command_info(type<Wav2TxtArgs>), "wav2txt")
-        return
+        return 0
     }
 
     log_tune_status("wav2txt")
@@ -68,7 +73,7 @@ def main {
     let samples <- load_audio_16k_mono(cfg.file)
     if (empty(samples)) {
         to_log(LOG_ERROR, "wav2txt: could not decode audio: {cfg.file}\n")
-        return
+        return 1
     }
     let decode_s = double(get_time_usec(t_decode)) / 1.0e6lf
     let audio_s = double(length(samples)) / 16000.0lf   // 16 kHz mono
@@ -91,9 +96,11 @@ def main {
         to_log(LOG_INFO, "wav2txt: wrote {cfg.out}\n")
     } else {
         to_log(LOG_ERROR, "wav2txt: could not write {cfg.out}\n")
+        return 1
     }
 
     // rtf = transcription wall-clock / audio duration; < 1.0 is faster than real time
     let rtf = audio_s > 0.0lf ? transcribe_s / audio_s : 0.0lf
     to_log(LOG_INFO, "wav2txt: {audio_s} s audio | decode {decode_s} s | transcribe {transcribe_s} s | rtf {rtf}\n")
+    return 0
 }

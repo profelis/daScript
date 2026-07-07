@@ -58,17 +58,22 @@ def pick_quant(s : string) : QuantMode {
 }
 
 [export, tune_policy(missing = "auto")]
-def main {
+def main : int {
+    // inference on the interpreter is uselessly slow — require the JIT (or a jit -exe build)
+    if (!jit_enabled() && !is_standalone_exe()) {
+        to_log(LOG_ERROR, "ask: run under the JIT — bin/daslang -jit utils/dasllama-server/ask.das -- ...\n")
+        return 1
+    }
     var r <- parse_args(type<AskArgs>)
     if (r |> is_err) {
         print("error: {r |> unwrap_err}\n\n")
         print_help(get_command_info(type<AskArgs>), "ask")
-        return
+        return 1
     }
     let cfg <- r |> move_unwrap
     if (cfg.help) {
         print_help(get_command_info(type<AskArgs>), "ask")
-        return
+        return 0
     }
 
     log_tune_status("ask")
@@ -93,4 +98,5 @@ def main {
         print("\n[prompt {st.n_prompt} tok | gen {st.n_gen} tok | ttft {int(st.ttft_s * 1000.0lf)}ms | ")
         print("prefill {int(st.prefill_tps)} t/s | gen {int(st.gen_tps)} t/s]\n")
     }
+    return 0
 }

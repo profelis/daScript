@@ -69,17 +69,22 @@ def pick_quant(s : string) : QuantMode {
 // tuner and relaunches; thereafter it serves directly. DAS_TUNE_POLICY=error (or =fallback)
 // overrides while developing — no per-start tuning. --tune forces a re-tune + relaunch.
 [export, tune_policy(missing = "auto")]
-def main {
+def main : int {
+    // inference on the interpreter is uselessly slow — require the JIT (or a jit -exe build)
+    if (!jit_enabled() && !is_standalone_exe()) {
+        to_log(LOG_ERROR, "dasllama-server: run under the JIT — bin/daslang -jit utils/dasllama-server/main.das -- ...\n")
+        return 1
+    }
     var r <- parse_args(type<ServerArgs>)
     if (r |> is_err) {
         print("error: {r |> unwrap_err}\n\n")
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
-        return
+        return 1
     }
     let cfg <- r |> move_unwrap
     if (cfg.help) {
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
-        return
+        return 0
     }
 
     let port = cfg.port > 0 ? cfg.port : 8080     // non-positive (incl. a stray negative) -> default
@@ -98,4 +103,5 @@ def main {
     }
 
     run_server(port)
+    return 0
 }
