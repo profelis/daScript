@@ -241,7 +241,6 @@ struct ParakeetState {
     pre : array<float>
     padded : array<float>
     // conv subsampling
-    col : array<float>
     y0 : array<float>
     y2 : array<float>
     y3 : array<float>
@@ -328,8 +327,9 @@ def private pk_requant(x : array<float>; n, npos : int64; var xq : array<int8>; 
     asr_requant_rows_q8(x, n, npos, xq, xs)
 }
 
-// dw taps arrive [ch][3][3] (torch layout); the f4 dw kernel wants tap-major [9][ch]
-def private pk_dw_tap_major(var blob : array<float>; off, ch : int64) {
+// conv taps arrive [ch][3][3] (dw, torch) / [cout][9] (c0, im2col order); the f4 kernels
+// want tap-major [9][ch]
+def private pk_conv_tap_major(var blob : array<float>; off, ch : int64) {
     var tmp : array<float>
     tmp |> resize(int(ch * 9l))
     for (c in range64(ch)) {
@@ -551,14 +551,15 @@ def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
 
         var wscratch : array<float>   // q8 transcode staging, one GEMM tensor at a time
         pk_read(recs, bytes, "encoder.pre_encode.conv.0.weight", m.blob, m.c0_w, nch * 9l)
+        pk_conv_tap_major(m.blob, m.c0_w, nch)   // c0 kernel reads tap-major too
         pk_read(recs, bytes, "encoder.pre_encode.conv.0.bias", m.blob, m.c0_b, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.2.weight", m.blob, m.c2_w, nch * 9l)
-        pk_dw_tap_major(m.blob, m.c2_w, nch)
+        pk_conv_tap_major(m.blob, m.c2_w, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.2.bias", m.blob, m.c2_b, nch)
         pk_read_gemm(recs, bytes, "encoder.pre_encode.conv.3.weight", m, wscratch, m.c3_w, nch * nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.3.bias", m.blob, m.c3_b, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.5.weight", m.blob, m.c5_w, nch * 9l)
-        pk_dw_tap_major(m.blob, m.c5_w, nch)
+        pk_conv_tap_major(m.blob, m.c5_w, nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.5.bias", m.blob, m.c5_b, nch)
         pk_read_gemm(recs, bytes, "encoder.pre_encode.conv.6.weight", m, wscratch, m.c6_w, nch * nch)
         pk_read(recs, bytes, "encoder.pre_encode.conv.6.bias", m.blob, m.c6_b, nch)
@@ -737,34 +738,61 @@ def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel; var st : Par
 
 // ===== conv subsampling =====
 
-// regular conv2d k3 s2 p1 over [iw × ih × cin] (rows [ih][iw][c], c fastest) via im2col+GEMM
-def private pk_conv2d_s2(var out : array<float>; var col : array<float>;
-                         x : array<float>; blob : array<float>; w_off, b_off : int64;
-                         iw, ih, cin, cout : int64) {
+// c0: conv2d k3 s2 p1, cin=1, bias+relu fused. Each output row is 9 scalar-broadcast
+// mads over the contiguous channel axis; w tap-major [9][cout] (repacked at load, 9 KB —
+// L1-resident), OOB taps skipped (exact zeros in the im2col form). Bit-exact vs the old
+// im2col+K9-GEMM+bias+relu chain and 6.5x faster single-lane (see conv_sub_bench).
+def private pk_conv2d_c1_s2_relu(var out : array<float>; x : array<float>; blob : array<float>;
+                                 w_off, b_off : int64; iw, ih, cout : int64) {
     let ow = (iw - 1l) / 2l + 1l
     let oh = (ih - 1l) / 2l + 1l
-    let kdim = cin * 9l
-    let rows = oh * ow
-    pk_ensure(col, rows * kdim)
-    for (oy in range64(oh)) {
-        for (ox in range64(ow)) {
-            let r = (oy * ow + ox) * kdim
-            for (ic in range64(cin)) {
-                for (kh in range64(3l)) {
-                    let iy = oy * 2l - 1l + kh
+    pk_ensure(out, oh * ow * cout)
+    unsafe {
+        var op = addr(out[0])
+        let xp = reinterpret<float const?>(addr(x[0]))
+        let wp = reinterpret<float const?>(addr(blob[w_off]))
+        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        let zero = float4(0.0)
+        for (oy in range64(oh)) {
+            let iy0 = oy * 2l - 1l
+            for (ox in range64(ow)) {
+                let ix0 = ox * 2l - 1l
+                var xs : float[9]
+                for (kh in range64(3l)) {   // 9 guarded scalar taps, hoisted out of the channel sweep
+                    let iy = iy0 + kh
                     for (kw in range64(3l)) {
-                        let ix = ox * 2l - 1l + kw
-                        col[r + (ic * 3l + kh) * 3l + kw] = (iy >= 0l && iy < ih && ix >= 0l && ix < iw
-                            ? x[(iy * iw + ix) * cin + ic]
-                            : 0.0)
+                        let ix = ix0 + kw
+                        xs[kh * 3l + kw] = (iy >= 0l && iy < ih && ix >= 0l && ix < iw ? xp[iy * iw + ix] : 0.0)
                     }
+                }
+                let x0 = float4(xs[0], xs[0], xs[0], xs[0])
+                let x1 = float4(xs[1], xs[1], xs[1], xs[1])
+                let x2 = float4(xs[2], xs[2], xs[2], xs[2])
+                let x3 = float4(xs[3], xs[3], xs[3], xs[3])
+                let x4 = float4(xs[4], xs[4], xs[4], xs[4])
+                let x5 = float4(xs[5], xs[5], xs[5], xs[5])
+                let x6 = float4(xs[6], xs[6], xs[6], xs[6])
+                let x7 = float4(xs[7], xs[7], xs[7], xs[7])
+                let x8 = float4(xs[8], xs[8], xs[8], xs[8])
+                let o = (oy * ow + ox) * cout
+                var c = 0l
+                while (c < cout) {
+                    var acc = x0 * (*reinterpret<float4 const?>(wp + c))
+                    acc = mad(x1, *reinterpret<float4 const?>(wp + cout + c), acc)
+                    acc = mad(x2, *reinterpret<float4 const?>(wp + 2l * cout + c), acc)
+                    acc = mad(x3, *reinterpret<float4 const?>(wp + 3l * cout + c), acc)
+                    acc = mad(x4, *reinterpret<float4 const?>(wp + 4l * cout + c), acc)
+                    acc = mad(x5, *reinterpret<float4 const?>(wp + 5l * cout + c), acc)
+                    acc = mad(x6, *reinterpret<float4 const?>(wp + 6l * cout + c), acc)
+                    acc = mad(x7, *reinterpret<float4 const?>(wp + 7l * cout + c), acc)
+                    acc = mad(x8, *reinterpret<float4 const?>(wp + 8l * cout + c), acc)
+                    acc += *reinterpret<float4 const?>(bp + c)
+                    *reinterpret<float4?>(op + o + c) = max(acc, zero)
+                    c += 4l
                 }
             }
         }
     }
-    pk_ensure(out, rows * cout)
-    mm_blob_b(out, blob, w_off, col, kdim, cout, rows)
-    add_bias_rows(out, blob, b_off, cout, rows)
 }
 
 // guarded single position of the depthwise 3x3 (borders where a tap falls off the image)
@@ -859,8 +887,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
     var tp = ref_time_ticks()
     let t1 = (st.mel.n_len - 1l) / 2l + 1l
     let w1 = (m.n_mel - 1l) / 2l + 1l          // 64
-    pk_conv2d_s2(st.y0, st.col, st.mel.data, m.blob, m.c0_w, m.c0_b, m.n_mel, st.mel.n_len, 1l, nch)
-    pk_relu(st.y0, t1 * w1 * nch)
+    pk_conv2d_c1_s2_relu(st.y0, st.mel.data, m.blob, m.c0_w, m.c0_b, m.n_mel, st.mel.n_len, nch)
     pk_conv2d_dw_s2(st.y2, st.y0, m.blob, m.c2_w, m.c2_b, w1, t1, nch)
     let w2 = (w1 - 1l) / 2l + 1l               // 32
     let t2 = (t1 - 1l) / 2l + 1l
