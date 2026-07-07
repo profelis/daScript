@@ -81,9 +81,11 @@ TSVs: das `results_pk_ls_m1_t8_jo.tsv`, cli/onnx `results_pk_ls_m1_t8_p0.tsv`.
 
 das = tower q8 + threaded gelu table (`d25a46542`) + decoder q8 (`cb20e2954`) + the
 parakeet-parity opt pass (`8c10b930e`: per-frame threaded mel, threaded f4 cross_kv
-scatters, zero-alloc sessions, hmax+exp4 decode passes). Remaining profiled levers: tower
-attention head-unit raggedness (tiny 6 / turbo 20 units vs lane count — dominates encode),
-fc1/fc2 q8 rate gap.
+scatters, zero-alloc sessions, hmax+exp4 decode passes) + threaded bias/residual row
+passes (`cb26a05d0` — the "fc1/fc2 q8 rate gap" was single-threaded bias/residual
+bandwidth, not requant; ffn mm now runs ~84% of the aggregate lane estimate). Remaining
+profiled lever: tower attention head-unit raggedness (tiny 6 / turbo 20 units vs lane
+count — dominates encode).
 
 ### Apple M1 Max, 8 threads — both sides 2026-07-07 @ `da4254be9`, interleaved, best-of-2
 
@@ -105,31 +107,32 @@ pending a Parsec-off window.
 
 TSV (both sides): `results_wh_m1_t8.tsv`.
 
-### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `8c10b930e` (whisper opt pass); cli TSV 2026-07-07
+### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `cb26a05d0` (opt pass + threaded bias); cli TSV 2026-07-07
 
 | model | file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
 |---|---|---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 280 | 213 | 643 | 1.32x | **0.44x** |
-| tiny | jfk3.wav | 33 | 632 | 500 | - | 1.26x | - |
-| tiny | gb1.wav | 199 | 3315 | 2845 | - | 1.17x | - |
-| tiny | hp0.wav | 273 | 4118 | 3546 | - | 1.16x | - |
-| tiny | hp0x2.wav | 547 | 8058 | 7327 | - | 1.10x | - |
-| large-v3-turbo | jfk.wav | 11 | 4451 | 6728 | 3730 | **0.66x** | 1.19x |
-| large-v3-turbo | jfk3.wav | 33 | 9382 | 13657 | - | **0.69x** | - |
-| large-v3-turbo | gb1.wav | 199 | 39955 | 76720 | - | **0.52x** | - |
-| large-v3-turbo | hp0.wav | 273 | 57495 | 100852 | - | **0.57x** | - |
-| large-v3-turbo | hp0x2.wav | 547 | 111451 | 189313 | - | **0.59x** | - |
+| tiny | jfk.wav | 11 | 283 | 213 | 643 | 1.33x | **0.44x** |
+| tiny | jfk3.wav | 33 | 629 | 500 | - | 1.26x | - |
+| tiny | gb1.wav | 199 | 3292 | 2845 | - | 1.16x | - |
+| tiny | hp0.wav | 273 | 4007 | 3546 | - | 1.13x | - |
+| tiny | hp0x2.wav | 547 | 7985 | 7327 | - | 1.09x | - |
+| large-v3-turbo | jfk.wav | 11 | 4277 | 6728 | 3730 | **0.64x** | 1.15x |
+| large-v3-turbo | jfk3.wav | 33 | 8944 | 13657 | - | **0.65x** | - |
+| large-v3-turbo | gb1.wav | 199 | 38832 | 76720 | - | **0.51x** | - |
+| large-v3-turbo | hp0.wav | 273 | 55784 | 100852 | - | **0.55x** | - |
+| large-v3-turbo | hp0x2.wav | 547 | 107401 | 189313 | - | **0.57x** | - |
 
-TSVs: das `results_wh_zen2_t16_whopt.tsv` (best-of-2), cli side of `results_wh_zen2_t16.tsv`,
+TSVs: das `results_wh_zen2_t16_whopt2.tsv` (best-of-2), cli side of `results_wh_zen2_t16.tsv`,
 onnx `results_wh_zen2_t16_onnx.tsv` (2026-07-08). onnx = onnx-community exports, int8, ORT
 `intra_op=16` — the adapter is a SINGLE 30 s window (no long-form chunking; >30 s clips
 return truncated/empty text — skipped, `63e2ac191`), so jfk is its only valid row. The
 whisper opt pass (per-frame threaded mel, threaded f4 cross_kv scatters, zero-alloc
-sessions, hmax+exp4 decode passes) cut das tiny 22-25% and turbo 6-8% on this box: tiny
-trails AVX2 cli 1.10-1.32x (was 1.47-1.68x), turbo's lead widens to 0.52-0.69x, and das
-now beats onnx-int8 2.3x on its one comparable tiny row. tiny's remaining wall is
-unchanged — encoder attn head-units (~72% of encode at 6 units on 16 lanes); decoder q8
-stays net-neutral here (logits/cross_kv wins vs cache-hot per-layer GEMV losses — no VNNI).
+sessions, hmax+exp4 decode passes) cut das tiny 22-25% and turbo 6-8% on this box, and
+the threaded bias/residual passes (`cb26a05d0`) another 3-5% on turbo: tiny trails AVX2
+cli 1.09-1.33x (was 1.47-1.68x), turbo's lead widens to 0.51-0.65x, and das now beats
+onnx-int8 2.3x on its one comparable tiny row. tiny's remaining wall is unchanged —
+encoder attn head-units (~72% of encode at 6 units on 16 lanes); decoder q8 stays
+net-neutral here (logits/cross_kv wins vs cache-hot per-layer GEMV losses — no VNNI).
 
 ## Correctness
 
@@ -143,6 +146,8 @@ stays net-neutral here (logits/cross_kv wins vs cache-hot per-layer GEMV losses 
 
 ## Changelog
 
+- 2026-07-08 `cb26a05d0`: threaded bias/residual row passes (the "fc1/fc2 q8 rate gap" —
+  sub-buckets showed single-threaded bias bandwidth, not requant); zen2 turbo -3-5%.
 - 2026-07-08 `8c10b930e`: whisper parakeet-parity opt pass (per-frame threaded mel `a19a9d5ec`,
   threaded f4 cross_kv scatters `dec9f8656`, phase-0 zero-alloc `3c31be3a0`, decode
   hmax+exp4 `8c10b930e`); zen2 das re-sweep — tiny -22-25%, turbo -6-8%. M1 whisper table
