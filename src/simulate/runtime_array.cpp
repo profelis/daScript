@@ -96,10 +96,19 @@ namespace das
             context.throw_error_at(at, "array_resize: newSize exceeds INT64_MAX [newSize=%llu]", (unsigned long long)newSize);
         }
         if ( newSize > arr.capacity ) {
-            uint64_t newCapacity = uint64_t(1) << (64 - das_clz64(das::max(newSize, uint64_t(2)) - 1));
-            newCapacity = das::max(newCapacity, uint64_t(16));
-            // The pow2 round-up overflows past INT64_MAX when newSize > 2^62; clamp so the
-            // resulting capacity stays representable in the int64 long_capacity() surface.
+            uint64_t newCapacity;
+            // Small arrays round the capacity up to the next power of two, leaving slack for
+            // cheap incremental growth. Past 256 bytes that pow2 slack wastes up to ~2x memory,
+            // so a large resize() sizes to the request exactly (this is resize-only; push keeps
+            // geometric growth via array_grow). The newSize<=256 guard keeps newSize*stride from
+            // overflowing uint64 in the byte-size test.
+            if ( newSize <= uint64_t(256) && newSize * uint64_t(stride) <= uint64_t(256) ) {
+                newCapacity = uint64_t(1) << (64 - das_clz64(das::max(newSize, uint64_t(2)) - 1));
+                newCapacity = das::max(newCapacity, uint64_t(16));
+            } else {
+                newCapacity = newSize;
+            }
+            // Keep the resulting capacity representable in the int64 long_capacity() surface.
             if ( newCapacity > uint64_t(INT64_MAX) ) newCapacity = uint64_t(INT64_MAX);
             array_reserve(context, arr, newCapacity, stride, at);
         }

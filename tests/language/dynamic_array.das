@@ -41,6 +41,21 @@ def test_dynamic_array(t : T?) {
         t |> equal(capacity(arr), 33)
         t |> equal(length(arr), 4)
     }
+    t |> run("resize rounds to pow2 only under 256 bytes") @(t : T?) {
+        // int stride is 4 bytes, so the 256-byte pow2 threshold is 64 elements.
+        var tiny : array<int>
+        resize(tiny, 63)                // 252 bytes -> rounds UP to next pow2 (exact sizing would give 63)
+        t |> equal(capacity(tiny), 64)
+        var small : array<int>
+        resize(small, 64)               // exactly 256 bytes -> still next pow2
+        t |> equal(capacity(small), 64)
+        var big : array<int>
+        resize(big, 65)                 // 260 bytes -> sized exactly, not 128
+        t |> equal(capacity(big), 65)
+        var huge : array<int>
+        resize(huge, 1000)              // sized exactly, not 1024
+        t |> equal(capacity(huge), 1000)
+    }
     t |> run("move semantics") @(t : T?) {
         var arr : array<int>
         push(arr, 1)
