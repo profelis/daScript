@@ -3978,7 +3978,9 @@ class public CppAot : AstVisitor {
             write(*ss, "{tabs()}das_iterator_{(unsafe(reinterpret<ExprCallFunc?>(src))).func.name} DAS_COMMENT(");
         } else {
             let type_str = describeCppType(src._type, DescribeConfig(substitute_ref = true, skip_ref = true, cross_platform = cross_platform));
-            write(*ss, "{tabs()}das_iterator<{type_str}> {forSrcName(variable.name)}(");
+            // double parens: a source like range64(int64_t(a),int64_t(b)) is all constructor-style
+            // casts, so single parens parse as a function DECLARATION (most vexing parse)
+            write(*ss, "{tabs()}das_iterator<{type_str}> {forSrcName(variable.name)}((");
         }
     }
     def override visitExprForSource(ffor : ExprFor?; that : ExpressionPtr; last : bool) {
@@ -3996,8 +3998,10 @@ class public CppAot : AstVisitor {
             visit_expression(pCall.arguments[0], adapter);
             write(*ss, ",");
             visit_expression(pCall.arguments[1], adapter);
+            write(*ss, ");\n");
+        } else {
+            write(*ss, "));\n");   // closes the anti-vexing-parse double paren
         }
-        write(*ss, ");\n");
 
         // source
         // A value (non-ref) loop var is a local copy that first()/next() write into, so it must not be
