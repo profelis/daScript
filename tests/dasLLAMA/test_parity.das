@@ -6,6 +6,7 @@ require dasllama/dasllama   // the public facade — public-path tests exercise 
 require daslib/jobque_boost
 require daslib/fio
 require strings
+require _model_tier   // models_dir() + model_available() presence/size-tier gate (see the file's header)
 
 // Frozen token-for-token parity fixtures for the GGUF arches that stories15M (test_forward.das)
 // doesn't cover. Each fixture is a prompt-ID list + the reference greedy continuation that
@@ -15,12 +16,6 @@ require strings
 //
 // Prompts are deliberately the *confident* ones: high-entropy prompts flip on genuine near-ties
 // (sub-ULP libm cos/sin/exp/tanh vs llama.cpp), which are not bugs. See dasllama_newmodels_arc.
-
-// override the machine-local model root with DASLLAMA_MODELS_DIR (e.g. on the x64 handoff box)
-def private models_dir() : string {
-    let env = get_env_variable("DASLLAMA_MODELS_DIR")
-    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
-}
 
 def private same(a, b : array<int64>) : bool {
     if (length(a) != length(b)) {
@@ -91,10 +86,7 @@ def test_parity_tied_cls_q8_rows(t : T?) {
             return
         }
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var t32 <- load_gguf(path, QuantMode.fp32)
         var t8 <- load_gguf(path, QuantMode.q8)
         t |> success(!t32.cls_q8, "fp32 load keeps the fblob table")
@@ -137,10 +129,7 @@ def test_parity_gemma2(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, GEMMA2_PROMPT, GEMMA2_GEN), "gemma2 token-for-token")
     }
 }
@@ -161,10 +150,7 @@ def test_parity_tinyllama_v03(t : T?) {
             return
         }
         let path = path_join(models_dir(), "tinyllama-1.1b-v0.3-f16.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.fp32, TINYLLAMA_V03_PROMPT, TINYLLAMA_V03_GEN), "tinyllama v0.3 token-for-token")
     }
 }
@@ -185,10 +171,7 @@ def test_parity_llama3_2_1b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, LLAMA32_1B_PROMPT, LLAMA32_1B_GEN), "llama-3.2-1b token-for-token")
     }
 }
@@ -211,10 +194,7 @@ def test_parity_qwen25_15b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Qwen2.5-1.5B-Instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, QWEN25_15B_PROMPT, QWEN25_15B_GEN), "qwen2.5-1.5b token-for-token")
     }
 }
@@ -236,10 +216,7 @@ def test_parity_phi35(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, PHI35_PROMPT, PHI35_GEN), "phi-3.5 token-for-token")
     }
 }
@@ -259,10 +236,7 @@ def test_parity_smollm2(t : T?) {
             return
         }
         let path = path_join(models_dir(), "SmolLM2-1.7B-Instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, SMOLLM2_PROMPT, SMOLLM2_GEN), "smollm2 token-for-token")
     }
 }
@@ -282,10 +256,7 @@ def test_parity_mistral7b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Mistral-7B-Instruct-v0.3-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, MISTRAL7B_PROMPT, MISTRAL7B_GEN), "mistral-7b-v0.3 token-for-token")
     }
 }
@@ -308,10 +279,7 @@ def test_parity_qwen3_06b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, QWEN3_PROMPT, QWEN3_GEN), "qwen3-0.6b token-for-token")
     }
 }
@@ -324,10 +292,7 @@ def test_parity_qwen3_4b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Qwen3-4B-Instruct-2507-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, QWEN3_PROMPT, QWEN3_GEN), "qwen3-4b token-for-token")
     }
 }
@@ -346,10 +311,7 @@ def test_parity_qwen2moe(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var tr <- load_gguf(path, QuantMode.q8)
         if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
             tr.config.seq_len = 2048l
@@ -399,10 +361,7 @@ def test_parity_gemma3_1b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gemma-3-1b-it-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, GEMMA3_1B_PROMPT, GEMMA3_1B_GEN), "gemma3-1b token-for-token")
     }
 }
@@ -415,10 +374,7 @@ def test_parity_gemma3_4b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gemma-3-4b-it-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, GEMMA3_PROMPT, GEMMA3_4B_GEN), "gemma3-4b token-for-token")
     }
 }
@@ -468,10 +424,7 @@ def test_parity_gemma4_12b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gemma-4-12B-it-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-12b token-for-token")
     }
 }
@@ -516,10 +469,7 @@ def test_parity_gptoss_20b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gpt-oss-20b-mxfp4.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var tr <- load_model(path, QuantMode.q8)
         if (tr.config.seq_len > 2048l) {
             tr.config.seq_len = 2048l

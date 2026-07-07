@@ -12,6 +12,7 @@ require daslib/jobque_boost
 require daslib/fio
 require math
 require strings
+require _model_tier   // model_available() presence/size-tier gate (see the file's header)
 
 // Whisper-proper tests. The f16/gelu/mel/id tests are self-contained; the loader and
 // transcription tests need a whisper.cpp ggml-tiny.bin (gitignored) and skip without it.
@@ -227,10 +228,7 @@ def test_dec_layer_layout(t : T?) {
 def test_whisper_loader(t : T?) {
     t |> run("tiny bin: hparams, special ids, vocab (needs ggml-tiny.bin)") @(t : T?) {
         let path = path_join(whisper_models_dir(), "ggml-tiny.bin")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: ggml-tiny.bin not present")
-            return
-        }
+        if (!model_available(t, path)) return
         let w <- load_whisper_model(path)
         t |> equal(w.n_vocab, 51865l)
         t |> equal(w.enc.n_mel, 80l)
@@ -256,10 +254,7 @@ def test_whisper_loader(t : T?) {
 def test_asr_surface(t : T?) {
     t |> run("load_asr_model sniffs the bin + caps report whisper honestly") @(t : T?) {
         let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
-        if (!stat(model_path).is_valid) {
-            t |> success(true, "skipped: ggml-tiny.bin not present")
-            return
-        }
+        if (!model_available(t, model_path)) return
         var m <- load_asr_model(model_path)   // the sniff route: ggml magic + big vocab -> whisper
         t |> equal(m.whisper.n_vocab, 51865l, "loaded through the sniff")
         let c <- caps(m)
@@ -288,10 +283,7 @@ def test_qwen3a_tower(t : T?) {
             return
         }
         let path = path_join(samples_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: mmproj-Qwen3-ASR-0.6B-bf16.gguf not present")
-            return
-        }
+        if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -333,10 +325,7 @@ def test_parakeet_oracle(t : T?) {
             return
         }
         let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v2-f32.bin")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: ggml-parakeet-tdt-0.6b-v2-f32.bin not present")
-            return
-        }
+        if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -399,10 +388,7 @@ def test_parakeet_v3_oracle(t : T?) {
             return
         }
         let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v3-f32.bin")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: ggml-parakeet-tdt-0.6b-v3-f32.bin not present")
-            return
-        }
+        if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -445,10 +431,7 @@ def test_whisper_transcribe_oracle(t : T?) {
             return
         }
         let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
-        if (!stat(model_path).is_valid) {
-            t |> success(true, "skipped: ggml-tiny.bin not present")
-            return
-        }
+        if (!model_available(t, model_path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -524,10 +507,7 @@ def test_whisper_q8_gate(t : T?) {
             return
         }
         let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
-        if (!stat(model_path).is_valid) {
-            t |> success(true, "skipped: ggml-tiny.bin not present")
-            return
-        }
+        if (!model_available(t, model_path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
