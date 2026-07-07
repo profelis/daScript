@@ -105,26 +105,30 @@ TSV (both sides): `results_wh_m1_t8.tsv`.
 
 ### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `cb20e2954` (decoder q8); cli TSV 2026-07-07
 
-| model | file | audio s | das ms | cli ms | das/cli |
-|---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 358 | 213 | 1.68x |
-| tiny | jfk3.wav | 33 | 828 | 500 | 1.66x |
-| tiny | gb1.wav | 199 | 4256 | 2845 | 1.50x |
-| tiny | hp0.wav | 273 | 5366 | 3546 | 1.51x |
-| tiny | hp0x2.wav | 547 | 10758 | 7327 | 1.47x |
-| large-v3-turbo | jfk.wav | 11 | 4783 | 6728 | **0.71x** |
-| large-v3-turbo | jfk3.wav | 33 | 10015 | 13657 | **0.73x** |
-| large-v3-turbo | gb1.wav | 199 | 43552 | 76720 | **0.57x** |
-| large-v3-turbo | hp0.wav | 273 | 62500 | 100852 | **0.62x** |
-| large-v3-turbo | hp0x2.wav | 547 | 120378 | 189313 | **0.64x** |
+| model | file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
+|---|---|---|---|---|---|---|---|
+| tiny | jfk.wav | 11 | 358 | 213 | 643 | 1.68x | **0.56x** |
+| tiny | jfk3.wav | 33 | 828 | 500 | - | 1.66x | - |
+| tiny | gb1.wav | 199 | 4256 | 2845 | - | 1.50x | - |
+| tiny | hp0.wav | 273 | 5366 | 3546 | - | 1.51x | - |
+| tiny | hp0x2.wav | 547 | 10758 | 7327 | - | 1.47x | - |
+| large-v3-turbo | jfk.wav | 11 | 4783 | 6728 | 3730 | **0.71x** | 1.28x |
+| large-v3-turbo | jfk3.wav | 33 | 10015 | 13657 | - | **0.73x** | - |
+| large-v3-turbo | gb1.wav | 199 | 43552 | 76720 | - | **0.57x** | - |
+| large-v3-turbo | hp0.wav | 273 | 62500 | 100852 | - | **0.62x** | - |
+| large-v3-turbo | hp0x2.wav | 547 | 120378 | 189313 | - | **0.64x** | - |
 
-TSVs: das `results_wh_zen2_t16_dq8.tsv`, cli side of `results_wh_zen2_t16.tsv`. Decoder q8
+TSVs: das `results_wh_zen2_t16_dq8.tsv`, cli side of `results_wh_zen2_t16.tsv`, onnx
+`results_wh_zen2_t16_onnx.tsv` (2026-07-08). onnx = onnx-community exports, int8, ORT
+`intra_op=16` — the adapter is a SINGLE 30 s window (no long-form chunking; >30 s clips
+return truncated/empty text — skipped, `63e2ac191`), so jfk is its only valid row. Decoder q8
 is net-neutral end-to-end on this box (stage A/B, tiny/jfk: logits GEMV 3.8x + cross_kv
 1.6x faster, but the cache-resident per-layer decoder GEMVs run +7-21% SLOWER q8 — AVX2
 int8 dot + requant loses to plain FMA on L2/L3-hot weights without VNNI; decode is ~15% of
 tiny anyway). tiny's real wall = encoder attn head-units (72% of encode at 6 units on 16
-lanes); without AMX the q8 tower wins turbo outright. onnx whisper columns pending
-(harness wired, `f7bab29e3`).
+lanes); without AMX the q8 tower wins turbo outright. On the one onnx-comparable row, das
+wins tiny 1.8x while onnx-int8 leads turbo jfk 1.28x (short-clip; no long-file column
+exists to compare).
 
 ## Correctness
 
@@ -140,6 +144,8 @@ lanes); without AMX the q8 tower wins turbo outright. onnx whisper columns pendi
 
 - 2026-07-08 `cb20e2954`: whisper decoder q8; zen2 das re-sweep — end-to-end neutral there
   (logits/cross_kv wins vs cache-hot GEMV losses), M1 re-sweep pending Parsec window.
+- 2026-07-08 `63e2ac191`: zen2 onnx whisper columns (jfk-only — the onnx-asr whisper
+  adapter is single-window; >30 s rows skipped by the harness).
 - 2026-07-07 `c5ad73980`+: doc restructured — current tables only, per-platform sections.
 - 2026-07-07 `97e7e7cf6`: zen2 v3 three-side round (first v3/onnx numbers on that box).
 - 2026-07-07 `0ee3807ec`: zen2 das re-sweep post dispatch-fix + TUNE — das leads every row.
