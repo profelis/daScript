@@ -21,6 +21,9 @@ require dasllama/dasllama_par
 let PARAKEET_HOP = 160l
 let private LOCAL_ATTN_THRESHOLD = 8192l   // beyond this the oracle switches to local attention
 
+// interleaved (re, im) slots of one 512-pt FFT frame — the mel worker's stack buffer
+let private FFT_FRAME = 1024
+
 //! One decoded TDT token: vocab id, chosen duration (index + frames), the encoder frame it
 //! was emitted at, and its (log-)probability under the joint's full-row log-softmax.
 struct ParakeetToken {
@@ -86,7 +89,7 @@ struct ParakeetModel {
     durations : array<int>
     filters : array<float>     // [n_mel][n_fb]
     window : array<float>      // STFT window from the file
-    twiddles : array<float>    // DFT-as-GEMM twiddle matrix [n_fft × (n_fft/2+1)·2], built at load
+    fft : FftPlan = FftPlan()  // radix-2 plan (n_fft is 512 on every parakeet); built at load
     vocab : array<string>
     blob : array<float>
     // pre-encode conv stack
@@ -237,9 +240,6 @@ struct ParakeetState {
     mel : WhisperMel = WhisperMel()
     pre : array<float>
     padded : array<float>
-    xw : array<float>
-    reim : array<float>
-    power : array<float>
     // conv subsampling
     col : array<float>
     y0 : array<float>
@@ -423,7 +423,10 @@ def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
         m.n_durations = int64(rd_i32(bytes, o)); o += 4l
         m.n_max_tokens = int64(rd_i32(bytes, o)); o += 4l
         m.blank_id = int(m.n_vocab)
-        m.twiddles <- build_dft_twiddles(m.n_fft)
+        if (m.n_fft != 512l) {   // FFT_FRAME in the mel worker is sized for 512-pt frames
+            panic("dasLLAMA parakeet: n_fft {m.n_fft} — the mel path is built for the family's 512-pt STFT")
+        }
+        m.fft <- build_fft_plan(m.n_fft)
 
         // mel filterbank
         let fb_mel = int64(rd_i32(bytes, o)); o += 4l
@@ -636,52 +639,62 @@ def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel; var st : Par
     let n_bins = n_fft / 2l + 1l
     let wsz = int64(length(m.window))
     let wpad = (n_fft - wsz) / 2l
-
-    // windowed frames as GEMM rows: only [wpad, wpad+wsz) carries signal — zero the whole
-    // image first since the scratch is reused
-    pk_ensure(st.xw, st.mel.n_len * n_fft)
-    for (i in range64(st.mel.n_len * n_fft)) {
-        st.xw[i] = 0.0
-    }
-    for (i in range64(st.mel.n_len)) {
-        let off = i * PARAKEET_HOP
-        let n_do = min(wsz, n_padded - off)   // window applied at [wpad, wpad+wsz)
-        for (j in range64(n_do)) {
-            if (off + wpad + j < n_padded) {
-                st.xw[i * n_fft + wpad + j] = m.window[j] * st.padded[off + wpad + j]
-            }
-        }
-    }
-    pk_ensure(st.reim, st.mel.n_len * n_bins * 2l)
-    for (i in range64(st.mel.n_len * n_bins * 2l)) {   // gemm_f32 ACCUMULATES — zero the reused C
-        st.reim[i] = 0.0
-    }
-    gemm_f32(unsafe(addr(st.reim[0])), unsafe(addr(st.xw[0])), unsafe(addr(m.twiddles[0])),
-             st.mel.n_len, n_fft, n_bins * 2l)
-
     let mel_eps = 5.960464477539063e-08lf
-    pk_ensure(st.power, n_bins)
-    for (i in range64(st.mel.n_len)) {
-        for (k in range64(n_bins)) {
-            let re = st.reim[i * n_bins * 2l + k * 2l]
-            let im = st.reim[i * n_bins * 2l + k * 2l + 1l]
-            st.power[k] = re * re + im * im
-        }
-        for (j in range64(m.n_mel)) {
-            var sum = 0.0lf
-            var k = 0l
-            while (k + 3l < n_bins) {
-                sum += double(st.power[k] * m.filters[j * n_bins + k]
-                    + st.power[k + 1l] * m.filters[j * n_bins + k + 1l]
-                    + st.power[k + 2l] * m.filters[j * n_bins + k + 2l]
-                    + st.power[k + 3l] * m.filters[j * n_bins + k + 3l])
-                k += 4l
+    let n_len = st.mel.n_len
+    let n_mel = m.n_mel
+
+    // per-frame windowed 512-pt FFT + mel matvec, threaded over frames (frames are
+    // independent — bit-exact at any lane count); scratch is a per-worker stack frame,
+    // so a 9-minute clip no longer materializes the whole [frames × n_fft] image
+    unsafe {
+        let pdd = reinterpret<float const?>(addr(st.padded[0]))
+        let wnd = reinterpret<float const?>(addr(m.window[0]))
+        let flt = reinterpret<float const?>(addr(m.filters[0]))
+        let rev = reinterpret<int const?>(addr(m.fft.rev[0]))
+        let tw = reinterpret<float const?>(addr(m.fft.tw[0]))
+        var md = addr(st.mel.data[0])
+        maybe_parallel_for(0, int(n_len), lanes_for_work(n_len * n_fft * 8l, 0)) $(rb, re) {
+            var frame : float[FFT_FRAME]   // 512 interleaved (re, im) pairs, stack-resident
+            unsafe {
+                var fp = addr(frame[0])
+                for (i in range64(int64(rb), int64(re))) {
+                    let off = i * PARAKEET_HOP
+                    for (j in range64(n_fft * 2l)) {
+                        fp[j] = 0.0
+                    }
+                    let n_do = min(wsz, n_padded - off)   // window applied at [wpad, wpad+wsz)
+                    for (j in range64(n_do)) {
+                        if (off + wpad + j < n_padded) {
+                            fp[(wpad + j) * 2l] = wnd[j] * pdd[off + wpad + j]
+                        }
+                    }
+                    fft_pow2_run(n_fft, rev, tw, fp)
+                    for (k in range64(n_bins)) {   // power spectrum, packed to the front
+                        fp[k] = fp[2l * k] * fp[2l * k] + fp[2l * k + 1l] * fp[2l * k + 1l]
+                    }
+                    for (jm in range64(n_mel)) {
+                        let fr = jm * n_bins
+                        var s0 = 0.0
+                        var s1 = 0.0
+                        var s2 = 0.0
+                        var s3 = 0.0
+                        var k = 0l
+                        while (k + 3l < n_bins) {
+                            s0 += fp[k] * flt[fr + k]
+                            s1 += fp[k + 1l] * flt[fr + k + 1l]
+                            s2 += fp[k + 2l] * flt[fr + k + 2l]
+                            s3 += fp[k + 3l] * flt[fr + k + 3l]
+                            k += 4l
+                        }
+                        var sum = double((s0 + s1) + (s2 + s3))
+                        while (k < n_bins) {
+                            sum += double(fp[k] * flt[fr + k])
+                            k++
+                        }
+                        md[i * n_mel + jm] = float(log(sum + mel_eps))
+                    }
+                }
             }
-            while (k < n_bins) {
-                sum += double(st.power[k] * m.filters[j * n_bins + k])
-                k++
-            }
-            st.mel.data[i * m.n_mel + j] = float(log(sum + mel_eps))
         }
     }
 

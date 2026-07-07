@@ -156,6 +156,89 @@ def build_dft_twiddles(n_fft : int64) : array<float> {
     return <- b
 }
 
+//! Iterative radix-2 FFT plan for a power-of-2 size: bit-reversal permutation + twiddle
+//! table tw[k] = (cos, −sin)(2πk/n) interleaved, k < n/2 — same forward (e^{−2πi/n})
+//! convention as build_dft_twiddles, so power spectra agree to fp32 rounding.
+struct FftPlan {
+    n : int64 = 0l
+    rev : array<int>
+    tw : array<float>
+}
+
+def build_fft_plan(n : int64) : FftPlan {
+    if (n < 2l || (n & (n - 1l)) != 0l) {
+        panic("build_fft_plan: {n} is not a power of 2")
+    }
+    var p = FftPlan(n = n)
+    var bits = 0l
+    while ((1l << bits) < n) {
+        bits++
+    }
+    p.rev |> resize(int(n))
+    for (i in range64(n)) {
+        var r = 0l
+        var v = i
+        for (_b in range64(bits)) {
+            r = (r << 1l) | (v & 1l)
+            v >>= 1l
+        }
+        p.rev[i] = int(r)
+    }
+    p.tw |> resize(int(n))   // n/2 interleaved (cos, −sin) pairs
+    for (k in range64(n / 2l)) {
+        let theta = 2.0lf * DBL_PI * double(k) / double(n)
+        p.tw[2l * k] = cos(float(theta))
+        p.tw[2l * k + 1l] = -sin(float(theta))
+    }
+    return <- p
+}
+
+//! In-place radix-2 complex FFT over n interleaved (re, im) pairs at ``reim`` — pointer
+//! core so parallel workers can run it on stack buffers. ``rev``/``tw`` from an FftPlan
+//! of the same n.
+def fft_pow2_run(n : int64; rev : int const?; tw : float const?; var reim : float?) {
+    unsafe {
+        for (i in range64(n)) {   // bit-reversal permutation (swap once per pair)
+            let r = int64(rev[i])
+            if (i < r) {
+                let a = i * 2l
+                let b = r * 2l
+                let tre = reim[a]
+                let tim = reim[a + 1l]
+                reim[a] = reim[b]
+                reim[a + 1l] = reim[b + 1l]
+                reim[b] = tre
+                reim[b + 1l] = tim
+            }
+        }
+        var len = 2l
+        while (len <= n) {
+            let half = len >> 1l
+            let step = n / len
+            var base = 0l
+            while (base < n) {
+                for (j in range64(half)) {
+                    let w = j * step * 2l
+                    let wre = tw[w]
+                    let wim = tw[w + 1l]
+                    let a = (base + j) * 2l
+                    let b = (base + j + half) * 2l
+                    let bre = reim[b]
+                    let bim = reim[b + 1l]
+                    let tre = bre * wre - bim * wim
+                    let tim = bre * wim + bim * wre
+                    reim[b] = reim[a] - tre
+                    reim[b + 1l] = reim[a + 1l] - tim
+                    reim[a] += tre
+                    reim[a + 1l] += tim
+                }
+                base += len
+            }
+            len <<= 1l
+        }
+    }
+}
+
 //! Whisper log-mel spectrogram over the full (padded) input, then split into full 3000-frame
 //! chunks — the mtmd whisper preprocessor end-to-end: pad to ≥31 s, reflect-200 head pad,
 //! 30 s zero tail (+200), Hann-400/hop-160 power spectra, slaney mel (double accumulate,

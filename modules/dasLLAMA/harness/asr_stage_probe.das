@@ -4,6 +4,7 @@ options stack = 65536
 require dasllama/dasllama_asr
 require dasllama/dasllama_audio
 require audio
+require math   // the parakeet mel worker resolves log at the instantiation site
 require daslib/clargs
 require daslib/jobque_boost
 
