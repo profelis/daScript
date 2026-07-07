@@ -1153,20 +1153,24 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
             let kpad = (nk - 1l) / 2l   // depthwise pad (k−1)/2 both sides
             let one = float4(1.0, 1.0, 1.0, 1.0)
             let n4 = d / 4l
+            let d4ok = n4 * 4l == d
             maybe_parallel_for(0, int(tt), lanes_for_work(tt * d * 4l, 0)) $(rb, re) {
                 unsafe {
                     for (t in range64(int64(rb), int64(re))) {   // GLU: signal · σ(gate), float4 exp4
-                        let sgp = reinterpret<float4 const?>(hp + t * 2l * d)
-                        let gtp = reinterpret<float4 const?>(hp + t * 2l * d + d)
-                        var o4 = reinterpret<float4?>(xbp + t * d)
-                        for (k in range64(n4)) {
-                            let arg = clamp(-gtp[k], EXP4_LO, EXP4_HI)
-                            o4[k] = sgp[k] / (one + exp4(arg))
-                        }
-                        for (j in range64(n4 * 4l, d)) {   // tail (d % 4 != 0 models only)
-                            let sg = hp[t * 2l * d + j]
-                            let gt = hp[t * 2l * d + d + j]
-                            xbp[t * d + j] = sg * (1.0 / (1.0 + exp(-gt)))
+                        if (d4ok) {
+                            let sgp = reinterpret<float4 const?>(hp + t * 2l * d)
+                            let gtp = reinterpret<float4 const?>(hp + t * 2l * d + d)
+                            var o4 = reinterpret<float4?>(xbp + t * d)
+                            for (k in range64(n4)) {
+                                let arg = clamp(-gtp[k], EXP4_LO, EXP4_HI)
+                                o4[k] = sgp[k] / (one + exp4(arg))
+                            }
+                        } else {   // d % 4 != 0 models only
+                            for (j in range64(d)) {
+                                let sg = hp[t * 2l * d + j]
+                                let gt = hp[t * 2l * d + d + j]
+                                xbp[t * d + j] = sg * (1.0 / (1.0 + exp(-gt)))
+                            }
                         }
                     }
                 }
@@ -1174,7 +1178,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
             // depthwise conv1d k9 over time (reads xb rows t±kpad — barrier from the GLU
             // dispatch above), folded BN + silu; f4 row core on the all-taps-in-range
             // interior when k==9, guarded scalar rows otherwise (borders / odd k / odd d)
-            let f4ok = nk == 9l && n4 * 4l == d
+            let f4ok = nk == 9l && d4ok
             maybe_parallel_for(0, int(tt), lanes_for_work(tt * d * (nk + 4l), 0)) $(rb, re) {
                 unsafe {
                     for (t in range64(int64(rb), int64(re))) {
@@ -1196,7 +1200,22 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                                 *reinterpret<float4?>(aop + t * d + j) = bv4 / (one + exp4(arg))
                                 j += 4l
                             }
-                        } else {
+                        } elif (f4ok) {   // border rows: guarded taps (uniform over j), still f4
+                            var j = 0l
+                            while (j < d) {
+                                var acc = float4(0.0, 0.0, 0.0, 0.0)
+                                for (k in range64(9l)) {
+                                    let src = t + k - kpad
+                                    if (src >= 0l && src < tt) {
+                                        acc = mad(*reinterpret<float4 const?>(xbp + src * d + j), *reinterpret<float4 const?>(dwp + k * d + j), acc)
+                                    }
+                                }
+                                let bv4 = mad(acc, *reinterpret<float4 const?>(scp + j), *reinterpret<float4 const?>(shp + j))
+                                let arg = clamp(-bv4, EXP4_LO, EXP4_HI)
+                                *reinterpret<float4?>(aop + t * d + j) = bv4 / (one + exp4(arg))
+                                j += 4l
+                            }
+                        } else {   // generic k / d % 4 != 0 fallback
                             for (j in range64(d)) {
                                 var acc = 0.0
                                 for (k in range64(nk)) {
@@ -1273,16 +1292,45 @@ def private pk_predict(m : ParakeetModel; var s : ParakeetPredState; token : int
         array_view(m.blob, m.lstm_hh[l], 4l * pd * pd) $(whh : array<float>#) {
             matmul(s.gates2, whh, s.hbuf, pd, 4l * pd)
         }
-        for (j in range64(pd)) {
-            let ig = 1.0 / (1.0 + exp(-(s.gates[j] + s.gates2[j] + m.blob[m.lstm_b[l] + j])))
-            let fg = 1.0 / (1.0 + exp(-(s.gates[pd + j] + s.gates2[pd + j] + m.blob[m.lstm_b[l] + pd + j])))
-            let og = 1.0 / (1.0 + exp(-(s.gates[2l * pd + j] + s.gates2[2l * pd + j] + m.blob[m.lstm_b[l] + 2l * pd + j])))
-            let cg = tanh(s.gates[3l * pd + j] + s.gates2[3l * pd + j] + m.blob[m.lstm_b[l] + 3l * pd + j])
-            let cn = fg * s.c[l * pd + j] + ig * cg
-            s.c[l * pd + j] = cn
-            let hn = og * tanh(cn)
-            s.h[l * pd + j] = hn
-            s.xin[j] = hn
+        // gates via float4 exp4: σ = 1/(1+exp4(-a)), tanh(a) = 1 − 2/(1+exp4(2a)) (geglu4 identity)
+        unsafe {
+            let gp = reinterpret<float const?>(addr(s.gates[0]))
+            let g2p = reinterpret<float const?>(addr(s.gates2[0]))
+            let bp = reinterpret<float const?>(addr(m.blob[m.lstm_b[l]]))
+            var cp = addr(s.c[l * pd])
+            var hsp = addr(s.h[l * pd])
+            var xp = addr(s.xin[0])
+            let one = float4(1.0, 1.0, 1.0, 1.0)
+            let two = float4(2.0, 2.0, 2.0, 2.0)
+            let n4 = (pd / 4l) * 4l
+            var j = 0l
+            while (j < n4) {
+                let ia = (*reinterpret<float4 const?>(gp + j)) + (*reinterpret<float4 const?>(g2p + j)) + (*reinterpret<float4 const?>(bp + j))
+                let fa = (*reinterpret<float4 const?>(gp + pd + j)) + (*reinterpret<float4 const?>(g2p + pd + j)) + (*reinterpret<float4 const?>(bp + pd + j))
+                let oa = (*reinterpret<float4 const?>(gp + 2l * pd + j)) + (*reinterpret<float4 const?>(g2p + 2l * pd + j)) + (*reinterpret<float4 const?>(bp + 2l * pd + j))
+                let ga = (*reinterpret<float4 const?>(gp + 3l * pd + j)) + (*reinterpret<float4 const?>(g2p + 3l * pd + j)) + (*reinterpret<float4 const?>(bp + 3l * pd + j))
+                let ig = one / (one + exp4(clamp(-ia, EXP4_LO, EXP4_HI)))
+                let fg = one / (one + exp4(clamp(-fa, EXP4_LO, EXP4_HI)))
+                let og = one / (one + exp4(clamp(-oa, EXP4_LO, EXP4_HI)))
+                let cg = one - two / (one + exp4(clamp(two * ga, EXP4_LO, EXP4_HI)))
+                let cn = fg * (*reinterpret<float4 const?>(cp + j)) + ig * cg
+                *reinterpret<float4?>(cp + j) = cn
+                let hn = og * (one - two / (one + exp4(clamp(two * cn, EXP4_LO, EXP4_HI))))
+                *reinterpret<float4?>(hsp + j) = hn
+                *reinterpret<float4?>(xp + j) = hn
+                j += 4l
+            }
+            for (jj in range64(n4, pd)) {   // scalar tail (pd % 4 != 0 models only)
+                let ig = 1.0 / (1.0 + exp(-(gp[jj] + g2p[jj] + bp[jj])))
+                let fg = 1.0 / (1.0 + exp(-(gp[pd + jj] + g2p[pd + jj] + bp[pd + jj])))
+                let og = 1.0 / (1.0 + exp(-(gp[2l * pd + jj] + g2p[2l * pd + jj] + bp[2l * pd + jj])))
+                let cg = tanh(gp[3l * pd + jj] + g2p[3l * pd + jj] + bp[3l * pd + jj])
+                let cn = fg * cp[jj] + ig * cg
+                cp[jj] = cn
+                let hn = og * tanh(cn)
+                hsp[jj] = hn
+                xp[jj] = hn
+            }
         }
     }
     // joint.pred projection of the top hidden (already in s.xin after the last layer)
