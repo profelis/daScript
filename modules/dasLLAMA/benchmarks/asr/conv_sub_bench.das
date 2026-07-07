@@ -41,6 +41,9 @@ struct BenchArgs {
     @clarg_doc = "Run the permute + bias/relu epilogue variants instead of the breakdown"
     tail : bool
 
+    @clarg_doc = "Run the mel matvec variants instead of the breakdown"
+    meldot : bool
+
     @clarg_short = "?"
     @clarg_name = "show-help"
     @clarg_doc = "Show this help and exit"
@@ -523,6 +526,126 @@ def bench_tail(frames : int64; rounds : int) {
     print("  bias+relu separate: {best_sep / 1000.0lf} ms | fused_f4: {best_fus / 1000.0lf} ms ({best_sep / best_fus}x)\n")
 }
 
+// ===== mel matvec variants (the per-frame filterbank dot in parakeet_log_mel) =====
+
+// engine-verbatim: 4 scalar accumulators, double-summed, double tail, log at the end
+def meldot_cur(var md : float?; fp, flt : float const?; n_mel, n_bins : int64; mel_eps : double) {
+    unsafe {
+        for (jm in range64(n_mel)) {
+            let fr = jm * n_bins
+            var s0 = 0.0
+            var s1 = 0.0
+            var s2 = 0.0
+            var s3 = 0.0
+            var k = 0l
+            while (k + 3l < n_bins) {
+                s0 += fp[k] * flt[fr + k]
+                s1 += fp[k + 1l] * flt[fr + k + 1l]
+                s2 += fp[k + 2l] * flt[fr + k + 2l]
+                s3 += fp[k + 3l] * flt[fr + k + 3l]
+                k += 4l
+            }
+            var sum = double((s0 + s1) + (s2 + s3))
+            while (k < n_bins) {
+                sum += double(fp[k] * flt[fr + k])
+                k++
+            }
+            md[jm] = float(log(sum + mel_eps))
+        }
+    }
+}
+
+// tuned dot() per filter row
+def meldot_dot(var md : float?; fp, flt : float const?; n_mel, n_bins : int64; mel_eps : double) {
+    unsafe {
+        for (jm in range64(n_mel)) {
+            let sum = double(dot(flt + jm * n_bins, fp, n_bins))
+            md[jm] = float(log(sum + mel_eps))
+        }
+    }
+}
+
+// float4 accumulator + scalar tail, horizontal add in double
+def meldot_f4(var md : float?; fp, flt : float const?; n_mel, n_bins : int64; mel_eps : double) {
+    let n4 = n_bins - n_bins % 4l
+    unsafe {
+        for (jm in range64(n_mel)) {
+            let fr = jm * n_bins
+            var acc = float4(0.0)
+            var k = 0l
+            while (k < n4) {
+                acc = mad(*reinterpret<float4 const?>(fp + k), *reinterpret<float4 const?>(flt + fr + k), acc)
+                k += 4l
+            }
+            var sum = double((acc.x + acc.y) + (acc.z + acc.w))
+            while (k < n_bins) {
+                sum += double(fp[k] * flt[fr + k])
+                k++
+            }
+            md[jm] = float(log(sum + mel_eps))
+        }
+    }
+}
+
+def bench_meldot(rounds : int) {
+    let n_mel = 128l
+    let n_bins = 257l
+    let frames = 1101l   // one jfk of matvecs per timed rep
+    let mel_eps = 5.960464477539063e-08lf
+    print("\n--- mel matvec variants: {n_mel} x {n_bins}, {frames} frames/rep ---\n")
+    var fp : array<float>
+    var flt : array<float>
+    var md : array<float>
+    sized(fp, n_bins)
+    sized(flt, n_mel * n_bins)
+    sized(md, n_mel * 3l)
+    fill_sin(fp, 1.5, 0.171)
+    for (v in fp) {
+        v = v * v   // power spectrum: non-negative
+    }
+    fill_sin(flt, 0.5, 0.093)
+    for (v in flt) {
+        v = abs(v)   // filterbank weights: non-negative (log input stays positive)
+    }
+    unsafe {
+        var mdp = addr(md[0])
+        let fpp = reinterpret<float const?>(addr(fp[0]))
+        let flp = reinterpret<float const?>(addr(flt[0]))
+        meldot_cur(mdp, fpp, flp, n_mel, n_bins, mel_eps)
+        meldot_dot(mdp + n_mel, fpp, flp, n_mel, n_bins, mel_eps)
+        meldot_f4(mdp + 2l * n_mel, fpp, flp, n_mel, n_bins, mel_eps)
+        var mr_dot = 0.0lf
+        var mr_f4 = 0.0lf
+        for (j in range64(n_mel)) {
+            let want = double(md[j])
+            mr_dot = max(mr_dot, abs(double(md[n_mel + j]) - want) / (abs(want) + 1.0lf))
+            mr_f4 = max(mr_f4, abs(double(md[2l * n_mel + j]) - want) / (abs(want) + 1.0lf))
+        }
+        print("  gate (vs cur, LSB-class expected): dot maxrel {mr_dot}, f4 maxrel {mr_f4}\n")
+        var best_cur = 1.0e30lf
+        var best_dot = 1.0e30lf
+        var best_f4 = 1.0e30lf
+        for (_round in range(rounds)) {
+            var t0 = ref_time_ticks()
+            for (_f in range64(frames)) {
+                meldot_cur(mdp, fpp, flp, n_mel, n_bins, mel_eps)
+            }
+            best_cur = min(best_cur, double(get_time_usec(t0)))
+            t0 = ref_time_ticks()
+            for (_f in range64(frames)) {
+                meldot_dot(mdp, fpp, flp, n_mel, n_bins, mel_eps)
+            }
+            best_dot = min(best_dot, double(get_time_usec(t0)))
+            t0 = ref_time_ticks()
+            for (_f in range64(frames)) {
+                meldot_f4(mdp, fpp, flp, n_mel, n_bins, mel_eps)
+            }
+            best_f4 = min(best_f4, double(get_time_usec(t0)))
+        }
+        print("  cur: {best_cur / 1000.0lf} ms | dot(): {best_dot / 1000.0lf} ms ({best_cur / best_dot}x) | f4: {best_f4 / 1000.0lf} ms ({best_cur / best_f4}x)\n")
+    }
+}
+
 // ===== bench plumbing =====
 
 def sized(var a : array<float>; n : int64) {
@@ -826,6 +949,8 @@ def main() : int {
             bench_c0(frames, rounds)
         } elif (a.tail) {
             bench_tail(frames, rounds)
+        } elif (a.meldot) {
+            bench_meldot(rounds)
         } else {
             run_bench(frames, rounds)
         }

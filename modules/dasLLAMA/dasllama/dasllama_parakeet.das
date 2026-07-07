@@ -620,7 +620,7 @@ def load_parakeet_model(path : string; q8 : bool = false) : ParakeetModel {
 // ===== mel (frame-major!) =====
 
 //! Parakeet's log-mel: preemphasis 0.97, zero center-pad n_fft/2, the file's STFT window
-//! (centered inside the 512 frame), power spectra, mel dot (float4-group double-acc),
+//! (centered inside the 512 frame), power spectra, mel dot (the tuned ``dot`` kernel),
 //! NATURAL log(sum + 2⁻²⁴), then per-feature mean/std normalization computed over the
 //! valid frames only (Bessel n−1, std + 1e-5) and applied to all. FRAME-major
 //! ``[n_len][n_mel]``.
@@ -690,25 +690,8 @@ def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel; var st : Par
                     for (k in range64(n_bins)) {   // power spectrum, packed to the front
                         fp[k] = fp[2l * k] * fp[2l * k] + fp[2l * k + 1l] * fp[2l * k + 1l]
                     }
-                    for (jm in range64(n_mel)) {
-                        let fr = jm * n_bins
-                        var s0 = 0.0
-                        var s1 = 0.0
-                        var s2 = 0.0
-                        var s3 = 0.0
-                        var k = 0l
-                        while (k + 3l < n_bins) {
-                            s0 += fp[k] * flt[fr + k]
-                            s1 += fp[k + 1l] * flt[fr + k + 1l]
-                            s2 += fp[k + 2l] * flt[fr + k + 2l]
-                            s3 += fp[k + 3l] * flt[fr + k + 3l]
-                            k += 4l
-                        }
-                        var sum = double((s0 + s1) + (s2 + s3))
-                        while (k < n_bins) {
-                            sum += double(fp[k] * flt[fr + k])
-                            k++
-                        }
+                    for (jm in range64(n_mel)) {   // tuned dot: 3.5x the 4-acc scalar form (conv_sub_bench --meldot)
+                        let sum = double(dot(flt + jm * n_bins, fp, n_bins))
                         md[i * n_mel + jm] = float(log(sum + mel_eps))
                     }
                 }
