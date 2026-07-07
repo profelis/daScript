@@ -16,6 +16,7 @@ require dasllama/dasllama_common // nolint:STYLE030 — [init]-only: registers t
 require dasllama/dasllama_math
 require dasllama/dasllama_audio
 require dasllama/dasllama_quant
+require dasllama/dasllama_par
 require daslib/jobque_boost
 require daslib/clargs
 require math
@@ -48,6 +49,9 @@ struct BenchArgs {
 
     @clarg_doc = "Keep the default (hand) backend instead of the repack tier a model load selects"
     hand : bool
+
+    @clarg_doc = "silu4 lane-response sweep on the ffn image (tt x 4d), row-range threading"
+    silu : bool
 
     @clarg_short = "?"
     @clarg_name = "show-help"
@@ -424,7 +428,7 @@ def run_ffn_stage(rounds : int; tt : int64) {
             t = lap(acc, 1, t)
             matmul_q8q8_batch(h, wts[l * 2 + 0].q, wts[l * 2 + 0].s, xqi, xsi, d, d4, tt)
             t = lap(acc, 2, t)
-            silu4(h, tt * d4)
+            silu4_batch(h, d4, tt)
             t = lap(acc, 3, t)
             asr_requant_rows_q8(h, d4, tt, xqi, xsi)
             t = lap(acc, 4, t)
@@ -443,6 +447,50 @@ def run_ffn_stage(rounds : int; tt : int64) {
     }
     report_ops(names, best, rounds, "pk.ffn / 2")
     delete wts
+}
+
+// silu4 lane response on the ffn image (tt rows x 4d): whole-array call vs row-range chunks at
+// forced lane counts. Row length 4d is a multiple of 4, so every chunk start is 4-aligned and
+// the float4 grouping matches the whole-array pass element-for-element — bit-identical.
+def run_silu_sweep(rounds : int; tt : int64) {
+    let dimg = 4l * DD
+    let n = tt * dimg
+    var h : array<float>
+    h |> resize(int(n))
+    fill_sin(h, 2.0, 0.377)
+    let reps = int(clamp(200_000_000l / n, 1l, 400l))
+    let lane_grid = [1, 2, 4, 6, 8]
+    var best : array<double>
+    best |> resize(length(lane_grid) + 1)
+    for (v in best) {
+        v = 1e30lf
+    }
+    unsafe {
+        var hp = addr(h[0])
+        silu4(h, n)   // warmup
+        for (_r in range(rounds)) {
+            var t0 = ref_time_ticks()
+            for (_i in range(reps)) {
+                silu4(h, n)
+            }
+            best[0] = min(best[0], double(get_time_usec(t0)))
+            for (li, lanes in count(), lane_grid) {
+                t0 = ref_time_ticks()
+                for (_i in range(reps)) {
+                    maybe_parallel_for(0, int(tt), lanes) $(rb, re) {
+                        silu4(unsafe(hp + int64(rb) * dimg), int64(re - rb) * dimg)
+                    }
+                }
+                best[li + 1] = min(best[li + 1], double(get_time_usec(t0)))
+            }
+        }
+    }
+    print("\n--- silu4 lane response (tt={tt}, image {tt}x{dimg}, {reps} reps, best of {rounds}) ---\n")
+    print("  whole-array: {best[0] / double(reps) / 1000.0lf} ms/call\n")
+    for (li, lanes in count(), lane_grid) {
+        let ms = best[li + 1] / double(reps) / 1000.0lf
+        print("  lanes={lanes}: {ms} ms/call ({best[0] / best[li + 1]}x)\n")
+    }
 }
 
 [export]
@@ -480,6 +528,8 @@ def main() : int {
             run_attn_stage(rounds, tt)
         } elif (a.ffn) {
             run_ffn_stage(rounds, tt)
+        } elif (a.silu) {
+            run_silu_sweep(rounds, tt)
         } else {
             run_map(rounds)
         }

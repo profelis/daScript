@@ -1549,6 +1549,24 @@ def silu4(var x : array<float> | #; size : int64) {
     silu4(unsafe(addr(x[0])), size)
 }
 
+//! Threaded silu4 over a token-major image (npos rows x d columns): rows split across lanes.
+//! Row length a multiple of 4 keeps every chunk start 4-aligned, so the float4 grouping matches
+//! the whole-image call element-for-element — bit-identical at any lane count. Work weight 16:
+//! an exp4 element costs tens of MAC-equivalents, so the per-element invite is cost-honest
+//! (measured M1 8 lanes: 3.6x at the parakeet jfk ffn image, 6.9x at gb1).
+def silu4_batch(var x : array<float> | #; d, npos : int64) {
+    if (d % 4l != 0l || npos <= 1l) {   // odd row length would shift the float4 grouping per chunk
+        silu4(x, d * npos)
+        return
+    }
+    unsafe {
+        var xp = addr(x[0])
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 16l, 0)) $(rb, re) {
+            silu4(unsafe(xp + int64(rb) * d), int64(re - rb) * d)
+        }
+    }
+}
+
 //! Logit soft-capping (Gemma2): x = cap * tanh(x / cap), elementwise over the first `size`.
 //! Smoothly bounds values to (-cap, cap). Applied to attention scores (cap 50) after the
 //! 1/sqrt(head_size) scale and before softmax, and to the final classifier logits (cap 30).
