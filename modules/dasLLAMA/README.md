@@ -113,6 +113,7 @@ Legend: ✅ **verified token-for-token** vs the reference · 🚧 in progress ·
 | **Voxtral-Mini-3B** (audio input) | self-converted decoder Q8_0 + mmproj f32 (ggml-org publishes only K-quants; `convert_hf_to_gguf.py` needs `mistral-common` + a local missing-`return` fix, see `audio_models_plan.md`) | llama-arch decoder (head_dim 128, rope θ 1e8) + whisper tower + `voxtral` projector: avg-pool → post-LN → stack-4 → mm1 → gelu_erf → mm2, no biases; 187 tokens/chunk after `[BEGIN_AUDIO]` in the `[INST]…[/INST]` v7-tekken template; NEW `tekken` pre-tokenizer (generic-wregex alternation semantics — no contractions, single digits, '/' punct tail) | BPE (`tekken` pre) | ✅ | `llama-mtmd-cli --temp 0`: transcription prompt on jfk.wav byte-identical to natural stop; tokenizer id-for-id vs `llama-tokenize` (incl. 你A / contraction / digit probes); decoder 40/40 text-only (`harness/parity.sh`); encoder ≤5e-4 vs mtmd on real input. The two open-caption prompts each flip ONE step sitting at a 0.079 / 0.195-logit near-tie (p≈0.5 coin-flips; every matched step clears gaps up to 12 logits) — same knife-edge class as whisper tiny/base, not chased |
 | **Qwen3-ASR 0.6B / 1.7B** (speech-to-text) | ggml-org Q8_0 decoder + bf16 mmproj GGUFs (read directly — bf16→f32 is exact) | decoder is arch `qwen3vl` (M-RoPE degenerates for text+audio, deepstack inactive without vision — registered as a qwen3 alias) + NEW `qwen3a` encoder: 100-frame mel chunks through 3 stride-2 conv2d blocks (13×16×480), features to d_model, per-chunk position reset, transformer over 800-frame windows (13 tokens/chunk, k-biased attention on the shared tower block loop), GELU MLP projector; LLM-style transcription — the model emits `language {L}<asr_text>{text}`, parsed into `detected_lang` + one segment (no timestamps); context biasing via `AsrSession.context` | BPE (qwen2 pre) | ✅ | `llama-mtmd-cli --temp 0`: 0.6B transcript byte-identical on jfk.wav AND tools/mtmd/test-2.mp3 (88-token read of the NYT clip); 1.7B byte-identical on jfk.wav; encoder gated vs `MTMD_DEBUG_EMBEDDINGS` per-window token-0 (≤1e-4) in `test_whisper.das` |
 | **Parakeet-TDT 0.6b-v2** (speech-to-text) | self-converted `.nemo` → ggml bin (whisper.cpp's in-tree `convert-parakeet-to-ggml.py`, `--use-f32`) | NEW family end to end: frame-major mel (preemph 0.97, zero-center-pad, natural log, per-feature Bessel normalization) → conv2d subsampling (regular+depthwise ×2, 8× time) → 24 FastConformer blocks (macaron half-FFNs ×0.5, rel-pos attention with u/v biases + interleaved sin/cos table + scalar rel-shift gather, GLU→depthwise-k9→inference-BN→SiLU conv module, per-layer post-norm) → 2-layer LSTM predictor ([i,f,o,g] packed gates) → TDT joint (relu, full-row log-softmax) + duration-skip greedy | SPM (▁ pieces from the bin) | ✅ | `parakeet-cli -ng -ps` (CPU, f32): **jfk.wav 33/33 and gb1 (3-min Columbia address) 786/786 token-for-token** — ids, frames, duration indices AND values; the duration argmax must run over fp32 softmax values, not raw logits (the oracle's underflow-to-−inf tie-break, see `parakeet_plan.md`); suite gate in `test_whisper.das` |
+| **Parakeet-TDT 0.6b-v3** (speech-to-text, 25 European languages) | same converter as v2 (`--use-f32`) | the v2 pipeline verbatim — only the SPM vocab grows to 8192 pieces (joint row 8198); the loader reads every dim from the header, the ASR sniff routes any sub-32768 ggml-bin vocab to parakeet, and `caps()` flips to the 25-language list on the 8192-piece vocab | SPM (▁ pieces from the bin) | ✅ | `parakeet-cli -ng -ps` (CPU, f32): **jfk.wav 38/38 and gb1 655/655 token-for-token** — ids, frames, duration indices AND values; q8 default stays id/text-exact on both (jfk durations too; gb1 flips 16/655 duration picks only — ≤4-frame transient timestamp drift, always re-syncing); suite gate in `test_whisper.das` |
 | **Whisper — full family** (speech-to-text): tiny/base/base.en/small/medium/large-v3/large-v3-turbo | stock whisper.cpp `ggml-*.bin` (f16, read directly — no conversion) | Whisper encoder (the qwen2a tower core, tanh-fp16-LUT gelu, ln_post tail) + NEW text decoder w/ cross-attention (learned abs pos, tied logits, ≤448 ctx) + `whisper_full`'s greedy driver (timestamp rules, no-speech gate, long-form seek) | byte-level vocab from the bin | ✅ | `whisper-cli` CPU greedy (`-bs 1 -bo 1 -nf -ng`), jfk.wav w/ timestamps: **tiny, base.en, small, medium, large-v3, large-v3-turbo all token-for-token** (turbo also on 33 s long-form, 3 windows exact); base flips ONE step where the force-timestamp rule sits at a 2e-4-logit margin (oracle's own p=0.495 — a coin flip; base is exact in `-nt` mode) — rig + findings in `whisper_plan.md`; suite gate in `test_whisper.das` |
 | **gpt-oss-20b** | MXFP4 GGUF → self-Q8 | gpt-oss (MoE: 32 experts top-4, softmax over the SELECTED weights, no shared expert; router + per-expert + QKV + output-projection biases; clamped SwiGLU `swiglu_oai`; per-head attention sinks; alternating 128-token SWA; YaRN rope factor 32 over a 4096 original context) | BPE (`gpt-4o` pre) | ✅ | `llama.cpp` `simple_ids` / `harness/parity.sh`: 40/40 token-for-token on the counting prompt AND on a 449-token window-engaged prompt encoded in-test through the gpt-4o pre-tokenizer (both frozen fixtures in `test_parity.das`); tokenizer verified id-for-id vs llama.cpp on counting / mixed-case-contraction / whitespace probes |
 
@@ -174,6 +175,43 @@ What a model needs to "just work" today:
 | Sampling | greedy, temperature, top-k, repetition penalty (`SamplingParams`; greedy = temp 0, bit-identical to argmax) |
 | Chat | per-arch data-driven templates in the registry + one segment-accumulation renderer (`dasllama_chat`) — reproduces the reference prefills token-for-token (`test_chat.das`); the template is auto-detected by sniffing the GGUF's embedded `tokenizer.chat_template` (never executed), falling back to the arch heuristic; Qwen3-style `<think>` blocks are stripped from chat history (`strip_think`); Gemma-4 uses its channel-based turn format (`<|turn>` / `<turn|>`, non-thinking opener closes an empty `thought` channel); gpt-oss uses the Harmony-lite template (`<|start|>role<|message|>...<|end|>`, replies end at `<|return|>` / `<|call|>`, channel markers render in decoded text as in llama.cpp) |
 | Performance | KV cache, SIMD + JobQue-threaded matmul, activation-quant Q8·Q8 behind a pluggable kernel-backend registry (ARM SDOT/laneq today — `x64_arch.md` for the x64 mirror), flash-attention batched prefill, per-box kernel tuning (`tune_for_this_box.md`) |
+
+## Optimization guidelines
+
+Non-negotiable rules for anything on a hot path (per-token, per-frame, per-layer — anything
+that runs per unit of work rather than per load):
+
+1. **Dynamic memory allocation on a hot path does not exist.** No `resize`/`push`/`reserve`/
+   `new`/array literals per call — every buffer lives in a passed 'decoder'-style state
+   struct (`RunState`, `ParakeetState`, `EncoderState`, ...) owned by the session, grown
+   reserve-exact when a bigger shape arrives, never shrunk, allocated zero times in steady
+   state. No module-global scratch — state is passed explicitly. Corollary: reused scratch
+   is not zero-initialized like a fresh array — zero explicitly wherever the code relied on
+   fresh-allocation zeros, and reset carried state (LSTM h/c) per utterance.
+2. **If it's not local, the pointer is brought local.** Inner loops never chase struct
+   fields, blob offsets, or array handles — hoist `addr(state.arr[0])` / `addr(m.blob[off])`
+   into locals before the loop and index through those (`var p` for writable, the const
+   model gives read-only otherwise).
+3. **Optimize before threading.** A kernel reaches its best single-lane form first —
+   right algorithm, then loop form — and only then gets a `maybe_parallel_for`. Threading
+   a bad kernel just burns more cores on the same waste.
+4. **Loop forms are decided in isolated benchmarks, not by eye.** For a hot loop, build
+   the `[tune]`-marked scalar template AND a hand-float4 version, bench them head-to-head
+   standalone (the tune rig / a dedicated microbench, NOT end-to-end transcribe) — commit
+   the winner. "To know for sure."
+5. **Every `with_job_que()` that runs engine kernels calls `setup_dasllama_jobque()` first**
+   (engine spelling `setup_dasllama_jobque_`). Bare `with_job_que` leaves the queue on the
+   ~10us/job fifo fork/join — measured 2-7x on the parakeet jfk encoder stages, 2.2x
+   end-to-end — and any benchmark taken that way is measuring the wrong dispatch mode.
+   Same trap for isolated Q8 GEMM benches: a model load selects the repack backend tier
+   (`select_matmul_backend_for_load`), so a bench that skips the load step times the slower
+   hand backend unless it selects the tier itself (3x on M1: arm64-gen 900 vs sdot 300 GMAC/s).
+6. **Work units, not structural units.** When a stage's natural unit count is near the lane
+   count (per-head, per-expert, ...), flatten to finer units — a handful of units on N lanes
+   is a built-in makespan floor (whisper tiny: 6 head-units on 8 lanes = 25% idle; turbo 20
+   on 16 = ragged second wave). If each unit needs scratch, don't size it per unit —
+   dispatch with `maybe_parallel_for_indexed` and index per-slot scratch sized
+   `get_dispatch_slot_bound()` (tower attention is the reference consumer).
 
 ## Known **not** yet supported
 

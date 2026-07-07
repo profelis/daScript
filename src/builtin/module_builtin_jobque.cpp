@@ -864,6 +864,71 @@ namespace das {
         das_delete<Lambda>::clear(context, lambda);
     }
 
+    void team_parallel_for_indexed_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
+        // team_parallel_for_invoke with the worker slot exposed: the lambda is invoked as
+        // (slot, job_begin, job_end). JobQue::teamParallelFor already hands each chunk its
+        // claiming worker's slot (caller == getNumWorkers()); the non-indexed binding drops it.
+        // No two in-flight invocations share a slot, so slot-indexed scratch needs no locks;
+        // slot < getNumWorkers()+1 (degenerate/inline paths run everything as slot 0).
+        if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        int total = rangeEnd - rangeBegin;
+        if ( total <= 0 || numChunks <= 0 ) {
+            das_delete<Lambda>::clear(context, lambda);
+            return;
+        }
+        int actualChunks = numChunks < total ? numChunks : total;
+        int nW = g_jobQue->getNumWorkers();
+        if ( actualChunks == 1 || nW == 0 || !g_jobQue->getTeamMode() ) {
+            das_invoke_lambda<void>::invoke(context, lineinfo, lambda, 0, rangeBegin, rangeEnd);
+            das_delete<Lambda>::clear(context, lambda);
+            return;
+        }
+        int chunkSz = total / actualChunks;
+        int rem = total % actualChunks;
+        // one lambda clone per WORKER (the fifo path clones per chunk); the caller runs the original
+        vector<Context *> forkCtx(nW);
+        vector<char *> clonePtr(nW);
+        vector<shared_ptr<Context>> ownedCtx;   // non-pooled path: keep clones alive till the join
+        bool pooled = context->keepForkContexts.load(std::memory_order_relaxed);
+        if ( !pooled ) ownedCtx.resize(nW);
+        for ( int w = 0; w != nW; ++w ) {
+            Context * fc;
+            if ( pooled ) {
+                fc = context->acquireForkContext(uint32_t(ContextCategory::job_clone));
+            } else {
+                ownedCtx[w].reset(get_clone_context(context, uint32_t(ContextCategory::job_clone)));
+                ownedCtx[w]->sharedPtrContext = true;
+                fc = ownedCtx[w].get();
+            }
+            auto ptr = fc->allocate(lambdaSize + 16, lineinfo);
+            fc->heap->mark_comment(ptr, "new [[ ]] in team_parallel_for_indexed");
+            memset(ptr, 0, lambdaSize + 16);
+            ptr += 16;
+            das_invoke_function<void>::invoke(fc, lineinfo, fn, ptr, lambda.capture);
+            forkCtx[w] = fc;
+            clonePtr[w] = ptr;
+        }
+        auto bound = daScriptEnvironment::getBound();
+        JobChunk work = [&](int chunkIdx, int slot) {
+            int rb = rangeBegin + chunkIdx * chunkSz + (chunkIdx < rem ? chunkIdx : rem);
+            int re = rb + chunkSz + (chunkIdx < rem ? 1 : 0);
+            if ( slot == nW ) {
+                das_invoke_lambda<void>::invoke(context, lineinfo, lambda, slot, rb, re);
+            } else {
+                daScriptEnvironment::setBound(bound);
+                Lambda flambda(clonePtr[slot]);
+                das_invoke_lambda<void>::invoke(forkCtx[slot], lineinfo, flambda, slot, rb, re);
+            }
+        };
+        g_jobQue->teamParallelFor(actualChunks, work);
+        for ( int w = 0; w != nW; ++w ) {
+            Lambda flambda(clonePtr[w]);
+            das_delete<Lambda>::clear(forkCtx[w], flambda);
+            if ( pooled ) context->releaseForkContext(forkCtx[w]);
+        }
+        das_delete<Lambda>::clear(context, lambda);
+    }
+
     void team_parallel_stages_invoke ( const TArray<int3> & stages, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
         // Multi-stage team dispatch (see JobQue::teamParallelForStages): one rendezvous, one join,
         // internal barriers between stages. Each stage s of the array is int3(range_begin,
@@ -1389,6 +1454,9 @@ namespace das {
                     ->args({"context","line"});
             addExtern<DAS_BIND_FUN(team_parallel_for_invoke)>(*this, lib,  "team_parallel_for_invoke",
                 SideEffects::modifyExternal, "team_parallel_for_invoke")
+                    ->args({"range_begin","range_end","num_chunks","lambda","function","lambdaSize","context","line"});
+            addExtern<DAS_BIND_FUN(team_parallel_for_indexed_invoke)>(*this, lib,  "team_parallel_for_indexed_invoke",
+                SideEffects::modifyExternal, "team_parallel_for_indexed_invoke")
                     ->args({"range_begin","range_end","num_chunks","lambda","function","lambdaSize","context","line"});
             addExtern<DAS_BIND_FUN(team_parallel_stages_invoke)>(*this, lib,  "team_parallel_stages_invoke",
                 SideEffects::modifyExternal, "team_parallel_stages_invoke")

@@ -1,0 +1,9 @@
+das	ggml-parakeet-tdt-0.6b-v2-f32.bin	jfk.wav	11	1	1682.0430000000001
+das	ggml-parakeet-tdt-0.6b-v2-f32.bin	jfk3.wav	33	1	5084.683
+das	ggml-parakeet-tdt-0.6b-v2-f32.bin	gb1.wav	198.734375	1	55501.855
+das	ggml-parakeet-tdt-0.6b-v2-f32.bin	hp0.wav	273.28725000000003	1	92062.635
+das	ggml-parakeet-tdt-0.6b-v2-f32.bin	hp0x2.wav	546.5745000000001	1	294028.689
+cli	ggml-parakeet.bin	jfk.wav	11.000000	1	360.440
+cli	ggml-parakeet.bin	jfk3.wav	33.000000	1	896.190
+cli	ggml-parakeet.bin	gb1.wav	198.734375	1	9742.930
+cli	ggml-parakeet.bin	hp0.wav	273.287250	1	17172.670

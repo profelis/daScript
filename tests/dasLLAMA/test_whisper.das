@@ -105,13 +105,74 @@ def test_gelu_tanh_lut(t : T?) {
 }
 
 [test]
+def test_gelu_lut_batch_exhaustive(t : T?) {
+    t |> run("gelu_tanh_lut_batch == gelu_tanh_lut for EVERY finite f16 input") @(t : T?) {
+        // every f16 pattern as an input row; the batch (table) form must reproduce the
+        // computed form bit-for-bit — the table entries ARE the computed middle branch,
+        // this proves the branch structure and clamps line up too
+        var a : array<float>
+        var b : array<float>
+        a |> resize(65536)
+        for (h in range(65536)) {
+            a[h] = f16_to_f32(uint(h))
+        }
+        var keep : array<float>
+        keep |> reserve(65536)
+        for (v in a) {
+            if (v == v && v < 1e30 && v > -1e30) {   // finite only (nan/inf never reach gelu)
+                keep |> push(v)
+            }
+        }
+        let n = length(keep)
+        b |> resize(n)
+        for (i in range(n)) {
+            b[i] = keep[i]
+        }
+        gelu_tanh_lut(keep, int64(n))
+        gelu_tanh_lut_batch(b, int64(n), 1l)   // one row: pure table path, no threading
+        var bad = 0
+        for (x, y in keep, b) {
+            if (x != y) {
+                bad++
+            }
+        }
+        t |> success(bad == 0, "all {n} finite f16 patterns bit-equal ({bad} differ)")
+    }
+    t |> run("gelu_tanh_lut_batch == gelu_tanh_lut on fp32 inputs BETWEEN f16 patterns") @(t : T?) {
+        // exact-f16 inputs never exercise f32->f16 rounding — a dense fp32 sweep across
+        // (-10.5, 10.5) does, including the values that round UP to the +-10.0 boundary
+        // patterns (the bug class: unbuilt table entry read through the v < 10.0 branch)
+        let n = 200001
+        var a : array<float>
+        var b : array<float>
+        a |> resize(n)
+        b |> resize(n)
+        for (i in range(n)) {
+            let v = -10.5 + float(i) * 1.05e-4
+            a[i] = v
+            b[i] = v
+        }
+        gelu_tanh_lut(a, int64(n))
+        gelu_tanh_lut_batch(b, int64(n), 1l)
+        var bad = 0
+        for (x, y in a, b) {
+            if (x != y) {
+                bad++
+            }
+        }
+        t |> success(bad == 0, "dense sweep bit-equal ({bad} of {n} differ)")
+    }
+}
+
+[test]
 def test_whisper_mel(t : T?) {
     t |> run("whisper-flavor mel: frame math and silence fill") @(t : T?) {
         // stand-in filterbank (the real one loads from the model file)
         let fb <- build_mel_filterbank(80l, 400l, 16000l)
+        let plan <- build_whisper_mel_plan(400l)
         var silence : array<float>
         silence |> resize(16000)          // 1 s of zeros
-        let m <- log_mel_whisper(silence, fb, 80l)
+        let m <- log_mel_whisper(silence, plan, fb, 80l)
         t |> equal(m.n_len, (16000l + 480000l) / 160l)                    // no +1: last frame dropped
         t |> equal(m.n_len_org, 1l + (16000l + 200l - 400l) / 160l)       // real-audio frames
         // all-silence spectrogram: every value is ((-10) + 4)/4 = -1.5 after clamp+scale
@@ -125,9 +186,10 @@ def test_whisper_mel(t : T?) {
     }
     t |> run("window slice zero-fills past n_len") @(t : T?) {
         let fb <- build_mel_filterbank(80l, 400l, 16000l)
+        let plan <- build_whisper_mel_plan(400l)
         var silence : array<float>
         silence |> resize(16000)
-        let m <- log_mel_whisper(silence, fb, 80l)
+        let m <- log_mel_whisper(silence, plan, fb, 80l)
         let win <- whisper_mel_window(m, m.n_len - 10l)
         t |> equal(win.n_len, 3000l)
         t |> success(win.data[0] == -1.5, "first 10 frames real")
@@ -304,6 +366,72 @@ def test_parakeet_oracle(t : T?) {
             t |> equal(segs[0].tokens[32], 841, "tok[32] '.'")
             t |> success(segs[0].text == "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.", "text")
             t |> equal(s.detected_lang, "en")
+
+            // the default load above ran the Q8 fast path — pin that set_asr_fp32 gives the
+            // bit-exact fp32 route AND that both routes stay token-identical (jfk; gb1 was
+            // verified 786/786 at the q8 landing)
+            set_asr_fp32(true)
+            var mf <- load_asr_model(path)
+            set_asr_fp32(false)
+            t |> success(!mf.pk.q8, "knob forces fp32")
+            t |> success(m.pk.q8, "default load is q8")
+            var sf <- create_session(mf)
+            var fsegs : array<TranscribeSegment>
+            transcribe(mf, sf, samples) $(seg) {
+                fsegs |> push_clone(seg)
+            }
+            t |> equal(length(fsegs), 1)
+            t |> equal(length(fsegs[0].tokens), length(segs[0].tokens), "q8/fp32 token count")
+            for (a, b in fsegs[0].tokens, segs[0].tokens) {
+                t |> equal(a, b, "q8/fp32 token")
+            }
+            delete mf.pk.blob
+        }
+        delete m.pk.blob
+    }
+}
+
+[test]
+def test_parakeet_v3_oracle(t : T?) {
+    t |> run("parakeet-TDT v3 (25-lang) greedy on jfk.wav is token-for-token with parakeet-cli") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v3-f32.bin")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: ggml-parakeet-tdt-0.6b-v3-f32.bin not present")
+            return
+        }
+        let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
+        if (length(samples) == 0) {
+            t |> success(true, "skipped: jfk.wav not present")
+            return
+        }
+        // the 8192-piece SPM vocab routes to parakeet AND flips the multilingual caps
+        var m <- load_asr_model(path)
+        let c <- caps(m)
+        t |> equal(length(c.languages), 25, "25 languages")
+        t |> equal(m.pk.n_vocab, 8192l, "vocab")
+        t |> success(m.pk.q8, "default load is q8")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var s <- create_session(m, "de")   // any of the 25; parakeet has no conditioning
+            var segs : array<TranscribeSegment>
+            transcribe(m, s, samples) $(seg) {
+                segs |> push_clone(seg)
+            }
+            // parakeet-cli -ng -ps (CPU, f32 self-convert): 38 tokens; the q8 default stays
+            // id-exact on jfk (durations too — gb1's 16/655 duration-only flips are the known
+            // q8 divergence, ids/text exact there as well)
+            t |> equal(length(segs), 1)
+            t |> equal(length(segs[0].tokens), 38, "token count")
+            t |> equal(segs[0].tokens[0], 1976, "tok[0] '▁And'")
+            t |> equal(segs[0].tokens[1], 547, "tok[1] '▁so'")
+            t |> equal(segs[0].tokens[36], 7893, "tok[36] 'y'")
+            t |> equal(segs[0].tokens[37], 7883, "tok[37] '.'")
+            t |> success(segs[0].text == "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.", "text")
+            t |> equal(s.detected_lang, "", "v3 does not report a language")
         }
         delete m.pk.blob
     }
@@ -385,5 +513,62 @@ def test_whisper_transcribe_oracle(t : T?) {
             t |> equal(s3.lang_id, 0, "detected en")
             t |> success(auto_text == segs[0].text, "auto == en text")
         }
+    }
+}
+
+[test]
+def test_whisper_q8_gate(t : T?) {
+    t |> run("tiny q8 tower (the load_asr_model default) stays token-identical to fp32 on jfk") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
+        if (!stat(model_path).is_valid) {
+            t |> success(true, "skipped: ggml-tiny.bin not present")
+            return
+        }
+        let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
+        if (length(samples) == 0) {
+            t |> success(true, "skipped: jfk.wav not present")
+            return
+        }
+        var m <- load_asr_model(model_path)     // the asr-surface default: q8 tower
+        set_asr_fp32(true)
+        var mf <- load_asr_model(model_path)    // knob-pinned fp32 (the oracle route)
+        set_asr_fp32(false)
+        t |> success(m.whisper.enc.q8, "default load is q8")
+        t |> success(!mf.whisper.enc.q8, "knob forces fp32")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var s <- create_session(m)
+            var segs : array<TranscribeSegment>
+            transcribe(m, s, samples) $(seg) {
+                segs |> push_clone(seg)
+            }
+            var sf <- create_session(mf)
+            var fsegs : array<TranscribeSegment>
+            transcribe(mf, sf, samples) $(seg) {
+                fsegs |> push_clone(seg)
+            }
+            t |> equal(length(segs), length(fsegs), "segment count")
+            var mismatches = 0
+            var total = 0
+            for (a, b in segs, fsegs) {
+                t |> equal(length(a.tokens), length(b.tokens), "token count per segment")
+                for (x, y in a.tokens, b.tokens) {
+                    total++
+                    if (x != y) {
+                        mismatches++
+                    }
+                }
+                t |> success(a.text == b.text, "q8/fp32 text")
+            }
+            t |> success(mismatches == 0, "q8/fp32 token-identical ({mismatches}/{total} flips)")
+        }
+        delete m.whisper.dblob
+        delete m.whisper.enc.fblob
+        delete mf.whisper.dblob
+        delete mf.whisper.enc.fblob
     }
 }

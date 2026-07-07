@@ -355,6 +355,28 @@ what it costs today and what the fix would change.
   facade would need a session-taking `embed` overload, or the server reaches the public
   `embed_forward` primitive — but that breaks the facade-only invariant, so the overload is the
   clean path). Both are backlog; the server is serial and embeddings are low-frequency.
+- **q8 GEMV loses to fp32 on cache-resident weights without VNNI (zen2 whisper decoder,
+  2026-07-08).** Decoder-q8 stage A/B on zen2 tiny/jfk: logits GEMV 3.8x faster (76 MB —
+  bandwidth-bound, the q8 win) but per-layer decoder GEMVs +7-21% SLOWER q8 (~2.3 MB mats,
+  L2/L3-hot across the serial decode steps; AVX2 int8-dot + per-step requant loses to plain
+  FMA when there's no memory traffic to save). Cost today: whisper-tiny zen2 decode leaves
+  ~10-15 ms/clip on the table; net end-to-end neutral so nothing urgent. Possible fix: a
+  per-region "stay-fp32 when the mat fits cache and the box lacks int8-dot silicon" load
+  heuristic (or a box_profile knob like batch_grid_2d) — DON'T build until the M1 decoder-q8
+  re-sweep says whether sdot boxes want q8 everywhere (likely yes → knob would be x64-only).
+
+- **ASR short-clip fixed costs (parakeet, M1 — NEXT ROUND, Boris 2026-07-06; whisper tower
+  q8 postponed one session behind it).** Cost today at matched 8T: jfk das 703 ms vs cli 352
+  (2.0x), LibriSpeech dictation p50 651 vs 324; long clips already 1.07-1.10x, so the short
+  end is where the M1 gap lives. jfk stage profile (q8): ffn 215 / conv_module 126 /
+  attn_heads 120 / attn_proj 119 / conv_sub 55 / mel 33 / decode 27 ms. Levers: mel is
+  single-threaded (thread FFT/mel-dot over frames); conv_sub GEMMs stay fp32 — check their
+  threading; audit every `lanes_for_work` gate at jfk-size tt (small clips may run stages
+  inline that would profitably thread at 8 lanes); small-tt q8 tile shapes /
+  `effective_token_block` at tt≈140; per-layer requant overhead at small tt; v3 decode GEMV
+  is 8198×640 per step (8× v2's rows) — q8 the joint if it shows. Gate per lever: token
+  parity + jfk best-of-3 + LS p50 before/after, both boxes.
+
 - **✅ SHIPPED + SILICON-ADJUDICATED (zen2, 2026-07-05): 2-D batch chunk space (row-units ×
   token-blocks).** Landed as `batch_grid_2d` (0 = 1-D / 1 = fine grid, ggml's 16-token cells /
   2 = wave-aligned, rc·ntc = whole L-waves); the knob arms a per-dispatch auto-gate (engages only

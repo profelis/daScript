@@ -8,6 +8,7 @@ require daslib/array_boost
 require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
+require dasllama/dasllama_quant
 
 // Whisper-family audio frontend: 16 kHz mono PCM -> log-mel chunks, in two oracle-exact
 // flavors: log_mel_chunks mirrors llama.cpp mtmd (tools/mtmd/mtmd-audio.cpp, qwen2a tower),
@@ -77,6 +78,66 @@ def gelu_tanh_lut(var x : float?; size : int64) {
 def gelu_tanh_lut(var x : array<float> | #; size : int64) {
     if (size <= 0l) return
     gelu_tanh_lut(unsafe(addr(x[0])), size)
+}
+
+// The ACTUAL f16 lookup table (ggml's ggml_table_gelu_f16 shape): the middle branch of
+// gelu_tanh_lut is pure f16-domain — idx = f32_to_f16(v) determines the result exactly —
+// so one 65536-entry table replaces a libm tanh + two f16 round-trips per element.
+// Bit-exact vs the computed form by construction (entries ARE the computed form); the
+// suite proves it exhaustively over all f16 patterns. Built once, on first batch call
+// (main thread, before any dispatch captures the pointer).
+var private g_gelu_lut : array<float>
+
+def private gelu_lut_ensure() {
+    if (!empty(g_gelu_lut)) {
+        return
+    }
+    g_gelu_lut |> resize(65536)
+    for (h in range(65536)) {
+        let xr = f16_to_f32(uint(h))
+        // EVERY finite pattern gets the middle-branch value: an fp32 input just under 10.0
+        // passes the v < 10.0 branch but ROUNDS UP to the f16 pattern of 10.0, so boundary
+        // patterns are reachable — an unbuilt entry there returns 0 where the computed form
+        // returns ~10 (caught by the near-boundary sweep in the exhaustive suite test)
+        if ((unsafe(reinterpret<uint>(xr)) & 0x7F800000u) != 0x7F800000u) {   // finite (not inf/nan)
+            let g = 0.5 * xr * (1.0 + tanh(0.79788456080286535587989211986876 * xr * (1.0 + 0.044715 * xr * xr)))
+            g_gelu_lut[h] = f16_to_f32(f32_to_f16(g))
+        }
+    }
+}
+
+//! gelu_tanh_lut over a token-major image (npos rows × d): the middle branch reads the
+//! precomputed f16 table, rows split across lanes. Elementwise ⇒ bit-identical to the
+//! whole-image computed form at any lane count.
+def gelu_tanh_lut_batch(var x : array<float> | #; d, npos : int64) {
+    gelu_lut_ensure()
+    unsafe {
+        var xp = addr(x[0])
+        let lp = reinterpret<float const?>(addr(g_gelu_lut[0]))
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 8l, 0)) $(rb, re) {
+            unsafe {
+                for (i in range64(int64(rb) * d, int64(re) * d)) {
+                    let v = xp[i]
+                    if (v <= -10.0) {
+                        xp[i] = 0.0
+                    } elif (v < 10.0) {   // v >= 10 passes through unchanged
+                        xp[i] = lp[int(f32_to_f16(v))]
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! gelu_erf over a token-major image (npos rows × d), rows split across lanes. Elementwise
+//! ⇒ bit-identical to the whole-image call at any lane count.
+def gelu_erf_batch(var x : array<float> | #; d, npos : int64) {
+    unsafe {
+        var xp = addr(x[0])
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 16l, 0)) $(rb, re) {
+            gelu_erf(unsafe(xp + int64(rb) * d), int64(re - rb) * d)
+        }
+    }
 }
 
 //! Hann window of length ``n`` (periodic when ``periodic``), float-exact vs mtmd's
@@ -153,6 +214,89 @@ def build_dft_twiddles(n_fft : int64) : array<float> {
         }
     }
     return <- b
+}
+
+//! Iterative radix-2 FFT plan for a power-of-2 size: bit-reversal permutation + twiddle
+//! table tw[k] = (cos, −sin)(2πk/n) interleaved, k < n/2 — same forward (e^{−2πi/n})
+//! convention as build_dft_twiddles, so power spectra agree to fp32 rounding.
+struct FftPlan {
+    n : int64 = 0l
+    rev : array<int>
+    tw : array<float>
+}
+
+def build_fft_plan(n : int64) : FftPlan {
+    if (n < 2l || (n & (n - 1l)) != 0l) {
+        panic("build_fft_plan: {n} is not a power of 2")
+    }
+    var p = FftPlan(n = n)
+    var bits = 0l
+    while ((1l << bits) < n) {
+        bits++
+    }
+    p.rev |> resize(int(n))
+    for (i in range64(n)) {
+        var r = 0l
+        var v = i
+        for (_b in range64(bits)) {
+            r = (r << 1l) | (v & 1l)
+            v >>= 1l
+        }
+        p.rev[i] = int(r)
+    }
+    p.tw |> resize(int(n))   // n/2 interleaved (cos, −sin) pairs
+    for (k in range64(n / 2l)) {
+        let theta = 2.0lf * DBL_PI * double(k) / double(n)
+        p.tw[2l * k] = cos(float(theta))
+        p.tw[2l * k + 1l] = -sin(float(theta))
+    }
+    return <- p
+}
+
+//! In-place radix-2 complex FFT over n interleaved (re, im) pairs at ``reim`` — pointer
+//! core so parallel workers can run it on stack buffers. ``rev``/``tw`` from an FftPlan
+//! of the same n.
+def fft_pow2_run(n : int64; rev : int const?; tw : float const?; var reim : float?) {
+    unsafe {
+        for (i in range64(n)) {   // bit-reversal permutation (swap once per pair)
+            let r = int64(rev[i])
+            if (i < r) {
+                let a = i * 2l
+                let b = r * 2l
+                let tre = reim[a]
+                let tim = reim[a + 1l]
+                reim[a] = reim[b]
+                reim[a + 1l] = reim[b + 1l]
+                reim[b] = tre
+                reim[b + 1l] = tim
+            }
+        }
+        var len = 2l
+        while (len <= n) {
+            let half = len >> 1l
+            let step = n / len
+            var base = 0l
+            while (base < n) {
+                for (j in range64(half)) {
+                    let w = j * step * 2l
+                    let wre = tw[w]
+                    let wim = tw[w + 1l]
+                    let a = (base + j) * 2l
+                    let b = (base + j + half) * 2l
+                    let bre = reim[b]
+                    let bim = reim[b + 1l]
+                    let tre = bre * wre - bim * wim
+                    let tim = bre * wim + bim * wre
+                    reim[b] = reim[a] - tre
+                    reim[b + 1l] = reim[a + 1l] - tim
+                    reim[a] += tre
+                    reim[a + 1l] += tim
+                }
+                base += len
+            }
+            len <<= 1l
+        }
+    }
 }
 
 //! Whisper log-mel spectrogram over the full (padded) input, then split into full 3000-frame
@@ -261,77 +405,141 @@ struct WhisperMel {
     data : array<float>
 }
 
+// per-frame stack buffers in log_mel_whisper are sized for the fixed 400-pt whisper DFT
+let private MEL_DFT_N = 400
+let private MEL_DFT_BINS = 201
+
+//! Hoisted whisper-mel tables (build once at model load): Hann-400 window + the DFT twiddle
+//! matrix TRANSPOSED to ``[2·n_bins][n_fft]`` so each spectrum bin is two contiguous ``dot``
+//! rows (the per-frame matvec form in log_mel_whisper). Same table values as
+//! build_dft_twiddles, transposed layout.
+struct WhisperMelPlan {
+    n_fft : int64 = 0l
+    hann : array<float>
+    twt : array<float>   // [2·n_bins][n_fft]: row 2k = cos(2πjk/n), row 2k+1 = −sin(2πjk/n)
+}
+
+def build_whisper_mel_plan(n_fft : int64) : WhisperMelPlan {
+    if (n_fft != int64(MEL_DFT_N)) {
+        panic("build_whisper_mel_plan: log_mel_whisper stack frames are sized for {MEL_DFT_N}-pt DFT, got {n_fft}")
+    }
+    var p = WhisperMelPlan(n_fft = n_fft)
+    p.hann <- build_hann_window(n_fft)
+    let n_bins = n_fft / 2l + 1l
+    var cos_tab : array<float>
+    var sin_tab : array<float>
+    cos_tab |> resize(int(n_fft))
+    sin_tab |> resize(int(n_fft))
+    for (i in range64(n_fft)) {
+        let theta = 2.0lf * DBL_PI * double(i) / double(n_fft)
+        cos_tab[i] = cos(float(theta))
+        sin_tab[i] = sin(float(theta))
+    }
+    p.twt |> resize(int(2l * n_bins * n_fft))
+    for (k in range64(n_bins)) {
+        for (j in range64(n_fft)) {
+            let idx = (j * k) % n_fft
+            p.twt[(2l * k) * n_fft + j] = cos_tab[idx]
+            p.twt[(2l * k + 1l) * n_fft + j] = -sin_tab[idx]
+        }
+    }
+    delete cos_tab
+    delete sin_tab
+    return <- p
+}
+
+// exact-length grow for reused mel scratch: reserve once (exact), resize every call —
+// length stays exact so `for (v in arr)` loops and array-bound reads stay valid on reuse
+def private mel_sized(var a : array<float>; n : int64) {
+    if (int64(capacity(a)) < n) {
+        a |> reserve(int(n))
+    }
+    a |> resize(int(n))
+}
+
 //! whisper.cpp's ``log_mel_spectrogram`` — DIVERGES from the mtmd flavor above: reflect-200
 //! head from the RAW input (no 31 s pre-extend), 30 s zeros + 200 tail, n_len drops the last
 //! frame, frames past the real audio skip the FFT (every bin = log10(1e-10)), floor 1e-10,
-//! filterbank comes from the model file. Same global max−8 clamp + (x+4)/4.
-def log_mel_whisper(samples : array<float> | #; filters : array<float>; n_mel : int64) : WhisperMel {
+//! filterbank comes from the model file. Same global max−8 clamp + (x+4)/4. Returning form —
+//! the ``var padded``/``var m`` overload below reuses session scratch (zero per-transcribe
+//! alloc).
+def log_mel_whisper(samples : array<float> | #; plan : WhisperMelPlan; filters : array<float>; n_mel : int64) : WhisperMel {
+    var padded : array<float>
+    var m = WhisperMel(n_mel = n_mel)
+    log_mel_whisper(samples, plan, filters, n_mel, padded, m)
+    delete padded
+    return <- m
+}
+
+def log_mel_whisper(samples : array<float> | #; plan : WhisperMelPlan; filters : array<float>; n_mel : int64;
+                    var padded : array<float>; var m : WhisperMel) {
     let n_in = int64(length(samples))
     let head = AUDIO_N_FFT / 2l                            // 200
     let n_padded = n_in + AUDIO_SAMPLE_RATE * 30l + 2l * head
-    var padded : array<float>
-    padded |> resize(int(n_padded))                        // resize zero-fills (the whole tail)
-    for (i in range(int(n_in))) {
-        padded[int(head) + i] = samples[i]
-    }
+    mel_sized(padded, n_padded)
     let nref = clamp(n_in - 1l, 0l, head)                  // whisper.cpp reads samples[1..200] unguarded
+    for (i in range64(head - nref)) {                      // scratch is reused, not fresh: zero every region
+        padded[i] = 0.0
+    }
     for (i in range64(nref)) {
         padded[head - 1l - i] = samples[i + 1l]
     }
+    for (i in range(int(n_in))) {
+        padded[int(head) + i] = samples[i]
+    }
+    for (i in range64(head + n_in, n_padded)) {            // 30 s zero tail (+200)
+        padded[i] = 0.0
+    }
 
-    var m = WhisperMel(n_mel = n_mel)
+    m.n_mel = n_mel
     m.n_len = (n_padded - AUDIO_N_FFT) / AUDIO_HOP         // "remove the last frame"
     m.n_len_org = 1l + (n_in + head - AUDIO_N_FFT) / AUDIO_HOP
-    m.data |> resize(int(n_mel * m.n_len))
+    mel_sized(m.data, n_mel * m.n_len)
 
-    // frames whose window starts inside the real (head-padded) audio get the FFT; the rest
+    // frames whose window starts inside the real (head-padded) audio get the DFT; the rest
     // are pure zero-tail and fill with log10(1e-10) directly
     let n_fft = AUDIO_N_FFT
     let n_bins = n_fft / 2l + 1l
     let n_compute = min((n_in + head) / AUDIO_HOP + 1l, m.n_len)
-    let hann <- build_hann_window(n_fft)
-    let twiddles <- build_dft_twiddles(n_fft)
-
-    var xw : array<float>
-    xw |> resize(int(n_compute * n_fft))
-    for (i in range64(n_compute)) {
-        let off = i * AUDIO_HOP
-        for (j in range64(n_fft)) {
-            xw[i * n_fft + j] = hann[j] * padded[off + j]
-        }
+    if (plan.n_fft != n_fft) {
+        panic("log_mel_whisper: plan is {plan.n_fft}-pt, want {n_fft} — build_whisper_mel_plan(AUDIO_N_FFT)")
     }
-    var reim : array<float>
-    reim |> resize(int(n_compute * n_bins * 2l))
-    gemm_f32(unsafe(addr(reim[0])), unsafe(addr(xw[0])), unsafe(addr(twiddles[0])),
-             n_compute, n_fft, n_bins * 2l)
-
-    // power -> mel: float products in groups of 4 summed in float, each group added to a
-    // double accumulator — whisper.cpp's exact unrolled accumulation
     let log10_e = 0.43429448190325176lf
     let fill = float(log(1e-10lf) * log10_e)
-    var power : array<float>
-    power |> resize(int(n_bins))
-    for (i in range64(n_compute)) {
-        for (k in range64(n_bins)) {
-            let re = reim[i * n_bins * 2l + k * 2l]
-            let im = reim[i * n_bins * 2l + k * 2l + 1l]
-            power[k] = re * re + im * im
-        }
-        for (j in range64(n_mel)) {
-            var sum = 0.0lf
-            var k = 0l
-            while (k + 3l < n_bins) {
-                sum += double(power[k] * filters[j * n_bins + k]
-                    + power[k + 1l] * filters[j * n_bins + k + 1l]
-                    + power[k + 2l] * filters[j * n_bins + k + 2l]
-                    + power[k + 3l] * filters[j * n_bins + k + 3l])
-                k += 4l
+
+    // per-frame window + DFT matvec (two tuned dots per bin against the transposed twiddle
+    // rows) + mel dot, threaded over frames (independent — bit-exact at any lane count);
+    // scratch is a per-worker stack frame, so a 9-minute clip no longer materializes the
+    // ~170 MB [frames × n_fft] + [frames × 2·n_bins] images the GEMM form needed
+    let n_len = m.n_len
+    unsafe {
+        let pdd = reinterpret<float const?>(addr(padded[0]))
+        let hw = reinterpret<float const?>(addr(plan.hann[0]))
+        let twt = reinterpret<float const?>(addr(plan.twt[0]))
+        let flt = reinterpret<float const?>(addr(filters[0]))
+        var md = addr(m.data[0])
+        maybe_parallel_for(0, int(n_compute), lanes_for_work(n_compute * n_fft * n_bins * 2l, 0)) $(rb, re) {
+            var xwin : float[MEL_DFT_N]    // windowed samples, stack-resident
+            var pw : float[MEL_DFT_BINS]   // power spectrum
+            unsafe {
+                var xp = addr(xwin[0])
+                var pp = addr(pw[0])
+                for (i in range64(int64(rb), int64(re))) {
+                    let off = i * AUDIO_HOP
+                    for (j in range64(n_fft)) {
+                        xp[j] = hw[j] * pdd[off + j]
+                    }
+                    for (k in range64(n_bins)) {
+                        let sre = dot(twt + (2l * k) * n_fft, xp, n_fft)
+                        let sim = dot(twt + (2l * k + 1l) * n_fft, xp, n_fft)
+                        pp[k] = sre * sre + sim * sim
+                    }
+                    for (jm in range64(n_mel)) {
+                        let sum = double(dot(flt + jm * n_bins, pp, n_bins))
+                        md[jm * n_len + i] = float(log(max(sum, 1e-10lf)) * log10_e)
+                    }
+                }
             }
-            while (k < n_bins) {
-                sum += double(power[k] * filters[j * n_bins + k])
-                k++
-            }
-            m.data[j * m.n_len + i] = float(log(max(sum, 1e-10lf)) * log10_e)
         }
     }
     for (i in range64(n_compute, m.n_len)) {
@@ -350,22 +558,31 @@ def log_mel_whisper(samples : array<float> | #; filters : array<float>; n_mel : 
         let clamped = double(v) < mmax ? float(mmax) : v
         v = float((double(clamped) + 4.0lf) / 4.0lf)
     }
-    return <- m
 }
 
 //! Slice one 3000-frame encoder window starting at mel frame ``seek``; frames past
-//! ``m.n_len`` zero-fill (whisper.cpp's conv-input copy).
+//! ``m.n_len`` zero-fill (whisper.cpp's conv-input copy). Returning form — the ``var c``
+//! overload reuses session scratch (zero per-window alloc).
 def whisper_mel_window(m : WhisperMel; seek : int64) : MelChunk {
-    var c = MelChunk(n_mel = m.n_mel, n_len = AUDIO_CHUNK_FRAMES)
-    c.data |> resize(int(m.n_mel * AUDIO_CHUNK_FRAMES))
+    var c = MelChunk()
+    whisper_mel_window(m, seek, c)
+    return <- c
+}
+
+def whisper_mel_window(m : WhisperMel; seek : int64; var c : MelChunk) {
+    c.n_mel = m.n_mel
+    c.n_len = AUDIO_CHUNK_FRAMES
+    mel_sized(c.data, m.n_mel * AUDIO_CHUNK_FRAMES)
     let i0 = min(seek, m.n_len)
     let i1 = min(seek + AUDIO_CHUNK_FRAMES, m.n_len)
     for (j in range64(m.n_mel)) {
         for (i in range64(i1 - i0)) {
             c.data[j * AUDIO_CHUNK_FRAMES + i] = m.data[j * m.n_len + i0 + i]
         }
+        for (i in range64(i1 - i0, AUDIO_CHUNK_FRAMES)) {   // scratch is reused: zero the tail explicitly
+            c.data[j * AUDIO_CHUNK_FRAMES + i] = 0.0
+        }
     }
-    return <- c
 }
 
 // ===== Whisper encoder tower (fp32 bring-up; q8 fast path is ledgered) =====
@@ -395,6 +612,9 @@ struct AudioTower {
     mm1_out : int64 = 0l      // projector hidden width (ultravox: pre-swiglu, voxtral: pre-gelu)
     has_k_bias : bool = false // qwen3a attention carries a k bias; whisper towers don't
     fblob : array<float>
+    q8 : bool = false         // encoder GEMMs quantized: qblob/qscales carry the Q8_0 image
+    qblob : array<int8>       // whole-fblob-shaped Q8_0 quants (GEMM regions repacked in place)
+    qscales : array<float>    // per-32-block scales, indexed at woff/32
     conv1_w_off : int64
     conv1_b_off : int64
     conv2_w_off : int64
@@ -518,19 +738,72 @@ def layernorm_batch(var out : array<float>; src : array<float>; blob : array<flo
     }
 }
 
-//! y[p] += blob[b_off .. b_off+d) for every row (projection bias)
-def add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
-    for (p in range64(npos)) {
-        for (i in range64(d)) {
-            y[p * d + i] += blob[b_off + i]
+//! Threaded per-row Q8_0 requant of a token-major activation image — the audio-side twin of the
+//! decoder's requant_rows_q8 (private to dasllama_common). Feeds matmul_q8q8_batch/group3.
+def asr_requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>) {
+    let nb = n / 32l
+    unsafe {
+        let xp = reinterpret<float const?>(addr(x[0]))
+        var qp = addr(xqb[0])
+        var sp = addr(xsb[0])
+        maybe_parallel_for(0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let pp = int64(p)
+                    quantize_q8_0_into_ptr(xp + pp * n, n, qp, sp, pp * n, pp * nb)
+                }
+            }
         }
     }
 }
 
-//! x += r, elementwise (residual)
+//! y[p] += blob[b_off .. b_off+d) for every row (projection bias). float4 bulk + scalar
+//! tail, threaded over rows (gemv lane cap — pure streaming) — elementwise adds in the
+//! same per-element order, bit-exact vs the scalar loop at any lane count.
+def add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
+    if (npos <= 0l || d <= 0l) return
+    let d4 = d - d % 4l
+    unsafe {
+        var yp = addr(y[0])
+        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d, get_gemv_lane_cap())) $(rb, re) {
+            unsafe {
+                for (p in range64(int64(rb), int64(re))) {
+                    let row = p * d
+                    var i = 0l
+                    while (i < d4) {
+                        *reinterpret<float4?>(yp + row + i) = (*reinterpret<float4 const?>(yp + row + i)) + (*reinterpret<float4 const?>(bp + i))
+                        i += 4l
+                    }
+                    while (i < d) {
+                        yp[row + i] += bp[i]
+                        i++
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! x += r, elementwise (residual). float4 bulk in 4-aligned threaded chunks + scalar tail
+//! (gemv lane cap — pure streaming) — bit-exact vs the scalar loop at any lane count.
 def add_inplace_rows(var x : array<float>; r : array<float>; n : int64) {
-    for (i in range64(n)) {
-        x[i] += r[i]
+    if (n <= 0l) return
+    let nblk = n / 4l
+    unsafe {
+        var xp = addr(x[0])
+        let rp = reinterpret<float const?>(addr(r[0]))
+        maybe_parallel_for(0, int(nblk), lanes_for_work(n, get_gemv_lane_cap())) $(bb, be) {
+            unsafe {
+                for (b in range64(int64(bb), int64(be))) {
+                    let i = b * 4l
+                    *reinterpret<float4?>(xp + i) = (*reinterpret<float4 const?>(xp + i)) + (*reinterpret<float4 const?>(rp + i))
+                }
+            }
+        }
+        for (i in range64(nblk * 4l, n)) {
+            xp[i] += rp[i]
+        }
     }
 }
 
@@ -539,6 +812,88 @@ def mm_blob_b(var y : array<float>; blob : array<float>; woff : int64; x : array
     array_view(blob, woff, n * d) $(w : array<float>#) {
         matmul_batch(y, w, x, n, d, npos)
     }
+}
+
+// ===== tower Q8 rail (parakeet's v1 recipe: whole-blob Q8_0 image + per-GEMM-region repack) =====
+
+// repack one GEMM region for the active backend (scales index at woff/32 ⇒ woff must be
+// 32-aligned); a region whose contraction width is not a 32-multiple stays fp32 — tw_mm
+// falls back per call on the same condition, so plane and route can never disagree
+def private tw_repack(var t : AudioTower; woff, n, d : int64) {
+    if (n % 32l != 0l) {
+        return
+    }
+    if (woff % 32l != 0l) {
+        panic("audio tower q8: GEMM weight at {woff} is not 32-aligned")
+    }
+    repack_q8q8_weight(t.qblob, t.qscales, woff, n, d)
+}
+
+//! Quantize the tower's GEMM weights to Q8_0: conv2 + per-layer q/k/v/o + fc1/fc2 + projector
+//! mats. conv1 stays fp32 (its 3·n_mel contraction is not a 32-multiple on 80-mel models).
+//! qblob/qscales mirror fblob offsets; non-GEMM slots (biases, norms, pos rows) are
+//! quantized-but-unread — fblob stays the fp32 truth for them.
+def tower_quantize(var t : AudioTower) {
+    let total = int64(length(t.fblob)) & ~31l   // GEMM regions are 32-aligned and 32-sized; a ragged blob tail can't be one
+    t.qblob |> resize(int(total))
+    t.qscales |> resize(int(total / 32l))
+    quantize_q8_0_into(t.fblob, total, t.qblob, t.qscales, 0l, 0l)
+    t.q8 = true
+    if (!select_matmul_backend_for_load()) {
+        return   // row-major backend reads the flat Q8_0 image as-is
+    }
+    let d = t.d_model
+    let ff = t.n_ff
+    tw_repack(t, t.conv2_w_off, 3l * d, d)
+    for (l in range64(t.n_layer)) {
+        let lo = enc_layer_offsets(t, l)
+        tw_repack(t, lo.q_w, d, d)
+        tw_repack(t, lo.k_w, d, d)
+        tw_repack(t, lo.v_w, d, d)
+        tw_repack(t, lo.o_w, d, d)
+        tw_repack(t, lo.fc1_w, d, ff)
+        tw_repack(t, lo.fc2_w, ff, d)
+    }
+    if (t.proj_dim > 0l) {   // whisper .bin towers have no projector
+        if (t.proj_kind == AudioProjKind.qwen2a) {
+            tw_repack(t, t.proj_w_off, d, t.proj_dim)
+        } elif (t.proj_kind == AudioProjKind.ultravox) {
+            tw_repack(t, t.proj_w_off, d * t.stack_factor, t.mm1_out)
+            tw_repack(t, t.mm2_w_off, t.mm1_out / 2l, t.proj_dim)
+        } else {   // voxtral
+            tw_repack(t, t.proj_w_off, d * t.stack_factor, t.mm1_out)
+            tw_repack(t, t.mm2_w_off, t.mm1_out, t.proj_dim)
+        }
+    }
+}
+
+// q8 route for a tower GEMM: activation image (xq, xs) pre-quantized by the caller so q/k/v
+// share one requant (asr_requant_rows_q8); falls back to the fp32 blob when the region wasn't
+// quantizable (same n%32 condition as tw_repack)
+def private tw_mm(t : AudioTower; var y : array<float>; woff : int64; x : array<float>;
+                  xq : array<int8>; xs : array<float>; n, d, npos : int64) {
+    if (t.q8 && n % 32l == 0l) {
+        array_view(t.qblob, woff, n * d) $(wq : array<int8>#) {
+            array_view(t.qscales, woff / 32l, n * d / 32l) $(ws : array<float>#) {
+                matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, npos)
+            }
+        }
+    } else {
+        mm_blob_b(y, t.fblob, woff, x, n, d, npos)
+    }
+}
+
+def private tw_requant(t : AudioTower; x : array<float>; n, npos : int64; var xq : array<int8>; var xs : array<float>) {
+    if (t.q8 && n % 32l == 0l) {
+        asr_requant_rows_q8(x, n, npos, xq, xs)
+    }
+}
+
+// requant-and-multiply for single-consumer activations
+def private tw_mm_rq(t : AudioTower; var y : array<float>; woff : int64; x : array<float>;
+                     var xq : array<int8>; var xs : array<float>; n, d, npos : int64) {
+    tw_requant(t, x, n, npos, xq, xs)
+    tw_mm(t, y, woff, x, xq, xs, n, d, npos)
 }
 
 // Read a conv1d weight (GGUF flat [c_out][c_in][k], k contiguous — torch layout) permuted to
@@ -561,7 +916,7 @@ def private load_conv_permuted(m : GGUFMeta; bytes : array<uint8> | #; name : st
 //! into an AudioTower: hparams from the ``clip.audio.*`` keys, every tensor fp32 into the blob
 //! in ``enc_layer_offsets`` order, conv weights permuted for im2col. Vision tensors in a
 //! combined omni mmproj are skipped (the loader only reads ``a.*`` / ``mm.a.*`` names).
-def load_audio_tower(path : string) : AudioTower {
+def load_audio_tower(path : string; q8 : bool = false) : AudioTower {
     var t = AudioTower()
     let f = fopen(path, "rb")
     if (f == null) {
@@ -683,6 +1038,9 @@ def load_audio_tower(path : string) : AudioTower {
         }
     }
     fclose(f)
+    if (q8) {
+        tower_quantize(t)
+    }
     return <- t
 }
 
@@ -698,12 +1056,14 @@ struct EncoderState {
     kk : array<float>    // k token-major [T × d]
     vv : array<float>    // v token-major [T × d]
     hp : array<float>    // per-head packs q,kT,v,out: 4 × [T × d]
-    att : array<float>   // per-head blocked scores [n_head × ATTN_ENC_QB × T]
+    att : array<float>   // per-slot blocked scores [get_dispatch_slot_bound() × ATTN_ENC_QB × T]
     h : array<float>     // ffn hidden [T × ff]
     pooled : array<float>// [T/2 × d]
     ph : array<float>    // projector hidden [rows × mm1_out] (ultravox/voxtral)
     pg : array<float>    // ultravox swiglu output [rows × mm1_out/2]
     out : array<float>   // projected soft tokens [tokens_per_chunk × proj_dim]
+    xqi : array<int8>    // q8 requant image [T × max(3d, ff)] (empty on fp32 towers)
+    xsi : array<float>   // per-32-block scales for xqi
 }
 
 let ATTN_ENC_QB = 128l  // query rows per attention score block (15 MB att scratch at T=1500)
@@ -723,7 +1083,7 @@ def make_encoder_state(t : AudioTower) : EncoderState {
     s.kk |> resize(int(tt * d))
     s.vv |> resize(int(tt * d))
     s.hp |> resize(int(4l * tt * d))
-    s.att |> resize(int(t.n_head * ATTN_ENC_QB * tt))
+    s.att |> resize(int(int64(get_dispatch_slot_bound()) * ATTN_ENC_QB * tt))
     s.h |> resize(int(tt * t.n_ff))
     s.pooled |> resize(int(tt / 2l * d))
     let rows = audio_tokens_per_chunk(t)
@@ -734,16 +1094,35 @@ def make_encoder_state(t : AudioTower) : EncoderState {
         }
     }
     s.out |> resize(int(rows * t.proj_dim))
+    if (t.q8) {   // largest requant image any tower GEMM feeds (conv2 3d / fc2 ff / projector mats)
+        var need = tt * max(3l * d, t.n_ff)
+        if (t.proj_dim > 0l && t.proj_kind != AudioProjKind.qwen2a) {
+            need = max(need, rows * max(d * t.stack_factor, t.mm1_out))
+        }
+        s.xqi |> resize(int(need))
+        s.xsi |> resize(int(need / 32l))
+    }
     return <- s
 }
 
-// Non-causal blocked attention over gemm_f32, parallel across heads: per head, pack Q/Kᵀ/V,
-// then per ATTN_ENC_QB query rows score = Q·Kᵀ (scale + full-row softmax) and out = P·V.
+// Non-causal blocked attention over gemm_f32, flattened over (head × ATTN_ENC_QB query rows)
+// units: stage 1 packs Q/Kᵀ/V per (head × row-block), stage 2 runs score = Q·Kᵀ (scale +
+// full-row softmax), out = P·V, and the token-major scatter for its rows. Head-parallel left
+// lanes idle (tiny: 6 heads on 8 lanes; turbo: 20 = a 17% makespan floor); flattened units
+// self-serve chunk-per-unit, with slot-indexed score scratch (units of one head share the
+// per-head pack regions read-only after stage 1, so only scores need per-slot space).
 // No cache, no mask — every position sees all `tt` positions.
 def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
     let d = t.d_model
     let hs = d / t.n_head
     let scale = 1.0 / sqrt(float(hs))
+    let nqb = int((tt + ATTN_ENC_QB - 1l) / ATTN_ENC_QB)
+    let nu = int(t.n_head) * nqb
+    // que-less-creation guard: the state may have been sized under a smaller slot bound
+    let attNeed = int64(get_dispatch_slot_bound()) * ATTN_ENC_QB * tt
+    if (int64(length(s.att)) < attNeed) {
+        s.att |> resize(int(attNeed))
+    }
     unsafe {
         let qp = reinterpret<float const?>(addr(s.qq[0]))
         let kp = reinterpret<float const?>(addr(s.kk[0]))
@@ -751,45 +1130,59 @@ def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
         var hpp = addr(s.hp[0])
         var attp = addr(s.att[0])
         var aop = addr(s.xb2[0])
-        maybe_parallel_for(0, int(t.n_head), get_dispatch_lanes()) $(hb, he) {
+        var tp = ref_time_ticks()
+        maybe_parallel_for(0, nu, min(get_dispatch_lanes(), nu)) $(ub, ue) {
             unsafe {
-                for (h in range(hb, he)) {
+                for (u in range(ub, ue)) {
+                    let h = u / nqb
                     let hoff = int64(h) * hs
                     // per-head pack region: q [tt×hs], kT [hs×tt], v [tt×hs], oh [tt×hs]
                     var qh = hpp + int64(h) * 4l * tt * hs
                     var kt = qh + tt * hs
                     var vh = kt + tt * hs
-                    var oh = vh + tt * hs
-                    for (p in range64(tt)) {
+                    let p0 = int64(u % nqb) * ATTN_ENC_QB
+                    let p1 = min(p0 + ATTN_ENC_QB, tt)
+                    for (p in range64(p0, p1)) {
                         for (j in range64(hs)) {
                             qh[p * hs + j] = qp[p * d + hoff + j]
                             kt[j * tt + p] = kp[p * d + hoff + j]
                             vh[p * hs + j] = vp[p * d + hoff + j]
                         }
                     }
-                    var ah = attp + int64(h) * ATTN_ENC_QB * tt
-                    var qb0 = 0l
-                    while (qb0 < tt) {
-                        let qbn = min(ATTN_ENC_QB, tt - qb0)
-                        for (i in range64(qbn * tt)) {
-                            ah[i] = 0.0
-                        }
-                        gemm_f32(ah, qh + qb0 * hs, kt, qbn, hs, tt)
-                        for (r in range64(qbn)) {
-                            var row = ah + r * tt
-                            for (i in range64(tt)) {
-                                row[i] *= scale
-                            }
-                            softmax(row, tt)
-                        }
-                        for (i in range64(qbn * hs)) {
-                            oh[qb0 * hs + i] = 0.0
-                        }
-                        gemm_f32(oh + qb0 * hs, ah, vh, qbn, tt, hs)
-                        qb0 += qbn
+                }
+            }
+        }
+        asr_prof_add("enc.attn.pack", tp)
+        tp = ref_time_ticks()
+        maybe_parallel_for_indexed(0, nu, nu) $(slot, ub, ue) {
+            unsafe {
+                var ah = attp + int64(slot) * ATTN_ENC_QB * tt
+                for (u in range(ub, ue)) {
+                    let h = u / nqb
+                    let hoff = int64(h) * hs
+                    var qh = hpp + int64(h) * 4l * tt * hs
+                    var kt = qh + tt * hs
+                    var vh = kt + tt * hs
+                    var oh = vh + tt * hs
+                    let qb0 = int64(u % nqb) * ATTN_ENC_QB
+                    let qbn = min(ATTN_ENC_QB, tt - qb0)
+                    for (i in range64(qbn * tt)) {
+                        ah[i] = 0.0
                     }
-                    // scatter head output back to token-major xb2
-                    for (p in range64(tt)) {
+                    gemm_f32(ah, qh + qb0 * hs, kt, qbn, hs, tt)
+                    for (r in range64(qbn)) {
+                        var row = ah + r * tt
+                        for (i in range64(tt)) {
+                            row[i] *= scale
+                        }
+                        softmax(row, tt)
+                    }
+                    for (i in range64(qbn * hs)) {
+                        oh[qb0 * hs + i] = 0.0
+                    }
+                    gemm_f32(oh + qb0 * hs, ah, vh, qbn, tt, hs)
+                    // scatter this unit's rows back to token-major xb2
+                    for (p in range64(qb0, qb0 + qbn)) {
                         for (j in range64(hs)) {
                             aop[p * d + hoff + j] = oh[p * hs + j]
                         }
@@ -797,6 +1190,7 @@ def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
                 }
             }
         }
+        asr_prof_add("enc.attn.blocks", tp)
     }
 }
 
@@ -837,12 +1231,51 @@ def private diff_stage(name : string; x : array<float>; n : int64) {
     fclose(f)
 }
 
-// t.gelu_tanh selects the oracle-exact activation flavor (see gelu_tanh_lut)
-def private enc_gelu(t : AudioTower; var x : array<float>; size : int64) {
+// ===== ASR stage profiling rail =====
+// set_asr_prof(true) → the ASR encode/decode paths accumulate wall us per stage label;
+// asr_prof_report() prints totals sorted desc and resets. Harness-only, off by default.
+var g_asr_prof_on = false
+var private g_asr_prof : table<string; int64>
+var private g_asr_prof_hits : table<string; int64>
+
+def set_asr_prof(on : bool) {
+    g_asr_prof_on = on
+}
+
+//! Accumulate ``get_time_usec(t0)`` under ``name`` (no-op unless set_asr_prof(true)).
+def asr_prof_add(name : string; t0 : int64) {
+    if (!g_asr_prof_on) {
+        return
+    }
+    g_asr_prof[name] += int64(get_time_usec(t0))
+    g_asr_prof_hits[name]++
+}
+
+def asr_prof_report() {
+    var rows : array<tuple<name : string; us : int64>>
+    var total = 0l
+    for (k, v in keys(g_asr_prof), values(g_asr_prof)) {
+        rows |> push((name = k, us = v))
+        total += v
+    }
+    rows |> sort() $(a, b) => a.us > b.us
+    for (r in rows) {
+        let hits = g_asr_prof_hits?[r.name] ?? 0l
+        let pct = total > 0l ? double(r.us) * 100.0lf / double(total) : 0.0lf
+        print("PROF\t{r.name}\t{double(r.us) / 1000.0lf}\t{hits}\t{pct}\n")
+    }
+    print("PROF\ttotal\t{double(total) / 1000.0lf}\t\t\n")
+    clear(g_asr_prof)
+    clear(g_asr_prof_hits)
+}
+
+// t.gelu_tanh selects the oracle-exact activation flavor (see gelu_tanh_lut); threaded
+// flavor dispatch for row images (both flavors elementwise ⇒ bit-exact at any lane count)
+def private enc_gelu_batch(t : AudioTower; var x : array<float>; d, npos : int64) {
     if (t.gelu_tanh) {
-        gelu_tanh_lut(x, size)
+        gelu_tanh_lut_batch(x, d, npos)
     } else {
-        gelu_erf(x, size)
+        gelu_erf_batch(x, d, npos)
     }
 }
 
@@ -858,6 +1291,7 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     let tt = t.n_ctx
     let d = t.d_model
     let nm = t.n_mel
+    let tc = ref_time_ticks()
 
     // conv1 k3 s1 same: im2col column (dk, c) — matches the loader's weight permute
     for (i in range64(tin)) {
@@ -872,7 +1306,7 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
     }
     mm_blob_b(s.y1, t.fblob, t.conv1_w_off, s.x1, 3l * nm, d, tin)
     add_bias_rows(s.y1, t.fblob, t.conv1_b_off, d, tin)
-    enc_gelu(t, s.y1, tin * d)
+    enc_gelu_batch(t, s.y1, d, tin)
 
     // conv2 k3 s2 same -> T = tin/2 positions
     for (i in range64(tt)) {
@@ -885,14 +1319,15 @@ def audio_encode_blocks(t : AudioTower; var s : EncoderState; mel : MelChunk) {
             }
         }
     }
-    mm_blob_b(s.x, t.fblob, t.conv2_w_off, s.x2, 3l * d, d, tt)
+    tw_mm_rq(t, s.x, t.conv2_w_off, s.x2, s.xqi, s.xsi, 3l * d, d, tt)
     add_bias_rows(s.x, t.fblob, t.conv2_b_off, d, tt)
-    enc_gelu(t, s.x, tt * d)
+    enc_gelu_batch(t, s.x, d, tt)
 
     // + learned/sinusoidal position rows (loaded from the mmproj)
     for (i in range64(tt * d)) {
         s.x[i] += t.fblob[t.pos_off + i]
     }
+    asr_prof_add("enc.conv", tc)
     diff_stage("after_conv_pos", s.x, tt * d)
 
     encoder_blocks(t, s, tt)
@@ -906,36 +1341,65 @@ def encoder_blocks(t : AudioTower; var s : EncoderState; npos : int64) {
     let d = t.d_model
     for (l in range64(t.n_layer)) {
         let lo = enc_layer_offsets(t, l)
+        var te = ref_time_ticks()
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln1_w, lo.ln1_b, d, tt, t.eps)
-        mm_blob_b(s.qq, t.fblob, lo.q_w, s.xb, d, d, tt)
-        mm_blob_b(s.kk, t.fblob, lo.k_w, s.xb, d, d, tt)
-        mm_blob_b(s.vv, t.fblob, lo.v_w, s.xb, d, d, tt)
+        tw_requant(t, s.xb, d, tt, s.xqi, s.xsi)   // q/k/v share the post-LN activation: one requant
+        tw_mm(t, s.qq, lo.q_w, s.xb, s.xqi, s.xsi, d, d, tt)
+        tw_mm(t, s.kk, lo.k_w, s.xb, s.xqi, s.xsi, d, d, tt)
+        tw_mm(t, s.vv, lo.v_w, s.xb, s.xqi, s.xsi, d, d, tt)
         add_bias_rows(s.qq, t.fblob, lo.q_b, d, tt)   // q bias
         if (t.has_k_bias) {
             add_bias_rows(s.kk, t.fblob, lo.k_b, d, tt)
         }
         add_bias_rows(s.vv, t.fblob, lo.v_b, d, tt)   // v bias
+        asr_prof_add("enc.attn_proj", te)
         if (l == 0l) {
             diff_stage("b0_ln1", s.xb, tt * d)
             diff_stage("b0_q", s.qq, tt * d)
             diff_stage("b0_k", s.kk, tt * d)
             diff_stage("b0_v", s.vv, tt * d)
         }
+        te = ref_time_ticks()
         enc_attention(t, s, tt)
+        asr_prof_add("enc.attn_heads", te)
         if (l == 0l) {
             diff_stage("b0_attnout", s.xb2, tt * d)
         }
-        mm_blob_b(s.xb, t.fblob, lo.o_w, s.xb2, d, d, tt)
+        te = ref_time_ticks()
+        tw_mm_rq(t, s.xb, lo.o_w, s.xb2, s.xqi, s.xsi, d, d, tt)
         add_bias_rows(s.xb, t.fblob, lo.o_b, d, tt)
         add_inplace_rows(s.x, s.xb, tt * d)
+        asr_prof_add("enc.attn_out", te)
 
+        te = ref_time_ticks()
+        var tf = ref_time_ticks()
         layernorm_batch(s.xb, s.x, t.fblob, lo.ln2_w, lo.ln2_b, d, tt, t.eps)
-        mm_blob_b(s.h, t.fblob, lo.fc1_w, s.xb, d, t.n_ff, tt)
+        asr_prof_add("enc.ffn.fc1.ln", tf)
+        tf = ref_time_ticks()
+        tw_requant(t, s.xb, d, tt, s.xqi, s.xsi)
+        asr_prof_add("enc.ffn.fc1.rq", tf)
+        tf = ref_time_ticks()
+        tw_mm(t, s.h, lo.fc1_w, s.xb, s.xqi, s.xsi, d, t.n_ff, tt)
+        asr_prof_add("enc.ffn.fc1.mm", tf)
+        tf = ref_time_ticks()
         add_bias_rows(s.h, t.fblob, lo.fc1_b, t.n_ff, tt)
-        enc_gelu(t, s.h, tt * t.n_ff)
-        mm_blob_b(s.xb2, t.fblob, lo.fc2_w, s.h, t.n_ff, d, tt)
+        asr_prof_add("enc.ffn.fc1.bias", tf)
+        asr_prof_add("enc.ffn.fc1", te)
+        te = ref_time_ticks()
+        enc_gelu_batch(t, s.h, t.n_ff, tt)
+        asr_prof_add("enc.ffn.gelu", te)
+        te = ref_time_ticks()
+        tf = ref_time_ticks()
+        tw_requant(t, s.h, t.n_ff, tt, s.xqi, s.xsi)
+        asr_prof_add("enc.ffn.fc2.rq", tf)
+        tf = ref_time_ticks()
+        tw_mm(t, s.xb2, lo.fc2_w, s.h, s.xqi, s.xsi, t.n_ff, d, tt)
+        asr_prof_add("enc.ffn.fc2.mm", tf)
+        tf = ref_time_ticks()
         add_bias_rows(s.xb2, t.fblob, lo.fc2_b, d, tt)
         add_inplace_rows(s.x, s.xb2, tt * d)
+        asr_prof_add("enc.ffn.fc2.bias", tf)
+        asr_prof_add("enc.ffn.fc2", te)
         if (l == 0l) {
             diff_stage("after_block0", s.x, tt * d)
         }
@@ -992,17 +1456,17 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
         layernorm_batch(s.pooled, s.pooled, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tp, t.eps)
 
         // projector: one linear into the decoder's embedding space
-        mm_blob_b(s.out, t.fblob, t.proj_w_off, s.pooled, d, t.proj_dim, tp)
+        tw_mm_rq(t, s.out, t.proj_w_off, s.pooled, s.xqi, s.xsi, d, t.proj_dim, tp)
         add_bias_rows(s.out, t.fblob, t.proj_b_off, t.proj_dim, tp)
     } elif (t.proj_kind == AudioProjKind.ultravox) {
         // post-LN over all positions (no avg-pool), stacked rows straight off s.xb's memory
         layernorm_batch(s.xb, s.x, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tt, t.eps)
         let m1in = d * t.stack_factor
         rms_rows_blob(s.xb, t.fblob, t.normpre_off, m1in, rows)   // RMS-pre on stacked rows
-        mm_blob_b(s.ph, t.fblob, t.proj_w_off, s.xb, m1in, t.mm1_out, rows)
+        tw_mm_rq(t, s.ph, t.proj_w_off, s.xb, s.xqi, s.xsi, m1in, t.mm1_out, rows)
         swiglu_swapped_rows(s.pg, s.ph, t.mm1_out / 2l, rows)
         rms_rows_blob(s.pg, t.fblob, t.normmid_off, t.mm1_out / 2l, rows)
-        mm_blob_b(s.out, t.fblob, t.mm2_w_off, s.pg, t.mm1_out / 2l, t.proj_dim, rows)
+        tw_mm_rq(t, s.out, t.mm2_w_off, s.pg, s.xqi, s.xsi, t.mm1_out / 2l, t.proj_dim, rows)
     } else {   // voxtral: avg-pool -> post-LN -> stack -> mm1 -> gelu_erf -> mm2
         let tp = tt / 2l
         for (p in range64(tp)) {
@@ -1012,9 +1476,9 @@ def audio_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
         }
         layernorm_batch(s.pooled, s.pooled, t.fblob, t.lnp_w_off, t.lnp_b_off, d, tp, t.eps)
         let m1in = d * t.stack_factor
-        mm_blob_b(s.ph, t.fblob, t.proj_w_off, s.pooled, m1in, t.mm1_out, rows)
+        tw_mm_rq(t, s.ph, t.proj_w_off, s.pooled, s.xqi, s.xsi, m1in, t.mm1_out, rows)
         gelu_erf(s.ph, rows * t.mm1_out)
-        mm_blob_b(s.out, t.fblob, t.mm2_w_off, s.ph, t.mm1_out, t.proj_dim, rows)
+        tw_mm_rq(t, s.out, t.mm2_w_off, s.ph, s.xqi, s.xsi, t.mm1_out, t.proj_dim, rows)
     }
     diff_stage("out", s.out, rows * t.proj_dim)
 }

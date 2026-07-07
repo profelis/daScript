@@ -9,6 +9,7 @@ require strings
 require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
+require dasllama/dasllama_quant
 require dasllama/dasllama_audio
 
 // Whisper-proper ASR: reads ggerganov/whisper.cpp ggml-*.bin models directly (drop-in HF
@@ -42,8 +43,12 @@ struct WhisperModel {
     tok_space : int    // id of " " (suppress_blank's second victim)
     vocab : array<string>    // id -> raw bytes; synthesized tail ids (specials/timestamps) are ""
     filters : array<float>   // mel filterbank [n_mel][201], loaded from the file
+    mel : WhisperMelPlan = WhisperMelPlan()   // hoisted hann + transposed DFT twiddles
     enc : AudioTower = AudioTower()
     dblob : array<float>
+    dq8 : bool = false        // decoder GEMMs quantized: dqblob/dqscales carry the Q8_0 image
+    dqblob : array<int8>      // whole-dblob-shaped Q8_0 quants (GEMM regions repacked in place)
+    dqscales : array<float>   // per-32-block scales, indexed at woff/32
     d_pe_off : int64
     d_te_off : int64
     d_ln_w_off : int64
@@ -116,6 +121,80 @@ def dec_layer_offsets(w : WhisperModel; l : int64) : DecLayerOffs {
 // 8 square mats + 2 mlp mats (4d·d each) + 13 d-vectors + fc1 bias (4d)
 def dec_layer_stride(d : int64) : int64 => 16l * d * d + 17l * d
 
+// ===== decoder Q8 rail (the tower recipe on dblob: whole-blob Q8_0 image + per-region repack) =====
+
+// repack one decoder GEMM region for the active backend — tw_repack's twin (scales index at
+// woff/32 ⇒ woff must be 32-aligned); an n%32!=0 region stays fp32, wm_mm falls back per
+// call on the same condition
+def private wm_repack(var w : WhisperModel; woff, n, d : int64) {
+    if (n % 32l != 0l) {
+        return
+    }
+    if (woff % 32l != 0l) {
+        panic("whisper decoder q8: GEMM weight at {woff} is not 32-aligned")
+    }
+    repack_q8q8_weight(w.dqblob, w.dqscales, woff, n, d)
+}
+
+//! Quantize the decoder's GEMM weights to Q8_0: the tied token embedding (read as the
+//! [n_vocab × d] logits GEMV weight; embedding-row lookups keep reading fp32 dblob) +
+//! per-layer self/cross q/k/v/o + fc1/fc2. dqblob/dqscales mirror dblob offsets; non-GEMM
+//! slots (pe rows, norms, biases) are quantized-but-unread.
+def whisper_dec_quantize(var w : WhisperModel) {
+    let total = int64(length(w.dblob)) & ~31l
+    w.dqblob |> resize(int(total))
+    w.dqscales |> resize(int(total / 32l))
+    quantize_q8_0_into(w.dblob, total, w.dqblob, w.dqscales, 0l, 0l)
+    w.dq8 = true
+    if (!select_matmul_backend_for_load()) {
+        return   // row-major backend reads the flat Q8_0 image as-is
+    }
+    let d = w.n_text_state
+    wm_repack(w, w.d_te_off, d, w.n_vocab)
+    for (l in range64(w.n_text_layer)) {
+        let lo = dec_layer_offsets(w, l)
+        wm_repack(w, lo.q_w, d, d)
+        wm_repack(w, lo.k_w, d, d)
+        wm_repack(w, lo.v_w, d, d)
+        wm_repack(w, lo.o_w, d, d)
+        wm_repack(w, lo.cq_w, d, d)
+        wm_repack(w, lo.ck_w, d, d)
+        wm_repack(w, lo.cv_w, d, d)
+        wm_repack(w, lo.co_w, d, d)
+        wm_repack(w, lo.fc1_w, d, 4l * d)
+        wm_repack(w, lo.fc2_w, 4l * d, d)
+    }
+}
+
+// q8 route for a decoder GEMM: activation image (xq, xs) pre-quantized by the caller so
+// q/k/v (and every layer's ck/cv off one encode) share one requant; falls back to the fp32
+// blob when the region wasn't quantizable (same n%32 condition as wm_repack)
+def private wm_mm(w : WhisperModel; var y : array<float>; woff : int64; x : array<float>;
+                  xq : array<int8>; xs : array<float>; n, d, npos : int64) {
+    if (w.dq8 && n % 32l == 0l) {
+        array_view(w.dqblob, woff, n * d) $(wq : array<int8>#) {
+            array_view(w.dqscales, woff / 32l, n * d / 32l) $(ws : array<float>#) {
+                matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, npos)
+            }
+        }
+    } else {
+        mm_blob_b(y, w.dblob, woff, x, n, d, npos)
+    }
+}
+
+def private wm_requant(w : WhisperModel; x : array<float>; n, npos : int64; var xq : array<int8>; var xs : array<float>) {
+    if (w.dq8 && n % 32l == 0l) {
+        asr_requant_rows_q8(x, n, npos, xq, xs)
+    }
+}
+
+// requant-and-multiply for single-consumer activations
+def private wm_mm_rq(w : WhisperModel; var y : array<float>; woff : int64; x : array<float>;
+                     var xq : array<int8>; var xs : array<float>; n, d, npos : int64) {
+    wm_requant(w, x, n, npos, xq, xs)
+    wm_mm(w, y, woff, x, xq, xs, n, d, npos)
+}
+
 // ===== ggml bin container parsing =====
 
 // One tensor's location in the bin: ggml ttype (0=f32, 1=f16), element count, absolute
@@ -177,7 +256,7 @@ def private wt_read_conv_permuted(recs : table<string; WTensorRec>; b : array<ui
 
 //! Load a whisper.cpp ggml-*.bin model (f32/f16 tensor types; quantized whisper bins are not
 //! supported). Verified against whisper.cpp's whisper_model_load, byte for byte.
-def load_whisper_model(path : string) : WhisperModel {
+def load_whisper_model(path : string; q8 : bool = false) : WhisperModel {
     var w = WhisperModel()
     // the record walk runs until EOF, so it needs the true byte count — length(bytes) is
     // int32 and wraps negative on >2 GB bins (large-v3); stat's st_size is 64-bit
@@ -220,6 +299,7 @@ def load_whisper_model(path : string) : WhisperModel {
             w.filters[i] = rd_f32(bytes, o + i * 4l)
         }
         o += filt_mel * filt_fft * 4l
+        w.mel <- build_whisper_mel_plan(AUDIO_N_FFT)
 
         // vocab: raw byte tokens; hparams tail ids (specials/timestamps) have no bytes
         let n_vocab_file = int64(rd_i32(bytes, o)); o += 4l
@@ -335,6 +415,9 @@ def load_whisper_model(path : string) : WhisperModel {
         }
         wt_read(recs, bytes, "encoder.ln_post.weight", t.fblob, t.lnp_w_off, d)
         wt_read(recs, bytes, "encoder.ln_post.bias", t.fblob, t.lnp_b_off, d)
+        if (q8) {
+            tower_quantize(t)
+        }
         w.enc <- t
 
         // decoder blob
@@ -382,6 +465,9 @@ def load_whisper_model(path : string) : WhisperModel {
         wt_read(recs, bytes, "decoder.ln.bias", w.dblob, w.d_ln_b_off, dd)
     }
     fclose(f)
+    if (q8) {
+        whisper_dec_quantize(w)
+    }
     return <- w
 }
 
@@ -396,6 +482,14 @@ def whisper_encode(t : AudioTower; var s : EncoderState; mel : MelChunk) {
 }
 
 // ===== decoder =====
+
+//! One sampled token: greedy argmax id + the most probable timestamp token (whisper.cpp's
+//! token_data.tid — segment boundaries read it even off text tokens).
+struct SampledTok {
+    id : int
+    tid : int
+    plog : float
+}
 
 //! Decoder scratch + caches, sized once per model and reused across windows. Self-attn K/V
 //! caches and the per-window cross-attention memory are head-major; K is stored TRANSPOSED
@@ -418,6 +512,15 @@ struct DecoderState {
     att : array<float>      // per-head scores [H × ncap × max(Tmax, Ta)]
     x1 : array<float>       // [d] last-row staging for the tied-logits GEMV
     logits : array<float>   // [n_vocab]
+    xqi : array<int8>       // q8 requant image [max(Ta × d, ncap × 4d)] (empty on fp32 decoders)
+    xsi : array<float>      // per-32-block scales for xqi
+    // window-driver scratch, hoisted so a transcribe allocates nothing (README standing rule)
+    mel : WhisperMel = WhisperMel()   // full-clip spectrogram (grows to the longest clip seen)
+    mel_padded : array<float>         // log_mel_whisper padding scratch
+    win : MelChunk = MelChunk()       // the 3000-frame encoder window
+    prompt : array<int>
+    toks : array<SampledTok>
+    step : array<int>
 }
 
 def make_decoder_state(w : WhisperModel) : DecoderState {
@@ -444,6 +547,17 @@ def make_decoder_state(w : WhisperModel) : DecoderState {
     ds.att |> resize(int(hh * ncap * max(tmax, ta)))
     ds.x1 |> resize(int(d))
     ds.logits |> resize(int(w.n_vocab))
+    if (w.dq8) {   // largest requant image any decoder GEMM feeds (cross k/v enc_out Ta×d, mlp h ncap×4d)
+        let need = max(ta * d, ncap * 4l * d)
+        ds.xqi |> resize(int(need))
+        ds.xsi |> resize(int(need / 32l))
+    }
+    ds.win.n_mel = w.enc.n_mel
+    ds.win.n_len = AUDIO_CHUNK_FRAMES
+    ds.win.data |> resize(int(w.enc.n_mel * AUDIO_CHUNK_FRAMES))
+    ds.prompt |> reserve(4)
+    ds.toks |> reserve(int(w.n_text_ctx / 2l) - 4)   // n_max, the window token cap
+    ds.step |> resize(1)
     return <- ds
 }
 
@@ -456,24 +570,84 @@ def whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<fl
     let hs = d / hh
     let ta = w.enc.n_ctx
     let kscale = 1.0 / sqrt(sqrt(float(hs)))
+    wm_requant(w, enc_out, d, ta, ds.xqi, ds.xsi)   // every layer's ck & cv share this one requant
     for (l in range64(w.n_text_layer)) {
         let lo = dec_layer_offsets(w, l)
-        mm_blob_b(ds.ckv_tmp, w.dblob, lo.ck_w, enc_out, d, d, ta)
-        for (h in range64(hh)) {
-            let base = ((l * hh + h) * hs) * ta
-            for (t in range64(ta)) {
-                for (j in range64(hs)) {
-                    ds.kx[base + j * ta + t] = ds.ckv_tmp[t * d + h * hs + j] * kscale
+        wm_mm(w, ds.ckv_tmp, lo.ck_w, enc_out, ds.xqi, ds.xsi, d, d, ta)
+        // kx: 4x4 register-blocked transpose, t-block outer so the 4 source rows stream
+        // contiguously; threaded over t-blocks — pure scatter, bit-exact under any chunking
+        // (cross_kv_bench: 3.5-4.5x over the scalar form even single-lane)
+        unsafe {
+            let sp = reinterpret<float const?>(addr(ds.ckv_tmp[0]))
+            var op = addr(ds.kx[l * d * ta])
+            let nblk = ta / 4l
+            maybe_parallel_for(0, int(nblk), lanes_for_work(ta * d, 0)) $(bb, be) {
+                unsafe {
+                    for (blk in range64(int64(bb), int64(be))) {
+                        let t = blk * 4l
+                        let r0 = sp + t * d
+                        let r1 = sp + (t + 1l) * d
+                        let r2 = sp + (t + 2l) * d
+                        let r3 = sp + (t + 3l) * d
+                        for (h in range64(hh)) {
+                            let hoff = h * hs
+                            let base = h * hs * ta + t
+                            var j = 0l
+                            while (j + 3l < hs) {
+                                let a = (*reinterpret<float4 const?>(r0 + hoff + j)) * kscale
+                                let b = (*reinterpret<float4 const?>(r1 + hoff + j)) * kscale
+                                let c = (*reinterpret<float4 const?>(r2 + hoff + j)) * kscale
+                                let e = (*reinterpret<float4 const?>(r3 + hoff + j)) * kscale
+                                *reinterpret<float4?>(op + base + j * ta) = float4(a.x, b.x, c.x, e.x)
+                                *reinterpret<float4?>(op + base + (j + 1l) * ta) = float4(a.y, b.y, c.y, e.y)
+                                *reinterpret<float4?>(op + base + (j + 2l) * ta) = float4(a.z, b.z, c.z, e.z)
+                                *reinterpret<float4?>(op + base + (j + 3l) * ta) = float4(a.w, b.w, c.w, e.w)
+                                j += 4l
+                            }
+                            while (j < hs) {   // hs tail (whisper hs=64; generic safety)
+                                op[base + j * ta] = r0[hoff + j] * kscale
+                                op[base + j * ta + 1l] = r1[hoff + j] * kscale
+                                op[base + j * ta + 2l] = r2[hoff + j] * kscale
+                                op[base + j * ta + 3l] = r3[hoff + j] * kscale
+                                j++
+                            }
+                        }
+                    }
+                }
+            }
+            for (t in range64(nblk * 4l, ta)) {   // t tail (ta=1500 is 4-aligned; generic safety)
+                for (h in range64(hh)) {
+                    for (j in range64(hs)) {
+                        op[h * hs * ta + j * ta + t] = sp[t * d + h * hs + j] * kscale
+                    }
                 }
             }
         }
-        mm_blob_b(ds.ckv_tmp, w.dblob, lo.cv_w, enc_out, d, d, ta)
+        wm_mm(w, ds.ckv_tmp, lo.cv_w, enc_out, ds.xqi, ds.xsi, d, d, ta)
         add_bias_rows(ds.ckv_tmp, w.dblob, lo.cv_b, d, ta)
-        for (h in range64(hh)) {
-            let base = ((l * hh + h) * ta) * hs
-            for (t in range64(ta)) {
-                for (j in range64(hs)) {
-                    ds.vx[base + t * hs + j] = ds.ckv_tmp[t * d + h * hs + j]
+        // vx: t-major f4 copy — each source row streams once, hh contiguous hs-chunks fan
+        // out; threaded over t (cross_kv_bench: 4.3-5.1x single-lane)
+        unsafe {
+            let sp = reinterpret<float const?>(addr(ds.ckv_tmp[0]))
+            var op = addr(ds.vx[l * d * ta])
+            maybe_parallel_for(0, int(ta), lanes_for_work(ta * d, 0)) $(tb, te) {
+                unsafe {
+                    for (t in range64(int64(tb), int64(te))) {
+                        let src = sp + t * d
+                        for (h in range64(hh)) {
+                            var dst = op + h * ta * hs + t * hs
+                            let hoff = h * hs
+                            var j = 0l
+                            while (j + 3l < hs) {
+                                *reinterpret<float4?>(dst + j) = *reinterpret<float4 const?>(src + hoff + j)
+                                j += 4l
+                            }
+                            while (j < hs) {
+                                dst[j] = src[hoff + j]
+                                j++
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -633,15 +807,17 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
     let kq_scale = 1.0 / sqrt(sqrt(float(hs)))
     for (l in range64(w.n_text_layer)) {
         let lo = dec_layer_offsets(w, l)
+        var td = ref_time_ticks()
 
         // self-attention (q and k pre-scaled hs^-0.25, k/v appended to the caches)
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.ln1_w, lo.ln1_b, d, n, w.eps)
-        mm_blob_b(ds.qq, w.dblob, lo.q_w, ds.xb, d, d, n)
+        wm_requant(w, ds.xb, d, n, ds.xqi, ds.xsi)   // q/k/v share the post-LN activation: one requant
+        wm_mm(w, ds.qq, lo.q_w, ds.xb, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.qq, w.dblob, lo.q_b, d, n)
         scale_inplace(ds.qq, n * d, kq_scale)
-        mm_blob_b(ds.kk, w.dblob, lo.k_w, ds.xb, d, d, n)
+        wm_mm(w, ds.kk, lo.k_w, ds.xb, ds.xqi, ds.xsi, d, d, n)
         scale_inplace(ds.kk, n * d, kq_scale)
-        mm_blob_b(ds.vv, w.dblob, lo.v_w, ds.xb, d, d, n)
+        wm_mm(w, ds.vv, lo.v_w, ds.xb, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.vv, w.dblob, lo.v_b, d, n)
         for (r in range64(n)) {
             for (h in range64(hh)) {
@@ -652,36 +828,43 @@ def whisper_decode_batch(w : WhisperModel; var ds : DecoderState; tokens : array
             }
         }
         dec_self_attn(w, ds, l, n, p0)
-        mm_blob_b(ds.xb, w.dblob, lo.o_w, ds.xb2, d, d, n)
+        wm_mm_rq(w, ds.xb, lo.o_w, ds.xb2, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.o_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
+        asr_prof_add("wh.dec.self", td)
+        td = ref_time_ticks()
 
         // cross-attention (q unscaled; keys pre-scaled; softmax applies the other half)
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.cln_w, lo.cln_b, d, n, w.eps)
-        mm_blob_b(ds.qq, w.dblob, lo.cq_w, ds.xb, d, d, n)
+        wm_mm_rq(w, ds.qq, lo.cq_w, ds.xb, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.qq, w.dblob, lo.cq_b, d, n)
         dec_cross_attn(w, ds, l, n)
-        mm_blob_b(ds.xb, w.dblob, lo.co_w, ds.xb2, d, d, n)
+        wm_mm_rq(w, ds.xb, lo.co_w, ds.xb2, ds.xqi, ds.xsi, d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.co_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
+        asr_prof_add("wh.dec.cross", td)
+        td = ref_time_ticks()
 
         // mlp
         layernorm_batch(ds.xb, ds.x, w.dblob, lo.ln2_w, lo.ln2_b, d, n, w.eps)
-        mm_blob_b(ds.h, w.dblob, lo.fc1_w, ds.xb, d, 4l * d, n)
+        wm_mm_rq(w, ds.h, lo.fc1_w, ds.xb, ds.xqi, ds.xsi, d, 4l * d, n)
         add_bias_rows(ds.h, w.dblob, lo.fc1_b, 4l * d, n)
         gelu_tanh_lut(ds.h, n * 4l * d)
-        mm_blob_b(ds.xb, w.dblob, lo.fc2_w, ds.h, 4l * d, d, n)
+        wm_mm_rq(w, ds.xb, lo.fc2_w, ds.h, ds.xqi, ds.xsi, 4l * d, d, n)
         add_bias_rows(ds.xb, w.dblob, lo.fc2_b, d, n)
         add_inplace_rows(ds.x, ds.xb, n * d)
+        asr_prof_add("wh.dec.ffn", td)
     }
     ds.n_past += n
 
     // final LN, then tied-embedding logits for the last row only (greedy single decoder)
+    let tl = ref_time_ticks()
     layernorm_batch(ds.xb, ds.x, w.dblob, w.d_ln_w_off, w.d_ln_b_off, d, n, w.eps)
     for (j in range64(d)) {
         ds.x1[j] = ds.xb[(n - 1l) * d + j]
     }
-    mm_blob_b(ds.logits, w.dblob, w.d_te_off, ds.x1, d, w.n_vocab, 1l)
+    wm_mm_rq(w, ds.logits, w.d_te_off, ds.x1, ds.xqi, ds.xsi, d, w.n_vocab, 1l)
+    asr_prof_add("wh.dec.logits", tl)
 }
 
 // ===== greedy driver (whisper_full's single-decoder temp-0 path, fallback disabled) =====
@@ -707,14 +890,6 @@ struct TranscribeSegment {
     text : string
     tokens : array<int>
     avg_logprob : float = 0.0
-}
-
-// One sampled token: greedy argmax id + the most probable timestamp token (whisper.cpp's
-// token_data.tid — segment boundaries read it even off text tokens).
-struct private SampledTok {
-    id : int
-    tid : int
-    plog : float
 }
 
 // whisper.cpp's whisper_process_logits filter suite, in its exact order. ``n_sampled`` /
@@ -782,27 +957,45 @@ def private whisper_filter_logits(w : WhisperModel; var logits : array<float>; n
 
 }
 
+// f4 sum of exp(x[i] − m): exp4 fast-path with a −80 clamp so banned NEG_INF_LOGIT entries
+// stay in range (each contributes e⁻⁸⁰ ≈ 1.8e-35 instead of scalar-exp's exact 0 — nothing
+// at fp32 next to the ≥ 1 max-entry term). Two lane accumulators (exp4 ~7x, see dasllama_math).
+def private exp_sum4(p : float const?; n : int64; m : float) : float {
+    unsafe {
+        let pf4 = reinterpret<float4 const?>(p)
+        let mm = float4(m, m, m, m)
+        let lo = float4(-80.0, -80.0, -80.0, -80.0)
+        var acc0 = float4(0.0, 0.0, 0.0, 0.0)
+        var acc1 = acc0
+        let n8 = n / 8l
+        for (k in 0l..n8) {
+            acc0 += exp4(max(pf4[2l * k] - mm, lo))
+            acc1 += exp4(max(pf4[2l * k + 1l] - mm, lo))
+        }
+        let acc = acc0 + acc1
+        var sum = acc.x + acc.y + acc.z + acc.w
+        for (i in n8 * 8l .. n) {
+            sum += exp(max(p[i] - m, -80.0))
+        }
+        return sum
+    }
+}
+
 // the last process_logits rule, applied AFTER the logprob normalizer is captured: if the
 // probability mass over timestamps beats every text token, force a timestamp. logprob
 // comparison == raw-logit comparison (log_softmax is a monotone shift).
 def private whisper_force_ts_rule(w : WhisperModel; var logits : array<float>) {
-    var ts_max = NEG_INF_LOGIT
-    for (i in range(w.tok_beg, int(w.n_vocab))) {
-        ts_max = max(ts_max, logits[i])
-    }
-    if (ts_max > NEG_INF_LOGIT * 0.5) {
-        var ts_lse = 0.0
-        for (i in range(w.tok_beg, int(w.n_vocab))) {
-            ts_lse += exp(logits[i] - ts_max)
-        }
-        let ts_logsumexp = log(ts_lse) + ts_max
-        var text_max = NEG_INF_LOGIT
-        for (i in range(w.tok_beg)) {
-            text_max = max(text_max, logits[i])
-        }
-        if (ts_logsumexp > text_max) {
-            for (i in range(w.tok_beg)) {
-                logits[i] = NEG_INF_LOGIT
+    let n_ts = int64(length(logits)) - int64(w.tok_beg)
+    unsafe {
+        let p = reinterpret<float const?>(addr(logits[0]))
+        let ts_max = hmax(p + int64(w.tok_beg), n_ts)   // bit-identical to the scalar max fold
+        if (ts_max > NEG_INF_LOGIT * 0.5) {
+            let ts_logsumexp = log(exp_sum4(p + int64(w.tok_beg), n_ts, ts_max)) + ts_max
+            let text_max = hmax(p, int64(w.tok_beg))
+            if (ts_logsumexp > text_max) {
+                for (i in range(w.tok_beg)) {
+                    logits[i] = NEG_INF_LOGIT
+                }
             }
         }
     }
@@ -811,26 +1004,27 @@ def private whisper_force_ts_rule(w : WhisperModel; var logits : array<float>) {
 // log-sum-exp over the current logits — the logprob normalizer whisper.cpp captures between
 // the main filter suite and the force-timestamp rule (plog = logit − this)
 def private logits_lse(logits : array<float>) : float {
-    var m = NEG_INF_LOGIT
-    for (v in logits) {
-        m = max(m, v)
+    let n = int64(length(logits))
+    unsafe {
+        let p = reinterpret<float const?>(addr(logits[0]))
+        let m = hmax(p, n)
+        return log(exp_sum4(p, n, m)) + m
     }
-    var sum = 0.0
-    for (v in logits) {
-        sum += exp(v - m)
-    }
-    return log(sum) + m
 }
 
 // greedy argmax over all filtered logits + argmax over the timestamp region (tid); plog uses
-// the pre-force-ts normalizer ``lse`` (the sampled id is unbanned in both phases)
+// the pre-force-ts normalizer ``lse`` (the sampled id is unbanned in both phases). Full argmax
+// = hmax + first-index-at-max scan — identical to the strict-> scalar fold (earliest max wins).
 def private sample_greedy(w : WhisperModel; logits : array<float>; lse : float) : SampledTok {
     var r = SampledTok(id = 0, tid = w.tok_beg)
-    var bestv = logits[0]
-    for (i in range(1, length(logits))) {
-        if (logits[i] > bestv) {
-            bestv = logits[i]
-            r.id = i
+    unsafe {
+        let p = reinterpret<float const?>(addr(logits[0]))
+        let bestv = hmax(p, int64(length(logits)))
+        for (i in range64(int64(length(logits)))) {
+            if (p[i] == bestv) {
+                r.id = int(i)
+                break
+            }
         }
     }
     var bestts = logits[w.tok_beg]
@@ -850,15 +1044,12 @@ def private sample_greedy(w : WhisperModel; logits : array<float>; lse : float) 
 // softmax probability of one token id over RAW (pre-filter) logits — the no-speech gate
 // reads p[nosp] off the prompt decode before any filtering
 def private token_prob(logits : array<float>; id : int) : float {
-    var m = NEG_INF_LOGIT
-    for (v in logits) {
-        m = max(m, v)
+    let n = int64(length(logits))
+    unsafe {
+        let p = reinterpret<float const?>(addr(logits[0]))
+        let m = hmax(p, n)
+        return exp(logits[id] - m) / exp_sum4(p, n, m)
     }
-    var sum = 0.0
-    for (v in logits) {
-        sum += exp(v - m)
-    }
-    return exp(logits[id] - m) / sum
 }
 
 // Build and emit one segment off toks[i0..i1) at [t0, t1] — text = concat of the text-range
@@ -888,55 +1079,57 @@ def private emit_segment(w : WhisperModel; toks : array<SampledTok>; i0, i1 : in
 
 // The window loop (whisper_full's single-decoder temp-0 path, no_context): 30 s windows
 // advanced by decoded timestamps (or whole windows when no_timestamps), whisper.cpp's
-// logit-filter suite and segment-splitting rules. Emits segments through ``blk`` as each
-// window completes, offset by ``t_base`` centiseconds; ``complete_only`` stops before a
-// window whose 3000 mel frames aren't all real audio (the drain path). Returns the mel
-// frames consumed (the final seek, clamped to n_len_org).
+// logit-filter suite and segment-splitting rules. The spectrogram is read from ``ds.mel``
+// (the caller just filled it); win/prompt/toks ride the ds scratch — no per-window alloc.
+// Emits segments through ``blk`` as each window completes, offset by ``t_base`` centiseconds;
+// ``complete_only`` stops before a window whose 3000 mel frames aren't all real audio (the
+// drain path). Returns the mel frames consumed (the final seek, clamped to n_len_org).
 def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var ds : DecoderState;
-                                   mel : WhisperMel; lang_id : int; no_timestamps, translate : bool;
+                                   lang_id : int; no_timestamps, translate : bool;
                                    t_base : int64; complete_only : bool;
                                    blk : block<(seg : TranscribeSegment)>) : int64 {
-    let seek_end = mel.n_len_org
+    let seek_end = ds.mel.n_len_org
     let delta_min = 10l                  // ignore anything under 100 ms
     var seek = 0l
-    var step : array<int>
-    step |> resize(1)
     let n_max = int(w.n_text_ctx / 2l) - 4
 
-    while (seek + delta_min < seek_end && (!complete_only || seek + AUDIO_CHUNK_FRAMES <= mel.n_len_org)) {
-        let win <- whisper_mel_window(mel, seek)
-        whisper_encode(w.enc, es, win)
+    while (seek + delta_min < seek_end && (!complete_only || seek + AUDIO_CHUNK_FRAMES <= ds.mel.n_len_org)) {
+        whisper_mel_window(ds.mel, seek, ds.win)
+        var tw = ref_time_ticks()
+        whisper_encode(w.enc, es, ds.win)
+        asr_prof_add("wh.encode_total", tw)
+        tw = ref_time_ticks()
         whisper_cross_kv(w, ds, es.xb)
+        asr_prof_add("wh.cross_kv", tw)
+        tw = ref_time_ticks()
 
-        var prompt : array<int>
-        prompt |> reserve(4)
-        prompt |> push(w.tok_sot)
+        ds.prompt |> clear()
+        ds.prompt |> push(w.tok_sot)
         if (w.multilingual) {
-            prompt |> push(w.tok_sot + 1 + lang_id)
-            prompt |> push(translate ? w.tok_translate : w.tok_transcribe)
+            ds.prompt |> push(w.tok_sot + 1 + lang_id)
+            ds.prompt |> push(translate ? w.tok_translate : w.tok_transcribe)
         }
         if (no_timestamps) {
-            prompt |> push(w.tok_not)
+            ds.prompt |> push(w.tok_not)
         }
-        whisper_decode_batch(w, ds, prompt)
+        whisper_decode_batch(w, ds, ds.prompt)
         let no_speech_prob = token_prob(ds.logits, w.tok_nosp)
 
-        var toks : array<SampledTok>
-        toks |> reserve(n_max)
+        ds.toks |> clear()
         var seek_delta = 100l * 30l      // full window unless a timestamp moves it
         var has_ts = false
         var result_len = 0
         for (i in range(n_max)) {
-            let n_sampled = length(toks)
-            let last_id = n_sampled > 0 ? toks[n_sampled - 1].id : -1
-            let penult_id = n_sampled > 1 ? toks[n_sampled - 2].id : -1
+            let n_sampled = length(ds.toks)
+            let last_id = n_sampled > 0 ? ds.toks[n_sampled - 1].id : -1
+            let penult_id = n_sampled > 1 ? ds.toks[n_sampled - 2].id : -1
             whisper_filter_logits(w, ds.logits, no_timestamps, n_sampled, last_id, penult_id, has_ts, seek_delta)
             let lse = logits_lse(ds.logits)
             if (!no_timestamps) {
                 whisper_force_ts_rule(w, ds.logits)
             }
             let t = sample_greedy(w, ds.logits, lse)
-            toks |> push(t)
+            ds.toks |> push(t)   // nolint:PERF006 — reserved to n_max in make_decoder_state, capacity survives clear()
             if (g_whisper_trace) {
                 print("  [{i}] id {t.id} tid {t.tid} plog {t.plog} has_ts {has_ts} seek_delta {seek_delta}\n")
             }
@@ -960,9 +1153,10 @@ def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var 
                 }
                 break
             }
-            step[0] = t.id
-            whisper_decode_batch(w, ds, step)
+            ds.step[0] = t.id
+            whisper_decode_batch(w, ds, ds.step)
         }
+        asr_prof_add("wh.decode_total", tw)
 
         // the no-speech gate: a confident nosp read on the prompt logits + low avg logprob
         // over the kept tokens drops the window's segments (whisper.cpp defaults 0.6 / −1.0)
@@ -970,48 +1164,48 @@ def private transcribe_mel_windows(w : WhisperModel; var es : EncoderState; var 
         if (result_len > 0) {
             var sum = 0.0
             for (i in range(result_len)) {
-                sum += toks[i].plog
+                sum += ds.toks[i].plog
             }
             avg_logprobs = sum / float(result_len)
         }
         let is_no_speech = no_speech_prob > 0.6 && avg_logprobs < -1.0
         if (g_whisper_trace) {
-            print("window seek {seek} seek_end {seek_end}: {length(toks)} sampled, result_len {result_len}, seek_delta {seek_delta}, nosp {no_speech_prob}, avg_lp {avg_logprobs}, no_speech {is_no_speech}\n")
+            print("window seek {seek} seek_end {seek_end}: {length(ds.toks)} sampled, result_len {result_len}, seek_delta {seek_delta}, nosp {no_speech_prob}, avg_lp {avg_logprobs}, no_speech {is_no_speech}\n")
         }
 
         // split [0, result_len) into segments at timestamp tokens (whisper.cpp's emission loop)
         if (result_len > 0 && !is_no_speech) {
             var i0 = 0
-            var t0 = seek + 2l * int64(toks[0].tid - w.tok_beg)
+            var t0 = seek + 2l * int64(ds.toks[0].tid - w.tok_beg)
             var i = 0
             while (i < result_len) {
-                let t = toks[i]
+                let t = ds.toks[i]
                 if (t.id > w.tok_beg) {
                     let t1 = seek + 2l * int64(t.tid - w.tok_beg)
-                    emit_segment(w, toks, i0, i + 1, t_base + t0, t_base + t1, blk)
+                    emit_segment(w, ds.toks, i0, i + 1, t_base + t0, t_base + t1, blk)
                     t0 = t1
-                    while (i + 1 < result_len && toks[i + 1].id > w.tok_beg) {
+                    while (i + 1 < result_len && ds.toks[i + 1].id > w.tok_beg) {
                         i++
-                        t0 = seek + 2l * int64(toks[i].tid - w.tok_beg)
+                        t0 = seek + 2l * int64(ds.toks[i].tid - w.tok_beg)
                     }
                     i0 = i + 1
                 }
                 i++
             }
-            emit_segment(w, toks, i0, result_len, t_base + t0, t_base + seek + seek_delta, blk)
+            emit_segment(w, ds.toks, i0, result_len, t_base + t0, t_base + seek + seek_delta, blk)
         }
 
         // a window whose kept tokens end text-then-SINGLE-timestamp (no closing pair) covered
         // everything it could hear — skip the entire remaining chunk (whisper.cpp PR #2629)
         let single_ts_ending = (result_len > 1
-            && toks[result_len - 2].id < w.tok_beg
-            && toks[result_len - 1].id > w.tok_beg)
+            && ds.toks[result_len - 2].id < w.tok_beg
+            && ds.toks[result_len - 1].id > w.tok_beg)
         if (single_ts_ending) {
             seek_delta = min(seek_end - seek, 100l * 30l)
         }
         seek += seek_delta
     }
-    return min(seek, mel.n_len_org)
+    return min(seek, ds.mel.n_len_org)
 }
 
 //! Full greedy transcription into a segment array — the probe/test-facing form; the public
@@ -1021,13 +1215,15 @@ def whisper_transcribe_run(w : WhisperModel; var es : EncoderState; var ds : Dec
                            no_timestamps : bool = false; translate : bool = false) : array<TranscribeSegment> {
     var segments : array<TranscribeSegment>
     var lang_id = whisper_lang_id(lang)
-    let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
+    let tm = ref_time_ticks()
+    log_mel_whisper(samples, w.mel, w.filters, w.enc.n_mel, ds.mel_padded, ds.mel)
+    asr_prof_add("wh.mel", tm)
     if (lang == "auto") {
-        lang_id = whisper_detect_language(w, es, ds, mel)
+        lang_id = whisper_detect_language(w, es, ds)
     } elif (lang_id < 0) {
         panic("dasLLAMA whisper: unknown language '{lang}'")
     }
-    transcribe_mel_windows(w, es, ds, mel, lang_id, no_timestamps, translate, 0l, false) $(seg) {
+    transcribe_mel_windows(w, es, ds, lang_id, no_timestamps, translate, 0l, false) $(seg) {
         segments |> push_clone(seg)
     }
     return <- segments
@@ -1079,17 +1275,16 @@ def create_session(w : WhisperModel; lang : string = "en") : WhisperSession {
     return <- s
 }
 
-//! whisper.cpp's whisper_lang_auto_detect: encode the stream's first 30 s window, decode a
-//! bare [sot] prompt, and pick the language token with the highest probability. Returns the
-//! g_lang language id.
-def whisper_detect_language(w : WhisperModel; var es : EncoderState; var ds : DecoderState;
-                            mel : WhisperMel) : int {
-    let win <- whisper_mel_window(mel, 0l)
-    whisper_encode(w.enc, es, win)
+//! whisper.cpp's whisper_lang_auto_detect: encode the stream's first 30 s window (from the
+//! spectrogram the caller left in ``ds.mel``), decode a bare [sot] prompt, and pick the
+//! language token with the highest probability. Returns the g_lang language id.
+def whisper_detect_language(w : WhisperModel; var es : EncoderState; var ds : DecoderState) : int {
+    whisper_mel_window(ds.mel, 0l, ds.win)
+    whisper_encode(w.enc, es, ds.win)
     whisper_cross_kv(w, ds, es.xb)
-    var prompt : array<int>
-    prompt |> push(w.tok_sot)
-    whisper_decode_batch(w, ds, prompt)
+    ds.prompt |> clear()
+    ds.prompt |> push(w.tok_sot)
+    whisper_decode_batch(w, ds, ds.prompt)
     var best = 0
     for (i in range(1, int(w.n_lang))) {   // argmax over raw logits == argmax over their softmax
         if (ds.logits[w.tok_sot + 1 + i] > ds.logits[w.tok_sot + 1 + best]) {
@@ -1102,9 +1297,9 @@ def whisper_detect_language(w : WhisperModel; var es : EncoderState; var ds : De
 // Resolve the session's language id, running auto-detect on the first audio that reaches a
 // driver. Detection reuses the session scratch; the main loop re-encodes window 0 (matches
 // whisper.cpp, which also pays one extra encode for auto).
-def private resolve_lang_id(w : WhisperModel; var s : WhisperSession; mel : WhisperMel) : int {
+def private resolve_lang_id(w : WhisperModel; var s : WhisperSession) : int {
     if (s.lang_id < 0) {
-        s.lang_id = whisper_detect_language(w, s.es, s.ds, mel)
+        s.lang_id = whisper_detect_language(w, s.es, s.ds)
     }
     return s.lang_id
 }
@@ -1115,9 +1310,11 @@ def transcribe(w : WhisperModel; var s : WhisperSession; samples : array<float> 
     //! each 30 s window completes. Segment times are centiseconds. Returns the segment count.
     //! Does not touch the session's fed/pending stream — one-shot and push-chunks coexist.
     var count = 0
-    let mel <- log_mel_whisper(samples, w.filters, w.enc.n_mel)
-    let lang_id = resolve_lang_id(w, s, mel)
-    transcribe_mel_windows(w, s.es, s.ds, mel, lang_id, s.no_timestamps, s.translate, 0l, false) $(seg) {
+    let tm = ref_time_ticks()
+    log_mel_whisper(samples, w.mel, w.filters, w.enc.n_mel, s.ds.mel_padded, s.ds.mel)
+    asr_prof_add("wh.mel", tm)
+    let lang_id = resolve_lang_id(w, s)
+    transcribe_mel_windows(w, s.es, s.ds, lang_id, s.no_timestamps, s.translate, 0l, false) $(seg) {
         count++
         blk |> invoke(seg)
     }
@@ -1145,13 +1342,13 @@ def drain(w : WhisperModel; var s : WhisperSession; blk : block<(seg : Transcrib
     //! anything under a full window stays pending. Returns the segment count — 0 until at
     //! least 30 s is buffered.
     var count = 0
-    let mel <- log_mel_whisper(s.pending, w.filters, w.enc.n_mel)
     // no complete window yet -> nothing will transcribe; hold auto-detect for real audio too
     if (int64(length(s.pending)) < AUDIO_CHUNK_FRAMES * AUDIO_HOP) {
         return 0
     }
-    let lang_id = resolve_lang_id(w, s, mel)
-    let consumed = transcribe_mel_windows(w, s.es, s.ds, mel, lang_id,
+    log_mel_whisper(s.pending, w.mel, w.filters, w.enc.n_mel, s.ds.mel_padded, s.ds.mel)
+    let lang_id = resolve_lang_id(w, s)
+    let consumed = transcribe_mel_windows(w, s.es, s.ds, lang_id,
                                           s.no_timestamps, s.translate, s.t_base, true) $(seg) {
         count++
         blk |> invoke(seg)
@@ -1173,14 +1370,14 @@ def flush(w : WhisperModel; var s : WhisperSession; blk : block<(seg : Transcrib
     //! Transcribe everything left on the fed stream (including the sub-30 s tail), then clear
     //! it. The session stays usable — subsequent feeds continue the stream timeline.
     var count = 0
-    let mel <- log_mel_whisper(s.pending, w.filters, w.enc.n_mel)
-    let lang_id = resolve_lang_id(w, s, mel)
-    transcribe_mel_windows(w, s.es, s.ds, mel, lang_id,
+    log_mel_whisper(s.pending, w.mel, w.filters, w.enc.n_mel, s.ds.mel_padded, s.ds.mel)
+    let lang_id = resolve_lang_id(w, s)
+    transcribe_mel_windows(w, s.es, s.ds, lang_id,
                            s.no_timestamps, s.translate, s.t_base, false) $(seg) {
         count++
         blk |> invoke(seg)
     }
-    s.t_base += mel.n_len_org
+    s.t_base += s.ds.mel.n_len_org
     s.pending |> clear()
     return count
 }

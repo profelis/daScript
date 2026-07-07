@@ -40,6 +40,8 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | _aot_so_mod.das | *(helper)* #3212 fixture module — Outer holds Inner by value, declared Outer-first | |
 | t_invoke_void.das | AOT `invoke` dispatch — void-returning function pointer via AOT path | |
 | test_variant_alias_aot.das | AOT variant-alias codegen (#3269) — delete of handled variant alias, builtin push of a variant element | |
+| test_int64_ptr_index.das | AOT raw-pointer indexing by int64/uint64 (#3391) — at/safe_at through non-var (`T * const`), var (`T *`), and const-pointee pointers | |
+| test_range64_ctor_args.das | AOT most-vexing-parse — a for-source of constructor-style casts only (`range64(int64(a), int64(b))`) must emit a variable, not a function declaration | |
 
 ## apply/
 
@@ -274,6 +276,45 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_sql_view_mutations.das | `_sql_update` / `_sql_delete` / `_sql_upsert` against `[sql_view]` types (read-only rejection) | **expect** `40104:8` |
 | failed_sql_view_schema.das | `[sql_view]` field-annotation rejections (PK, UNIQUE, COMPUTED, DEFAULT, initializers, FK, column collisions) | **expect** `30111:9` |
 
+## dasLLAMA/
+
+> **Note:** Model-driven suites self-skip when the fixture models are absent. Run with JIT: `daslang -jit dastest/dastest.das -- --test tests/dasLLAMA/`
+
+| File | Description | Expects errors |
+|---|---|---|
+| test_arch_registry.das | Architecture registry — arch_names/ArchDesc registration, per-arch config dispatch | |
+| test_audio.das | Audio towers — mel/encoder/projector oracles, chat-audio and ASR gates (model-gated) | |
+| test_batch_grid.das | `batch_grid_2d` chunk space — 1-D/fine/wave-aligned grids bit-exact, per-dispatch auto-gate | |
+| test_box_profile.das | box_profile.json runtime knobs — parse, apply, invalid-JSON and missing-backend fallbacks | |
+| test_chat.das | Layer-2 chat engine — templates, roles, streaming respond | |
+| test_dispatch_shaping.das | lanes_for_work boundaries + matmul_chunks/matmul_chunks_gemv shapers (wave alignment, grain floors) | |
+| test_facade.das | The `dasllama` facade surface — load/session/encode/eval/generate/chat (model-gated) | |
+| test_facade_docs.das | Facade doc coverage — public symbols carry `//!` docs | |
+| test_flash.das | Flash-decode attention path vs the reference walk | |
+| test_forward.das | Forward-pass oracles vs frozen fixtures (model-gated) | |
+| test_fused_decode.das | Fused decode chain vs unfused reference | |
+| test_grid.das | Dispatch grid geometry helpers | |
+| test_groupn.das | Group-N GEMM row-group indexing | |
+| test_kernel_backend.das | Q8·Q8 kernel-backend registry — selection, pins, availability fallbacks | |
+| test_kgroup_repack.das | K-group repack layout round-trips | |
+| test_matmul.das | matmul/GEMV kernels (fp32/Q8/Q4) vs reference | |
+| test_matmul_batch.das | Batched (prefill) matmul vs reference — chunking invariance | |
+| test_mxfp4.das | MXFP4 dequant + expert matmul kernels | |
+| test_par_indexed.das | `maybe_parallel_for_indexed` contract — exactly-once coverage, slot bound, per-slot checksum across team/fifo/inline arms | |
+| test_parity.das | Frozen token-for-token parity fixtures (model-gated) | |
+| test_prefill.das | Prefill path produces decode-identical logits | |
+| test_quant.das | Q8_0/Q4_0 quantize/dequantize round-trips | |
+| test_rmsnorm.das | rmsnorm kernel vs reference | |
+| test_rope.das | rope kernels (incl. NEOX/scaled) vs reference | |
+| test_sampling.das | Sampler determinism — greedy/top-k/top-p | |
+| test_silu.das | Activation kernels (silu/gelu incl. float4 forms) vs scalar reference | |
+| test_softmax.das | softmax kernels (incl. sink variant) vs reference | |
+| test_tokenizer.das | SPM + BPE tokenizer fixtures and round-trips | |
+| test_tune.das | `[tune]` framework — grid, winner selection, manifest | |
+| test_tuned.das | `[tuned]` loop-hint application | |
+| test_unicode.das | Unicode classification + UTF-8 codec | |
+| test_whisper.das | Whisper family — loaders, fp32 oracle, q8 gates, gelu LUT sweep, transcribe API (model-gated) | |
+
 ## daslib/
 
 | File | Description | Expects errors |
@@ -441,6 +482,14 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_missing_inherited.das | Completeness check catches missing inherited abstract methods | **expect** `30111` |
 | test_missing_method.das | Completeness check catches missing abstract methods | **expect** `30111` |
 
+## jit/
+
+| File | Description | Expects errors |
+|---|---|---|
+| bitfield64.das | 64-bit bitfield through the JIT — construction, pass/return, uint64 round-trip | |
+| lambda_return.das | Lambda returned from a function under the JIT | |
+| fast_math_specials.das | `options fast_math` stays value-safe for real infs — sigmoid/silu over the exp-overflow range (x64 rcp-NR NaN regression) | |
+
 ## jit_tests/
 
 50 files testing JIT compilation code generation. None have `expect` directives.
@@ -533,6 +582,8 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | _glob.das | *(helper)* Shared module defining `AAA = 10` | |
 | _helper_foo.das | *(helper)* Module providing `TestObjectFoo` struct and `testFoo` function | |
 | _helper_macro_uninferred.das | *(helper)* `[bad_emitter]` structure_macro that adds an un-inferred function during patch | |
+| _lambda_vis_inner.das | *(helper)* Non-public leaf module for lambda_in_generic_module_vis — provides `inner_dot` | |
+| _lambda_vis_mid.das | *(helper)* Mid module hosting generics whose outlined lambdas/generators/local fns must resolve `inner_dot` | |
 | _module_a.das | *(helper)* Module for module_vis_fail — globals, types, functions | |
 | _module_b.das | *(helper)* Module for module_vis_fail — requires _module_a | |
 | _operators_derived.das | *(helper)* Derived class BarOp | |
@@ -657,6 +708,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | lambda_basic.das | Lambda capture, invoke, null check, addX returning lambda | |
 | lambda_capture.das | Lambda capturing const values, finalizer behavior | |
 | lambda_capture_modes.das | Lambda capture ref/move/clone modes, capture with delete | |
+| lambda_in_generic_module_vis.das | Functions outlined from generic instances (lambda/generator/local fn/nested) keep the generic's origin module for name resolution | |
 | lambda_to_iter.das | Lambda as iterator via `each(lam)` for int& and struct | |
 | line_info.das | `testCallLine()` line info correctness (6 in script, 0 with AOT) | |
 | failed_local_classes_failed.das | no_local_class_members restriction | **expect** `31300:1` |

@@ -585,6 +585,17 @@ def team_parallel_for(range_begin, range_end : int; num_jobs : int; var l : lamb
     invoke(l, range_begin, range_end)   // note, this is never called if job-que is there.
 }
 
+[tag_function(tag_team_parallel_for_indexed), unused_argument(num_jobs)]
+def team_parallel_for_indexed(range_begin, range_end : int; num_jobs : int; var l : lambda<(slot : int; job_begin : int; job_end : int) : void>) {
+    //! ``team_parallel_for`` with the claiming worker's slot exposed: the lambda receives
+    //! ``(slot, job_begin, job_end)``. No two in-flight invocations share a slot, so per-slot
+    //! scratch (sized ``get_total_hw_jobs() + 1`` — the caller participates as the last slot)
+    //! needs no locks. Chunk split and self-serve scheduling are identical to
+    //! ``team_parallel_for``; degenerate paths (team mode off, trivial range/pool) run one
+    //! inline invoke over the whole range as slot 0.
+    invoke(l, 0, range_begin, range_end)   // note, this is never called if job-que is there.
+}
+
 [tag_function(tag_team_parallel_stages)]
 def team_parallel_stages(stages : array<int3>; var l : lambda<(stage : int; job_begin : int; job_end : int) : void>) {
     //! Multi-stage team dispatch: one team rendezvous runs the ``stages`` in order, with a
@@ -650,6 +661,7 @@ class private TeamParallelStagesMacro : AstFunctionAnnotation {
 class private TeamParallelForMacro : AstFunctionAnnotation {
     //! Rewrites ``team_parallel_for`` into ``team_parallel_for_invoke``, generating the same lambda
     //! cloning infrastructure as ``new_job`` (the per-worker cloning itself happens on the C++ side).
+    function_name : string = "team_parallel_for_invoke"
     def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
         macro_verify(call.arguments[3] is ExprAscend, compiling_program(), call.at, "expecting lambda declaration, ExprAscend")
         var asc = call.arguments[3] as ExprAscend
@@ -678,7 +690,7 @@ class private TeamParallelForMacro : AstFunctionAnnotation {
             ftype.argTypes[1].flags.constant = true
         }
         // make a team_parallel_for_invoke call
-        var ncall = new ExprCall(at = call.at, name := "team_parallel_for_invoke")
+        var ncall = new ExprCall(at = call.at, name := function_name)
         ncall.arguments |> emplace_new <| clone_expression(call.arguments[0])
         ncall.arguments |> emplace_new <| clone_expression(call.arguments[1])
         ncall.arguments |> emplace_new <| clone_expression(call.arguments[2])
@@ -687,6 +699,13 @@ class private TeamParallelForMacro : AstFunctionAnnotation {
         ncall.arguments |> emplace_new <| new ExprConstInt(at = call.at, value = mks._type.sizeOf)
         return <- ncall
     }
+}
+
+[tag_function_macro(tag="tag_team_parallel_for_indexed")]
+class private TeamParallelForIndexedMacro : TeamParallelForMacro {
+    //! Same lowering as ``TeamParallelForMacro``; the C++ entry point invokes the lambda with
+    //! the extra leading worker-slot argument.
+    override function_name : string = "team_parallel_for_indexed_invoke"
 }
 
 def _parallel_for_each(arr : array<auto(TT)>; num_jobs : int; blk : block<(job_begin : int; job_end : int; var wg : JobStatus?) : void>) {

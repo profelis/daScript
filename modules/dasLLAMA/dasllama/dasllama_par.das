@@ -5,6 +5,7 @@ module dasllama_par shared public
 
 require jobque public
 require daslib/jobque_boost public  // emitted code uses parallel_for / invoke
+require math public                 // emitted code uses min (indexed fifo arm)
 require daslib/ast
 require daslib/rtti
 require daslib/ast_boost
@@ -32,6 +33,20 @@ def maybe_parallel_for(parallel : bool; range_begin, range_end : int; num_jobs :
 def maybe_parallel_for(range_begin, range_end : int; num_jobs : int;
                        blk : block<(rb : int; re : int) : void>) {
     //! stub — rewritten by MaybeParallelForNjMacro into a runtime if/else
+}
+
+//! `maybe_parallel_for_indexed(range_begin, range_end, num_jobs) $(slot, rb, re) { ... }` —
+//! slot-indexed dispatch for per-slot scratch: like maybe_parallel_for, but the block also
+//! receives a slot index with the guarantee that no two in-flight invocations share one, so
+//! slot-indexed scratch needs no locks. Size the scratch to `get_dispatch_slot_bound()`.
+//! Team mode: `num_jobs` chunks self-serve as usual and slot is the claiming worker (the
+//! caller is the last slot) — pass a chunk-per-unit `num_jobs` for dynamic balance. Fifo
+//! mode: the range collapses to at most min(num_jobs, pool + 1) contiguous sub-ranges, one
+//! per slot. `num_jobs` <= 1 (or no job que) runs inline as slot 0.
+[tag_function(tag_maybe_parallel_for_indexed), unused_argument(range_begin, range_end, num_jobs, blk)]
+def maybe_parallel_for_indexed(range_begin, range_end : int; num_jobs : int;
+                               blk : block<(slot : int; rb : int; re : int) : void>) {
+    //! stub — rewritten by MaybeParallelForIndexedMacro into a runtime if/else
 }
 
 // Shared arm bodies — ONE source of truth for both lowerings so the arms can't drift.
@@ -88,6 +103,80 @@ class private MaybeParallelForMacro : AstFunctionAnnotation {
                 $b(parArm)
             } else {
                 $b(inlArm)
+            }
+        }
+        qb |> force_at(call.at)
+        return <- qb
+    }
+}
+
+// Indexed arm bodies. team: team_parallel_for_indexed passes the claiming worker's slot
+// straight through. fifo: no worker identity exists, so the range collapses to at most
+// min(num_jobs, pool + 1) contiguous sub-ranges — the sub-range INDEX is the slot (one fifo
+// job each, so no two in-flight invocations share it). inline: one invoke as slot 0.
+def private mpfi_team_arm(beginE, endE, njE, blkE : ExpressionPtr; at : LineInfo) : array<ExpressionPtr> {
+    let slT = make_unique_private_name("mpfi_slot", at)
+    let jbT = make_unique_private_name("mpfi_jb", at)
+    let jeT = make_unique_private_name("mpfi_je", at)
+    return <- qmacro_block_to_array() {
+        team_parallel_for_indexed($e(beginE), $e(endE), count_parallel_dispatch_thru($e(njE))) <| @($i(slT) : int; $i(jbT) : int; $i(jeT) : int) {
+            invoke($e(blkE), $i(slT), $i(jbT), $i(jeT))
+        }
+    }
+}
+
+def private mpfi_fifo_arm(beginE, endE, njE, blkE : ExpressionPtr; at : LineInfo) : array<ExpressionPtr> {
+    let nsN = make_unique_private_name("mpfi_ns", at)
+    let sbN = make_unique_private_name("mpfi_sb", at)
+    let seN = make_unique_private_name("mpfi_se", at)
+    let wgN = make_unique_private_name("mpfi_wg", at)
+    let slN = make_unique_private_name("mpfi_sl", at)
+    let jbN = make_unique_private_name("mpfi_jb", at)
+    let jeN = make_unique_private_name("mpfi_je", at)
+    let capN = make_unique_private_name("mpfi_cap", at)
+    return <- qmacro_block_to_array() {
+        let $i(capN) = is_job_que_available() ? get_total_hw_jobs() + 1 : 1
+        let $i(nsN) = min(min($e(njE), $e(endE) - $e(beginE)), $i(capN))
+        if ($i(nsN) > 1) {
+            parallel_for(0, $i(nsN), count_parallel_dispatch_thru($i(nsN))) <| $($i(sbN), $i(seN), $i(wgN)) {
+                for ($i(slN) in range($i(sbN), $i(seN))) {
+                    let $i(jbN) = $e(beginE) + int(int64($i(slN)) * int64($e(endE) - $e(beginE)) / int64($i(nsN)))
+                    let $i(jeN) = $e(beginE) + int(int64($i(slN) + 1) * int64($e(endE) - $e(beginE)) / int64($i(nsN)))
+                    invoke($e(blkE), $i(slN), $i(jbN), $i(jeN))
+                }
+                $i(wgN) |> notify_and_release
+            }
+        } else {
+            count_inline_run()
+            invoke($e(blkE), 0, $e(beginE), $e(endE))
+        }
+    }
+}
+
+[tag_function_macro(tag="tag_maybe_parallel_for_indexed")]
+class private MaybeParallelForIndexedMacro : AstFunctionAnnotation {
+    def override transform(var call : ExprCallFunc?; var errors : das_string) : ExpressionPtr {
+        let li = call.arguments.length() - 1
+        macro_verify(li == 3 && call.arguments[li] is ExprMakeBlock, compiling_program(), call.at,
+            "maybe_parallel_for_indexed expects (range_begin, range_end, num_jobs) and a $(slot, rb, re) block")
+        // args: 0=range_begin, 1=range_end, 2=num_jobs, 3=block.
+        // all three scalars bind ONCE — the arms read them repeatedly (fifo sub-range math)
+        let rbN = make_unique_private_name("mpfi_rb0", call.at)
+        let reN = make_unique_private_name("mpfi_re0", call.at)
+        let njN = make_unique_private_name("mpfi_nj", call.at)
+        var rbRead = qmacro($i(rbN))
+        var reRead = qmacro($i(reN))
+        var njRead = qmacro($i(njN))
+        var teamArm <- mpfi_team_arm(rbRead, reRead, njRead, call.arguments[3], call.at)
+        var fifoArm <- mpfi_fifo_arm(rbRead, reRead, njRead, call.arguments[3], call.at)
+        var qb = qmacro_block() {
+            let $i(rbN) = $e(call.arguments[0])
+            let $i(reN) = $e(call.arguments[1])
+            let $i(njN) = $e(call.arguments[2])
+            if ($i(njN) > 1 && is_job_que_available() && get_jobque_team_mode()) {
+                $b(teamArm)
+            } else {
+                $b(fifoArm)
             }
         }
         qb |> force_at(call.at)

@@ -58,14 +58,24 @@ struct AsrSession {
     qctx : Session = Session()
     qenc : EncoderState = EncoderState()
     qcs : Qwen3aConvState = Qwen3aConvState()
+    pkst : ParakeetState = ParakeetState()   // parakeet hot-path scratch — zero allocation per transcribe
     translate : bool = false
     no_timestamps : bool = false
     context : string = ""
     detected_lang : string = ""
 }
 
+// exact-fp32 knob for oracle rails: flip BEFORE load_asr_model to skip the Q8 fast path
+var private g_asr_force_fp32 = false
+
+//! Force the fp32 (bit-exact-with-oracle) path for models loaded AFTER this call — the
+//! default load quantizes the encoder GEMMs to Q8_0 (~4x on CPU, tolerance-gated).
+def set_asr_fp32(on : bool) {
+    g_asr_force_fp32 = on
+}
+
 //! Load an ASR model, sniffing the format: ggml-bin magic = whisper vs parakeet
-//! (disambiguated on vocab size: whisper >= 51864, parakeet ~1k); GGUF needs the model's
+//! (disambiguated on vocab size: whisper >= 51864, parakeet 1k/8k); GGUF needs the model's
 //! mmproj too — use the two-argument overload. One loader, no family names.
 def load_asr_model(path : string) : AsrModel {
     let f = fopen(path, "rb")
@@ -90,9 +100,9 @@ def load_asr_model(path : string) : AsrModel {
     if (magic != 0x67676d6cu) {
         panic("dasLLAMA asr: '{path}' is neither a GGUF nor a ggml bin")
     }
-    if (vocab < 8192) {   // parakeet bins carry a ~1k SPM vocab
+    if (vocab < 32768) {   // parakeet SPM vocabs: 1024 (v2, English) / 8192 (v3, 25-lang)
         var pm = AsrModel(kind = AsrKind.parakeet)
-        pm.pk <- load_parakeet_model(path)
+        pm.pk <- load_parakeet_model(path, !g_asr_force_fp32)
         return <- pm
     }
     // whisper vocabs: 51864 (.en) / 51865 (multilingual) / 51866 (large-v3 family); anything
@@ -101,7 +111,7 @@ def load_asr_model(path : string) : AsrModel {
         panic("dasLLAMA asr: '{path}' has n_vocab {vocab} — matches neither whisper (51864-51866) nor parakeet (~1k)")
     }
     var m = AsrModel(kind = AsrKind.whisper)
-    m.whisper <- load_whisper_model(path)
+    m.whisper <- load_whisper_model(path, !g_asr_force_fp32)
     return <- m
 }
 
@@ -126,6 +136,9 @@ def load_asr_model(path : string; mmproj : string) : AsrModel {
 //! multilingual models, segment timestamps. Qwen3-ASR: the model detects and reports the
 //! language itself (``detected_lang``), no timestamps, context biasing via
 //! ``AsrSession.context``.
+// v3 (25 European languages) carries an 8192-piece SPM vocab; v2 (English) 1024
+def private pk_is_multilingual(m : AsrModel) : bool => m.pk.n_vocab >= 8192l
+
 def caps(m : AsrModel) : AsrCaps {
     if (m.kind == AsrKind.qwen3a) {
         return <- AsrCaps(translate = false, timestamps = AsrTimestamps.none,
@@ -134,7 +147,13 @@ def caps(m : AsrModel) : AsrCaps {
     if (m.kind == AsrKind.parakeet) {
         var pc = AsrCaps(translate = false, timestamps = AsrTimestamps.segment,
                          streaming = false, prompt = false)
-        pc.languages <- ["en"]
+        if (pk_is_multilingual(m)) {
+            pc.languages <- ["bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de",
+                             "el", "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk",
+                             "sl", "es", "sv", "ru", "uk"]
+        } else {
+            pc.languages <- ["en"]
+        }
         return <- pc
     }
     var c = AsrCaps(translate = m.whisper.multilingual,
@@ -158,8 +177,12 @@ def create_session(m : AsrModel; lang : string = "en") : AsrSession {
     //! accepts "auto").
     var s = AsrSession()
     if (m.kind == AsrKind.parakeet) {
-        if (lang != "en" && lang != "auto") {
-            panic("dasLLAMA asr: this Parakeet model is English-only")
+        // parakeet has no language conditioning — the TDT decode transcribes whatever it
+        // hears; lang is validated against the model's set but otherwise unused
+        if (lang != "auto" && !has_value(caps(m).languages, lang)) {
+            panic(pk_is_multilingual(m) ?
+                "dasLLAMA asr: '{lang}' is not one of this Parakeet model's 25 languages" :
+                "dasLLAMA asr: this Parakeet model is English-only")
         }
         return <- s
     }
@@ -269,22 +292,29 @@ def private transcribe_qwen3a(m : AsrModel; var s : AsrSession; samples : array<
 // Parakeet transcription: full-clip FastConformer encode + TDT greedy, one segment.
 def private transcribe_parakeet(m : AsrModel; var s : AsrSession; samples : array<float> | #;
                                 blk : block<(seg : TranscribeSegment)>) : int {
-    let mel <- parakeet_log_mel(samples, m.pk)
-    var enc_out : array<float>
-    let tt = parakeet_encode(m.pk, mel, enc_out)
-    let toks <- parakeet_tdt_decode(m.pk, enc_out, tt)
+    var tp = ref_time_ticks()
+    parakeet_log_mel(samples, m.pk, s.pkst)
+    asr_prof_add("pk.mel", tp)
+    tp = ref_time_ticks()
+    let tt = parakeet_encode(m.pk, s.pkst)
+    asr_prof_add("pk.encode_total", tp)
+    tp = ref_time_ticks()
+    parakeet_tdt_decode(m.pk, s.pkst, tt)
+    asr_prof_add("pk.decode_total", tp)
     var seg = TranscribeSegment(t0 = 0l, t1 = int64(length(samples)) * 100l / AUDIO_SAMPLE_RATE,
-        text = parakeet_detokenize(m.pk, toks))
+        text = parakeet_detokenize(m.pk, s.pkst.toks))
     var plog_sum = 0.0lf
-    seg.tokens |> reserve(length(toks))
-    for (t in toks) {
+    seg.tokens |> reserve(length(s.pkst.toks))
+    for (t in s.pkst.toks) {
         seg.tokens |> push(t.id)
         plog_sum += double(t.plog)
     }
-    if (!empty(toks)) {
-        seg.avg_logprob = float(plog_sum / double(length(toks)))
+    if (!empty(s.pkst.toks)) {
+        seg.avg_logprob = float(plog_sum / double(length(s.pkst.toks)))
     }
-    s.detected_lang = "en"
+    if (!pk_is_multilingual(m)) {
+        s.detected_lang = "en"   // v3 transcribes without detecting/reporting a language
+    }
     blk |> invoke(seg)
     return 1
 }

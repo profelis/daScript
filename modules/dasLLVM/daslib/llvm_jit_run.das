@@ -33,18 +33,23 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x3aul   // aarch64_neon::smmla (i8mm) JIT intrinsic
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x3bul   // fast_math stamp narrowed to reassoc|nsz|contract
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
 // `options fast_math = true` (or policies.fast_math; `_jit_fast_math` is a legacy alias) stamps every FP
-// instruction with all fast-math flags before opt — lets
+// instruction with the VALUE-SAFE fast-math flags before opt — reassoc|nsz|contract — which lets
 // reductions reassociate/vectorize and FP contract everywhere. NON-bit-exact, but this is the same FP
 // laxity llama.cpp/ggml already runs with (hand-coded FMA + ~2ulp poly exp + reassociated SIMD reductions;
 // ggml CPU is just -O3, no -ffast-math flag — it hand-writes the equivalent). Measured greedy-STABLE on
 // Llama-3.2-1B prefill (identical next token @512/1024/2048, ~1% logit drift) for +8-10% end-to-end.
 // Default off (bit-exact). The magic-number exp survives reassoc — LLVM keeps `z` (its bits feed the
 // exponent bitcast), so it does NOT fold `(x*log2e + M) - M` away.
+//
+// nnan|ninf|arcp|afn are deliberately NOT stamped: engine kernels produce real infs (a sigmoid's
+// exp(-v) overflows float for v < -88), and on x64 arcp+ninf licensed rcp-estimate division whose
+// Newton step computes inf*0 = NaN — the whole parakeet encoder went NaN under the old all-flags
+// stamp (aarch64 never takes that lowering, which hid it). Regression: tests/jit/fast_math_specials.das.
 var g_jit_fast_math = false
 
 def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
@@ -58,7 +63,7 @@ def private apply_fast_math_to_module(m : LLVMOpaqueModule?) {
                 // the GEMM fold's contract-without-reassoc, pinning its fold order across
                 // loop shapes) keeps them; the blanket stamp only fills unset instructions
                 if (LLVMCanValueUseFastMathFlags(inst) != 0 && LLVMGetFastMathFlags(inst) == 0u) {
-                    LLVMSetFastMathFlags(inst, 0x7fu)   // reassoc|nnan|ninf|nsz|arcp|contract|afn
+                    LLVMSetFastMathFlags(inst, 0x29u)   // reassoc|nsz|contract (see header note)
                 }
                 inst = LLVMGetNextInstruction(inst)
             }
