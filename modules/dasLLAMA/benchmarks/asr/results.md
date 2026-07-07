@@ -98,7 +98,26 @@ turbo, fp32 cross_kv) are queued, this is the starting scoreboard.
 | large-v3-turbo | hp0.wav | 273 | 41934 | 32878 | 1.28x |
 | large-v3-turbo | hp0x2.wav | 547 | 80689 | 64621 | 1.25x |
 
-TSV (both sides): `results_wh_m1_t8.tsv`. zen2 whisper round pending.
+TSV (both sides): `results_wh_m1_t8.tsv`.
+
+### AMD EPYC Zen 2, 16 threads — both sides 2026-07-07 @ `da4254be9`, interleaved, best-of-2
+
+| model | file | audio s | das ms | cli ms | das/cli |
+|---|---|---|---|---|---|
+| tiny | jfk.wav | 11 | 345 | 213 | 1.62x |
+| tiny | jfk3.wav | 33 | 811 | 500 | 1.62x |
+| tiny | gb1.wav | 199 | 4420 | 2845 | 1.55x |
+| tiny | hp0.wav | 273 | 5351 | 3546 | 1.51x |
+| tiny | hp0x2.wav | 547 | 10632 | 7327 | 1.45x |
+| large-v3-turbo | jfk.wav | 11 | 5031 | 6728 | **0.75x** |
+| large-v3-turbo | jfk3.wav | 33 | 10225 | 13657 | **0.75x** |
+| large-v3-turbo | gb1.wav | 199 | 43039 | 76720 | **0.56x** |
+| large-v3-turbo | hp0.wav | 273 | 61907 | 100852 | **0.61x** |
+| large-v3-turbo | hp0x2.wav | 547 | 119655 | 189313 | **0.63x** |
+
+TSV (both sides): `results_wh_zen2_t16.tsv`. Shape: without AMX, the q8 tower already wins
+turbo outright; tiny is dominated by the fp32 decoder + fixed costs on both boxes — the
+decoder-q8 lever. onnx whisper columns pending (harness wired, `f7bab29e3`).
 
 ## Correctness
 
