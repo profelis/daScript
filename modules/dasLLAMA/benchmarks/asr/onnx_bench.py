@@ -5,6 +5,7 @@
 #
 #   .venv/bin/python onnx_bench.py --variant int8 --threads 8 \
 #       --wav corpus/jfk.wav --wav corpus/gb1.wav --reps 1
+#   .venv/bin/python onnx_bench.py --variant whisper-tiny-int8 --threads 8 --wav corpus/jfk.wav
 #
 # Venv: the mil-ad server clone's (~/Work/parakeet-tdt-0.6b-v3-fastapi-openai/.venv —
 # onnx-asr[hub] + onnxruntime). Models auto-download from HF on first use.
@@ -13,10 +14,18 @@ import time
 import wave
 
 VARIANTS = {
-    # mirror the mil-ad server's MODEL_CONFIGS
+    # parakeet v3 (mirror the mil-ad server's MODEL_CONFIGS)
     "int8": ("nemo-parakeet-tdt-0.6b-v3", "int8"),
     "fp32": ("istupakov/parakeet-tdt-0.6b-v3-onnx", None),
     "fp16": ("grikdotnet/parakeet-tdt-0.6b-fp16", "fp16"),
+    # parakeet v2 (English-only)
+    "v2-int8": ("nemo-parakeet-tdt-0.6b-v2", "int8"),
+    "v2-fp32": ("nemo-parakeet-tdt-0.6b-v2", None),
+    # whisper (onnx-community exports via onnx-asr's whisper adapter)
+    "whisper-tiny-int8": ("onnx-community/whisper-tiny", "int8"),
+    "whisper-tiny-fp32": ("onnx-community/whisper-tiny", None),
+    "whisper-turbo-int8": ("onnx-community/whisper-large-v3-turbo", "int8"),
+    "whisper-turbo-fp32": ("onnx-community/whisper-large-v3-turbo", None),
 }
 
 

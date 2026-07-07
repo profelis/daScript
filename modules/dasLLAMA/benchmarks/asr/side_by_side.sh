@@ -72,10 +72,17 @@ for model in $MODELS; do
             printf "cli\t%s\t%s\t%s\t%s\t%s\n" "$(basename "$mpath")" "$(basename "$w")" "$dur" "$rep" "$ms" |
                 tee -a "$RAW"
         done
-        # ONNX-Runtime side (v3-only exports exist); model name rewritten to join the das/cli key
-        if [ "$model" = "parakeet-v3" ] && [ -x "$ONNX_PY" ]; then
-            echo "== $model rep $rep: onnx-$ONNX_VARIANT =="
-            onnx_out=$("$ONNX_PY" onnx_bench.py --variant "$ONNX_VARIANT" --threads "$THREADS" $wavs --reps 1 2>&1) ||
+        # ONNX-Runtime side; model key -> onnx_bench variant ("" = no export wired)
+        case "$model" in
+            parakeet-v3)    onnx_var="$ONNX_VARIANT" ;;
+            parakeet)       onnx_var="v2-$ONNX_VARIANT" ;;
+            tiny)           onnx_var="whisper-tiny-$ONNX_VARIANT" ;;
+            large-v3-turbo) onnx_var="whisper-turbo-$ONNX_VARIANT" ;;
+            *)              onnx_var="" ;;
+        esac
+        if [ -n "$onnx_var" ] && [ -x "$ONNX_PY" ]; then
+            echo "== $model rep $rep: onnx-$onnx_var =="
+            onnx_out=$("$ONNX_PY" onnx_bench.py --variant "$onnx_var" --threads "$THREADS" $wavs --reps 1 2>&1) ||
                 { echo "$onnx_out" | tail -5; echo "ONNX RUN FAILED"; exit 1; }
             echo "$onnx_out" | grep "^SKIP" || true
             echo "$onnx_out" |
