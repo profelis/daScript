@@ -741,7 +741,8 @@ def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel; var st : Par
 // c0: conv2d k3 s2 p1, cin=1, bias+relu fused. Each output row is 9 scalar-broadcast
 // mads over the contiguous channel axis; w tap-major [9][cout] (repacked at load, 9 KB —
 // L1-resident), OOB taps skipped (exact zeros in the im2col form). Bit-exact vs the old
-// im2col+K9-GEMM+bias+relu chain and 6.5x faster single-lane (see conv_sub_bench).
+// im2col+K9-GEMM+bias+relu chain and 6.5x faster even single-lane (see conv_sub_bench);
+// threads over oy rows (independent — bit-exact at any lane count).
 def private pk_conv2d_c1_s2_relu(var out : array<float>; x : array<float>; blob : array<float>;
                                  w_off, b_off : int64; iw, ih, cout : int64) {
     let ow = (iw - 1l) / 2l + 1l
@@ -753,42 +754,46 @@ def private pk_conv2d_c1_s2_relu(var out : array<float>; x : array<float>; blob 
         let wp = reinterpret<float const?>(addr(blob[w_off]))
         let bp = reinterpret<float const?>(addr(blob[b_off]))
         let zero = float4(0.0)
-        for (oy in range64(oh)) {
-            let iy0 = oy * 2l - 1l
-            for (ox in range64(ow)) {
-                let ix0 = ox * 2l - 1l
-                var xs : float[9]
-                for (kh in range64(3l)) {   // 9 guarded scalar taps, hoisted out of the channel sweep
-                    let iy = iy0 + kh
-                    for (kw in range64(3l)) {
-                        let ix = ix0 + kw
-                        xs[kh * 3l + kw] = (iy >= 0l && iy < ih && ix >= 0l && ix < iw ? xp[iy * iw + ix] : 0.0)
+        maybe_parallel_for(0, int(oh), lanes_for_work(oh * ow * cout * 9l, 0)) $(rb, re) {
+            unsafe {
+                for (oy in range64(int64(rb), int64(re))) {
+                    let iy0 = oy * 2l - 1l
+                    for (ox in range64(ow)) {
+                        let ix0 = ox * 2l - 1l
+                        var xs : float[9]
+                        for (kh in range64(3l)) {   // 9 guarded scalar taps, hoisted out of the channel sweep
+                            let iy = iy0 + kh
+                            for (kw in range64(3l)) {
+                                let ix = ix0 + kw
+                                xs[kh * 3l + kw] = (iy >= 0l && iy < ih && ix >= 0l && ix < iw ? xp[iy * iw + ix] : 0.0)
+                            }
+                        }
+                        let x0 = float4(xs[0], xs[0], xs[0], xs[0])
+                        let x1 = float4(xs[1], xs[1], xs[1], xs[1])
+                        let x2 = float4(xs[2], xs[2], xs[2], xs[2])
+                        let x3 = float4(xs[3], xs[3], xs[3], xs[3])
+                        let x4 = float4(xs[4], xs[4], xs[4], xs[4])
+                        let x5 = float4(xs[5], xs[5], xs[5], xs[5])
+                        let x6 = float4(xs[6], xs[6], xs[6], xs[6])
+                        let x7 = float4(xs[7], xs[7], xs[7], xs[7])
+                        let x8 = float4(xs[8], xs[8], xs[8], xs[8])
+                        let o = (oy * ow + ox) * cout
+                        var c = 0l
+                        while (c < cout) {
+                            var acc = x0 * (*reinterpret<float4 const?>(wp + c))
+                            acc = mad(x1, *reinterpret<float4 const?>(wp + cout + c), acc)
+                            acc = mad(x2, *reinterpret<float4 const?>(wp + 2l * cout + c), acc)
+                            acc = mad(x3, *reinterpret<float4 const?>(wp + 3l * cout + c), acc)
+                            acc = mad(x4, *reinterpret<float4 const?>(wp + 4l * cout + c), acc)
+                            acc = mad(x5, *reinterpret<float4 const?>(wp + 5l * cout + c), acc)
+                            acc = mad(x6, *reinterpret<float4 const?>(wp + 6l * cout + c), acc)
+                            acc = mad(x7, *reinterpret<float4 const?>(wp + 7l * cout + c), acc)
+                            acc = mad(x8, *reinterpret<float4 const?>(wp + 8l * cout + c), acc)
+                            acc += *reinterpret<float4 const?>(bp + c)
+                            *reinterpret<float4?>(op + o + c) = max(acc, zero)
+                            c += 4l
+                        }
                     }
-                }
-                let x0 = float4(xs[0], xs[0], xs[0], xs[0])
-                let x1 = float4(xs[1], xs[1], xs[1], xs[1])
-                let x2 = float4(xs[2], xs[2], xs[2], xs[2])
-                let x3 = float4(xs[3], xs[3], xs[3], xs[3])
-                let x4 = float4(xs[4], xs[4], xs[4], xs[4])
-                let x5 = float4(xs[5], xs[5], xs[5], xs[5])
-                let x6 = float4(xs[6], xs[6], xs[6], xs[6])
-                let x7 = float4(xs[7], xs[7], xs[7], xs[7])
-                let x8 = float4(xs[8], xs[8], xs[8], xs[8])
-                let o = (oy * ow + ox) * cout
-                var c = 0l
-                while (c < cout) {
-                    var acc = x0 * (*reinterpret<float4 const?>(wp + c))
-                    acc = mad(x1, *reinterpret<float4 const?>(wp + cout + c), acc)
-                    acc = mad(x2, *reinterpret<float4 const?>(wp + 2l * cout + c), acc)
-                    acc = mad(x3, *reinterpret<float4 const?>(wp + 3l * cout + c), acc)
-                    acc = mad(x4, *reinterpret<float4 const?>(wp + 4l * cout + c), acc)
-                    acc = mad(x5, *reinterpret<float4 const?>(wp + 5l * cout + c), acc)
-                    acc = mad(x6, *reinterpret<float4 const?>(wp + 6l * cout + c), acc)
-                    acc = mad(x7, *reinterpret<float4 const?>(wp + 7l * cout + c), acc)
-                    acc = mad(x8, *reinterpret<float4 const?>(wp + 8l * cout + c), acc)
-                    acc += *reinterpret<float4 const?>(bp + c)
-                    *reinterpret<float4?>(op + o + c) = max(acc, zero)
-                    c += 4l
                 }
             }
         }
@@ -818,7 +823,8 @@ def private pk_dw_pos(var op : float?; xp, wp, bp : float const?; oy, ox, iw, ih
 }
 
 // depthwise conv2d k3 s2 p1, w tap-major [9][ch] (repacked at load): float4 over the
-// contiguous channel axis, 9 taps unrolled, guarded borders (isolated bench: 7.2x scalar)
+// contiguous channel axis, 9 taps unrolled, guarded borders (isolated bench: 7.2x scalar);
+// interior threads over oy rows (independent — bit-exact at any lane count)
 def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : array<float>;
                             w_off, b_off : int64; iw, ih, ch : int64) {
     let ow = (iw - 1l) / 2l + 1l
@@ -832,23 +838,27 @@ def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : arr
         let xp = reinterpret<float const?>(addr(x[0]))
         let wp = reinterpret<float const?>(addr(blob[w_off]))
         let bp = reinterpret<float const?>(addr(blob[b_off]))
-        for (oy in range64(1l, oy_end)) {
-            for (ox in range64(1l, ox_end)) {
-                let x0 = ((oy * 2l - 1l) * iw + ox * 2l - 1l) * ch
-                let o = (oy * ow + ox) * ch
-                var c = 0l
-                while (c < ch) {
-                    var acc = (*reinterpret<float4 const?>(xp + x0 + c)) * (*reinterpret<float4 const?>(wp + c))
-                    acc = mad(*reinterpret<float4 const?>(xp + x0 + ch + c), *reinterpret<float4 const?>(wp + ch + c), acc)
-                    acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * ch + c), *reinterpret<float4 const?>(wp + 2l * ch + c), acc)
-                    acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + c), *reinterpret<float4 const?>(wp + 3l * ch + c), acc)
-                    acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + ch + c), *reinterpret<float4 const?>(wp + 4l * ch + c), acc)
-                    acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + 2l * ch + c), *reinterpret<float4 const?>(wp + 5l * ch + c), acc)
-                    acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + c), *reinterpret<float4 const?>(wp + 6l * ch + c), acc)
-                    acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + ch + c), *reinterpret<float4 const?>(wp + 7l * ch + c), acc)
-                    acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + 2l * ch + c), *reinterpret<float4 const?>(wp + 8l * ch + c), acc)
-                    *reinterpret<float4?>(op + o + c) = acc + *reinterpret<float4 const?>(bp + c)
-                    c += 4l
+        maybe_parallel_for(1, int(oy_end), lanes_for_work(oh * ow * ch * 9l, 0)) $(rb, re) {
+            unsafe {
+                for (oy in range64(int64(rb), int64(re))) {
+                    for (ox in range64(1l, ox_end)) {
+                        let x0 = ((oy * 2l - 1l) * iw + ox * 2l - 1l) * ch
+                        let o = (oy * ow + ox) * ch
+                        var c = 0l
+                        while (c < ch) {
+                            var acc = (*reinterpret<float4 const?>(xp + x0 + c)) * (*reinterpret<float4 const?>(wp + c))
+                            acc = mad(*reinterpret<float4 const?>(xp + x0 + ch + c), *reinterpret<float4 const?>(wp + ch + c), acc)
+                            acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * ch + c), *reinterpret<float4 const?>(wp + 2l * ch + c), acc)
+                            acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + c), *reinterpret<float4 const?>(wp + 3l * ch + c), acc)
+                            acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + ch + c), *reinterpret<float4 const?>(wp + 4l * ch + c), acc)
+                            acc = mad(*reinterpret<float4 const?>(xp + x0 + rs + 2l * ch + c), *reinterpret<float4 const?>(wp + 5l * ch + c), acc)
+                            acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + c), *reinterpret<float4 const?>(wp + 6l * ch + c), acc)
+                            acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + ch + c), *reinterpret<float4 const?>(wp + 7l * ch + c), acc)
+                            acc = mad(*reinterpret<float4 const?>(xp + x0 + 2l * rs + 2l * ch + c), *reinterpret<float4 const?>(wp + 8l * ch + c), acc)
+                            *reinterpret<float4?>(op + o + c) = acc + *reinterpret<float4 const?>(bp + c)
+                            c += 4l
+                        }
+                    }
                 }
             }
         }
@@ -864,25 +874,29 @@ def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : arr
 }
 
 // feature permute xf[t][fr + w3*c] = y6[t][fr][c]: float4 over the contiguous c axis,
-// 4 strided scalar stores per group (bench: 2.85x the scalar 3-loop)
+// 4 strided scalar stores per group (bench: 2.85x the scalar 3-loop); threads over t
 def private pk_xf_permute(var xf : array<float>; y6 : array<float>; tt, w3, nch : int64) {
     let feat = w3 * nch
     unsafe {
         var fp = addr(xf[0])
         let yp = reinterpret<float const?>(addr(y6[0]))
-        for (t in range64(tt)) {
-            let base = t * feat
-            for (fr in range64(w3)) {
-                let yr = base + fr * nch
-                let fo = base + fr
-                var c = 0l
-                while (c < nch) {
-                    let v = *reinterpret<float4 const?>(yp + yr + c)
-                    fp[fo + w3 * c] = v.x
-                    fp[fo + w3 * (c + 1l)] = v.y
-                    fp[fo + w3 * (c + 2l)] = v.z
-                    fp[fo + w3 * (c + 3l)] = v.w
-                    c += 4l
+        maybe_parallel_for(0, int(tt), lanes_for_work(tt * feat, 0)) $(rb, re) {
+            unsafe {
+                for (t in range64(int64(rb), int64(re))) {
+                    let base = t * feat
+                    for (fr in range64(w3)) {
+                        let yr = base + fr * nch
+                        let fo = base + fr
+                        var c = 0l
+                        while (c < nch) {
+                            let v = *reinterpret<float4 const?>(yp + yr + c)
+                            fp[fo + w3 * c] = v.x
+                            fp[fo + w3 * (c + 1l)] = v.y
+                            fp[fo + w3 * (c + 2l)] = v.z
+                            fp[fo + w3 * (c + 3l)] = v.w
+                            c += 4l
+                        }
+                    }
                 }
             }
         }
@@ -890,25 +904,29 @@ def private pk_xf_permute(var xf : array<float>; y6 : array<float>; tt, w3, nch 
 }
 
 // fused bias+relu over rows (the 1x1 conv epilogues) — one float4 pass instead of the
-// add_bias_rows + relu pair re-streaming the image (bench: 11.8x); explicit npos: scratch
-// is oversized
+// add_bias_rows + relu pair re-streaming the image (bench: 11.8x); threads over rows;
+// explicit npos: scratch is oversized
 def private pk_bias_relu(var y : array<float>; blob : array<float>; b_off, d, npos : int64) {
     let d4 = d - d % 4l
     unsafe {
         var yp = addr(y[0])
         let bp = reinterpret<float const?>(addr(blob[b_off]))
         let zero = float4(0.0)
-        for (p in range64(npos)) {
-            let row = p * d
-            var i = 0l
-            while (i < d4) {
-                let v = (*reinterpret<float4 const?>(yp + row + i)) + (*reinterpret<float4 const?>(bp + i))
-                *reinterpret<float4?>(yp + row + i) = max(v, zero)
-                i += 4l
-            }
-            while (i < d) {
-                yp[row + i] = max(yp[row + i] + bp[i], 0.0)
-                i++
+        maybe_parallel_for(0, int(npos), lanes_for_work(npos * d, 0)) $(rb, re) {
+            unsafe {
+                for (p in range64(int64(rb), int64(re))) {
+                    let row = p * d
+                    var i = 0l
+                    while (i < d4) {
+                        let v = (*reinterpret<float4 const?>(yp + row + i)) + (*reinterpret<float4 const?>(bp + i))
+                        *reinterpret<float4?>(yp + row + i) = max(v, zero)
+                        i += 4l
+                    }
+                    while (i < d) {
+                        yp[row + i] = max(yp[row + i] + bp[i], 0.0)
+                        i++
+                    }
+                }
             }
         }
     }
