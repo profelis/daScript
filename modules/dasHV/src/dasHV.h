@@ -52,13 +52,14 @@ void das_wss_any ( Handle<hv::WebSocketServer> h, const char * url, Lambda lmb, 
 void das_wss_static ( Handle<hv::WebSocketServer> h, const char * path, const char * dir );
 void das_wss_allow_cors ( Handle<hv::WebSocketServer> h );
 void das_wss_sse ( Handle<hv::WebSocketServer> h, const char * url, Lambda lmb, Context * context, LineInfoArg * at );
+void das_wss_stream ( Handle<hv::WebSocketServer> h, const char * url, Lambda lmb, Context * context, LineInfoArg * at );
 
-// HttpResponseWriter operations
-int das_writer_end_headers ( hv::HttpResponseWriter * w, const char * key, const char * value );
-int das_writer_sse_event ( hv::HttpResponseWriter * w, const char * data, const char * event );
-int das_writer_write_chunked ( hv::HttpResponseWriter * w, const char * data, int32_t len );
-int das_writer_end ( hv::HttpResponseWriter * w );
-int das_writer_close ( hv::HttpResponseWriter * w );
+// HttpResponseWriter operations — handle-first so they can marshal the write onto the server loop
+int das_writer_respond ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, int32_t status, const char * content_type, const char * body );
+int das_writer_end_headers ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * key, const char * value );
+int das_writer_sse_event ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * data, const char * event );
+int das_writer_write_chunked ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * data );
+void das_writer_close ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w );
 void das_writer_release ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w );
 
 http_status das_resp_string ( HttpResponse * resp, const char * msg, http_status status = HTTP_STATUS_OK );

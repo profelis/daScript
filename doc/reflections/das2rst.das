@@ -241,7 +241,7 @@ def document_module_dashv(_root : string) {
         group_by_regex("WebSocket server lifecycle", mod, %regex~(make_web_socket_server|destroy_web_socket_server|start|stop)$%%),
         group_by_regex("WebSocket channel send", mod, %regex~(send)$%%),
         group_by_regex("Handle operations", mod, %regex~(is_alive|==|!=)$%%),
-        group_by_regex("HTTP route registration", mod, %regex~(GET|POST|PUT|DELETE|PATCH|HEAD|ANY|SSE)$%%),
+        group_by_regex("HTTP route registration", mod, %regex~(GET|POST|PUT|DELETE|PATCH|HEAD|ANY|SSE|STREAM)$%%),
         group_by_regex("HTTP server configuration", mod, %regex~(STATIC|allow_cors|set_document_root|set_home_page|set_index_of|set_error_page)$%%),
         group_by_regex("HTTP response helpers", mod, %regex~(TEXT_PLAIN|JSON|REDIRECT|SERVE_FILE|DATA|set_header|set_content_type)$%%),
         group_by_regex("HTTP client requests", mod, %regex~(request|request_cb|status_message)$%%),
@@ -249,7 +249,7 @@ def document_module_dashv(_root : string) {
         group_by_regex("Request configuration", mod, %regex~(set_basic_auth|set_bearer_token_auth|set_timeout|set_connect_timeout|allow_redirect|set_param|get_param|each_param)$%%),
         group_by_regex("Cookies", mod, %regex~(add_cookie|get_cookie|each_cookie)$%%),
         group_by_regex("Form data", mod, %regex~(set_form_data|set_form_file|get_form_data|each_form_field|save_form_file|set_url_encoded|get_url_encoded)$%%),
-        group_by_regex("SSE response writer", mod, %regex~(sse_event|end_headers|write_chunked|end_response|close_writer|release_writer)$%%)
+        group_by_regex("SSE response writer", mod, %regex~(respond|sse_event|end_headers|write_chunked|close_writer|release_writer)$%%)
     )
     document("HTTP and WebSocket library (libhv)", mod, "dashv.rst", groups)
 }
@@ -298,6 +298,7 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
         group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
+        group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Chat", mod, %regex~(create_chat|add_user|add_user_audio|add_assistant|render_turn|respond)$%%)
     )
     var hook = DocsHook()

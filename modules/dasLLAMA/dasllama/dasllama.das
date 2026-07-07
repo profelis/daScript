@@ -119,6 +119,17 @@ def generate_embd(model : Model; var session : Session; embd : array<float>; npo
     return generate_embd_(model, session, embd, npos, params, max_tokens, blk)
 }
 
+// ===== Embeddings =====
+
+def embed(model : Model; text : string) : array<float> {
+    //! Mean-pooled, L2-normalized sentence embedding of ``text`` (``model.config.dim`` floats): the
+    //! decoder's last-layer hidden state (post-final RMSNorm) averaged over token positions, then
+    //! unit-normalized. One forward over a fresh session per call. A decoder-only model used as an
+    //! embedder yields RAG-grade vectors — good for retrieval / similarity, not a substitute for a
+    //! dedicated embedding model.
+    return <- embed_(model, text)
+}
+
 // ===== Chat =====
 
 def create_chat(model : Model; system : string = ""; max_new : int64 = 256l) : ChatSession {

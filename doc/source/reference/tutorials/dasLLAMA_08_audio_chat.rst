@@ -75,6 +75,6 @@ a program finds out instead of being silently absorbed.
 
    Full source: :download:`tutorials/dasLLAMA/08_audio_chat.das <../../../../tutorials/dasLLAMA/08_audio_chat.das>`
 
-   Previous tutorial: :ref:`tutorial_dasLLAMA_speech_to_text`
+   Previous tutorial: :ref:`tutorial_dasLLAMA_speech_to_text` · Next tutorial: :ref:`tutorial_dasLLAMA_embeddings`
 
    The audio-chat CLI: ``examples/dasLLAMA/audio.das``
