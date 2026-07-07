@@ -89,6 +89,14 @@ This applies to ALL test directories (e.g., `tests/fio/`, `tests/fs/`, `tests/js
 
 **Trap:** glob exclusion ALONE is not enough. `test_aot` runs every file under `tests/` regardless of what was stub-generated, so an excluded-but-not-`no_aot` file fails at runtime with `error[50101]` on all its functions (precedent: `tests/fixed_array/test_interop.das`, issue #3077).
 
+**Trap — `_`-prefixed fixture MODULES in an existing test dir.** The per-dir AOT globs
+exclude `_*` files (`EXCLUDE REGEX "/_"`), so a new same-dir fixture module (`require`d by a
+test via the bare same-directory form) never gets AOT'd — the test then fails 50101 on the
+fixture's functions ("module never AOT'd" looks identical to a stale stub). Register the
+fixture explicitly in the dir's module list in `tests/aot/CMakeLists.txt` (e.g.
+`AOT_LANGUAGE_MODULE_FILES` for `tests/language/_*.das`; precedent: `_lambda_vis_inner.das` /
+`_lambda_vis_mid.das`).
+
 **Intentionally-non-compiling `expect`-fixtures** (a `[macro]`/annotation that is *supposed* to fail compilation, driven by a sibling test via `compile_file` + asserting the error text — e.g. fail-closed codegen-rejection fixtures): `options no_aot` does NOT save these. `no_aot` skips *emission*, but the AOT generator (`utils/aot/main.das`) still *compiles* the program first, so a file that fails compilation breaks the AOT build before the no-emit skip applies. Put such fixtures in a **`_`-prefixed file inside a non-globbed subdir** (e.g. `tests/spirv/_fail_closed/_fc_*.das`): the `_` prefix keeps dastest/`test_aot` from discovering+running it, and the subdir keeps the non-recursive `tests/<dir>/*.das` AOT glob from trying to stub-generate it. Add an `expect <code>` directive too so the lint sweep skips it (precedent: `tests/spirv/_fail_closed/`, dasSpirv Phase 6.4 fail-closed gate).
 
 **AOT-emit trap — raw-pointer indexing by int64 (FIXED, #3391).** `p[i]` where `p : T?` and `i : int64` used to be AOT-ambiguous for the non-`var` pointer form: `das_index<T * const>` had only `int32_t`/`uint32_t` `at`/`safe_at` overloads (the `T *` and `const T * const` specializations got 64-bit overloads in `c40b653d9`; this one was missed). Fixed by adding the int64/uint64 overloads in `include/daScript/simulate/aot.h`; regression test `tests/aot/test_int64_ptr_index.das`. Old workaround (`for (i in range(int(n)))` / `p[int(i)]`) is no longer needed.
