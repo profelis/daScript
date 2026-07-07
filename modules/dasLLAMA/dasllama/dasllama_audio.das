@@ -1056,7 +1056,7 @@ struct EncoderState {
     kk : array<float>    // k token-major [T × d]
     vv : array<float>    // v token-major [T × d]
     hp : array<float>    // per-head packs q,kT,v,out: 4 × [T × d]
-    att : array<float>   // per-head blocked scores [n_head × ATTN_ENC_QB × T]
+    att : array<float>   // per-slot blocked scores [get_dispatch_slot_bound() × ATTN_ENC_QB × T]
     h : array<float>     // ffn hidden [T × ff]
     pooled : array<float>// [T/2 × d]
     ph : array<float>    // projector hidden [rows × mm1_out] (ultravox/voxtral)
@@ -1083,7 +1083,7 @@ def make_encoder_state(t : AudioTower) : EncoderState {
     s.kk |> resize(int(tt * d))
     s.vv |> resize(int(tt * d))
     s.hp |> resize(int(4l * tt * d))
-    s.att |> resize(int(t.n_head * ATTN_ENC_QB * tt))
+    s.att |> resize(int(int64(get_dispatch_slot_bound()) * ATTN_ENC_QB * tt))
     s.h |> resize(int(tt * t.n_ff))
     s.pooled |> resize(int(tt / 2l * d))
     let rows = audio_tokens_per_chunk(t)
@@ -1105,13 +1105,24 @@ def make_encoder_state(t : AudioTower) : EncoderState {
     return <- s
 }
 
-// Non-causal blocked attention over gemm_f32, parallel across heads: per head, pack Q/Kᵀ/V,
-// then per ATTN_ENC_QB query rows score = Q·Kᵀ (scale + full-row softmax) and out = P·V.
+// Non-causal blocked attention over gemm_f32, flattened over (head × ATTN_ENC_QB query rows)
+// units: stage 1 packs Q/Kᵀ/V per (head × row-block), stage 2 runs score = Q·Kᵀ (scale +
+// full-row softmax), out = P·V, and the token-major scatter for its rows. Head-parallel left
+// lanes idle (tiny: 6 heads on 8 lanes; turbo: 20 = a 17% makespan floor); flattened units
+// self-serve chunk-per-unit, with slot-indexed score scratch (units of one head share the
+// per-head pack regions read-only after stage 1, so only scores need per-slot space).
 // No cache, no mask — every position sees all `tt` positions.
 def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
     let d = t.d_model
     let hs = d / t.n_head
     let scale = 1.0 / sqrt(float(hs))
+    let nqb = int((tt + ATTN_ENC_QB - 1l) / ATTN_ENC_QB)
+    let nu = int(t.n_head) * nqb
+    // que-less-creation guard: the state may have been sized under a smaller slot bound
+    let attNeed = int64(get_dispatch_slot_bound()) * ATTN_ENC_QB * tt
+    if (int64(length(s.att)) < attNeed) {
+        s.att |> resize(int(attNeed))
+    }
     unsafe {
         let qp = reinterpret<float const?>(addr(s.qq[0]))
         let kp = reinterpret<float const?>(addr(s.kk[0]))
@@ -1119,45 +1130,59 @@ def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
         var hpp = addr(s.hp[0])
         var attp = addr(s.att[0])
         var aop = addr(s.xb2[0])
-        maybe_parallel_for(0, int(t.n_head), get_dispatch_lanes()) $(hb, he) {
+        var tp = ref_time_ticks()
+        maybe_parallel_for(0, nu, min(get_dispatch_lanes(), nu)) $(ub, ue) {
             unsafe {
-                for (h in range(hb, he)) {
+                for (u in range(ub, ue)) {
+                    let h = u / nqb
                     let hoff = int64(h) * hs
                     // per-head pack region: q [tt×hs], kT [hs×tt], v [tt×hs], oh [tt×hs]
                     var qh = hpp + int64(h) * 4l * tt * hs
                     var kt = qh + tt * hs
                     var vh = kt + tt * hs
-                    var oh = vh + tt * hs
-                    for (p in range64(tt)) {
+                    let p0 = int64(u % nqb) * ATTN_ENC_QB
+                    let p1 = min(p0 + ATTN_ENC_QB, tt)
+                    for (p in range64(p0, p1)) {
                         for (j in range64(hs)) {
                             qh[p * hs + j] = qp[p * d + hoff + j]
                             kt[j * tt + p] = kp[p * d + hoff + j]
                             vh[p * hs + j] = vp[p * d + hoff + j]
                         }
                     }
-                    var ah = attp + int64(h) * ATTN_ENC_QB * tt
-                    var qb0 = 0l
-                    while (qb0 < tt) {
-                        let qbn = min(ATTN_ENC_QB, tt - qb0)
-                        for (i in range64(qbn * tt)) {
-                            ah[i] = 0.0
-                        }
-                        gemm_f32(ah, qh + qb0 * hs, kt, qbn, hs, tt)
-                        for (r in range64(qbn)) {
-                            var row = ah + r * tt
-                            for (i in range64(tt)) {
-                                row[i] *= scale
-                            }
-                            softmax(row, tt)
-                        }
-                        for (i in range64(qbn * hs)) {
-                            oh[qb0 * hs + i] = 0.0
-                        }
-                        gemm_f32(oh + qb0 * hs, ah, vh, qbn, tt, hs)
-                        qb0 += qbn
+                }
+            }
+        }
+        asr_prof_add("enc.attn.pack", tp)
+        tp = ref_time_ticks()
+        maybe_parallel_for_indexed(0, nu, nu) $(slot, ub, ue) {
+            unsafe {
+                var ah = attp + int64(slot) * ATTN_ENC_QB * tt
+                for (u in range(ub, ue)) {
+                    let h = u / nqb
+                    let hoff = int64(h) * hs
+                    var qh = hpp + int64(h) * 4l * tt * hs
+                    var kt = qh + tt * hs
+                    var vh = kt + tt * hs
+                    var oh = vh + tt * hs
+                    let qb0 = int64(u % nqb) * ATTN_ENC_QB
+                    let qbn = min(ATTN_ENC_QB, tt - qb0)
+                    for (i in range64(qbn * tt)) {
+                        ah[i] = 0.0
                     }
-                    // scatter head output back to token-major xb2
-                    for (p in range64(tt)) {
+                    gemm_f32(ah, qh + qb0 * hs, kt, qbn, hs, tt)
+                    for (r in range64(qbn)) {
+                        var row = ah + r * tt
+                        for (i in range64(tt)) {
+                            row[i] *= scale
+                        }
+                        softmax(row, tt)
+                    }
+                    for (i in range64(qbn * hs)) {
+                        oh[qb0 * hs + i] = 0.0
+                    }
+                    gemm_f32(oh + qb0 * hs, ah, vh, qbn, tt, hs)
+                    // scatter this unit's rows back to token-major xb2
+                    for (p in range64(qb0, qb0 + qbn)) {
                         for (j in range64(hs)) {
                             aop[p * d + hoff + j] = oh[p * hs + j]
                         }
@@ -1165,6 +1190,7 @@ def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
                 }
             }
         }
+        asr_prof_add("enc.attn.blocks", tp)
     }
 }
 
