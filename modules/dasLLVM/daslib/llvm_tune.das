@@ -33,8 +33,10 @@ require llvm/daslib/llvm_code public
 //! Per-box sharing + UX rail: a library declares `[tune_scope(name=, tuner=)]` (manifest at
 //! `<das_root>/<name>.tune.json`, shared by every app that requires it); an app declares
 //! `[tune_policy(missing = fallback|warn|error|auto|restart)]`; `--tune` after `--` on the
-//! app's command line forces a fresh tuner run. Standalone builds (`llvm-jit -exe`, AOT) are
-//! tune-free by contract — see `tune_standalone_gate`.
+//! app's command line forces a fresh tuner run. AOT builds are fully tune-free
+//! (`tune_aot_gate`); `-exe` builds stamp normally but run no policy (`tune_exe_gate`) — an
+//! exe built WITH a manifest is a local-use artifact shipping those winners, one built
+//! without ships the generic per-ISA `fallback=` stamps.
 
 // ===== manifest + mode =====
 
@@ -44,17 +46,23 @@ def tune_mode() : string {
     return empty(m) ? "normal" : m
 }
 
-//! True when this compile produces a standalone artifact — `llvm-jit -exe`
-//! (`policies.jit_exe_mode`), AOT C++ generation (`policies.aot_module`), or an AOT-consuming
-//! run (`policies.aot`). Tune is a per-box, compile-at-startup concept, so under this gate
-//! every tune annotation is inert: no manifest/scope reads, no stamps (`fallback=` included),
-//! no policy, no injected checks — only the reference-row `<name>_variants()` registries are
-//! emitted so harness code still compiles. AOT soundness depends on the gate covering BOTH
-//! the generating and the consuming compile: per-box stamps would desync their AOT hashes.
-def tune_standalone_gate() : bool {
-    return (compiling_program().policies.jit_exe_mode
-        || compiling_program().policies.aot
-        || compiling_program().policies.aot_module)
+//! True when this compile is AOT — C++ generation (`policies.aot_module`) or an AOT-consuming
+//! run (`policies.aot`). Under AOT every tune annotation is fully inert: no manifest/scope
+//! reads, no stamps (`fallback=` included), no policy, no injected checks — only the
+//! reference-row `<name>_variants()` registries are emitted so harness code still compiles.
+//! AOT soundness depends on the gate covering BOTH the generating and the consuming compile:
+//! per-box stamps would desync their AOT hashes.
+def tune_aot_gate() : bool {
+    return compiling_program().policies.aot || compiling_program().policies.aot_module
+}
+
+//! True when this compile produces a standalone exe (`llvm-jit -exe`). Stamping still runs:
+//! an exe built on a box WITH a manifest ships those winners (a local-use artifact by
+//! definition), and without one it ships the generic per-ISA `fallback=` stamps. Only the
+//! policy rail (`[tune_policy]`, `--tune`) is dead — a frozen artifact must not demand or
+//! run tuning.
+def tune_exe_gate() : bool {
+    return compiling_program().policies.jit_exe_mode
 }
 
 // runtime copy of the program's manifest declaration, set by the injected [init]s — a
@@ -460,10 +468,11 @@ class private TuneAnnotation : AstFunctionAnnotation {
             delete comps
             return false
         }
-        // standalone artifacts (-exe, AOT) are tune-free by contract — reference bodies only,
-        // registries emitted so harness code compiles. Overrides grid modes too: a stale
-        // DAS_TUNE_MODE env must not leak variant stubs into a shipped binary.
-        if (tune_standalone_gate()) {
+        // AOT is tune-free by contract — reference bodies only, registries emitted so harness
+        // code compiles. Overrides grid modes too: a stale DAS_TUNE_MODE env must not leak
+        // variant stubs into generated C++. (-exe is NOT gated here: an exe ships the box's
+        // manifest winners — local-use build — or the generic fallback= stamps without one.)
+        if (tune_aot_gate()) {
             let noPerms : array<TunePerm>
             var gok = emit_registry(compiling_module(), func, noPerms, errors)
             for (c in comps) {
@@ -690,8 +699,8 @@ def private restamp_program(manifest : table<string; string>; mpath : string; va
 class private TuneManifestAnnotation : AstFunctionAnnotation {
     def override apply(var func : FunctionPtr; var group : ModuleGroup;
                        args : AnnotationArgumentList; var errors : das_string) : bool {
-        // standalone artifacts are tune-free by contract — no init injection, no restamp
-        if (tune_standalone_gate()) return true
+        // AOT is tune-free by contract — no init injection, no restamp
+        if (tune_aot_gate()) return true
         let nv = find_arg(args, "name")
         if (!(nv is tString) || empty(nv as tString)) {
             errors := "[tune_manifest] on {func.name}: name=\"<app name>\" is required"
@@ -739,7 +748,7 @@ def private resolve_decl_path(declFile : string; p : string) : string {
 class private TuneScopeAnnotation : AstStructureAnnotation {
     def override apply(var st : StructurePtr; var group : ModuleGroup;
                        args : AnnotationArgumentList; var errors : das_string) : bool {
-        if (tune_standalone_gate()) return true
+        if (tune_aot_gate()) return true
         let nv = find_arg(args, "name")
         if (!(nv is tString) || empty(nv as tString)) {
             errors := "[tune_scope]: name=\"<scope name>\" is required"
@@ -839,10 +848,11 @@ def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : s
 class private TunePolicyAnnotation : AstFunctionAnnotation {
     def override apply(var func : FunctionPtr; var group : ModuleGroup;
                        args : AnnotationArgumentList; var errors : das_string) : bool {
-        // standalone builds are tune-free; grid-mode children manage their own manifest (and
-        // the spawned tuner compiles in tune mode — the recursion guard); a DAS_TUNE_MANIFEST
-        // env override means the user drives manually
-        if (tune_standalone_gate() || tune_mode() != "normal"
+        // AOT and -exe builds run no policy (a frozen artifact must not demand or run
+        // tuning); grid-mode children manage their own manifest (and the spawned tuner
+        // compiles in tune mode — the recursion guard); a DAS_TUNE_MANIFEST env override
+        // means the user drives manually
+        if (tune_aot_gate() || tune_exe_gate() || tune_mode() != "normal"
                 || !empty(get_env_variable("DAS_TUNE_MANIFEST"))) {
             return true
         }
