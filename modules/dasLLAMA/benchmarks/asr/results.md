@@ -79,11 +79,14 @@ TSVs: das `results_pk_ls_m1_t8_jo.tsv`, cli/onnx `results_pk_ls_m1_t8_p0.tsv`.
 
 ## Whisper — das vs whisper-cli (`-bs 1 -bo 1 -nf -ng`)
 
-das = tower q8 + threaded gelu table (`d25a46542`); decoder still fp32 — the profiled
-levers (tower attention walk order, decoder q8 incl. the 265 MB fp32 logits GEMV on
-turbo, fp32 cross_kv) are queued, this is the starting scoreboard.
+das = tower q8 + threaded gelu table (`d25a46542`) + decoder q8 (`cb20e2954`: self/cross
+attn + mlp + tied-te logits GEMV + cross_kv). Remaining profiled levers: tower attention
+head-unit raggedness (tiny 6 / turbo 20 units vs lane count — dominates encode), fc1/fc2
+q8 rate gap, mel.
 
 ### Apple M1 Max, 8 threads — both sides 2026-07-07 @ `da4254be9`, interleaved, best-of-2
+
+das rows predate decoder q8 (`cb20e2954`) — re-sweep pending a Parsec-off window.
 
 | model | file | audio s | das ms | cli ms | das/cli |
 |---|---|---|---|---|---|
@@ -100,36 +103,43 @@ turbo, fp32 cross_kv) are queued, this is the starting scoreboard.
 
 TSV (both sides): `results_wh_m1_t8.tsv`.
 
-### AMD EPYC Zen 2, 16 threads — both sides 2026-07-07 @ `da4254be9`, interleaved, best-of-2
+### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `cb20e2954` (decoder q8); cli TSV 2026-07-07
 
 | model | file | audio s | das ms | cli ms | das/cli |
 |---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 345 | 213 | 1.62x |
-| tiny | jfk3.wav | 33 | 811 | 500 | 1.62x |
-| tiny | gb1.wav | 199 | 4420 | 2845 | 1.55x |
-| tiny | hp0.wav | 273 | 5351 | 3546 | 1.51x |
-| tiny | hp0x2.wav | 547 | 10632 | 7327 | 1.45x |
-| large-v3-turbo | jfk.wav | 11 | 5031 | 6728 | **0.75x** |
-| large-v3-turbo | jfk3.wav | 33 | 10225 | 13657 | **0.75x** |
-| large-v3-turbo | gb1.wav | 199 | 43039 | 76720 | **0.56x** |
-| large-v3-turbo | hp0.wav | 273 | 61907 | 100852 | **0.61x** |
-| large-v3-turbo | hp0x2.wav | 547 | 119655 | 189313 | **0.63x** |
+| tiny | jfk.wav | 11 | 358 | 213 | 1.68x |
+| tiny | jfk3.wav | 33 | 828 | 500 | 1.66x |
+| tiny | gb1.wav | 199 | 4256 | 2845 | 1.50x |
+| tiny | hp0.wav | 273 | 5366 | 3546 | 1.51x |
+| tiny | hp0x2.wav | 547 | 10758 | 7327 | 1.47x |
+| large-v3-turbo | jfk.wav | 11 | 4783 | 6728 | **0.71x** |
+| large-v3-turbo | jfk3.wav | 33 | 10015 | 13657 | **0.73x** |
+| large-v3-turbo | gb1.wav | 199 | 43552 | 76720 | **0.57x** |
+| large-v3-turbo | hp0.wav | 273 | 62500 | 100852 | **0.62x** |
+| large-v3-turbo | hp0x2.wav | 547 | 120378 | 189313 | **0.64x** |
 
-TSV (both sides): `results_wh_zen2_t16.tsv`. Shape: without AMX, the q8 tower already wins
-turbo outright; tiny is dominated by the fp32 decoder + fixed costs on both boxes — the
-decoder-q8 lever. onnx whisper columns pending (harness wired, `f7bab29e3`).
+TSVs: das `results_wh_zen2_t16_dq8.tsv`, cli side of `results_wh_zen2_t16.tsv`. Decoder q8
+is net-neutral end-to-end on this box (stage A/B, tiny/jfk: logits GEMV 3.8x + cross_kv
+1.6x faster, but the cache-resident per-layer decoder GEMVs run +7-21% SLOWER q8 — AVX2
+int8 dot + requant loses to plain FMA on L2/L3-hot weights without VNNI; decode is ~15% of
+tiny anyway). tiny's real wall = encoder attn head-units (72% of encode at 6 units on 16
+lanes); without AMX the q8 tower wins turbo outright. onnx whisper columns pending
+(harness wired, `f7bab29e3`).
 
 ## Correctness
 
 - das fp32 is token-for-token with parakeet-cli (v2 jfk 33 + gb1 786; v3 jfk 38 + gb1 655)
   and with whisper-cli (tiny jfk, suite oracle).
 - das q8 (the path benched here): parakeet ids/text exact vs fp32, gb1 shows a handful of
-  duration-pick flips (≤4-frame timestamp drift); whisper word-exact on
-  tiny/base/small/large-v3-turbo, base flips one segment-split timestamp (`wh_q8_probe`).
+  duration-pick flips (≤4-frame timestamp drift); whisper (tower + decoder q8) word-exact
+  on tiny/small/large-v3-turbo, base drops one comma on a 0.018-logit fp32 top-2 near-tie
+  (teacher-forced adjudication; `wh_q8_probe`).
 - onnx-int8 changes TEXT vs fp32 (e.g. jfk "for you, ask" → "for you. Ask").
 
 ## Changelog
 
+- 2026-07-08 `cb20e2954`: whisper decoder q8; zen2 das re-sweep — end-to-end neutral there
+  (logits/cross_kv wins vs cache-hot GEMV losses), M1 re-sweep pending Parsec window.
 - 2026-07-07 `c5ad73980`+: doc restructured — current tables only, per-platform sections.
 - 2026-07-07 `97e7e7cf6`: zen2 v3 three-side round (first v3/onnx numbers on that box).
 - 2026-07-07 `0ee3807ec`: zen2 das re-sweep post dispatch-fix + TUNE — das leads every row.
