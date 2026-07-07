@@ -46,18 +46,35 @@ We have gemma-4-12B-it verified (arch: heterogeneous sliding/global geometry, p-
 V-from-K global layers, per-layer output scale, final softcap). The family is five models;
 four remain. Order inside the wave = cheapest first, each gated before the next starts.
 
-1. **gemma-4-31B dense — verify-only slice.** Same arch as 12B by all public docs
-   (**VERIFY** at load: header dims only). Q8 ≈ 33 GB — fits M1 Max; zen2 fine. Work =
-   download + parity run + fixture + matrix row. Source: `ggml-org/gemma-4-31B-it-GGUF`
-   (Q8 text + bf16 mmproj), downloaded 2026-07-07 — direct GGUF, no conversion. If the
-   header shows a geometry surprise, it becomes a small arch slice and the wave re-sizes.
-2. **gemma-4-26B-A4B MoE — medium slice.** Third MoE shape next to qwen2moe (softmax
-   top-4-of-60, un-renormalized, sigmoid shared expert) and gpt-oss (top-4-of-32, softmax
-   over selected, no shared). **VERIFY** the 26B router details from the llama.cpp arch
-   before writing code (router activation, top-k, renorm, shared expert, expert FFN kind).
-   Wiring rides the existing MoE block seam; 4B active = strong CPU target, likely the
-   family's perf sweet spot for us. Source: `ggml-org/gemma-4-26B-A4B-it-GGUF` (Q8 text +
-   bf16 mmproj), downloaded 2026-07-07 — direct GGUF, no conversion.
+1. **gemma-4-31B dense — ✅ DONE 2026-07-07 (verify-only, zero code).** Header confirmed
+   the same gemma4 arch as the 12B, scaled: 60 layers, embd 5376, 32Q / [16×5,4]KV heads;
+   PLE off, shared_kv 0, softcap 30, 5-local:1-global SWA. Ran the existing gemma4 forward
+   unchanged → **40/40 token-for-token** vs simple_ids (harness/parity.sh). Fixture
+   `test_parity_gemma4_31b` (reuses GEMMA4_12B_GEN — identical counting continuation) +
+   README matrix row. Committed on `bbatkin/model-expansion` (`19d7712cd`). Source:
+   `ggml-org/gemma-4-31B-it-GGUF` (Q8 + bf16 mmproj), direct GGUF.
+2. **gemma-4-26B-A4B MoE — 🎯 NEXT. PROBED 2026-07-07; a real MoE slice (medium).**
+   Header: gemma4 arch, 30 layers, embd 2816, ff 2112, 16Q / [8×5,2]KV heads, **128 experts
+   top-8**, expert_ff 704, softcap 30, SWA 1024, PLE off, shared_kv 0. The gemma4 MoE
+   (`src/models/gemma4.cpp` `is_moe_layer` branch, lines ~291-344) is **two parallel branches
+   SUMMED** (`cur = shared + routed`):
+   - **Shared expert** — dense GeGLU FFN: `ffn_norm` → build_ffn(GELU, PAR) → `ffn_post_norm_1`. Always on.
+   - **Routed experts** — `ffn_pre_norm_2` → MoE → `ffn_post_norm_2`. Router is *custom-normalized*:
+     `RMS_norm(attn_out) × 1/√n_embd × learned ffn_gate_inp_s`, then `ffn_gate_inp` matmul → logits.
+     **Softmax top-8-of-128 WITH renorm** (`norm_w=true`). Experts are **fused gate_up**
+     (`ffn_gate_up_exps`, dim n_ff_exp·2) GeGLU + per-expert output scales
+     (`ffn_up_exps_s`/`gate_exps_s`/`down_exps_s`).
+   **Already in dasLLAMA** (proven by 12B/31B 40/40): attn geometry, dense GeGLU, per-tensor
+   `_s` scale machinery. **NEW code** (in `dasllama_arch_gemma4.das`, a MoE-layer branch): the
+   router normalization + softmax/renorm top-8, fused-gate_up experts w/ scales, the parallel
+   dense-shared-expert sum, and the extra sandwich norms (`ffn_pre_norm_2`,
+   `ffn_post_norm_1/2`). Rides the existing routed-expert GEMM seam (qwen2moe/gpt-oss).
+   **vs qwen2moe** (the closest): gemma4 renormalizes top-k (qwen2moe doesn't), has a learned
+   router input-scale + RMS/√d normalization (qwen2moe's router is a plain matmul), fuses
+   gate_up (qwen2moe separate), and its shared expert is a **dense parallel** FFN (qwen2moe's
+   is sigmoid-gated). Then 26B parity 40/40 (harness/parity.sh) + `test_parity_gemma4_26b`
+   fixture (large-tier) + README row. Source: `ggml-org/gemma-4-26B-A4B-it-GGUF` (Q8 + bf16
+   mmproj), on disk 2026-07-07. 4B active = strong CPU target, likely the family's perf sweet spot.
 3. **gemma-4-E2B / E4B — the edge models. PROBED 2026-07-07; slice RE-SIZED DOWN to
    "PLE + KV-sharing," best case.** Read of `src/models/gemma4.cpp` vs `gemma3n.cpp`
    plus E2B/E4B header dumps settled every VERIFY below:
