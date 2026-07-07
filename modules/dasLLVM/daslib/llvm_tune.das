@@ -736,28 +736,30 @@ def private restamp_module(var mod : Module?; manifest : table<string; string>; 
     }
 }
 
-// The [tune_manifest] re-stamp walk. KNOWN LIMIT: re-stamping is only proven for functions
-// in the DECLARING (root) module — mutating a required module's already-compiled [tune]
-// function trips the re-infer pass (cross-module). Library kernels take their manifest
-// winners at [tune] time instead ([tune_scope] / DAS_TUNE_MANIFEST env), which is
-// cross-module-safe; policy auto/--tune re-exec into a fresh compile for the same reason.
-def private restamp_program(manifest : table<string; string>; mpath : string; var errors : das_string) {
-    program_for_each_module(compiling_program()) $(mod) {
-        restamp_module(mod, manifest, mpath, errors)
-    }
+// The [tune_manifest] re-stamp. Restricted to the DECLARING (root) module ON PURPOSE: mutating
+// a REQUIRED module's already-compiled [tune] function is a cross-module mutation that trips the
+// re-infer pass (see restamp_fn), so walking the whole program here would let an app-manifest
+// entry for a library kernel crash the compile. Library kernels take their manifest winners at
+// [tune] time instead (DAS_TUNE_MANIFEST env / [tune_scope]), which is cross-module-safe; policy
+// auto/--tune re-exec into a fresh compile for the same reason. So [tune_manifest] overrides
+// only the app's OWN [tune] functions; entries naming a required module's kernel are inert.
+def private restamp_root_module(manifest : table<string; string>; mpath : string; var errors : das_string) {
+    restamp_module(compiling_module(), manifest, mpath, errors)
 }
 
 //! `[tune_manifest(name = "myapp", dir = "...")]` on the app's `main` (any function in the
 //! root file): opts the app into a tune manifest at `<dir>/<name>.tune.json`. `dir` resolves
 //! against the declaring file's directory (absolute dirs pass through; omitted dir = the
-//! declaring file's directory), so two apps sharing a folder pick distinct names. The root
-//! module compiles after every library `[tune]`, so in normal mode this apply re-stamps the
-//! tuned functions from the declared manifest. No entry for a function keeps its
-//! `[tune]`-time stamp (fallback= or reference) — a stale manifest must not drop a new
-//! kernel family to the reference tier; an explicit "reference" entry forces the original
-//! body. Without the file the `fallback=` stamps stand. `DAS_TUNE_MANIFEST` overrides the
-//! declaration entirely. Also injects an [init] pointing the runtime write API
-//! (`tune_manifest_set`) at the same file.
+//! declaring file's directory), so two apps sharing a folder pick distinct names. In normal
+//! mode this apply re-stamps the app's OWN `[tune]` functions from the declared manifest — only
+//! the root module, since re-stamping a required library's compiled `[tune]` is cross-module
+//! and unsafe (see `restamp_root_module`); a manifest entry naming a library kernel is inert
+//! (override those via `DAS_TUNE_MANIFEST` env or `[tune_scope]`). No entry for a function keeps
+//! its `[tune]`-time stamp (fallback= or reference) — a stale manifest must not drop a new
+//! kernel family to the reference tier; an explicit "reference" entry forces the original body.
+//! Without the file the `fallback=` stamps stand. `DAS_TUNE_MANIFEST` overrides the declaration
+//! entirely. Also injects an [init] pointing the runtime write API (`tune_manifest_set`) at the
+//! same file.
 [function_macro(name = "tune_manifest")]
 class private TuneManifestAnnotation : AstFunctionAnnotation {
     def override apply(var func : FunctionPtr; var group : ModuleGroup;
@@ -785,7 +787,7 @@ class private TuneManifestAnnotation : AstFunctionAnnotation {
         var found = false
         var manifest <- read_manifest(mpath, found)
         if (found) {
-            restamp_program(manifest, mpath, errors)
+            restamp_root_module(manifest, mpath, errors)
         }
         delete manifest
         return empty(errors)
