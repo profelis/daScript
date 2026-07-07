@@ -77,11 +77,28 @@ TSV (all sides): `results_pk_zen2_t16_v3.tsv`. onnx = ORT `intra_op=16`.
 
 TSVs: das `results_pk_ls_m1_t8_jo.tsv`, cli/onnx `results_pk_ls_m1_t8_p0.tsv`.
 
-## Whisper family
+## Whisper — das vs whisper-cli (`-bs 1 -bo 1 -nf -ng`)
 
-Tower q8 + threaded gelu table shipped 2026-07-07 (`0c23c0009`, `d25a46542`) — corpus
-scoreboard vs whisper-cli pending the next bench window. (The old fp32-tower spot number,
-M1 tiny jfk 541 ms vs cli 165, predates both.)
+das = tower q8 + threaded gelu table (`d25a46542`); decoder still fp32 — the profiled
+levers (tower attention walk order, decoder q8 incl. the 265 MB fp32 logits GEMV on
+turbo, fp32 cross_kv) are queued, this is the starting scoreboard.
+
+### Apple M1 Max, 8 threads — both sides 2026-07-07 @ `da4254be9`, interleaved, best-of-2
+
+| model | file | audio s | das ms | cli ms | das/cli |
+|---|---|---|---|---|---|
+| tiny | jfk.wav | 11 | 193 | 122 | 1.58x |
+| tiny | jfk3.wav | 33 | 451 | 298 | 1.52x |
+| tiny | gb1.wav | 199 | 2336 | 1672 | 1.40x |
+| tiny | hp0.wav | 273 | 2972 | 2102 | 1.41x |
+| tiny | hp0x2.wav | 547 | 5932 | 4836 | 1.23x |
+| large-v3-turbo | jfk.wav | 11 | 3311 | 2150 | 1.54x |
+| large-v3-turbo | jfk3.wav | 33 | 6972 | 4494 | 1.55x |
+| large-v3-turbo | gb1.wav | 199 | 29782 | 25415 | 1.17x |
+| large-v3-turbo | hp0.wav | 273 | 41934 | 32878 | 1.28x |
+| large-v3-turbo | hp0x2.wav | 547 | 80689 | 64621 | 1.25x |
+
+TSV (both sides): `results_wh_m1_t8.tsv`. zen2 whisper round pending.
 
 ## Correctness
 
