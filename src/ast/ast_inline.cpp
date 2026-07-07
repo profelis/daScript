@@ -1395,7 +1395,7 @@ namespace das {
                         }
                     } else if ( varParam ) {
                         // a mutable by-value param IS a local copy
-                        makeArgTemp(A->clone(), false, false, false);
+                        makeArgTemp(A->clone(), false, false, A->type && !A->type->canCopy());
                     } else if ( leafConst ) {
                         sub.substitute = leafA;
                     } else if ( leafVar ) {
@@ -1437,7 +1437,7 @@ namespace das {
                         if ( reads<=1 && !underLoop && inlinePure(A) && orderSafe ) {
                             sub.substitute = A;
                         } else {
-                            makeArgTemp(A->clone(), true, false, false);
+                            makeArgTemp(A->clone(), true, false, A->type && !A->type->canCopy());
                         }
                     }
                     paramSub[P] = sub;
