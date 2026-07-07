@@ -123,6 +123,31 @@ def tune_manifest_set(fname : string; suffix : string) : bool {
     return ok
 }
 
+// ===== tune status (runtime) =====
+
+//! One tuned function's final compile-time decision, as reported by `tune_status()`.
+struct TuneStatus {
+    fname : string
+    scope : string          // [tune_scope] name, "" when env/app-manifest driven
+    suffix : string         // winning perm suffix, "" for the reference body
+    source : string         // "manifest" | "fallback" | "reference"
+    manifestPath : string   // the manifest the winner came from (or would come from)
+}
+
+var private g_tune_status : array<TuneStatus>
+
+//! Hook the `[tune_policy]`-injected [init] calls once per tuned function.
+def tune_status_add(fname, scope, suffix, source, manifestPath : string) {
+    g_tune_status |> push(TuneStatus(fname = fname, scope = scope, suffix = suffix,
+        source = source, manifestPath = manifestPath))
+}
+
+//! The program's tune decisions — one row per `[tune]` function. Populated when the app
+//! declares `[tune_policy]` (its injected [init] fills the table); empty otherwise.
+def tune_status() : array<TuneStatus> {
+    return clone_to_move(g_tune_status)
+}
+
 // ===== [tune_scope] data — library-owned per-box scope =====
 
 // one registered scope: a per-box manifest at <das_root>/<name>.tune.json plus the harness
@@ -306,13 +331,18 @@ def private take_perms(func : FunctionPtr; var errors : das_string) : array<Tune
 // [llvm_code(name=<generator>, <perm args>)] onto `fn`. The appended declaration's own apply
 // does not run for macro-added annotations, so force the side effects here too — without
 // userScenario the front-end const-folds constant-arg calls before they reach the JIT.
-def private stamp_llvm_code(var fn : FunctionPtr; genKey : string; perm : TunePerm) {
+// tune_suffix/tune_from ride along as extra args (generators ignore unknown args by
+// contract): they are the stamped-truth record `collect_status` reads back off the AST —
+// `from` is the manifest the winner came from, "" for a fallback= stamp.
+def private stamp_llvm_code(var fn : FunctionPtr; genKey : string; perm : TunePerm; from : string) {
     var aargs : array<tuple<argname : string; argvalue : RttiValue>>
-    aargs |> reserve(length(perm.args) + 1)
+    aargs |> reserve(length(perm.args) + 3)
     aargs |> push((argname = "name", argvalue = RttiValue(tString = genKey)))
     for (a in perm.args) {
         aargs |> push((argname = a.argname, argvalue = a.argvalue))
     }
+    aargs |> push((argname = "tune_suffix", argvalue = RttiValue(tString = perm.suffix)))
+    aargs |> push((argname = "tune_from", argvalue = RttiValue(tString = from)))
     fn |> append_annotation("llvm_code", "llvm_code", aargs)
     fn.sideEffectFlags.userScenario = true
     delete aargs
@@ -329,7 +359,7 @@ def private stamp_grid(var func : FunctionPtr; genKey : string; perms : array<Tu
     for (p in perms) {
         var fclone = clone_function(func)
         fclone.name := "{func.name}__{p.suffix}"
-        stamp_llvm_code(fclone, genKey, p)
+        stamp_llvm_code(fclone, genKey, p, "")
         fclone.flags.generated = true
         if (!(mod |> add_function(fclone))) {
             errors := "[tune] on {func.name}: failed to add variant {fclone.name}"
@@ -343,7 +373,7 @@ def private stamp_grid(var func : FunctionPtr; genKey : string; perms : array<Tu
         for (p in perms) {
             var cclone = clone_function(c.fn)
             cclone.name := "{c.fnname}__{p.suffix}"
-            stamp_llvm_code(cclone, c.genkey, p)
+            stamp_llvm_code(cclone, c.genkey, p, "")
             cclone.flags.generated = true
             if (!(mod |> add_function(cclone))) {
                 errors := "[tune] on {func.name}: failed to add companion variant {cclone.name}"
@@ -550,9 +580,9 @@ class private TuneAnnotation : AstFunctionAnnotation {
             ok = false
             for (p in perms) {
                 if (p.suffix == suffix) {
-                    stamp_llvm_code(func, genKey, p)
+                    stamp_llvm_code(func, genKey, p, fromManifest ? mpath : "")
                     for (c in comps) {
-                        stamp_llvm_code(c.fn, c.genkey, p)
+                        stamp_llvm_code(c.fn, c.genkey, p, fromManifest ? mpath : "")
                     }
                     print("llvm_tune: {fname} <- {suffix} ({fromManifest ? mpath : "fallback"})\n")
                     ok = true
@@ -650,9 +680,9 @@ def private restamp_fn(var fn : FunctionPtr; mod : Module?; manifest : table<str
         var stamped = false
         for (p in rows) {
             if (p.suffix == suffix) {
-                stamp_llvm_code(fn, genKey, p)
+                stamp_llvm_code(fn, genKey, p, mpath)
                 for (c in comps) {
-                    stamp_llvm_code(c.fn, c.genkey, p)
+                    stamp_llvm_code(c.fn, c.genkey, p, mpath)
                 }
                 print("llvm_tune: {fname} <- {suffix} ({mpath})\n")
                 stamped = true
@@ -831,6 +861,45 @@ def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : s
     return true
 }
 
+// final stamped truth per [tune] function, read off the AST (the tune_suffix/tune_from args
+// stamp_llvm_code records) — no macro-state bank, so shared-context reuse across compiles
+// can't pollute it
+def private collect_status() : array<TuneStatus> {
+    var rows : array<TuneStatus>
+    let env = get_env_variable("DAS_TUNE_MANIFEST")
+    program_for_each_module(compiling_program()) $(mod) {
+        let modName = "{mod.name}"
+        var scopeName = ""
+        var scopePath = ""
+        if (g_scopes |> key_exists(modName)) {
+            scopeName = g_scopes[modName].scopeName
+            scopePath = g_scopes[modName].manifestPath
+        }
+        for_each_function(mod, "") $(fn) {
+            var isTuned = false
+            var suffix = ""
+            var from = ""
+            for (ann in fn.annotations) {
+                if (ann.annotation.name == "tune") {
+                    isTuned = true
+                } elif (ann.annotation.name == "llvm_code") {
+                    let sv = find_arg(ann.arguments, "tune_suffix")
+                    if (sv is tString) { suffix = sv as tString }
+                    let fv = find_arg(ann.arguments, "tune_from")
+                    if (fv is tString) { from = fv as tString }
+                }
+            }
+            if (isTuned) {
+                let source = empty(suffix) ? "reference" : (empty(from) ? "fallback" : "manifest")
+                let mpath = !empty(from) ? from : (!empty(env) ? env : scopePath)
+                rows |> push(TuneStatus(fname = "{fn.name}", scope = scopeName,
+                    suffix = suffix, source = source, manifestPath = mpath))
+            }
+        }
+    }
+    return <- rows
+}
+
 //! `[tune_policy(missing = "...")]` on the app's `main` (any function in the root file): what
 //! to do about `[tune_scope]`s whose per-box manifest is missing at compile time —
 //!   fallback: stamp `fallback=` silently (the default everywhere, also without this annotation)
@@ -930,6 +999,30 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
             break if (!empty(errors))
         }
         delete seen
+        // the runtime status table: one tune_status_add per [tune] function, reflecting every
+        // restamp above (the rows are read off the final AST, not banked during stamping)
+        if (empty(errors)) {
+            var rows <- collect_status()
+            if (!empty(rows)) {
+                var body : array<ExpressionPtr>
+                body |> reserve(length(rows))
+                for (row in rows) {
+                    body |> push <| qmacro_expr() {
+                        tune_status_add($v(row.fname), $v(row.scope), $v(row.suffix),
+                            $v(row.source), $v(row.manifestPath))
+                    }
+                }
+                var fn = qmacro_function("`tune`status`init") $() : void {
+                    $b(body)
+                }
+                fn |> append_annotation("$", "init")
+                fn.flags.generated = true
+                if (!(compiling_module() |> add_function(fn))) {
+                    errors := "[tune_policy]: duplicate declaration (one per program)"
+                }
+            }
+            delete rows
+        }
         return empty(errors)
     }
 }
