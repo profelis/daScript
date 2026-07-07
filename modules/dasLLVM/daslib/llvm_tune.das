@@ -697,31 +697,29 @@ def private restamp_fn(var fn : FunctionPtr; mod : Module?; manifest : table<str
     delete comps
 }
 
-// scopeName restricts the walk to modules bound to that scope — a scope's manifest must not
-// stamp another library's same-named kernel (the keys are bare function names). "" walks the
-// whole program: the explicit overrides (DAS_TUNE_MANIFEST env, app [tune_manifest]) keep
-// program-wide semantics by design.
-def private restamp_program(manifest : table<string; string>; mpath : string; scopeName : string; var errors : das_string) {
+def private restamp_module(var mod : Module?; manifest : table<string; string>; mpath : string; var errors : das_string) {
+    var tuned : array<FunctionPtr>
+    for_each_function(mod, "") $(fn) {
+        for (ann in fn.annotations) {
+            if (ann.annotation.name == "tune") {
+                tuned |> push(fn)
+                break
+            }
+        }
+    }
+    for (fn in tuned) {
+        restamp_fn(fn, mod, manifest, mpath, errors)
+    }
+}
+
+// The [tune_manifest] re-stamp walk. KNOWN LIMIT: re-stamping is only proven for functions
+// in the DECLARING (root) module — mutating a required module's already-compiled [tune]
+// function trips the re-infer pass (cross-module). Library kernels take their manifest
+// winners at [tune] time instead ([tune_scope] / DAS_TUNE_MANIFEST env), which is
+// cross-module-safe; policy auto/--tune re-exec into a fresh compile for the same reason.
+def private restamp_program(manifest : table<string; string>; mpath : string; var errors : das_string) {
     program_for_each_module(compiling_program()) $(mod) {
-        var skip = false
-        if (!empty(scopeName)) {
-            let modName = "{mod.name}"
-            skip = !(g_scopes |> key_exists(modName)) || g_scopes[modName].scopeName != scopeName
-        }
-        if (!skip) {
-            var tuned : array<FunctionPtr>
-            for_each_function(mod, "") $(fn) {
-                for (ann in fn.annotations) {
-                    if (ann.annotation.name == "tune") {
-                        tuned |> push(fn)
-                        break
-                    }
-                }
-            }
-            for (fn in tuned) {
-                restamp_fn(fn, mod, manifest, mpath, errors)
-            }
-        }
+        restamp_module(mod, manifest, mpath, errors)
     }
 }
 
@@ -763,7 +761,7 @@ class private TuneManifestAnnotation : AstFunctionAnnotation {
         var found = false
         var manifest <- read_manifest(mpath, found)
         if (found) {
-            restamp_program(manifest, mpath, "", errors)
+            restamp_program(manifest, mpath, errors)
         }
         delete manifest
         return empty(errors)
@@ -836,8 +834,8 @@ def private tuner_cmd(scope : TuneScope) : string {
     return "{envs}\"{get_das_exe()}\" -jit \"{scope.tunerPath}\" -dasroot \"{get_das_root()}\""
 }
 
-// spawn the scope's tuner to completion, relaying its output; works from macro context
-// (policy=auto/--tune, during the root-module compile) and from runtime (policy=restart)
+// spawn the scope's tuner to completion, relaying its output — RUNTIME only (the auto and
+// restart guards); never from macro context, where a daslang child cannot run mid-compile
 def private run_scope_tuner(scope : TuneScope) : bool {
     let tmp = path_join(get_das_root(), "_tune_{scope.scopeName}_out.txt")
     let cmd = "{tuner_cmd(scope)} > \"{tmp}\" 2>&1"
@@ -847,6 +845,68 @@ def private run_scope_tuner(scope : TuneScope) : bool {
     remove(tmp)
     print("{outp}\n")
     return true
+}
+
+// runtime accumulators for the auto/--tune guard: how many scopes just got tuned, and the
+// re-exec'd child's exit code
+var private g_tuned_scopes = 0
+var private g_reexec_code = 0
+
+//! Runtime half of `[tune_policy(missing = "auto")]` / `--tune` — injected at the top of the
+//! app's `main`, one call per scope, followed by `tune_auto_reexec()`. Runs the scope's tuner
+//! when the manifest is missing (unconditionally under `--tune`); tuning happens at RUNTIME
+//! because the winners are compile-time stamps — this process compiled without them, and the
+//! re-exec that follows picks them up in a fresh compile.
+def tune_auto_prepare(scopeName : string; manifestPath : string; tunerPath : string; force : bool) {
+    if (!force && fexist(manifestPath)) {
+        return
+    }
+    print("llvm_tune: scope '{scopeName}' {force ? "re-tuning (--tune)" : "is untuned on this box — tuning now"}\n")
+    run_scope_tuner(TuneScope(scopeName = scopeName, manifestPath = manifestPath, tunerPath = tunerPath))
+    if (fexist(manifestPath)) {
+        g_tuned_scopes++
+    } else {
+        print("llvm_tune: tuner produced no manifest at {manifestPath}\n")
+    }
+}
+
+//! Relaunch the current process so a fresh compile stamps the just-written manifests (the
+//! winners are compile-time stamps — they cannot be adopted mid-run). Relays the child's
+//! output; `--tune` is stripped from the relaunch, so the child converges (its manifests are
+//! present) instead of looping. Returns true when the child ran and main must return
+//! immediately — `tune_reexec_code()` is its exit code.
+def tune_auto_reexec() : bool {
+    if (g_tuned_scopes == 0) {
+        return false
+    }
+    // aliases a process-global Array header — do not delete
+    var argv <- get_command_line_arguments()
+    var args : array<string>
+    args |> reserve(length(argv))
+    for (a in argv) {
+        if (a != "--tune") {
+            args |> push("{a}")
+        }
+    }
+    print("llvm_tune: re-launching to apply the fresh manifests\n")
+    var rc : int
+    unsafe {
+        rc = popen_argv(args, 0.0) $(f) {
+            if (f != null) {
+                while (!feof(f)) {
+                    print(fgets(f))
+                }
+            }
+        }
+    }
+    delete args
+    g_reexec_code = rc
+    return true
+}
+
+//! The re-exec'd child's exit code — what an `int` main returns after `tune_auto_reexec()`.
+def tune_reexec_code() : int {
+    return g_reexec_code
 }
 
 //! Runtime half of `[tune_policy(missing = "restart")]` — injected as a guard at the top of
@@ -911,19 +971,23 @@ def private collect_status() : array<TuneStatus> {
     return <- rows
 }
 
-//! `[tune_policy(missing = "...")]` on the app's `main` (any function in the root file): what
-//! to do about `[tune_scope]`s whose per-box manifest is missing at compile time —
+//! `[tune_policy(missing = "...")]` on the app's `main` (must be `main` for auto/restart —
+//! they prepend a guard to its body): what to do about `[tune_scope]`s whose per-box
+//! manifest is missing at compile time —
 //!   fallback: stamp `fallback=` silently (the default everywhere, also without this annotation)
 //!   warn:    loud compile-time banner with the exact tuner command
 //!   error:   fail the compile with the same message — the dev mode
-//!   auto:    run the scope's tuner NOW (child process), re-stamp from the fresh manifest, and
-//!            continue — first start tunes, then serves
-//!   restart: tune at app startup instead (injected [init]), then exit asking for a restart
-//! `--tune` after `--` on the app's command line forces the auto path even when the manifest
-//! exists (re-tune). `DAS_TUNE_POLICY` env overrides the declared value (CI kill switch:
-//! `DAS_TUNE_POLICY=fallback`). Grid modes (`DAS_TUNE_MODE=tune`/`test` — also the recursion
-//! guard for the spawned tuner), a `DAS_TUNE_MANIFEST` env override, and standalone builds
-//! (`-exe`, AOT) skip policy entirely.
+//!   auto:    tune at startup (injected guard runs each missing scope's tuner), then RE-EXEC
+//!            the process — the fresh compile stamps the winners; one launch, then it serves.
+//!            (Tuning cannot happen mid-compile: the tuner is a daslang child, and adopting
+//!            its winners means new compile-time stamps anyway.)
+//!   restart: like auto but no re-exec — tune at startup, then exit asking for a manual
+//!            restart (one missing scope per start)
+//! `--tune` after `--` on the app's command line forces the auto path even when the manifests
+//! exist (re-tune; the flag is stripped from the re-exec). `DAS_TUNE_POLICY` env overrides
+//! the declared value (CI kill switch: `DAS_TUNE_POLICY=fallback`). Grid modes
+//! (`DAS_TUNE_MODE=tune`/`test` — also the recursion guard for the spawned tuner), a
+//! `DAS_TUNE_MANIFEST` env override, and standalone builds (`-exe`, AOT) skip policy entirely.
 [function_macro(name = "tune_policy")]
 class private TunePolicyAnnotation : AstFunctionAnnotation {
     def override apply(var func : FunctionPtr; var group : ModuleGroup;
@@ -953,10 +1017,11 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
         if (force && empty(g_scopes)) {
             print("llvm_tune: --tune requested but no [tune_scope] is declared by any required library\n")
         }
-        // snapshot: values() locks the table for the loop's duration, and the body's restamp
-        // reads g_scopes (the [] op is insert-capable — it trips the lock even on hits)
+        // snapshot: values() locks the table for the loop's duration, and the body reads
+        // g_scopes indirectly (the [] op is insert-capable — it trips the lock even on hits)
         var scopes <- [for (scope in values(g_scopes)); scope]
         var seen : table<string>
+        var autoScopes : array<TuneScope>
         for (scope in scopes) {
             continue if (seen |> key_exists(scope.scopeName))
             seen |> insert(scope.scopeName)
@@ -965,18 +1030,15 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
             delete manifest
             continue if (found && !force)
             if (force || policy == "auto") {
+                // NO tuner run and NO restamp at compile time: the tuner is a daslang child
+                // (can't run mid-compile), and restamping a REQUIRED module's compiled
+                // function is a cross-module mutation the re-infer pass can't survive.
+                // Instead a runtime guard tunes and RE-EXECS — the fresh compile stamps the
+                // winners at [tune] time, which is cross-module-safe.
                 if (empty(scope.tunerPath)) {
                     errors := "[tune_policy]: scope '{scope.scopeName}' declares no tuner= — cannot {force ? "--tune" : "auto-tune"}; produce {scope.manifestPath} manually"
                 } else {
-                    run_scope_tuner(scope)
-                    var found2 = false
-                    var fresh <- read_manifest(scope.manifestPath, found2)
-                    if (found2) {
-                        restamp_program(fresh, scope.manifestPath, scope.scopeName, errors)
-                    } else {
-                        errors := "[tune_policy]: tuner for scope '{scope.scopeName}' produced no manifest at {scope.manifestPath}"
-                    }
-                    delete fresh
+                    autoScopes |> push(scope)
                 }
             } elif (policy == "error") {
                 errors := "[tune_policy]: scope '{scope.scopeName}' is untuned on this box — run: {empty(scope.tunerPath) ? "<no tuner declared>" : tuner_cmd(scope)} (or start with --tune)"
@@ -1014,8 +1076,47 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
         }
         delete seen
         delete scopes
-        // the runtime status table: one tune_status_add per [tune] function, reflecting every
-        // restamp above (the rows are read off the final AST, not banked during stamping)
+        // the auto/--tune guard: prepend one tune_auto_prepare per scope, then the re-exec —
+        // execution order is prepare(s) first, re-exec last, ahead of the original body
+        if (empty(errors) && !empty(autoScopes)) {
+            if (!(func.body is ExprBlock)) {
+                errors := "[tune_policy]: {func.name} has no body block"
+            } elif (func.result.baseType != Type.tVoid && func.result.baseType != Type.tInt
+                    && func.result.baseType != Type.autoinfer) {
+                // autoinfer = undeclared result, void by convention for main
+                errors := "[tune_policy]: auto/--tune — {func.name} must return void or int"
+            } else {
+                var guards : array<ExpressionPtr>
+                guards |> reserve(length(autoScopes) + 1)
+                for (scope in autoScopes) {
+                    guards |> push <| qmacro_expr() {
+                        tune_auto_prepare($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath), $v(force))
+                    }
+                }
+                if (func.result.baseType == Type.tInt) {
+                    guards |> push <| qmacro_expr() {
+                        if (tune_auto_reexec()) {
+                            return tune_reexec_code()
+                        }
+                    }
+                } else {
+                    guards |> push <| qmacro_expr() {
+                        if (tune_auto_reexec()) {
+                            return
+                        }
+                    }
+                }
+                var blk = unsafe(reinterpret<ExprBlock?>(func.body))
+                var gi = length(guards) - 1
+                while (gi >= 0) {
+                    blk.list |> push(guards[gi], 0)
+                    gi--
+                }
+            }
+        }
+        delete autoScopes
+        // the runtime status table: one tune_status_add per [tune] function — with auto now
+        // tuning at runtime the rows always reflect this compile's [tune]-time stamps
         if (empty(errors)) {
             var rows <- collect_status()
             if (!empty(rows)) {
