@@ -62,6 +62,12 @@ def main():
     for wav in args.wav:
         dur = audio_seconds(wav)
         base = wav.rsplit("/", 1)[-1]
+        # onnx-asr's whisper adapter is a single 30 s window — no long-form chunking
+        # (verified: hp0 returns empty text in 230 ms, jfk3 truncates at ~30 s). A longer
+        # clip would bench a silent truncation, not a transcription.
+        if args.variant.startswith("whisper") and dur > 30.0:
+            print(f"SKIP\t{name}\t{base}\tsingle-window adapter: {dur:.0f}s > 30s")
+            continue
         text = ""
         for rep in range(1, args.reps + 1):
             t0 = time.perf_counter()
