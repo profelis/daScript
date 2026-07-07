@@ -133,10 +133,23 @@ parakeet-tdt-0.6b-v2 (f32 bin), das vs parakeet-cli (plain AVX2, no AMX):
 | hp0.wav | 273 | 15339 | 29698 | **0.52x** | 17.8 | 9.2 |
 | hp0x2.wav | 547 | 44789 | 95549 | **0.47x** | 12.2 | 5.7 |
 
-zen2 shape: das now leads every row — the old "crossover ≈ 2.5-3 min" died with the
-dispatch fix (jfk was 3.02x, now 0.63x: the fifo cost scaled with 16 lanes and hit short
-clips hardest). v3 + onnx columns on zen2 still pending (box needs the v3 bin + an
-onnxruntime venv).
+parakeet-tdt-0.6b-**v3** (f32 bin), das vs parakeet-cli vs ONNX-Runtime int8, 3 reps
+interleaved A/B/C (all three sides fresh on this box — the v3 bin and the onnx venv landed
+2026-07-07; onnx = istupakov v3 int8 via onnx-asr, ORT intra_op=16; hp0x2 overflows its
+baked rel-pos table and is skipped, das/cli handle it):
+
+| file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx | das xRT | cli xRT | onnx xRT |
+|---|---|---|---|---|---|---|---|---|---|
+| jfk.wav | 11 | 414 | 673 | 570 | **0.61x** | **0.73x** | 26.6 | 16.3 | 19.3 |
+| jfk3.wav | 33 | 1171 | 1757 | 1776 | **0.67x** | **0.66x** | 28.2 | 18.8 | 18.6 |
+| gb1.wav | 199 | 9654 | 16670 | 17286 | **0.58x** | **0.56x** | 20.6 | 11.9 | 11.5 |
+| hp0.wav | 273 | 14902 | 27775 | 26868 | **0.54x** | **0.55x** | 18.3 | 9.8 | 10.2 |
+| hp0x2.wav | 547 | 41436 | 88198 | - | **0.47x** | - | 13.2 | 6.2 | - |
+
+zen2 shape: das now leads every row on both models and every competitor — the old
+"crossover ≈ 2.5-3 min" died with the dispatch fix (v2 jfk was 3.02x, now 0.63x: the fifo
+cost scaled with 16 lanes and hit short clips hardest). v3 das beats onnx-int8 0.55-0.73x
+while staying word-exact vs fp32 (onnx-int8 changes text).
 
 ## zen2 EPYC — 2026-07-06 (SUPERSEDED das rows; cli STANDING BASELINE source)
 
