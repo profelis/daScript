@@ -163,10 +163,10 @@ parakeet-tdt-0.6b-v2 (f32 bin), das vs parakeet-cli (plain AVX2, no AMX):
 | hp0.wav | 273 | 23702 | 29698 | **0.80x** | 11.5 | 9.2 |
 | hp0x2.wav | 547 | 66271 | 95549 | **0.69x** | 8.2 | 5.7 |
 
-zen2 shape: crossover ≈ 2.5-3 min, das wins grow with length (threaded row-blocked
-attention + q8 GEMMs scale better than ggml's parakeet graph); short clips lose on
-per-layer GEMM shapes at small tt + fixed mel/decode — zen2 jfk (3x) is the worst case
-and the next short-clip target. v3 + onnx columns on zen2 pending (box needs the v3 bin
-+ an onnxruntime venv).
+zen2 shape then: crossover ≈ 2.5-3 min — the short-clip losses were the dispatch
+handicap, not the kernels (see the 2026-07-07 section).
 
-Whisper-family (fp32 tower, pre-q8): M1 tiny jfk 541 ms vs cli 165 ms (3.3x) — tower q8 queued.
+Whisper-family: the 2026-07-06 fp32-tower row (M1 tiny jfk 541 ms vs cli 165, 3.3x) is
+SUPERSEDED — tower q8 + the threaded gelu table shipped 2026-07-07 (word-exact vs fp32 on
+tiny/base/small/large-v3-turbo, wh_q8_probe); the whisper corpus scoreboard vs whisper-cli
+is the next bench round.
