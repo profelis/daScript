@@ -4,9 +4,11 @@
 // DAS_ASSERTF assumed it never could ("how? it matched during findMatchingFunctions
 // the same way"). In release that fell through to a null makeType and crashed in
 // ExprMakeStruct::visit. The guard now returns cleanly, so the bad default surfaces
-// as ordinary compile errors instead of a crash.
+// as ordinary compile errors instead of a crash. (The former trailing 30341 was the
+// locked-instance-name dead end; the origin-generic fallback now re-resolves and the
+// broken default errors as 30511 instead.)
 options gen2
-expect 30161, 30254, 30341
+expect 30161, 30254, 30511, 30511
 
 tuple var0 {}
 

@@ -712,6 +712,39 @@ namespace das {
                 return true; }, moduleName);
         return result;
     }
+    Function * InferTypes::lockedNameGenericOrigin(const string & name, const MatchingFunctions & functions) const {
+        if (name.compare(0, 4, "__::") != 0) return nullptr;
+        auto funcName = name.substr(4);
+        if (funcName.find('`') == string::npos) return nullptr;
+        Function * origin = nullptr;
+        auto consider = [&](Function * pFn) -> bool {       // false = not one shared family
+            if (!pFn || !pFn->fromGeneric) return false;
+            if (origin && origin != pFn->fromGeneric) return false;
+            origin = pFn->fromGeneric;
+            return true;
+        };
+        if (!functions.empty()) {                           // ambiguous candidates in hand
+            for (auto & pFn : functions) {
+                if (!consider(pFn)) return nullptr;
+            }
+            return origin;
+        }
+        auto hFuncName = hash64z(funcName.c_str());         // no visibility filter - only fromGeneric is read
+        bool conflict = false;
+        program->library.foreach([&](Module * mod) -> bool {
+            auto itFnList = mod->functionsByName.find(hFuncName);
+            if (itFnList) {
+                for (auto & pFn : itFnList->second) {
+                    if (!consider(pFn)) {
+                        conflict = true;
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }, "*");
+        return conflict ? nullptr : origin;
+    }
     void InferTypes::findMatchingFunctionsAndGenerics(MatchingFunctions &resultFunctions, MatchingFunctions &resultGenerics, const string &name, const vector<TypeDeclPtr> &types, const vector<MakeFieldDeclPtr> &arguments, bool inferBlock) const {
         string moduleName, funcName;
         splitTypeName(name, moduleName, funcName);
@@ -1417,6 +1450,22 @@ namespace das {
             if (functions.empty() && generics.empty() && expr->pipedCallArgument && !expr->arguments.empty()) {
                 tryPipedCallPadding(expr, types, functions, generics, visCheck);
             }
+            // a name locked to a generic-instance family ("__::module`name`hash") can
+            // stop matching after its subtree was cloned or re-typed: the genericFunction
+            // short-circuit does not survive ExprCall::clone, and lookup by the locked
+            // name sees only the flavor-frozen instances - the generic itself is
+            // unreachable under that name. fall back to the origin generic so the next
+            // pass re-resolves with first-resolution semantics, reusing a sibling or
+            // minting the right flavor
+            if (generics.empty() && functions.size() != 1) {
+                if (auto origin = lockedNameGenericOrigin(expr->name, functions)) {
+                    expr->name = origin->module->name.empty() ? origin->name
+                               : (origin->module->name + "::" + origin->name);
+                    reportAstChanged();
+                    if (func) func->notInferred();
+                    return nullptr;
+                }
+            }
         } else {
             functions.push_back(lookupFunction);
         }
@@ -1523,6 +1572,10 @@ namespace das {
                 auto oneGeneric = generics.back();
                 auto genName = getGenericInstanceName(oneGeneric);
                 auto instancedFunctions = findMatchingFunctions(program->thisModule->name, thisModule, genName, types, true); // "__::genName"
+                // pointer/iterator element variance lets one call match several flavor
+                // siblings (a const-element instance accepts a mut-element call).
+                // substitute distance separates them - the exact-flavor sibling wins
+                applyLSP(types, instancedFunctions);
                 if (instancedFunctions.size() > 1) {
                     TextWriter ss;
                     for (auto &instFn : instancedFunctions) {
