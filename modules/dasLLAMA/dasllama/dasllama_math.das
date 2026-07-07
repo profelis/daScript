@@ -509,6 +509,35 @@ def gemm_f32(var cp : float?; ap, bp : float const?; M, K, N : int64) {
     }
 }
 
+//! gemm_f32 with the tile walk COLUMN-BLOCKS OUTER (jj outer, ii inner): the K×16 B strip stays
+//! L1-hot across all row blocks, so a big-M call streams B from L2/fabric once instead of M/4
+//! times. Same tiles, same per-element kk-order fma chains — numerically identical to gemm_f32;
+//! only the tile visit order differs. The win is multi-thread on big-B shapes: parakeet's
+//! attention chunks (M ≈ tt/lanes rows, B = Kᵀ/pos/V at 1.3-2.5 MB) stop multiplying their B
+//! traffic, which is what saturates the fabric when 8 lanes stream concurrently (gb1 attn
+//! blocks −20%, clean-window). Callers whose B is L1-small or reused back-to-back keep
+//! gemm_f32 — its streaming-B walk prefetches better single-thread.
+[hint(noalias = cp, noalias = ap, noalias = bp)]
+def gemm_f32_jo(var cp : float?; ap, bp : float const?; M, K, N : int64) {
+    let m4 = M - M % 4l
+    let n16 = N - N % 16l
+    var jj = 0l
+    while (jj < n16) {
+        var ii = 0l
+        while (ii < m4) {
+            gemm_f32_uk_4x16(cp, ap, bp, ii, jj, K, N)
+            ii += 4l
+        }
+        jj += 16l
+    }
+    if (n16 < N) {                                   // right strip: rows [0,m4) × cols [n16,N)
+        gemm_f32_region(cp, ap, bp, 0l, m4, n16, N, K, N)
+    }
+    if (m4 < M) {                                    // bottom strip: rows [m4,M) × all cols
+        gemm_f32_region(cp, ap, bp, m4, M, 0l, N, K, N)
+    }
+}
+
 //! Q8_0 dequant-in-dot: weights are int8 quants `wq` + one fp32 scale `ws` per 32-block,
 //! activations `x` stay fp32. A float4 accumulator is carried across the blocks (scale
 //! applied per block as a broadcast fma), with a single horizontal reduce at the end —

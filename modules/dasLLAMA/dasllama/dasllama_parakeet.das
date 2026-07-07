@@ -1088,6 +1088,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                 let bvp = reinterpret<float const?>(addr(m.blob[lo.bias_v + hi * dh]))
                 // transposed head views ((Q+u), (Q+v), Kᵀ, V_h, pos_hᵀ) — the row GEMMs read
                 // these in full, so they build before the compute dispatch
+                var th = ref_time_ticks()
                 maybe_parallel_for(0, int(tt), lanes_for_work(tt * dh * 4l, 0)) $(rb, re) {
                     unsafe {
                         for (t in range64(int64(rb), int64(re))) {
@@ -1101,6 +1102,8 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                         }
                     }
                 }
+                asr_prof_add("pk.attn_heads.pack", th)
+                th = ref_time_ticks()
                 maybe_parallel_for(0, int(ww), lanes_for_work(ww * dh, 0)) $(rb, re) {
                     unsafe {
                         for (w in range64(int64(rb), int64(re))) {
@@ -1110,6 +1113,8 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                         }
                     }
                 }
+                asr_prof_add("pk.attn_heads.pos", th)
+                th = ref_time_ticks()
                 // content scores (Q+u)·Kᵀ + rel scores (Q+v)·pos_hᵀ (gathered at (T−1)−q+k) +
                 // softmax + P·V_h, threaded over query rows in 4-ROW BLOCKS: gemm_f32's 4×16
                 // tile / scalar-remainder split is row-position-dependent, so 4-aligned chunk
@@ -1127,8 +1132,8 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                         for (i in range64(r0 * ww, r1 * ww)) {
                             rlp[i] = 0.0
                         }
-                        gemm_f32(scp + r0 * tt, qup + r0 * dh, ktp, nr, dh, tt)
-                        gemm_f32(rlp + r0 * ww, qvp + r0 * dh, pop, nr, dh, ww)
+                        gemm_f32_jo(scp + r0 * tt, qup + r0 * dh, ktp, nr, dh, tt)
+                        gemm_f32_jo(rlp + r0 * ww, qvp + r0 * dh, pop, nr, dh, ww)
                         for (q in range64(r0, r1)) {
                             let base = tt - 1l - q
                             for (k in range64(tt)) {
@@ -1143,7 +1148,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                         for (i in range64(r0 * dh, r1 * dh)) {
                             ohp[i] = 0.0
                         }
-                        gemm_f32(ohp + r0 * dh, scp + r0 * tt, vhp, nr, tt, dh)
+                        gemm_f32_jo(ohp + r0 * dh, scp + r0 * tt, vhp, nr, tt, dh)
                         for (t in range64(r0, r1)) {
                             for (j in range64(dh)) {
                                 aop[t * d + hoff + j] = ohp[t * dh + j]
@@ -1151,6 +1156,7 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                         }
                     }
                 }
+                asr_prof_add("pk.attn_heads.blocks", th)
             }
         }
         asr_prof_add("pk.attn_heads", tp)
