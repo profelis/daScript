@@ -57,7 +57,7 @@ def pick_quant(s : string) : QuantMode {
     return QuantMode.q8
 }
 
-[export, tune_policy(missing = "error")]
+[export, tune_policy(missing = "auto")]
 def main {
     var r <- parse_args(type<AskArgs>)
     if (r |> is_err) {
@@ -70,6 +70,8 @@ def main {
         print_help(get_command_info(type<AskArgs>), "ask")
         return
     }
+
+    log_tune_status("ask")
 
     let max_new = cfg.max_tokens > 0 ? int64(cfg.max_tokens) : 256l
 
@@ -86,6 +88,9 @@ def main {
             fflush(fstdout())
             return true
         }
+        // throughput: prompt/gen token counts, time-to-first-token, prefill and decode t/s
+        let st = stats(s)
+        print("\n[prompt {st.n_prompt} tok | gen {st.n_gen} tok | ttft {int(st.ttft_s * 1000.0lf)}ms | ")
+        print("prefill {int(st.prefill_tps)} t/s | gen {int(st.gen_tps)} t/s]\n")
     }
-    print("\n")
 }

@@ -1,21 +1,20 @@
 options gen2
 options stack = 262144
 
-// wav2txt — transcribe an audio file to text with a dasLLAMA ASR model. A third sibling of
-// dasllama-server, and the simplest kind of tune consumer: it requires dasLLAMA and so inherits
-// the shared [tune_scope] with NO tune declaration AND no [tune_policy] — it silently runs this
-// box's tuned kernels when a manifest exists (server/ask having produced it) and the generic
-// per-ISA fallback otherwise. Nothing to configure; tuning is entirely the server's/ask's story.
+// wav2txt — transcribe an audio file to text with a dasLLAMA ASR model. A sibling of
+// dasllama-server: it requires dasLLAMA and so inherits the shared [tune_scope], reading the
+// same <das_root>/dasllama.tune.json. Its policy is "auto" like the server — the first use on
+// an untuned box tunes and relaunches, then transcribes. --tune forces a re-tune;
+// DAS_TUNE_POLICY=error skips per-start tuning while developing.
 //
 //   bin/daslang -jit utils/dasllama-server/wav2txt.das -- --asr <asr.gguf> --file <audio.wav> [--out t.txt]
 
-require dasllama/dasllama       // load_asr_model / transcribe / the shared [tune_scope]
+require dasllama/dasllama            // load_asr_model / transcribe / the shared [tune_scope]
+require dasllama/dasllama_audio_io   // load_audio_16k_mono: file -> 16 kHz mono f32
+require llvm/daslib/llvm_tune        // [tune_policy] + log_tune_status
 require daslib/jobque_boost
 require daslib/clargs
 require daslib/fio
-require strings
-require math
-require audio                   // miniaudio: decode any audio file -> 16 kHz mono f32
 
 [CommandLineArgs]
 struct Wav2TxtArgs {
@@ -40,43 +39,16 @@ struct Wav2TxtArgs {
     @clarg_doc = "mmproj for a GGUF ASR model (paired with --asr)"
     mmproj : string
 
+    @clarg_doc = "Re-tune this box's dasLLAMA kernels, then relaunch"
+    tune : bool
+
     @clarg_short = "?"
     @clarg_name = "show-help"
     @clarg_doc = "Show this help and exit"
     help : bool
 }
 
-// Decode any format miniaudio handles to 16 kHz mono f32 PCM — the ASR facade takes samples,
-// not a path (the same decode rail the server and the dasLLAMA examples use).
-def load_audio_16k_mono(path : string) : array<float> {
-    var samples : array<float>
-    var decoder = new ma_decoder
-    var config <- ma_decoder_config_init(ma_format.ma_format_f32, 1u, 16000u)
-    if (ma_decoder_init_file(path, unsafe(addr(config)), decoder) != ma_result.MA_SUCCESS) {
-        unsafe {
-            delete decoder
-        }
-        return <- samples
-    }
-    let chunk = 16000
-    var total = 0
-    while (true) {
-        samples |> resize(total + chunk)
-        let got = int(ma_decoder_read_pcm_frames(decoder, unsafe(addr(samples[total])), uint64(chunk)))
-        total += got
-        if (got < chunk) {
-            break
-        }
-    }
-    samples |> resize(total)
-    ma_decoder_uninit(decoder)
-    unsafe {
-        delete decoder
-    }
-    return <- samples
-}
-
-[export]
+[export, tune_policy(missing = "auto")]
 def main {
     var r <- parse_args(type<Wav2TxtArgs>)
     if (r |> is_err) {
@@ -90,21 +62,28 @@ def main {
         return
     }
 
+    log_tune_status("wav2txt")
+
+    let t_decode = ref_time_ticks()
     let samples <- load_audio_16k_mono(cfg.file)
     if (empty(samples)) {
         to_log(LOG_ERROR, "wav2txt: could not decode audio: {cfg.file}\n")
         return
     }
+    let decode_s = double(get_time_usec(t_decode)) / 1.0e6lf
+    let audio_s = double(length(samples)) / 16000.0lf   // 16 kHz mono
 
     var m <- empty(cfg.mmproj) ? load_asr_model(cfg.asr) : load_asr_model(cfg.asr, cfg.mmproj)
     let lang = empty(cfg.lang) ? "en" : cfg.lang
 
     var text = ""
+    let t_tr = ref_time_ticks()
     with_job_que() {
         setup_dasllama_jobque()
         var s = create_session(m, lang)
         text = transcribe(m, s, samples)
     }
+    let transcribe_s = double(get_time_usec(t_tr)) / 1.0e6lf
 
     if (empty(cfg.out)) {
         print("{text}\n")
@@ -113,4 +92,8 @@ def main {
     } else {
         to_log(LOG_ERROR, "wav2txt: could not write {cfg.out}\n")
     }
+
+    // rtf = transcription wall-clock / audio duration; < 1.0 is faster than real time
+    let rtf = audio_s > 0.0lf ? transcribe_s / audio_s : 0.0lf
+    to_log(LOG_INFO, "wav2txt: {audio_s} s audio | decode {decode_s} s | transcribe {transcribe_s} s | rtf {rtf}\n")
 }

@@ -148,6 +148,30 @@ def tune_status() : array<TuneStatus> {
     return clone_to_move(g_tune_status)
 }
 
+//! Log the tune status table at `LOG_INFO` — the shared "am I tuned?" surface for any app.
+//! `appName` prefixes the lines. No-op when the table is empty (no `[tune_policy]`, or a
+//! standalone build). Prints `<n>/<total> kernels tuned for this box`, one line per function,
+//! and a `--tune` hint when any kernel is on a fallback/reference tier.
+def log_tune_status(appName : string) {
+    var st <- tune_status()
+    if (empty(st)) {
+        delete st
+        return
+    }
+    var tuned = 0
+    for (s in st) {
+        tuned += s.source == "manifest" ? 1 : 0
+    }
+    to_log(LOG_INFO, "{appName}: tune status ({tuned}/{length(st)} kernels tuned for this box):\n")
+    for (s in st) {
+        to_log(LOG_INFO, "  {s.fname}: {empty(s.suffix) ? "reference" : s.suffix} ({s.source})\n")
+    }
+    if (tuned < length(st)) {
+        to_log(LOG_INFO, "{appName}: run with --tune to tune the remaining kernels for this box\n")
+    }
+    delete st
+}
+
 // ===== [tune_scope] data — library-owned per-box scope =====
 
 // one registered scope: a per-box manifest at <das_root>/<name>.tune.json plus the harness

@@ -65,29 +65,6 @@ def pick_quant(s : string) : QuantMode {
     return QuantMode.q8
 }
 
-// Log this box's tune state — which perm each gen kernel is running and where it came from
-// (manifest = tuned for this box, fallback = the generic per-ISA default, reference = untuned
-// body). Empty on a build with no [tune_scope] in the require chain (dasLLVM not mounted).
-def log_tune_status() {
-    var st <- tune_status()
-    if (empty(st)) {
-        delete st
-        return
-    }
-    var tuned = 0
-    for (s in st) {
-        tuned += s.source == "manifest" ? 1 : 0
-    }
-    to_log(LOG_INFO, "dasllama-server: tune status ({tuned}/{length(st)} kernels tuned for this box):\n")
-    for (s in st) {
-        to_log(LOG_INFO, "  {s.fname}: {empty(s.suffix) ? "reference" : s.suffix} ({s.source})\n")
-    }
-    if (tuned < length(st)) {
-        to_log(LOG_INFO, "dasllama-server: run with --tune to tune the remaining kernels for this box\n")
-    }
-    delete st
-}
-
 // missing = "auto": on the first start of an untuned box the injected guard runs the dasLLAMA
 // tuner and relaunches; thereafter it serves directly. DAS_TUNE_POLICY=error (or =fallback)
 // overrides while developing — no per-start tuning. --tune forces a re-tune + relaunch.
@@ -108,7 +85,7 @@ def main {
     let port = cfg.port > 0 ? cfg.port : 8080     // non-positive (incl. a stray negative) -> default
     let ctx = cfg.ctx > 0 ? int64(cfg.ctx) : 4096l   // guard: a negative ctx would make seq_len < 0
 
-    log_tune_status()
+    log_tune_status("dasllama-server")
     print("loading {cfg.model} ...\n")
     var m <- load_model(cfg.model, pick_quant(cfg.quant))
     m.config.seq_len = min(m.config.seq_len, ctx)
