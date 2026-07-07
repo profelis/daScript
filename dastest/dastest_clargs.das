@@ -89,6 +89,18 @@ struct DastestArgs {
     @clarg_doc = "Set cop.keep_alive so _KeepAlive SimNode variants get dispatched"
     keep_alive : bool = false
 
+    @clarg_doc = "Compile every test with the CSE (common-subexpression-elimination) pass disabled (cop.disable_cse)"
+    disable_cse : bool = false
+
+    @clarg_doc = "Compile every test with the DSE (dead-store-elimination) pass disabled (cop.disable_dse)"
+    disable_dse : bool = false
+
+    @clarg_doc = "Compile every test with the [inline] function inliner disabled (cop.disable_inline)"
+    disable_inline : bool = false
+
+    @clarg_doc = "Compile every test with automatic block-inlining + invoke-of-literal devirt disabled (cop.disable_auto_inline)"
+    disable_auto_inline : bool = false
+
     @clarg_doc = "On a test panic, walk the call stack at throw time (real frames + line info, args via context settings) instead of the post-unwind walk that reports sp=0 with no frames. Sets the test context's alwaysStackWalkOnException. Off by default: a test that swallows a panic via try/recover would also emit a walk — enable for debugging a failing/crashing test"
     stack_on_exception : bool = false
 
