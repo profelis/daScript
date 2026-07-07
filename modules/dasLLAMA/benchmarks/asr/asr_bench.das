@@ -101,6 +101,9 @@ def main() : int {
     print("LOAD\t{model_name}\t{load_ms}\n")
 
     with_job_que() {
+        // pooled forks + team dispatch + spin window — without it every kernel dispatch pays
+        // the ~10us/job fifo fork/join (2-7x on the jfk encoder stages)
+        setup_dasllama_jobque()
         for (path in cfg.wav) {
             var samples <- load_audio_16k_mono(path)
             let audio_s = double(length(samples)) / double(AUDIO_SAMPLE_RATE)

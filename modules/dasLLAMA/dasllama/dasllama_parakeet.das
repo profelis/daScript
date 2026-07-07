@@ -1023,27 +1023,49 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
 
         // FFN1 (macaron half)
         tp = ref_time_ticks()
+        var tf = tp
         layernorm_batch(st.xb, st.x, m.blob, lo.nf1_w, lo.nf1_b, d, tt, m.eps)
+        asr_prof_add("pk.ffn.ln", tf)
+        tf = ref_time_ticks()
         pk_mm_rq(m, st.h, lo.ff1a_w, st.xb, st.xqi, st.xsi, d, 4l * d, tt)
+        asr_prof_add("pk.ffn.a", tf)
+        tf = ref_time_ticks()
         silu4(st.h, tt * 4l * d)
+        asr_prof_add("pk.ffn.silu", tf)
+        tf = ref_time_ticks()
         pk_mm_rq(m, st.xb, lo.ff1b_w, st.h, st.xqi, st.xsi, 4l * d, d, tt)
+        asr_prof_add("pk.ffn.b", tf)
+        tf = ref_time_ticks()
         for (i in range64(tt * d)) {
             st.x[i] += 0.5 * st.xb[i]
         }
+        asr_prof_add("pk.ffn.res", tf)
         pk_scan("L{l}.ffn1", st.x, tt * d)
         asr_prof_add("pk.ffn", tp)
 
         // rel-pos attention
         tp = ref_time_ticks()
+        var tq = tp
         layernorm_batch(st.xb, st.x, m.blob, lo.nat_w, lo.nat_b, d, tt, m.eps)
+        asr_prof_add("pk.attn_proj.ln", tq)
+        tq = ref_time_ticks()
         if (m.q8) {   // q/k/v share the post-LN activation: one requant, three GEMMs
             pk_requant(st.xb, d, tt, st.xqi, st.xsi)
         }
+        asr_prof_add("pk.attn_proj.rq", tq)
+        tq = ref_time_ticks()
         pk_mm(m, st.qq, lo.q_w, st.xb, st.xqi, st.xsi, d, d, tt)
+        asr_prof_add("pk.attn_proj.q", tq)
+        tq = ref_time_ticks()
         pk_mm(m, st.kk, lo.k_w, st.xb, st.xqi, st.xsi, d, d, tt)
+        asr_prof_add("pk.attn_proj.k", tq)
+        tq = ref_time_ticks()
         pk_mm(m, st.vv, lo.v_w, st.xb, st.xqi, st.xsi, d, d, tt)
+        asr_prof_add("pk.attn_proj.v", tq)
+        tq = ref_time_ticks()
         // pos projection for this layer: [W × d], against the hoisted layer-invariant image
         pk_mm(m, st.posl, lo.pos_w, st.pos_emb, st.posq, st.poss, d, d, ww)
+        asr_prof_add("pk.attn_proj.pos", tq)
         asr_prof_add("pk.attn_proj", tp)
         tp = ref_time_ticks()
         for (hi in range64(n_head)) {

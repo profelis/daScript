@@ -3,6 +3,7 @@ options stack = 65536
 
 require dasllama/dasllama_asr
 require dasllama/dasllama_audio
+require dasllama/dasllama_math
 require audio
 require math   // the parakeet mel worker resolves log at the instantiation site
 require daslib/clargs
@@ -94,6 +95,8 @@ def main() : int {
     let samples <- load_audio_16k_mono(cfg.wav)
     let reps = cfg.reps > 0 ? cfg.reps : 1
     with_job_que() {
+        setup_dasllama_jobque_()   // the engine dispatch standard — bare with_job_que profiles the
+                                   // ~10us/job fifo fork/join instead of the shipped team dispatch
         run_once(m, samples)               // warmup, unprofiled
         set_asr_prof(true)
         for (_rep in range(reps)) {

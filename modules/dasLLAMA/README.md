@@ -199,6 +199,13 @@ that runs per unit of work rather than per load):
    the `[tune]`-marked scalar template AND a hand-float4 version, bench them head-to-head
    standalone (the tune rig / a dedicated microbench, NOT end-to-end transcribe) — commit
    the winner. "To know for sure."
+5. **Every `with_job_que()` that runs engine kernels calls `setup_dasllama_jobque()` first**
+   (engine spelling `setup_dasllama_jobque_`). Bare `with_job_que` leaves the queue on the
+   ~10us/job fifo fork/join — measured 2-7x on the parakeet jfk encoder stages, 2.2x
+   end-to-end — and any benchmark taken that way is measuring the wrong dispatch mode.
+   Same trap for isolated Q8 GEMM benches: a model load selects the repack backend tier
+   (`select_matmul_backend_for_load`), so a bench that skips the load step times the slower
+   hand backend unless it selects the tier itself (3x on M1: arm64-gen 900 vs sdot 300 GMAC/s).
 
 ## Known **not** yet supported
 
