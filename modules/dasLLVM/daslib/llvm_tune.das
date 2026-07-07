@@ -878,18 +878,29 @@ def private run_scope_tuner(scope : TuneScope) : bool {
 var private g_tuned_scopes = 0
 var private g_reexec_code = 0
 
+// "tuned" for the runtime guards means the SAME thing the compile-time [tune] gate means: a
+// manifest that exists AND parses (read_manifest's `found`). A stray empty / half-written /
+// corrupt file must NOT read as tuned — otherwise the guard no-ops while the compile fell back
+// to fallback stamps, and the app can never self-heal.
+def private manifest_present(path : string) : bool {
+    var found = false
+    var m <- read_manifest(path, found)
+    delete m
+    return found
+}
+
 //! Runtime half of `[tune_policy(missing = "auto")]` / `--tune` — injected at the top of the
 //! app's `main`, one call per scope, followed by `tune_auto_reexec()`. Runs the scope's tuner
 //! when the manifest is missing (unconditionally under `--tune`); tuning happens at RUNTIME
 //! because the winners are compile-time stamps — this process compiled without them, and the
 //! re-exec that follows picks them up in a fresh compile.
 def tune_auto_prepare(scopeName : string; manifestPath : string; tunerPath : string; force : bool) {
-    if (!force && fexist(manifestPath)) {
+    if (!force && manifest_present(manifestPath)) {
         return
     }
     print("llvm_tune: scope '{scopeName}' {force ? "re-tuning (--tune)" : "is untuned on this box — tuning now"}\n")
     run_scope_tuner(TuneScope(scopeName = scopeName, manifestPath = manifestPath, tunerPath = tunerPath))
-    if (fexist(manifestPath)) {
+    if (manifest_present(manifestPath)) {
         g_tuned_scopes++
     } else {
         print("llvm_tune: tuner produced no manifest at {manifestPath}\n")
@@ -941,7 +952,7 @@ def tune_reexec_code() : int {
 //! compile-time stamps — this process compiled without them). False = manifest present,
 //! carry on.
 def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : string) : bool {
-    if (fexist(manifestPath)) {
+    if (manifest_present(manifestPath)) {
         return false
     }
     print("llvm_tune: scope '{scopeName}' is untuned on this box\n")
@@ -950,7 +961,7 @@ def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : s
         return true
     }
     run_scope_tuner(TuneScope(scopeName = scopeName, manifestPath = manifestPath, tunerPath = tunerPath))
-    if (fexist(manifestPath)) {
+    if (manifest_present(manifestPath)) {
         print("llvm_tune: scope '{scopeName}' tuned -> {manifestPath}\nllvm_tune: restart to apply the winners\n")
     } else {
         print("llvm_tune: tuner produced no manifest at {manifestPath}\n")
