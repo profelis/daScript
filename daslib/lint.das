@@ -360,7 +360,10 @@ class LintVisitor : AstVisitor {
             op == "&"  || op == "|"  || op == "^" ||
             op == "-=" || op == "/=" || op == "%="
         )
-        if (op_same_suspicious && expr_equal(expr.left, expr.right, false)) {
+        // identical constants are macro-splice residue (`$v(n) > 1` with n == 1),
+        // const-fold food rather than a copy-paste typo
+        if (op_same_suspicious && expr_equal(expr.left, expr.right, false)
+                && !(expr.left.__rtti |> starts_with("ExprConst"))) {
             lint_error("LINT007: left and right operands of '{op}' are the same", expr.at)
         }
     }

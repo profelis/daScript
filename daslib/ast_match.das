@@ -490,7 +490,9 @@ def private qm_guard(at : LineInfo; var cond : Expression?&; var fail_call : Exp
     var fail_ret = new ExprReturn(at = at, subexpr = fail_call)
     var fail_blk = new ExprBlock(at = at)
     fail_blk.list |> emplace(fail_ret)
-    return new ExprIfThenElse(at = at, cond = cond, if_true = fail_blk)
+    var g = new ExprIfThenElse(at = at, cond = cond, if_true = fail_blk)
+    g.genFlags.generated = true     // guard ladders are macro output; style lint skips them
+    return g
 }
 
 [macro_function]
@@ -1217,7 +1219,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
         body |> push <| qmacro_expr(${ var $i(cast_var) = $e(as_cast_ac); })
         // Match generatorSyntax (both true and false enforced)
         if (pat_gen) {
-            var cg = qmacro($i(cast_var).generatorSyntax == false)
+            var cg = qmacro(!$i(cast_var).generatorSyntax)
             var fg = qmacro(qm_fail_field($i(actual_var)))
             body |> push <| qm_guard(at, cg, fg)
         } else {
@@ -1227,7 +1229,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
         }
         // Match tableSyntax (both true and false enforced)
         if (pat_tbl) {
-            var ct = qmacro($i(cast_var).tableSyntax == false)
+            var ct = qmacro(!$i(cast_var).tableSyntax)
             var ft = qmacro(qm_fail_field($i(actual_var)))
             body |> push <| qm_guard(at, ct, ft)
         } else {
