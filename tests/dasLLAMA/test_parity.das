@@ -429,6 +429,25 @@ def test_parity_gemma4_12b(t : T?) {
     }
 }
 
+// gemma-4-31B-it Q8 — the SAME heterogeneous gemma4 arch as the 12B, scaled up (60 layers,
+// embd 5376, 32Q/[16x5,4]KV heads; PLE off, shared_kv 0, softcap 30, 5-local:1-global SWA).
+// A verify-only slice: it runs the existing gemma4 forward with no code change, and continues
+// the 1..320 counting prompt byte-identically to the 12B (same vocab, both count) — so it reuses
+// GEMMA4_12B_GEN. Verified 40/40 vs simple_ids (harness/parity.sh) 2026-07-07. Large-tier
+// (32 GB): the fast loop skips it; DASLLAMA_PARITY_FULL=1 runs it.
+[test]
+def test_parity_gemma4_31b(t : T?) {
+    t |> run("gemma4 forward (gemma-4-31B-it Q8, same arch as 12B scaled: 60L/5376d)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-31B-it-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-31b token-for-token")
+    }
+}
+
 // gpt-oss-20b (arch "gpt-oss", native-MXFP4 expert planes — attn/cls Q8) — the wave-5 stack: per-head
 // attention sinks, YaRN rope (factor 32 / 4096), alternating 128-token SWA, softmax-after-top-k
 // routing with router + per-expert + QKV + output-projection biases, clamped SwiGLU. Counting
