@@ -421,6 +421,7 @@ def private transcribe_qwen3omni(m : AsrModel; var s : AsrSession; samples : arr
 
     let n_head = int64(length(head))
     let npos = n_head + n_audio + int64(length(tail))
+    asr_ctx_guard(n_audio, npos, m.dec.config.seq_len)
     var embd : array<float>
     embd |> resize(int(npos * dim))
     embed_text_rows(m.dec, head, embd, 0l)
@@ -465,6 +466,14 @@ def private transcribe_qwen3omni(m : AsrModel; var s : AsrSession; samples : arr
     return 1
 }
 
+// The decoder's KV cache is sized at seq_len; if prompt + audio soft tokens reach it, eval_embd_
+// would write past the cache and panic opaquely. Fail fast with a clear "clip too long" message.
+def private asr_ctx_guard(n_audio, npos, seq_len : int64) {
+    if (npos >= seq_len) {
+        panic("dasLLAMA asr: {n_audio} audio + prompt tokens = {npos} positions exceed the decoder's {seq_len}-token context — clip too long for a single window")
+    }
+}
+
 // Canary-Qwen transcription: FastConformer-32 encode + projector, the SALM/Qwen prompt with the
 // audio soft tokens spliced at the placeholder, greedy decode over the Qwen3-1.7B decoder until
 // the text EOS (151645, which is included in the emitted ids — the NeMo generate convention).
@@ -491,6 +500,7 @@ def private transcribe_canary(m : AsrModel; var s : AsrSession; samples : array<
 
     let n_head = int64(length(head))
     let npos = n_head + n_audio + int64(length(tail))
+    asr_ctx_guard(n_audio, npos, m.dec.config.seq_len)
     var embd : array<float>
     embd |> resize(int(npos * dim))
     embed_text_rows(m.dec, head, embd, 0l)
@@ -576,6 +586,7 @@ def private transcribe_gemma4a(m : AsrModel; var s : AsrSession; samples : array
 
     let n_head = int64(length(head))
     let npos = n_head + n_audio + int64(length(tail))
+    asr_ctx_guard(n_audio, npos, m.dec.config.seq_len)
     var embd : array<float>
     embd |> resize(int(npos * dim))
     embed_text_rows(m.dec, head, embd, 0l)
