@@ -33,7 +33,7 @@ Run
 Run under ``-jit`` --- interpreted inference is far too slow for model work::
 
    bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> \
-       [--port 8080] [--quant q8] [--asr <asr.bin>] [--mmproj <mmproj.gguf>] [--ctx 4096]
+       [--port 8080] [--quant q8] [--asr <asr.bin>] [--mmproj <mmproj.gguf>] [--ctx 4096] [--tune]
 
 .. list-table::
    :header-rows: 1
@@ -67,6 +67,10 @@ Run under ``-jit`` --- interpreted inference is far too slow for model work::
      -
      - ``4096``
      - Context-length cap in tokens
+   * - ``--tune``
+     -
+     - ---
+     - Re-tune this box's dasLLAMA kernels, then relaunch (see *Per-box tuning*)
    * - ``--help``
      - ``-?``
      - ---
@@ -75,6 +79,27 @@ Run under ``-jit`` --- interpreted inference is far too slow for model work::
 The server is single-context and serializes requests on the tick thread (one
 in-flight request), matching dasLLAMA's one-generation-loop. OpenAI is
 stateless --- the client resends the full transcript each turn.
+
+Per-box tuning
+==============
+
+The server declares ``[tune_policy(missing = "auto")]``, so the **first start
+on an untuned box** runs the dasLLAMA kernel tuner (``gen_tune_probe``), writes
+the per-box manifest, and relaunches itself with the winners; thereafter it
+serves directly and logs the tune status at startup. ``--tune`` forces a
+re-tune. ``DAS_TUNE_POLICY=error`` skips per-start tuning while developing (it
+prints the tuner command instead of running it).
+
+The winners live at ``<das_root>/dasllama.tune.json`` and are shared by every
+dasLLAMA application on the box — no per-app scope declaration, since requiring
+dasLLAMA pulls in its ``[tune_scope]``. Two sibling CLI tools ship alongside
+the server, each with the same ``[tune_policy(missing = "auto")]`` and reading
+the same manifest: ``ask`` (a one-shot ``--prompt`` → completion, reporting
+ttft and prefill/decode t/s) and ``wav2txt`` (an ``--file`` audio → transcript,
+reporting decode/transcribe time and the real-time factor). Whichever of the
+three you run first tunes the box; the rest are then instant. See :ref:`tune`
+for the framework, and ``modules/dasLLAMA/tune_for_this_box.md`` for the
+measurement discipline.
 
 
 Endpoints

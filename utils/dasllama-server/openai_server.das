@@ -3,7 +3,7 @@ options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact); infere
 
 module openai_server
 
-require dasllama/dasllama       // the public facade — the ONLY dasLLAMA surface this tool touches
+require dasllama/dasllama       // the public facade — the main dasLLAMA surface this tool touches
 require dashv/dashv_boost public
 require daslib/json_boost
 require daslib/defer            // defer() { delete js } — free the parsed request JSON on every exit path
@@ -12,7 +12,7 @@ require daslib/strings_boost    // join()
 require daslib/fio              // sleep(), path_join, base_name, remove, get_env_variable
 require strings
 require math
-require audio                   // miniaudio decoder: any uploaded audio format -> 16 kHz mono f32
+require dasllama/dasllama_audio_io   // load_audio_16k_mono: any uploaded audio format -> 16 kHz mono f32
 
 // An OpenAI-compatible HTTP server over the dasLLAMA facade. It reaches only public facade verbs —
 // no engine internals — which is the acceptance test for the API: if a full OpenAI surface builds
@@ -245,37 +245,6 @@ def private tmpdir() : string {
     var err = ""
     let d = temp_directory(err)   // fio: platform temp dir (Windows GetTempPath, POSIX $TMPDIR/tmp)
     return empty(d) ? "/tmp" : d
-}
-
-// Decode an uploaded audio file (any format miniaudio handles) to 16 kHz mono f32 PCM — the ASR
-// input. Empty on failure. (dasLLAMA's ASR facade takes samples, not a path — this is the decode rail
-// its examples roll by hand; the server owns it so the facade stays audio-IO-free.)
-def private load_audio_16k_mono(path : string) : array<float> {
-    var samples : array<float>
-    var decoder = new ma_decoder
-    var config <- ma_decoder_config_init(ma_format.ma_format_f32, 1u, 16000u)
-    if (ma_decoder_init_file(path, unsafe(addr(config)), decoder) != ma_result.MA_SUCCESS) {
-        unsafe {
-            delete decoder
-        }
-        return <- samples
-    }
-    let chunk = 16000
-    var total = 0
-    while (true) {
-        samples |> resize(total + chunk)   // grow by a chunk, read straight into the tail
-        let got = int(ma_decoder_read_pcm_frames(decoder, unsafe(addr(samples[total])), uint64(chunk)))
-        total += got
-        if (got < chunk) {
-            break
-        }
-    }
-    samples |> resize(total)
-    ma_decoder_uninit(decoder)
-    unsafe {
-        delete decoder
-    }
-    return <- samples
 }
 
 // ===== Handlers =====
