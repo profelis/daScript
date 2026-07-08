@@ -3120,7 +3120,8 @@ def private ffn_gemma4_decode(t : Model; var s : Session; l : int64) {
     prof_add("act_resid", ts_resid)
 }
 
-// gemma4 FFN prefill: dense delegates; MoE runs the per-token core over each position's residual row.
+// gemma4 FFN prefill: dense delegates; MoE takes the grouped expert-bucketed path (Q8, default) or the
+// per-position reference loop (fp32 loads and the bit-identical A/B switch).
 def private ffn_gemma4_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     if (c.n_expert <= 0l) {
@@ -3128,11 +3129,15 @@ def private ffn_gemma4_prefill(t : Model; var s : Session; l : int64; npos : int
         return
     }
     let dim = c.dim
-    for (p in range64(npos)) {
-        copy_floats(s.x_b, p * dim, s.moe_ao, 0l, dim)
-        gemma4_moe_ffn(t, s, l)
-        for (i in range64(dim)) {
-            s.x_b[p * dim + i] += s.moe_acc[i]
+    if (t.quant == QuantMode.q8 && g_moe_grouped_prefill) {
+        gemma4_moe_prefill_grouped(t, s, l, npos)
+    } else {
+        for (p in range64(npos)) {
+            copy_floats(s.x_b, p * dim, s.moe_ao, 0l, dim)
+            gemma4_moe_ffn(t, s, l)
+            for (i in range64(dim)) {
+                s.x_b[p * dim + i] += s.moe_acc[i]
+            }
         }
     }
     if (c.layer_out_scale) {
@@ -4314,6 +4319,182 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     if (c.pre_post_norm) {
         rms_batch(s.xb2_b, s.xb2_b, t, t.rms_post_ffn_off + l * dim, dim, npos)
     }
+    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
+    prof_add("act_resid", ts_resid)
+}
+
+// gemma4 MoE router input, batched: the twin of gemma4_router_tmp over npos positions. Per position
+// rin[p] = RMS(src[p]) × 1/√dim × ffn_gate_inp_s, the sum-of-squares DOUBLE-accumulated to match
+// ggml_float — the discrete top-8 select is near-tie-brittle, so a float SoS drift flips experts. One
+// row per position, independent, so it threads; bit-identical per row to the decode single-token path.
+def private gemma4_router_batch(t : Model; var rin : array<float>; src : array<float>; l, dim, npos : int64) {
+    let eps = t.config.norm_eps
+    let inv_d = 1.0 / sqrt(float(dim))
+    unsafe {
+        var op = addr(rin[0])
+        let ip = reinterpret<float const?>(addr(src[0]))
+        let scp = reinterpret<float const?>(addr(t.fblob[t.moe_router_scale_off + l * dim]))
+        maybe_parallel_for(dim * npos >= g_norm_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let off = int64(p) * dim
+                    var ss = 0.0lf
+                    for (i in range64(dim)) {
+                        let v = ip[off + i]
+                        ss += double(v * v)
+                    }
+                    let scale = 1.0 / sqrt(float(ss / double(dim)) + eps)
+                    for (i in range64(dim)) {
+                        op[off + i] = ip[off + i] * scale * inv_d * scp[i]
+                    }
+                }
+            }
+        }
+    }
+}
+
+// gemma4 MoE prefill, grouped: the batched twin of gemma4_moe_ffn (26B-A4B). Routes every position
+// through the custom double-RMS router, buckets the (position, slot) pairs by expert, runs ONE Q8
+// batch GEMM chain per touched expert (moe_gather_rows + the CSR trick, same as ffn_moe_prefill_grouped),
+// then the DENSE parallel shared expert batched over all positions — the two branches summed under the
+// shared post_ffw_norm. Bit-identical per row to the naive per-position path: same per-row quants/dots,
+// slot-order reduce, the router SoS in double. So the g_moe_grouped_prefill toggle is a pure perf lever.
+// Buffer reuse (all pre-sized by forward_prefill_alloc): xb2_b holds the router input, then the routed
+// reduce (the router input is dead by then); xb_b holds pre_ffw_norm_2 (quantized away), then rms_ffn
+// for the dense expert; moe_gout is the per-expert down scratch, then the dense down output.
+def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let hidden = c.hidden_dim
+    let nb = dim / 32l
+    let ne = c.n_expert
+    let k = c.n_expert_used
+    let nfe = c.n_ff_exp
+    let nk = npos * k
+    s.moe_rlog |> resize(npos * ne)
+    s.moe_idx_b |> resize(nk)
+    s.moe_w_b |> resize(nk)
+    s.moe_cnt |> resize(ne)
+    s.moe_bkt |> resize(nk)
+    s.moe_gxq |> resize(npos * dim)
+    s.moe_gxs |> resize(npos * nb)
+    s.moe_ghb |> resize(npos * nfe)
+    s.moe_ghb2 |> resize(npos * nfe)
+    s.moe_hq |> resize(npos * nfe)
+    s.moe_hs |> resize(npos * nfe / 32l)
+    s.moe_gout |> resize(npos * dim)
+    s.moe_eout |> resize(nk * dim)
+
+    // 1. route every position: custom double-RMS router input in xb2_b, one batched router GEMM,
+    //    per-row select, then fold each selected expert's ffn_down_exps_s down scale into its weight
+    let ts_route = ref_time_ticks()
+    gemma4_router_batch(t, s.xb2_b, s.x_b, l, dim, npos)
+    mm_fblob_b(s.moe_rlog, t, t.router_off + l * ne * dim, s.xb2_b, dim, ne, npos)
+    for (p in range64(npos)) {
+        array_view(s.moe_rlog, p * ne, ne) $(var lg : array<float>#) {
+            moe_select(c, lg, s.moe_idx_b, s.moe_w_b, p * k)
+        }
+        for (j in range64(k)) {
+            s.moe_w_b[p * k + j] *= t.fblob[t.moe_down_scale_off + l * ne + s.moe_idx_b[p * k + j]]
+        }
+    }
+    // bucket the (position, slot) pairs by expert — CSR with the in-place cursor trick (moe_cnt[e]
+    // ends as e's run END, moe_cnt[e-1] its start), same as ffn_moe_prefill_grouped
+    for (e in range64(ne)) {
+        s.moe_cnt[e] = 0l
+    }
+    for (r in range64(nk)) {
+        s.moe_cnt[s.moe_idx_b[r]]++
+    }
+    var run = 0l
+    for (e in range64(ne)) {
+        let cn = s.moe_cnt[e]
+        s.moe_cnt[e] = run
+        run += cn
+    }
+    for (r in range64(nk)) {
+        let e = s.moe_idx_b[r]
+        s.moe_bkt[s.moe_cnt[e]] = r
+        s.moe_cnt[e]++
+    }
+    prof_add("moe_route", ts_route)
+
+    // 2. expert input = pre_ffw_norm_2(residual) per position, quantized ONCE for every expert GEMM
+    rms_batch(s.xb_b, s.x_b, t, t.rms_pre_ffn2_off + l * dim, dim, npos)
+    requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
+
+    // 3. one Q8 batch GEMM chain per touched expert over its gathered rows; the raw down-projection
+    //    rows park in the (position, slot) grid for the ordered reduce
+    for (e in range64(ne)) {
+        let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
+        let cnt = s.moe_cnt[e] - b0
+        if (cnt == 0l) {
+            continue
+        }
+        let ts_gather = ref_time_ticks()
+        moe_gather_rows(s, b0, cnt, dim, k)
+        prof_add("moe_gather", ts_gather)
+        let eg = l * ne + e
+        let base = eg * dim * nfe
+        mm_b_q8_pre(s.moe_ghb, t, t.we1_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        mm_b_q8_pre(s.moe_ghb2, t, t.we3_off + base, s.moe_gxq, s.moe_gxs, dim, nfe, cnt)
+        let ts_act = ref_time_ticks()
+        gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
+        prof_add("act", ts_act)
+        requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
+        mm_b_q8_pre(s.moe_gout, t, t.we2_off + base, s.moe_hq, s.moe_hs, nfe, dim, cnt)
+        let ts_park = ref_time_ticks()
+        for (r in range64(cnt)) {
+            copy_floats(s.moe_gout, r * dim, s.moe_eout, s.moe_bkt[b0 + r] * dim, dim)
+        }
+        prof_add("moe_park", ts_park)
+    }
+
+    // 4. ordered reduce into xb2_b (router input now dead there): per position, the k weighted routed
+    //    outputs in slot order — exactly the decode moe_experts_apply accumulation order — then the
+    //    routed post_ffw_norm_2. Plain mul+add (NOT axpy); rows are disjoint so threading is exact.
+    let ts_red = ref_time_ticks()
+    unsafe {
+        var ap = addr(s.xb2_b[0])
+        let ep = reinterpret<float const?>(addr(s.moe_eout[0]))
+        let wp = reinterpret<float const?>(addr(s.moe_w_b[0]))
+        maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let pp = int64(p)
+                    var arow = ap + pp * dim
+                    for (i in range64(dim)) {
+                        arow[i] = 0.0
+                    }
+                    for (j in range64(k)) {
+                        let w = wp[pp * k + j]
+                        let er = ep + (pp * k + j) * dim
+                        for (i in range64(dim)) {
+                            arow[i] += w * er[i]
+                        }
+                    }
+                }
+            }
+        }
+    }
+    prof_add("moe_reduce", ts_red)
+    rms_batch(s.xb2_b, s.xb2_b, t, t.rms_post_ffn2_off + l * dim, dim, npos)
+
+    // 5. dense parallel shared expert over ALL positions: rms_ffn -> GeGLU -> post_ffw_norm_1 into gout
+    let ts_sh = ref_time_ticks()
+    rms_batch(s.xb_b, s.x_b, t, t.rms_ffn_off + l * dim, dim, npos)
+    mm_b(s.hb_b, t, t.w1_off + l * dim * hidden, s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
+    mm_b(s.hb2_b, t, t.w3_off + l * dim * hidden, s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
+    gate_batch(s.hb_b, s.hb2_b, c.ffn_act, hidden, npos)
+    mm_b(s.moe_gout, t, t.w2_off + l * hidden * dim, s.hb_b, s.xqb, s.xsb, hidden, dim, npos)
+    rms_batch(s.moe_gout, s.moe_gout, t, t.rms_post_ffn1_off + l * dim, dim, npos)
+    prof_add("mm_shexp", ts_sh)
+
+    // 6. combine (routed + dense), the shared post_ffw_norm on the sum, then the residual add. The
+    //    layer-output scale tail is applied by the caller (ffn_gemma4_prefill), shared with the naive path.
+    add_inplace(unsafe(addr(s.xb2_b[0])), unsafe(addr(s.moe_gout[0])), npos * dim)
+    rms_batch(s.xb2_b, s.xb2_b, t, t.rms_post_ffn_off + l * dim, dim, npos)
+    let ts_resid = ref_time_ticks()
     add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
     prof_add("act_resid", ts_resid)
 }

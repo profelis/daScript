@@ -97,6 +97,16 @@ four remain. Order inside the wave = cheapest first, each gated before the next 
    is sigmoid-gated). Then 26B parity 40/40 (harness/parity.sh) + `test_parity_gemma4_26b`
    fixture (large-tier) + README row. Source: `ggml-org/gemma-4-26B-A4B-it-GGUF` (Q8 + bf16
    mmproj), on disk 2026-07-07. 4B active = strong CPU target, likely the family's perf sweet spot.
+   **PREFILL grouped-batched (✅ 2026-07-07).** The 26B prefill was naive per-token (each position
+   looped through `gemma4_moe_ffn`) → **35 t/s, 0.23× lcpp**. New `gemma4_moe_prefill_grouped` +
+   `gemma4_router_batch` route every position, bucket (position, slot) by expert (CSR), run one Q8
+   batch GEMM chain per touched expert (reusing `moe_gather_rows` + the qwen2moe grouped machinery),
+   and batch the dense parallel shared expert over all positions — summed under the shared
+   post_ffw_norm. Bit-identical per row to the naive path (same quants/dots, slot-order reduce, router
+   SoS in double), gated by the existing `g_moe_grouped_prefill` A/B toggle; no new Session buffers.
+   Measured (M1 Max, prefill-512, interleaved A/B): **grouped 217 t/s vs naive 39 = 5.5×**, and **217
+   vs lcpp 151.1 = 1.44× — das now LEADS lcpp on 26B prefill.** Correctness held: the counting-prompt
+   1492-token prefill still produces `GEMMA4_26B_GEN` token-for-token, grouped==naive==fixture.
 3. **gemma-4-E2B / E4B — the edge models. PROBED 2026-07-07; slice RE-SIZED DOWN to
    "PLE + KV-sharing," best case.** Read of `src/models/gemma4.cpp` vs `gemma3n.cpp`
    plus E2B/E4B header dumps settled every VERIFY below:
