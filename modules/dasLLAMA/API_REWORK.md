@@ -394,6 +394,16 @@ what it costs today and what the fix would change.
   kernel (the same SIMD/threaded machinery parakeet/whisper towers already use) — likely the single
   biggest audio-side win on the shelf — plus the long-context decode path. Not chased mid-wave.
 
+- **Qwen3-Omni AuT tower is fp32 scalar too; perf numbers are SOFT (Wave A3, 2026-07-08).**
+  Same shape as A2: parity gate is fp32, so the shared qwen3a AuT encoder runs scalar. A/B (M1 Max
+  8T, das vs llama-mtmd-cli): jfk das 3625 ms / xRT 3.03 vs mtmd 1173 / 9.4 = **das trails 3.09×**;
+  jfk3 das 8263 / 3.99 vs mtmd 2079 / 15.9 = **3.97×**. Dominant gap = the fp32 scalar qwen3a tower
+  (~4.8× encode), same lever as the gemma4a entry above — SIMD/Q8 the shared AuT/qwen3a encoder
+  covers BOTH A2 and A3. The q8 MoE thinker (grouped prefill ~207 t/s + q8 decode) also trails ggml.
+  ⚠️ These A/B numbers are SOFT: measured with a dormant Parsec host daemon (1.6% CPU) + Spotlight
+  indexing the freshly-downloaded 34 GB — a clean announced Parsec-off re-sweep would firm them (parity
+  is unaffected). Not chased mid-wave.
+
 - **ASR short-clip fixed costs (parakeet, M1 — NEXT ROUND, Boris 2026-07-06; whisper tower
   q8 postponed one session behind it).** Cost today at matched 8T: jfk das 703 ms vs cli 352
   (2.0x), LibriSpeech dictation p50 651 vs 324; long clips already 1.07-1.10x, so the short
