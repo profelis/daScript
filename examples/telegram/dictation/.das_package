@@ -1,0 +1,21 @@
+options gen2
+
+require daslib/daspkg
+
+[export]
+def package() {
+    package_name("dictation-bot")
+    package_description("Telegram bot that transcribes voice/audio messages into clean, readable text (whisper + dasLLAMA)")
+}
+
+[export]
+def dependencies(version : string) {
+    require_package("dasTelegram")
+}
+
+[export]
+def release() {
+    release_main("main.das")
+    release_name("dictation-bot")
+    release_include("dictation.toml")   // ship the config template next to the exe
+}

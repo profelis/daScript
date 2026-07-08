@@ -2022,12 +2022,12 @@ install(FILES ${DAS_UNCATEGORIZED_EXAMPLES}
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/uncategorized
 )
 
-# Install telegram example
+# Install telegram echo-bot example
 install(FILES
-    ${PROJECT_SOURCE_DIR}/examples/telegram/.das_package
-    ${PROJECT_SOURCE_DIR}/examples/telegram/README.md
-    ${PROJECT_SOURCE_DIR}/examples/telegram/echo_bot.das
-    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/telegram
+    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/README.md
+    ${PROJECT_SOURCE_DIR}/examples/telegram/echo-bot/echo_bot.das
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/telegram/echo-bot
 )
 
 # Install claude example
