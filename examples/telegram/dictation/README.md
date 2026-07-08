@@ -70,6 +70,8 @@ To transcribe every voice note posted in a group, either:
 
 - The LLM step's latency scales with transcript length (decode is memory-bandwidth-bound), so a long
   voice note can take a few minutes. Model size — not core count — is the main lever.
-- A standalone `daspkg release` executable is a work in progress: the dasLLAMA `-exe` codegen path does
-  not yet resolve the address of the tune kernels' `@@`-function-pointer struct-field defaults. Until
-  that lands, run the bot under `-jit` as above.
+- The `-jit` invocation above is the run-from-source path. For a redistributable build,
+  `daspkg release --root examples/telegram/dictation --out <dir>` produces `<dir>/dictation-bot/` — a
+  standalone executable (plus the daslang runtime DLLs, shared modules, and `dictation.toml`) that runs
+  with no daslang installed. The whisper/LLM models are referenced by absolute path in the config, so
+  they are not bundled; edit the shipped `dictation.toml` to point at the models on the target machine.

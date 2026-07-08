@@ -14,6 +14,8 @@ let GLOBAL_INIT_SCRIPT = "{OUTPUT_DIR}/jit_exe_test_global_init.das"
 let GLOBAL_INIT_EXE = "{OUTPUT_DIR}/jit_exe_test_global_init"
 let CLONE_INIT_SCRIPT = "{OUTPUT_DIR}/jit_exe_test_clone_init.das"
 let CLONE_INIT_EXE = "{OUTPUT_DIR}/jit_exe_test_clone_init"
+let FNPTR_GLOBAL_SCRIPT = "{OUTPUT_DIR}/jit_exe_test_fnptr_global.das"
+let FNPTR_GLOBAL_EXE = "{OUTPUT_DIR}/jit_exe_test_fnptr_global"
 
 def write_hello_script() : bool {
     var ok = false
@@ -84,6 +86,25 @@ def write_clone_init_script() : bool {
             fprint(f, "    \}\n")
             fprint(f, "    print(\"CLONE_INIT_MARKER=[\{seen\}]\\n\")\n")
             fprint(f, "\}\n")
+            ok = true
+        }
+    }
+    return ok
+}
+
+// A function-pointer global initialized with `@@fn` (an ExprAddr) is a UID-bearing node inside a
+// global-variable initializer. A standalone -exe codegens those (generate_globals_initialization_fn),
+// unlike -jit where the interpreter runs global inits. Without the fix, create_uid_nodes never gave
+// the ExprAddr an id and get_base panicked "Key not found"; with it, the exe runs and prints 42.
+def write_fnptr_global_script() : bool {
+    var ok = false
+    mkdir_rec(OUTPUT_DIR)
+    fopen(FNPTR_GLOBAL_SCRIPT, "w") $(f) {
+        if (f != null) {
+            fprint(f, "options gen2\n")
+            fprint(f, "def my_kernel(x : int) : int \{ return x + 1 \}\n")
+            fprint(f, "var g_fn = @@my_kernel\n")
+            fprint(f, "[export] def main() \{ print(\"FNPTR_RESULT=[\{invoke(g_fn, 41)}]\\n\"); \}\n")
             ok = true
         }
     }
@@ -162,6 +183,15 @@ def test_clone_init_in_thread(t : T?) {
     t |> success(find(output, "CLONE_INIT_MARKER=[0]") == -1)
 }
 
+// A function-pointer global (`var g = @@fn`) must codegen + run in a standalone -exe. Regression for
+// the "Key not found" / "unresolved expression" panic on UID-bearing nodes in global initializers.
+def test_fnptr_global(t : T?) {
+    t |> equal(write_fnptr_global_script(), true)
+    if (!compile_to_exe(t, FNPTR_GLOBAL_SCRIPT, FNPTR_GLOBAL_EXE)) { return ; }
+    let output = run_exe(FNPTR_GLOBAL_EXE)
+    t |> success(find(output, "FNPTR_RESULT=[42]") != -1)
+}
+
 [test]
 def test_executable(t : T?) {
     // Skip on Windows: standalone exes built here link against the daslang
@@ -177,5 +207,8 @@ def test_executable(t : T?) {
     }
     t |> run("[init] runs in cloned context") @(t : T?) {
         test_clone_init_in_thread(t)
+    }
+    t |> run("function-pointer global (@@fn in global init)") @(t : T?) {
+        test_fnptr_global(t)
     }
 }
