@@ -106,6 +106,9 @@ struct Config {
     rope_ff_global_only : bool = false // rope_freqs factors apply only to GLOBAL layers (gemma4 p-RoPE)
     layer_out_scale : bool = false     // per-layer scalar on the layer output (gemma4 layer_output_scale; loader-detected)
     v_from_k_mask : uint64 = 0ul       // bit l: layer l has no attn_v tensor — V reuses the pre-norm K projection (gemma4 global layers)
+    // gemma-4 E-series (E2B/E4B): per-layer embeddings (PLE) + cross-layer KV sharing (both loader-detected)
+    n_embd_per_layer : int64 = 0       // PLE input dim (E2B/E4B: 256); 0 = no PLE
+    n_layer_kv_from_start : int64 = 0  // first N layers own their KV; later layers reuse a source layer's KV (0 = all own)
     // MoE FFN (qwen2moe shape: routed top-k + shared expert). `moe` is the arch opt-in that lets the
     // loader read the {arch}.expert_* keys; the geometry comes from metadata, 0 = dense FFN
     moe : bool = false                 // arch opt-in: this arch's FFN is router + experts
@@ -181,6 +184,19 @@ struct Model {
     out_scale_off : int64
     // token ids whose logits pin to -inf after the classifier (gemma4 suppress_tokens); empty = none
     suppress : array<int64>
+    // gemma-4 E-series cross-layer KV sharing: per-layer KV SOURCE (== l for own-KV layers; an
+    // earlier layer for shared layers, which carry no attn_k/attn_v of their own). Filled by
+    // layout_offsets; kv_row_prefix aliases a shared layer's slot onto its source's.
+    kv_src : array<int64>
+    // gemma-4 E-series per-layer embeddings (PLE) — offsets valid only when config.n_embd_per_layer > 0.
+    // The Q8 token table (linear, gathered per token — NOT repacked) + the per-layer Q8 gate/proj live
+    // in the big-weight blob; the fp32 model-proj + the two norm families live in fblob.
+    ple_emb_off : int64     // qblob: Q8 per_layer_token_embd, linear [vocab x (ple*layers)]
+    ple_model_off : int64   // fblob: fp32 per_layer_model_proj [dim x (ple*layers)]
+    ple_pnorm_off : int64   // fblob: fp32 per_layer_proj_norm [ple]
+    ple_gate_off : int64    // qblob: per_layer_inp_gate, layers x (dim x ple)
+    ple_proj_off : int64    // qblob: per_layer_proj,     layers x (ple x dim)
+    ple_post_off : int64    // fblob: fp32 per_layer_post_norm, layers x dim
     // per-layer KV-ROW prefix (Σ layer_kv_dim of prior layers), filled by layout_offsets — makes
     // kv_cache_off O(1). seq_len-INDEPENDENT on purpose: tests cap seq_len after load, so the cache
     // offset multiplies by the live value at call time, never a baked one
@@ -408,12 +424,33 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     }
     t.rms_final_off = fo
     fo += dim
+    // gemma-4 E-series PLE norms (fblob): the single proj-norm vector [ple] + the per-layer post-norm.
+    if (has_ple(c)) {
+        t.ple_pnorm_off = fo
+        fo += c.n_embd_per_layer
+        t.ple_post_off = fo
+        fo += layers * dim
+        t.ple_model_off = fo
+        fo += dim * c.n_embd_per_layer * layers
+    }
+    // Per-layer KV source + cache-row prefix. A shared layer (E-series) contributes NO width and
+    // aliases its source layer's slot, so kv_cache_off returns the source base and its own K/V are
+    // never stored (the memory win). kv_source[l] < l for shared layers, so the source prefix exists.
+    t.kv_src |> clear()
+    t.kv_src |> reserve(layers)
+    for (l in range64(layers)) {
+        t.kv_src |> push(layer_kv_source(c, l))
+    }
     t.kv_row_prefix |> clear()
     t.kv_row_prefix |> reserve(layers)
     var kvrow = 0l
     for (l in range64(layers)) {
-        t.kv_row_prefix |> push(kvrow)
-        kvrow += layer_kv_dim(c, l)
+        if (t.kv_src[l] != l) {
+            t.kv_row_prefix |> push(t.kv_row_prefix[t.kv_src[l]])
+        } else {
+            t.kv_row_prefix |> push(kvrow)
+            kvrow += layer_kv_dim(c, l)
+        }
     }
     var wo = 0l
     t.wq_offs |> clear()
@@ -425,14 +462,19 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     t.wk_offs |> clear()
     t.wk_offs |> reserve(layers)
     for (l in range64(layers)) {
-        t.wk_offs |> push(wo)
-        wo += dim * layer_kv_dim(c, l)
+        if (t.kv_src[l] != l) {
+            t.wk_offs |> push(-1l)   // shared-KV layer (E-series): no attn_k of its own
+        } else {
+            t.wk_offs |> push(wo)
+            wo += dim * layer_kv_dim(c, l)
+        }
     }
     t.wv_offs |> clear()
     t.wv_offs |> reserve(layers)
     for (l in range64(layers)) {
-        if (((c.v_from_k_mask >> uint64(l)) & 1ul) != 0ul) {
-            t.wv_offs |> push(-1l)   // no attn_v tensor: V reuses the pre-norm K projection
+        // -1 marks either a V-from-K layer (gemma4 global) or a shared-KV layer (E-series, no attn_v)
+        if (t.kv_src[l] != l || ((c.v_from_k_mask >> uint64(l)) & 1ul) != 0ul) {
+            t.wv_offs |> push(-1l)
         } else {
             t.wv_offs |> push(wo)
             wo += dim * layer_kv_dim(c, l)
@@ -490,6 +532,15 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         wo += layers * hidden * dim
         t.w3_off = wo
         wo += layers * dim * hidden
+    }
+    if (has_ple(c)) {  // gemma-4 E-series PLE big weights: the Q8 token table + per-layer Q8 gate/proj
+        let ple = c.n_embd_per_layer
+        t.ple_emb_off = wo   // linear, NOT repacked — gathered per token
+        wo += c.vocab_size * ple * layers
+        t.ple_gate_off = wo
+        wo += layers * dim * ple
+        t.ple_proj_off = wo
+        wo += layers * ple * dim
     }
     if (c.shared_weights) {
         if (t.cls_q8) {
@@ -694,11 +745,18 @@ def private repack_q8_weights(var t : Model) {
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
         repack_q8q8_weight(t.qblob, t.qscales, t.wq_offs[l], dim, qd)
-        repack_q8q8_weight(t.qblob, t.qscales, t.wk_offs[l], dim, kv)
+        if (t.wk_offs[l] >= 0l) {   // absent on E-series shared-KV layers
+            repack_q8q8_weight(t.qblob, t.qscales, t.wk_offs[l], dim, kv)
+        }
         if (t.wv_offs[l] >= 0l) {
             repack_q8q8_weight(t.qblob, t.qscales, t.wv_offs[l], dim, kv)
         }
         repack_q8q8_weight(t.qblob, t.qscales, t.wo_offs[l], qd, dim)
+        if (has_ple(c)) {  // gemma-4 E-series per-layer PLE gate/proj (the emb table stays linear, unpacked)
+            let ple = c.n_embd_per_layer
+            repack_q8q8_weight(t.qblob, t.qscales, t.ple_gate_off + l * dim * ple, dim, ple)
+            repack_q8q8_weight(t.qblob, t.qscales, t.ple_proj_off + l * ple * dim, ple, dim)
+        }
         if (c.n_expert > 0l) {   // MoE: each expert slice is its own 2D tensor, repacked per its shape
             let ege = dim * c.n_ff_exp
             if (!t.experts_mx4) {   // native-MXFP4 stacks live in mxq/mxs, row-major (no Q8 repack)
@@ -867,14 +925,19 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 panic("dasLLAMA: partial rotary (rope.dimension_count_swa != the sliding head size) is not supported")
             }
         }
-        // honest gates for gemma4 features beyond this wave (E-series shared KV / PLE, the MoE 26B)
-        if (gguf_has(m, "{arch}.attention.shared_kv_layers")
-                && gguf_int(m, bytes, "{arch}.attention.shared_kv_layers") > 0l) {
-            panic("dasLLAMA: shared KV layers (Gemma-4 E-series) are not yet supported")
+        // gemma-4 E-series: cross-layer KV sharing — the last N layers reuse an earlier layer's KV
+        // cache (n_layer_kv_from_start = layers - shared), and their own attn_k/attn_v are dead weights
+        // (skipped by layout_offsets). Mirrors llama.cpp gemma4's has_kv()/reuse().
+        if (gguf_has(m, "{arch}.attention.shared_kv_layers")) {
+            let n_shared = gguf_int(m, bytes, "{arch}.attention.shared_kv_layers")
+            if (n_shared > 0l) {
+                t.config.n_layer_kv_from_start = layers - n_shared
+            }
         }
-        if (gguf_has(m, "{arch}.embedding_length_per_layer_input")
-                && gguf_int(m, bytes, "{arch}.embedding_length_per_layer_input") > 0l) {
-            panic("dasLLAMA: per-layer embeddings (Gemma-4 E-series PLE) are not yet supported")
+        // gemma-4 E-series: per-layer embeddings (PLE) — a per-(token, layer) side input mixed into
+        // each layer's output. n_embd_per_layer = 0 on the dense 12B/31B (feature off).
+        if (gguf_has(m, "{arch}.embedding_length_per_layer_input")) {
+            t.config.n_embd_per_layer = gguf_int(m, bytes, "{arch}.embedding_length_per_layer_input")
         }
         // gemma4 is MoE only when the file carries experts (12B/31B dense, 26B-A4B MoE)
         if (t.config.moe_optional
@@ -1082,7 +1145,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             if (t.config.qk_norm) {  // Qwen3/gemma4: per-head Q/K norms (head_size(l) each)
                 let hs = layer_head_size(t.config, l)
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.attn_q_norm.weight", t.fblob, t.rms_q_offs[l], hs)
-                gguf_read_tensor_f32(m, bytes, "blk.{l}.attn_k_norm.weight", t.fblob, t.rms_k_offs[l], hs)
+                if (t.wk_offs[l] >= 0l) {   // shared-KV layers (E-series) never project/norm their own K
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.attn_k_norm.weight", t.fblob, t.rms_k_offs[l], hs)
+                }
             }
             if (t.config.layer_out_scale) {  // gemma4: one output scalar per layer
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.layer_output_scale.weight", t.fblob, t.out_scale_off + l, 1l)
@@ -1098,6 +1163,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             if (t.config.attn_sinks) {  // gpt-oss: one sink logit per head
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.attn_sinks.weight", t.fblob, t.sinks_off + l * n_heads, n_heads)
             }
+            if (has_ple(t.config)) {  // gemma-4 E-series: per-layer PLE output norm (fblob)
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.post_norm.weight", t.fblob, t.ple_post_off + l * dim, dim)
+            }
         }
         if (t.config.v_norm) {  // the weightless V-norm's synthetic all-ones weight vector
             for (i in range64(max_head_size(t.config))) {
@@ -1105,6 +1173,11 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
         }
         gguf_read_tensor_f32(m, bytes, "output_norm.weight", t.fblob, t.rms_final_off, dim)
+        if (has_ple(t.config)) {  // gemma-4 E-series PLE globals: fp32 model-proj + proj-norm (both fblob)
+            let ple = t.config.n_embd_per_layer
+            gguf_read_tensor_f32(m, bytes, "per_layer_model_proj.weight", t.fblob, t.ple_model_off, dim * ple * layers)
+            gguf_read_tensor_f32(m, bytes, "per_layer_proj_norm.weight", t.fblob, t.ple_pnorm_off, ple)
+        }
         // big 2D weights -> active precision. ggml stores them row-major [out x in] = our convention.
         var scratch : array<float>
         for (l in range64(layers)) {
@@ -1118,8 +1191,10 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wv_offs[l], dim * kv_l, scratch, dim * qd_l + dim * kv_l)
             } else {
                 load_big(m, bytes, "blk.{l}.attn_q.weight", t, t.wq_offs[l], dim * qd_l, scratch)
-                load_big(m, bytes, "blk.{l}.attn_k.weight", t, t.wk_offs[l], dim * kv_l, scratch)
-                if (t.wv_offs[l] >= 0l) {   // absent on gemma4 global layers (V reuses the K projection)
+                if (t.wk_offs[l] >= 0l) {   // absent on E-series shared-KV layers (reuse the source layer's K)
+                    load_big(m, bytes, "blk.{l}.attn_k.weight", t, t.wk_offs[l], dim * kv_l, scratch)
+                }
+                if (t.wv_offs[l] >= 0l) {   // absent on gemma4 global (V-from-K) + E-series shared-KV layers
                     load_big(m, bytes, "blk.{l}.attn_v.weight", t, t.wv_offs[l], dim * kv_l, scratch)
                 }
             }
@@ -1186,6 +1261,14 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_off + l * dim * hidden, dim * hidden, scratch)
                 load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_off + l * hidden * dim, hidden * dim, scratch)
             }
+            if (has_ple(t.config)) {  // gemma-4 E-series: per-layer PLE gate (dim->ple) + proj (ple->dim), Q8
+                let ple = t.config.n_embd_per_layer
+                load_big(m, bytes, "blk.{l}.inp_gate.weight", t, t.ple_gate_off + l * dim * ple, dim * ple, scratch)
+                load_big(m, bytes, "blk.{l}.proj.weight", t, t.ple_proj_off + l * ple * dim, ple * dim, scratch)
+            }
+        }
+        if (has_ple(t.config)) {  // the Q8 per-layer token-embedding table [vocab x (ple*layers)], linear (gathered per token, never repacked)
+            load_big(m, bytes, "per_layer_token_embd.weight", t, t.ple_emb_off, vocab * t.config.n_embd_per_layer * layers, scratch)
         }
         if (!t.config.shared_weights) {
             load_big(m, bytes, "output.weight", t, t.wcls_off, vocab * dim, scratch)
@@ -1389,6 +1472,12 @@ struct Session {
     ffn_gu : array<float>       // dense/shexp gate+up fuse output — gate half then up half (2 x max_ffn_width)
     mx4_wq : array<int8>        // grouped-prefill expansion of ONE native-MXFP4 expert to exact Q8 (dim x n_ff_exp)
     mx4_ws : array<float>       // ... and its per-block scales (same / 32); see expand_mx4_region_q8
+    // gemma-4 E-series per-layer embeddings (PLE) scratch — empty unless config.n_embd_per_layer > 0.
+    // ple_inp holds one (position, layer) side vector per row, POSITION-major: (p, l, i) at
+    // p*(n_layers*ple) + l*ple + i. Sized to 1 position in make_run_state, npos in forward_prefill.
+    ple_inp : array<float>      // the built per-(position, layer) side input (npos x n_layers x ple)
+    ple_proj : array<float>     // model-proj scratch for the pre-step (npos x n_layers x ple)
+    ple_gate : array<float>     // per-(position) gate vector for the layer block (npos x ple)
 }
 
 //! Allocate the run state sized to a model.
@@ -1429,6 +1518,12 @@ def make_run_state(c : Config) : Session {
         s.moe_dn |> resize(c.n_expert_used * c.dim)
         s.moe_dq |> resize(c.n_expert_used * c.n_ff_exp)
         s.moe_ds |> resize(c.n_expert_used * c.n_ff_exp / 32l)
+    }
+    if (has_ple(c)) {   // gemma-4 E-series PLE decode scratch (one position)
+        let all = c.n_layers * c.n_embd_per_layer
+        s.ple_inp |> resize(all)
+        s.ple_proj |> resize(all)
+        s.ple_gate |> resize(c.n_embd_per_layer)
     }
     s.ffn_offs |> resize(4)
     s.ffn_gu |> resize(2l * ffw)
@@ -1987,6 +2082,20 @@ def layer_is_sliding(c : Config; l : int64) : bool => (c.sliding_window > 0l
 // ===== Per-layer attention geometry (gemma4: sliding vs global layer classes differ) =====
 // head_size/n_kv_heads/kv_dim in Config describe the GLOBAL class; the *_swa fields (0 = same)
 // override for sliding layers. Everything downstream sizes scratch to the class maxima.
+
+//! Does this model carry per-layer embeddings (gemma-4 E-series)?
+def has_ple(c : Config) : bool => c.n_embd_per_layer > 0l
+
+//! Layer `l`'s KV source (mirrors llama.cpp gemma4 reuse()): own-KV layers map to themselves; a
+//! shared layer (l >= n_layer_kv_from_start) reuses the last own-KV layer of its class — sliding
+//! reads kv_from_start-2, global reads kv_from_start-1 (those two straddle the boundary by pattern).
+def layer_kv_source(c : Config; l : int64) : int64 {
+    let kvfs = c.n_layer_kv_from_start
+    if (kvfs <= 0l || l < kvfs) {
+        return l
+    }
+    return kvfs - (layer_is_sliding(c, l) ? 2l : 1l)
+}
 
 //! Layer `l`'s attention head size.
 def layer_head_size(c : Config; l : int64) : int64 => (layer_is_sliding(c, l) && c.head_size_swa > 0l
@@ -2597,6 +2706,9 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     // Sliding-window (local) vs global attention per the arch's layer pattern (Gemma2 alternates,
     // Gemma3 5:1). The window covers all positions when pos < window, so it's a no-op for short contexts.
     let is_sliding = layer_is_sliding(c, l)
+    // gemma-4 E-series shared-KV layer: no attn_k/attn_v of its own — project Q only and attend
+    // against the SOURCE layer's cached K/V (loff already aliases the source's slot).
+    let kv_shared = t.kv_src[l] != l
     let kstart = (is_sliding && pos + 1l > c.sliding_window) ? (pos + 1l - c.sliding_window) : 0l
     let cnt = pos + 1l - kstart
     // attention rmsnorm
@@ -2605,7 +2717,11 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     prof_add("norm", ts_norm0)
     // q, k, v projections (independent — share s.xb; fused into one parallel dispatch when Q8)
     let ts_qkv = ref_time_ticks()
-    mm_qkv(s, t, l)
+    if (kv_shared) {
+        mm(s.q, t, t.wq_offs[l], s.xb, s.xq, s.xs, dim, qd)   // Q only
+    } else {
+        mm_qkv(s, t, l)
+    }
     if (c.attn_qkv_bias) {  // Qwen2: + bias before RoPE
         add_bias(s.q, 0l, t.bq, l * qd, qd)
         add_bias(s.k, 0l, t.bk, l * kv_dim, kv_dim)
@@ -2615,7 +2731,9 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     if (c.qk_norm) {  // Qwen3/gemma4: per-head RMSNorm on q/k before RoPE — q/k are n_heads/n_kv_heads rows of head_size
         let ts_qknorm = ref_time_ticks()
         rms_batch(s.q, s.q, t, t.rms_q_offs[l], head_size, n_heads)
-        rms_batch(s.k, s.k, t, t.rms_k_offs[l], head_size, n_kv_heads)
+        if (!kv_shared) {
+            rms_batch(s.k, s.k, t, t.rms_k_offs[l], head_size, n_kv_heads)
+        }
         prof_add("norm", ts_qknorm)
     }
     // gemma4: weightless per-head RMSNorm on V (all-ones weight; V is never roped). V-from-K layers
@@ -2637,10 +2755,10 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
             let srow = swa_row ? reinterpret<float const?>(addr(s.rope_sin_swa[0])) : reinterpret<float const?>(addr(s.rope_sin[0]))
             if (c.rope_neox) {
                 rope_scaled_neox_tab(addr(s.q[0]), head_size, qd, crow, srow)
-                rope_scaled_neox_tab(addr(s.k[0]), head_size, kv_dim, crow, srow)
+                if (!kv_shared) { rope_scaled_neox_tab(addr(s.k[0]), head_size, kv_dim, crow, srow) }
             } else {
                 rope_scaled_tab(addr(s.q[0]), head_size, qd, crow, srow)
-                rope_scaled_tab(addr(s.k[0]), head_size, kv_dim, crow, srow)
+                if (!kv_shared) { rope_scaled_tab(addr(s.k[0]), head_size, kv_dim, crow, srow) }
             }
         }
     } else {
@@ -2648,15 +2766,20 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         let fscale = is_sliding ? c.rope_freq_scale_swa : c.rope_freq_scale
         let use_ff = !(c.rope_ff_global_only && is_sliding)
         rope_apply(s.q, pos, head_size, qd, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
-        rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+        if (!kv_shared) {
+            rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+        }
     }
     prof_add("rope", ts_rope)
-    // store k, v for this position into the KV cache
-    let ts_kv = ref_time_ticks()
-    let kvoff = loff + pos * kv_dim
-    copy_floats(unsafe(addr(s.key_cache[kvoff])), unsafe(addr(s.k[0])), kv_dim)
-    copy_floats(unsafe(addr(s.value_cache[kvoff])), unsafe(addr(s.v[0])), kv_dim)
-    prof_add("kv_store", ts_kv)
+    // store k, v for this position into the KV cache (shared-KV layers: nothing to store — the
+    // source layer already cached its K/V, which loff points at)
+    if (!kv_shared) {
+        let ts_kv = ref_time_ticks()
+        let kvoff = loff + pos * kv_dim
+        copy_floats(unsafe(addr(s.key_cache[kvoff])), unsafe(addr(s.k[0])), kv_dim)
+        copy_floats(unsafe(addr(s.value_cache[kvoff])), unsafe(addr(s.v[0])), kv_dim)
+        prof_add("kv_store", ts_kv)
+    }
     // multi-head attention, threaded over heads past the decode threshold — each head reads its own
     // q/K/V slices and writes a disjoint att row (h*seq_len) and xb slice, so threading is
     // result-identical to the inline loop (the per-token KV read grows linearly with context; the
@@ -2784,7 +2907,9 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
         rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
     }
     add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
-    if (c.layer_out_scale) {  // gemma4: scale the whole layer output (after the residual)
+    // gemma4: scale the whole layer output (after the residual). The E-series applies it AFTER its PLE
+    // block (in ffn_gemma4_decode), so skip it here when PLE is on.
+    if (c.layer_out_scale && !has_ple(c)) {
         scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
     }
     prof_add("act_resid", ts_resid1)
@@ -3044,6 +3169,84 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     }
 }
 
+// ===== gemma-4 E-series per-layer embeddings (PLE) =====
+// A per-(token, layer) side input mixed into each layer's output. Two steps mirroring llama.cpp
+// gemma4's build_inp_per_layer + project_per_layer_inputs (once per token) and the in-loop
+// per_layer_embd block (once per layer). ple_inp is POSITION-major: (p, l, i) at p*(layers*ple)+l*ple+i.
+
+// Pre-step finish (shared by decode/prefill): given the gathered+sqrt(ple)-scaled token rows already
+// in s.ple_inp[0..npos*all), add the projected embedding branch. proj = rmsnorm((1/√dim)·(model_proj·
+// embd)); ple_inp = (gathered + proj)/√2. embd_scaled is the sqrt(dim)-scaled residual (s.x / s.x_b).
+def private ple_pre_finish(t : Model; var s : Session; embd_scaled : array<float>; npos : int64) {
+    let c = t.config
+    let ple = c.n_embd_per_layer
+    let all = c.n_layers * ple
+    scale_inplace(unsafe(addr(s.ple_inp[0])), sqrt(float(ple)), npos * all)
+    // model_proj · embedding (batched over positions), then × 1/√dim
+    mm_fblob_b(s.ple_proj, t, t.ple_model_off, embd_scaled, c.dim, all, npos)
+    scale_inplace(unsafe(addr(s.ple_proj[0])), 1.0 / sqrt(float(c.dim)), npos * all)
+    // RMSNorm each (position, layer) ple-slice with the single proj-norm vector
+    rms_batch(s.ple_proj, s.ple_proj, t, t.ple_pnorm_off, ple, npos * c.n_layers)
+    add_inplace(unsafe(addr(s.ple_inp[0])), unsafe(addr(s.ple_proj[0])), npos * all)
+    scale_inplace(unsafe(addr(s.ple_inp[0])), 1.0 / sqrt(2.0), npos * all)
+}
+
+// Decode pre-step: gather the single token's per-layer embedding row, then finish.
+def private ple_pre_decode(t : Model; var s : Session; token : int64) {
+    let all = t.config.n_layers * t.config.n_embd_per_layer
+    dequant_q8_row(t, t.ple_emb_off + token * all, all, unsafe(addr(s.ple_inp[0])))
+    ple_pre_finish(t, s, s.x, 1l)
+}
+
+// Prefill pre-step: gather every position's per-layer embedding row, then finish (batched).
+def private ple_pre_prefill(t : Model; var s : Session; tokens : array<int64>; npos : int64) {
+    let all = t.config.n_layers * t.config.n_embd_per_layer
+    for (p in range64(npos)) {
+        dequant_q8_row(t, t.ple_emb_off + tokens[p] * all, all, unsafe(addr(s.ple_inp[p * all])))
+    }
+    ple_pre_finish(t, s, s.x_b, npos)
+}
+
+// Prefill-from-embeddings (multimodal) pre-step: no token ids, so the gather uses the padding token
+// (id 0) broadcast across positions — matching llama.cpp gemma4's build_inp_per_layer media branch.
+def private ple_pre_prefill_pad(t : Model; var s : Session; npos : int64) {
+    let all = t.config.n_layers * t.config.n_embd_per_layer
+    for (p in range64(npos)) {
+        dequant_q8_row(t, t.ple_emb_off, all, unsafe(addr(s.ple_inp[p * all])))
+    }
+    ple_pre_finish(t, s, s.x_b, npos)
+}
+
+// Per-layer block (decode): cur += post_norm(proj · (gelu(inp_gate·cur) ⊙ ple_inp[l])). In place on s.x.
+def private ple_block_decode(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let ple = c.n_embd_per_layer
+    mm(s.ple_gate, t, t.ple_gate_off + l * dim * ple, s.x, s.xq, s.xs, dim, ple)   // dim -> ple
+    gelu(s.ple_gate, ple)
+    mul_inplace(unsafe(addr(s.ple_gate[0])), unsafe(addr(s.ple_inp[l * ple])), ple)  // ⊙ this layer's side input
+    mm(s.xb, t, t.ple_proj_off + l * ple * dim, s.ple_gate, s.xq, s.xs, ple, dim)   // ple -> dim
+    rms_at(s.xb, t, t.ple_post_off + l * dim, s.xb, dim)
+    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)   // residual (pe_in + projected)
+}
+
+// Per-layer block (prefill, batched over npos). ple_inp is position-major so the layer-l side vector
+// of position p sits at p*(layers*ple) + l*ple.
+def private ple_block_prefill(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let ple = c.n_embd_per_layer
+    let all = c.n_layers * ple
+    mm_b(s.ple_gate, t, t.ple_gate_off + l * dim * ple, s.x_b, s.xqb, s.xsb, dim, ple, npos)
+    gelu(s.ple_gate, npos * ple)
+    for (p in range64(npos)) {
+        mul_inplace(unsafe(addr(s.ple_gate[p * ple])), unsafe(addr(s.ple_inp[p * all + l * ple])), ple)
+    }
+    mm_b(s.xb_b, t, t.ple_proj_off + l * ple * dim, s.ple_gate, s.xqb, s.xsb, ple, dim, npos)
+    rms_batch(s.xb_b, s.xb_b, t, t.ple_post_off + l * dim, dim, npos)
+    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb_b[0])), npos * dim)
+}
+
 // gemma4 MoE router input: weightless RMSNorm(attn_out) × (1/√dim) × ffn_gate_inp_s, into s.xb2.
 // Distinct from the plain-matmul routers: the RMS is over attn_out (not the shared-expert pre-norm),
 // weightless, then scaled by 1/√n_embd and a learned per-channel scale before the ffn_gate_inp matmul.
@@ -3106,7 +3309,15 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
 def private ffn_gemma4_decode(t : Model; var s : Session; l : int64) {
     let c = t.config
     if (c.n_expert <= 0l) {
-        ffn_dense_decode(t, s, l)
+        ffn_dense_decode(t, s, l)   // out_scale deferred to after the PLE block when has_ple
+        if (has_ple(c)) {  // E-series: per-layer embedding block sits between the FFN residual and out_scale
+            let ts_ple = ref_time_ticks()
+            ple_block_decode(t, s, l)
+            if (c.layer_out_scale) {
+                scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], c.dim)
+            }
+            prof_add("ple", ts_ple)
+        }
         return
     }
     let dim = c.dim
@@ -3125,7 +3336,15 @@ def private ffn_gemma4_decode(t : Model; var s : Session; l : int64) {
 def private ffn_gemma4_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     if (c.n_expert <= 0l) {
-        ffn_dense_prefill(t, s, l, npos)
+        ffn_dense_prefill(t, s, l, npos)   // out_scale deferred to after the PLE block when has_ple
+        if (has_ple(c)) {  // E-series per-layer embedding block, then out_scale
+            let ts_ple = ref_time_ticks()
+            ple_block_prefill(t, s, l, npos)
+            if (c.layer_out_scale) {
+                scale_inplace(unsafe(addr(s.x_b[0])), t.fblob[t.out_scale_off + l], npos * c.dim)
+            }
+            prof_add("ple", ts_ple)
+        }
         return
     }
     let dim = c.dim
@@ -3204,6 +3423,11 @@ def forward(t : Model; var s : Session; token, pos : int64) {
         scale_inplace(unsafe(addr(s.x[0])), c.embed_scale, dim)
     }
     prof_add("embed", ts_embed)
+    if (has_ple(c)) {  // gemma-4 E-series: build this token's per-(layer) side input before the stack
+        let ts_ple = ref_time_ticks()
+        ple_pre_decode(t, s, token)
+        prof_add("ple", ts_ple)
+    }
 
     // this position's RoPE cos/sin row(s), shared across all layers and q/k (the decode twin of
     // prefill's table: the classic path recomputes pow/cos/sin per PAIR per layer — bit-identical
@@ -3755,6 +3979,8 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     let loff = kv_cache_off(t, l)
     // sliding vs global attention per the arch's layer pattern (see attention_std_decode)
     let is_sliding = layer_is_sliding(c, l)
+    // gemma-4 E-series shared-KV layer: project Q only, attend against the source layer's cache (loff aliases it)
+    let kv_shared = t.kv_src[l] != l
     // attention rmsnorm, per position
     let ts_norm0 = ref_time_ticks()
     rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
@@ -3762,17 +3988,21 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     // batched q/k/v projections (each re-quantizes xb_b — cheap vs the matmul)
     let ts_qkv = ref_time_ticks()
     mm_b(s.q_b, t, t.wq_offs[l], s.xb_b, s.xqb, s.xsb, dim, qd, npos)
-    mm_b(s.k_b, t, t.wk_offs[l], s.xb_b, s.xqb, s.xsb, dim, kv_dim, npos)
-    if (t.wv_offs[l] >= 0l) {
-        mm_b(s.v_b, t, t.wv_offs[l], s.xb_b, s.xqb, s.xsb, dim, kv_dim, npos)
-    } elif (c.v_norm) {
-        // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection, with the copy
-        // fused into the weightless V-norm (k_b read fully before v_b is written; k_b stays intact
-        // for its own qk_norm + rope). The v_norm step below skips these layers. Bit-identical to
-        // copy + in-place norm; lands in this mm_qkv bucket instead of "norm".
-        rms_batch(s.v_b, s.k_b, t, t.rms_ones_off, head_size, npos * n_kv_heads)
+    if (kv_shared) {
+        // E-series shared-KV layer: no K/V of its own — the source layer already filled the cache
     } else {
-        copy_floats(s.k_b, 0l, s.v_b, 0l, npos * kv_dim)
+        mm_b(s.k_b, t, t.wk_offs[l], s.xb_b, s.xqb, s.xsb, dim, kv_dim, npos)
+        if (t.wv_offs[l] >= 0l) {
+            mm_b(s.v_b, t, t.wv_offs[l], s.xb_b, s.xqb, s.xsb, dim, kv_dim, npos)
+        } elif (c.v_norm) {
+            // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection, with the copy
+            // fused into the weightless V-norm (k_b read fully before v_b is written; k_b stays intact
+            // for its own qk_norm + rope). The v_norm step below skips these layers. Bit-identical to
+            // copy + in-place norm; lands in this mm_qkv bucket instead of "norm".
+            rms_batch(s.v_b, s.k_b, t, t.rms_ones_off, head_size, npos * n_kv_heads)
+        } else {
+            copy_floats(s.k_b, 0l, s.v_b, 0l, npos * kv_dim)
+        }
     }
     if (c.attn_qkv_bias) {  // Qwen2: + bias per position before RoPE
         for (p in range64(npos)) {
@@ -3785,7 +4015,9 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     if (c.qk_norm) {  // Qwen3/gemma4: per-head RMSNorm on q/k before RoPE — q_b/k_b are npos*n_heads/n_kv_heads contiguous head_size rows
         let ts_qknorm = ref_time_ticks()
         rms_batch(s.q_b, s.q_b, t, t.rms_q_offs[l], head_size, npos * n_heads)
-        rms_batch(s.k_b, s.k_b, t, t.rms_k_offs[l], head_size, npos * n_kv_heads)
+        if (!kv_shared) {
+            rms_batch(s.k_b, s.k_b, t, t.rms_k_offs[l], head_size, npos * n_kv_heads)
+        }
         prof_add("norm", ts_qknorm)
     }
     // gemma4: weightless per-head RMSNorm on V (all-ones weight; V is never roped). V-from-K layers
@@ -3801,24 +4033,29 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     // p-RoPE arches (gemma4) apply the rope_freqs factors to GLOBAL layers only.
     let ts_rope = ref_time_ticks()
     let swa_rope = is_sliding && has_dual_rope(c)
+    // shared-KV layers rope Q only (kv_dim = 0 makes the K rope a no-op; there's no K to store)
+    let rope_kv = kv_shared ? 0l : kv_dim
     if (use_rope_tab) {
         if (swa_rope) {
-            rope_batch_tab(s.q_b, s.k_b, s.rope_cos_swa, s.rope_sin_swa, c.rope_neox, npos, head_size, qd, kv_dim)
+            rope_batch_tab(s.q_b, s.k_b, s.rope_cos_swa, s.rope_sin_swa, c.rope_neox, npos, head_size, qd, rope_kv)
         } else {
-            rope_batch_tab(s.q_b, s.k_b, s.rope_cos, s.rope_sin, c.rope_neox, npos, head_size, qd, kv_dim)
+            rope_batch_tab(s.q_b, s.k_b, s.rope_cos, s.rope_sin, c.rope_neox, npos, head_size, qd, rope_kv)
         }
     } else {
         let theta = swa_rope ? c.rope_freq_base_swa : c.rope_freq_base
         let fscale = swa_rope ? c.rope_freq_scale_swa : c.rope_freq_scale
         let use_ff = !(c.rope_ff_global_only && is_sliding)
-        rope_batch(s.q_b, s.k_b, t, theta, fscale, start_pos, npos, head_size, qd, kv_dim, use_ff)
+        rope_batch(s.q_b, s.k_b, t, theta, fscale, start_pos, npos, head_size, qd, rope_kv, use_ff)
     }
     prof_add("rope", ts_rope)
     // store the roped k / raw v into the KV cache — a SEPARATE pass (provably identical to
     // interleaving: rope of pos p touches only q_b[p]/k_b[p], the copy reads only k_b[p]/v_b[p]).
-    let ts_kv = ref_time_ticks()
-    kv_store_batch(s.key_cache, s.value_cache, s.k_b, s.v_b, loff, start_pos, npos, kv_dim)
-    prof_add("kv_store", ts_kv)
+    // Shared-KV layers store nothing — the source layer (processed earlier) already cached its K/V.
+    if (!kv_shared) {
+        let ts_kv = ref_time_ticks()
+        kv_store_batch(s.key_cache, s.value_cache, s.k_b, s.v_b, loff, start_pos, npos, kv_dim)
+        prof_add("kv_store", ts_kv)
+    }
     // causal attention into xb_b (position ap attends to cached keys kstart..ap; kstart = 0 unless a
     // Gemma2 sliding-window layer past the window). Output for position p lands at xb_b[p*qd..]
     // (qd-strided), feeding the wo projection below. Algorithm (classic vs blocked) is A/B-selectable.
@@ -3872,7 +4109,8 @@ def private ffn_dense_prefill(t : Model; var s : Session; l : int64; npos : int6
         rms_batch(s.xb_b, s.xb_b, t, t.rms_post_ffn_off + l * dim, dim, npos)
     }
     add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb_b[0])), npos * dim)
-    if (c.layer_out_scale) {  // gemma4: scale the whole layer output (after the residual)
+    // E-series applies out_scale AFTER its PLE block (in ffn_gemma4_prefill) — skip it here when PLE is on
+    if (c.layer_out_scale && !has_ple(c)) {  // gemma4: scale the whole layer output (after the residual)
         let os = t.fblob[t.out_scale_off + l]
         scale_inplace(unsafe(addr(s.x_b[0])), os, npos * dim)
     }
@@ -4556,6 +4794,11 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
         scale_inplace(unsafe(addr(s.x_b[0])), c.embed_scale, npos * dim)
     }
     prof_add("embed", ts_embed)
+    if (has_ple(c)) {  // gemma-4 E-series: build each position's per-(layer) side input before the stack
+        let ts_ple = ref_time_ticks()
+        ple_pre_prefill(t, s, tokens, npos)
+        prof_add("ple", ts_ple)
+    }
 
     forward_prefill_body(t, s, npos, start_pos)
 }
@@ -4583,6 +4826,11 @@ def forward_prefill_embd(t : Model; var s : Session; embd : array<float>; npos, 
         s.x_b[i] = embd[i]
     }
     prof_add("embed", ts_embed)
+    if (has_ple(t.config)) {  // gemma-4 E-series: PLE side input (padding-token gather for the media path)
+        let ts_ple = ref_time_ticks()
+        ple_pre_prefill_pad(t, s, npos)
+        prof_add("ple", ts_ple)
+    }
     forward_prefill_body(t, s, npos, start_pos)
 }
 
@@ -4695,6 +4943,12 @@ def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : 
     s.hb2_b |> resize(npos * hidden)
     s.xqb |> resize(npos * maxn)
     s.xsb |> resize(npos * maxn / 32l)
+    if (has_ple(c)) {   // gemma-4 E-series PLE prefill scratch (npos positions)
+        let all = c.n_layers * c.n_embd_per_layer
+        s.ple_inp |> resize(npos * all)
+        s.ple_proj |> resize(npos * all)
+        s.ple_gate |> resize(npos * c.n_embd_per_layer)
+    }
     // per-head attention scratch, per the selected algorithm. classic uses one (start_pos+npos)-wide
     // score row per head; blocked needs ATTN_BLOCK_Q such rows per head (one per query in the block) —
     // size for blocked, classic indexes the first row of each head's block, so the wider allocation is

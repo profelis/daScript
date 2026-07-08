@@ -514,6 +514,32 @@ def test_parity_gemma4_26b(t : T?) {
     }
 }
 
+// gemma-4-E4B-it Q8 — the gemma4 arch's edge member (42 layers, embd 2560, 8Q/2KV heads;
+// PLE on with per_layer=256, cross-layer KV sharing over the last 18 layers, 5-local:1-global SWA,
+// window 512, softcap 30). Two features beyond the dense 12B/31B:
+//   • PLE (per-layer embeddings): a per-(token, layer) side input — gather the token's Q8 PLE row,
+//     project the scaled embedding through per_layer_model_proj, RMSNorm + combine — mixed into each
+//     layer's output by gelu(inp_gate·cur) ⊙ ple_inp[l] → proj → post_norm, before the layer scale.
+//   • Cross-layer KV sharing: the last 18 layers carry no attn_k/attn_v; they project Q only and attend
+//     against an earlier layer's cached K/V (sliding → kv_from_start-2, global → kv_from_start-1),
+//     mirroring llama.cpp gemma4's has_kv()/reuse(). Their own K/V weights are dead in the file (skipped).
+// A dense model, so it holds the full 40 token-for-token (verified 40/40 vs simple_ids, harness/parity.sh,
+// on the 1..320 counting prompt — the 512 window is genuinely engaged, kstart > 0). The continuation is
+// byte-identical to the 12B/31B (same counting momentum + vocab), so it reuses GEMMA4_12B_GEN.
+// Large-tier (~8 GB): DASLLAMA_PARITY_FULL=1.
+[test]
+def test_parity_gemma4_e4b(t : T?) {
+    t |> run("gemma4 forward (gemma-4-E4B-it Q8: per-layer embeddings + cross-layer KV sharing)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-E4B-it-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-e4b token-for-token")
+    }
+}
+
 // gpt-oss-20b (arch "gpt-oss", native-MXFP4 expert planes — attn/cls Q8) — the wave-5 stack: per-head
 // attention sinks, YaRN rope (factor 32 / 4096), alternating 128-token SWA, softmax-after-top-k
 // routing with router + per-expert + QKV + output-projection biases, clamped SwiGLU. Counting
