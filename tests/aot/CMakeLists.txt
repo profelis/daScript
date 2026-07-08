@@ -558,6 +558,11 @@ add_custom_target(test_aot_algorithm)
 SET(ALGORITHM_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_ALGORITHM_FILES}" ALGORITHM_AOT_GENERATED_SRC test_aot_algorithm daslang)
 
+add_custom_target(test_aot_md_boost)
+FILE(GLOB AOT_MD_BOOST_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/md_boost/*.das")
+SET(MD_BOOST_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_MD_BOOST_FILES}" MD_BOOST_AOT_GENERATED_SRC test_aot_md_boost daslang)
+
 add_custom_target(test_aot_apply)
 SET(APPLY_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_APPLY_FILES}" APPLY_AOT_GENERATED_SRC test_aot_apply daslang)
@@ -1022,6 +1027,7 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
     ${TEST_AOT_GENERATED_SRC}
     ${TESTING_AOT_GENERATED_SRC}
     ${ALGORITHM_AOT_GENERATED_SRC}
+    ${MD_BOOST_AOT_GENERATED_SRC}
     ${APPLY_AOT_GENERATED_SRC}
     ${ARCHIVE_AOT_GENERATED_SRC}
     ${LONG_ARRAY_TABLE_AOT_GENERATED_SRC}
@@ -1113,7 +1119,7 @@ add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
 TARGET_LINK_LIBRARIES(test_aot libDaScriptAot ${SRC_LIBRARIES} ${DAS_MODULES_LIBS})
 ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_tests test_aot_testing
-    test_aot_algorithm test_aot_apply test_aot_archive test_aot_long_array_table test_aot_ast_match
+    test_aot_algorithm test_aot_md_boost test_aot_apply test_aot_archive test_aot_long_array_table test_aot_ast_match
     test_aot_assert_once test_aot_async test_aot_bare_block test_aot_base64
     test_aot_bitfields test_aot_bool_array
     test_aot_class_boost
