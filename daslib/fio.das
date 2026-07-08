@@ -135,7 +135,9 @@ def mkdir_rec(path : string) : bool {
     return true if (path == "")
     var st : FStat
     return true if (stat(path, st) && st.is_dir)
-    mkdir_rec(dir_name(path))
+    let parent = dir_name(path)
+    return true if (parent == path)   // reached a root (e.g. a Windows drive root "E:") — nothing above to create
+    mkdir_rec(parent)
     return mkdir(path)
 }
 
@@ -144,7 +146,9 @@ def mkdir_rec(path : string; var error : string&) : bool {
     return true if (path == "")
     var st : FStat
     return true if (stat(path, st) && st.is_dir)
-    if (!mkdir_rec(dir_name(path), error)) return false
+    let parent = dir_name(path)
+    return true if (parent == path)   // reached a root (e.g. a Windows drive root "E:") — nothing above to create
+    if (!mkdir_rec(parent, error)) return false
     return mkdir(path, error)
 }
 
