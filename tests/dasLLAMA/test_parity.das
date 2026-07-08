@@ -6,6 +6,7 @@ require dasllama/dasllama   // the public facade — public-path tests exercise 
 require daslib/jobque_boost
 require daslib/fio
 require strings
+require _model_tier   // models_dir() + model_available() presence/size-tier gate (see the file's header)
 
 // Frozen token-for-token parity fixtures for the GGUF arches that stories15M (test_forward.das)
 // doesn't cover. Each fixture is a prompt-ID list + the reference greedy continuation that
@@ -15,12 +16,6 @@ require strings
 //
 // Prompts are deliberately the *confident* ones: high-entropy prompts flip on genuine near-ties
 // (sub-ULP libm cos/sin/exp/tanh vs llama.cpp), which are not bugs. See dasllama_newmodels_arc.
-
-// override the machine-local model root with DASLLAMA_MODELS_DIR (e.g. on the x64 handoff box)
-def private models_dir() : string {
-    let env = get_env_variable("DASLLAMA_MODELS_DIR")
-    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
-}
 
 def private same(a, b : array<int64>) : bool {
     if (length(a) != length(b)) {
@@ -91,10 +86,7 @@ def test_parity_tied_cls_q8_rows(t : T?) {
             return
         }
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var t32 <- load_gguf(path, QuantMode.fp32)
         var t8 <- load_gguf(path, QuantMode.q8)
         t |> success(!t32.cls_q8, "fp32 load keeps the fblob table")
@@ -137,10 +129,7 @@ def test_parity_gemma2(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, GEMMA2_PROMPT, GEMMA2_GEN), "gemma2 token-for-token")
     }
 }
@@ -161,10 +150,7 @@ def test_parity_tinyllama_v03(t : T?) {
             return
         }
         let path = path_join(models_dir(), "tinyllama-1.1b-v0.3-f16.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.fp32, TINYLLAMA_V03_PROMPT, TINYLLAMA_V03_GEN), "tinyllama v0.3 token-for-token")
     }
 }
@@ -185,10 +171,7 @@ def test_parity_llama3_2_1b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, LLAMA32_1B_PROMPT, LLAMA32_1B_GEN), "llama-3.2-1b token-for-token")
     }
 }
@@ -211,10 +194,7 @@ def test_parity_qwen25_15b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Qwen2.5-1.5B-Instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, QWEN25_15B_PROMPT, QWEN25_15B_GEN), "qwen2.5-1.5b token-for-token")
     }
 }
@@ -236,10 +216,7 @@ def test_parity_phi35(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, PHI35_PROMPT, PHI35_GEN), "phi-3.5 token-for-token")
     }
 }
@@ -259,10 +236,7 @@ def test_parity_smollm2(t : T?) {
             return
         }
         let path = path_join(models_dir(), "SmolLM2-1.7B-Instruct-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, SMOLLM2_PROMPT, SMOLLM2_GEN), "smollm2 token-for-token")
     }
 }
@@ -282,10 +256,7 @@ def test_parity_mistral7b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Mistral-7B-Instruct-v0.3-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, MISTRAL7B_PROMPT, MISTRAL7B_GEN), "mistral-7b-v0.3 token-for-token")
     }
 }
@@ -308,10 +279,7 @@ def test_parity_qwen3_06b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, QWEN3_PROMPT, QWEN3_GEN), "qwen3-0.6b token-for-token")
     }
 }
@@ -324,10 +292,7 @@ def test_parity_qwen3_4b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Qwen3-4B-Instruct-2507-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, QWEN3_PROMPT, QWEN3_GEN), "qwen3-4b token-for-token")
     }
 }
@@ -346,10 +311,7 @@ def test_parity_qwen2moe(t : T?) {
             return
         }
         let path = path_join(models_dir(), "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var tr <- load_gguf(path, QuantMode.q8)
         if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
             tr.config.seq_len = 2048l
@@ -357,6 +319,40 @@ def test_parity_qwen2moe(t : T?) {
         t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen2moe token-for-token")
         set_moe_grouped_prefill(false)
         t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen2moe reference-prefill token-for-token")
+        set_moe_grouped_prefill(true)
+        delete tr
+    }
+}
+
+// Qwen3-30B-A3B Q8 — the qwen3moe arch: Qwen3 attention (per-head QK-norm pre-RoPE, NEOX rope, no
+// QKV bias) with routed experts — softmax router → RENORMALIZED top-8-of-128, and NO shared expert
+// (vs qwen2moe's un-renormalized top-4 + sigmoid shared expert). Same Qwen BPE vocab and counting
+// continuation as the dense Qwen fixtures, so the id arrays are shared. Runs through BOTH MoE prefill
+// paths off one load (grouped default + per-position reference) — bit-identical by construction.
+//
+// Unlike the gemma-4-26B MoE (which capped at 11), qwen3moe holds the full 40-token counting
+// continuation token-for-token: at every confident step das tracks the oracle (verified through
+// oracle margins as tight as 0.08 logits on a prose probe), with no systematic router flips — the
+// shared float `ffn_norm` already tracks ggml's double-accumulated norm closely enough for the
+// discrete top-8-of-128 pick. High-entropy prompts still diverge at the model's OWN near-ties (a
+// prose probe flips at the first coin-flip: oracle top-1/top-2 gap 0.04 at step 6, das picks the
+// oracle's #2 — not a forward bug). Large-tier (~32 GB): DASLLAMA_PARITY_FULL=1.
+[test]
+def test_parity_qwen3moe_30b(t : T?) {
+    t |> run("qwen3moe forward (Qwen3-30B-A3B Q8: QK-norm attn, softmax top-8-of-128 renormalized, no shared expert)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Qwen3-30B-A3B-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3moe token-for-token")
+        set_moe_grouped_prefill(false)
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3moe reference-prefill token-for-token")
         set_moe_grouped_prefill(true)
         delete tr
     }
@@ -399,10 +395,7 @@ def test_parity_gemma3_1b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gemma-3-1b-it-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, GEMMA3_1B_PROMPT, GEMMA3_1B_GEN), "gemma3-1b token-for-token")
     }
 }
@@ -415,10 +408,7 @@ def test_parity_gemma3_4b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gemma-3-4b-it-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         t |> success(parity_ok(path, QuantMode.q8, GEMMA3_PROMPT, GEMMA3_4B_GEN), "gemma3-4b token-for-token")
     }
 }
@@ -468,11 +458,104 @@ def test_parity_gemma4_12b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gemma-4-12B-it-Q8_0.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-12b token-for-token")
+    }
+}
+
+// gemma-4-31B-it Q8 — the SAME heterogeneous gemma4 arch as the 12B, scaled up (60 layers,
+// embd 5376, 32Q/[16x5,4]KV heads; PLE off, shared_kv 0, softcap 30, 5-local:1-global SWA).
+// A verify-only slice: it runs the existing gemma4 forward with no code change, and continues
+// the 1..320 counting prompt byte-identically to the 12B (same vocab, both count) — so it reuses
+// GEMMA4_12B_GEN. Verified 40/40 vs simple_ids (harness/parity.sh) 2026-07-07. Large-tier
+// (32 GB): the fast loop skips it; DASLLAMA_PARITY_FULL=1 runs it.
+[test]
+def test_parity_gemma4_31b(t : T?) {
+    t |> run("gemma4 forward (gemma-4-31B-it Q8, same arch as 12B scaled: 60L/5376d)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
-        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-12b token-for-token")
+        let path = path_join(models_dir(), "gemma-4-31B-it-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-31b token-for-token")
+    }
+}
+
+// gemma-4-26B-A4B-it Q8 — the gemma4 arch's MoE member (30 layers, embd 2816, 16Q/[8×5,2]KV heads;
+// 128 experts top-8, expert_ff 704; PLE off, softcap 30, SWA 1024). Every layer sums two parallel
+// branches: a DENSE shared expert (ffn_norm → GeGLU → post_ffw_norm_1) and routed experts
+// (pre_ffw_norm_2 → softmax top-8-renormalized → post_ffw_norm_2), with a custom-normalized router
+// (weightless-RMS(attn_out) × 1/√dim × ffn_gate_inp_s), fused gate_up expert stacks split at load,
+// and a per-expert down-output scale.
+//
+// The continuation is capped at 11 tokens (the dense 12B/31B run the full 40). Unlike a dense model,
+// this MoE routes a DISCRETE top-8-of-128 per layer, so at a router near-tie dasLLAMA's float
+// residual stream can land on the other side of the coin-flip from llama.cpp and pick a different
+// expert — a real O(1) output shift. That is NOT a forward bug: verified against llama.cpp's own
+// per-step logit margins, the divergences sit exactly where the *oracle itself* is near-tied (top-1
+// vs top-2 gap ~0.5–2.2 at counting steps 12/26/32/38). The router-input RMS is double-accumulated
+// to match ggml (`ggml_float`), which removes the SYSTEMATIC flips (steps where the oracle is
+// confident); what remains is irreducible near-tie sensitivity no float engine can pin. The first 11
+// counting tokens are all oracle-confident (gap >6) and match token-for-token. Details:
+// modules/dasLLAMA/model_expansion_plan.md (Wave G2). Large-tier (~26 GB): DASLLAMA_PARITY_FULL=1.
+let GEMMA4_26B_GEN <- [236743l, 236800l, 236778l, 236770l, 236764l, 236743l, 236800l, 236778l, 236778l, 236764l, 236743l]
+
+[test]
+def test_parity_gemma4_26b(t : T?) {
+    t |> run("gemma4 MoE forward (gemma-4-26B-A4B-it Q8: dense shared expert + routed top-8-of-128)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-26B-A4B-it-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_26B_GEN), "gemma4-26b token-for-token")
+    }
+}
+
+// gemma-4-E4B-it Q8 — the gemma4 arch's edge member (42 layers, embd 2560, 8Q/2KV heads;
+// PLE on with per_layer=256, cross-layer KV sharing over the last 18 layers, 5-local:1-global SWA,
+// window 512, softcap 30). Two features beyond the dense 12B/31B:
+//   • PLE (per-layer embeddings): a per-(token, layer) side input — gather the token's Q8 PLE row,
+//     project the scaled embedding through per_layer_model_proj, RMSNorm + combine — mixed into each
+//     layer's output by gelu(inp_gate·cur) ⊙ ple_inp[l] → proj → post_norm, before the layer scale.
+//   • Cross-layer KV sharing: the last 18 layers carry no attn_k/attn_v; they project Q only and attend
+//     against an earlier layer's cached K/V (sliding → kv_from_start-2, global → kv_from_start-1),
+//     mirroring llama.cpp gemma4's has_kv()/reuse(). Their own K/V weights are dead in the file (skipped).
+// A dense model, so it holds the full 40 token-for-token (verified 40/40 vs simple_ids, harness/parity.sh,
+// on the 1..320 counting prompt — the 512 window is genuinely engaged, kstart > 0). The continuation is
+// byte-identical to the 12B/31B (same counting momentum + vocab), so it reuses GEMMA4_12B_GEN.
+// Large-tier (~8 GB): DASLLAMA_PARITY_FULL=1.
+[test]
+def test_parity_gemma4_e4b(t : T?) {
+    t |> run("gemma4 forward (gemma-4-E4B-it Q8: per-layer embeddings + cross-layer KV sharing)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-E4B-it-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-e4b token-for-token")
+    }
+}
+
+// gemma-4-E2B-it Q8 — the smaller edge model (35 layers, embd 1536, 8Q/1KV heads; PLE + cross-layer
+// KV sharing exactly as the E4B, plus one extra feature: **per-layer FFN width** (feed_forward_length
+// is a per-layer array — 6144 for layers 0-14, 12288 for 15-34 — the elastic MatFormer sub-model of
+// the E4B). The dense FFN weight offsets vary per layer (ffn_w / w1_offs·w2_offs·w3_offs); hidden_dim
+// is the max for scratch. Dense, so the full 40 hold (40/40 vs simple_ids on the window-engaged 1..320
+// counting prompt); reuses GEMMA4_12B_GEN. Fast-tier (~5 GB): runs in the default loop.
+[test]
+def test_parity_gemma4_e2b(t : T?) {
+    t |> run("gemma4 forward (gemma-4-E2B-it Q8: PLE + KV sharing + per-layer FFN width)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-e2b token-for-token")
     }
 }
 
@@ -516,10 +599,7 @@ def test_parity_gptoss_20b(t : T?) {
             return
         }
         let path = path_join(models_dir(), "gpt-oss-20b-mxfp4.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var tr <- load_model(path, QuantMode.q8)
         if (tr.config.seq_len > 2048l) {
             tr.config.seq_len = 2048l

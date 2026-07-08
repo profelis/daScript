@@ -1,6 +1,9 @@
 options gen2
 options persistent_heap   // model-scale allocations — freed per test
-options stack = 65536
+// The uniform AsrModel/AsrSession union every backend's model+scratch by value (whisper, qwen3a,
+// parakeet, canary, gemma4a) — ~5 KB / ~10 KB each now; tests holding two (q8-gate) or nesting
+// load frames (parakeet) need headroom above the default. Bumped for the 6-backend union.
+options stack = 131072
 
 require dastest/testing_boost public
 require dasllama/dasllama_whisper
@@ -12,6 +15,7 @@ require daslib/jobque_boost
 require daslib/fio
 require math
 require strings
+require _model_tier   // model_available() presence/size-tier gate (see the file's header)
 
 // Whisper-proper tests. The f16/gelu/mel/id tests are self-contained; the loader and
 // transcription tests need a whisper.cpp ggml-tiny.bin (gitignored) and skip without it.
@@ -25,6 +29,12 @@ def private whisper_models_dir() : string {
 def private samples_dir() : string {
     let env = get_env_variable("DASLLAMA_MODELS_DIR")
     return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+}
+
+// the ASR corpus (jfk + LibriSpeech clips) lives under the repo's benchmarks/asr, gitignored
+def private corpus_dir() : string {
+    let env = get_env_variable("DASLLAMA_CORPUS_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/daScript/modules/dasLLAMA/benchmarks/asr/corpus/" : env
 }
 
 // Minimal RIFF/WAVE reader for the 16-bit PCM mono test fixture (jfk.wav).
@@ -227,10 +237,7 @@ def test_dec_layer_layout(t : T?) {
 def test_whisper_loader(t : T?) {
     t |> run("tiny bin: hparams, special ids, vocab (needs ggml-tiny.bin)") @(t : T?) {
         let path = path_join(whisper_models_dir(), "ggml-tiny.bin")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: ggml-tiny.bin not present")
-            return
-        }
+        if (!model_available(t, path)) return
         let w <- load_whisper_model(path)
         t |> equal(w.n_vocab, 51865l)
         t |> equal(w.enc.n_mel, 80l)
@@ -256,10 +263,7 @@ def test_whisper_loader(t : T?) {
 def test_asr_surface(t : T?) {
     t |> run("load_asr_model sniffs the bin + caps report whisper honestly") @(t : T?) {
         let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
-        if (!stat(model_path).is_valid) {
-            t |> success(true, "skipped: ggml-tiny.bin not present")
-            return
-        }
+        if (!model_available(t, model_path)) return
         var m <- load_asr_model(model_path)   // the sniff route: ggml magic + big vocab -> whisper
         t |> equal(m.whisper.n_vocab, 51865l, "loaded through the sniff")
         let c <- caps(m)
@@ -288,10 +292,7 @@ def test_qwen3a_tower(t : T?) {
             return
         }
         let path = path_join(samples_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: mmproj-Qwen3-ASR-0.6B-bf16.gguf not present")
-            return
-        }
+        if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -333,10 +334,7 @@ def test_parakeet_oracle(t : T?) {
             return
         }
         let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v2-f32.bin")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: ggml-parakeet-tdt-0.6b-v2-f32.bin not present")
-            return
-        }
+        if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -399,10 +397,7 @@ def test_parakeet_v3_oracle(t : T?) {
             return
         }
         let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v3-f32.bin")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: ggml-parakeet-tdt-0.6b-v3-f32.bin not present")
-            return
-        }
+        if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -445,10 +440,7 @@ def test_whisper_transcribe_oracle(t : T?) {
             return
         }
         let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
-        if (!stat(model_path).is_valid) {
-            t |> success(true, "skipped: ggml-tiny.bin not present")
-            return
-        }
+        if (!model_available(t, model_path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -524,10 +516,7 @@ def test_whisper_q8_gate(t : T?) {
             return
         }
         let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
-        if (!stat(model_path).is_valid) {
-            t |> success(true, "skipped: ggml-tiny.bin not present")
-            return
-        }
+        if (!model_available(t, model_path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
             t |> success(true, "skipped: jfk.wav not present")
@@ -570,5 +559,197 @@ def test_whisper_q8_gate(t : T?) {
         delete m.whisper.enc.fblob
         delete mf.whisper.dblob
         delete mf.whisper.enc.fblob
+    }
+}
+
+// Transcribe one corpus clip through the uniform ASR surface (fresh session) and gate its ids
+// against the frozen NeMo SALM greedy reference. Skips if the clip is absent.
+def private check_canary_clip(t : T?; m : AsrModel; wav : string; expected : array<int>) {
+    let samples <- read_wav_pcm16_mono(wav)
+    if (empty(samples)) {
+        t |> success(true, "skipped: {base_name(wav)} not present")
+        return
+    }
+    var s <- create_session(m, "en")
+    var segs : array<TranscribeSegment>
+    transcribe(m, s, samples) $(seg) {
+        segs |> push_clone(seg)
+    }
+    t |> equal(length(segs), 1, "{base_name(wav)}: one segment")
+    t |> equal(length(segs[0].tokens), length(expected), "{base_name(wav)}: token count")
+    for (a, b in segs[0].tokens, expected) {
+        t |> equal(a, b, "{base_name(wav)}: token id")
+    }
+    t |> equal(s.detected_lang, "en", "{base_name(wav)}: english")
+}
+
+[test]
+def test_canary_qwen_oracle(t : T?) {
+    t |> run("Canary-Qwen 2.5B greedy is token-for-token with the NeMo SALM oracle") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        if (!parity_full_mode()) {   // ~6.7 GB two-file (decoder GGUF + f32 encoder bin) — large-tier
+            t |> success(true, "skipped: canary-qwen is large-tier — set DASLLAMA_PARITY_FULL=1 to run")
+            return
+        }
+        let dec = path_join(samples_dir(), "canary-qwen-2.5b-decoder-f16.gguf")
+        let enc = path_join(samples_dir(), "canary-qwen-2.5b-encoder-f32.bin")
+        if (!model_available(t, dec) || !model_available(t, enc)) {
+            return
+        }
+        // the two-file route: decoder GGUF (LoRA-merged Qwen3-1.7B) + "CNRY" FastConformer bin
+        var m <- load_asr_model(dec, enc)
+        let c <- caps(m)
+        t |> equal(length(c.languages), 1, "English-only")
+        t |> success(!c.translate && c.timestamps == AsrTimestamps.none && !c.streaming, "no translate / timestamps / streaming")
+        t |> equal(m.cenc.n_layer, 32l, "FastConformer-32")
+        t |> equal(m.cenc.proj_dim, 2048l, "projects to the Qwen3 hidden width")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            // Frozen NeMo SALM greedy ids (harness/canary_qwen_expected.tsv); trailing 151645 = text EOS
+            check_canary_clip(t, m, path_join(corpus_dir(), "jfk.wav"),
+                [3036, 773, 847, 12357, 8877, 2548, 537, 1128, 697, 3146, 646, 653, 369, 498, 2548,
+                 1128, 498, 646, 653, 369, 697, 3146, 151645])
+            check_canary_clip(t, m, path_join(corpus_dir(), "librispeech/09_1089-134686-0008.wav"),
+                [785, 26915, 304, 892, 806, 83909, 413, 55707, 3304, 5086, 572, 264, 9255, 11, 78908,
+                 6540, 315, 5561, 151645])
+            check_canary_clip(t, m, path_join(corpus_dir(), "librispeech/05_1089-134686-0004.wav"),
+                [2833, 5779, 29160, 451, 11896, 374, 8580, 389, 498, 13, 7684, 3729, 9972, 151645])
+        }
+        delete m.dec.wblob
+        delete m.cenc.blob
+    }
+}
+
+// Gemma-4 E2B audio: greedy no-think transcription is token-for-token with llama-mtmd-cli through
+// the confident prefix. The gemma4a Conformer encoder soft tokens match mtmd's audio embeddings at
+// rel ~0.0027 (float-reduction-order noise); the full transcription diverges only at the Gemma-4
+// q8 decoder's OWN ~0.6-logit near-tie (llama.cpp's raw logits at that step: three tokens within
+// 0.6), the qwen3moe/gemma-26B situation. So the fixture asserts the confident head, not the tail.
+// Oracle: llama-mtmd-cli -m E2B-Q8 --mmproj bf16 --audio clip --temp 0 --jinja (no-think turn).
+[test]
+def test_gemma4a_audio_oracle(t : T?) {
+    t |> run("Gemma-4 E2B audio greedy is token-for-token with llama-mtmd-cli (confident prefix)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let dec = path_join(samples_dir(), "gemma-4-E2B-it-Q8_0.gguf")
+        let mmproj = path_join(samples_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
+        if (!model_available(t, dec) || !model_available(t, mmproj)) {
+            return
+        }
+        var m <- load_asr_model(dec, mmproj)
+        t |> equal(m.g4a.n_layer, 12l, "gemma4a Conformer, 12 blocks")
+        t |> equal(m.g4a.d_model, 1024l, "audio d_model 1024")
+        t |> equal(m.g4a.n_head, 8l, "8 heads")
+        t |> equal(m.g4a.proj_dim, m.dec.config.dim, "projects into the Gemma-4 embedding width")
+        let wav = path_join(corpus_dir(), "gemma4a_test2.wav")
+        let samples <- read_wav_pcm16_mono(wav)
+        if (empty(samples)) {
+            t |> success(true, "skipped: gemma4a_test2.wav not present")
+            delete m.dec.wblob
+            delete m.g4a.blob
+            return
+        }
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var s <- create_session(m, "en")
+            var segs : array<TranscribeSegment>
+            transcribe(m, s, samples) $(seg) {
+                segs |> push_clone(seg)
+            }
+            t |> equal(length(segs), 1, "one segment")
+            // frozen llama-mtmd-cli no-think greedy ids (first 40 tokens — the confident prefix
+            // before the model's own ~0.6-logit near-tie at step 48). "The New York Times from
+            // July 21st, 1969. This isn't just newsprint and ink. This is the moment when..."
+            let expected = [818, 1799, 3773, 11922, 699, 5505, 236743, 236778, 236770, 540,
+                            236764, 236743, 236770, 236819, 236825, 236819, 236761, 1174, 5889, 236789,
+                            236745, 1164, 4668, 1995, 532, 19764, 236761, 1174, 563, 506,
+                            3479, 1056, 27069, 236789, 236751, 24625, 9156, 5452, 3645, 236772]
+            t |> success(int64(length(segs[0].tokens)) >= int64(length(expected)),
+                "emitted at least {length(expected)} tokens ({length(segs[0].tokens)})")
+            var mismatches = 0
+            for (i in range(min(length(expected), length(segs[0].tokens)))) {
+                if (segs[0].tokens[i] != expected[i]) {
+                    mismatches++
+                }
+            }
+            t |> success(mismatches == 0, "confident prefix token-for-token ({mismatches} mismatches)")
+            t |> equal(s.detected_lang, "en", "english")
+        }
+        delete m.dec.wblob
+        delete m.g4a.blob
+    }
+}
+
+// Transcribe one corpus clip through the uniform ASR surface (fresh session) and gate its ids
+// against the frozen llama-mtmd-cli greedy reference. Skips if the clip is absent.
+def private check_q3omni_clip(t : T?; m : AsrModel; wav : string; expected : array<int>) {
+    let samples <- read_wav_pcm16_mono(wav)
+    if (empty(samples)) {
+        t |> success(true, "skipped: {base_name(wav)} not present")
+        return
+    }
+    var s <- create_session(m, "auto")
+    var segs : array<TranscribeSegment>
+    transcribe(m, s, samples) $(seg) {
+        segs |> push_clone(seg)
+    }
+    t |> equal(length(segs), 1, "{base_name(wav)}: one segment")
+    t |> equal(length(segs[0].tokens), length(expected), "{base_name(wav)}: token count")
+    for (a, b in segs[0].tokens, expected) {
+        t |> equal(a, b, "{base_name(wav)}: token id")
+    }
+}
+
+// Qwen3-Omni-30B audio-in/text-out: the SHARED qwen3a AuT tower (proj_dim 2048) + the qwen3vlmoe
+// MoE thinker (= qwen3moe + M-RoPE-degenerate-to-1D + inert deepstack for audio). Greedy transcription
+// (--temp 0 --jinja, bare user turn on the non-thinking Instruct thinker) is token-for-token with
+// llama-mtmd-cli on the same Q8 thinker + bf16 mmproj — the FULL id sequence incl. the trailing
+// <|im_end|> (151645), with NO near-tie divergence (unlike gemma4a/qwen3moe-decoder near-ties).
+// Oracle: llama-mtmd-cli -m Q8 --mmproj bf16 --audio clip -p "Transcribe the audio." --temp 0 --jinja.
+[test]
+def test_qwen3omni_audio_oracle(t : T?) {
+    t |> run("Qwen3-Omni-30B greedy audio transcription is token-for-token with llama-mtmd-cli") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        if (!parity_full_mode()) {   // ~34 GB (Q8 thinker + bf16 mmproj) — large-tier
+            t |> success(true, "skipped: Qwen3-Omni-30B is large-tier — set DASLLAMA_PARITY_FULL=1 to run")
+            return
+        }
+        let dec = path_join(samples_dir(), "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf")
+        let mmproj = path_join(samples_dir(), "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf")
+        if (!model_available(t, dec) || !model_available(t, mmproj)) {
+            return
+        }
+        var m <- load_asr_model(dec, mmproj)
+        t |> equal(m.dec.arch, "qwen3vlmoe", "the Qwen3-Omni MoE thinker")
+        t |> equal(m.q3t.core.n_layer, 32l, "AuT tower, 32 blocks")
+        t |> equal(m.q3t.core.d_model, 1280l, "audio d_model 1280")
+        t |> equal(m.q3t.proj_dim, m.dec.config.dim, "projects into the thinker embedding width (2048)")
+        let c <- caps(m)
+        t |> success(empty(c.languages) && !c.translate && c.timestamps == AsrTimestamps.none && !c.streaming,
+            "detects language internally, no translate / timestamps / streaming")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            // frozen llama-mtmd-cli --temp 0 --jinja greedy ids (trailing 151645 = <|im_end|> EOG)
+            check_q3omni_clip(t, m, path_join(corpus_dir(), "jfk.wav"),
+                [3036, 773, 11, 847, 12357, 8877, 11, 2548, 537, 1128, 697, 3146, 646, 653, 369,
+                 498, 11, 2548, 1128, 498, 646, 653, 369, 697, 3146, 13, 151645])
+            check_q3omni_clip(t, m, path_join(corpus_dir(), "librispeech/09_1089-134686-0008.wav"),
+                [785, 26915, 304, 892, 806, 83909, 269, 55707, 3304, 5086, 572, 264, 9255, 11,
+                 78908, 6540, 315, 5561, 13, 151645])
+            check_q3omni_clip(t, m, path_join(corpus_dir(), "librispeech/05_1089-134686-0004.wav"),
+                [2833, 5779, 11, 7722, 451, 613, 645, 374, 8580, 389, 498, 13, 7684, 3729, 11,
+                 9972, 13, 7684, 3729, 13, 151645])
+        }
+        delete m.dec.wblob
+        delete m.q3t.core.fblob
+        delete m.q3t.cblob
     }
 }

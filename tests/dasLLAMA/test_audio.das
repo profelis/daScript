@@ -8,15 +8,12 @@ require dasllama/dasllama_math   // setup_dasllama_jobque_
 require daslib/jobque_boost
 require daslib/fio
 require math
+require _model_tier   // models_dir() + model_available() presence/size-tier gate (see the file's header)
 
 // Audio tower tests. The mel/gelu/filterbank tests are self-contained; the encoder test
 // needs the locally-converted Qwen2-Audio mmproj (2.5 GB, gitignored) and skips without it.
 // The oracle constants come from llama.cpp's mtmd (llama-mtmd-debug, CPU backend) — the rig
 // and end-to-end token parity runs live in modules/dasLLAMA/qwen2_audio_plan.md.
-def private models_dir() : string {
-    let env = get_env_variable("DASLLAMA_MODELS_DIR")
-    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
-}
 
 [test]
 def test_gelu_erf(t : T?) {
@@ -131,10 +128,7 @@ def test_swiglu_swapped(t : T?) {
 def test_ultravox_tower(t : T?) {
     t |> run("ultravox mmproj: stack-8 projector shapes + 187 tokens/chunk") @(t : T?) {
         let path = path_join(models_dir(), "mmproj-ultravox-1b-f32.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: mmproj-ultravox-1b-f32.gguf not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var tw <- load_audio_tower(path)
         t |> success(tw.proj_kind == AudioProjKind.ultravox, "kind")
         t |> equal(tw.stack_factor, 8l, "stack factor")
@@ -176,10 +170,7 @@ def test_ultravox_tower(t : T?) {
 def test_voxtral_tower(t : T?) {
     t |> run("voxtral mmproj: avg-pool + stack-4 projector shapes + 187 tokens/chunk") @(t : T?) {
         let path = path_join(models_dir(), "voxtral-mini-mmproj-f32.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: voxtral-mini-mmproj-f32.gguf not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var tw <- load_audio_tower(path)
         t |> success(tw.proj_kind == AudioProjKind.voxtral, "kind")
         t |> equal(tw.stack_factor, 4l, "stack factor")
@@ -221,10 +212,7 @@ def test_voxtral_tower(t : T?) {
 def test_omni_tower(t : T?) {
     t |> run("qwen2.5o mmproj: audio side is qwen2a verbatim, vision tensors skipped") @(t : T?) {
         let path = path_join(models_dir(), "mmproj-omni-3b-f32.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: mmproj-omni-3b-f32.gguf not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var tw <- load_audio_tower(path)   // loading at all proves the v.* tensors are skipped
         t |> success(tw.proj_kind == AudioProjKind.qwen2a, "kind aliases qwen2a")
         t |> equal(tw.proj_dim, 2048l, "proj_dim (3B decoder)")
@@ -242,10 +230,7 @@ def test_encoder_oracle(t : T?) {
             return
         }
         let path = path_join(models_dir(), "qwen2audio-mmproj-f32.gguf")
-        if (!stat(path).is_valid) {
-            t |> success(true, "skipped: qwen2audio-mmproj-f32.gguf not present")
-            return
-        }
+        if (!model_available(t, path)) return
         var tw <- load_audio_tower(path)
         t |> equal(tw.n_mel, 128l, "n_mel")
         t |> equal(tw.d_model, 1280l, "d_model")

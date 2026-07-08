@@ -94,11 +94,14 @@ FILE(GLOB AOT_DASPEG_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tes
 
 # AOT for dasLLAMA test files
 FILE(GLOB AOT_DASLLAMA_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/dasLLAMA/*.das")
+# _*.das are shared fixture modules (AOT'd via AOT_DASLLAMA_MODULE_FILES below), not scripts
+list(FILTER AOT_DASLLAMA_FILES EXCLUDE REGEX "/_")
 
 # dasLLAMA shared-module library files (required by the tests; AOT'd as a lib so the
 # shared-module functions get one canonical AOT registration matching the runtime).
 # Leaf modules first so cross-module deps resolve.
 SET(AOT_DASLLAMA_MODULE_FILES
+    tests/dasLLAMA/_model_tier.das
     modules/dasLLVM/daslib/aarch64_neon.das
     modules/dasLLVM/daslib/x64_avx.das
     modules/dasLLAMA/dasllama/dasllama_math.das
@@ -116,6 +119,8 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_whisper.das
     modules/dasLLAMA/dasllama/dasllama_qwen3a.das
     modules/dasLLAMA/dasllama/dasllama_parakeet.das
+    modules/dasLLAMA/dasllama/dasllama_canary.das
+    modules/dasLLAMA/dasllama/dasllama_gemma4a.das
     modules/dasLLAMA/dasllama/dasllama_arch_llama.das
     modules/dasLLAMA/dasllama/dasllama_arch_qwen2.das
     modules/dasLLAMA/dasllama/dasllama_arch_qwen3.das
@@ -124,6 +129,7 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_arch_gemma3.das
     modules/dasLLAMA/dasllama/dasllama_arch_gemma4.das
     modules/dasLLAMA/dasllama/dasllama_arch_qwen2moe.das
+    modules/dasLLAMA/dasllama/dasllama_arch_qwen3moe.das
     modules/dasLLAMA/dasllama/dasllama_arch_gptoss.das
     modules/dasLLAMA/dasllama/dasllama_transformer.das
     modules/dasLLAMA/dasllama/dasllama_asr.das
