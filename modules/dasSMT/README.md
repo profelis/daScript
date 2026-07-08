@@ -10,6 +10,7 @@ Enable with `-DDAS_SMT_DISABLED=OFF`.
 - `daslib/smt_boost.das` — raw-API helpers: context/solver lifecycle, error polling, array-argument wrappers
 - `daslib/smt_expr.das` — typed symbolic values (`SInt`/`SBool`/`SReal`/`SString`), Z3py-style solver/model API
 - `daslib/smt_macro.das` — `constrain` / `smt_formula` macros and `[smt_fn]` function lifting
+- `examples/` — `hello_z3.das` (raw C API), `hello_smtlib.das` (SMT-LIB text), `hello_api.das` (typed API), `atlas_packing.das` + `entity_placement.das` (showcases), `theorems.das` (`[smt_fn]` over Diophantine equations: Z3 solves Euler #9, but Fermat n=3 is undecidable)
 
 ## The three levels
 
