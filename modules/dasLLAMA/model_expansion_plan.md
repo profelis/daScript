@@ -148,10 +148,22 @@ four remain. Order inside the wave = cheapest first, each gated before the next 
      Existing arches byte-unchanged (all new paths gate on `has_ple` / `kv_src[l]!=l` /
      `ffn_w`, all off elsewhere); parity suite green. The channel-aware chat template + the
      per-class head-size machinery were already in place from G1/G2.
-   - **▶ PENDING: the section-closing prefill + decode A/B vs lcpp** (the new standing rule).
-     Both models' prefill rides the batched `forward_prefill_body` (batched attn +
-     `ffn_dense_prefill` + `ple_block_prefill`), NOT naive — needs a Parsec-off window to
-     measure vs `llama-bench -ngl 0`.
+   - **✅ Section-closing prefill + decode A/B vs lcpp** (M1 Max, Parsec off, box profile,
+     das best-of-4; lcpp `llama-bench -ngl 0 -t 8`). Prefill rides the batched
+     `forward_prefill_body` (batched attn + `ffn_dense_prefill` + `ple_block_prefill`), NOT
+     naive. **das is at PARITY on the dense E-series — no lead, no meaningful gap:**
+     - **E2B** — prefill das **376 t/s** (pp512) / 405 (pp256) vs lcpp **382** = **0.98×**
+       (ahead at pp256); decode das **36.0 t/s** (ctx8) vs lcpp tg128 **36.9** = **0.98×**.
+     - **E4B** — prefill das **178.7 t/s** (pp512) vs lcpp **192.9** = **0.93×**; decode das
+       **18.7 t/s** (ctx8) vs lcpp tg128 **19.2** = **0.98×**.
+     Unlike the MoE waves (Q/G2 LED lcpp via GROUPED prefill — a sparsity lever), these are
+     DENSE: prefill has no batching win to exploit, so it's das NEON-SDOT vs lcpp
+     Accelerate-BLAS (AMX-backed), and the larger E4B GEMM favors AMX more (hence 0.93× vs
+     E2B's 0.98×). Decode is bandwidth-bound → tied both models. Rigs: `benchmarks/
+     prefill_perf.das` (batched vs per-token), `benchmarks/decode_prof.das` (two ctx windows).
+     **Ledger:** the E4B dense-prefill 0.93× is the AMX-access asymmetry (documented, boxes
+     w/o AMX exposure). Potential das-side lever: a gemm-gen tuned Q8 kernel for the E-series
+     dims (dim 2560 × ff 10240) — not chased mid-wave.
 
    Original probe notes (all resolved above):
    PROBED 2026-07-07; slice RE-SIZED DOWN to "PLE + KV-sharing," best case. Read of

@@ -364,6 +364,15 @@ what it costs today and what the fix would change.
   per-region "stay-fp32 when the mat fits cache and the box lacks int8-dot silicon" load
   heuristic (or a box_profile knob like batch_grid_2d) — DON'T build until the M1 decoder-q8
   re-sweep says whether sdot boxes want q8 everywhere (likely yes → knob would be x64-only).
+- **Gemma-4 E-series DENSE prefill trails lcpp Accelerate-BLAS on M1 (Wave G3 A/B, 2026-07-07).**
+  E4B pp512 das **178.7** vs lcpp **192.9 = 0.93×**; E2B pp512 das **376** vs lcpp **382 = 0.98×**
+  (E2B ties, E4B ~7% back). Decode tied both (bandwidth-bound: E4B 18.7/19.2, E2B 36.0/36.9).
+  Root: dense prefill has no sparsity/grouping lever (unlike the MoE waves that LED lcpp), so it's
+  das NEON-SDOT vs lcpp Accelerate-BLAS (AMX-backed) on the projection/FFN GEMMs — the larger E4B
+  dim (2560 × ff 10240) favors AMX more, hence 0.93× vs E2B's 0.98×. Cost today: ~7% E4B prefill
+  on M1 only; boxes without AMX exposure (zen2/SPR VNNI) already close it. Possible lever: a
+  gemm-gen tuned Q8 kernel for the E-series shapes (the tune framework already exists) — don't
+  build until an AMX-less box A/B says the shape actually leaves das-kernel headroom on the table.
 
 - **ASR short-clip fixed costs (parakeet, M1 — NEXT ROUND, Boris 2026-07-06; whisper tower
   q8 postponed one session behind it).** Cost today at matched 8T: jfk das 703 ms vs cli 352
