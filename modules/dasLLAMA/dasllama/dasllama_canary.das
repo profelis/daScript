@@ -357,13 +357,13 @@ def canary_log_mel(m : CanaryEncoder; samples : array<float> | #; var st : Canar
         for (i in range64(valid)) {
             sum += double(st.mel[i * n_mel + j])
         }
-        let mean = sum / double(valid)
+        let mean = sum / double(max(valid, 1l))
         var sq = 0.0lf
         for (i in range64(valid)) {
             let dv = double(st.mel[i * n_mel + j]) - mean
             sq += dv * dv
         }
-        let denom = sqrt(sq / (double(valid) - 1.0lf)) + 1e-5lf
+        let denom = sqrt(sq / max(double(valid) - 1.0lf, 1.0lf)) + 1e-5lf
         for (i in range64(n_len)) {
             st.mel[i * n_mel + j] = float((double(st.mel[i * n_mel + j]) - mean) / denom)
         }

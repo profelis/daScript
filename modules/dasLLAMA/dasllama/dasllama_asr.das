@@ -129,7 +129,8 @@ def load_asr_model(path : string; mmproj : string) : AsrModel {
     //! encoder is sniffed — a GGUF ``qwen3a`` mmproj is the AuT tower shared by Qwen3-ASR (dense
     //! qwen3 decoder) and Qwen3-Omni-30B (the qwen3vlmoe MoE thinker); a ``gemma4a`` mmproj is the
     //! Gemma-4 Conformer; a "CNRY" bin is the Canary-Qwen FastConformer encoder + projector
-    //! (LoRA-merged Qwen3-1.7B decoder). Decoder weights load fp32; context is capped at 8192.
+    //! (LoRA-merged Qwen3-1.7B decoder). The Canary decoder loads fp32 (its parity gate); the
+    //! gemma4a / qwen3a / qwen3omni text decoders load Q8. Context is capped at 8192.
     let ef = fopen(mmproj, "rb")
     if (ef == null) {
         panic("dasLLAMA asr: cannot open mmproj '{mmproj}'")

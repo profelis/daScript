@@ -362,7 +362,7 @@ def gemma4a_log_mel(enc : Gemma4aEncoder; samples : array<float> | #; off, len :
     let n_bins = enc.n_bins
     let pad_left = G4A_WINDOW / 2l
     let n_with_left = len + pad_left
-    let pt_frames = (n_with_left - (G4A_WINDOW + 1l)) / G4A_HOP + 1l
+    let pt_frames = max((n_with_left - (G4A_WINDOW + 1l)) / G4A_HOP + 1l, 1l)
     let n_padded_needed = (pt_frames - 1l) * G4A_HOP + G4A_N_FFT
     let total_pad = max(n_padded_needed - len, pad_left)
     let n_padded = total_pad + len
