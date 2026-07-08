@@ -88,6 +88,47 @@ def model_path(m : LlmModel) : string {
     return "{models_dir()}{m.file}"
 }
 
+//! The scoreboard spelling of a quant mode (the JSON `quant` cell).
+def quant_str(q : QuantMode) : string {
+    if (q == QuantMode.q8) {
+        return "q8"
+    }
+    if (q == QuantMode.q4) {
+        return "q4"
+    }
+    return "fp32"
+}
+
+//! Active (per-token) parameter count in billions, derived from `t`'s Config geometry: the full
+//! embedding (also the tied classifier) + attention + FFN, counting only the `n_expert_used` routed
+//! experts for MoE. Dense models get ~total; MoE gets the compute-relevant active size. Norms/biases
+//! (negligible) and the per-layer PLE embedding table (an embedding lookup, not a matmul) are omitted.
+def active_params_b(t : Model) : double {
+    let c = t.config
+    var p = c.vocab_size * c.dim   // token embedding (also the tied classifier when shared_weights)
+    for (l in range64(c.n_layers)) {
+        let qd = layer_qd(c, l)
+        let kvd = layer_kv_dim(c, l)
+        p += c.dim * qd + c.dim * kvd + qd * c.dim   // wq, wk, wo
+        if (t.wv_offs[l] >= 0l) {
+            p += c.dim * kvd                         // wv (absent on gemma-4 V-from-K layers)
+        }
+        if (c.moe) {
+            p += c.dim * c.n_expert                        // router
+            p += c.n_expert_used * 3l * c.dim * c.n_ff_exp // ACTIVE routed experts only
+            if (c.n_ff_shexp > 0l) {
+                p += 3l * c.dim * c.n_ff_shexp             // shared expert
+            }
+        } else {
+            p += 3l * c.dim * layer_hidden(t, l)           // dense gate / up / down
+        }
+    }
+    if (!c.shared_weights) {
+        p += c.dim * c.vocab_size                          // untied classifier
+    }
+    return double(p) / 1.0e9lf
+}
+
 //! True when `m` is present on disk AND in the requested tier. `sz` receives the file size (0 if absent).
 def model_selected(m : LlmModel; tier : Tier; var sz : uint64&) : bool {
     let st = stat(model_path(m))
