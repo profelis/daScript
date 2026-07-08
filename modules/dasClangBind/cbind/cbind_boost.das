@@ -79,7 +79,7 @@ def clang_typeToDasTypeUnqEx(var t : CXType; topLevel : bool; rules : TypeRules;
     } elif (t.kind == CXTypeKind.Double) {
         return "double"
     } elif (t.kind == CXTypeKind.NullPtr) {
-        let end = topLevel ? "?" : " ?"
+        let end = "?"
         return "void{end}"
     } elif (t.kind == CXTypeKind.Pointer) {
         var pt = clang_getCanonicalType(clang_getPointeeType(t))
@@ -89,12 +89,17 @@ def clang_typeToDasTypeUnqEx(var t : CXType; topLevel : bool; rules : TypeRules;
         } elif (rules.uchar_ptr_is_string && (pt.kind == CXTypeKind.Char_U || pt.kind == CXTypeKind.UChar)) {
             rest = "string"
         } elif (rules.structure_ptr_is_void_ptr && pt.kind == CXTypeKind.Record) {
-            let end = topLevel ? "?" : " ?";
+            let end = "?";
             rest = "void{end}"
         } else {
             let inner = clang_typeToDasTypeEx(pt, false, rules, error);
-            let end = topLevel ? "?" : " ?";
-            rest = "{inner}{end}"
+            // das-fmt canon: bare pointer chains glue as `T ??`, while a const
+            // split spells `T? const?` — migrate the space in front of the pair
+            if (inner |> ends_with("?")) {
+                rest = "{inner |> slice(0, length(inner) - 1)} ??"
+            } else {
+                rest = "{inner}?"
+            }
         }
         if (topLevel && rules.top_level_pointers_are_implicit) {
             return "{rest} implicit"
@@ -120,7 +125,7 @@ def clang_typeToDasTypeUnqEx(var t : CXType; topLevel : bool; rules : TypeRules;
         return string(clang_getTypeSpelling(t))
     } elif (t.kind == CXTypeKind.FunctionProto) {
         if (rules.function_proto_is_void_ptr) {
-            let end = topLevel ? "?" : " ?";
+            let end = "?";
             return "void{end}"
         } else {
             error += "unsupported type FunctionProto\n"
@@ -172,11 +177,11 @@ def clang_isForwardDeclaration(var cursor : CXCursor) {
     return clang_equalCursors(cursor, definition) == 0u
 }
 
-def clang_das_isRef(var c : CXType) {
+def clang_das_isRef(c : CXType) {
     return c.kind == CXTypeKind.LValueReference
 }
 
-def clang_das_isCopyOnReturn(var c : CXType) {
+def clang_das_isCopyOnReturn(c : CXType) {
     return c.kind == CXTypeKind.Record
 }
 
