@@ -300,19 +300,39 @@ converter" premise is wrong for this checkpoint; convert from safetensors direct
   yielding a plain Qwen3-1.7B. prompt_format `qwen`; SALM prompt "Transcribe the following:
   `<|audioplaceholder|>`" wrapped in the Qwen chat template, audio frames splice at the tag.
 
-### Remaining: the daslang model-implementation phase (NOT done this session).
+### daslang model-implementation phase — ✅ DONE 2026-07-08. Token-for-token vs the NeMo SALM oracle.
 
-Reuse-heavy but a real arch slice — the cleanest fit is the **two-file qwen3a pattern**:
-a LoRA-merged **Qwen3-1.7B GGUF** decoder + a **canary-encoder bin** (FastConformer+projector)
-as the "mmproj", loaded via `load_asr_model(decoder, encoder_bin)` (new `AsrKind.canary`),
-so the Qwen3-ASR audio-splice + greedy-decode rail carries most of it. Work: (1) safetensors
-→ (qwen3 GGUF + encoder bin) converter incl. the LoRA merge and the bf16→f32/Q8 transcode
-(extend `convert-parakeet-to-ggml.py` for the encoder half; the qwen3 half is a standard HF→GGUF
-+ LoRA-fold); (2) daslang FastConformer-32 forward = parakeet encoder **+ attention biases**,
-no TDT, then `perception.proj`; (3) splice into the qwen3 decoder + the SALM/Qwen prompt;
-(4) parity token-for-token vs `harness/canary_qwen_expected.tsv`; (5) README matrix row;
-(6) section-closing prefill+decode A/B (decoder-side only, vs standalone Qwen3-1.7B llama-bench
-`-ngl 0 -t 8`, since llama.cpp can't run the ASR model). Lands behind the uniform ASR surface.
+Shipped the **two-file qwen3a-shaped rail**: a LoRA-merged **Qwen3-1.7B GGUF** decoder + a
+"CNRY" **FastConformer encoder bin** loaded via `load_asr_model(decoder, encoder_bin)` (new
+`AsrKind.canary`, routed by the mmproj magic sniff), so the audio-splice + greedy-decode rail
+carries the decode. Delivered:
+- **(1) Converter** `harness/convert_canary_to_ggml.py` (safetensors direct, no NeMo import):
+  the decoder half reconstructs a Qwen3-1.7B HF checkpoint with the LoRA **merged** (`W += 2.0·B·A`
+  on q/v_proj) and runs `convert_hf_to_gguf.py`; the encoder half writes a self-describing
+  named-tensor f32 bin (bf16→f32 exact) of the FastConformer + `perception.proj`.
+- **(2) New module `dasllama_canary.das`** — a clean fp32 FastConformer-32 forward (NOT a
+  parakeet edit; parakeet's kernels are `private` + q8-tuned, so a self-contained module was the
+  safer/cleaner fit). Reuses the shared `mm_blob_b`/`layernorm_batch`/`gemm_f32`/`silu4_batch`
+  math. Carries the **qkv + ffn + conv biases** parakeet lacks; the depthwise conv bias folds
+  into BN. 🔑 **The load-bearing delta from parakeet was NeMo's `MaskedConvSequential`** — it
+  zeroes the time-rows past the propagated valid length (1100→550→275→138) BEFORE each stride-2
+  conv; without it the last conv row is wrong and the error compounds ~10% by the last layer.
+  With it, **every encoder layer matches the NeMo perception dump at rel 0.0 (OUT ≤1e-4)**.
+- **(3) `transcribe_canary`** splices the projector soft tokens at the SALM/Qwen chatml prompt
+  (`user\nTranscribe the following: <AUDIO><|im_end|>\n<|im_start|>assistant\n` — the exact ids
+  dumped from `formatter.encode_dialog`), greedy-decodes the Qwen3 decoder until the text EOS
+  (151645, emitted into the ids per the NeMo `generate` convention).
+- **(4) Parity** `test_canary_qwen_oracle` (`test_whisper.das`, large-tier ~6.7 GB two-file,
+  `DASLLAMA_PARITY_FULL=1`): **jfk + 2 LibriSpeech clips token-for-token** vs
+  `harness/canary_qwen_expected.tsv` (fresh session per clip — reuse across different-length
+  clips hits the shared decoder-KV subtlety, out of scope). **(5)** README matrix row.
+- **(6) Section-closing perf A/B rides `benchmarks/asr/` vs the NeMo reference engine**, exactly
+  like parakeet/whisper — **NOT llama.cpp** (zero canary/SALM support) and NOT onnx (onnx-asr
+  ships no canary export). Reference = `harness/`→`benchmarks/asr/canary_qwen_bench.py` (NeMo
+  SALM greedy, CPU, timed transcribe excl. load). das transcribe-ms + xRT vs NeMo in
+  `benchmarks/asr/results.md` + committed TSVs; das **leads** the NeMo reference ~1.3–1.5× even
+  at fp32 (M1 Max 8T). Ledger: the decoder loads fp32 for token-for-token safety — a q8 decoder
+  + q8 encoder is the obvious perf follow-up (not chased mid-wave; parity gate is fp32).
 
 ## Wave A2 — Gemma-4 E-series audio input
 

@@ -28,6 +28,12 @@ def private samples_dir() : string {
     return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
 }
 
+// the ASR corpus (jfk + LibriSpeech clips) lives under the repo's benchmarks/asr, gitignored
+def private corpus_dir() : string {
+    let env = get_env_variable("DASLLAMA_CORPUS_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/daScript/modules/dasLLAMA/benchmarks/asr/corpus/" : env
+}
+
 // Minimal RIFF/WAVE reader for the 16-bit PCM mono test fixture (jfk.wav).
 def private read_wav_pcm16_mono(path : string) : array<float> {
     var out : array<float>
@@ -550,5 +556,66 @@ def test_whisper_q8_gate(t : T?) {
         delete m.whisper.enc.fblob
         delete mf.whisper.dblob
         delete mf.whisper.enc.fblob
+    }
+}
+
+// Transcribe one corpus clip through the uniform ASR surface (fresh session) and gate its ids
+// against the frozen NeMo SALM greedy reference. Skips if the clip is absent.
+def private check_canary_clip(t : T?; m : AsrModel; wav : string; expected : array<int>) {
+    let samples <- read_wav_pcm16_mono(wav)
+    if (empty(samples)) {
+        t |> success(true, "skipped: {base_name(wav)} not present")
+        return
+    }
+    var s <- create_session(m, "en")
+    var segs : array<TranscribeSegment>
+    transcribe(m, s, samples) $(seg) {
+        segs |> push_clone(seg)
+    }
+    t |> equal(length(segs), 1, "{base_name(wav)}: one segment")
+    t |> equal(length(segs[0].tokens), length(expected), "{base_name(wav)}: token count")
+    for (a, b in segs[0].tokens, expected) {
+        t |> equal(a, b, "{base_name(wav)}: token id")
+    }
+    t |> equal(s.detected_lang, "en", "{base_name(wav)}: english")
+}
+
+[test]
+def test_canary_qwen_oracle(t : T?) {
+    t |> run("Canary-Qwen 2.5B greedy is token-for-token with the NeMo SALM oracle") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        if (!parity_full_mode()) {   // ~6.7 GB two-file (decoder GGUF + f32 encoder bin) — large-tier
+            t |> success(true, "skipped: canary-qwen is large-tier — set DASLLAMA_PARITY_FULL=1 to run")
+            return
+        }
+        let dec = path_join(samples_dir(), "canary-qwen-2.5b-decoder-f16.gguf")
+        let enc = path_join(samples_dir(), "canary-qwen-2.5b-encoder-f32.bin")
+        if (!model_available(t, dec) || !model_available(t, enc)) {
+            return
+        }
+        // the two-file route: decoder GGUF (LoRA-merged Qwen3-1.7B) + "CNRY" FastConformer bin
+        var m <- load_asr_model(dec, enc)
+        let c <- caps(m)
+        t |> equal(length(c.languages), 1, "English-only")
+        t |> success(!c.translate && c.timestamps == AsrTimestamps.none && !c.streaming, "no translate / timestamps / streaming")
+        t |> equal(m.cenc.n_layer, 32l, "FastConformer-32")
+        t |> equal(m.cenc.proj_dim, 2048l, "projects to the Qwen3 hidden width")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            // Frozen NeMo SALM greedy ids (harness/canary_qwen_expected.tsv); trailing 151645 = text EOS
+            check_canary_clip(t, m, path_join(corpus_dir(), "jfk.wav"),
+                [3036, 773, 847, 12357, 8877, 2548, 537, 1128, 697, 3146, 646, 653, 369, 498, 2548,
+                 1128, 498, 646, 653, 369, 697, 3146, 151645])
+            check_canary_clip(t, m, path_join(corpus_dir(), "librispeech/09_1089-134686-0008.wav"),
+                [785, 26915, 304, 892, 806, 83909, 413, 55707, 3304, 5086, 572, 264, 9255, 11, 78908,
+                 6540, 315, 5561, 151645])
+            check_canary_clip(t, m, path_join(corpus_dir(), "librispeech/05_1089-134686-0004.wav"),
+                [2833, 5779, 29160, 451, 11896, 374, 8580, 389, 498, 13, 7684, 3729, 9972, 151645])
+        }
+        delete m.dec.wblob
+        delete m.cenc.blob
     }
 }

@@ -11,6 +11,7 @@ require dasllama/dasllama_audio  // EncoderState (the qwen3a tower's scratch)
 require dasllama/dasllama_whisper public
 require dasllama/dasllama_qwen3a public
 require dasllama/dasllama_parakeet public
+require dasllama/dasllama_canary public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — the qwen3a decoder is a full LLM; umbrella fires arch [init]s
 
 // The uniform ASR surface: one loader that sniffs the file format, one verb set that
@@ -28,6 +29,7 @@ enum private AsrKind {
     whisper
     qwen3a
     parakeet
+    canary
 }
 
 //! What a loaded ASR model honestly supports — advisory (invalid options still panic loudly
@@ -44,9 +46,10 @@ struct AsrCaps {
 struct AsrModel {
     kind : AsrKind = AsrKind.whisper
     whisper : WhisperModel = WhisperModel()
-    dec : Model = Model()              // qwen3a: the qwen3 decoder LLM
+    dec : Model = Model()              // qwen3a / canary: the qwen3 decoder LLM
     q3t : Qwen3aTower = Qwen3aTower()  // qwen3a: the chunked audio encoder
     pk : ParakeetModel = ParakeetModel()
+    cenc : CanaryEncoder = CanaryEncoder()   // canary: the FastConformer-32 encoder + projector
 }
 
 //! One transcription stream over an AsrModel: per-backend scratch plus the shared options.
@@ -59,6 +62,7 @@ struct AsrSession {
     qenc : EncoderState = EncoderState()
     qcs : Qwen3aConvState = Qwen3aConvState()
     pkst : ParakeetState = ParakeetState()   // parakeet hot-path scratch — zero allocation per transcribe
+    cst : CanaryState = CanaryState()        // canary encoder scratch (shares qctx for the decoder)
     translate : bool = false
     no_timestamps : bool = false
     context : string = ""
@@ -116,8 +120,37 @@ def load_asr_model(path : string) : AsrModel {
 }
 
 def load_asr_model(path : string; mmproj : string) : AsrModel {
-    //! The GGUF route (Qwen3-ASR): ``path`` is the decoder GGUF (arch qwen3vl), ``mmproj``
-    //! its qwen3a audio encoder. Decoder weights load Q8; context is capped at 8192.
+    //! The two-file route: ``path`` is the decoder GGUF, ``mmproj`` its audio front end. The
+    //! encoder is sniffed — a GGUF mmproj is Qwen3-ASR's qwen3a tower; a "CNRY" bin is the
+    //! Canary-Qwen FastConformer encoder + projector (LoRA-merged Qwen3-1.7B decoder). Decoder
+    //! weights load fp32; context is capped at 8192.
+    let ef = fopen(mmproj, "rb")
+    if (ef == null) {
+        panic("dasLLAMA asr: cannot open mmproj '{mmproj}'")
+    }
+    // stat, not length(bytes): the fmap array's length() wraps int32 on >2GB files (the fp32
+    // canary encoder is ~3GB), which would misroute the sniff
+    if (stat(mmproj).size < 4ul) {
+        panic("dasLLAMA asr: mmproj '{mmproj}' is too short")
+    }
+    var emagic = 0u
+    fmap(ef) $(var bytes : array<uint8>#) {
+        emagic = rd_u32(bytes, 0l)
+    }
+    fclose(ef)
+    if (emagic == CANARY_MAGIC) {
+        var m = AsrModel(kind = AsrKind.canary)
+        m.dec <- load_model_(path, QuantMode.fp32)
+        if (m.dec.arch != "qwen3") {
+            panic("dasLLAMA asr: '{path}' is arch '{m.dec.arch}' — the Canary route expects a Qwen3-1.7B decoder")
+        }
+        m.dec.config.seq_len = min(m.dec.config.seq_len, 8192l)
+        m.cenc <- load_canary_encoder(mmproj)
+        if (m.cenc.proj_dim != m.dec.config.dim) {
+            panic("dasLLAMA asr: canary encoder projects to {m.cenc.proj_dim} but the decoder is {m.dec.config.dim}-wide — mismatched pair")
+        }
+        return <- m
+    }
     var m = AsrModel(kind = AsrKind.qwen3a)
     m.dec <- load_model_(path, QuantMode.q8)
     if (m.dec.arch != "qwen3vl" && m.dec.arch != "qwen3") {
@@ -140,6 +173,12 @@ def load_asr_model(path : string; mmproj : string) : AsrModel {
 def private pk_is_multilingual(m : AsrModel) : bool => m.pk.n_vocab >= 8192l
 
 def caps(m : AsrModel) : AsrCaps {
+    if (m.kind == AsrKind.canary) {
+        var cc = AsrCaps(translate = false, timestamps = AsrTimestamps.none,
+                         streaming = false, prompt = false)
+        cc.languages <- ["en"]
+        return <- cc
+    }
     if (m.kind == AsrKind.qwen3a) {
         return <- AsrCaps(translate = false, timestamps = AsrTimestamps.none,
                           streaming = false, prompt = true)
@@ -184,6 +223,13 @@ def create_session(m : AsrModel; lang : string = "en") : AsrSession {
                 "dasLLAMA asr: '{lang}' is not one of this Parakeet model's 25 languages" :
                 "dasLLAMA asr: this Parakeet model is English-only")
         }
+        return <- s
+    }
+    if (m.kind == AsrKind.canary) {
+        if (lang != "auto" && lang != "en") {
+            panic("dasLLAMA asr: this Canary-Qwen model is English-only — create the session with lang=\"en\" or \"auto\"")
+        }
+        s.qctx <- create_session_(m.dec)
         return <- s
     }
     if (m.kind == AsrKind.qwen3a) {
@@ -289,6 +335,84 @@ def private transcribe_qwen3a(m : AsrModel; var s : AsrSession; samples : array<
     return 1
 }
 
+// Canary-Qwen transcription: FastConformer-32 encode + projector, the SALM/Qwen prompt with the
+// audio soft tokens spliced at the placeholder, greedy decode over the Qwen3-1.7B decoder until
+// the text EOS (151645, which is included in the emitted ids — the NeMo generate convention).
+def private transcribe_canary(m : AsrModel; var s : AsrSession; samples : array<float> | #;
+                              blk : block<(seg : TranscribeSegment)>) : int {
+    let tp = ref_time_ticks()
+    canary_log_mel(m.cenc, samples, s.cst)
+    let n_audio = canary_encode(m.cenc, s.cst)   // s.cst.out holds [n_audio × proj_dim] soft tokens
+    asr_prof_add("cn.encode", tp)
+
+    let dim = m.dec.config.dim
+    let im_start = special_id(m.dec, "<|im_start|>")
+    let im_end = special_id(m.dec, "<|im_end|>")   // = the text EOS (151645)
+    // SALM "qwen" prompt: <|im_start|>user\nTranscribe the following: <AUDIO><|im_end|>\n<|im_start|>assistant\n
+    var head : array<int64>
+    head |> push(im_start)
+    head |> push_from(encode_(m.dec, "user\n", false, false))
+    head |> push_from(encode_(m.dec, "Transcribe the following: ", false, false))
+    var tail : array<int64>
+    tail |> push(im_end)
+    tail |> push_from(encode_(m.dec, "\n", false, false))
+    tail |> push(im_start)
+    tail |> push_from(encode_(m.dec, "assistant\n", false, false))
+
+    let n_head = int64(length(head))
+    let npos = n_head + n_audio + int64(length(tail))
+    var embd : array<float>
+    embd |> resize(int(npos * dim))
+    embed_text_rows(m.dec, head, embd, 0l)
+    for (i in range64(n_audio * dim)) {
+        embd[n_head * dim + i] = s.cst.out[i]
+    }
+    embed_text_rows(m.dec, tail, embd, n_head + n_audio)
+
+    s.qctx.n_past = 0l   // fresh sequence per transcribe
+    eval_embd_(m.dec, s.qctx, embd, npos)
+
+    let max_new = m.dec.config.seq_len - npos - 1l
+    var one : array<int64>
+    one |> resize(1)
+    var toks : array<int>
+    var raw : array<string>
+    toks |> reserve(128)   // typical transcription length; grows if a clip runs longer
+    raw |> reserve(128)
+    var plog_sum = 0.0lf
+    for (_i in range64(max_new)) {
+        var best = 0
+        for (i in range(1, length(s.qctx.logits))) {
+            if (s.qctx.logits[i] > s.qctx.logits[best]) {
+                best = i
+            }
+        }
+        let mx = s.qctx.logits[best]
+        var lse = 0.0lf
+        for (v in s.qctx.logits) {
+            lse += double(exp(v - mx))
+        }
+        plog_sum += double(s.qctx.logits[best]) - (log(lse) + double(mx))
+        toks |> push(best)
+        if (int64(best) == im_end) {   // EOS: emitted into the ids, then stop
+            break
+        }
+        raw |> push(piece_(m.dec, int64(best)))
+        one[0] = int64(best)
+        eval_(m.dec, s.qctx, one)
+    }
+
+    var seg = TranscribeSegment(t0 = 0l, t1 = int64(length(samples)) * 100l / AUDIO_SAMPLE_RATE,
+        text = strip(join(raw, "")))
+    seg.tokens := toks
+    if (!empty(toks)) {
+        seg.avg_logprob = float(plog_sum / double(length(toks)))
+    }
+    s.detected_lang = "en"
+    blk |> invoke(seg)
+    return 1
+}
+
 // Parakeet transcription: full-clip FastConformer encode + TDT greedy, one segment.
 def private transcribe_parakeet(m : AsrModel; var s : AsrSession; samples : array<float> | #;
                                 blk : block<(seg : TranscribeSegment)>) : int {
@@ -324,6 +448,9 @@ def transcribe(m : AsrModel; var s : AsrSession; samples : array<float> | #;
     //! Transcribe ``samples`` (16 kHz mono f32 PCM), one ``TranscribeSegment`` per trailing-block
     //! call. Returns the segment count. Whisper honors ``translate``/``no_timestamps``; qwen3a
     //! emits ONE segment (no timestamps) and fills ``detected_lang``.
+    if (m.kind == AsrKind.canary) {
+        return transcribe_canary(m, s, samples, blk)
+    }
     if (m.kind == AsrKind.qwen3a) {
         return transcribe_qwen3a(m, s, samples, blk)
     }
