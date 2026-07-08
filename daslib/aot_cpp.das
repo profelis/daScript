@@ -4302,6 +4302,7 @@ def public getRequiredModulesFor(program : ProgramPtr) {
 
 def public compile_and_simulate(input : string, var access; var mg : ModuleGroup?, cop, blk) {
     //! Compiles a daslang file, simulates it, and invokes a callback with the program and context.
+    let wasInAot = is_in_aot()
     set_aot();
     compile_file(input, access, mg, cop) $(ok; var program : smart_ptr<Program>; issues) {
         if (!ok) {
@@ -4316,6 +4317,7 @@ def public compile_and_simulate(input : string, var access; var mg : ModuleGroup
             blk(program, pctx)
         }
     }
+    if (!wasInAot) reset_aot()
 }
 
 
