@@ -1,0 +1,19 @@
+options gen2
+
+require daslib/fio
+
+[export]
+def initialize(project_path : string) {
+    let daslib_paths = [
+        "smt_boost", "smt_expr", "smt_macro"
+    ]
+    let bindings_paths = [
+        "z3_const", "z3_enum", "z3_func", "z3_struct"
+    ]
+    for (path in daslib_paths) {
+        register_native_path("smt", "daslib/{path}", "{project_path}/daslib/{path}.das")
+    }
+    for (path in bindings_paths) {
+        register_native_path("smt", "bindings/{path}", "{project_path}/bindings/{path}.das")
+    }
+}
