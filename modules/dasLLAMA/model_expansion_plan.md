@@ -404,14 +404,48 @@ The E2B/E4B carry native audio. Depends on Wave G step 3 (text path verified). *
   but on the map for later.
 Projector + soft-token splice ride the existing audio-chat rails.
 
-## Wave A3 — Qwen3-Omni-30B-A3B, audio-in/text-out
+## Wave A3 — Qwen3-Omni-30B-A3B, audio-in/text-out — ✅ DONE 2026-07-08. FULL token-for-token.
 
-Depends on Wave Q (thinker = qwen3moe). Audio tower is **AuT** — a new encoder family,
-NOT whisper-based (**VERIFY** exact blocks from the tech report / llama.cpp mtmd). We take
-audio understanding + ASR only; the Talker (speech generation) is explicitly out of scope.
-Oracle: **VERIFY** llama.cpp mtmd support; without it this waits. Size: q8 ≈ 30 GB — fits.
-Claimed SOTA ASR (beats Voxtral-Small) — if it verifies, it enters the ASR bench
-scoreboard next to whisper/parakeet/canary.
+Audio understanding + ASR only; Talker (speech-gen) out of scope. The recon-and-gate cleared
+GREEN on all three prereqs, and the slice turned out **config-sized — both halves were already
+shipped**:
+- **Oracle ✅** — llama.cpp mtmd supports Qwen3-Omni audio (PR #19441, in the local checkout;
+  `llama-mtmd-cli --temp 0 --jinja` runs it). The audio wrapper is `<|audio_start|>…<|audio_end|>`.
+- **Model ✅** — `ggml-org/Qwen3-Omni-30B-A3B-Instruct-GGUF` ships a READABLE **Q8_0 thinker
+  (32.5 GB)** + **bf16 audio mmproj (2.2 GB)** — no K-quant blocker, no conversion. On disk 2026-07-08.
+- **Thinker ✅** — converts as arch **`qwen3vlmoe`**, NOT plain qwen3moe. But `qwen3vlmoe` =
+  qwen3moe (Wave Q) + M-RoPE (whose coordinates all equal the linear position for text+audio, so
+  any rope-section layout degenerates to standard rope) + vision-only deepstack (inert without
+  vision). So the SHIPPED qwen3moe forward is **bit-identical** — registered as a `qwen3vlmoe`
+  alias mirroring the existing qwen3→qwen3vl pattern (config-only, `moe_blocks()` reused).
+- **Audio tower = AuT (`qwen3a`)** — the SAME encoder family as the already-shipped **Qwen3-ASR**
+  (`dasllama_qwen3a.das`), not whisper-based. The mtmd `qwen3a` preprocessor + graph are
+  architecturally fixed (chunk 100, window 800), so the data-driven dasLLAMA tower loaded
+  Qwen3-Omni's bigger AuT (d_model 1280, 32 blocks, 20 heads, ff 5120, proj 2048) **verbatim** —
+  zero encoder code. proj 2048 = the thinker's n_embd.
+
+Net slice: register the `qwen3vlmoe` alias (+audio markers) in `dasllama_arch_qwen3moe.das`, and add
+`AsrKind.qwen3omni` to `dasllama_asr.das` — routed by the `qwen3vlmoe` decoder arch under the same
+`qwen3a` mmproj sniff, REUSING the existing `dec`/`q3t`/`qenc`/`qcs` fields (**zero AsrModel/AsrSession
+frame growth** — the A2 standing lesson dodged by construction) + a `transcribe_qwen3omni` that splices
+the soft tokens into a bare Qwen chatml turn ("Transcribe the audio."), greedy-decoded to plain text
+until `<|im_end|>`.
+- **Parity: FULL token-for-token** vs `llama-mtmd-cli --temp 0 --jinja` on the same Q8 thinker + bf16
+  mmproj — **jfk + 2 LibriSpeech clips, complete id sequences incl. the trailing `<|im_end|>` (151645),
+  NO near-tie divergence** (unlike gemma4a/qwen3moe-decoder near-ties — the ASR turn is confident).
+  Fixture `test_qwen3omni_audio_oracle` (large-tier, `DASLLAMA_PARITY_FULL=1`) + README matrix row.
+- **Section-closing perf A/B** (`benchmarks/asr/results.md`, M1 Max 8T): das transcribe **3625 ms /
+  xRT 3.03** (jfk) vs mtmd-cli **1173 ms / xRT 9.4** — **das trails 3.1x** (4.0x on the 33 s jfk3). The
+  gap is the fp32 **scalar** qwen3a AuT tower (encode 1665 ms vs mtmd's bf16-SIMD 349 ms ≈ 4.8x); the
+  q8 MoE thinker (grouped prefill ~207 t/s + q8 decode) also trails ggml here. Both are ledger items
+  (gemm-gen tuned Q8 audio-tower kernel for 1280/5120 + the MoE prefill/decode path); the A3 gate is
+  fp32 encoder correctness + parity, not perf.
+
+Original scope notes (superseded — the AuT tower + qwen3moe thinker were both already shipped):
+Depends on Wave Q (thinker = qwen3moe). Audio tower is **AuT** — a new encoder family, NOT
+whisper-based. Claimed SOTA ASR (beats Voxtral-Small) — if it verifies as SOTA ASR it can enter the
+ASR bench scoreboard next to whisper/parakeet/canary (the A/B here is a das-vs-mtmd-cli latency
+comparison, not a WER leaderboard run).
 
 ## Cross-cutting: K-quant READ support (pull-forward candidate)
 

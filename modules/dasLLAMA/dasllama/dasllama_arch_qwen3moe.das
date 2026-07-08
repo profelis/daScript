@@ -25,5 +25,16 @@ def register_arch_qwen3moe() {
     d.chat.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
     d.chat.assistant_open.parts <- [chat_special("<|im_start|>"), chat_text("assistant\n")]
     d.chat.stop <- ["<|im_end|>", "<|endoftext|>"]
+    // Qwen3-Omni-30B's thinker converts as `qwen3vlmoe` — qwen3moe + M-RoPE + deepstack. For
+    // text + audio input every M-RoPE coordinate equals the linear position (so any section
+    // layout degenerates to standard rope), and the deepstack merge is inactive without vision
+    // channels — the plain qwen3moe forward is bit-identical. Audio spans wrap in
+    // <|audio_start|>/<|audio_end|> (the qwen3a markers). (Clone the template BEFORE register_arch moves `d`.)
+    var dv = ArchDesc(name = "qwen3vlmoe", configure = @@configure_qwen3moe)
+    dv.blocks = moe_blocks()
+    dv.chat := d.chat
+    dv.chat.audio_pre.parts <- [chat_special("<|audio_start|>")]
+    dv.chat.audio_post.parts <- [chat_special("<|audio_end|>")]
     register_arch("qwen3moe", d)
+    register_arch("qwen3vlmoe", dv)
 }

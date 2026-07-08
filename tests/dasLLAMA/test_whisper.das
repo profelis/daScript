@@ -684,3 +684,72 @@ def test_gemma4a_audio_oracle(t : T?) {
         delete m.g4a.blob
     }
 }
+
+// Transcribe one corpus clip through the uniform ASR surface (fresh session) and gate its ids
+// against the frozen llama-mtmd-cli greedy reference. Skips if the clip is absent.
+def private check_q3omni_clip(t : T?; m : AsrModel; wav : string; expected : array<int>) {
+    let samples <- read_wav_pcm16_mono(wav)
+    if (empty(samples)) {
+        t |> success(true, "skipped: {base_name(wav)} not present")
+        return
+    }
+    var s <- create_session(m, "auto")
+    var segs : array<TranscribeSegment>
+    transcribe(m, s, samples) $(seg) {
+        segs |> push_clone(seg)
+    }
+    t |> equal(length(segs), 1, "{base_name(wav)}: one segment")
+    t |> equal(length(segs[0].tokens), length(expected), "{base_name(wav)}: token count")
+    for (a, b in segs[0].tokens, expected) {
+        t |> equal(a, b, "{base_name(wav)}: token id")
+    }
+}
+
+// Qwen3-Omni-30B audio-in/text-out: the SHARED qwen3a AuT tower (proj_dim 2048) + the qwen3vlmoe
+// MoE thinker (= qwen3moe + M-RoPE-degenerate-to-1D + inert deepstack for audio). Greedy transcription
+// (--temp 0 --jinja, bare user turn on the non-thinking Instruct thinker) is token-for-token with
+// llama-mtmd-cli on the same Q8 thinker + bf16 mmproj — the FULL id sequence incl. the trailing
+// <|im_end|> (151645), with NO near-tie divergence (unlike gemma4a/qwen3moe-decoder near-ties).
+// Oracle: llama-mtmd-cli -m Q8 --mmproj bf16 --audio clip -p "Transcribe the audio." --temp 0 --jinja.
+[test]
+def test_qwen3omni_audio_oracle(t : T?) {
+    t |> run("Qwen3-Omni-30B greedy audio transcription is token-for-token with llama-mtmd-cli") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        if (!parity_full_mode()) {   // ~34 GB (Q8 thinker + bf16 mmproj) — large-tier
+            t |> success(true, "skipped: Qwen3-Omni-30B is large-tier — set DASLLAMA_PARITY_FULL=1 to run")
+            return
+        }
+        let dec = path_join(samples_dir(), "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf")
+        let mmproj = path_join(samples_dir(), "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf")
+        if (!model_available(t, dec) || !model_available(t, mmproj)) {
+            return
+        }
+        var m <- load_asr_model(dec, mmproj)
+        t |> equal(m.dec.arch, "qwen3vlmoe", "the Qwen3-Omni MoE thinker")
+        t |> equal(m.q3t.core.n_layer, 32l, "AuT tower, 32 blocks")
+        t |> equal(m.q3t.core.d_model, 1280l, "audio d_model 1280")
+        t |> equal(m.q3t.proj_dim, m.dec.config.dim, "projects into the thinker embedding width (2048)")
+        let c <- caps(m)
+        t |> success(empty(c.languages) && !c.translate && c.timestamps == AsrTimestamps.none && !c.streaming,
+            "detects language internally, no translate / timestamps / streaming")
+        with_job_que() {
+            setup_dasllama_jobque_()
+            // frozen llama-mtmd-cli --temp 0 --jinja greedy ids (trailing 151645 = <|im_end|> EOG)
+            check_q3omni_clip(t, m, path_join(corpus_dir(), "jfk.wav"),
+                [3036, 773, 11, 847, 12357, 8877, 11, 2548, 537, 1128, 697, 3146, 646, 653, 369,
+                 498, 11, 2548, 1128, 498, 646, 653, 369, 697, 3146, 13, 151645])
+            check_q3omni_clip(t, m, path_join(corpus_dir(), "librispeech/09_1089-134686-0008.wav"),
+                [785, 26915, 304, 892, 806, 83909, 269, 55707, 3304, 5086, 572, 264, 9255, 11,
+                 78908, 6540, 315, 5561, 13, 151645])
+            check_q3omni_clip(t, m, path_join(corpus_dir(), "librispeech/05_1089-134686-0004.wav"),
+                [2833, 5779, 11, 7722, 451, 613, 645, 374, 8580, 389, 498, 13, 7684, 3729, 11,
+                 9972, 13, 7684, 3729, 13, 151645])
+        }
+        delete m.dec.wblob
+        delete m.q3t.core.fblob
+        delete m.q3t.cblob
+    }
+}

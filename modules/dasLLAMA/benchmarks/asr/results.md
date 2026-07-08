@@ -201,6 +201,33 @@ neither is chased — the A2 gate is fp32 encoder correctness. Ledger note in `m
 
 TSVs: das `results_g4a_m1_t8.tsv`, cli `results_g4a_m1_mtmd.tsv`.
 
+## Qwen3-Omni-30B audio — das vs llama-mtmd-cli
+
+Qwen3-Omni-30B-A3B (audio-in/text-out; Talker out of scope) transcription benched vs the CLI oracle
+`llama-mtmd-cli` (`--temp 0 --jinja`, a bare user turn on the non-thinking Instruct thinker:
+"Transcribe the audio."). das runs the SHARED qwen3a AuT tower **fp32** (correctness-first; the
+mmproj is bf16, the tower a scalar fp32 forward — not the perf gate) + the qwen3vlmoe (30B-A3B)
+thinker q8 (matching mtmd). Transcribe time excludes model load; both sides greedy, transcribe-only
+timers (mtmd measured with an in-`main` `std::chrono` wrap of encode+prefill+generate).
+
+### Apple M1 Max, 8 threads — das 2026-07-08 (Parsec host daemon idle, no active session); mtmd-cli same box/build
+
+| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT | das encode ms | cli encode ms |
+|---|---|---|---|---|---|---|---|---|
+| jfk.wav | 11 | 3625 | 1173 | 3.09x | 3.03 | 9.4 | 1665 | 349 |
+| jfk3.wav | 33 | 8263 | 2079 | 3.97x | 3.99 | 15.9 | 4760 | 1191 |
+
+das **trails 3.1x (jfk) → 4.0x (jfk3)** — the gap is the fp32 **scalar** qwen3a AuT tower (d_model
+1280 × ff 5120, 32 blocks: 1665/4760 ms vs mtmd's bf16-SIMD 349/1191 ms = ~4.8x/4.0x). The output is
+a fixed ~27-token transcription both clips, so the gap widens with clip length as the linear-in-audio
+encode dominates. The thinker side is das's grouped q8 MoE prefill (~207 tok/s — the Wave-Q path,
+engaged for the audio-embd prefill) + q8 decode, and it too trails ggml here. Both are perf-ledger
+items (a gemm-gen tuned Q8 audio-tower kernel for the 1280/5120 dims + the MoE prefill/decode path);
+neither chased — the A3 gate is fp32 encoder correctness + token-for-token parity. Ledger note in
+`model_expansion_plan.md`.
+
+TSVs: das `results_q3o_m1_t8.tsv`, cli `results_q3o_m1_mtmd.tsv`.
+
 ## Correctness
 
 - das fp32 is token-for-token with parakeet-cli (v2 jfk 33 + gb1 786; v3 jfk 38 + gb1 655)
@@ -211,6 +238,9 @@ TSVs: das `results_g4a_m1_t8.tsv`, cli `results_g4a_m1_mtmd.tsv`.
   transcription is token-for-token with mtmd-cli through the 48-token confident prefix and
   diverges only at the Gemma-4 q8 decoder's OWN ~0.6-logit near-tie (llama.cpp's raw logits at
   that step: three tokens within 0.6). `test_gemma4a_audio_oracle` asserts the confident head.
+- Qwen3-Omni-30B (audio-in/text-out; SHARED qwen3a AuT tower + qwen3vlmoe MoE thinker): the greedy
+  transcription is **FULL token-for-token** with mtmd-cli on jfk + 2 LibriSpeech clips incl. the
+  trailing `<|im_end|>` (151645), with NO near-tie divergence. `test_qwen3omni_audio_oracle` (large-tier).
 - das q8 (the path benched here): parakeet ids/text exact vs fp32, gb1 shows a handful of
   duration-pick flips (≤4-frame timestamp drift); whisper (tower + decoder q8) word-exact
   on tiny/small/large-v3-turbo, base drops one comma on a 0.018-logit fp32 top-2 near-tie
@@ -219,6 +249,11 @@ TSVs: das `results_g4a_m1_t8.tsv`, cli `results_g4a_m1_mtmd.tsv`.
 
 ## Changelog
 
+- 2026-07-08: NEW Qwen3-Omni-30B audio section (Wave A3) — das (fp32 SHARED qwen3a AuT tower + q8
+  qwen3vlmoe MoE thinker) vs `llama-mtmd-cli`. FULL token-for-token (jfk + 2 LibriSpeech, incl.
+  trailing `<|im_end|>`). das trails 3.1x→4.0x: fp32 scalar audio tower (~4.8x/4.0x on encode) + the
+  MoE thinker path; the A3 gate is fp32 encoder + parity. TSVs `results_q3o_m1_t8.tsv` /
+  `results_q3o_m1_mtmd.tsv`.
 - 2026-07-08: NEW Gemma-4 E2B audio section — das (fp32 gemma4a Conformer + q8 Gemma-4 decoder)
   vs the CLI oracle `llama-mtmd-cli` (no-think). das trails 3.9x: fp32 scalar encoder (16x on
   encode) + long-context decode gap; the A2 gate is fp32 encoder correctness (rel ~0.0027 vs
