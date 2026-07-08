@@ -2024,12 +2024,18 @@ def cmd_release(root : string; out_dir : string) : int {
     //     `<das_root>/bin`, while LIBRARY artifacts (.dylib / .so) go in
     //     `<das_root>/lib` — search the correct dir per platform.
     let platform = get_platform_name()
+    // Source the runtime libs from the EXACT build that compiled the exe. On Windows the DLLs
+    // sit next to the daslang binary used above (get_daslang_path) — bin/ or bin/<config>/. A
+    // recursive bin/** glob crosses config subdirs (Release/Debug/RelWithDebInfo) and, copying
+    // same-named files last-wins, ships a MISMATCHED build: a stale DLL missing a symbol the exe
+    // imports then fails at load with STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139). Globbing the
+    // codegen binary's own dir non-recursively pins the matching pair. On Unix the .so/.dylib
+    // live in a single lib/, so the recursive walk there is safe.
+    let daslang_dir = dir_name(replace(get_daslang_path(), "\\", "/"))
     let runtime_lib_dir = (platform == "windows"
-        ? "{get_das_root()}/bin"
+        ? daslang_dir
         : "{get_das_root()}/lib")
-    // Patterns are `**/...` so the recursive walk crosses config subdirs
-    // (Visual Studio / Xcode put the artifact in `bin/Release/`, not `bin/`).
-    let runtime_glob = (platform == "windows" ? "**/libDaScriptDyn*.dll"
+    let runtime_glob = (platform == "windows" ? "libDaScriptDyn*.dll"
         : platform == "darwin" ? "**/*libDaScriptDyn*.dylib"
         : "**/*libDaScriptDyn*.so")
     var runtime_copy_failed = false
