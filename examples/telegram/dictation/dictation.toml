@@ -4,10 +4,12 @@
 # The bot reads this file from next to its executable, or from --config <path>.
 
 # Whisper ASR model (whisper.cpp ggml .bin). Multilingual large-v3-turbo is a good RU+EN default.
-whisper_model = "E:/whisper.cpp/models/ggml-large-v3-turbo.bin"
+# Set this to your local model path; empty = the bot exits at startup asking you to set it.
+whisper_model = ""
 
 # Instruct LLM (GGUF) that rewrites the raw transcript into clean, paragraph-split text.
-llm_model = "D:/Work/llama.cpp/models/Qwen3-4B-Instruct-2507-Q8_0.gguf"
+# Set this to your local model path; empty = the bot exits at startup asking you to set it.
+llm_model = ""
 
 # Telegram bot token from @BotFather. Leave empty to read TELEGRAM_BOT_TOKEN from the environment.
 bot_token = ""
@@ -42,6 +44,6 @@ log_level = "info"
 # so Cyrillic counts ~2 per character.
 min_chars = 8
 
-# Archive every received audio file here (original format). Empty = don't keep any audio.
+# Archive every received audio file here (original format). Empty = don't keep any audio (default).
 # The directory is created if missing; files are named <unixdate>_<senderid>_<telegram-name>.
-keep_audio_dir = "E:/dictation-audio"
+keep_audio_dir = ""
