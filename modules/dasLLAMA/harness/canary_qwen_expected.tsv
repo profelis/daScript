@@ -1,0 +1,18 @@
+# Canary-Qwen-2.5B greedy-transcribe reference — Wave A1 frozen oracle fixture.
+# Reference engine: NeMo trunk SALM.generate (do_sample=False, num_beams=1), CPU.
+#   model  = nvidia/canary-qwen-2.5b  (SALM: FastConformer enc + Qwen3-1.7B dec + LoRA)
+#   nemo   = git+https://github.com/NVIDIA/NeMo.git@06312c963  (nemo_toolkit 3.1.0)
+#   torch 2.12.1, transformers 5.13.0, peft 0.19.1, python 3.11
+#   driver = harness/canary_qwen_oracle.py   (max_new_tokens=128)
+#   prompt = "Transcribe the following: <|audioplaceholder|>"  (Qwen chat template)
+# Re-generate:
+#   ~/Work/canary-nemo-oracle/.venv/bin/python harness/canary_qwen_oracle.py \
+#     --wav benchmarks/asr/corpus/jfk.wav \
+#     --wav benchmarks/asr/corpus/librispeech/09_1089-134686-0008.wav \
+#     --wav benchmarks/asr/corpus/librispeech/05_1089-134686-0004.wav
+# Columns: CLIP <tab> IDS(space-joined generated token ids, incl. trailing EOS 151645) <tab> TEXT
+#
+# The dasLLAMA canary forward (once landed) must reproduce the IDS column token-for-token.
+jfk.wav	3036 773 847 12357 8877 2548 537 1128 697 3146 646 653 369 498 2548 1128 498 646 653 369 697 3146 151645	And so my fellow Americans ask not what your country can do for you ask what you can do for your country
+09_1089-134686-0008.wav	785 26915 304 892 806 83909 413 55707 3304 5086 572 264 9255 11 78908 6540 315 5561 151645	The chaos in which his ardour extinguished itself was a cold, indifferent knowledge of himself
+05_1089-134686-0004.wav	2833 5779 29160 451 11896 374 8580 389 498 13 7684 3729 9972 151645	Number ten Fresh Nelly is waiting on you. Good night husband

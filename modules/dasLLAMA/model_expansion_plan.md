@@ -248,19 +248,71 @@ window and wait for go before profiling; re-run the das side only vs the stored 
 
 ## Wave A1 — Canary-Qwen 2.5B (the ASR leaderboard crown)
 
-Tops Open ASR (5.63 % WER English). Architecturally two pillars we already own:
-FastConformer encoder (= parakeet's, **VERIFY** the canary variant's deltas — subsampling
-factor, rel-pos flavor, d_model) + **unmodified Qwen3-1.7B** decoder in SALM arrangement
-(**VERIFY** the adapter: how encoder frames project/splice into the LLM — likely a linear
-projector + prompt wrapping, i.e. our soft-token splice rail).
+Tops Open ASR (5.63 % WER English). SALM: FastConformer encoder + **unmodified
+Qwen3-1.7B** decoder + a linear projector + LoRA on the LLM.
 
-- Conversion: `.nemo` → ggml bin, extend the parakeet converter (precedent in-tree).
-- Oracle: NO cli oracle exists — NeMo python greedy transcribe is the reference. New
-  oracle rail: a pinned-venv driver like `onnx_bench.py` (engine-level, no HTTP), plus
-  frozen transcript fixtures. This is the wave's main risk/cost — budget a session for
-  the rig before the model work.
-- Lands as an `AsrModel` family behind the uniform ASR surface (`load_asr_model` sniff:
-  nemo-converted bin + qwen3 vocab present).
+### Oracle rail — ✅ DONE 2026-07-07 (the wave's designated first sub-task / main risk).
+
+NeMo python greedy transcribe is the reference (NO cli/llama.cpp oracle exists — llama.cpp
+has zero canary/SALM/FastConformer support; only the bare `qwen3` decoder arch, so the
+section-closing A/B can at most reference a standalone Qwen3-1.7B `llama-bench`, never the
+ASR model). Rig built + verified end-to-end:
+- **Driver:** `harness/canary_qwen_oracle.py` — engine-level (no HTTP), `SALM.from_pretrained`
+  + `model.generate` with `GenerationConfig(do_sample=False, num_beams=1)` (pure greedy,
+  deterministic — jfk IDs identical across reruns). Emits `IDS`/`TEXT` fixture lines.
+- **Frozen fixture:** `harness/canary_qwen_expected.tsv` — jfk + 2 librispeech clips,
+  token-for-token greedy ids incl. trailing EOS 151645. jfk → "And so my fellow Americans
+  ask not what your country can do for you ask what you can do for your country".
+- **Pinned venv** (`~/Work/canary-nemo-oracle/.venv`, gitignored): **python 3.11**, NeMo
+  **trunk** `git+https://github.com/NVIDIA/NeMo.git@06312c963` (`nemo_toolkit 3.1.0`; the
+  README requires trunk, no released wheel has `speechlm2`), torch 2.12.1, transformers
+  5.13.0, **peft 0.19.1** (must add — trunk `[asr]` doesn't pull it; SALM needs it for LoRA).
+  Install: `pip install "nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git" peft`.
+- **🔑 macOS gotcha — brew-python `_decimal` fails (mpdecimal 3→4 ABI drift).** NeMo→lhotse
+  does `from _decimal import ROUND_HALF_UP`; brew python 3.10/3.11 were linked against
+  `libmpdec.3.dylib` which mpdecimal 4.0.1 no longer ships → `ImportError` at SALM import.
+  Fix (benign compat symlink): `ln -sf $(brew --prefix mpdecimal)/lib/libmpdec.4.dylib
+  $(brew --prefix mpdecimal)/lib/libmpdec.3.dylib`. (python3.14 / Apple 3.9.6 have working
+  `_decimal` but are too-new/too-old for the wheels.)
+
+### Architecture — fully mapped 2026-07-07 (from `config.json` + safetensors header).
+
+Source: `nvidia/canary-qwen-2.5b` ships **HF-native `config.json` + `model.safetensors`
+(bf16, 1718 tensors)** — **NOT a `.nemo`** (the plan's "extend the parakeet `.nemo`
+converter" premise is wrong for this checkpoint; convert from safetensors directly, or
+`SALM.save_to()` a `.nemo` first). The encoder is self-contained in the SALM checkpoint
+(`canary-1b-flash` is NOT separately downloaded). All three original **VERIFY**s resolved:
+- **Encoder = FastConformer, parakeet-key-identical** (`perception.encoder.*`): d_model
+  1024, **32 layers** (parakeet 24), ff 4096, 8 heads, feat_in 128, subsampling `dw_striding`
+  **factor 8** (pre_encode.conv.{0,2,3,5,6}/out — same shapes as parakeet: feat 4096=16·256),
+  `self_attention_model='rel_pos'`, conv_kernel 9, batch_norm, `att_context_size=[-1,-1]`
+  (**full global** attention). **DELTA vs parakeet:** canary has `self_attn.linear_{q,k,v,out}.bias`
+  and `feed_forward*.linear{1,2}.bias` (parakeet has NO qkv biases, only `pos_bias_u/v`) —
+  the converter + forward must carry them. Drop the whole TDT predictor/joint (canary has none).
+- **Projector** = `perception.proj` linear **[2048,1024] + bias** (audio d_model 1024 → LLM
+  hidden 2048). `modality_adapter` is `IdentityConnector` (no-op). Mel: `perception.preprocessor.featurizer.fb`
+  [1,128,257] + `.window` [400] (n_fft 512, 16 kHz, per_feature norm — parakeet mel flavor).
+- **Decoder = plain Qwen3-1.7B we already own** (`llm.base_model.model.model.*`): 28 layers,
+  hidden 2048, ff 6144, 16 Q-heads / 8 KV-heads × 128, q_norm/k_norm [128] (qwen3 qk_norm),
+  RoPE-neox. `embed_tokens.weight` [151936,2048] shared (no separate `lm_head` — tied).
+  **LoRA** on `q_proj` + `v_proj` only (`.base_layer.weight` + `.lora_A`[128,2048] +
+  `.lora_B`[out,128]); r=128 α=256 → **merge `W += (α/r)·B·A = W + 2.0·B·A` at conversion**,
+  yielding a plain Qwen3-1.7B. prompt_format `qwen`; SALM prompt "Transcribe the following:
+  `<|audioplaceholder|>`" wrapped in the Qwen chat template, audio frames splice at the tag.
+
+### Remaining: the daslang model-implementation phase (NOT done this session).
+
+Reuse-heavy but a real arch slice — the cleanest fit is the **two-file qwen3a pattern**:
+a LoRA-merged **Qwen3-1.7B GGUF** decoder + a **canary-encoder bin** (FastConformer+projector)
+as the "mmproj", loaded via `load_asr_model(decoder, encoder_bin)` (new `AsrKind.canary`),
+so the Qwen3-ASR audio-splice + greedy-decode rail carries most of it. Work: (1) safetensors
+→ (qwen3 GGUF + encoder bin) converter incl. the LoRA merge and the bf16→f32/Q8 transcode
+(extend `convert-parakeet-to-ggml.py` for the encoder half; the qwen3 half is a standard HF→GGUF
++ LoRA-fold); (2) daslang FastConformer-32 forward = parakeet encoder **+ attention biases**,
+no TDT, then `perception.proj`; (3) splice into the qwen3 decoder + the SALM/Qwen prompt;
+(4) parity token-for-token vs `harness/canary_qwen_expected.tsv`; (5) README matrix row;
+(6) section-closing prefill+decode A/B (decoder-side only, vs standalone Qwen3-1.7B llama-bench
+`-ngl 0 -t 8`, since llama.cpp can't run the ASR model). Lands behind the uniform ASR surface.
 
 ## Wave A2 — Gemma-4 E-series audio input
 
