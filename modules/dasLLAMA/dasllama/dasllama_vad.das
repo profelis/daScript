@@ -107,13 +107,13 @@ def private sv_read(recs : table<string; SvRec>; b : array<uint8> | #; name : st
 //! Load a converted Silero-VAD bin (harness/convert_silero_vad.py output, fp32).
 def load_vad_model(path : string) : VadModel {
     var m = VadModel()
-    let n_bytes = int64(stat(path).size)
-    if (n_bytes < 8l) {
-        panic("dasLLAMA vad: '{path}' is too small to be a model")
-    }
     let f = fopen(path, "rb")
     if (f == null) {
         panic("dasLLAMA vad: cannot open model '{path}'")
+    }
+    let n_bytes = int64(stat(path).size)
+    if (n_bytes < 8l) {
+        panic("dasLLAMA vad: '{path}' is too small to be a model")
     }
     fmap(f) $(var bytes : array<uint8>#) {
         var o = 0l
@@ -137,6 +137,9 @@ def load_vad_model(path : string) : VadModel {
             let n_dims = int64(rd_i32(bytes, o)); o += 4l
             let name_len = int64(rd_i32(bytes, o)); o += 4l
             let ttype = rd_i32(bytes, o); o += 4l
+            if (n_dims < 0l || n_dims > 8l || name_len < 0l || o + n_dims * 4l + name_len > n_bytes) {
+                panic("dasLLAMA vad: corrupt tensor record in '{path}'")
+            }
             var n_elem = 1l
             for (_d in range64(n_dims)) {
                 n_elem *= int64(rd_i32(bytes, o)); o += 4l
@@ -452,7 +455,10 @@ def vad_iter_feed(m : VadModel; var it : VadIter; samples : array<float> | #;
                 it.temp_end = it.cur
             }
             if (it.cur - it.temp_end >= min_silence) {
-                let e = it.temp_end + speech_pad - SV_CHUNK
+                // clamp the padded end to consumed audio: at pad > 32 ms the raw padded offset can
+                // point past it.cur (silero VADIterator leaves it unclamped) — a no-op at the 30 ms
+                // default, so the event-for-event parity gate is unaffected.
+                let e = max(0l, min(it.cur, it.temp_end + speech_pad - SV_CHUNK))
                 it.temp_end = 0l
                 it.triggered = false
                 invoke(blk, VadEvent(kind = VadEventKind.speech_end, sample = e))

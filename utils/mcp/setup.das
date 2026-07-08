@@ -150,6 +150,10 @@ def stage_jit_backend(root : string) {
             print("WARNING: JIT backend file '{rel}' not found in source tree {src_root}; worktree -jit may be unavailable\n")
             continue
         }
+        let dstdir = dir_name(dst)
+        if (!fexist(dstdir)) {
+            mkdir(dstdir)
+        }
         let cr = copy_file_result(src, dst, false)
         if (cr is error) {
             print("WARNING: failed to stage JIT backend '{rel}': {cr as error}\n")
