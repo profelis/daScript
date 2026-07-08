@@ -150,6 +150,19 @@ expert** (**VERIFY** against llama.cpp's `qwen3moe` build fn). Small slice; 3B-a
 our threaded engine probably becomes the best chat model per CPU-second we ship.
 Unlocks the Wave A3 Omni thinker. Oracle: `simple_ids`, standard.
 
+**Prefill = grouped batched, NOT naive `forward`-per-token (Boris, 2026-07-07).** qwen3moe is
+qwen2moe-shaped, so its prefill rides the EXISTING `ffn_moe_prefill` → `ffn_moe_prefill_grouped`
+path (register `moe_blocks()`; the no-shared-expert case `nsh==0` is already handled). Naive
+per-token is allowed only as an INTERMEDIATE correctness step — the shipped prefill must batch.
+Verify q8 actually engages the grouped path (`forward_prefill` runs per-token `forward()` for
+`q4 || npos≤0`; `g_moe_grouped_prefill` gates the rest). Template: the gemma-4-26B
+`gemma4_moe_prefill_grouped` slice (2026-07-07, 5.5× → leads lcpp 1.44×).
+
+**Session closes with A/B profiling vs llama.cpp (Boris, 2026-07-07).** Prefill-512 interleaved
+A/B (das grouped vs the stored lcpp baseline; grouped-vs-naive as the internal sanity). Rig =
+adapt `harness/tune_confirm_prefill.das` into an interleaved A/B (throwaway). Announce a Parsec-off
+window and wait for go before profiling; re-run the das side only vs the stored lcpp number.
+
 ## Wave A1 — Canary-Qwen 2.5B (the ASR leaderboard crown)
 
 Tops Open ASR (5.63 % WER English). Architecturally two pillars we already own:
