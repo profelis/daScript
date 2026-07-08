@@ -447,6 +447,7 @@ namespace das {
     DAS_CC_API Module * thisModule ( Context * context, LineInfoArg * lineinfo );
     DAS_CC_API smart_ptr_raw<Program> thisProgram ( Context * context );
     DAS_CC_API void astVisit ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info );
+    DAS_CC_API void astVisitWithSort ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, bool sortStructures, Context * context, LineInfoArg * line_info );
     DAS_CC_API void astVisitGenerics ( smart_ptr_raw<Program> program, VisitorAdapter * adapter, Context * context, LineInfoArg * line_info );
     DAS_CC_API void astVisitModule ( smart_ptr_raw<Program> program, VisitorAdapter * adapter,
                       Module* module, Context * context, LineInfoArg * line_info );
@@ -523,6 +524,7 @@ namespace das {
     DAS_CC_API void getAstContext ( smart_ptr_raw<Program> prog, Expression * expr, const TBlock<void,bool,AstContext> & block, Context * context, LineInfoArg * at );
     DAS_CC_API char * get_mangled_name ( Function * func, Context * context, LineInfoArg * at );
     DAS_CC_API char * get_mangled_name_t ( TypeDecl * typ, Context * context, LineInfoArg * at );
+    DAS_CC_API char * get_aot_hash_comment_fn ( const Function * func, Context * context, LineInfoArg * at );
     DAS_CC_API char * get_mangled_name_v ( Variable * var, Context * context, LineInfoArg * at );
     DAS_CC_API char * get_mangled_name_b ( ExprBlock * expr, Context * context, LineInfoArg * at );
     DAS_CC_API TypeDeclPtr parseMangledNameFn ( const char * txt, ModuleGroup & lib, Module * thisModule, Context * context, LineInfoArg * at );

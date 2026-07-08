@@ -1186,17 +1186,17 @@ class public BlockVariableCollector : AstVisitor {
         }
         return blk;
     }
-    def getFinalBlock() {
+    def getFinalBlock() : ExprBlock? {
         for (i in range(length(stack))) {
-            let blk = stack[length(stack) - i - 1];
+            var blk = stack[length(stack) - i - 1];
             if (!empty(blk.finalList)) return blk;
             if (blk.blockFlags.isClosure) return null;
         }
         return null;
     }
-    def getTopBlock() {
+    def getTopBlock() : ExprBlock? {
         for (i in range(length(stack))) {
-            let blk = stack[length(stack) - i - 1];
+            var blk = stack[length(stack) - i - 1];
             if (blk.blockFlags.isClosure) return blk;
         }
         return stack[0];

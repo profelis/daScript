@@ -28,7 +28,7 @@ FILE(GLOB AOT_DASLIB_MODULE_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPEN
 #                                 annotation_arguments, ExprBlock) lacking AOT header decls
 #   network                    — daslang class `Server` shadows C++ `das::Server`,
 #                                codegen resolves NetworkServer? to the daslang class
-list(FILTER AOT_DASLIB_MODULE_FILES EXCLUDE REGEX "daslib/(aot_macro|debugger|profiler|profiler_boost|ast_debug|decs_state|aot_cpp|aot_standalone|network)\\.das$")
+list(FILTER AOT_DASLIB_MODULE_FILES EXCLUDE REGEX "daslib/(aot_macro|debugger|profiler|profiler_boost|ast_debug|decs_state|aot_standalone|network)\\.das$")
 # just_in_time bootstraps the LLVM-backed JIT module via [extern](library=LLVM.dll).
 # Without DAS_LLVM_DISABLED=OFF, the [extern] macro fails at compile time.
 IF(DAS_LLVM_DISABLED)
