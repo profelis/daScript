@@ -335,8 +335,54 @@ carries the decode. Delivered:
   at fp32 (M1 Max 8T). Ledger: the decoder loads fp32 for token-for-token safety — a q8 decoder
   + q8 encoder is the obvious perf follow-up (not chased mid-wave; parity gate is fp32).
 
-## Wave A2 — Gemma-4 E-series audio input
+## Wave A2 — Gemma-4 E-series audio input — ✅ DONE 2026-07-08 (E2B; encoder token-exact)
 
+**Shipped: `dasllama_gemma4a.das`** — the `gemma4a` Conformer audio encoder + audio mm embedder,
+read straight from the bf16 audio mmproj GGUF (no conversion), spliced into the G3 Gemma-4 text
+path via `forward_prefill_embd`. New `AsrKind.gemma4a` behind the uniform ASR surface, routed by
+the mmproj's `clip.audio.projector_type='gemma4a'`. **The encoder soft tokens match mtmd's audio
+embeddings at rel ~0.0027** (float-reduction-order noise vs ggml's DFT + SIMD matmuls — NOT a bug;
+a bf16-activation test confirmed f32 is the closest match, so ggml keeps f32 activations too).
+- **Architecture (verified against `tools/mtmd/models/gemma4a.cpp`, NOT the pre-probe notes):**
+  - Mel: 128-bin **HTK** filterbank (not Slaney), n_fft 512, window 320 (Hann zero-padded to
+    512), hop 160, **natural-log magnitude** (not power), floor 0.001, semicausal left-pad
+    window/2, NO per-feature norm. Matches mtmd's mel at max-abs 0.0016.
+  - Subsample: Conv2D ×2 (k3 s2 p1) → LayerNorm-over-channels (weight-only, eps 1e-6) → ReLU,
+    then input projection (flatten order k=freq·32+channel). Verified vs a clean conv1 dump at
+    rel 0.0001.
+  - **Attention is CHUNKED-LOCAL, not "full self-attn"** — it reduces to a plain causal
+    sliding-window of 12 (self + 11 past); the Transformer-XL blocked relative shift maps to
+    `RPE_row = 12 − (i−j)`, sinusoidal RPE positions `12−p`; q_scale=(1/√dh)/ln2,
+    k_scale=ln(1+e)/ln2, per-dim Q scale, softcap 50. norm_eps hardcoded **1e-6** (ignores the
+    1e-5 metadata). No per_dim_k_scale (absent in the file).
+  - Conv module: RMSNorm → pw1 → GLU (sigmoid gate on 2nd half) → causal depthwise conv1d k=5
+    (ssm_conv, left-pad 4) → RMSNorm → SiLU → pw2. 🔑 **`norm_conv`/`conv_norm` are name-swapped
+    in the GGUF** (upstream tensor_mapping.py): the PRE-conv RMSNorm reads the tensor named
+    `conv_norm`, the POST-depthwise one `norm_conv`. This was the single load-bearing bug (rel
+    0.74 → 0.0027).
+  - 🔑 **Per-op activation-quant calibration ranges** (`input_max/min`, `output_max/min`) honored
+    on the ffn/attn/conv matmuls (clamp-in before the matmul, clamp-out after) — the flagged A2
+    subtlety; loaded as `Clamp` structs, applied in `g4a_mm_clamped`.
+  - Output: out proj (+bias) → weightless RMSNorm → mm input proj. All bf16 weights, fp32 forward.
+- **Token-for-token (E2B, `test_gemma4a_audio_oracle`):** the no-think greedy transcription
+  (`--temp 0 --jinja`, a bare user turn — the reasoning channel is near-tie-brittle and disabled
+  both sides) is token-for-token with mtmd-cli through the **48-token confident prefix**, diverging
+  ONLY at the Gemma-4 q8 decoder's OWN ~0.6-logit near-tie (llama.cpp's raw logits at that step:
+  three tokens within 0.6 — the qwen3moe/gemma-26B situation). Proven audio-INDEPENDENT: feeding
+  the EXACT mtmd reference soft tokens through the das q8 decoder diverges at the SAME step. Fixture
+  freezes the first 40 confident ids ("The New York Times from July 21st, 1969. This isn't just
+  newsprint and ink…"). Fast-tier (E2B decoder 4.97 GB); corpus clip `gemma4a_test2.wav`.
+- **Section-closing perf A/B** (`benchmarks/asr/results.md`, M1 Max 8T, no-think both sides): das
+  transcribe **6028 ms / xRT 2.89** vs mtmd-cli **1547 ms / xRT 11.3** — **das trails 3.9x**. das
+  encode 1888 ms vs mtmd 117 ms (16x — the fp32 **scalar** Conformer vs ggml's bf16-weight SIMD
+  GEMMs); long-context decode 21.7 vs 78 tok/s. The audio soft tokens ride the BATCHED
+  `forward_prefill_embd` (PLE-aware), not naive per-token.
+- **Ledger:** the E2B encode 16x gap is a gemm-gen tuned **Q8 audio-tower kernel** (dims: d_model
+  1024 × ff 4096, conv pw 1024↔2048) — the obvious follow-up; and the ~500-position long-context
+  decode gap. Neither chased — the A2 gate is fp32 encoder correctness. E4B is the same arch
+  (proj_dim 2560) — the loader/encoder are dim-generic; not benched (large-tier).
+
+Original probe notes (superseded — several were wrong; see the verified architecture above):
 The E2B/E4B carry native audio. Depends on Wave G step 3 (text path verified). **PROBED
 2026-07-07 — both VERIFYs resolved GREEN; oracle proven end-to-end** (E2B transcribed
 `tools/mtmd/test-2.mp3` verbatim at `--temp 0 --jinja`; conformer encode 302 ms):

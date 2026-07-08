@@ -179,11 +179,38 @@ halve), where NeMo's batched-BLAS decode scales better. das xRT holds ~1.5–2.0
 
 TSVs: das `results_cq_m1_t8.tsv`, nemo `results_cq_m1_nemo.tsv`.
 
+## Gemma-4 E2B audio — das vs llama-mtmd-cli
+
+The gemma4a Conformer audio path benched vs the CLI oracle `llama-mtmd-cli` (`--temp 0 --jinja`,
+no-think turn — a bare user turn; the reasoning channel is near-tie-brittle, disabled both sides).
+das runs the encoder **fp32** (correctness-first; the mmproj is bf16 and the Conformer is a scalar
+fp32 forward — encode runs once per clip and is explicitly not the perf gate), the Gemma-4 decoder
+q8 (matching mtmd). Transcribe time excludes model load; both sides greedy, one 17.4 s clip.
+
+### Apple M1 Max, 8 threads — das 2026-07-08 (Parsec off); mtmd-cli same box/build
+
+| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT | das encode ms | cli encode ms |
+|---|---|---|---|---|---|---|---|---|
+| gemma4a_test2.wav | 17.4 | 6028 | 1547 | 3.90x | 2.89 | 11.3 | 1888 | 117 |
+
+das **trails 3.9x** — the gap is the fp32 **scalar** Conformer encoder (1888 ms vs mtmd's 117 ms
+= 16x; ggml runs the audio tower as bf16-weight SIMD GEMMs, das as a plain fp32 forward) plus a
+long-context decode gap (~495 audio+prompt positions: das 21.7 tok/s vs cli 78). Both are the
+obvious perf follow-ups (a gemm-gen tuned Q8 audio-tower kernel + the long-context decode path);
+neither is chased — the A2 gate is fp32 encoder correctness. Ledger note in `model_expansion_plan.md`.
+
+TSVs: das `results_g4a_m1_t8.tsv`, cli `results_g4a_m1_mtmd.tsv`.
+
 ## Correctness
 
 - das fp32 is token-for-token with parakeet-cli (v2 jfk 33 + gb1 786; v3 jfk 38 + gb1 655)
   and with whisper-cli (tiny jfk, suite oracle), and Canary-Qwen with NeMo SALM greedy
   (jfk + 2 LibriSpeech clips, incl. trailing EOS).
+- Gemma-4 E2B audio (gemma4a Conformer): the fp32 encoder soft tokens match mtmd's audio
+  embeddings at rel ~0.0027 (float-reduction-order noise, not a bug); the no-think greedy
+  transcription is token-for-token with mtmd-cli through the 48-token confident prefix and
+  diverges only at the Gemma-4 q8 decoder's OWN ~0.6-logit near-tie (llama.cpp's raw logits at
+  that step: three tokens within 0.6). `test_gemma4a_audio_oracle` asserts the confident head.
 - das q8 (the path benched here): parakeet ids/text exact vs fp32, gb1 shows a handful of
   duration-pick flips (≤4-frame timestamp drift); whisper (tower + decoder q8) word-exact
   on tiny/small/large-v3-turbo, base drops one comma on a 0.018-logit fp32 top-2 near-tie
@@ -192,6 +219,10 @@ TSVs: das `results_cq_m1_t8.tsv`, nemo `results_cq_m1_nemo.tsv`.
 
 ## Changelog
 
+- 2026-07-08: NEW Gemma-4 E2B audio section — das (fp32 gemma4a Conformer + q8 Gemma-4 decoder)
+  vs the CLI oracle `llama-mtmd-cli` (no-think). das trails 3.9x: fp32 scalar encoder (16x on
+  encode) + long-context decode gap; the A2 gate is fp32 encoder correctness (rel ~0.0027 vs
+  mtmd soft tokens). TSVs `results_g4a_m1_t8.tsv` / `results_g4a_m1_mtmd.tsv`.
 - 2026-07-08 `daf12e7b7`: NEW Canary-Qwen 2.5B section — das (fp32) vs the NeMo SALM reference
   engine (`canary_qwen_bench.py`; no llama.cpp/onnx canary support). das leads every short clip
   1.4–3x, trails 3.7x on the fp32-decoder-bound 3-min gb1. TSVs `results_cq_m1_t8.tsv` /

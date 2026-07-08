@@ -619,3 +619,65 @@ def test_canary_qwen_oracle(t : T?) {
         delete m.cenc.blob
     }
 }
+
+// Gemma-4 E2B audio: greedy no-think transcription is token-for-token with llama-mtmd-cli through
+// the confident prefix. The gemma4a Conformer encoder soft tokens match mtmd's audio embeddings at
+// rel ~0.0027 (float-reduction-order noise); the full transcription diverges only at the Gemma-4
+// q8 decoder's OWN ~0.6-logit near-tie (llama.cpp's raw logits at that step: three tokens within
+// 0.6), the qwen3moe/gemma-26B situation. So the fixture asserts the confident head, not the tail.
+// Oracle: llama-mtmd-cli -m E2B-Q8 --mmproj bf16 --audio clip --temp 0 --jinja (no-think turn).
+[test]
+def test_gemma4a_audio_oracle(t : T?) {
+    t |> run("Gemma-4 E2B audio greedy is token-for-token with llama-mtmd-cli (confident prefix)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let dec = path_join(samples_dir(), "gemma-4-E2B-it-Q8_0.gguf")
+        let mmproj = path_join(samples_dir(), "mmproj-gemma-4-E2B-it-bf16.gguf")
+        if (!model_available(t, dec) || !model_available(t, mmproj)) {
+            return
+        }
+        var m <- load_asr_model(dec, mmproj)
+        t |> equal(m.g4a.n_layer, 12l, "gemma4a Conformer, 12 blocks")
+        t |> equal(m.g4a.d_model, 1024l, "audio d_model 1024")
+        t |> equal(m.g4a.n_head, 8l, "8 heads")
+        t |> equal(m.g4a.proj_dim, m.dec.config.dim, "projects into the Gemma-4 embedding width")
+        let wav = path_join(corpus_dir(), "gemma4a_test2.wav")
+        let samples <- read_wav_pcm16_mono(wav)
+        if (empty(samples)) {
+            t |> success(true, "skipped: gemma4a_test2.wav not present")
+            delete m.dec.wblob
+            delete m.g4a.blob
+            return
+        }
+        with_job_que() {
+            setup_dasllama_jobque_()
+            var s <- create_session(m, "en")
+            var segs : array<TranscribeSegment>
+            transcribe(m, s, samples) $(seg) {
+                segs |> push_clone(seg)
+            }
+            t |> equal(length(segs), 1, "one segment")
+            // frozen llama-mtmd-cli no-think greedy ids (first 40 tokens — the confident prefix
+            // before the model's own ~0.6-logit near-tie at step 48). "The New York Times from
+            // July 21st, 1969. This isn't just newsprint and ink. This is the moment when..."
+            let expected = [818, 1799, 3773, 11922, 699, 5505, 236743, 236778, 236770, 540,
+                            236764, 236743, 236770, 236819, 236825, 236819, 236761, 1174, 5889, 236789,
+                            236745, 1164, 4668, 1995, 532, 19764, 236761, 1174, 563, 506,
+                            3479, 1056, 27069, 236789, 236751, 24625, 9156, 5452, 3645, 236772]
+            t |> success(int64(length(segs[0].tokens)) >= int64(length(expected)),
+                "emitted at least {length(expected)} tokens ({length(segs[0].tokens)})")
+            var mismatches = 0
+            for (i in range(min(length(expected), length(segs[0].tokens)))) {
+                if (segs[0].tokens[i] != expected[i]) {
+                    mismatches++
+                }
+            }
+            t |> success(mismatches == 0, "confident prefix token-for-token ({mismatches} mismatches)")
+            t |> equal(s.detected_lang, "en", "english")
+        }
+        delete m.dec.wblob
+        delete m.g4a.blob
+    }
+}

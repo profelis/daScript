@@ -12,6 +12,7 @@ require dasllama/dasllama_whisper public
 require dasllama/dasllama_qwen3a public
 require dasllama/dasllama_parakeet public
 require dasllama/dasllama_canary public
+require dasllama/dasllama_gemma4a public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — the qwen3a decoder is a full LLM; umbrella fires arch [init]s
 
 // The uniform ASR surface: one loader that sniffs the file format, one verb set that
@@ -30,6 +31,7 @@ enum private AsrKind {
     qwen3a
     parakeet
     canary
+    gemma4a
 }
 
 //! What a loaded ASR model honestly supports — advisory (invalid options still panic loudly
@@ -50,6 +52,7 @@ struct AsrModel {
     q3t : Qwen3aTower = Qwen3aTower()  // qwen3a: the chunked audio encoder
     pk : ParakeetModel = ParakeetModel()
     cenc : CanaryEncoder = CanaryEncoder()   // canary: the FastConformer-32 encoder + projector
+    g4a : Gemma4aEncoder = Gemma4aEncoder()  // gemma4a: the Conformer audio encoder + mm embedder
 }
 
 //! One transcription stream over an AsrModel: per-backend scratch plus the shared options.
@@ -63,6 +66,7 @@ struct AsrSession {
     qcs : Qwen3aConvState = Qwen3aConvState()
     pkst : ParakeetState = ParakeetState()   // parakeet hot-path scratch — zero allocation per transcribe
     cst : CanaryState = CanaryState()        // canary encoder scratch (shares qctx for the decoder)
+    g4st : Gemma4aState = Gemma4aState()     // gemma4a encoder scratch (shares qctx for the decoder)
     translate : bool = false
     no_timestamps : bool = false
     context : string = ""
@@ -134,10 +138,32 @@ def load_asr_model(path : string; mmproj : string) : AsrModel {
         panic("dasLLAMA asr: mmproj '{mmproj}' is too short")
     }
     var emagic = 0u
+    var eproj = ""
     fmap(ef) $(var bytes : array<uint8>#) {
         emagic = rd_u32(bytes, 0l)
+        if (emagic == 0x46554747u) {   // "GGUF" — sniff the audio projector type
+            let mm <- parse_gguf_meta(bytes)
+            if (gguf_has(mm, "clip.audio.projector_type")) {
+                eproj = gguf_str(mm, bytes, "clip.audio.projector_type")
+            } elif (gguf_has(mm, "clip.projector_type")) {
+                eproj = gguf_str(mm, bytes, "clip.projector_type")
+            }
+        }
     }
     fclose(ef)
+    if (eproj == "gemma4a") {
+        var m = AsrModel(kind = AsrKind.gemma4a)
+        m.dec <- load_model_(path, QuantMode.q8)
+        if (m.dec.arch != "gemma4") {
+            panic("dasLLAMA asr: '{path}' is arch '{m.dec.arch}' — the gemma4a audio route expects a Gemma-4 decoder")
+        }
+        m.dec.config.seq_len = min(m.dec.config.seq_len, 8192l)
+        m.g4a <- load_gemma4a_encoder(mmproj)
+        if (m.g4a.proj_dim != m.dec.config.dim) {
+            panic("dasLLAMA asr: gemma4a encoder projects to {m.g4a.proj_dim} but the decoder is {m.dec.config.dim}-wide — mismatched pair")
+        }
+        return <- m
+    }
     if (emagic == CANARY_MAGIC) {
         var m = AsrModel(kind = AsrKind.canary)
         m.dec <- load_model_(path, QuantMode.fp32)
@@ -173,6 +199,14 @@ def load_asr_model(path : string; mmproj : string) : AsrModel {
 def private pk_is_multilingual(m : AsrModel) : bool => m.pk.n_vocab >= 8192l
 
 def caps(m : AsrModel) : AsrCaps {
+    if (m.kind == AsrKind.gemma4a) {
+        // Gemma-4 E-series audio: multimodal chat model; the ASR rail drives a greedy
+        // transcription turn. No timestamps; the model reasons then transcribes.
+        var gc = AsrCaps(translate = false, timestamps = AsrTimestamps.none,
+                         streaming = false, prompt = false)
+        gc.languages <- ["en"]
+        return <- gc
+    }
     if (m.kind == AsrKind.canary) {
         var cc = AsrCaps(translate = false, timestamps = AsrTimestamps.none,
                          streaming = false, prompt = false)
@@ -229,6 +263,10 @@ def create_session(m : AsrModel; lang : string = "en") : AsrSession {
         if (lang != "auto" && lang != "en") {
             panic("dasLLAMA asr: this Canary-Qwen model is English-only — create the session with lang=\"en\" or \"auto\"")
         }
+        s.qctx <- create_session_(m.dec)
+        return <- s
+    }
+    if (m.kind == AsrKind.gemma4a) {
         s.qctx <- create_session_(m.dec)
         return <- s
     }
@@ -413,6 +451,92 @@ def private transcribe_canary(m : AsrModel; var s : AsrSession; samples : array<
     return 1
 }
 
+// Gemma-4 E-series audio transcription: gemma4a Conformer encode + mm embedder, the soft tokens
+// spliced into the gemma-4 channel chat template (system `<|think|>` → user `<|audio>`…`<audio|>`
+// Transcribe → model), greedy decode over the Gemma-4 decoder until `<turn|>`/`<eos>` (which is
+// emitted into the ids). The reasoning `<|channel>thought…<channel|>` prefix is stripped for the
+// returned text. Token-for-token vs llama-mtmd-cli `--temp 0 --jinja`.
+def private transcribe_gemma4a(m : AsrModel; var s : AsrSession; samples : array<float> | #;
+                               blk : block<(seg : TranscribeSegment)>) : int {
+    var tp = ref_time_ticks()
+    var rows : array<float>
+    let n_audio = gemma4a_encode_all(m.g4a, s.g4st, samples, rows)
+    asr_prof_add("g4a.encode", tp)
+
+    let dim = m.dec.config.dim
+    let nl = encode_(m.dec, "\n", false, false)
+    // no-think turn: a bare user turn (no system/`<|think|>`) yields a deterministic transcription
+    // — the reasoning channel is near-tie-brittle across float engines, so it is disabled here.
+    var head : array<int64>
+    head |> push(special_id(m.dec, "<bos>"))
+    head |> push(special_id(m.dec, "<|turn>"))
+    head |> push_from(encode_(m.dec, "user", false, false))
+    head |> push_from(nl)
+    head |> push(special_id(m.dec, "<|audio>"))
+    var tail : array<int64>
+    tail |> push(special_id(m.dec, "<audio|>"))
+    tail |> push_from(encode_(m.dec, "Transcribe this audio.", false, false))
+    tail |> push(special_id(m.dec, "<turn|>"))
+    tail |> push_from(nl)
+    tail |> push(special_id(m.dec, "<|turn>"))
+    tail |> push_from(encode_(m.dec, "model", false, false))
+    tail |> push_from(nl)
+
+    let n_head = int64(length(head))
+    let npos = n_head + n_audio + int64(length(tail))
+    var embd : array<float>
+    embd |> resize(int(npos * dim))
+    embed_text_rows(m.dec, head, embd, 0l)
+    for (i in range64(n_audio * dim)) {
+        embd[n_head * dim + i] = rows[i]
+    }
+    embed_text_rows(m.dec, tail, embd, n_head + n_audio)
+
+    s.qctx.n_past = 0l   // fresh sequence per transcribe
+    tp = ref_time_ticks()
+    eval_embd_(m.dec, s.qctx, embd, npos)
+
+    let turn_end = special_id(m.dec, "<turn|>")
+    let eos = special_id(m.dec, "<eos>")
+    let max_new = m.dec.config.seq_len - npos - 1l
+    var one : array<int64>
+    one |> resize(1)
+    var toks : array<int>
+    var raw : array<string>
+    toks |> reserve(512)
+    raw |> reserve(512)
+    for (_i in range64(max_new)) {
+        var best = 0
+        for (i in range(1, length(s.qctx.logits))) {
+            if (s.qctx.logits[i] > s.qctx.logits[best]) {
+                best = i
+            }
+        }
+        toks |> push(best)
+        if (int64(best) == turn_end || int64(best) == eos) {   // EOG: emitted into the ids, then stop
+            break
+        }
+        raw |> push(piece_(m.dec, int64(best)))
+        one[0] = int64(best)
+        eval_(m.dec, s.qctx, one)
+    }
+    asr_prof_add("g4a.decode", tp)
+
+    // strip the reasoning channel: keep the text after the last `<channel|>` (the final transcription)
+    let full = join(raw, "")
+    var text = full
+    let mark = rfind(full, "<channel|>")
+    if (mark >= 0) {
+        text = slice(full, mark + length("<channel|>"), length(full))
+    }
+    var seg = TranscribeSegment(t0 = 0l, t1 = int64(length(samples)) * 100l / AUDIO_SAMPLE_RATE,
+        text = strip(text))
+    seg.tokens := toks
+    s.detected_lang = "en"
+    blk |> invoke(seg)
+    return 1
+}
+
 // Parakeet transcription: full-clip FastConformer encode + TDT greedy, one segment.
 def private transcribe_parakeet(m : AsrModel; var s : AsrSession; samples : array<float> | #;
                                 blk : block<(seg : TranscribeSegment)>) : int {
@@ -448,6 +572,9 @@ def transcribe(m : AsrModel; var s : AsrSession; samples : array<float> | #;
     //! Transcribe ``samples`` (16 kHz mono f32 PCM), one ``TranscribeSegment`` per trailing-block
     //! call. Returns the segment count. Whisper honors ``translate``/``no_timestamps``; qwen3a
     //! emits ONE segment (no timestamps) and fills ``detected_lang``.
+    if (m.kind == AsrKind.gemma4a) {
+        return transcribe_gemma4a(m, s, samples, blk)
+    }
     if (m.kind == AsrKind.canary) {
         return transcribe_canary(m, s, samples, blk)
     }
