@@ -121,6 +121,7 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_parakeet.das
     modules/dasLLAMA/dasllama/dasllama_canary.das
     modules/dasLLAMA/dasllama/dasllama_gemma4a.das
+    modules/dasLLAMA/dasllama/dasllama_vad.das
     modules/dasLLAMA/dasllama/dasllama_arch_llama.das
     modules/dasLLAMA/dasllama/dasllama_arch_qwen2.das
     modules/dasLLAMA/dasllama/dasllama_arch_qwen3.das

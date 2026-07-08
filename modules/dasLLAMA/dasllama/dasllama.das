@@ -17,6 +17,7 @@ require dasllama/dasllama_transformer public   // the engine + arch registry; ev
 require dasllama/dasllama_chat public          // layer 2: chat sessions over the same engine
 require dasllama/dasllama_audio public         // audio tower (mel frontend + whisper encoder + projectors)
 require dasllama/dasllama_asr public           // uniform ASR surface (whisper today; parakeet/qwen3-asr land behind the same sniff)
+require dasllama/dasllama_vad public           // Silero-VAD (voice-activity detection): segments + streaming iterator
 require dasllama/dasllama_math                 // setup_dasllama_jobque_ (engine-level, wrapped below, not re-exported)
 
 // This facade owns the good names; the engine spells each wrapped function with a trailing
