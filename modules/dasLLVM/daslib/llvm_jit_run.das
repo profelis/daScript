@@ -419,7 +419,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
         jit_flags.need_di = debug_info
 
         let attrs = new Attributes(g_ctx)
-        var uids = create_uid_nodes(prog, funcs)
+        var uids = create_uid_nodes(prog, funcs, gen_exe)
         var fake_visitor = new LlvmJitVisitor(ctx, g_prim_t, uids, jit_flags, null, attrs)
         ast_gc_guard() {
             for (fun in funcs) {
