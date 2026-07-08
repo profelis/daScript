@@ -160,6 +160,11 @@ embd 2048, ff 6144, 32Q/4KV heads (head_size 128), **128 experts top-8**, expert
   top-8-of-128 pick. Prose diverges only at the model's OWN first near-tie (oracle top-1/top-2 gap
   **0.04 at step 6**, das picks the oracle's #2 — a coin-flip, not a bug). Better than gemma-26B
   (capped at 11): qwen3moe holds the full 40 on the confident counting continuation.
+- **Prefill A/B (M1 Max, PP=512, Parsec off, box profile, interleaved best-of-5):** das grouped
+  **206.8 t/s** vs das naive per-position 44.5 = **4.64×** (internal sanity — grouped batching engaged,
+  like the 26B's 5.5×); vs lcpp CPU `-ngl 0 -t 8` **130.0 t/s** = **das LEADS lcpp 1.59×**. Robust:
+  the pessimistic settled das rep (195) still beats lcpp's optimistic end (136) by 1.43×. Grouped is
+  the shipped default (`ffn_moe_prefill` dispatches it for q8); reference path kept as the A/B lever.
 - The 235B-A22B header-tolerance row was NOT attempted (doesn't fit; deferred).
 
 Original scope notes (all resolved above): qwen2moe wiring + qwen3's QK-norm, **renormalized** top-k
