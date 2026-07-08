@@ -107,6 +107,8 @@ Expect `0`.
 
 ## 6. Re-request Copilot review
 
+**Resolve (and reply to) every prior thread BEFORE re-requesting review.** Re-requesting while old threads are still open leaves the PR ambiguous — you can't tell a stale comment (already addressed, from a superseded commit) from one that still needs action. Resolve first, and any thread that's still open after the next review is unambiguously *new*.
+
 After all replies + resolves + force-push, re-request:
 ```
 mcp__github__request_copilot_review(owner=…, repo=…, pullNumber=…)
@@ -131,4 +133,4 @@ Each iteration: triage → discuss → fix → gate → amend → force-push →
 | Amend/push | `git commit --amend --no-edit`, `git push --force-with-lease` | Keep squashed branch squashed |
 | Reply | `mcp__github__add_reply_to_pull_request_comment` | Every addressed comment gets a reply |
 | Resolve | `gh api graphql ... resolveReviewThread` | Every addressed thread gets resolved |
-| Re-request | `mcp__github__request_copilot_review` | After replies, resolves, and push |
+| Re-request | `mcp__github__request_copilot_review` | AFTER replies + resolves + push — never with open prior threads (stale-vs-new becomes ambiguous) |

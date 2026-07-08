@@ -364,6 +364,45 @@ what it costs today and what the fix would change.
   per-region "stay-fp32 when the mat fits cache and the box lacks int8-dot silicon" load
   heuristic (or a box_profile knob like batch_grid_2d) — DON'T build until the M1 decoder-q8
   re-sweep says whether sdot boxes want q8 everywhere (likely yes → knob would be x64-only).
+- **Gemma-4 E-series DENSE prefill trails lcpp Accelerate-BLAS on M1 (Wave G3 A/B, 2026-07-07).**
+  E4B pp512 das **178.7** vs lcpp **192.9 = 0.93×**; E2B pp512 das **376** vs lcpp **382 = 0.98×**
+  (E2B ties, E4B ~7% back). Decode tied both (bandwidth-bound: E4B 18.7/19.2, E2B 36.0/36.9).
+  Root: dense prefill has no sparsity/grouping lever (unlike the MoE waves that LED lcpp), so it's
+  das NEON-SDOT vs lcpp Accelerate-BLAS (AMX-backed) on the projection/FFN GEMMs — the larger E4B
+  dim (2560 × ff 10240) favors AMX more, hence 0.93× vs E2B's 0.98×. Cost today: ~7% E4B prefill
+  on M1 only; boxes without AMX exposure (zen2/SPR VNNI) already close it. Possible lever: a
+  gemm-gen tuned Q8 kernel for the E-series shapes (the tune framework already exists) — don't
+  build until an AMX-less box A/B says the shape actually leaves das-kernel headroom on the table.
+
+- **Canary-Qwen ASR runs fp32 for parity; q8 decoder+encoder is the follow-up (Wave A1,
+  2026-07-08).** The token-for-token gate loads the LoRA-merged Qwen3-1.7B decoder + FastConformer
+  encoder at fp32. Perf A/B (M1 8T, das vs NeMo SALM greedy, `benchmarks/asr/results.md`): das
+  LEADS every short/dictation clip 1.4–3× (jfk das/nemo 0.61×, LibriSpeech 0.34–0.49×) — the
+  Canary-Qwen use case — but TRAILS 3.7× on the 3-min gb1, where the fp32 1.7B decoder is
+  bandwidth-bound over gb1's ~2500 audio soft tokens. Fix: a q8 decoder (the existing q8 GEMV path,
+  ~2× decode on the bandwidth rail) + q8 encoder, both straight ports of the parakeet/whisper q8
+  machinery gated behind the fp32 parity default. Don't chase until the ASR-perf pass — but
+  gb1-class long-audio is where it pays.
+
+- **Gemma-4 E-series audio (gemma4a) encoder is fp32 SCALAR — big A/B gap (Wave A2, 2026-07-08).**
+  The parity gate is fp32 encoder correctness, so the gemma4a Conformer runs a plain fp32 scalar
+  forward. A/B (M1 Max 8T, das vs llama-mtmd-cli, `benchmarks/asr/results.md`): das transcribe
+  6028 ms / xRT 2.89 vs mtmd-cli 1547 ms / xRT 11.3 → **das TRAILS 3.9×**, dominated by the encoder:
+  das encode 1888 ms vs mtmd 117 ms = **16×** (fp32 scalar Conformer vs ggml's bf16-weight SIMD
+  GEMMs); long-context decode 21.7 vs 78 tok/s also lags. Unlike A1/parakeet/whisper (which lead or
+  tie), this tower has had NO perf pass. Fix: route the gemma4a tower through the gemm-gen Q8 audio
+  kernel (the same SIMD/threaded machinery parakeet/whisper towers already use) — likely the single
+  biggest audio-side win on the shelf — plus the long-context decode path. Not chased mid-wave.
+
+- **Qwen3-Omni AuT tower is fp32 scalar too; perf numbers are SOFT (Wave A3, 2026-07-08).**
+  Same shape as A2: parity gate is fp32, so the shared qwen3a AuT encoder runs scalar. A/B (M1 Max
+  8T, das vs llama-mtmd-cli): jfk das 3625 ms / xRT 3.03 vs mtmd 1173 / 9.4 = **das trails 3.09×**;
+  jfk3 das 8263 / 3.99 vs mtmd 2079 / 15.9 = **3.97×**. Dominant gap = the fp32 scalar qwen3a tower
+  (~4.8× encode), same lever as the gemma4a entry above — SIMD/Q8 the shared AuT/qwen3a encoder
+  covers BOTH A2 and A3. The q8 MoE thinker (grouped prefill ~207 t/s + q8 decode) also trails ggml.
+  ⚠️ These A/B numbers are SOFT: measured with a dormant Parsec host daemon (1.6% CPU) + Spotlight
+  indexing the freshly-downloaded 34 GB — a clean announced Parsec-off re-sweep would firm them (parity
+  is unaffected). Not chased mid-wave.
 
 - **ASR short-clip fixed costs (parakeet, M1 — NEXT ROUND, Boris 2026-07-06; whisper tower
   q8 postponed one session behind it).** Cost today at matched 8T: jfk das 703 ms vs cli 352

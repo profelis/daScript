@@ -1,0 +1,49 @@
+# dictation bot configuration
+#
+# Edit the paths below to point at your local models. Absolute paths recommended.
+# The bot reads this file from next to its executable, or from --config <path>.
+
+# Whisper ASR model (whisper.cpp ggml .bin). Multilingual large-v3-turbo is a good RU+EN default.
+# Set this to your local model path; empty = the bot exits at startup asking you to set it.
+whisper_model = ""
+
+# Instruct LLM (GGUF) that rewrites the raw transcript into clean, paragraph-split text.
+# Set this to your local model path; empty = the bot exits at startup asking you to set it.
+llm_model = ""
+
+# Telegram bot token from @BotFather. Leave empty to read TELEGRAM_BOT_TOKEN from the environment.
+bot_token = ""
+
+# dasLLAMA worker cap: workers + the computing main thread = compute lanes. 7 -> 8 lanes.
+# DAS_JOBQUE_THREADS in the environment still overrides this.
+threads = 7
+
+# Whisper language hint. "auto" detects the language of each message (recommended for RU+EN).
+language = "auto"
+
+# Reply-token budget for the LLM cleanup step (a longer voice note needs more).
+max_tokens = 2048
+
+# LLM sampling temperature. 0 = greedy (most faithful to the transcript).
+temp = 0.0
+
+# ffmpeg executable — on PATH, or an absolute path. Used to transcode OGG/Opus voice notes to WAV.
+ffmpeg = "ffmpeg"
+
+# getUpdates long-poll timeout, seconds.
+poll_timeout = 30
+
+# Log file path. Leave empty to write dictation.log next to the executable.
+log_file = ""
+
+# Log level: trace | debug | info | warning | error | critical.
+log_level = "info"
+
+# Skip the LLM cleanup when the transcript is this short (bytes) or less — 0 skips only empty
+# transcripts; 8 also drops Whisper's short silence hallucinations ("you", ".", …). Note bytes,
+# so Cyrillic counts ~2 per character.
+min_chars = 8
+
+# Archive every received audio file here (original format). Empty = don't keep any audio (default).
+# The directory is created if missing; files are named <unixdate>_<senderid>_<telegram-name>.
+keep_audio_dir = ""

@@ -1508,7 +1508,11 @@ class public LlvmJitVisitor : AstVisitor {
                 set_public_linkage(global_addr)
                 LLVMSetInitializer(global_addr, types.ConstPtr(address |> intptr, nonnull_type))
             }
-        } else {
+        } elif (!flags.gen_exe) {
+            // In JIT mode each function is codegen'd once, so a duplicate name is a real bug.
+            // In exe mode init_globals and init_globals_clone both codegen the same global-var
+            // initializers, so the same addr/global-const slot is legitimately re-encountered —
+            // reuse it silently (idempotent: same name is the same module-level slot).
             failed("Name duplicate {name.glob()}\n")
         }
         return load_local_const(global_addr, nonnull_type)

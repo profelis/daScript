@@ -23,12 +23,14 @@ def private configure_gemma4(var c : Config) {
     c.attn_scale = 1.0                  // no 1/sqrt(head_size) score scale — QK-norm replaces it
     c.v_norm = true                     // weightless per-head RMSNorm on V after projection
     c.rope_ff_global_only = true        // p-RoPE: rope_freqs factors apply to global layers only
+    c.moe_optional = true               // 26B-A4B is MoE; 12B/31B are dense — the loader decides by file
+    c.norm_topk_prob = true             // gemma4 renormalizes the selected top-k weights (no GGUF key; build_moe_ffn norm_w=true)
 }
 
 [init]
 def register_arch_gemma4() {
     var d = ArchDesc(name = "gemma4", configure = @@configure_gemma4)
-    d.blocks = std_blocks()
+    d.blocks = gemma4_blocks()   // dense (12B/31B) or parallel dense-shared + routed MoE (26B-A4B) by expert count
     // channel-based turn format (replaces gemma's <start_of_turn>): the assistant opener closes an
     // empty `thought` channel — the template's non-thinking default — so the model answers directly
     d.chat.add_bos = true   // BOS = <bos> (id 2)
