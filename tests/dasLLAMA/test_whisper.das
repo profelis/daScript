@@ -1,6 +1,9 @@
 options gen2
 options persistent_heap   // model-scale allocations — freed per test
-options stack = 65536
+// The uniform AsrModel/AsrSession union every backend's model+scratch by value (whisper, qwen3a,
+// parakeet, canary, gemma4a) — ~5 KB / ~10 KB each now; tests holding two (q8-gate) or nesting
+// load frames (parakeet) need headroom above the default. Bumped for the 6-backend union.
+options stack = 131072
 
 require dastest/testing_boost public
 require dasllama/dasllama_whisper
