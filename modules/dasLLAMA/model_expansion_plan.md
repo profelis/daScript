@@ -141,13 +141,29 @@ Oracle throughout: llama.cpp `simple_ids` / `harness/parity.sh` (gemma4 support 
 proven by the 12B row). Chat template: gemma family template already registered; E-series
 **VERIFY** for deltas.
 
-## Wave Q — Qwen3-MoE (best value/cost on the LLM side)
+## Wave Q — Qwen3-MoE (best value/cost on the LLM side) — ✅ CORRECTNESS DONE 2026-07-07
 
-**Qwen3-30B-A3B** (+ optionally the 235B-A22B for header-tolerance only — it does not fit
-either box; no parity run, just a clean "too big" load error). Arch delta over what we
-run: qwen2moe wiring + qwen3's QK-norm, **renormalized** top-k router, **no shared
-expert** (**VERIFY** against llama.cpp's `qwen3moe` build fn). Small slice; 3B-active on
-our threaded engine probably becomes the best chat model per CPU-second we ship.
+**Qwen3-30B-A3B — ✅ DONE (config-only arch, zero new forward code).** VERIFY resolved GREEN
+against llama.cpp `build_qwen3moe` (`src/models/qwen3moe.cpp`): standard attention with per-head
+Q/K-norm before RoPE (our `c.qk_norm`), `1/√head` scale, no QKV bias; `build_moe_ffn` with softmax
+router + `norm_w=true` (renormalized top-k) + `nullptr` shared-expert gate (none). So the whole slice
+is `configure_qwen3moe = rope_neox + qk_norm + moe + norm_topk_prob` on `moe_blocks()` (new file
+`dasllama_arch_qwen3moe.das`, +transformer require, +`.das_module`/CMake/AOT lists). The loader
+already reads `expert_weights_norm`/`expert_shared_feed_forward_length`; the router `moe_select`
+already renormalizes; the grouped prefill already handles `nsh==0`. Header (confirmed): 48 layers,
+embd 2048, ff 6144, 32Q/4KV heads (head_size 128), **128 experts top-8**, expert_ff 768.
+- **Counting 40/40 token-for-token** (`harness/parity.sh`), both grouped + reference prefill paths,
+  bit-identical. Fixture `test_parity_qwen3moe_30b` (reuses `QWEN3_PROMPT`/`QWEN3_GEN`, large-tier).
+- **NO double-RMS needed** (vs gemma-26B). Margin analysis (`simple_ids_margin`) on a prose probe:
+  das tracks the oracle through margins as tight as **0.08 logits** with no systematic router flips —
+  the shared float `ffn_norm` already matches ggml's double-accumulated norm closely enough for the
+  top-8-of-128 pick. Prose diverges only at the model's OWN first near-tie (oracle top-1/top-2 gap
+  **0.04 at step 6**, das picks the oracle's #2 — a coin-flip, not a bug). Better than gemma-26B
+  (capped at 11): qwen3moe holds the full 40 on the confident counting continuation.
+- The 235B-A22B header-tolerance row was NOT attempted (doesn't fit; deferred).
+
+Original scope notes (all resolved above): qwen2moe wiring + qwen3's QK-norm, **renormalized** top-k
+router, **no shared expert**. Small slice; 3B-active is now the best chat model per CPU-second we ship.
 Unlocks the Wave A3 Omni thinker. Oracle: `simple_ids`, standard.
 
 **Prefill = grouped batched, NOT naive `forward`-per-token (Boris, 2026-07-07).** qwen3moe is

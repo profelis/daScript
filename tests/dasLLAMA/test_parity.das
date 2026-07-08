@@ -324,6 +324,40 @@ def test_parity_qwen2moe(t : T?) {
     }
 }
 
+// Qwen3-30B-A3B Q8 — the qwen3moe arch: Qwen3 attention (per-head QK-norm pre-RoPE, NEOX rope, no
+// QKV bias) with routed experts — softmax router → RENORMALIZED top-8-of-128, and NO shared expert
+// (vs qwen2moe's un-renormalized top-4 + sigmoid shared expert). Same Qwen BPE vocab and counting
+// continuation as the dense Qwen fixtures, so the id arrays are shared. Runs through BOTH MoE prefill
+// paths off one load (grouped default + per-position reference) — bit-identical by construction.
+//
+// Unlike the gemma-4-26B MoE (which capped at 11), qwen3moe holds the full 40-token counting
+// continuation token-for-token: at every confident step das tracks the oracle (verified through
+// oracle margins as tight as 0.08 logits on a prose probe), with no systematic router flips — the
+// shared float `ffn_norm` already tracks ggml's double-accumulated norm closely enough for the
+// discrete top-8-of-128 pick. High-entropy prompts still diverge at the model's OWN near-ties (a
+// prose probe flips at the first coin-flip: oracle top-1/top-2 gap 0.04 at step 6, das picks the
+// oracle's #2 — not a forward bug). Large-tier (~32 GB): DASLLAMA_PARITY_FULL=1.
+[test]
+def test_parity_qwen3moe_30b(t : T?) {
+    t |> run("qwen3moe forward (Qwen3-30B-A3B Q8: QK-norm attn, softmax top-8-of-128 renormalized, no shared expert)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Qwen3-30B-A3B-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3moe token-for-token")
+        set_moe_grouped_prefill(false)
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3moe reference-prefill token-for-token")
+        set_moe_grouped_prefill(true)
+        delete tr
+    }
+}
+
 // gemma-3-1b-it + gemma-3-4b-it Q8 — the per-layer attention-pattern arch (5-local:1-global SWA +
 // dual RoPE θ; the 4B adds linear-8 position scaling on global layers). The 4B counts cleanly from
 // "1..7," (BOS=2); the 1B used to drop into prose after "10" — a prose tail that flipped a genuine
