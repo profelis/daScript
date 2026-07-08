@@ -384,6 +384,16 @@ what it costs today and what the fix would change.
   machinery gated behind the fp32 parity default. Don't chase until the ASR-perf pass — but
   gb1-class long-audio is where it pays.
 
+- **Gemma-4 E-series audio (gemma4a) encoder is fp32 SCALAR — big A/B gap (Wave A2, 2026-07-08).**
+  The parity gate is fp32 encoder correctness, so the gemma4a Conformer runs a plain fp32 scalar
+  forward. A/B (M1 Max 8T, das vs llama-mtmd-cli, `benchmarks/asr/results.md`): das transcribe
+  6028 ms / xRT 2.89 vs mtmd-cli 1547 ms / xRT 11.3 → **das TRAILS 3.9×**, dominated by the encoder:
+  das encode 1888 ms vs mtmd 117 ms = **16×** (fp32 scalar Conformer vs ggml's bf16-weight SIMD
+  GEMMs); long-context decode 21.7 vs 78 tok/s also lags. Unlike A1/parakeet/whisper (which lead or
+  tie), this tower has had NO perf pass. Fix: route the gemma4a tower through the gemm-gen Q8 audio
+  kernel (the same SIMD/threaded machinery parakeet/whisper towers already use) — likely the single
+  biggest audio-side win on the shelf — plus the long-context decode path. Not chased mid-wave.
+
 - **ASR short-clip fixed costs (parakeet, M1 — NEXT ROUND, Boris 2026-07-06; whisper tower
   q8 postponed one session behind it).** Cost today at matched 8T: jfk das 703 ms vs cli 352
   (2.0x), LibriSpeech dictation p50 651 vs 324; long clips already 1.07-1.10x, so the short
