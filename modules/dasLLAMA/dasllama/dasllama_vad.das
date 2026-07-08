@@ -458,7 +458,7 @@ def vad_iter_feed(m : VadModel; var it : VadIter; samples : array<float> | #;
                 // clamp the padded end to consumed audio: at pad > 32 ms the raw padded offset can
                 // point past it.cur (silero VADIterator leaves it unclamped) — a no-op at the 30 ms
                 // default, so the event-for-event parity gate is unaffected.
-                let e = max(0l, min(it.cur, it.temp_end + speech_pad - SV_CHUNK))
+                let e = clamp(it.temp_end + speech_pad - SV_CHUNK, 0l, it.cur)
                 it.temp_end = 0l
                 it.triggered = false
                 invoke(blk, VadEvent(kind = VadEventKind.speech_end, sample = e))
