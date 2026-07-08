@@ -9,10 +9,7 @@ require strings
 [export]
 def main() {
     // read token from env var or .bot_token file
-    var token = ""
-    unsafe {
-        token = get_env_variable("TELEGRAM_BOT_TOKEN")
-    }
+    var token = get_env_variable("TELEGRAM_BOT_TOKEN")
     if (empty(token)) {
         fopen(".bot_token", "rb") $(f) {
             if (f != null) {
