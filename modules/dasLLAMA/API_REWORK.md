@@ -374,6 +374,16 @@ what it costs today and what the fix would change.
   gemm-gen tuned Q8 kernel for the E-series shapes (the tune framework already exists) — don't
   build until an AMX-less box A/B says the shape actually leaves das-kernel headroom on the table.
 
+- **Canary-Qwen ASR runs fp32 for parity; q8 decoder+encoder is the follow-up (Wave A1,
+  2026-07-08).** The token-for-token gate loads the LoRA-merged Qwen3-1.7B decoder + FastConformer
+  encoder at fp32. Perf A/B (M1 8T, das vs NeMo SALM greedy, `benchmarks/asr/results.md`): das
+  LEADS every short/dictation clip 1.4–3× (jfk das/nemo 0.61×, LibriSpeech 0.34–0.49×) — the
+  Canary-Qwen use case — but TRAILS 3.7× on the 3-min gb1, where the fp32 1.7B decoder is
+  bandwidth-bound over gb1's ~2500 audio soft tokens. Fix: a q8 decoder (the existing q8 GEMV path,
+  ~2× decode on the bandwidth rail) + q8 encoder, both straight ports of the parakeet/whisper q8
+  machinery gated behind the fp32 parity default. Don't chase until the ASR-perf pass — but
+  gb1-class long-audio is where it pays.
+
 - **ASR short-clip fixed costs (parakeet, M1 — NEXT ROUND, Boris 2026-07-06; whisper tower
   q8 postponed one session behind it).** Cost today at matched 8T: jfk das 703 ms vs cli 352
   (2.0x), LibriSpeech dictation p50 651 vs 324; long clips already 1.07-1.10x, so the short

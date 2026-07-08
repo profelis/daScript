@@ -253,10 +253,11 @@ Qwen3-1.7B** decoder + a linear projector + LoRA on the LLM.
 
 ### Oracle rail — ✅ DONE 2026-07-07 (the wave's designated first sub-task / main risk).
 
-NeMo python greedy transcribe is the reference (NO cli/llama.cpp oracle exists — llama.cpp
-has zero canary/SALM/FastConformer support; only the bare `qwen3` decoder arch, so the
-section-closing A/B can at most reference a standalone Qwen3-1.7B `llama-bench`, never the
-ASR model). Rig built + verified end-to-end:
+NeMo python greedy transcribe is the reference (NO cli/llama.cpp/onnx-asr canary oracle
+exists — llama.cpp has zero canary/SALM/FastConformer support, onnx-asr ships no canary
+export; so both parity AND the section-closing perf A/B ride the NeMo SALM engine on the
+`benchmarks/asr/` rail, exactly like parakeet/whisper — audio waves are NEVER benched vs
+llama.cpp). Rig built + verified end-to-end:
 - **Driver:** `harness/canary_qwen_oracle.py` — engine-level (no HTTP), `SALM.from_pretrained`
   + `model.generate` with `GenerationConfig(do_sample=False, num_beams=1)` (pure greedy,
   deterministic — jfk IDs identical across reruns). Emits `IDS`/`TEXT` fixture lines.
