@@ -123,6 +123,42 @@ def ensure_sgconfig(root : string) {
     }
 }
 
+// Stage the JIT backend files that a plain `--target daslang` build does NOT produce:
+// <root>/lib/LLVM.dll (the LLVM codegen backend, loaded by name from dasLLVM's bindings) and
+// <root>/bin/lld-link.exe (links each JIT-emitted .dll). Only the dasLLVM shared-lib CMake step
+// stages these, and building just the `daslang` target skips it — so without this a fresh
+// worktree binary silently falls back to the interpreter (`-jit` fails: "can't load LLVM.dll").
+// Copy them from the source tree of the daslang running this setup (get_das_root()), which is a
+// JIT-capable build; skip when a file is already present or we're setting up that source tree.
+// Windows-only for now (the codegen dll name / linker differ on posix — staging there is TBD).
+def stage_jit_backend(root : string) {
+    if (get_platform_name() != "windows") {
+        return
+    }
+    let src_root = get_das_root()
+    if (get_full_file_name(src_root) == get_full_file_name(root)) {
+        return
+    }
+    let jit_files = ["lib/LLVM.dll", "bin/lld-link.exe"]
+    for (rel in jit_files) {
+        let dst = path_join(root, rel)
+        if (fexist(dst)) {
+            continue
+        }
+        let src = path_join(src_root, rel)
+        if (!fexist(src)) {
+            print("WARNING: JIT backend file '{rel}' not found in source tree {src_root}; worktree -jit may be unavailable\n")
+            continue
+        }
+        let cr = copy_file_result(src, dst, false)
+        if (cr is error) {
+            print("WARNING: failed to stage JIT backend '{rel}': {cr as error}\n")
+        } else {
+            print("Staged JIT backend: {rel}\n")
+        }
+    }
+}
+
 // Point .mcp.json at the stdio supervisor (mcp_supervisor.py). The supervisor
 // owns the .mcp.json merge (preserving other servers like github), so setup
 // just invokes it. Requires python on PATH — Claude Code spawns the supervisor
@@ -203,6 +239,7 @@ def main() : int {
     }
 
     ensure_sgconfig(root)
+    stage_jit_backend(root)
     if (!emit_mcp_config(root)) {
         return 1
     }
