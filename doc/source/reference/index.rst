@@ -28,6 +28,7 @@ THE SOFTWARE.
    spirv.rst
    utils.rst
    tutorials.rst
+   tune.rst
    flatten.rst
    linq_fold_patterns.rst
    linq_das.rst

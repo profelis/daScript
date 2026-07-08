@@ -7,7 +7,33 @@ tuner is measurement, not codegen.** Every "breakthrough" we later retracted was
 measurement artifact; every real win survived the discipline below.
 
 Companion docs: `x64_arch.md` (what's universal vs per-box), `get_x64_going.md` (bring-up —
-finish it first; tuning an incorrect kernel is worse than pointless).
+finish it first; tuning an incorrect kernel is worse than pointless). For the tune *framework*
+itself (the `[tune]`/`[tune_scope]`/`[tune_policy]` annotations, the manifest format, the mode
+contract) see `doc/source/reference/tune.rst`; this doc is the dasLLAMA-specific application of
+it plus the measurement discipline.
+
+---
+
+## Zero-config: `dasllama-server` tunes itself
+
+The everyday path needs no manual step. `dasllama_math_gen` declares
+`[tune_scope(name = "dasllama", tuner = "../harness/gen_tune_probe.das")]`, so the gen GEMM
+family resolves its per-box winner from `<das_root>/dasllama.tune.json` — shared by
+**every** dasLLAMA application on the box. `dasllama-server` declares
+`[tune_policy(missing = "auto")]`: the first start on an untuned box runs `gen_tune_probe`,
+writes the manifest, and relaunches itself with the winners; thereafter it serves directly and
+logs the tune status at startup. `--tune` forces a re-tune; `DAS_TUNE_POLICY=error` skips
+per-start tuning while developing (it prints the tuner command instead).
+
+Two sibling CLI tools share the same manifest — no per-app scope declaration, since requiring
+dasLLAMA pulls in its `[tune_scope]`: `ask` (prompt → completion, reporting ttft + prefill/decode
+t/s) and `wav2txt` (audio → text, reporting decode/transcribe time + real-time factor). Both carry
+the same `[tune_policy(missing = "auto")]`, so whichever of the three you run first tunes the box
+and the rest are instant. Tune once, and every dasLLAMA app on the box is tuned.
+
+This zero-config path covers only the **gen GEMM manifest** (`gen_tune_probe`). The
+`[tuned]` loop-hint kernels (`box_profile.json`, below), the backend/thread/token-block runtime
+knobs, and the measurement discipline are still the manual, hands-on story — read on.
 
 ---
 
@@ -18,7 +44,7 @@ finish it first; tuning an incorrect kernel is worse than pointless).
 | Kernel backend (ISA) | auto by priority; `pin_kernel_backend(name)` for A/B; loader picks repack backends; profile `runtime.backend` pins | runtime | `matmul_q8q8*` wrappers |
 | Batch backend (hybrid) | `select_batch_backend(name)` / profile `runtime.batch_backend` / env `DASLLAMA_PIN_BATCH_BACKEND` (benches) — overrides ONLY the batch-shaped slots (prefill GEMM + mx4 batch) from a layout-compatible donor, GEMV slots stay with `runtime.backend`. For boxes where decode and prefill prefer different backends (e.g. portable GEMV + a row-major donor's batch). Survives load-time re-select | runtime | the batch matmul wrappers |
 | Loop hints per kernel (`vectorize_width` × `unroll_count`) | `box_profile.json` flat keys, read at **compile time** by `[tuned]` | compile (JIT re-keys automatically) | all 16 `[tuned]` kernels: dot, axpy, add/mul/scale_inplace, copy_floats, softmax(+_sink), rmsnorm, dot_q4, dot_q8q8, dot_mx4q8, quantize_q8_0_into_ptr, rope_scaled_neox_tab, gemm_f32_uk_4x16, dot_q8q8_laneq4x4 |
-| Gen GEMM tile family (manifest) | `DAS_TUNE_MODE=tune gen_tune_probe` benches the `[tune_perm]` grid and writes the winner to `DAS_TUNE_MANIFEST` — **guarded by the e2e confirm pass**: a winner that diverges from the per-ISA fallback must beat it in a real-model prefill A/B (`DASLLAMA_CONFIRM_MODEL=<q8 gguf>`, interleaved, challenger needs >×1.02, else the fallback stays pinned). The guard exists because the 1-core fixture regime CAN crown an e2e loser (SPR: amx won the tile bench, lost prefill ~2×; M1: a +3.3%-iso shape made only +2.0% e2e — rejected) | compile (stamp at `[tune]`) | `q8q8_tile_gen` + companions (the gen batch/gemv kernels) |
+| Gen GEMM tile family (manifest) | `gen_tune_probe` (the `[tune_scope(name="dasllama")]` tuner — run by `dasllama-server`'s `policy=auto` / `--tune`, or by hand with `DAS_TUNE_MODE=tune`) benches the `[tune_perm]` grid and writes the winner to `<das_root>/dasllama.tune.json` — **guarded by the e2e confirm pass**: a winner that diverges from the per-ISA fallback must beat it in a real-model prefill A/B (`DASLLAMA_CONFIRM_MODEL=<q8 gguf>`, interleaved, challenger needs >×1.02, else the fallback stays pinned). The guard exists because the 1-core fixture regime CAN crown an e2e loser (SPR: amx won the tile bench, lost prefill ~2×; M1: a +3.3%-iso shape made only +2.0% e2e — rejected) | compile (stamp at `[tune]`) | `q8q8_tile_gen` + companions (the gen batch/gemv kernels) |
 | Token block `TB` | `set_q8_token_block(n)` (default 128) / profile `runtime.q8_token_block` | runtime | the repack-tier batch kernel only |
 | L2 budget (TB cliff guard) | `set_q8_l2_budget(bytes)` (default 4 MB — provisional, one M1 Max) / profile `runtime.q8_l2_budget` | runtime | `effective_token_block(tb, n) = clamp(tb, 1, budget/n)` (dasllama_math.das) |
 | Work-proportional dispatch | `set_target_chunk_work` (MACs per dispatch chunk, default 1M — lanes = clamp(work/target, 1, lanes); 1 lane = inline, so 2×target is the old 2M inline boundary) + `set_gemv_lane_cap` / `set_batch_lane_cap` (per-regime lane ceilings, 0 = uncapped — the GEMV cap is the box's DRAM knee, measured by `harness/team_probe.das`) / profile `runtime.target_chunk_work` / `runtime.gemv_lane_cap` / `runtime.batch_lane_cap` | runtime | every matmul dispatch (the `matmul_chunks*` shapers), the fused-chain gates, decode attention |

@@ -32,6 +32,12 @@ require math
 // generated family. The generators live in dasllama/dasllama_gemm_gen.das (llvm-jit context,
 // wired via llvm/daslib/llvm_user_modules.das).
 
+// The library-owned tune scope: every app that pulls dasLLAMA in shares the per-box winners
+// at <das_root>/dasllama.tune.json, and [tune_policy]/--tune run gen_tune_probe to produce
+// them (point DASLLAMA_CONFIRM_MODEL at a q8 gguf to arm its e2e confirm gate).
+[tune_scope(name = "dasllama", tuner = "../harness/gen_tune_probe.das")]
+struct private DasllamaTuneScope {}
+
 //! The layout companion (the six-function stamp): the repack interleave (mr) the stamped tile
 //! reads. Reference body = the reference tile's grp4; the generator emits the perm's mr and
 //! declines in lockstep with the tile generator (shared perm_declines), so a perm the tile
