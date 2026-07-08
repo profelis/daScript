@@ -165,6 +165,10 @@ embd 2048, ff 6144, 32Q/4KV heads (head_size 128), **128 experts top-8**, expert
   like the 26B's 5.5×); vs lcpp CPU `-ngl 0 -t 8` **130.0 t/s** = **das LEADS lcpp 1.59×**. Robust:
   the pessimistic settled das rep (195) still beats lcpp's optimistic end (136) by 1.43×. Grouped is
   the shipped default (`ffn_moe_prefill` dispatches it for q8); reference path kept as the A/B lever.
+- **Decode / emission (M1 Max, box profile):** das **27.5 tok/s** fresh (ctx 8) / 24.8 (ctx 512) vs
+  lcpp CPU tg128 `-ngl 0 -t 8` **20.2 t/s** = **das LEADS lcpp 1.36×**. Lands in the plan's predicted
+  25-30 t/s band — fully interactive; the A3B (3B-active) shape delivering as expected. So das leads
+  lcpp on BOTH prefill (1.59×) and decode (1.36×) for qwen3moe-30B.
 - The 235B-A22B header-tolerance row was NOT attempted (doesn't fit; deferred).
 
 Original scope notes (all resolved above): qwen2moe wiring + qwen3's QK-norm, **renormalized** top-k
