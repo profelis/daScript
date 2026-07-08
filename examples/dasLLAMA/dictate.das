@@ -39,6 +39,7 @@ def transcribe_slice(var m : AsrModel; lang : string; take : array<float>; s, e 
     }
     var sess <- create_session(m, lang)
     let text = transcribe(m, sess, slice)
+    delete sess     // per-utterance session: free it, else the take leaks one session per segment
     delete slice
     return text
 }
