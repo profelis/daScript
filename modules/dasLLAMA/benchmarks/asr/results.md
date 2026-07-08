@@ -151,10 +151,39 @@ row now edges onnx-int8 (0.99x). das beats onnx-int8 3.0x on the comparable tiny
 tiny's next wall is decode (~59 ms/rep vs encode 114); decoder q8 stays net-neutral here
 (logits/cross_kv wins vs cache-hot per-layer GEMV losses — no VNNI).
 
+## Canary-Qwen 2.5B — das vs the NeMo SALM reference engine
+
+llama.cpp has **zero** canary/SALM/FastConformer support and onnx-asr ships no canary export,
+so the only reference is **NeMo SALM greedy** (`canary_qwen_bench.py`, engine-level python, CPU,
+timed transcribe excludes model load — same shape as `asr_bench.das`'s BENCH line). das runs
+**fp32** here (the token-for-token parity load: LoRA-merged Qwen3-1.7B decoder + f32 FastConformer
+encoder); a q8 decoder + q8 encoder is the obvious perf follow-up (not chased — the parity gate is
+fp32). Correctness is token-for-token on every clip (model matrix + `test_canary_qwen_oracle`).
+
+### Apple M1 Max, 8 threads — both sides 2026-07-08 @ `daf12e7b7` (Parsec off)
+
+| file | audio s | das ms | nemo ms | das/nemo | das xRT | nemo xRT |
+|---|---|---|---|---|---|---|
+| jfk.wav | 11 | 5433 | 8952 | **0.61x** | 2.0 | 1.2 |
+| jfk3.wav | 33 | 17488 | 24098 | **0.73x** | 1.9 | 1.4 |
+| 05_1089-134686-0004.wav | 5.2 | 2817 | 5693 | **0.49x** | 1.9 | 0.9 |
+| 09_1089-134686-0008.wav | 6.7 | 3664 | 7947 | **0.46x** | 1.8 | 0.8 |
+| 15_1089-134686-0014.wav | 2.2 | 1461 | 4317 | **0.34x** | 1.5 | 0.5 |
+| gb1.wav | 199 | 131609 | 35466 | 3.71x | 1.5 | 5.6 |
+
+das **leads on every short/dictation clip (1.4–3x — the Canary-Qwen use case)**: NeMo carries a
+heavy fixed per-`generate` overhead that dominates a few-second clip (its xRT stays < 1 on the
+LibriSpeech clips). It **trails 3.7x on the 3-minute gb1** — the fp32 1.7B decoder is
+bandwidth-bound prefilling gb1's ~2500 audio soft tokens (exactly the knob a q8 decoder would
+halve), where NeMo's batched-BLAS decode scales better. das xRT holds ~1.5–2.0 across the board.
+
+TSVs: das `results_cq_m1_t8.tsv`, nemo `results_cq_m1_nemo.tsv`.
+
 ## Correctness
 
 - das fp32 is token-for-token with parakeet-cli (v2 jfk 33 + gb1 786; v3 jfk 38 + gb1 655)
-  and with whisper-cli (tiny jfk, suite oracle).
+  and with whisper-cli (tiny jfk, suite oracle), and Canary-Qwen with NeMo SALM greedy
+  (jfk + 2 LibriSpeech clips, incl. trailing EOS).
 - das q8 (the path benched here): parakeet ids/text exact vs fp32, gb1 shows a handful of
   duration-pick flips (≤4-frame timestamp drift); whisper (tower + decoder q8) word-exact
   on tiny/small/large-v3-turbo, base drops one comma on a 0.018-logit fp32 top-2 near-tie
@@ -163,6 +192,10 @@ tiny's next wall is decode (~59 ms/rep vs encode 114); decoder q8 stays net-neut
 
 ## Changelog
 
+- 2026-07-08 `daf12e7b7`: NEW Canary-Qwen 2.5B section — das (fp32) vs the NeMo SALM reference
+  engine (`canary_qwen_bench.py`; no llama.cpp/onnx canary support). das leads every short clip
+  1.4–3x, trails 3.7x on the fp32-decoder-bound 3-min gb1. TSVs `results_cq_m1_t8.tsv` /
+  `results_cq_m1_nemo.tsv`.
 - 2026-07-08 `cab95ee9c`: flattened tower attention over (head × query-block) units via the
   new slot-indexed team dispatch (jobque `team_parallel_for_indexed` `9f7b10288` +
   `maybe_parallel_for_indexed` `3800b2aa4`) — bit-exact (pre/post fingerprints
