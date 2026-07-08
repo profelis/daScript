@@ -16,6 +16,7 @@ IF(NOT DAS_LLAMA_INCLUDED)
     ADD_MODULE_DAS(dasllama dasllama dasllama_whisper)
     ADD_MODULE_DAS(dasllama dasllama dasllama_qwen3a)
     ADD_MODULE_DAS(dasllama dasllama dasllama_parakeet)
+    ADD_MODULE_DAS(dasllama dasllama dasllama_vad)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_llama)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_qwen2)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_qwen3)
@@ -37,6 +38,11 @@ IF(NOT DAS_LLAMA_INCLUDED)
     )
     install(FILES ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/.das_module
         DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLAMA
+    )
+    # checked-in Silero-VAD weights (MIT, see the LICENSE beside them) — ship with the SDK
+    install(FILES ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/models/silero_vad.bin
+        ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/models/silero_vad.LICENSE
+        DESTINATION ${DAS_INSTALL_MODULESDIR}/dasLLAMA/models
     )
     # per-box tuning: the profile producer ([tuned] in the module is the consumer) + its doc
     install(FILES ${PROJECT_SOURCE_DIR}/modules/dasLLAMA/harness/tune_kernels.das

@@ -3,79 +3,123 @@ options stack = 65536
 options fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%)
 options persistent_heap
 
-require dasllama/dasllama       // the ASR surface: load_asr_model / create_session / transcribe
+require dasllama/dasllama       // ASR (load_asr_model/transcribe) + Silero-VAD (load_vad_model/VadIter)
 require audio/audio_record      // microphone capture (sound_record_*)
 require daslib/jobque_boost
-require daslib/fio
+require daslib/fio              // sleep
 require strings
 require math
 
-// Live dictation: microphone -> Parakeet-TDT. The capture device fills a lock-free ring
-// buffer from the audio thread; this script drains it on the main thread, re-transcribing
-// the growing take every REDECODE_S seconds so the line under your voice keeps extending.
-// Parakeet decodes several times faster than realtime, so whole-take re-decodes stay cheap
-// for dictation-length audio (the encoder is O(T²) past a few minutes — take a breath).
+// Live dictation: microphone -> Silero-VAD endpointing -> Parakeet-TDT. The VAD cuts the mic
+// stream into utterances at silence boundaries; each finished utterance is transcribed EXACTLY
+// ONCE (vs the old whole-take re-decode every 2 s), and the take ends automatically after a
+// short trailing silence. Any ASR model the uniform loader takes works; Parakeet is the latency
+// pick (no 30 s window). The VAD weights (~1.2 MB) are checked in and MIT-licensed (Silero Team).
 //
-// Any ASR model the uniform loader takes works here; Parakeet is the pick for latency
-// (no 30 s window). Whisper bins work too — expect window-sized latency.
-//
-//   bin/daslang -jit examples/dasLLAMA/dictate.das -- <asr-model> [seconds]
-//   e.g. bin/daslang -jit examples/dasLLAMA/dictate.das -- ggml-parakeet-tdt-0.6b-v2-f32.bin 15
+//   bin/daslang -jit examples/dasLLAMA/dictate.das -- <asr-model> [max-seconds]
+//   e.g. bin/daslang -jit examples/dasLLAMA/dictate.das -- ggml-parakeet-tdt-0.6b-v2-f32.bin 30
 
 let RATE = 16000
-let REDECODE_S = 2.0    // re-transcribe cadence while recording
-let DEFAULT_SECONDS = 15.0
+let MAX_SECONDS_DEFAULT = 30.0
+let END_SILENCE_S = 1.5    // stop the take after this much trailing silence past the last utterance
+
+def vad_bin_default() : string {
+    return "{get_das_root()}/modules/dasLLAMA/models/silero_vad.bin"
+}
+
+// slice [s,e) out of the running take and transcribe it once
+def transcribe_slice(var m : AsrModel; lang : string; take : array<float>; s, e : int64) : string {
+    if (e <= s) {
+        return ""
+    }
+    var slice : array<float>
+    slice |> resize(int(e - s))
+    for (i in range(length(slice))) {
+        slice[i] = take[s + int64(i)]
+    }
+    var sess <- create_session(m, lang)
+    let text = transcribe(m, sess, slice)
+    delete slice
+    return text
+}
 
 [export]
 def main {
     let cmd <- get_command_line_arguments()
     var model_path = ""
-    var seconds = DEFAULT_SECONDS
+    var max_seconds = MAX_SECONDS_DEFAULT
     for (a in cmd) {
         if (ends_with(a, ".bin") || ends_with(a, ".gguf")) {
-            model_path = a
+            if (empty(model_path)) {
+                model_path = a
+            }
         } elif (!empty(model_path) && to_float(a) > 0.0) {
-            seconds = to_float(a)
+            max_seconds = to_float(a)
         }
     }
     if (empty(model_path)) {
-        print("usage: daslang -jit examples/dasLLAMA/dictate.das -- <asr-model> [seconds]\n")
+        print("usage: daslang -jit examples/dasLLAMA/dictate.das -- <asr-model> [max-seconds]\n")
         return
     }
 
-    print("loading {model_path}\n")
+    print("loading ASR  {model_path}\n")
     var m <- load_asr_model(model_path)
     let c <- caps(m)
     let lang = !empty(c.languages) && length(c.languages) == 1 ? c.languages[0] : "auto"
+    print("loading VAD  {vad_bin_default()}\n")
+    var vm <- load_vad_model(vad_bin_default())
 
-    // ring sized to the whole take (+ slack): a slow decoder blocks the drain loop for its
-    // full decode, and audio landing meanwhile must fit in the ring or it drops (whisper's
-    // 30 s-padded decode showed exactly that; parakeet never gets close)
-    if (!sound_record_start(RATE, 1, int(seconds * float(RATE)) + RATE * 5, -1)) {
+    if (!sound_record_start(RATE, 1, int(max_seconds * float(RATE)) + RATE * 5, -1)) {
         panic("could not open the capture device (no microphone, or access denied)")
     }
-    print("recording {seconds} s — speak!\n\n")
+    print("listening — speak; stops after {END_SILENCE_S} s of silence (max {max_seconds} s)\n\n")
 
     with_job_que() {
         setup_dasllama_jobque()
+        var vit : VadIter
+        vad_iter_reset(vit, default_vad_opts())
+
         var take : array<float>
-        take |> reserve(int(seconds * float(RATE)) + RATE)
+        take |> reserve(int(max_seconds * float(RATE)) + RATE)
         var scratch : array<float>
         scratch |> resize(RATE / 4)
-        var since_decode = 0
-        var line = ""
-        while (float(length(take)) < seconds * float(RATE)) {
+        var newbuf : array<float>
+        newbuf |> reserve(RATE / 4)
+
+        var seg_start = 0l
+        var open = false          // a speech segment is currently in progress
+        var any = false           // at least one segment has started
+        var last_end = -1l        // absolute sample of the last utterance end
+        var transcript = ""
+
+        while (float(length(take)) < max_seconds * float(RATE)) {
             let n = sound_record_read(scratch)
             if (n > 0) {
                 for (i in range(n)) {
                     take |> push(scratch[i])
                 }
-                since_decode += n
-                if (float(since_decode) >= REDECODE_S * float(RATE)) {
-                    since_decode = 0
-                    var s <- create_session(m, lang)
-                    line = transcribe(m, s, take)
-                    print("[{float(length(take)) / float(RATE)} s] {line}\n")
+                newbuf |> resize(n)
+                for (i in range(n)) {
+                    newbuf[i] = scratch[i]
+                }
+                vad_iter_feed(vm, vit, newbuf) $(ev : VadEvent) {
+                    if (ev.kind == VadEventKind.speech_start) {
+                        seg_start = max(0l, ev.sample)
+                        open = true
+                        any = true
+                        print("  [listening…]\n")
+                    } else {
+                        let e = min(ev.sample, int64(length(take)))
+                        let text = transcribe_slice(m, lang, take, seg_start, e)
+                        transcript += (empty(transcript) ? "" : " ") + text
+                        print("  {text}\n")
+                        open = false
+                        last_end = e
+                    }
+                }
+                // endpoint on a long trailing silence past the last utterance
+                if (any && !open && last_end >= 0l && vit.cur - last_end > int64(END_SILENCE_S * float(RATE))) {
+                    break
                 }
             } else {
                 sleep(5u)
@@ -85,10 +129,11 @@ def main {
         if (sound_record_overflow_frames() > 0l) {
             print("(dropped {sound_record_overflow_frames()} frames — the decode loop fell behind)\n")
         }
-
-        // the final pass over the full take
-        var s <- create_session(m, lang)
-        let final_text = transcribe(m, s, take)
-        print("\n=== final ===\n{final_text}\n")
+        // a segment still open at stop (speech ongoing) — transcribe its tail
+        if (open) {
+            let text = transcribe_slice(m, lang, take, seg_start, int64(length(take)))
+            transcript += (empty(transcript) ? "" : " ") + text
+        }
+        print("\n=== transcript ===\n{transcript}\n")
     }
 }
