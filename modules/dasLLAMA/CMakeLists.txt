@@ -16,12 +16,9 @@ IF(NOT DAS_LLAMA_INCLUDED)
     ADD_MODULE_DAS(dasllama dasllama dasllama_whisper)
     ADD_MODULE_DAS(dasllama dasllama dasllama_qwen3a)
     ADD_MODULE_DAS(dasllama dasllama dasllama_parakeet)
-<<<<<<< HEAD
-    ADD_MODULE_DAS(dasllama dasllama dasllama_vad)
-=======
     ADD_MODULE_DAS(dasllama dasllama dasllama_canary)
     ADD_MODULE_DAS(dasllama dasllama dasllama_gemma4a)
->>>>>>> origin/master
+    ADD_MODULE_DAS(dasllama dasllama dasllama_vad)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_llama)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_qwen2)
     ADD_MODULE_DAS(dasllama dasllama dasllama_arch_qwen3)
