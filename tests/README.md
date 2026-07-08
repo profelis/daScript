@@ -107,7 +107,8 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_piped_block_mismatch.das | Piped block signature mismatch after padding | **expect** `30341` |
 | failed_piped_no_block_param.das | No block-like parameter for the piped block to land on | **expect** `30341` |
 | failed_piped_ambiguous.das | Two overloads with equal padding — ambiguous piped call | **expect** `30341` |
-| failed_piped_named_call.das | Named-argument call + piped block is a parse error | **expect** `30347` |
+| piped_named_call.das | Named-argument call + piped block — block becomes the trailing positional (free-fn and method forms) | |
+| failed_piped_named_padding.das | Piped block on a named call does not pad across a default param to a later block param (padding for named calls is a follow-up) | **expect** `30341` |
 | failed_piped_field.das | Field access + piped block is a parse error | **expect** `30347` |
 | test_bare_block.das | Bare lexical blocks — scoping, nesting, finally, control flow, name reuse | |
 | test_block_in_finally.das | Block locals + finally/defer — invoked from defer/plain finally, declared after defer, early-return path, loop-iterator capture, by-ref mutation visibility (AOT hoisted-block codegen) | |
@@ -731,6 +732,9 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | move_lambda_local_ref.das | `capture(<- arr)` moving array into lambda | |
 | move_on_return.das | Move with `finally` delete — pipeline array return | |
 | failed_named_call.das | Named arguments — reordering, skipping, defaults, error cases | **expect** `30304:12` `30101:1` `30507:1` |
+| named_call.das | Bracket-less named call args — bare mixed `foo(pos, name=v)`, multi-named, bracketed regression, move `<-` / clone `:=`, overload + generic pick, piped block, method form | |
+| failed_named_call_bare.das | Bad named args — unknown/duplicate/missing/out-of-order name, overlap with a filled slot | **expect** `30341:5` |
+| failed_named_call_order.das | Named argument must be a strict suffix — a positional after a named arg is a syntax error | **expect** `30151` |
 | new_and_init.das | `new_and_init` — allocate and copy struct with `always_export_initializer` | |
 | new_delete.das | `delete` for arrays, tables, structs, handles, strings — heap tracking | |
 | new_with_init.das | `new` with struct constructors — zeroed, defaults, custom, array | |

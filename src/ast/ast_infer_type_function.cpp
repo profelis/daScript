@@ -967,7 +967,20 @@ namespace das {
                 }
                 fnArgIndex++;
             }
-            newCallArguments.push_back(arg->value->clone());
+            // honor the named-arg binding sigil, consistent with a regular call:
+            //   <-  (move)  -> builtin::consume_argument, same as positional foo(<- x)
+            //   :=  (clone) -> builtin::clone_to_move, a cloned movable temp (source preserved)
+            if (arg->moveSemantics) {
+                auto moveExpr = new ExprCall(arg->at, "builtin::consume_argument");
+                moveExpr->arguments.push_back(arg->value->clone());
+                newCallArguments.push_back(moveExpr);
+            } else if (arg->cloneSemantics) {
+                auto cloneExpr = new ExprCall(arg->at, "builtin::clone_to_move");
+                cloneExpr->arguments.push_back(arg->value->clone());
+                newCallArguments.push_back(cloneExpr);
+            } else {
+                newCallArguments.push_back(arg->value->clone());
+            }
             fnArgIndex++;
         }
         while (fnArgIndex < pFn->arguments.size()) {
