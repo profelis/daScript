@@ -13,10 +13,11 @@ require math
 // Live dictation: microphone -> Silero-VAD endpointing -> Parakeet-TDT. The VAD cuts the mic
 // stream into utterances at silence boundaries; each finished utterance is transcribed EXACTLY
 // ONCE (vs the old whole-take re-decode every 2 s), and the take ends automatically after a
-// short trailing silence. Any ASR model the uniform loader takes works; Parakeet is the latency
-// pick (no 30 s window). The VAD weights (~1.2 MB) are checked in and MIT-licensed (Silero Team).
+// short trailing silence. Takes a ggml-bin ASR model (Parakeet or Whisper — the single-arg
+// load_asr_model route); Parakeet is the latency pick (no 30 s window). The VAD weights (~1.2 MB)
+// are checked in and MIT-licensed (Silero Team).
 //
-//   bin/daslang -jit examples/dasLLAMA/dictate.das -- <asr-model> [max-seconds]
+//   bin/daslang -jit examples/dasLLAMA/dictate.das -- <asr-model.bin> [max-seconds]
 //   e.g. bin/daslang -jit examples/dasLLAMA/dictate.das -- ggml-parakeet-tdt-0.6b-v2-f32.bin 30
 
 let RATE = 16000
@@ -50,7 +51,7 @@ def main {
     var model_path = ""
     var max_seconds = MAX_SECONDS_DEFAULT
     for (a in cmd) {
-        if (ends_with(a, ".bin") || ends_with(a, ".gguf")) {
+        if (ends_with(a, ".bin")) {   // ggml-bin ASR only; GGUF decoders need the 2-arg load_asr_model
             if (empty(model_path)) {
                 model_path = a
             }
@@ -59,7 +60,7 @@ def main {
         }
     }
     if (empty(model_path)) {
-        print("usage: daslang -jit examples/dasLLAMA/dictate.das -- <asr-model> [max-seconds]\n")
+        print("usage: daslang -jit examples/dasLLAMA/dictate.das -- <asr-model.bin> [max-seconds]\n")
         return
     }
 
