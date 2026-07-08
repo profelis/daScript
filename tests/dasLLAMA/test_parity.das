@@ -540,6 +540,25 @@ def test_parity_gemma4_e4b(t : T?) {
     }
 }
 
+// gemma-4-E2B-it Q8 — the smaller edge model (35 layers, embd 1536, 8Q/1KV heads; PLE + cross-layer
+// KV sharing exactly as the E4B, plus one extra feature: **per-layer FFN width** (feed_forward_length
+// is a per-layer array — 6144 for layers 0-14, 12288 for 15-34 — the elastic MatFormer sub-model of
+// the E4B). The dense FFN weight offsets vary per layer (ffn_w / w1_offs·w2_offs·w3_offs); hidden_dim
+// is the max for scratch. Dense, so the full 40 hold (40/40 vs simple_ids on the window-engaged 1..320
+// counting prompt); reuses GEMMA4_12B_GEN. Fast-tier (~5 GB): runs in the default loop.
+[test]
+def test_parity_gemma4_e2b(t : T?) {
+    t |> run("gemma4 forward (gemma-4-E2B-it Q8: PLE + KV sharing + per-layer FFN width)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_12B_GEN), "gemma4-e2b token-for-token")
+    }
+}
+
 // gpt-oss-20b (arch "gpt-oss", native-MXFP4 expert planes — attn/cls Q8) — the wave-5 stack: per-head
 // attention sinks, YaRN rope (factor 32 / 4096), alternating 128-token SWA, softmax-after-top-k
 // routing with router + per-expert + QKV + output-projection biases, clamped SwiGLU. Counting

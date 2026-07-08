@@ -39,6 +39,16 @@ Implications for this plan:
 - Correctness waves run fp32 first; q8 is a follow-up knob with its own gate class.
 - Models live in `~/Work/llama.cpp/models` (gitignored), self-conversion recipes recorded
   in the plan of the wave that introduced them.
+- **Every LLM section closes with a prefill AND decode A/B vs llama.cpp** (Boris,
+  2026-07-07). Correctness token-for-token is necessary but not the finish line: each
+  model's section ends with a prefill throughput A/B (das vs `llama-bench`/`simple_ids`
+  CPU `-ngl 0`) and a decode/emission A/B (`llama-bench -p 0 -n 128`), on a Parsec-off
+  window (announce + wait for go — [[parsec-off-before-profiling]]), the das side re-run
+  vs the stored lcpp baseline. **The prefill under test MUST be the batched path, never
+  the naive `forward`-per-token loop** — verify q8 engages the batched `forward_prefill`
+  (the naive fallback is q4/npos≤0 only; for a new MoE arch confirm the grouped path
+  fires). Precedent: Wave Q (prefill 1.59× / decode 1.36× vs lcpp), Wave G2
+  (prefill grouped 5.5× → leads lcpp 1.44×).
 
 ## Wave G — Gemma-4 family completion (the named target)
 
@@ -107,9 +117,45 @@ four remain. Order inside the wave = cheapest first, each gated before the next 
    Measured (M1 Max, prefill-512, interleaved A/B): **grouped 217 t/s vs naive 39 = 5.5×**, and **217
    vs lcpp 151.1 = 1.44× — das now LEADS lcpp on 26B prefill.** Correctness held: the counting-prompt
    1492-token prefill still produces `GEMMA4_26B_GEN` token-for-token, grouped==naive==fixture.
-3. **gemma-4-E2B / E4B — the edge models. PROBED 2026-07-07; slice RE-SIZED DOWN to
-   "PLE + KV-sharing," best case.** Read of `src/models/gemma4.cpp` vs `gemma3n.cpp`
-   plus E2B/E4B header dumps settled every VERIFY below:
+3. **gemma-4-E2B / E4B — the edge models. ✅ TEXT DONE 2026-07-07 (2 commits: E4B then
+   E2B). 40/40 token-for-token, both flash + classic prefill, window engaged.** The slice
+   was 3 features, not the "PLE + KV-sharing" 2 the pre-probe sized — the real GGUF headers
+   added a THIRD (E2B's per-layer FFN width). All three landed:
+   - **PLE** (both): new fblob regions (fp32 `per_layer_model_proj` + `per_layer_proj_norm`
+     + per-layer `post_norm`) + Q8 big weights (the `[vocab × ple·layers]` token table,
+     per-layer `inp_gate`/`proj`). Pre-step per token (gather ×√ple; project ×1/√dim →
+     RMSNorm → +gathered → ×1/√2) + a per-layer block after the FFN residual, before the
+     layer scale: `cur += post_norm(proj·(gelu(inp_gate·cur) ⊙ ple_inp[l]))`. 🔑 the token
+     table is `[vocab × (ple·layers)]` — load ALL `ple·layers` per row (the initial bug was
+     loading only `ple`).
+   - **Cross-layer KV sharing** (both): `n_layer_kv_from_start = layers - shared_kv_layers`
+     (15 for E2B, 24 for E4B). It's SEMANTICALLY LOAD-BEARING, not just a memory opt — the
+     shared layers' own `attn_k`/`attn_v` are DEAD weights in the file (llama.cpp gates KV
+     *use* on `has_kv(il)`, not load). Shared layers project Q only and attend against the
+     source layer's cache (sliding → `kv_from_start-2`, global → `kv_from_start-1`). Skipped
+     at load (memory win); `kv_row_prefix` aliases the shared slot onto its source so
+     `kv_cache_off` is unchanged in the hot path; decode + prefill attention gained a Q-only
+     branch. `layer_kv_source(c,l)` mirrors llama.cpp gemma4's `reuse()`.
+   - **Per-layer FFN width (E2B ONLY)** — `feed_forward_length` is a per-layer ARRAY on E2B
+     (6144 ×15 then 12288 ×20 — the elastic MatFormer sub-model of the E4B; E4B is uniform
+     10240). `w1_off`/`w2_off`/`w3_off` became per-layer arrays `w*_offs` filled by
+     `fill_dense_ffn_offsets` (kept as separate contiguous regions so the llama2.c checkpoint
+     block-copy survives); `ffn_w[l]` + `layer_hidden(t,l)`; `hidden_dim` = max (scratch).
+     🔑 `ffn_w` lives on the **Model**, NOT Config — Config must stay copyable (`let c =
+     t.config` is everywhere; an array field breaks it).
+   - Fixtures both reuse `GEMMA4_12B_GEN` (byte-identical counting continuation). E4B
+     large-tier (~8 GB, `DASLLAMA_PARITY_FULL=1`); E2B fast-tier (~5 GB, default loop).
+     Existing arches byte-unchanged (all new paths gate on `has_ple` / `kv_src[l]!=l` /
+     `ffn_w`, all off elsewhere); parity suite green. The channel-aware chat template + the
+     per-class head-size machinery were already in place from G1/G2.
+   - **▶ PENDING: the section-closing prefill + decode A/B vs lcpp** (the new standing rule).
+     Both models' prefill rides the batched `forward_prefill_body` (batched attn +
+     `ffn_dense_prefill` + `ple_block_prefill`), NOT naive — needs a Parsec-off window to
+     measure vs `llama-bench -ngl 0`.
+
+   Original probe notes (all resolved above):
+   PROBED 2026-07-07; slice RE-SIZED DOWN to "PLE + KV-sharing," best case. Read of
+   `src/models/gemma4.cpp` vs `gemma3n.cpp` plus E2B/E4B header dumps settled every VERIFY:
    - **PLE — ON & confirmed.** `embedding_length_per_layer_input = 256` on both E2B and
      E4B (the 12B has it 0 → PLE is an E-series-only feature). Tables: `per_layer_tok_embd`
      {256·n_layer, n_vocab}, `per_layer_model_proj`, `per_layer_proj_norm`, plus per-layer

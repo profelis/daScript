@@ -67,7 +67,7 @@ enum AttnPrefillMode {
 //! Model hyperparameters (the 7-int checkpoint header plus derived sizes).
 struct Config {
     dim : int64
-    hidden_dim : int64
+    hidden_dim : int64          // dense FFN width; the MAX across layers when it varies per layer (scratch sizing)
     n_layers : int64
     n_heads : int64
     n_kv_heads : int64
@@ -224,9 +224,13 @@ struct Model {
     wk_offs : array<int64>
     wv_offs : array<int64>
     wo_offs : array<int64>
-    w1_off : int64
-    w2_off : int64
-    w3_off : int64
+    // dense FFN weights — PER-LAYER offsets (gemma-4 E2B varies the FFN width by layer: 6144 for
+    // layers 0-14, 12288 for 15-34, the elastic MatFormer sub-model). Uniform arches fill these with
+    // a flat stride. ffn_w[l] = layer l's FFN width (empty = uniform config.hidden_dim); layer_hidden(t, l).
+    w1_offs : array<int64>
+    w2_offs : array<int64>
+    w3_offs : array<int64>
+    ffn_w : array<int64>
     // MoE (valid when config.n_expert > 0; the dense w1/w2/w3 regions are not allocated then).
     // Router matrices + shared-expert gate vectors are small fp32 -> fblob; the routed expert
     // stacks (expert-major within each layer) and the shared-expert 2D weights -> big-weight blob
@@ -336,6 +340,20 @@ struct private LayoutSizes {
     fblob_n : int64   // element count of the fp32 aux region
     wblob_n : int64   // element count of the big-weight region
     mx_n : int64      // element count of the native-MXFP4 expert planes (0 unless experts_mx4)
+}
+
+// Fill the dense FFN offset tables (w1/w2/w3), each a contiguous per-layer region, from `wo` — the
+// running big-weight cursor. Per-layer FFN width (gemma-4 E2B) reads t.ffn_w; empty = uniform `hidden`.
+// Keeping w1/w2/w3 as separate contiguous regions preserves the llama2.c checkpoint's block copy.
+def private fill_dense_ffn_offsets(var t : Model; wo, layers, dim, hidden : int64) : int64 {
+    var off = wo
+    t.w1_offs |> clear(); t.w1_offs |> reserve(layers)
+    for (l in range64(layers)) { t.w1_offs |> push(off); off += dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]) }
+    t.w2_offs |> clear(); t.w2_offs |> reserve(layers)
+    for (l in range64(layers)) { t.w2_offs |> push(off); off += (empty(t.ffn_w) ? hidden : t.ffn_w[l]) * dim }
+    t.w3_offs |> clear(); t.w3_offs |> reserve(layers)
+    for (l in range64(layers)) { t.w3_offs |> push(off); off += dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]) }
+    return off
 }
 
 // Fill both offset tables from the config; return the element counts of each region. The big-weight
@@ -518,20 +536,10 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             wo += layers * she
         }
         if (c.moe_dense_shexp) {  // gemma4: the DENSE parallel shared expert (plain ffn gate/up/down)
-            t.w1_off = wo
-            wo += layers * dim * hidden
-            t.w2_off = wo
-            wo += layers * hidden * dim
-            t.w3_off = wo
-            wo += layers * dim * hidden
+            wo = fill_dense_ffn_offsets(t, wo, layers, dim, hidden)
         }
     } else {
-        t.w1_off = wo
-        wo += layers * dim * hidden
-        t.w2_off = wo
-        wo += layers * hidden * dim
-        t.w3_off = wo
-        wo += layers * dim * hidden
+        wo = fill_dense_ffn_offsets(t, wo, layers, dim, hidden)
     }
     if (has_ple(c)) {  // gemma-4 E-series PLE big weights: the Q8 token table + per-layer Q8 gate/proj
         let ple = c.n_embd_per_layer
@@ -635,11 +643,11 @@ def load_checkpoint(path : string) : Model {
             fc += layers * qd * dim
             copy_floats(src, fc, t.fblob, t.rms_ffn_off, layers * dim)
             fc += layers * dim
-            copy_floats(src, fc, t.wblob, t.w1_off, layers * dim * hidden)
+            copy_floats(src, fc, t.wblob, t.w1_offs[0], layers * dim * hidden)
             fc += layers * dim * hidden
-            copy_floats(src, fc, t.wblob, t.w2_off, layers * hidden * dim)
+            copy_floats(src, fc, t.wblob, t.w2_offs[0], layers * hidden * dim)
             fc += layers * hidden * dim
-            copy_floats(src, fc, t.wblob, t.w3_off, layers * dim * hidden)
+            copy_floats(src, fc, t.wblob, t.w3_offs[0], layers * dim * hidden)
             fc += layers * dim * hidden
             copy_floats(src, fc, t.fblob, t.rms_final_off, dim)
             fc += dim
@@ -774,14 +782,15 @@ def private repack_q8_weights(var t : Model) {
                 repack_q8q8_weight(t.qblob, t.qscales, t.wsh3_off + l * she, dim, c.n_ff_shexp)
             }
             if (c.moe_dense_shexp) {  // gemma4: the dense parallel shared expert repacks like a plain FFN
-                repack_q8q8_weight(t.qblob, t.qscales, t.w1_off + l * dim * hidden, dim, hidden)
-                repack_q8q8_weight(t.qblob, t.qscales, t.w2_off + l * hidden * dim, hidden, dim)
-                repack_q8q8_weight(t.qblob, t.qscales, t.w3_off + l * dim * hidden, dim, hidden)
+                repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, hidden)
+                repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], hidden, dim)
+                repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, hidden)
             }
         } else {
-            repack_q8q8_weight(t.qblob, t.qscales, t.w1_off + l * dim * hidden, dim, hidden)
-            repack_q8q8_weight(t.qblob, t.qscales, t.w2_off + l * hidden * dim, hidden, dim)
-            repack_q8q8_weight(t.qblob, t.qscales, t.w3_off + l * dim * hidden, dim, hidden)
+            let h = layer_hidden(t, l)
+            repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, h)
+            repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], h, dim)
+            repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, h)
         }
     }
     if (!c.shared_weights || t.cls_q8) {
@@ -828,8 +837,20 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         }
         // GGUF uses the architecture name as the metadata key prefix (llama.*, qwen2.*, gemma2.*, ...)
         let dim = gguf_int(m, bytes, "{arch}.embedding_length")
-        let hidden = gguf_int(m, bytes, "{arch}.feed_forward_length")
         let layers = gguf_int(m, bytes, "{arch}.block_count")
+        // FFN width: a scalar for uniform arches, or a per-layer array (gemma-4 E2B: the elastic
+        // MatFormer sub-model, 6144 for layers 0-14 then 12288). ffn_w holds the per-layer widths;
+        // hidden_dim is the MAX (scratch sizing). Set before layout_offsets so the offsets vary per layer.
+        var hidden = 0l
+        if (gguf_is_array(m, "{arch}.feed_forward_length")) {
+            t.ffn_w <- gguf_int_array(m, bytes, "{arch}.feed_forward_length")
+            if (int64(length(t.ffn_w)) != layers) {
+                panic("dasLLAMA: feed_forward_length array has {length(t.ffn_w)} entries, expected {layers}")
+            }
+            for (w in t.ffn_w) { hidden = max(hidden, w) }
+        } else {
+            hidden = gguf_int(m, bytes, "{arch}.feed_forward_length")
+        }
         let n_heads = gguf_int(m, bytes, "{arch}.attention.head_count")
         let seq_len = gguf_int(m, bytes, "{arch}.context_length")
         // vocab from the token-embedding tensor: rows = vocab, cols = dim
@@ -1248,18 +1269,19 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                     load_big(m, bytes, "blk.{l}.ffn_up_shexp.weight", t, t.wsh3_off + l * she, she, scratch)
                 }
                 if (t.config.moe_dense_shexp) {  // gemma4: the DENSE parallel shared expert (plain ffn gate/up/down)
-                    load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_off + l * dim * hidden, dim * hidden, scratch)
-                    load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_off + l * dim * hidden, dim * hidden, scratch)
-                    load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_off + l * hidden * dim, hidden * dim, scratch)
+                    load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_offs[l], dim * hidden, scratch)
+                    load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * hidden, scratch)
+                    load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], hidden * dim, scratch)
                 }
             } elif (t.config.fused_qkv) {
-                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w1_off + l * dim * hidden, dim * hidden, scratch, 0l)
-                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_off + l * dim * hidden, dim * hidden, scratch, dim * hidden)
-                load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_off + l * hidden * dim, hidden * dim, scratch)
+                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w1_offs[l], dim * hidden, scratch, 0l)
+                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * hidden, scratch, dim * hidden)
+                load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], hidden * dim, scratch)
             } else {
-                load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_off + l * dim * hidden, dim * hidden, scratch)
-                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_off + l * dim * hidden, dim * hidden, scratch)
-                load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_off + l * hidden * dim, hidden * dim, scratch)
+                let h = layer_hidden(t, l)   // gemma-4 E2B varies this per layer
+                load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_offs[l], dim * h, scratch)
+                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * h, scratch)
+                load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], h * dim, scratch)
             }
             if (has_ple(t.config)) {  // gemma-4 E-series: per-layer PLE gate (dim->ple) + proj (ple->dim), Q8
                 let ple = t.config.n_embd_per_layer
@@ -2086,6 +2108,10 @@ def layer_is_sliding(c : Config; l : int64) : bool => (c.sliding_window > 0l
 //! Does this model carry per-layer embeddings (gemma-4 E-series)?
 def has_ple(c : Config) : bool => c.n_embd_per_layer > 0l
 
+//! Layer `l`'s dense FFN width. Uniform config.hidden_dim unless the model varies it per layer
+//! (gemma-4 E2B: 6144 for layers 0-14, 12288 for 15-34).
+def layer_hidden(t : Model; l : int64) : int64 => (empty(t.ffn_w) ? t.config.hidden_dim : t.ffn_w[l])
+
 //! Layer `l`'s KV source (mirrors llama.cpp gemma4 reuse()): own-KV layers map to themselves; a
 //! shared layer (l >= n_layer_kv_from_start) reuses the last own-KV layer of its class — sliding
 //! reads kv_from_start-2, global reads kv_from_start-1 (those two straddle the boundary by pattern).
@@ -2632,9 +2658,9 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         var xs2p = addr(s.xs2[0])
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
         let wsb = reinterpret<float const?>(addr(t.qscales[0]))
-        let w1o = t.w1_off + l * dim * hidden
-        let w3o = t.w3_off + l * dim * hidden
-        let w2o = t.w2_off + l * hidden * dim
+        let w1o = t.w1_offs[l]   // fused chain runs only for uniform-width arches (layer_out_scale gates it off)
+        let w3o = t.w3_offs[l]
+        let w2o = t.w2_offs[l]
         let wp1 = wqb + w1o
         let ws1 = wsb + w1o / 32l
         let wp3 = wqb + w3o
@@ -2854,15 +2880,15 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
 def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
     let c = t.config
     let dim = c.dim
-    let hidden = c.hidden_dim
+    let hidden = layer_hidden(t, l)   // gemma-4 E2B varies FFN width per layer
     let ts_ffn = ref_time_ticks()
     if (t.quant == QuantMode.q8) {
         // gate+up share the activation: ONE quantize + ONE region-list dispatch into ffn_gu's
         // halves (bit-identical — same quants, same per-row dots, only the scheduling changes)
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
-        s.ffn_offs[0] = t.w1_off + l * dim * hidden
+        s.ffn_offs[0] = t.w1_offs[l]
         s.ffn_offs[1] = 0l
-        s.ffn_offs[2] = t.w3_off + l * dim * hidden
+        s.ffn_offs[2] = t.w3_offs[l]
         s.ffn_offs[3] = 0l
         mm_at_q8_groupn(s.ffn_gu, t, s.ffn_offs, 2l, s.xq, s.xs, dim, hidden)
         prof_add("mm_ffn", ts_ffn)
@@ -2874,17 +2900,17 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
         // down projection off the gated half
         let ts_down = ref_time_ticks()
         quantize_q8_0_into(s.ffn_gu, hidden, s.xq, s.xs, 0l, 0l)
-        mm_at_q8_pre(s.xb, t, t.w2_off + l * hidden * dim, s.xq, s.xs, hidden, dim)
+        mm_at_q8_pre(s.xb, t, t.w2_offs[l], s.xq, s.xs, hidden, dim)
         prof_add("mm_ffn", ts_down)
     } else {
-        mm(s.hb, t, t.w1_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
-        mm(s.hb2, t, t.w3_off + l * dim * hidden, s.xb, s.xq, s.xs, dim, hidden)
+        mm(s.hb, t, t.w1_offs[l], s.xb, s.xq, s.xs, dim, hidden)
+        mm(s.hb2, t, t.w3_offs[l], s.xb, s.xq, s.xs, dim, hidden)
         prof_add("mm_ffn", ts_ffn)
         let ts_act = ref_time_ticks()
         gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)   // fused act*gate; same kernel as prefill (npos=1 → inline)
         prof_add("act", ts_act)
         let ts_ffn2 = ref_time_ticks()
-        mm(s.xb, t, t.w2_off + l * hidden * dim, s.hb, s.xq, s.xs, hidden, dim)
+        mm(s.xb, t, t.w2_offs[l], s.hb, s.xq, s.xs, hidden, dim)
         prof_add("mm_ffn", ts_ffn2)
     }
 }
@@ -4087,22 +4113,22 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
 def private ffn_dense_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
     let dim = c.dim
-    let hidden = c.hidden_dim
+    let hidden = layer_hidden(t, l)   // gemma-4 E2B varies FFN width per layer
     // ffn rmsnorm, per position
     let ts_norm1 = ref_time_ticks()
     rms_batch(s.xb_b, s.x_b, t, t.rms_ffn_off + l * dim, dim, npos)
     prof_add("norm", ts_norm1)
     // gated FFN (batched): hb = act(W1·xb) * (W3·xb) — act/mul elementwise, so batch-flat
     let ts_ffn = ref_time_ticks()
-    mm_b(s.hb_b, t, t.w1_off + l * dim * hidden, s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
-    mm_b(s.hb2_b, t, t.w3_off + l * dim * hidden, s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
+    mm_b(s.hb_b, t, t.w1_offs[l], s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
+    mm_b(s.hb2_b, t, t.w3_offs[l], s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
     prof_add("mm_ffn", ts_ffn)
     let ts_act = ref_time_ticks()
     gate_batch(s.hb_b, s.hb2_b, c.ffn_act, hidden, npos)   // fused act*gate (exp4 unless act_vec off)
     prof_add("act", ts_act)
     // down projection (batched) + optional post-FFN norm + residual
     let ts_ffn2 = ref_time_ticks()
-    mm_b(s.xb_b, t, t.w2_off + l * hidden * dim, s.hb_b, s.xqb, s.xsb, hidden, dim, npos)
+    mm_b(s.xb_b, t, t.w2_offs[l], s.hb_b, s.xqb, s.xsb, hidden, dim, npos)
     prof_add("mm_ffn", ts_ffn2)
     let ts_resid1 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm per position before residual
@@ -4721,10 +4747,10 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
     // 5. dense parallel shared expert over ALL positions: rms_ffn -> GeGLU -> post_ffw_norm_1 into gout
     let ts_sh = ref_time_ticks()
     rms_batch(s.xb_b, s.x_b, t, t.rms_ffn_off + l * dim, dim, npos)
-    mm_b(s.hb_b, t, t.w1_off + l * dim * hidden, s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
-    mm_b(s.hb2_b, t, t.w3_off + l * dim * hidden, s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
+    mm_b(s.hb_b, t, t.w1_offs[l], s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
+    mm_b(s.hb2_b, t, t.w3_offs[l], s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
     gate_batch(s.hb_b, s.hb2_b, c.ffn_act, hidden, npos)
-    mm_b(s.moe_gout, t, t.w2_off + l * hidden * dim, s.hb_b, s.xqb, s.xsb, hidden, dim, npos)
+    mm_b(s.moe_gout, t, t.w2_offs[l], s.hb_b, s.xqb, s.xsb, hidden, dim, npos)
     rms_batch(s.moe_gout, s.moe_gout, t, t.rms_post_ffn1_off + l * dim, dim, npos)
     prof_add("mm_shexp", ts_sh)
 
