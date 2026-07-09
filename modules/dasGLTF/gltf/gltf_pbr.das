@@ -253,12 +253,13 @@ def private bind_material(model : GltfGlModel; mat : GltfMaterial) {
     }
 }
 
-// Fill the joint-palette uniform for a skin (clamped to GLTF_MAX_JOINTS). gltf_pbr_vs_bind_uniform then
-// uploads u_joints, since the vertex program references it.
-def private bind_skin_palette(scene : GltfScene; skinIndex : int) {
+// Fill the joint-palette uniform for a skin (clamped to GLTF_MAX_JOINTS), pre-multiplied by the world-
+// space `root` transform. The skinned vertex path blends the palette directly (it never reads u_model),
+// so baking root here is what makes a viewer turntable transform reach skinned geometry too.
+def private bind_skin_palette(scene : GltfScene; skinIndex : int; root : float4x4) {
     let njoint = min(length(scene.skins[skinIndex].joints), GLTF_MAX_JOINTS)
     for (j in range(njoint)) {
-        u_joints[j] = gltf_joint_matrix(scene, skinIndex, j)
+        u_joints[j] = root * gltf_joint_matrix(scene, skinIndex, j)
     }
 }
 
@@ -267,6 +268,15 @@ def private bind_skin_palette(scene : GltfScene; skinIndex : int) {
 //! otherwise the node's precomputed `world` matrix is the model transform. Per primitive the material
 //! factors + textures are bound and doubleSided/alpha GL state is set. Caller owns clear + depth state.
 def gltf_pbr_render(r : GltfPbrRenderer; model : GltfGlModel; scene : GltfScene;
+                    view, proj : float4x4; camPos : float3; light : GltfPbrLight) {
+    gltf_pbr_render(r, model, scene, identity4x4(), view, proj, camPos, light)
+}
+
+//! As above, but pre-multiplies a world-space `root` transform onto the whole scene (a viewer turntable
+//! rotation/scale, say). Rigid nodes render at `root * node.world`; for skinned nodes `root` is baked into
+//! the joint palette, so it transforms rigid and skinned geometry alike — and lighting responds correctly
+//! (root reaches the world-space normals). The plain overload passes `identity4x4()`, so it is unchanged.
+def gltf_pbr_render(r : GltfPbrRenderer; model : GltfGlModel; scene : GltfScene; root : float4x4;
                     view, proj : float4x4; camPos : float3; light : GltfPbrLight) {
     glUseProgram(r.program)
     u_viewProj = proj * view
@@ -279,12 +289,12 @@ def gltf_pbr_render(r : GltfPbrRenderer; model : GltfGlModel; scene : GltfScene;
             continue
         }
         if (node.skin >= 0 && node.skin < length(scene.skins)) {
-            bind_skin_palette(scene, node.skin)
+            bind_skin_palette(scene, node.skin, root)
             u_skinned = 1.0
-            u_model = identity4x4()   // palette is already world-space; no per-node model transform
+            u_model = identity4x4()   // skinned path blends the (root-baked) palette; u_model is unused
         } else {
             u_skinned = 0.0
-            u_model = node.world
+            u_model = root * node.world
         }
         for (glp in model.meshes[node.mesh].primitives) {
             if (glp.material >= 0 && glp.material < length(scene.materials)) {

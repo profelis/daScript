@@ -2084,6 +2084,18 @@ install(FILES ${PROJECT_SOURCE_DIR}/examples/gltf/GLTF_SAMPLE_ASSETS.LICENSE
     DESTINATION ${DAS_INSTALL_DOCDIR}
 )
 
+# dasGLTF ImGui mesh viewer. The dasImgui dep is daspkg-installed into modules/ (gitignored) from the
+# .das_package; run with -project_root examples/gltf/mesh_viewer_opengl. Ships source + manifest only.
+file(GLOB DAS_GLTF_VIEWER_EXAMPLE
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/*.das
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/.gitignore
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/README.md
+)
+install(FILES ${DAS_GLTF_VIEWER_EXAMPLE}
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/mesh_viewer_opengl
+)
+
 add_subdirectory(tutorials)
 
 # Test-runner targets (run_tests_interpreter / _jit / _aot).

@@ -1,0 +1,22 @@
+options gen2
+require daslib/daspkg
+
+[export]
+def package() {
+    package_name("gltf_mesh_viewer")
+    package_author("borisbat")
+    package_description("glTF 2.0 mesh viewer — load a .glb/.gltf, orbit it under metallic-roughness PBR, drive model transform / animation / lighting from Dear ImGui. dasGLTF + OpenGL + dasImgui showcase.")
+}
+
+[export]
+def dependencies(version : string) {
+    require_package("dasImgui")
+}
+
+[export]
+def release() {
+    release_main("main.das")
+    release_include("../media/**")
+    release_include("../*.LICENSE")
+    release_include("../PROVENANCE.md")
+}
