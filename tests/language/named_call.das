@@ -138,6 +138,17 @@ def test_method_arrow(t : T?) {
 }
 
 [test]
+def test_method_all_named(t : T?) {
+    // pure all-named method call, no positional and no brackets -- both '.' and '->'
+    let w = Widget(id = 7)
+    t |> equal(w.render(title = "hi"), "W7:hi:0")
+    t |> equal(w->render(title = "hi"), "W7:hi:0")
+    // multiple named args, still no positional (self is the only non-named arg)
+    t |> equal(w.render(title = "yo", depth = 3), "W7:yo:3")
+    t |> equal(w->render(title = "yo", depth = 3), "W7:yo:3")
+}
+
+[test]
 def test_all_named(t : T?) {
     // pure all-named (no positional at all) resolves as a function call
     t |> equal(three(a = 1, hint = "an"), "1/an/7")
@@ -168,6 +179,15 @@ def test_class_method_arrow(t : T?) {
     var g = new Gadget(id = 3)
     // '->' on a genuine class method: middle positional after self + named depth
     t |> equal(g->paint("hdr", depth = 2), "G3:hdr:2")
+    unsafe { delete g }
+}
+
+[test]
+def test_class_method_all_named(t : T?) {
+    var g = new Gadget(id = 3)
+    // pure all-named on a genuine class method, no positional -- both '.' and '->'
+    t |> equal(g.paint(title = "hi"), "G3:hi:0")
+    t |> equal(g->paint(title = "hi"), "G3:hi:0")
     unsafe { delete g }
 }
 
