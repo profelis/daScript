@@ -296,9 +296,9 @@ def private dasllama_type_stanza(f : FILE const?; lab : string; tname : string; 
 def document_module_dasllama(_root : string) {
     var mod = find_module("dasllama")
     var groups <- array<DocGroup>(
-        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|setup_dasllama_jobque|caps)$%%),
+        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
-        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|sample|set_seed|stats)$%%),
+        group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
         group_by_regex("Chat", mod, %regex~(create_chat|add_user|add_user_audio|add_assistant|render_turn|respond)$%%)
@@ -312,6 +312,10 @@ def document_module_dasllama(_root : string) {
             "A loaded model: weights, ``config``, tokenizer, and the architecture's blocks and chat template, as produced by ``load_model``. User code touches ``config`` (e.g. cap ``config.seq_len`` before ``create_session`` on large-context models) and ``arch`` (the GGUF architecture name).")
         dasllama_type_stanza(f, "struct-dasllama_common-Session", "Session",
             "One generation stream over a model: the KV cache, scratch buffers, sampling RNG, and the current position ``n_past``. ``logits`` holds the distribution produced by the last ``eval``. A model serves many independent sessions.")
+        dasllama_type_stanza(f, "struct-dasllama_common-BatchWorkspace", "BatchWorkspace",
+            "Caller-owned scratch for ``eval_batch``: the batched activation buffers a step of B sessions shares. One per concurrent batch, reused across calls; holds no session state — positions, caches and logits stay in the sessions.")
+        dasllama_type_stanza(f, "enum-dasllama_common-KVDtype", "KVDtype",
+            "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference.")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",
             "Weight representation picked at load: ``fp32`` — the token-exact reference; ``q8`` — int8 quantization, the fast CPU path; ``q4`` — 4-bit, smallest footprint.")
         dasllama_type_stanza(f, "struct-dasllama_common-SamplingParams", "SamplingParams",
