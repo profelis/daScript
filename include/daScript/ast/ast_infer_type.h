@@ -199,6 +199,11 @@ namespace das {
         vector<ExpressionPtr> demotePipedNamedCallArguments(ExprNamedCall *expr, const FunctionPtr &pFn, int blockParam);
         ExpressionPtr demoteNamedArgValue(MakeFieldDecl *arg) const;
 
+        // piped padding for a genuine class method: self at nonNamedArguments[0] and fullNonNamedTypes[0]
+        // (the caller prepends both for the implicit-self path), the block pads across defaults to reach
+        // a later block param, then the result is wrapped in invoke(type<st>.name, self, ...).
+        ExpressionPtr tryPipedMemberCallPadding(ExprNamedCall *expr, Structure *st, const ExpressionPtr &selfExpr, const vector<TypeDeclPtr> &fullNonNamedTypes);
+
         string reportAliasError(const TypeDeclPtr &type) const;
 
         string describeMismatchingArgument(const string &argName, const TypeDeclPtr &passType, const TypeDeclPtr &argType, int argIndex) const;

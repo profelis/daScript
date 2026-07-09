@@ -5644,6 +5644,10 @@ namespace das {
                         auto callStruct = tp->structType;
                         vector<TypeDeclPtr> nonNamedArgumentTypes;
                         nonNamedArgumentTypes.push_back(vSelf->type);
+                        // include the middle positionals + the piped block (was: self only, which dropped them)
+                        for (size_t i = 1, n = expr->nonNamedArguments.size(); i != n; ++i) {
+                            nonNamedArgumentTypes.push_back(expr->nonNamedArguments[i]->type);
+                        }
                         if (hasMatchingMemberCall(callStruct, expr->name, *expr->arguments, nonNamedArgumentTypes, true)) {
                             reportAstChanged();
                             auto pInvoke = makeInvokeMethod(expr->at, callStruct, vSelf, expr->name);
@@ -5653,6 +5657,12 @@ namespace das {
                                 pInvoke->arguments.push_back(newArguments[i]);
                             }
                             return pInvoke;
+                        }
+                        // piped block needs to pad across defaults to reach a later block param (self already at [0])
+                        if (expr->pipedCallArgument) {
+                            if (auto demoted = tryPipedMemberCallPadding(expr, callStruct, vSelf, nonNamedArgumentTypes)) {
+                                return demoted;
+                            }
                         }
                         string moreError = reportMismatchingMemberCall(callStruct, expr->name, *expr->arguments, nonNamedArgumentTypes, true);
                         reportMissing(expr, nonNamedTypes, "no matching functions or generics: ", true, CompilationError::function_not_found, moreError);
@@ -5679,6 +5689,23 @@ namespace das {
                             pInvoke->arguments.push_back(newArguments[i]);
                         }
                         return pInvoke;
+                    }
+                    // piped block needs to pad across defaults to reach a later block param. self is implicit here,
+                    // so prepend it to both the type list and the arguments (mirrors the non-piped path's insert);
+                    // restore on failure so a not-yet-ready retry does not double the self argument.
+                    if (expr->pipedCallArgument) {
+                        vector<TypeDeclPtr> fullNonNamedTypes;
+                        fullNonNamedTypes.reserve(nonNamedArgumentTypes.size() + 1);
+                        fullNonNamedTypes.push_back(new TypeDecl(selfStruct));
+                        for (auto &t : nonNamedArgumentTypes) {
+                            fullNonNamedTypes.push_back(t);
+                        }
+                        auto self = new ExprVar(expr->at, "self");
+                        expr->nonNamedArguments.insert(expr->nonNamedArguments.begin(), self);
+                        if (auto demoted = tryPipedMemberCallPadding(expr, selfStruct, self, fullNonNamedTypes)) {
+                            return demoted;
+                        }
+                        expr->nonNamedArguments.erase(expr->nonNamedArguments.begin());
                     }
                     string moreError = reportMismatchingMemberCall(selfStruct, expr->name, *expr->arguments, nonNamedArgumentTypes, false);
                     reportMissing(expr, nonNamedTypes, "no matching functions or generics: ", true, CompilationError::function_not_found, moreError);

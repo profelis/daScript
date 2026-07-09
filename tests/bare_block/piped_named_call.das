@@ -39,6 +39,37 @@ def draw(self : Panel; _caption : string; indent : int = 0; body : block<() : in
 // generic first argument, block param last -> pads
 def gdraw(tag; opt : int = 0; body : block<() : int>) : int { return opt + invoke(body) }
 
+// genuine class method (def inside class {}): a struct field, unreachable by bare name, so it
+// resolves through the member-call path. block param last, behind a defaulted 'indent' -> pads.
+class Frame {
+    depth : int
+    def region(_caption : string; indent : int = 0; body : block<() : int>) : int {
+        return depth + indent + invoke(body)
+    }
+    // two defaults between the middle positional and the block param
+    def region2(_caption : string; a : int = 0; b : int = 0; body : block<() : int>) : int {
+        return depth + a + b + invoke(body)
+    }
+    // block param right after self+caption (no default between) -> no padding
+    def plain(_caption : string; body : block<() : int>) : int {
+        return depth + invoke(body)
+    }
+    // implicit-self member call from within another method, block param pads across 'indent'
+    def wrap() : int {
+        return region("hi", indent = 4) {
+            return 3
+        }
+    }
+}
+
+// struct (not class) method with a block param last, behind a defaulted arg -> pads
+struct Box {
+    v : int
+    def cell(_caption : string; pad : int = 0; body : block<() : int>) : int {
+        return v + pad + invoke(body)
+    }
+}
+
 [test]
 def test_method_named_piped_block(t : T?) {
     let h = Holder(v = 100)
@@ -102,4 +133,37 @@ def test_dot_and_generic_padding(t : T?) {
         return 2
     }
     t |> equal(r2, 5)
+}
+
+[test]
+def test_class_method_padding(t : T?) {
+    var f = new Frame(depth = 100)
+    // middle positional "hdr" + named indent, block param last -> block pads across indent
+    let r1 = f.region("hdr", indent = 5) {
+        return 1
+    }
+    t |> equal(r1, 106)
+    // block right after self+caption (no default between) -> no padding needed
+    let r2 = f.plain("hdr") {
+        return 9
+    }
+    t |> equal(r2, 109)
+    // two defaults, only the second named -> the first is padded across too
+    let r3 = f.region2("hdr", b = 3) {
+        return 2
+    }
+    t |> equal(r3, 105)
+    // implicit-self member call, block pads across a default
+    t |> equal(f.wrap(), 107)
+    unsafe { delete f }
+}
+
+[test]
+def test_struct_method_padding(t : T?) {
+    var b = new Box(v = 10)
+    let r = b.cell("hdr", pad = 5) {
+        return 1
+    }
+    t |> equal(r, 16)
+    unsafe { delete b }
 }

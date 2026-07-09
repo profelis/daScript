@@ -41,6 +41,21 @@ def render(self : Widget; title : string; depth : int = 0) : string {
 struct SameName { p : int }
 def SameName(p : int; q : int) : string { return "fn:{p}:{q}" }
 
+// genuine class method (def inside class {}) - a middle positional after self plus a
+// named/defaulted arg. render() above is a FREE function via dot, so it resolves through the
+// regular lookup; a class method is a struct field, unreachable by bare name, so it goes through
+// the member-call path where middle positionals after self used to be dropped.
+class Gadget {
+    id : int
+    def paint(title : string; depth : int = 0) : string {
+        return "G{id}:{title}:{depth}"
+    }
+    // calls its own method with implicit self
+    def repaint(title : string) : string {
+        return paint(title, depth = 5)
+    }
+}
+
 // ---- tests -------------------------------------------------------------------
 
 [test]
@@ -122,4 +137,14 @@ def test_struct_beats_function(t : T?) {
     // SameName is both a struct and a function; all-named construction builds the STRUCT
     let s = SameName(p = 7)
     t |> equal(s.p, 7)
+}
+
+[test]
+def test_class_method_bare(t : T?) {
+    var g = new Gadget(id = 3)
+    // middle positional "hdr" after self + named depth -> the positional is kept (was dropped)
+    t |> equal(g.paint("hdr", depth = 2), "G3:hdr:2")
+    // implicit-self member call with a middle positional + named arg
+    t |> equal(g.repaint("hi"), "G3:hi:5")
+    unsafe { delete g }
 }

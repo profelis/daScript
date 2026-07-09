@@ -807,6 +807,28 @@ namespace das {
         newCall->arguments = das::move(newArgs);
         return newCall;
     }
+    ExpressionPtr InferTypes::tryPipedMemberCallPadding(ExprNamedCall *expr, Structure *st, const ExpressionPtr &selfExpr, const vector<TypeDeclPtr> &fullNonNamedTypes) {
+        // a class method is a single struct field (no name overloading), so there is exactly one candidate
+        auto methodFunc = findMethodFunction(st, expr->name);
+        if (!methodFunc) {
+            return nullptr;
+        }
+        int blockParam = -1, padCount = 0;
+        if (!findPipedNamedLanding(methodFunc, fullNonNamedTypes, *expr->arguments, false, blockParam, padCount)) {
+            return nullptr;
+        }
+        auto newArgs = demotePipedNamedCallArguments(expr, methodFunc, blockParam);
+        if (newArgs.empty()) { // a padded default was not ready
+            return nullptr;
+        }
+        reportAstChanged();
+        // self lands in the invoke receiver; the demoted self slot (result[0]) is dropped, same as the non-piped path
+        auto pInvoke = makeInvokeMethod(expr->at, st, selfExpr, expr->name);
+        for (size_t i = 1, n = newArgs.size(); i != n; ++i) {
+            pInvoke->arguments.push_back(newArgs[i]);
+        }
+        return pInvoke;
+    }
     Function *InferTypes::findMethodFunction(Structure *st, const string &name) const {
         if (name.find("::") != string::npos) {
             return nullptr;
