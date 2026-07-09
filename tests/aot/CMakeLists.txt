@@ -13,22 +13,13 @@ DAS_AOT_LIB("${AOT_TESTING_FILES}" TESTING_AOT_GENERATED_SRC test_aot_testing da
 # AOT all daslib .das files — catches codegen regressions for any module,
 # not just those used in tests/. Files marked `options no_aot` are silently skipped.
 FILE(GLOB AOT_DASLIB_MODULE_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "daslib/*.das")
-# Exclude modules that misbehave under batched AOT:
-#   aot_macro                  — [simulate_macro] fires, expects policies.aot_result
-#   debugger                   — required by others; error surfaces here
-#   profiler, ast_debug        — [_macro] installs thread-local debug agent at compile,
-#                                second module install panics on the first
-#   profiler_boost             — transitively requires profiler; installing the debug
-#                                agent in a batch perturbs SIM trees of subsequent
-#                                files, changing own-hashes so stubs don't match
-#                                runtime → error[50101] AOT link failed
-#   decs_state                 — [init, export] forks debug agent context during init
-#   aot_cpp, aot_standalone    — AST-codegen modules: rely on C++ bindings
-#                                (get_aot_hash_comment, visit_with_sort, aotFieldName,
-#                                 annotation_arguments, ExprBlock) lacking AOT header decls
-#   network                    — daslang class `Server` shadows C++ `das::Server`,
-#                                codegen resolves NetworkServer? to the daslang class
-list(FILTER AOT_DASLIB_MODULE_FILES EXCLUDE REGEX "daslib/(aot_macro|debugger|profiler|profiler_boost|ast_debug|decs_state|aot_cpp|aot_standalone|network)\\.das$")
+# Exclude modules that genuinely break batched AOT:
+#   aot_macro      — [simulate_macro] fails to simulate during AOT generation
+#   profiler       — emits AOT C++ hitting an ambiguous __bit_set overload (aot.h)
+#   profiler_boost — its [_macro] forks profiler's thread-local instrumenting agent, which
+#                    perturbs later batch files' hashes → error[50101]
+#   network        — daslang class `Server` shadows C++ `das::Server` (server_init undeclared)
+list(FILTER AOT_DASLIB_MODULE_FILES EXCLUDE REGEX "daslib/(aot_macro|profiler|profiler_boost|network)\\.das$")
 # just_in_time bootstraps the LLVM-backed JIT module via [extern](library=LLVM.dll).
 # Without DAS_LLVM_DISABLED=OFF, the [extern] macro fails at compile time.
 IF(DAS_LLVM_DISABLED)
