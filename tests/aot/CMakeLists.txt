@@ -98,6 +98,7 @@ SET(AOT_DASLLAMA_MODULE_FILES
     tests/dasLLAMA/_model_tier.das
     modules/dasLLVM/daslib/aarch64_neon.das
     modules/dasLLVM/daslib/x64_avx.das
+    modules/dasLLVM/daslib/f16_cvt.das
     modules/dasLLAMA/dasllama/dasllama_math.das
     modules/dasLLAMA/dasllama/dasllama_math_default.das
     modules/dasLLAMA/dasllama/dasllama_math_aarch64_neon.das
