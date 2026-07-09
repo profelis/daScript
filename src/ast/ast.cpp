@@ -2752,6 +2752,7 @@ namespace das {
             }
         }
         cexpr->methodCall = methodCall;
+        cexpr->pipedCallArgument = pipedCallArgument;
         return cexpr;
     }
 

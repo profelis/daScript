@@ -108,7 +108,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_piped_no_block_param.das | No block-like parameter for the piped block to land on | **expect** `30341` |
 | failed_piped_ambiguous.das | Two overloads with equal padding — ambiguous piped call | **expect** `30341` |
 | piped_named_call.das | Named-argument call + piped block — block becomes the trailing positional (free-fn and method forms) | |
-| failed_piped_named_padding.das | Piped block on a named call does not pad across a default param to a later block param (padding for named calls is a follow-up) | **expect** `30341` |
+| failed_piped_named_padding.das | Piped block on a named call can't land — a non-default param blocks the pad, or there's no block param at all | **expect** `30341:2` |
 | failed_piped_field.das | Field access + piped block is a parse error | **expect** `30347` |
 | test_bare_block.das | Bare lexical blocks — scoping, nesting, finally, control flow, name reuse | |
 | test_block_in_finally.das | Block locals + finally/defer — invoked from defer/plain finally, declared after defer, early-return path, loop-iterator capture, by-ref mutation visibility (AOT hoisted-block codegen) | |

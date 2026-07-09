@@ -1398,6 +1398,7 @@ namespace das
         MakeStructPtr  arguments = nullptr;
         bool        argumentsFailedToInfer = false;
         bool        methodCall = false;
+        bool        pipedCallArgument = false;  // last nonNamedArgument was attached via trailing pipe
     };
 
     struct DAS_API ExprMakeLocal : Expression {

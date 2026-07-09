@@ -5614,6 +5614,20 @@ namespace das {
                 reportAstChanged();
                 return demoteCall(expr, generics.back());
             } else {
+                // piped block on a named call: retry with pad-aware matching so the block can land on a
+                // later block param across defaults, exactly like a regular piped call. runs before the
+                // method paths - it also covers dot-syntax calls that resolve to a free function
+                // (w.foo(...) == foo(w, ...)); a genuine class method falls through to the member path below.
+                if (expr->pipedCallArgument) {
+                    MatchingFunctions pipedAmbiguous;
+                    if (auto demoted = tryPipedNamedCallPadding(expr, nonNamedTypes, pipedAmbiguous)) {
+                        return demoted; // reportAstChanged already called inside
+                    }
+                    if (!pipedAmbiguous.empty()) {
+                        reportExcess(expr, nonNamedTypes, "too many matching functions or generics: ", pipedAmbiguous, generics);
+                        return Visitor::visit(expr);
+                    }
+                }
                 if (expr->methodCall) {
                     if ( expr->nonNamedArguments.empty() ) {
                         reportMissing(expr, nonNamedTypes, "no matching functions or generics: ", true);

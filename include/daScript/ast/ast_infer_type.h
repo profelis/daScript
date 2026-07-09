@@ -186,6 +186,19 @@ namespace das {
 
         bool tryPipedCallPadding(ExprLooksLikeCall *expr, vector<TypeDeclPtr> &types, MatchingFunctions &functions, MatchingFunctions &generics, bool visCheck);
 
+        // shared winner selection for piped padding (least pad -> functions over generics -> substitute distance).
+        // returns the single winner, or nullptr on ambiguity (ambiguousFunctions gets the non-generic tie set).
+        Function * selectPipedWinner(MatchingFunctions &pipedFns, MatchingFunctions &pipedGens, const vector<TypeDeclPtr> &types, das_hash_map<Function *, pair<int, int>> &landing, bool &useGenerics, MatchingFunctions &ambiguousFunctions) const;
+
+        // named analogue of the piped landing search: positionals fill 0..p-1, the block lands on a block-typed
+        // slot, named args map by name, defaults fill the rest.
+        bool isFunctionCompatiblePipedNamedAt(Function *pFn, const vector<TypeDeclPtr> &nonNamedTypes, const vector<MakeFieldDeclPtr> &arguments, int blockParam, bool inferAuto) const;
+        bool findPipedNamedLanding(Function *pFn, const vector<TypeDeclPtr> &nonNamedTypes, const vector<MakeFieldDeclPtr> &arguments, bool inferAuto, int &blockParam, int &padCount) const;
+        void findMatchingPipedNamedFunctionsAndGenerics(MatchingFunctions &resultFunctions, MatchingFunctions &resultGenerics, const string &name, const vector<TypeDeclPtr> &nonNamedTypes, const vector<MakeFieldDeclPtr> &arguments, bool visCheck, das_hash_map<Function *, pair<int, int>> &landing) const;
+        ExpressionPtr tryPipedNamedCallPadding(ExprNamedCall *expr, const vector<TypeDeclPtr> &nonNamedTypes, MatchingFunctions &ambiguousFunctions);
+        vector<ExpressionPtr> demotePipedNamedCallArguments(ExprNamedCall *expr, const FunctionPtr &pFn, int blockParam);
+        ExpressionPtr demoteNamedArgValue(MakeFieldDecl *arg) const;
+
         string reportAliasError(const TypeDeclPtr &type) const;
 
         string describeMismatchingArgument(const string &argName, const TypeDeclPtr &passType, const TypeDeclPtr &argType, int argIndex) const;

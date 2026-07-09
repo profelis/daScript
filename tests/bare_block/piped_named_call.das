@@ -1,7 +1,8 @@
 options gen2
 
-// a named-argument call CAN now take a piped block: the block becomes the
-// trailing positional argument (it used to be a parse error, error[30347]).
+// a named-argument call can take a piped block. it lands on the block parameter,
+// padding across defaults just like a regular piped call (so the block param may be
+// last, behind named/defaulted arguments).
 require dastest/testing_boost public
 
 struct Holder {
@@ -15,6 +16,28 @@ def setv(self : Holder; _caption : string; blk : block<() : int>; x : int = 0) :
 def freefn(tag : int; blk : block<() : int>; scale : int = 1) : int {
     return tag + scale * invoke(blk)
 }
+
+// block parameter is LAST, behind a defaulted 'opt' -> needs padding
+def sec(tag : int; opt : int = 0; body : block<() : int>) : int {
+    return tag + opt + invoke(body)
+}
+
+// two defaults between the positional and the block param
+def two(tag : int; a : int = 0; b : int = 0; body : block<() : int>) : int {
+    return tag + a + b + invoke(body)
+}
+
+// overload set - least padding wins (the 3-arg one, block closer)
+def ov(a : int; x : int = 0; body : block<() : int>) : int { return 100 + a + x + invoke(body) }
+def ov(a : int; x : int = 0; y : int = 0; body : block<() : int>) : int { return 200 + a + x + y + invoke(body) }
+
+struct Panel { depth : int }
+// free function called via dot (w.draw(...) == draw(w, ...)); block param last -> pads
+def draw(self : Panel; _caption : string; indent : int = 0; body : block<() : int>) : int {
+    return self.depth + indent + invoke(body)
+}
+// generic first argument, block param last -> pads
+def gdraw(tag; opt : int = 0; body : block<() : int>) : int { return opt + invoke(body) }
 
 [test]
 def test_method_named_piped_block(t : T?) {
@@ -31,4 +54,52 @@ def test_freefn_named_piped_block(t : T?) {
         return 4
     }
     t |> equal(r, 43)
+}
+
+[test]
+def test_named_piped_padding(t : T?) {
+    // block param last, named 'opt' in between -> block pads across opt
+    let r1 = sec(5, opt = 3) {
+        return 1
+    }
+    t |> equal(r1, 9)
+    // still works with no named arg (block right after positional, no padding)
+    let r2 = sec(5) {
+        return 1
+    }
+    t |> equal(r2, 6)
+    // two defaults, both named
+    let r3 = two(1, a = 2, b = 3) {
+        return 4
+    }
+    t |> equal(r3, 10)
+    // two defaults, only the second named -> the first is padded
+    let r4 = two(1, b = 3) {
+        return 4
+    }
+    t |> equal(r4, 8)
+}
+
+[test]
+def test_named_piped_overload(t : T?) {
+    // least padding wins: the 3-arg ov (block at slot 2) beats the 4-arg one
+    let r = ov(1, x = 2) {
+        return 3
+    }
+    t |> equal(r, 106)
+}
+
+[test]
+def test_dot_and_generic_padding(t : T?) {
+    // dot-syntax free function, block param last, named 'indent' -> block pads across indent
+    let p = Panel(depth = 100)
+    let r1 = p.draw("hdr", indent = 5) {
+        return 1
+    }
+    t |> equal(r1, 106)
+    // generic first arg, block param last -> pads
+    let r2 = gdraw(7, opt = 3) {
+        return 2
+    }
+    t |> equal(r2, 5)
 }
