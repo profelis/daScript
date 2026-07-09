@@ -51,15 +51,24 @@ def env_or(name, dflt : string) : string {
 
 def whisper_cpp_bin(cli : string) : string {
     let root = env_or("WHISPER_CPP", "/Users/borisbatkin/Work/whisper.cpp")
-    return "{root}/build/bin/{cli}"
+    // Locate the built binary across cmake layouts: MSVC multi-config (build\bin\Release\x.exe),
+    // Ninja/single-config (build/bin/x.exe), Mac/Make (build/bin/x). stat picks the one that exists.
+    for (c in [normalize("{root}/build/bin/Release/{cli}.exe"),
+               normalize("{root}/build/bin/{cli}.exe"),
+               normalize("{root}/build/bin/{cli}")]) {
+        if (stat(c).is_valid) {
+            return c
+        }
+    }
+    return normalize("{root}/build/bin/{cli}")
 }
 
 def onnx_py() : string {
-    return env_or("ONNX_PY", "/Users/borisbatkin/Work/parakeet-tdt-0.6b-v3-fastapi-openai/.venv/bin/python")
+    return normalize(env_or("ONNX_PY", "/Users/borisbatkin/Work/parakeet-tdt-0.6b-v3-fastapi-openai/.venv/bin/python"))
 }
 
 def nemo_py() : string {
-    return env_or("NEMO_PY", "/Users/borisbatkin/Work/canary-nemo-oracle/.venv/bin/python")
+    return normalize(env_or("NEMO_PY", "/Users/borisbatkin/Work/canary-nemo-oracle/.venv/bin/python"))
 }
 
 // The clean CPU-only build (llama.cpp-clean, ebd048f, Accelerate ON, Metal OFF, no dasprof) patched
@@ -67,7 +76,7 @@ def nemo_py() : string {
 // numbers rode Metal (GPU) despite the "CPU-only" label — ggml's Conformer audio ops don't route
 // through BLAS/AMX, so a genuine CPU encode is ~16 s (and das's optimized scalar Conformer beats it).
 def mtmd_bin() : string {
-    return env_or("MTMD_BIN", "/Users/borisbatkin/Work/llama.cpp-clean/build-amx/bin/llama-mtmd-cli")
+    return normalize(env_or("MTMD_BIN", "/Users/borisbatkin/Work/llama.cpp-clean/build-amx/bin/llama-mtmd-cli"))
 }
 
 // The python bench scripts live beside the corpus (asr/); this tool runs from the repo-root cwd.

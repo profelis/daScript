@@ -63,18 +63,20 @@ def private measure(var t : Model; prefill_ctx, emission_ctx : int) : tuple<pref
     var em = 0.0lf
     with_job_que() {
         setup_dasllama_jobque_()
-        let warm <- build_prompt(8l)
+        var warm <- build_prompt(8l)
         for (p in range64(8l)) {
             forward(t, s, warm[p], p)
         }
         forward_prefill(t, s, warm, 8l, 0l)
+        delete warm
         // PREFILL — one batched forward_prefill (matches llama-bench pp<N>)
         let np = int64(prefill_ctx)
-        let prompt <- build_prompt(np)
+        var prompt <- build_prompt(np)
         let t0 = ref_time_ticks()
         forward_prefill(t, s, prompt, np, 0l)
         let us_pf = get_time_usec(t0)
         pf = double(np) / (double(us_pf) * 1.0e-6lf)
+        delete prompt
         // EMISSION — greedy decode from position 0 (matches llama-bench tg<N>)
         let ng = int64(emission_ctx)
         var tok = 1l
@@ -86,6 +88,7 @@ def private measure(var t : Model; prefill_ctx, emission_ctx : int) : tuple<pref
         let us_em = get_time_usec(t1)
         em = double(ng) / (double(us_em) * 1.0e-6lf)
     }
+    delete s   // free the run-state (KV cache) — measure() runs once per model
     return (prefill = pf, emission = em)
 }
 
@@ -195,6 +198,7 @@ def main() {
         logger_info("profile.llm.gen", "model done", JV({"model" => JV(m.display), "elapsed_ms" => JV(ms),
             "das_prefill_tok_s" => JV(meas.prefill), "das_emission_tok_s" => JV(meas.emission),
             "lcpp_prefill_tok_s" => JV(pf_ref), "lcpp_emission_tok_s" => JV(em_ref)}))
+        delete t   // free the model's weights before the next one (else all models stay resident)
     }
     logger_info("profile.llm.gen", "run done", JV({"profiled" => JV(length(prof.tests)), "path" => JV(profile_llm_path())}))
     print("profiled {length(prof.tests)} model row(s) -> {profile_llm_path()}\n")

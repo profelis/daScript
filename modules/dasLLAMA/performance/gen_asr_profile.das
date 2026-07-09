@@ -73,6 +73,7 @@ def load_audio_16k_mono(path : string) : array<float> {
     unsafe {
         delete decoder
     }
+    delete buf
     return <- out
 }
 
@@ -88,6 +89,7 @@ def measure_das(var m : AsrModel; samples : array<float>; reps : int; lang : str
         }
         let ms = double(get_time_usec(t0)) / 1000.0lf
         best = min(best, ms)
+        delete s
     }
     return best
 }
@@ -160,8 +162,9 @@ def add_libri_sides(var sides : array<LibriStat>; var m : AsrModel; spec : AsrMo
     var das_ms : array<double>
     das_ms |> reserve(length(clips))
     for (path in clips) {
-        let samples <- load_audio_16k_mono(path)
+        var samples <- load_audio_16k_mono(path)
         das_ms |> push(measure_das(m, samples, reps, spec.lang))
+        delete samples
     }
     let da = aggregate(das_ms)
     upsert_side(sides, LibriStat(side = "das {spec.libri_short}", mean_ms = da.mean, p50_ms = da.p50, p95_ms = da.p95))
@@ -236,19 +239,21 @@ def main() {
                 ? load_asr_model(model_path)
                 : load_asr_model(model_path, "{spec.root}{spec.das_mmproj}"))
             // warmup (JIT compile + first-touch) on the shortest bucket
-            let warm <- load_audio_16k_mono("{asr_corpus_dir()}{spec.buckets[0]}")
+            var warm <- load_audio_16k_mono("{asr_corpus_dir()}{spec.buckets[0]}")
             measure_das(m, warm, 1, spec.lang)
+            delete warm
 
             var buckets : array<AsrBucket>
             buckets |> reserve(length(spec.buckets))
             for (wav in spec.buckets) {
-                let samples <- load_audio_16k_mono("{asr_corpus_dir()}{wav}")
+                var samples <- load_audio_16k_mono("{asr_corpus_dir()}{wav}")
                 let audio_s = double(length(samples)) / double(AUDIO_SAMPLE_RATE)
                 let das_ms = measure_das(m, samples, cfg.reps, spec.lang)
                 buckets |> emplace(AsrBucket(wav = wav, audio_s = audio_s, das_ms = das_ms,
                     refs <- ref_times_for(baselines, spec.display, wav)))
                 logger_info("profile.asr.gen", "bucket done", JV({"model" => JV(spec.display), "wav" => JV(wav),
                     "das_ms" => JV(das_ms), "audio_s" => JV(audio_s)}))
+                delete samples
             }
             // NB: under -jit, a comprehension used INLINE as a `<-` move-init inside a struct
             // constructor silently yields an EMPTY array (interp is fine) — hoist it to a local
@@ -266,6 +271,7 @@ def main() {
             write_asr_profile(prof)   // persist now — a crash on a later model never costs this one
             let ms = double(get_time_usec(t0)) / 1000.0lf
             logger_info("profile.asr.gen", "model done", JV({"model" => JV(spec.display), "elapsed_ms" => JV(ms), "buckets" => JV(length(spec.buckets))}))
+            delete m   // free the loaded model's weights before the next model (else 6 models stay resident)
         }
     }
     logger_info("profile.asr.gen", "run done", JV({"profiled" => JV(length(prof.tests)), "path" => JV(profile_asr_path())}))
