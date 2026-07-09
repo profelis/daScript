@@ -26,6 +26,9 @@ OpenGL adapter — `require gltf/gltf_gl` + `gltf/gltf_pbr` (require `dasOpenGL`
 - `gltf/gltf_pbr.das` — portable Cook-Torrance GGX metal-rough shader (native DSL, `[vertex_program]`/
   `[fragment_program]`): tangent-space normals, occlusion, emissive, directional light + ambient, sRGB
   output, alpha OPAQUE/MASK/BLEND, doubleSided cull, GPU skinning (64-joint palette)
+- `gltf/gltf_pbr_common.das` — backend-neutral PBR shader math (GGX BRDF, normal perturbation, vector-space
+  skin blend, sRGB encode): pure scalar/vector/matrix functions both shader emitters lower as user
+  functions, shared with the dasVulkan renderer
 
 ## Neutral core
 

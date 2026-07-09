@@ -7,6 +7,7 @@ module gltf_pbr shared
 
 require gltf/gltf_types
 require gltf/gltf_scene
+require gltf/gltf_pbr_common
 require gltf/gltf_gl public
 require opengl/opengl_boost public
 require glsl/glsl_opengl public
@@ -50,30 +51,19 @@ def gltf_pbr_vs {
     var wnormal = float3(0.0, 0.0, 0.0)
     var wtangent = float3(0.0, 0.0, 0.0)
     if (u_skinned > 0.5) {
-        // Linear-blend skinning in VECTOR space: daslang shader math has mat*vec, vec*scalar and vec+vec,
-        // but no mat+mat / scalar*mat, so we blend the transformed vectors rather than the matrices. The
-        // palette already maps into world space (joint.world * inverseBind), so u_model is not applied.
-        let p = float4(a_position, 1.0)
-        let nn = float4(a_normal, 0.0)
-        let tg = float4(a_tangent.xyz, 0.0)
-        // clamp to the palette size: a skin with > GLTF_MAX_JOINTS joints (or malformed JOINTS_0)
-        // would otherwise index u_joints out of range -> undefined shader behavior.
+        // The palette already maps into world space (joint.world * inverseBind), so u_model is not
+        // applied. clamp to the palette size: a skin with > GLTF_MAX_JOINTS joints (or malformed
+        // JOINTS_0) would otherwise index u_joints out of range -> undefined shader behavior.
         let jx = clamp(int(a_joints0.x), 0, GLTF_MAX_JOINTS - 1)
         let jy = clamp(int(a_joints0.y), 0, GLTF_MAX_JOINTS - 1)
         let jz = clamp(int(a_joints0.z), 0, GLTF_MAX_JOINTS - 1)
         let jw = clamp(int(a_joints0.w), 0, GLTF_MAX_JOINTS - 1)
-        world = ((u_joints[jx] * p) * a_weights0.x
-               + (u_joints[jy] * p) * a_weights0.y
-               + (u_joints[jz] * p) * a_weights0.z
-               + (u_joints[jw] * p) * a_weights0.w)
-        wnormal = ((u_joints[jx] * nn).xyz * a_weights0.x
-                 + (u_joints[jy] * nn).xyz * a_weights0.y
-                 + (u_joints[jz] * nn).xyz * a_weights0.z
-                 + (u_joints[jw] * nn).xyz * a_weights0.w)
-        wtangent = ((u_joints[jx] * tg).xyz * a_weights0.x
-                  + (u_joints[jy] * tg).xyz * a_weights0.y
-                  + (u_joints[jz] * tg).xyz * a_weights0.z
-                  + (u_joints[jw] * tg).xyz * a_weights0.w)
+        world = gltf_skin_point(u_joints[jx], u_joints[jy], u_joints[jz], u_joints[jw],
+            a_weights0, float4(a_position, 1.0))
+        wnormal = gltf_skin_point(u_joints[jx], u_joints[jy], u_joints[jz], u_joints[jw],
+            a_weights0, float4(a_normal, 0.0)).xyz
+        wtangent = gltf_skin_point(u_joints[jx], u_joints[jy], u_joints[jz], u_joints[jw],
+            a_weights0, float4(a_tangent.xyz, 0.0)).xyz
     } else {
         world = u_model * float4(a_position, 1.0)
         // u_normal_matrix is inverse-transpose(u_model 3x3), so normals stay correct under
@@ -113,47 +103,11 @@ var @uniform @stage = 4 u_emissive_tex    : sampler2D
 
 var @out o_color : float4
 
-// Trowbridge-Reitz GGX normal distribution.
-def private distribution_ggx(n, h : float3; roughness : float) : float {
-    let a = roughness * roughness
-    let a2 = a * a
-    let ndoth = max(dot(n, h), 0.0)
-    let d = ndoth * ndoth * (a2 - 1.0) + 1.0
-    return a2 / max(3.14159265 * d * d, 0.0000001)
-}
-
-// Smith geometry term with Schlick-GGX, direct-lighting k = (r+1)^2 / 8.
-def private geometry_smith(n, v, l : float3; roughness : float) : float {
-    let r = roughness + 1.0
-    let k = r * r * 0.125
-    let ndotv = max(dot(n, v), 0.0)
-    let ndotl = max(dot(n, l), 0.0)
-    let gv = ndotv / (ndotv * (1.0 - k) + k)
-    let gl = ndotl / (ndotl * (1.0 - k) + k)
-    return gv * gl
-}
-
-def private fresnel_schlick(cos_theta : float; f0 : float3) : float3 {
-    let m = clamp(1.0 - cos_theta, 0.0, 1.0)
-    let m5 = m * m * m * m * m
-    return f0 + (float3(1.0, 1.0, 1.0) - f0) * m5
-}
-
-// Perturb the geometric normal by the tangent-space normal map when a tangent frame exists; fall back
-// to the geometric normal otherwise (the flat-normal default texture also yields no perturbation).
+// The BRDF / normal-perturbation / skinning math lives in gltf/gltf_pbr_common — shared with the
+// dasVulkan renderer; this module only samples textures and feeds the values in.
 def private shade_normal(uv : float2) : float3 {
-    let n_geom = normalize(v_world_normal)
-    let tlen = length(v_world_tangent)
-    var n = n_geom
-    if (tlen > 0.0001) {
-        let t = v_world_tangent * (1.0 / tlen)
-        let b = cross(n_geom, t) * v_tangent_w
-        let s = texture(u_normal_tex, uv).xyz * 2.0 - float3(1.0, 1.0, 1.0)
-        let sx = s.x * u_normal_scale
-        let sy = s.y * u_normal_scale
-        n = normalize(t * sx + b * sy + n_geom * s.z)
-    }
-    return n
+    return gltf_perturb_normal(normalize(v_world_normal), v_world_tangent, v_tangent_w,
+        texture(u_normal_tex, uv).xyz, u_normal_scale)
 }
 
 [fragment_program]
@@ -174,29 +128,12 @@ def gltf_pbr_fs {
     let n = shade_normal(uv)
     let v = normalize(u_cam_pos - v_world_pos)
     let l = normalize(u_light_dir)
-    let h = normalize(v + l)
-    let ndotl = max(dot(n, l), 0.0)
-    let ndotv = max(dot(n, v), 0.0)
-
-    let f0 = lerp(float3(0.04, 0.04, 0.04), albedo, float3(metallic, metallic, metallic))
-    let d = distribution_ggx(n, h, roughness)
-    let g = geometry_smith(n, v, l, roughness)
-    let f = fresnel_schlick(max(dot(h, v), 0.0), f0)
-    let spec_denom = 4.0 * ndotv * ndotl + 0.0001
-    let specular = f * (d * g * (1.0 / spec_denom))
-
-    let kd = (float3(1.0, 1.0, 1.0) - f) * (1.0 - metallic)
-    let diffuse = kd * albedo * (1.0 / 3.14159265)
-    let direct = (diffuse + specular) * u_light_color * ndotl
-
-    // occlusion darkens indirect (ambient) only, per the glTF strength blend
-    let ao = 1.0 + u_occlusion_strength * (occ - 1.0)
-    let ambient = u_ambient * albedo * ao
+    let direct = gltf_pbr_direct(albedo, metallic, roughness, n, v, l, u_light_color)
+    let ambient = gltf_pbr_ambient(albedo, u_ambient, occ, u_occlusion_strength)
 
     let linear = ambient + direct + emissive
     // no sRGB default framebuffer -> encode linear -> sRGB (approximate 2.2 gamma)
-    let g22 = 1.0 / 2.2
-    let out_rgb = pow(linear, float3(g22, g22, g22))
+    let out_rgb = gltf_srgb_encode(linear)
     let out_a = u_alpha_mode > 1.5 ? base.w : 1.0
     o_color = float4(out_rgb, out_a)
 }
