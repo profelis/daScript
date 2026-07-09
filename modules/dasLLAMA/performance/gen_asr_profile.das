@@ -237,8 +237,9 @@ def main() {
                     refs <- ref_times_for(baselines, spec.display, wav)))
                 print("  {wav}: das {das_ms} ms ({audio_s} s)\n")
             }
-            // NB: a comprehension used INLINE as a `<-` move-init inside a struct constructor
-            // silently yields an empty array — hoist it to a local first (verified gotcha).
+            // NB: under -jit, a comprehension used INLINE as a `<-` move-init inside a struct
+            // constructor silently yields an EMPTY array (interp is fine) — hoist it to a local
+            // first. Verified JIT miscompile; the plain-local `<-` (buckets) beside it is unaffected.
             var reftools <- [for (rf in spec.refs); rf.tool]
             var rec = AsrRec(model = spec.display, das_model = spec.das_model,
                 references <- reftools, buckets <- buckets)
