@@ -35,19 +35,19 @@ def isLLVMOpaqueBlockPtr(vinfo) {
 }
 
 def describe_arg(var ctxid : Context; vinfo; arg : void?) : void {
-    let parg = unsafe(reinterpret<void ??> (arg))
+    let parg = unsafe(reinterpret<void ??>(arg))
     if (parg == null || *parg == null) {
         report_to_debugger(ctxid, "llvm_debug", vinfo.name, null)
         return
     }
     if (isLLVMOpaqueValuePtr(vinfo)) {
-        let pexpression = unsafe(reinterpret<LLVMOpaqueValue ??> (arg))
+        let pexpression = unsafe(reinterpret<LLVMOpaqueValue ??>(arg))
         report_to_debugger(ctxid, "llvm_debug", vinfo.name, describe(*pexpression))
     } elif (isLLVMOpaqueTypePtr(vinfo)) {
-        let pexpression = unsafe(reinterpret<LLVMOpaqueType ??> (arg))
+        let pexpression = unsafe(reinterpret<LLVMOpaqueType ??>(arg))
         report_to_debugger(ctxid, "llvm_debug", vinfo.name, describe(*pexpression))
     } elif (isLLVMOpaqueBlockPtr(vinfo)) {
-        let pexpression = unsafe(reinterpret<LLVMOpaqueBasicBlock ??> (arg))
+        let pexpression = unsafe(reinterpret<LLVMOpaqueBasicBlock ??>(arg))
         report_to_debugger(ctxid, "llvm_debug", vinfo.name, describe(*pexpression))
         report_to_debugger(ctxid, "llvm_debug", "{vinfo.name}.detail", describe(LLVMBasicBlockAsValue(*pexpression)))
     }

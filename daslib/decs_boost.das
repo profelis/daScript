@@ -94,7 +94,7 @@ class DecsTemplate : AstStructureAnnotation {
         var fnArch = qmacro_function("apply_decs_template_arch") $(var arch : Archetype; eidx : int; eid : EntityId; src : $t(st); var cache : array<int>) : void {
             pass
         }
-        var blkA = unsafe(reinterpret<ExprBlock?> (fnArch.body))
+        var blkA = unsafe(reinterpret<ExprBlock?>(fnArch.body))
         blkA.list |> clear()
         blkA.list |> emplace_new <| qmacro_block() {
             if (length(cache) == 0) {
@@ -109,7 +109,7 @@ class DecsTemplate : AstStructureAnnotation {
         var fnBulk = qmacro_function("create_entities`{st.name}") $(count : int; user_blk : block<(eid : decs::EntityId; i : int; var entity : $t(st)) : void>) : void {
             pass
         }
-        var blk = unsafe(reinterpret<ExprBlock?> (fnBulk.body))
+        var blk = unsafe(reinterpret<ExprBlock?>(fnBulk.body))
         blk.list |> clear()
         blk.list |> emplace_new <| qmacro_block() {
             var defval := default<$t(st)>

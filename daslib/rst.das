@@ -1541,7 +1541,7 @@ def document_structure_annotation(doc_file : file; mod : Module?; value) {
     var props : array<array<string>>
     props |> emplace(array<string>("field", "type"))
     var annT = new TypeDecl(baseType = Type.tHandle,
-        annotation = unsafe(reinterpret<TypeAnnotation?> (value)))
+        annotation = unsafe(reinterpret<TypeAnnotation?>(value)))
     for_each_function(mod, "") $(func) {
         if (!func.moreFlags.propertyFunction || func.arguments |> length != 1) return
         let fna = string(func.name)
@@ -1558,7 +1558,7 @@ def document_structure_annotation(doc_file : file; mod : Module?; value) {
         fwrite(doc_file, make_table("Properties", props))
     }
 
-    var ann = unsafe(reinterpret<BasicStructureAnnotation?> (value))
+    var ann = unsafe(reinterpret<BasicStructureAnnotation?>(value))
 
     var tab : array<array<string>>
     tab |> emplace(array<string>("field", "type"))

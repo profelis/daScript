@@ -616,7 +616,7 @@ def write_json(val : JsonValue?) : string {
 def write_json(val : JsonValue?#) : string {
     //! Overload accepting temporary type
     unsafe {// Fine, as json doesn't escape the function
-        return write_json(reinterpret<JsonValue?> (val))
+        return write_json(reinterpret<JsonValue?>(val))
     }
 }
 

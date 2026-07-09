@@ -370,7 +370,7 @@ def public make_alias_type_decl(name : string) : TypeDecl? {
 }
 
 def private convert_pointer_expr(mod; data; info; at) : Expression? {
-    assume pdata = *unsafe(reinterpret<uint8 const ??> (data));
+    assume pdata = *unsafe(reinterpret<uint8 const ??>(data));
     if (pdata == null) return new ExprConstPtr(at = at);
     assume first_tstr = describe(info.firstType);
     if (first_tstr == "ast_core::TypeDecl") {

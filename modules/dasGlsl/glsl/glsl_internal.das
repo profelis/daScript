@@ -1285,7 +1285,7 @@ class GlslExport : AstVisitor {
         }
         var fnName : string
         unsafe {
-            fnName = glsl_function_name(reinterpret<FunctionPtr> (expr.func))
+            fnName = glsl_function_name(reinterpret<FunctionPtr>(expr.func))
         }
         if (caps.output_compatibility_constructors) {
             glsl_compatibility_constructors |> get(fnName) $(newName) {

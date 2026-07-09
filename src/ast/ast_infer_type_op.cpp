@@ -152,7 +152,8 @@ namespace das {
             return Visitor::visit(expr); // failed to infer
         // pointer arithmetics
         if (expr->subexpr->type->isPointer()) {
-            if (!expr->subexpr->type->firstType) {
+            // same tVoid-shaped void? guard as the binary case below
+            if (!expr->subexpr->type->firstType || expr->subexpr->type->firstType->baseType == Type::tVoid) {
                 error("operations on 'void' pointers are prohibited; " +
                           describeType(expr->subexpr->type),
                       "", "",
@@ -391,7 +392,10 @@ namespace das {
         }
         // pointer arithmetics
         if (expr->left->type->isPointer() && expr->right->type->isIndexExt()) {
-            if (!expr->left->type->firstType) {
+            // a void? can carry firstType as an explicit tVoid node — that shape used to slip
+            // past the null check and lower with stride sizeof(void) == 0, silently turning
+            // `p + n` into `p`
+            if (!expr->left->type->firstType || expr->left->type->firstType->baseType == Type::tVoid) {
                 error("operations on 'void' pointers are prohibited; " +
                           describeType(expr->left->type),
                       "", "",

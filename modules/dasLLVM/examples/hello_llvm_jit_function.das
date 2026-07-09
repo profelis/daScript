@@ -46,7 +46,7 @@ def main {
     LLVMCreateJITCompilerForModule(engine, mod)
     var pfun = LLVMGetFunctionAddress(engine, "sum")
     unsafe {
-        instrument_jit(reinterpret<void?> (pfun), @@add_two_ints, LineInfo(), this_context())
+        instrument_jit(reinterpret<void?>(pfun), @@add_two_ints, LineInfo(), this_context())
     }
     let res = add_two_ints(11, 12)
     print("result = {res}\n")

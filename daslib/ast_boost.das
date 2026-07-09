@@ -312,7 +312,7 @@ def setup_call_list(name : string; at : LineInfo; subblock : block<(var fn : Fun
     } elif (fn.body.__rtti != "ExprBlock") {
         panic("expecting func.ExprBlock")
     }
-    return unsafe(reinterpret<ExprBlock?> (fn.body))
+    return unsafe(reinterpret<ExprBlock?>(fn.body))
 }
 
 def setup_call_list(name : string; at : LineInfo; isInit : bool = false; isPrivate : bool = true; isLateInit : bool = false) : ExprBlock? {
@@ -351,21 +351,21 @@ def setup_macro(name : string; at : LineInfo) : ExprBlock? {
         if (!(compiling_module() |> add_function(fn))) {
             panic("failed to setup macro, can't add function {fn.name}")
         }
-        return unsafe(reinterpret<ExprBlock?> (res))
+        return unsafe(reinterpret<ExprBlock?>(res))
     } else {
         if (fn.body.__rtti != "ExprBlock") {
             panic("expecting func.ExprBlock")
         }
         unsafe {
-            var blk = reinterpret<ExprBlock?> (fn.body)
+            var blk = reinterpret<ExprBlock?>(fn.body)
             if (blk.list |> length != 1 || blk.list[0].__rtti != "ExprIfThenElse") {
                 panic("expecting is_compiling_macros")
             }
-            var ife = reinterpret<ExprIfThenElse?> (blk.list[0])
+            var ife = reinterpret<ExprIfThenElse?>(blk.list[0])
             if (ife.if_true.__rtti != "ExprBlock") {
                 panic("expecting ife.if_true.ExprBlock")
             }
-            return reinterpret<ExprBlock?> (ife.if_true)
+            return reinterpret<ExprBlock?>(ife.if_true)
         }
     }
 }
@@ -516,7 +516,7 @@ class TagFunctionMacro : SetupAnyAnnotation {
             return false
         }
         tag = argTag as tString
-        return SetupAnyAnnotation`apply(cast<SetupAnyAnnotation> (self), st, group, args, errors)
+        return SetupAnyAnnotation`apply(cast<SetupAnyAnnotation>(self), st, group, args, errors)
     }
 }
 
@@ -709,7 +709,7 @@ def private walk_and_convert_dim(data : uint8 const?; info : TypeDeclPtr; at : L
 
 def private walk_and_convert_pointer(data : uint8 const?; info : TypeDeclPtr; at : LineInfo) : Expression? {
     unsafe {
-        let pdata = *(reinterpret<uint8 const ??> (data))
+        let pdata = *(reinterpret<uint8 const ??>(data))
         var elem = walk_and_convert(pdata, info.firstType, at)
         var mkAsc = new ExprAscend(at = at, subexpr = elem)
         return mkAsc
@@ -751,7 +751,7 @@ def private walk_and_convert_structure(data : uint8 const?; info : TypeDeclPtr; 
 
 def private walk_and_convert_variant(data : uint8 const?; info : TypeDeclPtr; at : LineInfo) : Expression? {
     unsafe {
-        let vindex = *reinterpret<int?> (data)
+        let vindex = *reinterpret<int?>(data)
         let offset = get_variant_field_offset(info, vindex)
         var mkVariant = new ExprMakeVariant(at = at, makeType = clone_type(info))
         var elem = walk_and_convert(data + offset, info.argTypes[vindex], at)
@@ -793,42 +793,42 @@ def private walk_and_convert_table(data : uint8 const?; info : TypeDeclPtr; at :
 def private walk_and_convert_basic(data : uint8 const?; info : TypeDeclPtr; at : LineInfo) : Expression? {
     unsafe {
         if (info.baseType == Type.tInt8) {
-            return new ExprConstInt8(at = at, value = *reinterpret<int8?> (data))
+            return new ExprConstInt8(at = at, value = *reinterpret<int8?>(data))
         } elif (info.baseType == Type.tInt16) {
-            return new ExprConstInt16(at = at, value = *reinterpret<int16?> (data))
+            return new ExprConstInt16(at = at, value = *reinterpret<int16?>(data))
         } elif (info.baseType == Type.tInt) {
-            return new ExprConstInt(at = at, value = *reinterpret<int?> (data))
+            return new ExprConstInt(at = at, value = *reinterpret<int?>(data))
         } elif (info.baseType == Type.tInt64) {
-            return new ExprConstInt64(at = at, value = *reinterpret<int64?> (data))
+            return new ExprConstInt64(at = at, value = *reinterpret<int64?>(data))
         } elif (info.baseType == Type.tUInt8) {
-            return new ExprConstUInt8(at = at, value = *reinterpret<uint8?> (data))
+            return new ExprConstUInt8(at = at, value = *reinterpret<uint8?>(data))
         } elif (info.baseType == Type.tUInt16) {
-            return new ExprConstUInt16(at = at, value = *reinterpret<uint16?> (data))
+            return new ExprConstUInt16(at = at, value = *reinterpret<uint16?>(data))
         } elif (info.baseType == Type.tUInt) {
-            return new ExprConstUInt(at = at, value = *reinterpret<uint?> (data))
+            return new ExprConstUInt(at = at, value = *reinterpret<uint?>(data))
         }  elif (info.baseType == Type.tUInt64) {
-            return new ExprConstUInt64(at = at, value = *reinterpret<uint64?> (data))
+            return new ExprConstUInt64(at = at, value = *reinterpret<uint64?>(data))
         } elif (info.baseType == Type.tFloat) {
-            return new ExprConstFloat(at = at, value = *reinterpret<float?> (data))
+            return new ExprConstFloat(at = at, value = *reinterpret<float?>(data))
         } elif (info.baseType == Type.tDouble) {
-            return new ExprConstDouble(at = at, value = *reinterpret<double?> (data))
+            return new ExprConstDouble(at = at, value = *reinterpret<double?>(data))
         } elif (info.baseType == Type.tBool) {
-            return new ExprConstBool(at = at, value = *reinterpret<bool?> (data))
+            return new ExprConstBool(at = at, value = *reinterpret<bool?>(data))
         } elif (info.baseType == Type.tRange) {
-            return new ExprConstRange(at = at, value = *reinterpret<range?> (data))
+            return new ExprConstRange(at = at, value = *reinterpret<range?>(data))
         } elif (info.baseType == Type.tURange) {
-            return new ExprConstURange(at = at, value = *reinterpret<urange?> (data))
+            return new ExprConstURange(at = at, value = *reinterpret<urange?>(data))
         } elif (info.baseType == Type.tRange64) {
-            return new ExprConstRange64(at = at, value = *reinterpret<range64?> (data))
+            return new ExprConstRange64(at = at, value = *reinterpret<range64?>(data))
         } elif (info.baseType == Type.tURange64) {
-            return new ExprConstURange64(at = at, value = *reinterpret<urange64?> (data))
+            return new ExprConstURange64(at = at, value = *reinterpret<urange64?>(data))
         } elif (info.baseType == Type.tString) {
-            return new ExprConstString(at = at, value := *reinterpret<string?> (data))
+            return new ExprConstString(at = at, value := *reinterpret<string?>(data))
         } elif (info.baseType == Type.tBitfield8
                 || info.baseType == Type.tBitfield16
                 || info.baseType == Type.tBitfield
                 || info.baseType == Type.tBitfield64) {
-            return new ExprConstBitfield(at = at, value = *reinterpret<bitfield?> (data), bitfieldType = clone_type(info))
+            return new ExprConstBitfield(at = at, value = *reinterpret<bitfield?>(data), bitfieldType = clone_type(info))
         } else {
             panic("unsupported {info.baseType}")
             return null
@@ -840,20 +840,20 @@ def private walk_and_convert_basic(data : uint8 const?; info : TypeDeclPtr; at :
 def private walk_and_convert_enumeration(data : uint8 const?; info : TypeDeclPtr; at : LineInfo) : Expression? {
     var eval = 0l
     if (info.baseType == Type.tEnumeration) {
-        eval = int64(*unsafe(reinterpret<int?> (data)))
+        eval = int64(*unsafe(reinterpret<int?>(data)))
     } elif (info.baseType == Type.tEnumeration8) {
         eval = int64(*data)
     } elif (info.baseType == Type.tEnumeration16) {
-        eval = int64(*unsafe(reinterpret<int16?> (data)))
+        eval = int64(*unsafe(reinterpret<int16?>(data)))
     } elif (info.baseType == Type.tEnumeration64) {
-        eval = *unsafe(reinterpret<int64?> (data))
+        eval = *unsafe(reinterpret<int64?>(data))
     } else {
         panic("unsupported enumeration")
     }
     let name = info.enumType |> find_enum_name(eval)
     panic("can't find name of enum value {eval} in {describe(info)}") if (name == "")
     return new ExprConstEnumeration(
-        enumType := unsafe(reinterpret<Enumeration?> (info.enumType)),
+        enumType := unsafe(reinterpret<Enumeration?>(info.enumType)),
         value := name)
 }
 
@@ -866,7 +866,7 @@ def walk_and_convert(data : uint8 const?; info : TypeDeclPtr; at : LineInfo) : E
         return walk_and_convert_array(data, info, at)
     } elif (info.baseType == Type.tPointer) {
         unsafe {
-            if (*reinterpret<uint8 const ??> (data) == null) {
+            if (*reinterpret<uint8 const ??>(data) == null) {
                 return new ExprConstPtr(at = at)
             } elif (info.firstType == null || info.firstType.isVoid) {
                 return new ExprConstPtr(at = at)
@@ -894,7 +894,7 @@ def convert_to_expression(var value : auto& ==const; at : LineInfo) {
     var info = typeinfo ast_typedecl(value)
     unsafe {
         let pval = addr(value)
-        return walk_and_convert(reinterpret<uint8 const?> (pval), info, at)
+        return walk_and_convert(reinterpret<uint8 const?>(pval), info, at)
     }
 }
 
@@ -903,7 +903,7 @@ def convert_to_expression(value : auto ==const; at : LineInfo) {
     var info = typeinfo ast_typedecl(value)
     unsafe {
         let pval = addr(value)
-        return walk_and_convert(reinterpret<uint8 const?> (pval), info, at)
+        return walk_and_convert(reinterpret<uint8 const?>(pval), info, at)
     }
 }
 
@@ -1236,7 +1236,7 @@ def private debug_expression_impl(var writer : StringBuilderWriter; expr : Expre
             writer |> write(" file=\"{e.at.fileInfo.name}\"")
         }
         if (e.__rtti == "ExprCall" || e.__rtti == "ExprInvoke") { // nolint:STYLE006
-            let enc = unsafe(reinterpret<ExprLooksLikeCall?> (e))
+            let enc = unsafe(reinterpret<ExprLooksLikeCall?>(e))
             if (int(enc.atEnclosure.line) != 0 || int(enc.atEnclosure.last_line) != 0) {
                 writer |> write(" atEnclosure={int(enc.atEnclosure.line)}:{int(enc.atEnclosure.column)}-{int(enc.atEnclosure.last_line)}:{int(enc.atEnclosure.last_column)}")
             }
@@ -1246,7 +1246,7 @@ def private debug_expression_impl(var writer : StringBuilderWriter; expr : Expre
         writer |> write(" {describe(expr)})")
         return
     }
-    var ann = unsafe(reinterpret<BasicStructureAnnotation?> (get_expression_annotation(expr)))
+    var ann = unsafe(reinterpret<BasicStructureAnnotation?>(get_expression_annotation(expr)))
     if (ann == null) {
         writer |> write(")")
         return
@@ -1256,31 +1256,31 @@ def private debug_expression_impl(var writer : StringBuilderWriter; expr : Expre
             let tstr = describe(xtype)
             var p8 : int8?
             unsafe {
-                p8 = (reinterpret<int8?> (expr)) + int(offset)
+                p8 = (reinterpret<int8?>(expr)) + int(offset)
             }
             if (tstr == "ast_core::Expression?") {
-                let pv = unsafe(reinterpret<Expression ??> (p8))
+                let pv = unsafe(reinterpret<Expression ??>(p8))
                 let ts = repeat("  ", tabs + 2)
                 writer |> write("\n{ts}({name} ")
                 debug_expression_impl(writer, *pv, deFlags, tabs + 2)
                 writer |> write(")")
             } elif (tstr == "$::das_string") {
-                let pv = unsafe(reinterpret<das_string?> (p8))
+                let pv = unsafe(reinterpret<das_string?>(p8))
                 writer |> write(" {name}=\"{*pv}\"")
             } elif (tstr == "int") {
-                let pv = unsafe(reinterpret<int?> (p8))
+                let pv = unsafe(reinterpret<int?>(p8))
                 writer |> write(" {name}={*pv}")
             } elif (tstr == "uint") {
-                let pv = unsafe(reinterpret<uint?> (p8))
+                let pv = unsafe(reinterpret<uint?>(p8))
                 writer |> write(" {name}={*pv}")
             } elif (tstr == "int64") {
-                let pv = unsafe(reinterpret<int64?> (p8))
+                let pv = unsafe(reinterpret<int64?>(p8))
                 writer |> write(" {name}={*pv}")
             } elif (tstr == "uint64") {
-                let pv = unsafe(reinterpret<uint64?> (p8))
+                let pv = unsafe(reinterpret<uint64?>(p8))
                 writer |> write(" {name}={*pv}")
             } elif (tstr == "bool") {
-                let pv = unsafe(reinterpret<bool?> (p8))
+                let pv = unsafe(reinterpret<bool?>(p8))
                 writer |> write(" {name}={*pv}")
             } else {
                 pass
@@ -1293,10 +1293,10 @@ def private debug_expression_impl(var writer : StringBuilderWriter; expr : Expre
             let tstr = describe(xtype)
             var p8 : int8?
             unsafe {
-                p8 = (reinterpret<int8?> (expr)) + int(offset)
+                p8 = (reinterpret<int8?>(expr)) + int(offset)
             }
             if (tstr == "$::dasvector`ptr`Expression") {
-                let pv = unsafe(reinterpret<dasvector`ptr`Expression?> (p8))
+                let pv = unsafe(reinterpret<dasvector`ptr`Expression?>(p8))
                 if (!empty(*pv)) {
                     let ts = repeat("  ", tabs + 2)
                     writer |> write("\n{ts}[{name}\n")
@@ -1310,7 +1310,7 @@ def private debug_expression_impl(var writer : StringBuilderWriter; expr : Expre
                     writer |> write("]")
                 }
             } elif (tstr == "$::dasvector`ptr`Variable") {
-                let pv = unsafe(reinterpret<dasvector`ptr`Variable?> (p8))
+                let pv = unsafe(reinterpret<dasvector`ptr`Variable?>(p8))
                 if (!empty(*pv)) {
                     let ts = repeat("  ", tabs + 2)
                     writer |> write("\n{ts}[{name}\n")

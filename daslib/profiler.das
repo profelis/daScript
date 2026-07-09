@@ -191,7 +191,7 @@ class PerformanceProfilerAgent : ProfilerBaseAgent {
         time_unit = cfg.time_unit
         if (report_memory) {
             unsafe {
-                self.onInstrumentFunction = reinterpret<function<(var agent : DapiDebugAgent; var ctx : Context; fn : SimFunction?; entering : bool; userData : uint64) : void>> (self.onInstrumentFunctionWithMemory)
+                self.onInstrumentFunction = reinterpret<function<(var agent : DapiDebugAgent; var ctx : Context; fn : SimFunction?; entering : bool; userData : uint64) : void>>(self.onInstrumentFunctionWithMemory)
             }
         }
         write("[")

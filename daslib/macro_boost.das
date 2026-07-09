@@ -49,7 +49,7 @@ class CaptureBlock : AstVisitor {
         let vptr = expr.variable
         if (!(scope |> key_exists(vptr))) {
             unsafe {
-                captured[vptr] = reinterpret<ExprVar?> (expr)
+                captured[vptr] = reinterpret<ExprVar?>(expr)
             }
         }
     }
@@ -93,9 +93,9 @@ class ColletFinally : AstVisitor {
     def override preVisitExprBlock(blk : ExprBlock?) : void {
         unsafe {
             if (!empty(blk.finalList)) {
-                blocks |> insert(reinterpret<ExprBlock?> (blk))
+                blocks |> insert(reinterpret<ExprBlock?>(blk))
             } elif (alwaysFor && blk.blockFlags.forLoop) {
-                blocks |> insert(reinterpret<ExprBlock?> (blk))
+                blocks |> insert(reinterpret<ExprBlock?>(blk))
             }
         }
     }

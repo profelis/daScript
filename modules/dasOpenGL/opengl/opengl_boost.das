@@ -43,7 +43,7 @@ def write_ssbo(ssbo : uint; data : auto(TT)) {
         panic("can't map ssbo")
     }
     unsafe { // nolint:STYLE025 — expression-form unsafe loses the reinterpret in generic instances (31004)
-        *(reinterpret<TT -const?> (p_mat)) = data
+        *(reinterpret<TT -const?>(p_mat)) = data
     }
     glUnmapBuffer(GL_SHADER_STORAGE_BUFFER)
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0u)
@@ -56,7 +56,7 @@ def read_ssbo(ssbo : uint; var data : auto(TT)) {
         panic("can't map ssbo")
     }
     unsafe { // nolint:STYLE025 — expression-form unsafe loses the reinterpret in generic instances (31004)
-        data = *(reinterpret<TT?> (p_mat))
+        data = *(reinterpret<TT?>(p_mat))
     }
     glUnmapBuffer(GL_SHADER_STORAGE_BUFFER)
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0u)
@@ -186,7 +186,7 @@ def glUniformMatrix3fv(location : int; value : float3x3) {
 def glBufferData(target : GLenum; arr; usage : GLenum) {
     unsafe {
         assert(!empty(arr))
-        glBufferData(target, int64(length(arr) * typeinfo sizeof(arr[0])), reinterpret<void?> (addr(arr[0])), usage)
+        glBufferData(target, int64(length(arr) * typeinfo sizeof(arr[0])), reinterpret<void?>(addr(arr[0])), usage)
     }
 }
 
@@ -272,13 +272,13 @@ def std140_release_all() {
 
 def glVertexAttribPointer(index : uint; size : int; tp : GLenum; normalized : bool; stride : int; offset : int) {
     unsafe {
-        glVertexAttribPointer(index, size, tp, normalized, stride, reinterpret<void?> (offset))
+        glVertexAttribPointer(index, size, tp, normalized, stride, reinterpret<void?>(offset))
     }
 }
 
 def glVertexAttribPointer(index : uint; size : int; tp : GLenum; normalized : bool; stride : int; ptrd : void?; offset : int) {
     unsafe {
-        var poffset = reinterpret<int8?> (ptrd)
+        var poffset = reinterpret<int8?>(ptrd)
         poffset += offset
         glVertexAttribPointer(index, size, tp, normalized, stride, poffset)
     }
@@ -298,7 +298,7 @@ def create_shader(src : string implicit; shaderType : uint; canfail : bool = fal
             unsafe {
                 var log : array<uint>
                 resize(log, 16384)
-                let slog = reinterpret<string> (addr(log[0]))
+                let slog = reinterpret<string>(addr(log[0]))
                 glGetShaderInfoLog(s, 16384, null, slog)
                 to_log(LOG_ERROR, "Shader source:\n{src}\n")
                 panic("{slog}\n\nFAILED TO CREATE SHADER ({status})\n")
@@ -331,7 +331,7 @@ def link_shader(program : uint; canfail : bool = false) {
         if (!canfail) {
             unsafe {
                 var log : uint8[512]
-                let slog = reinterpret<string> (addr(log[0]))
+                let slog = reinterpret<string>(addr(log[0]))
                 glGetProgramInfoLog(program, 512, null, slog)
                 panic("FAILED TO LINK SHADER PROGRAM ({status}):\n{slog}\n")
             }

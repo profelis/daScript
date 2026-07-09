@@ -229,14 +229,14 @@ class ContextStateAgent : DapiDebugAgent {
                 addr(msg_ids[0]),
                 addr(msg_severities[0]),
                 addr(msg_lengths[0]),
-                reinterpret<string> (addr(msg_logs[0]))
+                reinterpret<string>(addr(msg_logs[0]))
             );
         }
         var offset = 0;
         for (source, tpe, id, severitie, len in msg_sources, msg_types, msg_ids, msg_severities, msg_lengths) {
             var mtext : string;
             unsafe {
-                mtext = reinterpret<string> (addr(msg_logs[offset]));
+                mtext = reinterpret<string>(addr(msg_logs[offset]));
             }
             offset += len;
             if (source != 0u) {

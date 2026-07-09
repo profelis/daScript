@@ -1839,16 +1839,20 @@ expression_let
     }
     ;
 
+// The operand is REQUIRED to be parenthesized (self-delimiting, like DAS_UNSAFE below). The old
+// juxtaposition form `cast<T> expr` swallowed trailing binary operators into the operand —
+// `reinterpret<uint8?>(p) + 1` parsed as `reinterpret<uint8?>((p) + 1)`, silently doing the
+// arithmetic on p's original type (stride 0 for void?, i.e. dropping the add entirely).
 expr_cast
-    :   DAS_CAST[loc] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options[decl] '>' { yyextra->das_arrow_depth --; } expr_no_bracket[subexpr] {
+    :   DAS_CAST[loc] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options[decl] '>' { yyextra->das_arrow_depth --; } '(' expr[subexpr] ')' {
         $$ = new ExprCast(tokAt(scanner,@loc),$subexpr,$decl);
     }
-    |   DAS_UPCAST[loc] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options[decl] '>' { yyextra->das_arrow_depth --; } expr_no_bracket[subexpr] {
+    |   DAS_UPCAST[loc] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options[decl] '>' { yyextra->das_arrow_depth --; } '(' expr[subexpr] ')' {
         auto pCast = new ExprCast(tokAt(scanner,@loc),$subexpr,$decl);
         pCast->upcast = true;
         $$ = pCast;
     }
-    |   DAS_REINTERPRET[loc] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options[decl] '>' { yyextra->das_arrow_depth --; } expr_no_bracket[subexpr] {
+    |   DAS_REINTERPRET[loc] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options[decl] '>' { yyextra->das_arrow_depth --; } '(' expr[subexpr] ')' {
         auto pCast = new ExprCast(tokAt(scanner,@loc),$subexpr,$decl);
         pCast->reinterpret = true;
         $$ = pCast;

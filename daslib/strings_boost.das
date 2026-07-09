@@ -374,7 +374,7 @@ def public glob_match(pattern, text : string) : bool {
     if (empty(text)) {
         // text is empty — only matches if pattern is all *'s
         unsafe {
-            var pp = reinterpret<uint8?> (pattern)
+            var pp = reinterpret<uint8?>(pattern)
             while (*pp == uint8('*')) {
                 pp++
             }
@@ -382,8 +382,8 @@ def public glob_match(pattern, text : string) : bool {
         }
     }
     unsafe {
-        var pp = reinterpret<uint8?> (pattern)
-        var tp = reinterpret<uint8?> (text)
+        var pp = reinterpret<uint8?>(pattern)
+        var tp = reinterpret<uint8?>(text)
         var star_pp : uint8?
         var star_tp : uint8?
         while (*tp != 0u8) {

@@ -13,11 +13,11 @@ def operator [] (tf : SafeOpFoo; cmp : string) : string {
 def operator ?[] (tf : SafeOpFoo; cmp : string) : string const?# {
     if (cmp == tf . . a) {
         unsafe {
-            return reinterpret<string const?#> (addr(tf . . a))
+            return reinterpret<string const?#>(addr(tf . . a))
         }
     } else {
         unsafe {
-            return reinterpret<string const?#> (null)
+            return reinterpret<string const?#>(null)
         }
     }
 }
@@ -29,11 +29,11 @@ def operator .(tf : SafeOpFoo; name : string) : SafeOpFoo {
 def operator ?.(tf : SafeOpFoo; name : string) : string const?# {
     if (name == "yes") {
         unsafe {
-            return reinterpret<string const?#> (addr(tf . . a))
+            return reinterpret<string const?#>(addr(tf . . a))
         }
     } else {
         unsafe {
-            return reinterpret<string const?#> (null)
+            return reinterpret<string const?#>(null)
         }
     }
 }

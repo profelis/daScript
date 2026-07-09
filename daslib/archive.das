@@ -275,7 +275,7 @@ def public serialize(var arch : Archive; var value : string&) {
                 tbuf |> resize_no_init(len + 1)                         // todo: implement preallocat string with raii
                 arch.stream->read(addr(tbuf[0]), len)
                 tbuf[len] = 0u8
-                value = clone_string(reinterpret<string#> (addr(tbuf[0])))
+                value = clone_string(reinterpret<string#>(addr(tbuf[0])))
                 delete tbuf
             } else {
                 value = ""
@@ -284,7 +284,7 @@ def public serialize(var arch : Archive; var value : string&) {
             var len = length(value)
             arch |> write_raw(len)
             if (len > 0) {
-                arch.stream->write(reinterpret<void?> (value), len)
+                arch.stream->write(reinterpret<void?>(value), len)
             }
         }
     }
