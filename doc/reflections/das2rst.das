@@ -767,7 +767,7 @@ def document_module_math_boost(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Angle conversions", mod, %regex~(degrees|radians)$%%),
         group_by_regex("Intersections", mod, %regex~(is_intersecting)$%%),
-        group_by_regex("Matrices", mod, %regex~(look_at_lh|look_at_rh|perspective_lh|perspective_rh|perspective_rh_opengl|ortho_rh|planar_shadow)$%%),
+        group_by_regex("Matrices", mod, %regex~(look_at_lh|look_at_rh|perspective_lh|perspective_rh|perspective_rh_opengl|perspective_rh_0_to_1|perspective_rh_minus1_to_1|ortho_rh|planar_shadow)$%%),
         group_by_regex("Plane", mod, %regex~(plane_dot|plane_normalize|plane_from_point_normal)$%%),
         group_by_regex("Color conversions", mod, %regex~(linear_to_SRGB)$%%),
         group_by_regex("Color packing and unpacking", mod, %regex~(RGBA_TO_UCOLOR|UCOLOR_TO_RGBA|UCOLOR_TO_RGB)$%%)
