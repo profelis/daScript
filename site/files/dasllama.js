@@ -55,10 +55,10 @@
         '</div>';
       }
       var pos = octPos(r);
-      var win = r >= 0.995;
+      var kind = r > 1.005 ? 'win' : (r < 0.995 ? 'loss' : 'tie');   // same thresholds as the caption
       var left = Math.min(50, pos), width = Math.abs(pos - 50);
       return '' +
-        '<div class="dl-bar ' + (win ? 'dl-bar--win' : 'dl-bar--loss') + '">' +
+        '<div class="dl-bar dl-bar--' + kind + '">' +
           '<div class="dl-bar__label">' + t.model + '</div>' +
           '<div class="dl-bar__track">' +
             '<div class="dl-bar__center"></div>' +
@@ -70,9 +70,9 @@
 
     // full table
     function rcell(r) {
-      return r === null
-        ? '<td class="dl-num dl-dim">-</td>'
-        : '<td class="dl-num ' + (r >= 0.995 ? 'dl-win' : 'dl-loss') + '">' + fmt(r, 2) + '×</td>';
+      if (r === null) return '<td class="dl-num dl-dim">-</td>';
+      var cls = r > 1.005 ? 'dl-win' : (r < 0.995 ? 'dl-loss' : '');   // tie: neutral, matching the caption's win/tie split
+      return '<td class="dl-num ' + cls + '">' + fmt(r, 2) + '×</td>';
     }
     var tableHTML = rows.map(function (t) {
       var pr = ratio(t.prefill.das_tok_s, t.prefill.llama_cpp_tok_s);
