@@ -707,6 +707,24 @@ def private parse_gltf_json(jsonText : string; var glbBin : array<uint8>; baseDi
     return <- scene
 }
 
+def load_gltf_from_memory(bytes : array<uint8>; baseDir : string = "") : GltfScene {
+    //! Load a glTF 2.0 document (.gltf JSON, .glb binary, or base64-embedded
+    //! .gltf) from an in-memory byte buffer. `baseDir` resolves external
+    //! buffer/image URIs (pass "" for a self-contained .glb). Returns an empty
+    //! scene on failure.
+    var scene : GltfScene
+    var jsonText : string
+    var glbBin : array<uint8>
+    if (length(bytes) >= 12 && gltf_rd_u32(bytes, 0l) == 0x46546C67u) {
+        parse_glb(bytes, jsonText, glbBin)
+    } else {
+        jsonText = string(bytes)
+    }
+    scene <- parse_gltf_json(jsonText, glbBin, baseDir)
+    delete glbBin
+    return <- scene
+}
+
 def load_gltf(path : string) : GltfScene {
     //! Load a glTF 2.0 file (.gltf, .glb, or base64-embedded .gltf) into a
     //! backend-agnostic `GltfScene`. Returns an empty scene on failure.
@@ -725,16 +743,7 @@ def load_gltf(path : string) : GltfScene {
         to_log(LOG_ERROR, "gltf: cannot open {path}\n")
         return <- scene
     }
-    let baseDir = dir_name(path)
-    var jsonText : string
-    var glbBin : array<uint8>
-    if (length(fileBytes) >= 12 && gltf_rd_u32(fileBytes, 0l) == 0x46546C67u) {
-        parse_glb(fileBytes, jsonText, glbBin)
-    } else {
-        jsonText = string(fileBytes)
-    }
-    scene <- parse_gltf_json(jsonText, glbBin, baseDir)
+    scene <- load_gltf_from_memory(fileBytes, dir_name(path))
     delete fileBytes
-    delete glbBin
     return <- scene
 }

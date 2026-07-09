@@ -35,6 +35,9 @@ require gltf/gltf_boost
 var scene <- load_gltf("model.glb")         // .glb / .gltf / base64 / external .bin
 update_world_transforms(scene)              // fill GltfNode.world from the hierarchy
 let (mn, mx) = gltf_scene_bounds(scene)     // world-space AABB (auto-framing)
+
+// already have the bytes? parse in-memory (baseDir resolves external .bin/images; "" for self-contained .glb)
+var scene2 <- load_gltf_from_memory(bytes, baseDir)
 ```
 
 `GltfScene` holds `meshes / materials / textures / images / samplers / nodes / roots / skins /
