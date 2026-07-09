@@ -1,0 +1,373 @@
+{
+  "platform": {
+    "cpu": "Apple M1 Max",
+    "os": "macOS 26.4.1",
+    "threads": 8,
+    "daslang": "0.6.3",
+    "llama_cpp": "",
+    "date": "2026-07-08",
+    "box_profile": "default",
+    "parsec_off": true
+  },
+  "tests": [
+    {
+      "model": "Parakeet-TDT v2",
+      "das_model": "ggml-parakeet-tdt-0.6b-v2-f32.bin",
+      "references": [
+        "parakeet-cli",
+        "onnx"
+      ],
+      "buckets": [
+        {
+          "wav": "jfk.wav",
+          "audio_s": 11,
+          "das_ms": 214.38,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 336.2800000000001
+            },
+            {
+              "tool": "onnx",
+              "ms": 483.105
+            }
+          ]
+        },
+        {
+          "wav": "jfk3.wav",
+          "audio_s": 33,
+          "das_ms": 699.289,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 749.16
+            },
+            {
+              "tool": "onnx",
+              "ms": 874.404
+            }
+          ]
+        },
+        {
+          "wav": "gb1.wav",
+          "audio_s": 198.734375,
+          "das_ms": 6110.614,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 6661.88
+            },
+            {
+              "tool": "onnx",
+              "ms": 7187.931
+            }
+          ]
+        },
+        {
+          "wav": "hp0.wav",
+          "audio_s": 273.28725,
+          "das_ms": 9125.525,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 10955.380000000001
+            },
+            {
+              "tool": "onnx",
+              "ms": 11551.981
+            }
+          ]
+        },
+        {
+          "wav": "hp0x2.wav",
+          "audio_s": 546.5745,
+          "das_ms": 28037.843,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 37609.77
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "model": "Parakeet-TDT v3",
+      "das_model": "ggml-parakeet-tdt-0.6b-v3-f32.bin",
+      "references": [
+        "parakeet-cli",
+        "onnx"
+      ],
+      "buckets": [
+        {
+          "wav": "jfk.wav",
+          "audio_s": 11,
+          "das_ms": 207.492,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 342.56999999999994
+            },
+            {
+              "tool": "onnx",
+              "ms": 472.174
+            }
+          ]
+        },
+        {
+          "wav": "jfk3.wav",
+          "audio_s": 33,
+          "das_ms": 646.532,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 769.6
+            },
+            {
+              "tool": "onnx",
+              "ms": 906.063
+            }
+          ]
+        },
+        {
+          "wav": "gb1.wav",
+          "audio_s": 198.734375,
+          "das_ms": 5767.696,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 6783.5
+            },
+            {
+              "tool": "onnx",
+              "ms": 7211.572
+            }
+          ]
+        },
+        {
+          "wav": "hp0.wav",
+          "audio_s": 273.28725,
+          "das_ms": 9266.237,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 11100.94
+            },
+            {
+              "tool": "onnx",
+              "ms": 11535.219
+            }
+          ]
+        },
+        {
+          "wav": "hp0x2.wav",
+          "audio_s": 546.5745,
+          "das_ms": 28221.799,
+          "refs": [
+            {
+              "tool": "parakeet-cli",
+              "ms": 38061.560000000005
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "model": "Whisper tiny",
+      "das_model": "ggml-tiny.bin",
+      "references": [
+        "whisper-cli",
+        "onnx"
+      ],
+      "buckets": [
+        {
+          "wav": "jfk.wav",
+          "audio_s": 11,
+          "das_ms": 110.421,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 123.82
+            },
+            {
+              "tool": "onnx",
+              "ms": 416.397
+            }
+          ]
+        },
+        {
+          "wav": "jfk3.wav",
+          "audio_s": 33,
+          "das_ms": 243.874,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 314.37
+            }
+          ]
+        },
+        {
+          "wav": "gb1.wav",
+          "audio_s": 198.734375,
+          "das_ms": 1169.18,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 1954.52
+            }
+          ]
+        },
+        {
+          "wav": "hp0.wav",
+          "audio_s": 273.28725,
+          "das_ms": 1493.017,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 2121.4500000000003
+            }
+          ]
+        },
+        {
+          "wav": "hp0x2.wav",
+          "audio_s": 546.5745,
+          "das_ms": 2987.692,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 4700.72
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "model": "Whisper large-v3-turbo",
+      "das_model": "ggml-large-v3-turbo.bin",
+      "references": [
+        "whisper-cli",
+        "onnx"
+      ],
+      "buckets": [
+        {
+          "wav": "jfk.wav",
+          "audio_s": 11,
+          "das_ms": 2594.186,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 2144.37
+            },
+            {
+              "tool": "onnx",
+              "ms": 2317.569
+            }
+          ]
+        },
+        {
+          "wav": "jfk3.wav",
+          "audio_s": 33,
+          "das_ms": 5290.437,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 4447.179999999999
+            }
+          ]
+        },
+        {
+          "wav": "gb1.wav",
+          "audio_s": 198.734375,
+          "das_ms": 21853.88,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 25355.19
+            }
+          ]
+        },
+        {
+          "wav": "hp0.wav",
+          "audio_s": 273.28725,
+          "das_ms": 32176.114,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 32876.15
+            }
+          ]
+        },
+        {
+          "wav": "hp0x2.wav",
+          "audio_s": 546.5745,
+          "das_ms": 61918.925,
+          "refs": [
+            {
+              "tool": "whisper-cli",
+              "ms": 64500.29
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "librispeech": {
+    "n_clips": 25,
+    "sides": [
+      {
+        "side": "das v2",
+        "mean_ms": 172.9484,
+        "p50_ms": 174.258,
+        "p95_ms": 305.193
+      },
+      {
+        "side": "parakeet-cli v2",
+        "mean_ms": 309.6272000000001,
+        "p50_ms": 306.1,
+        "p95_ms": 436.9699999999999
+      },
+      {
+        "side": "onnx v2",
+        "mean_ms": 381.4163199999999,
+        "p50_ms": 396.128,
+        "p95_ms": 542.396
+      },
+      {
+        "side": "das v3",
+        "mean_ms": 183.80019999999996,
+        "p50_ms": 184.931,
+        "p95_ms": 309.871
+      },
+      {
+        "side": "parakeet-cli v3",
+        "mean_ms": 316.4532000000001,
+        "p50_ms": 317.45000000000005,
+        "p95_ms": 456.44000000000005
+      },
+      {
+        "side": "onnx v3",
+        "mean_ms": 400.94003999999995,
+        "p50_ms": 383.087,
+        "p95_ms": 571.766
+      },
+      {
+        "side": "das tiny",
+        "mean_ms": 114.80496000000001,
+        "p50_ms": 115.092,
+        "p95_ms": 135.373
+      },
+      {
+        "side": "whisper-cli tiny",
+        "mean_ms": 126.61159999999997,
+        "p50_ms": 126.03999999999999,
+        "p95_ms": 162.97
+      },
+      {
+        "side": "onnx tiny",
+        "mean_ms": 421.80467999999996,
+        "p50_ms": 418.209,
+        "p95_ms": 510.16
+      }
+    ]
+  }
+}

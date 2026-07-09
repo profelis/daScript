@@ -279,6 +279,22 @@ def main() {
             }
         }
     }
-    write_asr_baselines(rows)
-    print("\nwrote {length(rows)} baseline row(s) -> {baseline_asr_path()}\n")
+    // merge into any existing baseline so partial per-model runs (-o Parakeet, then -o Whisper)
+    // accumulate; a fresh row for the same tool+model+kind+wav wins over the stored one.
+    var merged <- read_asr_baselines()
+    for (nr in rows) {
+        var found = false
+        for (m in merged) {
+            if (m.tool == nr.tool && m.model == nr.model && m.kind == nr.kind && m.wav == nr.wav) {
+                m = nr
+                found = true
+                break
+            }
+        }
+        if (!found) {
+            merged |> push(nr)
+        }
+    }
+    write_asr_baselines(merged)
+    print("\nwrote {length(rows)} new row(s); baseline now {length(merged)} row(s) -> {baseline_asr_path()}\n")
 }

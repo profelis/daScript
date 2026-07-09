@@ -141,6 +141,18 @@ def libri_clips() : array<string> {
     return <- out
 }
 
+// Replace-or-append a dictation side by its label, so a re-run (or a second model's --libri pass)
+// refreshes its rows instead of duplicating them.
+def upsert_side(var sides : array<LibriStat>; s : LibriStat) {
+    for (x in sides) {
+        if (x.side == s.side) {
+            x = s
+            return
+        }
+    }
+    sides |> push(s)
+}
+
 // Add the das + per-tool reference LibriSpeech dictation stats for one model into `sides`.
 def add_libri_sides(var sides : array<LibriStat>; var m : AsrModel; spec : AsrModelSpec;
                     baselines : array<AsrBaseRow>; reps : int) {
@@ -152,7 +164,7 @@ def add_libri_sides(var sides : array<LibriStat>; var m : AsrModel; spec : AsrMo
         das_ms |> push(measure_das(m, samples, reps))
     }
     let da = aggregate(das_ms)
-    sides |> push(LibriStat(side = "das {spec.libri_short}", mean_ms = da.mean, p50_ms = da.p50, p95_ms = da.p95))
+    upsert_side(sides, LibriStat(side = "das {spec.libri_short}", mean_ms = da.mean, p50_ms = da.p50, p95_ms = da.p95))
     // reference sides from the stored libri baseline rows (per tool, aggregated across clips)
     for (ref in spec.refs) {
         let rms <- [for (b in baselines);
@@ -160,7 +172,7 @@ def add_libri_sides(var sides : array<LibriStat>; var m : AsrModel; spec : AsrMo
             where b.model == spec.display && b.kind == "libri" && b.tool == ref.tool && b.ms > 0.0lf]
         if (!empty(rms)) {
             let ra = aggregate(rms)
-            sides |> push(LibriStat(side = "{ref.tool} {spec.libri_short}", mean_ms = ra.mean, p50_ms = ra.p50, p95_ms = ra.p95))
+            upsert_side(sides, LibriStat(side = "{ref.tool} {spec.libri_short}", mean_ms = ra.mean, p50_ms = ra.p50, p95_ms = ra.p95))
         }
     }
 }
@@ -225,8 +237,11 @@ def main() {
                     refs <- ref_times_for(baselines, spec.display, wav)))
                 print("  {wav}: das {das_ms} ms ({audio_s} s)\n")
             }
+            // NB: a comprehension used INLINE as a `<-` move-init inside a struct constructor
+            // silently yields an empty array — hoist it to a local first (verified gotcha).
+            var reftools <- [for (rf in spec.refs); rf.tool]
             var rec = AsrRec(model = spec.display, das_model = spec.das_model,
-                references <- [for (rf in spec.refs); rf.tool], buckets <- buckets)
+                references <- reftools, buckets <- buckets)
             upsert_asr(prof.tests, rec)
 
             if (cfg.libri && !empty(spec.libri_short)) {
