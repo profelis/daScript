@@ -541,7 +541,8 @@ namespace das {
         verifyType(expr->makeType);
         auto mkBaseT = expr->makeType;
         while (mkBaseT->baseType==Type::tFixedArray && mkBaseT->firstType) mkBaseT = mkBaseT->firstType;
-        if (mkBaseT->baseType != Type::tStructure && mkBaseT->baseType != Type::tHandle) {
+        if (mkBaseT->baseType != Type::tStructure && mkBaseT->baseType != Type::tHandle && !mkBaseT->isAlias()) {
+            // an unresolved alias is handled in visit() (it may promote foo(a=5) to a named call)
             if (expr->structs.size()) {
                 error("[[" + describeType(expr->makeType) + "]] with non-structure type", "", "",
                       expr->at, CompilationError::invalid_structure_type);
@@ -814,6 +815,31 @@ namespace das {
                 expr->makeType = aT;
                 reportAstChanged();
             } else {
+                // an unresolved alias that names a visible function/generic is promoted to a named
+                // call foo(a=5, ...); a real struct/handle resolves above, so struct construction wins.
+                // visibility mirrors findMatchingFunctions so a same-named non-visible function can't trip it.
+                if (expr->structs.size() == 1 && !expr->structs[0]->empty()) {
+                    string aMod, aFn;
+                    splitTypeName(expr->makeType->alias, aMod, aFn);
+                    auto hFn = hash64z(aFn.c_str());
+                    auto inWhichModule = getSearchModule(aMod);
+                    bool hasFn = false;
+                    program->library.foreach([&](Module *mod) -> bool {
+                        if ( !isVisibleFunc(inWhichModule, mod) ) return true;
+                        if ( mod->functionsByName.find(hFn) || mod->genericsByName.find(hFn) ) {
+                            hasFn = true;
+                            return false;
+                        }
+                        return true;
+                    }, aMod);
+                    if ( hasFn ) {
+                        auto nc = new ExprNamedCall(expr->at, expr->makeType->alias);
+                        nc->arguments = expr->structs[0];
+                        expr->structs.clear();
+                        reportAstChanged();
+                        return nc;
+                    }
+                }
                 error("undefined [[ ]] expression type " + describeType(expr->makeType),
                       reportInferAliasErrors(expr->makeType), "", expr->makeType->at, CompilationError::lookup_expression_type);
                 return Visitor::visit(expr);

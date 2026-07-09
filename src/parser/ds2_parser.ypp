@@ -1543,8 +1543,9 @@ expr_call_pipe_no_bracket
             pCall->pipedCallArgument = true;
             $$ = $call;
         } else if ( $call->rtti_isNamedCall() ) {
-            das2_yyerror(scanner,"piped block can't be combined with named arguments",tokAt(scanner,@block),
-                CompilationError::cant_pipe);
+            // piped block on a named call: the block becomes the trailing positional argument
+            auto nc = (ExprNamedCall *) $call;
+            nc->nonNamedArguments.push_back($block);
             $$ = $call;
         } else {
             das2_yyerror(scanner,"piped block requires a function call",tokAt(scanner,@block),
@@ -1559,8 +1560,9 @@ expr_call_pipe_no_bracket
             pCall->pipedCallArgument = true;
             $$ = $call;
         } else if ( $call->rtti_isNamedCall() ) {
-            das2_yyerror(scanner,"piped block can't be combined with named arguments",tokAt(scanner,@block),
-                CompilationError::cant_pipe);
+            // piped block on a named call: the block becomes the trailing positional argument
+            auto nc = (ExprNamedCall *) $call;
+            nc->nonNamedArguments.push_back($block);
             $$ = $call;
         } else {
             das2_yyerror(scanner,"piped block requires a function call",tokAt(scanner,@block),
@@ -1575,14 +1577,21 @@ expr_call_pipe_no_bracket
             pCall->pipedCallArgument = true;
             $$ = $call;
         } else if ( $call->rtti_isNamedCall() ) {
-            das2_yyerror(scanner,"piped block can't be combined with named arguments",tokAt(scanner,@block),
-                CompilationError::cant_pipe);
+            // piped block on a named call: the block becomes the trailing positional argument
+            auto nc = (ExprNamedCall *) $call;
+            nc->nonNamedArguments.push_back($block);
             $$ = $call;
         } else {
             das2_yyerror(scanner,"piped block requires a function call",tokAt(scanner,@block),
                 CompilationError::cant_pipe);
             $$ = $call;
         }
+    }
+    | expr_named_call[call] expr_full_block_assumed_piped[block] {
+        // free-function named call + piped block: the block becomes the trailing positional argument
+        auto nc = (ExprNamedCall *) $call;
+        nc->nonNamedArguments.push_back($block);
+        $$ = $call;
     }
     ;
 
@@ -2015,6 +2024,14 @@ expr_named_call
         delete $name;
         $$ = nc;
     }
+    |   name_in_namespace[name] '(' expr_list[arguments] ',' make_struct_fields[list] ')' {
+        // bracket-less mixed named call: foo(pos..., name = value) -- named args are a strict suffix
+        auto nc = new ExprNamedCall(tokAt(scanner,@name),*$name);
+        nc->nonNamedArguments = sequenceToList($arguments);
+        nc->arguments = $list;
+        delete $name;
+        $$ = nc;
+    }
     ;
 
 /* a->b(args) is short for invoke(a.b, a, args)  */
@@ -2095,6 +2112,17 @@ expr_field_no_bracket
         nc->methodCall = true;
         nc->arguments = $list;
         nc->nonNamedArguments.push_back($left);
+        delete $method_name;
+        $$ = nc;
+    }
+    |   expr_no_bracket[left] '.'[loc] NAME[method_name] '(' expr_list[arguments] ',' make_struct_fields[list] ')' {
+        // bracket-less mixed named method call: a.m(pos..., name = value)
+        auto nc = new ExprNamedCall(tokAt(scanner,@method_name),*$method_name);
+        nc->methodCall = true;
+        nc->arguments = $list;
+        nc->nonNamedArguments.push_back($left);
+        auto callArgs = sequenceToList($arguments);
+        nc->nonNamedArguments.insert ( nc->nonNamedArguments.end(), callArgs.begin(), callArgs.end() );
         delete $method_name;
         $$ = nc;
     }
