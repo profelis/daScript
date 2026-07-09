@@ -205,6 +205,13 @@ def gltf_gl_load_hdr_env(path : string) : tuple<uint; float> {
         to_log(LOG_ERROR, "gltf: HDR environment load failed: {path}\n")
         return (0u, 0.0)
     }
+    if (x <= 0 || y <= 0) {
+        // fail closed on a decodable-but-degenerate image: glTexImage2D and log2 below
+        // both assume positive dimensions
+        stbi_image_free(unsafe(reinterpret<void?>(data)))
+        to_log(LOG_ERROR, "gltf: HDR environment has invalid dimensions {x}x{y}: {path}\n")
+        return (0u, 0.0)
+    }
     var tex : uint
     glGenTextures(1, safe_addr(tex))
     glBindTexture(GL_TEXTURE_2D, tex)

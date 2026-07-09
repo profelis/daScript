@@ -136,8 +136,9 @@ def gltf_pbr_fs {
     var ambient = gltf_pbr_ambient(albedo, u_ambient, occ, u_occlusion_strength)
     if (u_env_amount > 0.0) {
         // image-based ambient: irradiance from a deep mip along n, reflection from a
-        // roughness-scaled mip along the mirror direction (mips as prefiltered environment)
-        let irr = textureLod(u_env_tex, gltf_equirect_uv(n), u_env_max_lod - 2.0).xyz
+        // roughness-scaled mip along the mirror direction (mips as prefiltered environment);
+        // clamp so a tiny environment (max lod < 2) can't produce a negative LOD
+        let irr = textureLod(u_env_tex, gltf_equirect_uv(n), max(u_env_max_lod - 2.0, 0.0)).xyz
         let refl = textureLod(u_env_tex, gltf_equirect_uv(gltf_reflect_dir(n, v)), roughness * u_env_max_lod).xyz
         ambient = gltf_env_ambient(albedo, metallic, roughness, n, v, irr, refl,
             gltf_occlusion_factor(occ, u_occlusion_strength)) * u_env_amount

@@ -32,7 +32,6 @@ require daslib/apply_in_context
 require daslib/jobque_boost
 require daslib/strings_boost
 require daslib/dap
-require daslib/algorithm
 require daslib/debug_eval
 
 
@@ -2286,10 +2285,10 @@ class private EvalWalker : DapiStackWalker {
         //! Writes a function argument as a let-binding for runtime expression evaluation.
         if (vinfo.flags.refType) {
             let parg = unsafe(reinterpret<void?>(arg))
-            *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} & = * reinterpret<{describe(type_info(vinfo))}?> {parg}ul // ref argument\n")
+            *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} & = * reinterpret<{describe(type_info(vinfo))}?>({parg}ul) // ref argument\n")
         } elif (vinfo.dimSize > 0u) {
             let parg = unsafe(reinterpret<void?>(arg))
-            *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} = * reinterpret<{describe(type_info(vinfo))}?> {parg}ul // ref argument\n")
+            *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} = * reinterpret<{describe(type_info(vinfo))}?>({parg}ul) // ref argument\n")
         } else {
             *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} = ")
             if (vinfo.basicType == Type.tString) {
@@ -2312,12 +2311,12 @@ class private EvalWalker : DapiStackWalker {
                         let pref = unsafe(reinterpret<void ??>(arg))
                         var cvinfo = vinfo
                         cvinfo.flags.ref = false
-                        *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} = * reinterpret<{describe(type_info(cvinfo))}?> {*pref}ul // already ref\n")
+                        *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} = * reinterpret<{describe(type_info(cvinfo))}?>({*pref}ul) // already ref\n")
                     }
                 } elif (vinfo.dimSize > 0u) {
-                    *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} = * reinterpret<{describe(type_info(vinfo))}?> {arg}ul\n")
+                    *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} = * reinterpret<{describe(type_info(vinfo))}?>({arg}ul)\n")
                 } else {
-                    *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} & = * reinterpret<{describe(type_info(vinfo))}?> {arg}ul\n")
+                    *W |> write("\t\tlet {vinfo.name} : {describe(type_info(vinfo))} & = * reinterpret<{describe(type_info(vinfo))}?>({arg}ul)\n")
                 }
             }
         }
