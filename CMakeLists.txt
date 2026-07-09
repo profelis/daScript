@@ -2069,6 +2069,14 @@ install(FILES
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/opengl/media
 )
 
+# dasGLTF sample assets (Khronos glTF-Sample-Assets; BoomBox is CC0). Loaded by
+# examples/opengl/10_hello_gltf.das via get_das_root()/examples/gltf/media. M4 adds the
+# GLTF_SAMPLE_ASSETS.LICENSE + PROVENANCE + the ImGui viewer tree here.
+install(FILES
+    ${PROJECT_SOURCE_DIR}/examples/gltf/media/BoomBox.glb
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/media
+)
+
 add_subdirectory(tutorials)
 
 # Test-runner targets (run_tests_interpreter / _jit / _aot).

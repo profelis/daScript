@@ -136,6 +136,7 @@ def look_at_rh(Eye, At, Up : float3) {
     return tm
 }
 
+[deprecated(message="w-row bug (m[3][3] left at 1 -> clip.w = -z+1); mirror perspective_rh_0_to_1 for a corrected left-handed variant")]
 def perspective_lh(fovy, aspect, zn, zf : float) {
     //! left-handed (z forward) perspective matrix
     let yScale = 1. / tan(fovy / 2.)
@@ -150,6 +151,7 @@ def perspective_lh(fovy, aspect, zn, zf : float) {
     return Result
 }
 
+[deprecated(message="w-row bug (m[3][3] left at 1 -> clip.w = -z+1); use perspective_rh_0_to_1 (corrected, z in [0..1])")]
 def perspective_rh(fovy, aspect, zn, zf : float) {
     //! right-handed (z toward viewer) perspective matrix
     let yScale = 1. / tan(fovy / 2.)
@@ -164,6 +166,7 @@ def perspective_rh(fovy, aspect, zn, zf : float) {
     return Result
 }
 
+[deprecated(message="w-row bug (m[3][3] left at 1 -> clip.w = -z+1); use perspective_rh_minus1_to_1 (corrected, z in [-1..1])")]
 def perspective_rh_opengl(fovy, aspect, zn, zf : float) {
     //! right-handed (z toward viewer) opengl (z in [-1..1]) perspective matrix
     let yScale = 1. / tan(fovy / 2.)
@@ -175,6 +178,41 @@ def perspective_rh_opengl(fovy, aspect, zn, zf : float) {
     Result[2][2] = (zf + zn) / (zn - zf)
     Result[2][3] = -1.0
     Result[3][2] = 2. * zn * zf / (zn - zf)
+    return Result
+}
+
+// perspective_rh_0_to_1 / perspective_rh_minus1_to_1 are the corrected, depth-range-explicit builders.
+// The legacy perspective_rh / _lh / _rh_opengl above leave m[3][3]=1 (identity residue), so their w-row
+// is (0,0,-1,1) not (0,0,-1,0) -> clip.w = -z_view + 1. That mild bias is invisible at camera distance
+// ~O(1..10) but shrinks a sub-metre model dramatically; those legacy fns stay as-is so the demos tuned
+// to them are unchanged. New code should use these two (correct w-row) and pick by clip-space z range.
+def perspective_rh_0_to_1(fovy, aspect, zn, zf : float) {
+    //! right-handed (z toward viewer) perspective matrix, clip-space z in [0..1] (Vulkan / D3D).
+    let yScale = 1. / tan(fovy / 2.)
+    let xScale = yScale / aspect
+    var Result : float4x4
+    identity(Result)
+    Result[0][0] = xScale
+    Result[1][1] = yScale
+    Result[2][2] = zf / (zn - zf)
+    Result[2][3] = -1.0
+    Result[3][2] = zn * zf / (zn - zf)
+    Result[3][3] = 0.
+    return Result
+}
+
+def perspective_rh_minus1_to_1(fovy, aspect, zn, zf : float) {
+    //! right-handed (z toward viewer) perspective matrix, clip-space z in [-1..1] (OpenGL).
+    let yScale = 1. / tan(fovy / 2.)
+    let xScale = yScale / aspect
+    var Result : float4x4
+    identity(Result)
+    Result[0][0] = xScale
+    Result[1][1] = yScale
+    Result[2][2] = (zf + zn) / (zn - zf)
+    Result[2][3] = -1.0
+    Result[3][2] = 2. * zn * zf / (zn - zf)
+    Result[3][3] = 0.
     return Result
 }
 
