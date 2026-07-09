@@ -343,6 +343,7 @@ jobs:
         cp site/downloads.html _site/
         cp site/daspkg.html _site/
         cp site/examples.html _site/
+        cp site/dasllama.html _site/
         cp site/robots.txt _site/
         cp -r site/files _site/files
 
