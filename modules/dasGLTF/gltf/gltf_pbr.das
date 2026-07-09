@@ -36,6 +36,7 @@ var @uniform u_model    : float4x4
 var @uniform u_viewProj : float4x4
 var @uniform u_skinned  : float                    // 1 = blend the joint palette, 0 = rigid (use u_model)
 var @uniform u_joints   : float4x4[GLTF_MAX_JOINTS] // world-space skinning palette (joint.world * inverseBind)
+var @uniform u_normal_matrix : float3x3            // inverse-transpose of u_model's 3x3 (rigid-path normals)
 
 var @inout v_world_pos     : float3
 var @inout v_world_normal  : float3
@@ -73,9 +74,10 @@ def gltf_pbr_vs {
                   + (u_joints[jw] * tg).xyz * a_weights0.w)
     } else {
         world = u_model * float4(a_position, 1.0)
-        let nm = float3x3(u_model)
-        wnormal = nm * a_normal
-        wtangent = nm * a_tangent.xyz
+        // u_normal_matrix is inverse-transpose(u_model 3x3), so normals stay correct under
+        // non-uniform scale / shear (float3x3(u_model) would skew them).
+        wnormal = u_normal_matrix * a_normal
+        wtangent = u_normal_matrix * a_tangent.xyz
     }
     v_world_pos = world.xyz
     v_world_normal = normalize(wnormal)
@@ -292,9 +294,11 @@ def gltf_pbr_render(r : GltfPbrRenderer; model : GltfGlModel; scene : GltfScene;
             bind_skin_palette(scene, node.skin, root)
             u_skinned = 1.0
             u_model = identity4x4()   // skinned path blends the (root-baked) palette; u_model is unused
+            u_normal_matrix = identity3x3()   // unused in the skinned branch
         } else {
             u_skinned = 0.0
             u_model = root * node.world
+            u_normal_matrix = float3x3(transpose(inverse(u_model)))
         }
         for (glp in model.meshes[node.mesh].primitives) {
             if (glp.material >= 0 && glp.material < length(scene.materials)) {

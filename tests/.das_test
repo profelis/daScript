@@ -27,7 +27,9 @@ def can_visit_folder(folder_name : string; var result : bool?) {
         return
     }
     if (folder_name == "dasGLTF") {
-        *result = has_module("gltf")
+        // gltf_parse requires stbimage (image decode), so these tests only build where
+        // stbimage is present — same gate as the stbimage folder itself.
+        *result = has_module("gltf") && has_module("stbimage")
         return
     }
     if (folder_name == "minfft") {

@@ -209,6 +209,14 @@ def private attr(prim : JPrimitive; key : string) : int {
 // One float4 per element (missing lanes zero); handles interleaved byteStride,
 // integer-lane / normalized componentTypes, and sparse overrides.
 
+// Validate that the byte span [base, base+span) fits inside buffers[bufIdx]. A malformed/hostile
+// glTF can name an out-of-range buffer or a span past the buffer end; failing this leaves the decode
+// zero-filled (or skips the sparse/image patch) rather than panicking, keeping load_gltf's documented
+// fail-closed contract (return an empty scene on bad input).
+def private buffer_range_ok(buffers : array<array<uint8>>; bufIdx : int; base, span : int64) : bool {
+    return bufIdx >= 0 && bufIdx < length(buffers) && base >= 0l && base + span <= int64(length(buffers[bufIdx]))
+}
+
 def private decode_floats(gltf : JGltf; buffers : array<array<uint8>>; ai : int) : array<float4> {
     var result : array<float4>
     if (ai < 0 || ai >= length(gltf.accessors)) return <- result
@@ -221,14 +229,17 @@ def private decode_floats(gltf : JGltf; buffers : array<array<uint8>>; ai : int)
         let elemSize = compSize * int64(ncomp)
         let stride = bv.byteStride != 0 ? int64(bv.byteStride) : elemSize
         let base = int64(bv.byteOffset) + int64(acc.byteOffset)
-        for (i in range(acc.count)) {
-            let eoff = base + int64(i) * stride
-            var f0 = 0.; var f1 = 0.; var f2 = 0.; var f3 = 0.
-            f0 = gltf_read_comp_float(buffers[bv.buffer], eoff, acc.componentType, acc.normalized)
-            if (ncomp > 1) { f1 = gltf_read_comp_float(buffers[bv.buffer], eoff + compSize, acc.componentType, acc.normalized) }
-            if (ncomp > 2) { f2 = gltf_read_comp_float(buffers[bv.buffer], eoff + compSize * 2l, acc.componentType, acc.normalized) }
-            if (ncomp > 3) { f3 = gltf_read_comp_float(buffers[bv.buffer], eoff + compSize * 3l, acc.componentType, acc.normalized) }
-            result[i] = float4(f0, f1, f2, f3)
+        let span = acc.count > 0 ? int64(acc.count - 1) * stride + elemSize : 0l
+        if (buffer_range_ok(buffers, bv.buffer, base, span)) {
+            for (i in range(acc.count)) {
+                let eoff = base + int64(i) * stride
+                var f0 = 0.; var f1 = 0.; var f2 = 0.; var f3 = 0.
+                f0 = gltf_read_comp_float(buffers[bv.buffer], eoff, acc.componentType, acc.normalized)
+                if (ncomp > 1) { f1 = gltf_read_comp_float(buffers[bv.buffer], eoff + compSize, acc.componentType, acc.normalized) }
+                if (ncomp > 2) { f2 = gltf_read_comp_float(buffers[bv.buffer], eoff + compSize * 2l, acc.componentType, acc.normalized) }
+                if (ncomp > 3) { f3 = gltf_read_comp_float(buffers[bv.buffer], eoff + compSize * 3l, acc.componentType, acc.normalized) }
+                result[i] = float4(f0, f1, f2, f3)
+            }
         }
     }
     apply_sparse_floats(gltf, buffers, acc, result)
@@ -239,6 +250,9 @@ def private apply_sparse_floats(gltf : JGltf; buffers : array<array<uint8>>; acc
     if (acc.sparse.count <= 0) return
     let sp = acc.sparse
     let ncomp = gltf_type_ncomp(acc._type)
+    // fail-closed: a malformed sparse accessor can name out-of-range bufferViews/buffers
+    if (sp.indices.bufferView < 0 || sp.indices.bufferView >= length(gltf.bufferViews)
+            || sp.values.bufferView < 0 || sp.values.bufferView >= length(gltf.bufferViews)) return
     let ibv = gltf.bufferViews[sp.indices.bufferView]
     let iCompSize = gltf_comp_size(sp.indices.componentType)
     let iStride = ibv.byteStride != 0 ? int64(ibv.byteStride) : iCompSize
@@ -248,6 +262,9 @@ def private apply_sparse_floats(gltf : JGltf; buffers : array<array<uint8>>; acc
     let vElem = vCompSize * int64(ncomp)
     let vStride = vbv.byteStride != 0 ? int64(vbv.byteStride) : vElem
     let vBase = int64(vbv.byteOffset) + int64(sp.values.byteOffset)
+    let iSpan = sp.count > 0 ? int64(sp.count - 1) * iStride + iCompSize : 0l
+    let vSpan = sp.count > 0 ? int64(sp.count - 1) * vStride + vElem : 0l
+    if (!buffer_range_ok(buffers, ibv.buffer, iBase, iSpan) || !buffer_range_ok(buffers, vbv.buffer, vBase, vSpan)) return
     for (k in range(sp.count)) {
         let target = int(gltf_read_comp_uint(buffers[ibv.buffer], iBase + int64(k) * iStride, sp.indices.componentType))
         let voff = vBase + int64(k) * vStride
@@ -270,8 +287,11 @@ def private decode_uints(gltf : JGltf; buffers : array<array<uint8>>; ai : int) 
         let compSize = gltf_comp_size(acc.componentType)
         let stride = bv.byteStride != 0 ? int64(bv.byteStride) : compSize
         let base = int64(bv.byteOffset) + int64(acc.byteOffset)
-        for (i in range(acc.count)) {
-            result[i] = gltf_read_comp_uint(buffers[bv.buffer], base + int64(i) * stride, acc.componentType)
+        let span = acc.count > 0 ? int64(acc.count - 1) * stride + compSize : 0l
+        if (buffer_range_ok(buffers, bv.buffer, base, span)) {
+            for (i in range(acc.count)) {
+                result[i] = gltf_read_comp_uint(buffers[bv.buffer], base + int64(i) * stride, acc.componentType)
+            }
         }
     }
     return <- result
@@ -288,17 +308,20 @@ def private decode_mat4(gltf : JGltf; buffers : array<array<uint8>>; ai : int) :
         let elemSize = compSize * 16l
         let stride = bv.byteStride != 0 ? int64(bv.byteStride) : elemSize
         let base = int64(bv.byteOffset) + int64(acc.byteOffset)
-        for (i in range(acc.count)) {
-            let eoff = base + int64(i) * stride
-            var m : float4x4
-            for (col in range(4)) {
-                m[col] = float4(
-                    gltf_rd_f32(buffers[bv.buffer], eoff + int64(col * 4 + 0) * compSize),
-                    gltf_rd_f32(buffers[bv.buffer], eoff + int64(col * 4 + 1) * compSize),
-                    gltf_rd_f32(buffers[bv.buffer], eoff + int64(col * 4 + 2) * compSize),
-                    gltf_rd_f32(buffers[bv.buffer], eoff + int64(col * 4 + 3) * compSize))
+        let span = acc.count > 0 ? int64(acc.count - 1) * stride + elemSize : 0l
+        if (buffer_range_ok(buffers, bv.buffer, base, span)) {
+            for (i in range(acc.count)) {
+                let eoff = base + int64(i) * stride
+                var m : float4x4
+                for (col in range(4)) {
+                    m[col] = float4(
+                        gltf_rd_f32(buffers[bv.buffer], eoff + int64(col * 4 + 0) * compSize),
+                        gltf_rd_f32(buffers[bv.buffer], eoff + int64(col * 4 + 1) * compSize),
+                        gltf_rd_f32(buffers[bv.buffer], eoff + int64(col * 4 + 2) * compSize),
+                        gltf_rd_f32(buffers[bv.buffer], eoff + int64(col * 4 + 3) * compSize))
+                }
+                result[i] = m
             }
-            result[i] = m
         }
     }
     return <- result
@@ -364,9 +387,11 @@ def private decode_image(gltf : JGltf; buffers : array<array<uint8>>; ji : JImag
         }
     } elif (ji.bufferView >= 0 && ji.bufferView < length(gltf.bufferViews)) {
         let bv = gltf.bufferViews[ji.bufferView]
-        encoded |> resize(bv.byteLength)
-        for (k in range(bv.byteLength)) {
-            encoded[k] = buffers[bv.buffer][int64(bv.byteOffset) + int64(k)]
+        if (buffer_range_ok(buffers, bv.buffer, int64(bv.byteOffset), int64(bv.byteLength))) {
+            encoded |> resize(bv.byteLength)
+            for (k in range(bv.byteLength)) {
+                encoded[k] = buffers[bv.buffer][int64(bv.byteOffset) + int64(k)]
+            }
         }
     }
     if (!empty(encoded)) {
