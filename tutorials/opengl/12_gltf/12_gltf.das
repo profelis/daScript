@@ -35,7 +35,8 @@ require daslib/safe_addr
 //   1. SHADOW    -> depth-only from the sun's POV (tutorial 08 pattern).
 //   2. GEOMETRY  -> the 4-attachment G-buffer: albedo+occlusion, world-normal+roughness,
 //                   world-pos+metallic, emissive. The glTF model + a procedural floor.
-//   3. SSAO      -> hemisphere-kernel occlusion from the G-buffer normal + position.
+//   3. SSAO      -> hemisphere-kernel occlusion from the G-buffer normal + position, then a
+//                   depth-aware (bilateral) separable Gaussian blur to denoise it edge-safely.
 //   4. LIGHTING  -> a fullscreen deferred pass: Cook-Torrance GGX per surface, one shadowed
 //                   sun + three orbiting point lights + hemisphere/IBL ambient, plus the
 //                   boosted emissive, written LINEAR into the RGBA16F HDR target.
@@ -240,6 +241,38 @@ def ssao_fs {
         ao = clamp(1.0 - SSAO_STRENGTH * occ / float(SSAO_K), 0.0, 1.0)
     }
     post_color = float4(ao, ao, ao, 1.0)
+}
+
+// ----- SSAO blur: depth-aware (bilateral) separable Gaussian to denoise -----
+// The 16-sample kernel is rotated per pixel (hash21), trading banding for high-frequency noise;
+// a 9-tap Gaussian run horizontally then vertically smooths it. Each tap is weighted by view-space
+// depth similarity (bilateral), so the blur smooths within a surface but never bleeds occlusion
+// across a silhouette edge into the background. u_blur_dir picks the axis + step width per pass.
+var @uniform @stage = 0 blur_src : sampler2D
+var @uniform @stage = 1 blur_pos : sampler2D   // G-buffer world position (for the depth weight)
+var @uniform u_blur_dir : float2
+
+let BLUR_DEPTH_SHARP = 8.0   // larger = the depth weight falls off faster across an edge
+
+// One bilateral tap: returns (weight, weight * ao) so the caller normalizes by total weight.
+def bilateral_tap(uv : float2; spatial, center_z : float) : float2 {
+    let z = (u_view * float4(texture(blur_pos, uv).xyz, 1.0)).z
+    let dz = z - center_z
+    let w = spatial * exp(-dz * dz * BLUR_DEPTH_SHARP)
+    return float2(w, w * texture(blur_src, uv).x)
+}
+
+[fragment_program]
+def ssao_blur_fs {
+    let o = u_blur_dir
+    let center_z = (u_view * float4(texture(blur_pos, v_uv).xyz, 1.0)).z
+    var acc = bilateral_tap(v_uv, 0.227027, center_z)
+    acc = acc + bilateral_tap(v_uv + o, 0.1945946, center_z) + bilateral_tap(v_uv - o, 0.1945946, center_z)
+    acc = acc + bilateral_tap(v_uv + o * 2.0, 0.1216216, center_z) + bilateral_tap(v_uv - o * 2.0, 0.1216216, center_z)
+    acc = acc + bilateral_tap(v_uv + o * 3.0, 0.054054, center_z) + bilateral_tap(v_uv - o * 3.0, 0.054054, center_z)
+    acc = acc + bilateral_tap(v_uv + o * 4.0, 0.016216, center_z) + bilateral_tap(v_uv - o * 4.0, 0.016216, center_z)
+    let result = acc.y / max(acc.x, 0.0001)
+    post_color = float4(result, result, result, 1.0)
 }
 
 // ----- deferred lighting pass -----
@@ -484,7 +517,7 @@ let RENDER_H = 720
 let SHADOW_DIM = 1024
 let BLOOM_MIPS = 5
 
-var prog_shadow, prog_gbuffer, prog_ssao, prog_light : uint
+var prog_shadow, prog_gbuffer, prog_ssao, prog_ssao_blur, prog_light : uint
 var prog_bright, prog_down, prog_up, prog_composite : uint
 
 var g_scene : GltfScene
@@ -496,6 +529,7 @@ var quad_vao, quad_vbo : uint
 
 var g_fbo, g_albedo, g_normal, g_worldpos, g_emissive_tex, g_depth : uint
 var ssao_fbo, ssao_tex : uint
+var ssao_blur_fbo, ssao_blur_tex : uint
 var shadow_fbo, shadow_tex : uint
 var hdr_fbo, hdr_color : uint
 var tex_env : uint
@@ -626,6 +660,12 @@ def create_gbuffer {
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         panic("SSAO framebuffer incomplete")
     }
+    glGenFramebuffers(1, safe_addr(ssao_blur_fbo))
+    glBindFramebuffer(GL_FRAMEBUFFER, ssao_blur_fbo)
+    ssao_blur_tex = make_color_attachment(RENDER_W, RENDER_H, int(GL_RGBA8), GL_RGBA, GL_UNSIGNED_BYTE, GL_COLOR_ATTACHMENT0, GL_LINEAR)
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        panic("SSAO blur framebuffer incomplete")
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0u)
 }
 
@@ -676,6 +716,7 @@ def init {
     prog_shadow = create_shader_program(@@shadow_vs, @@shadow_fs)
     prog_gbuffer = create_shader_program(@@gbuffer_vs, @@gbuffer_fs)
     prog_ssao = create_shader_program(@@post_vs, @@ssao_fs)
+    prog_ssao_blur = create_shader_program(@@post_vs, @@ssao_blur_fs)
     prog_light = create_shader_program(@@post_vs, @@lighting_fs)
     prog_bright = create_shader_program(@@post_vs, @@bright_fs)
     prog_down = create_shader_program(@@post_vs, @@down_fs)
@@ -851,6 +892,27 @@ def update : bool {
     ssao_g_worldpos := g_worldpos
     post_vs_bind_uniform(prog_ssao)
     ssao_fs_bind_uniform(prog_ssao)
+    draw_fullscreen()
+
+    // ===== Pass 3b: separable Gaussian blur of the SSAO (denoise) =====
+    glUseProgram(prog_ssao_blur)
+    // horizontal: ssao_tex -> ssao_blur_tex (2-texel step widens the Gaussian)
+    glBindFramebuffer(GL_FRAMEBUFFER, ssao_blur_fbo)
+    glViewport(0, 0, RENDER_W, RENDER_H)
+    blur_src := ssao_tex
+    blur_pos := g_worldpos
+    u_blur_dir = float2(2.0 / float(RENDER_W), 0.0)
+    post_vs_bind_uniform(prog_ssao_blur)
+    ssao_blur_fs_bind_uniform(prog_ssao_blur)
+    draw_fullscreen()
+    // vertical: ssao_blur_tex -> ssao_tex (so the lighting pass reads the blurred result)
+    glBindFramebuffer(GL_FRAMEBUFFER, ssao_fbo)
+    glViewport(0, 0, RENDER_W, RENDER_H)
+    blur_src := ssao_blur_tex
+    blur_pos := g_worldpos
+    u_blur_dir = float2(0.0, 2.0 / float(RENDER_H))
+    post_vs_bind_uniform(prog_ssao_blur)
+    ssao_blur_fs_bind_uniform(prog_ssao_blur)
     draw_fullscreen()
 
     // ===== Pass 4: deferred lighting -> HDR float target (linear) =====

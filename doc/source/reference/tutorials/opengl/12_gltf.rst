@@ -108,7 +108,10 @@ The six passes
 
 1. **Shadow** -- depth-only from the sun's point of view (the tutorial-08 pattern).
 2. **Geometry** -- the glTF model + floor into the four-attachment G-buffer.
-3. **SSAO** -- a hemisphere-kernel occlusion factor from the G-buffer normal + position.
+3. **SSAO** -- a hemisphere-kernel occlusion factor from the G-buffer normal + position,
+   then a depth-aware (bilateral) separable Gaussian blur. The kernel is rotated per pixel,
+   so the raw factor is noisy; the blur smooths it while the view-space depth weight stops the
+   occlusion bleeding across a silhouette edge into the background.
 4. **Lighting** -- deferred Cook-Torrance PBR + shadow + SSAO + IBL + emissive, into the HDR target.
 5. **Bloom** -- bright / downsample x4 / upsample x4 over the HDR target.
 6. **Composite** -- add bloom, ACES-tonemap, gamma-encode, to the screen.
