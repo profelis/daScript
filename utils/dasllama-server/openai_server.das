@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // the forward/prefill chain + generated kernels need more than the 16K default on arm64
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact); inference tool, not the test suite
 
 module openai_server

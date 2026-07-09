@@ -7,9 +7,11 @@ options gen2
 //! Gemma-2/3/4, Qwen-MoE, gpt-oss) — ``load_model`` dispatches on GGUF metadata, so the same
 //! program runs any of them.
 //!
-//! Run model programs with ``-jit`` (interpreted inference is far too slow), and wrap the
-//! generation in ``with_job_que()`` from ``daslib/jobque_boost`` so the kernels can thread —
-//! see ``examples/dasLLAMA/run.das`` and ``chat.das`` for the canonical shape.
+//! Run model programs with ``-jit`` (interpreted inference is far too slow), wrap the
+//! generation in ``with_job_que()`` from ``daslib/jobque_boost`` so the kernels can thread, and
+//! declare ``options stack = 65536`` — the forward chain outgrows the 16K default on arm64, and
+//! a required module cannot raise the program's stack for you. See ``examples/dasLLAMA/run.das``
+//! and ``chat.das`` for the canonical shape.
 
 module dasllama shared public
 

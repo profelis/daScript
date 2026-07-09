@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // the forward/prefill chain + generated kernels need more than the 16K default on arm64
 options persistent_heap        // models are loaded and freed per section (tutorial 04)
 options _jit_fast_math = true  // relaxed FP for the JIT'd kernels (non-bit-exact, ~+10%) — the parity tests stay bit-exact
 
