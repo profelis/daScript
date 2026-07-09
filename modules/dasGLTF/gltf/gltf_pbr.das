@@ -100,6 +100,10 @@ var @uniform @stage = 1 u_metal_rough_tex : sampler2D
 var @uniform @stage = 2 u_normal_tex      : sampler2D
 var @uniform @stage = 3 u_occlusion_tex   : sampler2D
 var @uniform @stage = 4 u_emissive_tex    : sampler2D
+// equirect HDR environment (linear radiance, mipmapped); u_env_amount = 0 -> flat ambient
+var @uniform @stage = 5 u_env_tex         : sampler2D
+var @uniform u_env_amount  : float
+var @uniform u_env_max_lod : float
 
 var @out o_color : float4
 
@@ -129,7 +133,15 @@ def gltf_pbr_fs {
     let v = normalize(u_cam_pos - v_world_pos)
     let l = normalize(u_light_dir)
     let direct = gltf_pbr_direct(albedo, metallic, roughness, n, v, l, u_light_color)
-    let ambient = gltf_pbr_ambient(albedo, u_ambient, occ, u_occlusion_strength)
+    var ambient = gltf_pbr_ambient(albedo, u_ambient, occ, u_occlusion_strength)
+    if (u_env_amount > 0.0) {
+        // image-based ambient: irradiance from a deep mip along n, reflection from a
+        // roughness-scaled mip along the mirror direction (mips as prefiltered environment)
+        let irr = textureLod(u_env_tex, gltf_equirect_uv(n), u_env_max_lod - 2.0).xyz
+        let refl = textureLod(u_env_tex, gltf_equirect_uv(gltf_reflect_dir(n, v)), roughness * u_env_max_lod).xyz
+        ambient = gltf_env_ambient(albedo, metallic, roughness, n, v, irr, refl,
+            gltf_occlusion_factor(occ, u_occlusion_strength)) * u_env_amount
+    }
 
     let linear = ambient + direct + emissive
     // no sRGB default framebuffer -> encode linear -> sRGB (approximate 2.2 gamma)
@@ -141,7 +153,17 @@ def gltf_pbr_fs {
 // ===== host renderer =====
 
 struct GltfPbrRenderer {
-    program : uint
+    program   : uint
+    envTex    : uint     // mipmapped equirect HDR environment, 0 = none (flat ambient)
+    envMaxLod : float
+}
+
+//! Attach a mipmapped equirect HDR environment (see gltf_gl_load_hdr_env); pass 0 to remove it.
+//! The renderer does not take ownership of the texture. `GltfPbrLight.environment` scales its
+//! contribution per frame.
+def gltf_pbr_set_environment(var r : GltfPbrRenderer; tex : uint; max_lod : float) {
+    r.envTex = tex
+    r.envMaxLod = max_lod
 }
 
 //! Compile + link the PBR program. Call with a current GL context; `delete` the renderer to release it.
@@ -222,6 +244,9 @@ def gltf_pbr_render(r : GltfPbrRenderer; model : GltfGlModel; scene : GltfScene;
     u_light_dir = normalize(light.direction)
     u_light_color = light.color * light.intensity
     u_ambient = light.ambient
+    u_env_tex := (r.envTex != 0u ? r.envTex : model.whiteTex)
+    u_env_amount = r.envTex != 0u ? light.environment : 0.0
+    u_env_max_lod = r.envMaxLod
     for (node in scene.nodes) {
         if (node.mesh < 0 || node.mesh >= length(model.meshes)) {
             continue

@@ -22,10 +22,12 @@ Neutral core — `require gltf/gltf_boost` (never pulls in OpenGL):
 OpenGL adapter — `require gltf/gltf_gl` + `gltf/gltf_pbr` (require `dasOpenGL` / `dasGlsl`):
 
 - `gltf/gltf_gl.das` — `GltfScene` → per-primitive VAO/VBO/EBO + textures (`GltfGlModel`); sRGB/linear
-  texture pipeline, mipmaps, sampler wrap/filter, white + flat-normal defaults
+  texture pipeline, mipmaps, sampler wrap/filter, white + flat-normal defaults, equirect HDR
+  environment loader (`gltf_gl_load_hdr_env`)
 - `gltf/gltf_pbr.das` — portable Cook-Torrance GGX metal-rough shader (native DSL, `[vertex_program]`/
-  `[fragment_program]`): tangent-space normals, occlusion, emissive, directional light + ambient, sRGB
-  output, alpha OPAQUE/MASK/BLEND, doubleSided cull, GPU skinning (64-joint palette)
+  `[fragment_program]`): tangent-space normals, occlusion, emissive, directional light + ambient or
+  image-based ambient from an equirect HDR environment (`gltf_pbr_set_environment`, roughness-mip
+  reflections), sRGB output, alpha OPAQUE/MASK/BLEND, doubleSided cull, GPU skinning (64-joint palette)
 - `gltf/gltf_pbr_common.das` — backend-neutral PBR shader math (GGX BRDF, normal perturbation, vector-space
   skin blend, sRGB encode): pure scalar/vector/matrix functions both shader emitters lower as user
   functions, shared with the dasVulkan renderer

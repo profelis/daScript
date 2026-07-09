@@ -30,4 +30,7 @@ daslang -project_root examples/gltf/mesh_viewer_opengl \
 
 - **Drag** — orbit the camera. **Scroll** — zoom.
 - **Model** window — animation clip + play/scrub, model rotation / scale, auto-rotate.
-- **Lighting** window — directional light direction / intensity / color, and ambient.
+- **Lighting** window — directional light direction / intensity / color, ambient, and environment amount.
+
+Metals reflect an equirect HDR environment (`tutorials/_assets/hdri/cannon_2k.hdr`, CC0 — the same
+map tutorial 12 uses); the **Environment** slider scales it, 0 falls back to flat ambient.

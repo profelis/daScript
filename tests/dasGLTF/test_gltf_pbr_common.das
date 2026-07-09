@@ -86,3 +86,30 @@ def test_shading_helpers(t : T?) {
         near3(t, gltf_srgb_encode(float3(1., 1., 1.)), float3(1., 1., 1.), 1e-6)
     }
 }
+
+[test]
+def test_environment_helpers(t : T?) {
+    t |> run("equirect uv poles and seam") @(t : T?) {
+        near(t, gltf_equirect_uv(float3(0., 1., 0.)).y, 0.0, 1e-5)     // straight up -> top row
+        near(t, gltf_equirect_uv(float3(0., -1., 0.)).y, 1.0, 1e-5)    // straight down -> bottom row
+        near(t, gltf_equirect_uv(float3(1., 0., 0.)).x, 0.5, 1e-5)     // +x -> mid-longitude
+        near(t, gltf_equirect_uv(float3(0., 0., 1.)).x, 0.75, 1e-5)    // +z -> quarter turn
+    }
+    t |> run("reflect_dir mirrors the view about the normal") @(t : T?) {
+        let n = float3(0., 0., 1.)
+        near3(t, gltf_reflect_dir(n, n), n, 1e-6)                              // head-on stays put
+        let v = normalize(float3(1., 0., 1.))
+        near3(t, gltf_reflect_dir(n, v), normalize(float3(-1., 0., 1.)), 1e-5) // 45 degrees flips x
+    }
+    t |> run("fresnel_roughness bounds") @(t : T?) {
+        let f0 = float3(0.04, 0.04, 0.04)
+        near3(t, gltf_fresnel_roughness(1.0, f0, 0.0), f0, 1e-6)                       // head-on -> f0
+        near3(t, gltf_fresnel_roughness(0.0, f0, 0.0), float3(1., 1., 1.), 1e-6)       // smooth grazing -> 1
+        near3(t, gltf_fresnel_roughness(0.0, f0, 1.0), f0, 1e-6)                       // fully rough can't exceed f0
+    }
+    t |> run("occlusion factor strength blend") @(t : T?) {
+        near(t, gltf_occlusion_factor(1.0, 1.0), 1.0, 1e-6)
+        near(t, gltf_occlusion_factor(0.0, 1.0), 0.0, 1e-6)
+        near(t, gltf_occlusion_factor(0.0, 0.0), 1.0, 1e-6)
+    }
+}

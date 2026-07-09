@@ -8,6 +8,8 @@ module gltf_gl shared
 require gltf/gltf_types
 require opengl/opengl_boost public
 require daslib/safe_addr
+require stbimage
+require math
 
 // OPT-IN OpenGL adapter: uploads a backend-agnostic GltfScene to GL buffers + textures.
 // The neutral core (gltf_types/gltf_accessor/gltf_parse/gltf_scene) never requires opengl;
@@ -191,6 +193,29 @@ def upload_gltf(scene : GltfScene) : GltfGlModel {
     model.whiteTex = create_solid_texture(255u, 255u, 255u, 255u)
     model.flatNormalTex = create_solid_texture(128u, 128u, 255u, 255u)
     return <- model
+}
+
+def gltf_gl_load_hdr_env(path : string) : tuple<uint; float> {
+    //! Load an equirectangular (2:1 lat-long) HDR image as a mipmapped RGB16F texture for
+    //! gltf_pbr_set_environment. Returns (texture, max mip lod); (0, 0) if it fails to load.
+    //! The caller owns the texture (glDeleteTextures when done).
+    var x, y, comp : int
+    let data = stbi_loadf(path, safe_addr(x), safe_addr(y), safe_addr(comp), 3)
+    if (data == null) {
+        to_log(LOG_ERROR, "gltf: HDR environment load failed: {path}\n")
+        return (0u, 0.0)
+    }
+    var tex : uint
+    glGenTextures(1, safe_addr(tex))
+    glBindTexture(GL_TEXTURE_2D, tex)
+    glTexImage2D(GL_TEXTURE_2D, 0, int(GL_RGB16F), x, y, 0, GL_RGB, GL_FLOAT, unsafe(reinterpret<void?>(data)))
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)             // longitude wraps
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)      // latitude clamps at the poles
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glGenerateMipmap(GL_TEXTURE_2D)                                          // mips = prefiltered roughness levels
+    stbi_image_free(unsafe(reinterpret<void?>(data)))
+    return (tex, floor(log2(float(max(x, y)))))
 }
 
 //! GL texture handle for a GltfScene.textures index, or `fallback` when the index is out of range
