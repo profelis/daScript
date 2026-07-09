@@ -241,7 +241,7 @@ namespace das {
     bool builtin_chdir ( const char * ) GENERATE_IO_STUB_RET
     bool builtin_mkdir ( const char * ) GENERATE_IO_STUB_RET
     void builtin_exit ( int32_t ) GENERATE_IO_STUB
-    char * builtin_resolve_this_module_dir ( const char *, Context * ) GENERATE_IO_STUB_RET
+    char * builtin_resolve_this_module_dir ( const char *, bool, Context * ) GENERATE_IO_STUB_RET
     bool builtin_remove_file ( const char * ) GENERATE_IO_STUB_RET
     bool builtin_rename_file ( const char *, const char * ) GENERATE_IO_STUB_RET
     bool builtin_rmdir ( const char * ) GENERATE_IO_STUB_RET
@@ -1757,10 +1757,17 @@ namespace das {
     //   3. dir_name(baked_path)       — dev (interpreted from source tree)
     // <rel> is the substring of dir_name(baked) starting at the last
     // "/modules/" segment.  Tiers 1+2 are skipped when baked has no /modules/
-    // segment (e.g. project-local code outside the package layout); when the
-    // baked dir has also gone missing on the target machine (relocated bundle),
-    // tier 3's fallback is <exe_dir> rather than the dead dev path.
-    char * builtin_resolve_this_module_dir ( const char * baked_path, Context * context ) {
+    // segment (e.g. project-local code outside the package layout).
+    //
+    // `standalone` is is_standalone_exe() folded at the call site (true only in
+    // a daspkg-release -exe). A standalone exe must NEVER resolve to the baked
+    // dev source tree: the compile-machine path is meaningless on a target box,
+    // and on the AUTHOR's own machine it still exists — so tier 3 would wrongly
+    // prefer it over the assets shipped next to the exe (the dictation-bot
+    // release-config bug). When standalone, the tier-3 fallback is <exe_dir>.
+    // For project-local code that fallback also fires when the baked dir has
+    // gone missing on the target machine (relocated bundle), even interpreted.
+    char * builtin_resolve_this_module_dir ( const char * baked_path, bool standalone, Context * context ) {
         namespace fs = std::filesystem;
         if ( !baked_path || !*baked_path ) return context->allocateString("", nullptr);
         // generic_string() (here and at every other path-to-string conversion
@@ -1785,38 +1792,40 @@ namespace das {
         if ( pos != std::string::npos ) {
             rel = canon.substr(pos + 1);  // drop leading '/' to keep it relative
         }
-        // Tier 1 — exe_dir
-        if ( !rel.empty() ) {
+        // <exe_dir> — computed once, reused by the tier-1 probe and the fallback.
+        fs::path exeDir;
+        {
             das::string exeFile = das::getExecutableFileName();
             if ( !exeFile.empty() ) {
-                fs::path exeDir = fs::path(exeFile.c_str()).parent_path();
+                exeDir = fs::path(exeFile.c_str()).parent_path();
                 if ( exeDir.empty() ) exeDir = ".";
+            }
+        }
+        if ( !rel.empty() ) {
+            // Tier 1 — <exe_dir>/<rel>
+            if ( !exeDir.empty() ) {
                 fs::path candidate = exeDir / rel;
                 std::error_code ec;
                 if ( fs::is_directory(candidate, ec) ) {
                     return context->allocateString(candidate.generic_string().c_str(), nullptr);
                 }
             }
-            // Tier 2 — das_root
+            // Tier 2 — <das_root>/<rel>
             fs::path candidate = fs::path(das::getDasRoot().c_str()) / rel;
             std::error_code ec;
             if ( fs::is_directory(candidate, ec) ) {
                 return context->allocateString(candidate.generic_string().c_str(), nullptr);
             }
         }
-        // Tier 3 — baked dir as fallback. Special case: project-local code
-        // (rel empty so tiers 1+2 were skipped) running from a relocated
-        // bundle where the dev-time baked dir no longer exists — fall back
-        // to <exe_dir> so assets shipped next to the exe are findable.
-        if ( rel.empty() ) {
+        // Tier 3 — fallback. Prefer <exe_dir> over the baked dev dir when this
+        // is a standalone exe (never trust the compile-machine source path), or
+        // when project-local code's baked dir has gone missing (relocated
+        // bundle). Otherwise (dev, running from source) the baked dir is right.
+        if ( !exeDir.empty() ) {
             std::error_code ec;
-            if ( !fs::is_directory(baked_dir, ec) ) {
-                das::string exeFile = das::getExecutableFileName();
-                if ( !exeFile.empty() ) {
-                    fs::path exeDir = fs::path(exeFile.c_str()).parent_path();
-                    if ( exeDir.empty() ) exeDir = ".";
-                    return context->allocateString(exeDir.generic_string().c_str(), nullptr);
-                }
+            bool baked_dir_exists = fs::is_directory(baked_dir, ec);
+            if ( standalone || ( rel.empty() && !baked_dir_exists ) ) {
+                return context->allocateString(exeDir.generic_string().c_str(), nullptr);
             }
         }
         return context->allocateString(baked_dir_str.c_str(), nullptr);
@@ -2011,7 +2020,7 @@ namespace das {
                     ->args({"path","context","at"});
             addExtern<DAS_BIND_FUN(builtin_resolve_this_module_dir)>(*this, lib, "__builtin_resolve_this_module_dir",
                 SideEffects::accessExternal, "builtin_resolve_this_module_dir")
-                    ->args({"baked_path","context"});
+                    ->args({"baked_path","standalone","context"});
             addExtern<DAS_BIND_FUN(get_env_variable)>(*this, lib, "get_env_variable",
                 SideEffects::accessExternal, "get_env_variable")
                     ->args({"var","context","at"});
