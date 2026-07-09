@@ -94,3 +94,12 @@ def gltf_srgb_encode(linear_rgb : float3) : float3 {
     let g22 = 1.0 / 2.2
     return pow(linear_rgb, float3(g22, g22, g22))
 }
+
+//! A single directional light plus a flat ambient term. `direction` points TOWARD the light.
+//! Shared host-side light description for the GL and Vulkan renderers.
+struct GltfPbrLight {
+    direction : float3 = float3(0.3, 0.7, 0.5)
+    color     : float3 = float3(1.0, 1.0, 1.0)
+    intensity : float  = 3.0
+    ambient   : float3 = float3(0.15, 0.15, 0.18)
+}

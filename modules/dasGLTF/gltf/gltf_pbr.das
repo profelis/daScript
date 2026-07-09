@@ -7,7 +7,7 @@ module gltf_pbr shared
 
 require gltf/gltf_types
 require gltf/gltf_scene
-require gltf/gltf_pbr_common
+require gltf/gltf_pbr_common public
 require gltf/gltf_gl public
 require opengl/opengl_boost public
 require glsl/glsl_opengl public
@@ -142,14 +142,6 @@ def gltf_pbr_fs {
 
 struct GltfPbrRenderer {
     program : uint
-}
-
-//! A single directional light plus a flat ambient term. `direction` points TOWARD the light.
-struct GltfPbrLight {
-    direction : float3 = float3(0.3, 0.7, 0.5)
-    color     : float3 = float3(1.0, 1.0, 1.0)
-    intensity : float  = 3.0
-    ambient   : float3 = float3(0.15, 0.15, 0.18)
 }
 
 //! Compile + link the PBR program. Call with a current GL context; `delete` the renderer to release it.
