@@ -358,6 +358,7 @@ struct AsrModelSpec {
     refs : array<AsrRef>
     buckets : array<string>
     libri_short : string
+    lang : string          // create_session language: "en" for the pure-ASR models, "auto" for audio-chat
 }
 
 // The audio models the suite profiles. Absent files are skipped at run time. The das side is uniform
@@ -369,31 +370,31 @@ def asr_catalog() : array<AsrModelSpec> {
         AsrModelSpec(display = "Parakeet-TDT v2", das_model = "ggml-parakeet-tdt-0.6b-v2-f32.bin",
             das_mmproj = "", root = wroot,
             refs <- [AsrRef(tool = "parakeet-cli", handle = ""), AsrRef(tool = "onnx", handle = "v2-int8")],
-            buckets <- corpus_buckets(), libri_short = "v2"),
+            buckets <- corpus_buckets(), libri_short = "v2", lang = "en"),
         AsrModelSpec(display = "Parakeet-TDT v3", das_model = "ggml-parakeet-tdt-0.6b-v3-f32.bin",
             das_mmproj = "", root = wroot,
             refs <- [AsrRef(tool = "parakeet-cli", handle = ""), AsrRef(tool = "onnx", handle = "int8")],
-            buckets <- corpus_buckets(), libri_short = "v3"),
+            buckets <- corpus_buckets(), libri_short = "v3", lang = "en"),
         AsrModelSpec(display = "Whisper tiny", das_model = "ggml-tiny.bin",
             das_mmproj = "", root = wroot,
             refs <- [AsrRef(tool = "whisper-cli", handle = ""), AsrRef(tool = "onnx", handle = "whisper-tiny-int8")],
-            buckets <- corpus_buckets(), libri_short = "tiny"),
+            buckets <- corpus_buckets(), libri_short = "tiny", lang = "en"),
         AsrModelSpec(display = "Whisper large-v3-turbo", das_model = "ggml-large-v3-turbo.bin",
             das_mmproj = "", root = wroot,
             refs <- [AsrRef(tool = "whisper-cli", handle = ""), AsrRef(tool = "onnx", handle = "whisper-turbo-int8")],
-            buckets <- corpus_buckets(), libri_short = ""),
+            buckets <- corpus_buckets(), libri_short = "", lang = "en"),
         AsrModelSpec(display = "Canary-Qwen 2.5B", das_model = "canary-qwen-2.5b-decoder-f16.gguf",
-            das_mmproj = "", root = lroot,
+            das_mmproj = "canary-qwen-2.5b-encoder-f32.bin", root = lroot,
             refs <- [AsrRef(tool = "nemo", handle = "nvidia/canary-qwen-2.5b")],
-            buckets <- ["jfk.wav", "jfk3.wav", "gb1.wav"], libri_short = ""),
+            buckets <- ["jfk.wav", "jfk3.wav", "gb1.wav"], libri_short = "", lang = "auto"),
         AsrModelSpec(display = "Gemma-4 E2B audio", das_model = "gemma-4-E2B-it-Q8_0.gguf",
             das_mmproj = "mmproj-gemma-4-E2B-it-bf16.gguf", root = lroot,
             refs <- [AsrRef(tool = "mtmd", handle = "mmproj-gemma-4-E2B-it-bf16.gguf")],
-            buckets <- ["gemma4a_test2.wav"], libri_short = ""),
+            buckets <- ["gemma4a_test2.wav"], libri_short = "", lang = "auto"),
         AsrModelSpec(display = "Qwen3-Omni-30B audio", das_model = "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf",
             das_mmproj = "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf", root = lroot,
             refs <- [AsrRef(tool = "mtmd", handle = "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf")],
-            buckets <- ["jfk.wav", "jfk3.wav"], libri_short = "")
+            buckets <- ["jfk.wav", "jfk3.wav"], libri_short = "", lang = "auto")
     ]
 }
 

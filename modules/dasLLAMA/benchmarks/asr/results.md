@@ -194,54 +194,50 @@ halve), where NeMo's batched-BLAS decode scales better. das xRT holds ~1.5–2.0
 
 TSVs: das `results_cq_m1_t8.tsv`, nemo `results_cq_m1_nemo.tsv`.
 
-## Gemma-4 E2B audio — das vs llama-mtmd-cli
+## Gemma-4 E2B audio — das vs llama-mtmd-cli (CPU-only)
 
-The gemma4a Conformer audio path benched vs the CLI oracle `llama-mtmd-cli` (`--temp 0 --jinja`,
-no-think turn — a bare user turn; the reasoning channel is near-tie-brittle, disabled both sides).
-das runs the encoder **fp32** (correctness-first; the mmproj is bf16 and the Conformer is a scalar
-fp32 forward — encode runs once per clip and is explicitly not the perf gate), the Gemma-4 decoder
-q8 (matching mtmd). Transcribe time excludes model load; both sides greedy, one 17.4 s clip.
+das = gemma4a Conformer encoder **fp32** (correctness-first — encode is not the perf gate) + Gemma-4
+decoder q8 (matching mtmd). Reference = `llama-mtmd-cli --temp 0 --jinja --reasoning off` (no-think),
+**CPU-only** (Accelerate/AMX, Metal off). Transcribe excludes model load; both greedy, one 17.4 s clip.
 
-### Apple M1 Max, 8 threads — das 2026-07-08 (Parsec off); mtmd-cli same box/build
+### Apple M1 Max, 8 threads
 
-| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT | das encode ms | cli encode ms |
-|---|---|---|---|---|---|---|---|---|
-| gemma4a_test2.wav | 17.4 | 6028 | 1547 | 3.90x | 2.89 | 11.3 | 1888 | 117 |
+<!-- GEN:asr Gemma-4 E2B audio m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-08 (Parsec off)._
 
-das **trails 3.9x** — the gap is the fp32 **scalar** Conformer encoder (1888 ms vs mtmd's 117 ms
-= 16x; ggml runs the audio tower as bf16-weight SIMD GEMMs, das as a plain fp32 forward) plus a
-long-context decode gap (~495 audio+prompt positions: das 21.7 tok/s vs cli 78). Both are the
-obvious perf follow-ups (a gemm-gen tuned Q8 audio-tower kernel + the long-context decode path);
-neither is chased — the A2 gate is fp32 encoder correctness. Ledger note in `model_expansion_plan.md`.
+| file              | audio s | das ms | mtmd ms |  das/mtmd | das xRT |
+| :---------------- | ------: | -----: | ------: | --------: | ------: |
+| gemma4a_test2.wav |      17 |   6069 |   18687 | **0.32x** |     2.9 |
+<!-- /GEN:asr Gemma-4 E2B audio m1 -->
 
-TSVs: das `results_g4a_m1_t8.tsv`, cli `results_g4a_m1_mtmd.tsv`.
+Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
+**das leads ~3x.** On a genuine CPU-only basis, ggml's Conformer audio ops don't route through
+BLAS/AMX, so mtmd's encode is ~16 s (≈99% of its total) — das's optimized fp32 scalar Conformer
+(~1.9 s) beats it ~9x on encode. The prior "das trails 3.9x" compared das-CPU against an mtmd whose
+audio encode was silently **Metal/GPU**-offloaded (mislabeled CPU-only) — a CPU-vs-GPU mismatch.
 
-## Qwen3-Omni-30B audio — das vs llama-mtmd-cli
+## Qwen3-Omni-30B audio — das vs llama-mtmd-cli (CPU-only)
 
-Qwen3-Omni-30B-A3B (audio-in/text-out; Talker out of scope) transcription benched vs the CLI oracle
-`llama-mtmd-cli` (`--temp 0 --jinja`, a bare user turn on the non-thinking Instruct thinker:
-"Transcribe the audio."). das runs the SHARED qwen3a AuT tower **fp32** (correctness-first; the
-mmproj is bf16, the tower a scalar fp32 forward — not the perf gate) + the qwen3vlmoe (30B-A3B)
-thinker q8 (matching mtmd). Transcribe time excludes model load; both sides greedy, transcribe-only
-timers (mtmd measured with an in-`main` `std::chrono` wrap of encode+prefill+generate).
+Audio-in/text-out (Talker out of scope). das = SHARED qwen3a AuT tower **fp32** (d_model 1280 × ff
+5120, 32 blocks — correctness-first, not the perf gate) + qwen3vlmoe (30B-A3B) thinker q8 (matching
+mtmd). Reference = `llama-mtmd-cli --temp 0 --jinja --reasoning off` (no-think), **CPU-only** (Metal
+off). Transcribe excludes model load; both greedy.
 
-### Apple M1 Max, 8 threads — das 2026-07-08 (Parsec host daemon idle, no active session); mtmd-cli same box/build
+### Apple M1 Max, 8 threads
 
-| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT | das encode ms | cli encode ms |
-|---|---|---|---|---|---|---|---|---|
-| jfk.wav | 11 | 3625 | 1173 | 3.09x | 3.03 | 9.4 | 1665 | 349 |
-| jfk3.wav | 33 | 8263 | 2079 | 3.97x | 3.99 | 15.9 | 4760 | 1191 |
+<!-- GEN:asr Qwen3-Omni-30B audio m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-08 (Parsec off)._
 
-das **trails 3.1x (jfk) → 4.0x (jfk3)** — the gap is the fp32 **scalar** qwen3a AuT tower (d_model
-1280 × ff 5120, 32 blocks: 1665/4760 ms vs mtmd's bf16-SIMD 349/1191 ms = ~4.8x/4.0x). The output is
-a fixed ~27-token transcription both clips, so the gap widens with clip length as the linear-in-audio
-encode dominates. The thinker side is das's grouped q8 MoE prefill (~207 tok/s — the Wave-Q path,
-engaged for the audio-embd prefill) + q8 decode, and it too trails ggml here. Both are perf-ledger
-items (a gemm-gen tuned Q8 audio-tower kernel for the 1280/5120 dims + the MoE prefill/decode path);
-neither chased — the A3 gate is fp32 encoder correctness + token-for-token parity. Ledger note in
-`model_expansion_plan.md`.
+| file     | audio s | das ms | mtmd ms |  das/mtmd | das xRT |
+| :------- | ------: | -----: | ------: | --------: | ------: |
+| jfk.wav  |      11 |   3683 |   21791 | **0.17x** |     3.0 |
+| jfk3.wav |      33 |   8533 |   45163 | **0.19x** |     3.9 |
+<!-- /GEN:asr Qwen3-Omni-30B audio m1 -->
 
-TSVs: das `results_q3o_m1_t8.tsv`, cli `results_q3o_m1_mtmd.tsv`.
+Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
+**das leads ~5x.** CPU-only, the AuT tower is entirely encode-bound in ggml (~21 s jfk / ~45 s jfk3,
+≈99% of mtmd's total); das's tower does it in ~1.7 / 4.8 s. Same CPU-vs-GPU correction as gemma4a —
+the prior "das trails 3-4x" measured mtmd's Metal-offloaded encode, mislabeled CPU-only.
 
 ## Correctness
 

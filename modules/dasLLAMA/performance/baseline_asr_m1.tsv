@@ -189,3 +189,6 @@ onnx	Whisper large-v3-turbo	corpus	jfk3.wav	-1	-1	-1
 onnx	Whisper large-v3-turbo	corpus	gb1.wav	-1	-1	-1
 onnx	Whisper large-v3-turbo	corpus	hp0.wav	-1	-1	-1
 onnx	Whisper large-v3-turbo	corpus	hp0x2.wav	-1	-1	-1
+mtmd	Gemma-4 E2B audio	corpus	gemma4a_test2.wav	-1	18686.9	16177.7
+mtmd	Qwen3-Omni-30B audio	corpus	jfk.wav	-1	21791.2	21533.7
+mtmd	Qwen3-Omni-30B audio	corpus	jfk3.wav	-1	45163	45109.3

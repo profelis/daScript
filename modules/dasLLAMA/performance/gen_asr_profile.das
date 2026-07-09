@@ -77,10 +77,10 @@ def load_audio_16k_mono(path : string) : array<float> {
 }
 
 // Best-of-`reps` transcribe ms for one loaded model over `samples`, from a warmed JIT + live jobque.
-def measure_das(var m : AsrModel; samples : array<float>; reps : int) : double {
+def measure_das(var m : AsrModel; samples : array<float>; reps : int; lang : string) : double {
     var best = 1.0e30lf
     for (_rep in range(reps)) {
-        var s <- create_session(m, "en")
+        var s <- create_session(m, lang)
         let t0 = ref_time_ticks()
         var ntok = 0
         transcribe(m, s, samples) $(seg) {
@@ -161,7 +161,7 @@ def add_libri_sides(var sides : array<LibriStat>; var m : AsrModel; spec : AsrMo
     das_ms |> reserve(length(clips))
     for (path in clips) {
         let samples <- load_audio_16k_mono(path)
-        das_ms |> push(measure_das(m, samples, reps))
+        das_ms |> push(measure_das(m, samples, reps, spec.lang))
     }
     let da = aggregate(das_ms)
     upsert_side(sides, LibriStat(side = "das {spec.libri_short}", mean_ms = da.mean, p50_ms = da.p50, p95_ms = da.p95))
@@ -225,14 +225,14 @@ def main() {
                 : load_asr_model(model_path, "{spec.root}{spec.das_mmproj}"))
             // warmup (JIT compile + first-touch) on the shortest bucket
             let warm <- load_audio_16k_mono("{asr_corpus_dir()}{spec.buckets[0]}")
-            measure_das(m, warm, 1)
+            measure_das(m, warm, 1, spec.lang)
 
             var buckets : array<AsrBucket>
             buckets |> reserve(length(spec.buckets))
             for (wav in spec.buckets) {
                 let samples <- load_audio_16k_mono("{asr_corpus_dir()}{wav}")
                 let audio_s = double(length(samples)) / double(AUDIO_SAMPLE_RATE)
-                let das_ms = measure_das(m, samples, cfg.reps)
+                let das_ms = measure_das(m, samples, cfg.reps, spec.lang)
                 buckets |> emplace(AsrBucket(wav = wav, audio_s = audio_s, das_ms = das_ms,
                     refs <- ref_times_for(baselines, spec.display, wav)))
                 print("  {wav}: das {das_ms} ms ({audio_s} s)\n")

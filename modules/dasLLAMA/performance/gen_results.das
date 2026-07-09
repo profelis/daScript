@@ -188,16 +188,13 @@ def bucket_ref_enc(b : AsrBucket; tool : string) : double {
     return -1.0lf
 }
 
-// Any bucket carrying an encode+prefill split (the mtmd-parity audio-chat models).
+// Whether to render the encode-split columns. Gated on the DAS split being present: the JSON retains
+// the mtmd reference encode_ms regardless, but until the das-side encode is wired (asr_prof, a TODO)
+// a lone "ref enc / das -" column pair reads as incomplete — so the encode story stays in prose.
 def has_encode(m : AsrRec) : bool {
     for (b in m.buckets) {
         if (b.das_encode_ms > 0.0lf) {
             return true
-        }
-        for (r in b.refs) {
-            if (r.encode_ms > 0.0lf) {
-                return true
-            }
         }
     }
     return false

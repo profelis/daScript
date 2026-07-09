@@ -62,8 +62,12 @@ def nemo_py() : string {
     return env_or("NEMO_PY", "/Users/borisbatkin/Work/canary-nemo-oracle/.venv/bin/python")
 }
 
+// The clean CPU-only build (llama.cpp-clean, ebd048f, Accelerate ON, Metal OFF, no dasprof) patched
+// with MTMD_TIMING + no-think (--reasoning off). CPU-only is deliberate: the fast historical mtmd
+// numbers rode Metal (GPU) despite the "CPU-only" label — ggml's Conformer audio ops don't route
+// through BLAS/AMX, so a genuine CPU encode is ~16 s (and das's optimized scalar Conformer beats it).
 def mtmd_bin() : string {
-    return env_or("MTMD_BIN", "/Users/borisbatkin/Work/llama.cpp/build/bin/llama-mtmd-cli")
+    return env_or("MTMD_BIN", "/Users/borisbatkin/Work/llama.cpp-clean/build-amx/bin/llama-mtmd-cli")
 }
 
 // The python bench scripts live beside the corpus (asr/); this tool runs from the repo-root cwd.
@@ -168,7 +172,7 @@ def run_mtmd(model_path, mmproj_path, wav_path : string; threads, reps : int; va
     var best = -1.0lf
     for (_rep in range(reps)) {
         let cmd = ("{mtmd_bin()} -m {model_path} --mmproj {mmproj_path} --audio {wav_path} " +
-            "-p \"Transcribe the audio.\" --temp 0 --jinja -ngl 0 -t {threads} 2>&1")
+            "-p \"Transcribe the audio.\" --temp 0 --jinja --reasoning off -ngl 0 -t {threads} 2>&1")
         let r = parse_mtmd_ms(run_capture(cmd, false))
         if (r.total > 0.0lf && (best < 0.0lf || r.total < best)) {
             best = r.total

@@ -309,6 +309,60 @@
           ]
         }
       ]
+    },
+    {
+      "model": "Gemma-4 E2B audio",
+      "das_model": "gemma-4-E2B-it-Q8_0.gguf",
+      "references": [
+        "mtmd"
+      ],
+      "buckets": [
+        {
+          "wav": "gemma4a_test2.wav",
+          "audio_s": 17.4396875,
+          "das_ms": 6069.164,
+          "refs": [
+            {
+              "tool": "mtmd",
+              "ms": 18686.9,
+              "encode_ms": 16177.7
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "model": "Qwen3-Omni-30B audio",
+      "das_model": "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf",
+      "references": [
+        "mtmd"
+      ],
+      "buckets": [
+        {
+          "wav": "jfk.wav",
+          "audio_s": 11,
+          "das_ms": 3683.024,
+          "refs": [
+            {
+              "tool": "mtmd",
+              "ms": 21791.2,
+              "encode_ms": 21533.7
+            }
+          ]
+        },
+        {
+          "wav": "jfk3.wav",
+          "audio_s": 33,
+          "das_ms": 8532.803,
+          "refs": [
+            {
+              "tool": "mtmd",
+              "ms": 45163.0,
+              "encode_ms": 45109.3
+            }
+          ]
+        }
+      ]
     }
   ],
   "librispeech": {
