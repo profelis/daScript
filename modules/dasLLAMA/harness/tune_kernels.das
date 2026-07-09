@@ -20,6 +20,7 @@ require dasllama/dasllama_quant  // quantize templates + the Q4/Q8 reference qua
 require dasllama/dasllama_common // the runtime-knob getters (the profile's "runtime" section snapshots them)
 require dasllama/dasllama_tune   // [dasllama_grid] emitter
 require llvm/daslib/aarch64_neon // nolint:STYLE030 — sdot4_laneq (referenced by the cloned laneq template bodies)
+require llvm/daslib/f16_cvt      // f16 references + the cloned f16-kernel template bodies
 require math                     // mad (referenced by the cloned template bodies)
 require daslib/json
 require daslib/json_boost
@@ -56,6 +57,14 @@ struct GridRopeTab {}
 struct GridGemm {}
 [dasllama_grid(src = "dot_q8q8_laneq4x4_template")]
 struct GridLaneq {}
+[dasllama_grid(src = "dot_f16_template")]
+struct GridDotF16 {}
+[dasllama_grid(src = "axpy_f16_template")]
+struct GridAxpyF16 {}
+[dasllama_grid(src = "cvt_f32_to_f16_template")]
+struct GridCvtToF16 {}
+[dasllama_grid(src = "cvt_f16_to_f32_template")]
+struct GridCvtToF32 {}
 
 // Registry fn-ptr signatures (== function_to_type of each template).
 typedef DotFn = function<(a : float const?; b : float const?; n : int64) : float>
@@ -308,6 +317,230 @@ def bench_axpy() : string {
     }
     print("  checksum {sink}\n")
     return report("axpy", names, best, ok)
+}
+
+// ===== f16 codec kernels: dot_f16 / axpy_f16 / cvt_f32_to_f16 / cvt_f16_to_f32 =====
+// The cache side is binary16-in-uint16; references convert via the exact f16_to_f32 bit-twiddle,
+// so the dots gate f64-relative and the converts gate EXACT (bit-equality per element).
+
+def bench_dot_f16() : string {
+    var a : array<float>
+    var b : array<uint16>
+    a |> resize(int(N))
+    b |> resize(int(N))
+    for (i in range(int(N))) {
+        a[i] = sin(float(i) * 0.1f)
+        b[i] = uint16(f32_to_f16(cos(float(i) * 0.07f)))
+    }
+    let pa = unsafe(addr(a[0]))
+    let pb = unsafe(addr(b[0]))
+    var want = 0.0lf
+    for (j in range(int(N))) {
+        want += double(a[j]) * double(f16_to_f32(uint(b[j])))
+    }
+
+    let vs <- dot_f16_template_variants()
+    let nv = length(vs)
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        let f = vs[i]._1
+        let got = double(f(pa, pb, N))
+        ok[i] = abs(got - want) / (abs(want) + 1.0lf) <= TOL
+        best[i] = 1.0e30lf
+    }
+
+    var sink = 0.0f
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                sink += f(pa, pb, N)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+    }
+    if (sink == 12345.678f) {
+        print("")   // keep sink live
+    }
+    return report("dot_f16", names, best, ok)
+}
+
+def bench_axpy_f16() : string {
+    let vs <- axpy_f16_template_variants()
+    let nv = length(vs)
+    let scale = 0.5f
+    var d0 : array<float>
+    var s : array<uint16>
+    var d : array<float>
+    d0 |> resize(int(N))
+    s |> resize(int(N))
+    d |> resize(int(N))
+    for (i in range(int(N))) {
+        d0[i] = 0.5f + 0.3f * sin(float(i) * 0.05f)
+        s[i] = uint16(f32_to_f16(cos(float(i) * 0.03f)))
+    }
+    var dp = unsafe(addr(d[0]))
+    let sp = unsafe(addr(s[0]))
+
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        reset(d, d0)
+        let f = vs[i]._1
+        invoke(f, dp, sp, scale, N)
+        var maxrel = 0.0lf
+        for (j in range(int(N))) {
+            let want = double(d0[j]) + double(scale) * double(f16_to_f32(uint(s[j])))
+            let rel = abs(double(d[j]) - want) / (abs(want) + 1.0lf)
+            if (rel > maxrel) {
+                maxrel = rel
+            }
+        }
+        ok[i] = maxrel <= TOL
+    }
+
+    var sink = 0.0f
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            reset(d, d0)
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                invoke(f, dp, sp, scale, N)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+        sink += d[0]
+    }
+    print("  checksum {sink}\n")
+    return report("axpy_f16", names, best, ok)
+}
+
+def bench_cvt_f32_to_f16() : string {
+    let vs <- cvt_f32_to_f16_template_variants()
+    let nv = length(vs)
+    var s : array<float>
+    var d : array<uint16>
+    s |> resize(int(N))
+    d |> resize(int(N))
+    for (i in range(int(N))) {
+        s[i] = 300.0f * sin(float(i) * 0.11f)   // spans the normal f16 range
+    }
+    s[7] = 1.0e6f      // clamp pin
+    s[13] = -1.0e6f
+    var dp = unsafe(addr(d[0]))
+    let sp = unsafe(addr(s[0]))
+
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        let f = vs[i]._1
+        invoke(f, dp, sp, N)
+        var exact = true
+        for (j in range(int(N))) {
+            exact &&= uint(d[j]) == f32_to_f16(clamp(s[j], -65504.0, 65504.0))
+        }
+        ok[i] = exact
+    }
+
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                invoke(f, dp, sp, N)   // pure overwrite — no reset needed
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+    }
+    return report("cvt_f32_to_f16", names, best, ok)
+}
+
+def bench_cvt_f16_to_f32() : string {
+    let vs <- cvt_f16_to_f32_template_variants()
+    let nv = length(vs)
+    var s : array<uint16>
+    var d : array<float>
+    s |> resize(int(N))
+    d |> resize(int(N))
+    for (i in range(int(N))) {
+        s[i] = uint16(f32_to_f16(300.0f * cos(float(i) * 0.09f)))
+    }
+    var dp = unsafe(addr(d[0]))
+    let sp = unsafe(addr(s[0]))
+
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        let f = vs[i]._1
+        invoke(f, dp, sp, N)
+        var exact = true
+        for (j in range(int(N))) {
+            exact &&= d[j] == f16_to_f32(uint(s[j]))
+        }
+        ok[i] = exact
+    }
+
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                invoke(f, dp, sp, N)   // pure overwrite — no reset needed
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+    }
+    return report("cvt_f16_to_f32", names, best, ok)
 }
 
 // ===== scale: (var d, scale)->void =====
@@ -1092,6 +1325,10 @@ def main {
 
     let dotw = bench_dot()
     let axpyw = bench_axpy()
+    let dotf16w = bench_dot_f16()
+    let axpyf16w = bench_axpy_f16()
+    let cvt16w = bench_cvt_f32_to_f16()
+    let cvt32w = bench_cvt_f16_to_f32()
     let addw = bench_binary("add_inplace", add_vs, add_d0, add_s, @@(a, b : float) : double => double(a) + double(b))
     let mulw = bench_binary("mul_inplace", mul_vs, mul_d0, mul_s, @@(a, b : float) : double => double(a) * double(b))
     let scalew = bench_scale()
@@ -1109,12 +1346,14 @@ def main {
     // Summary: which kernels the tuner re-tuned away from THEIR OWN shipped fallback (the
     // [tuned(fallback=...)] perm; bare [tuned] ships the vec8_u2 majority = BASELINE).
     print("\n===== summary (winner per kernel) =====\n")
-    let knames = fixed_array("dot", "axpy", "add_inplace", "mul_inplace", "scale_inplace", "copy_floats",
+    let knames = fixed_array("dot", "axpy", "dot_f16", "axpy_f16", "cvt_f32_to_f16", "cvt_f16_to_f32",
+        "add_inplace", "mul_inplace", "scale_inplace", "copy_floats",
         "softmax", "rmsnorm", "dot_q4", "dot_q8q8", "dot_mx4q8", "quantize_q8_0_into_ptr",
         "rope_scaled_neox_tab", "gemm_f32_uk_4x16", "dot_q8q8_laneq4x4")
-    let kwin = fixed_array(dotw, axpyw, addw, mulw, scalew, copyw,
+    let kwin = fixed_array(dotw, axpyw, dotf16w, axpyf16w, cvt16w, cvt32w, addw, mulw, scalew, copyw,
         softmaxw, rmsw, dq4w, dq8w, dmx4w, quantw, ropew, gemmw, laneqw)
     let kfall = fixed_array(BASELINE, BASELINE, BASELINE, BASELINE, BASELINE, BASELINE,
+        BASELINE, BASELINE, BASELINE, BASELINE,
         BASELINE, "plain", "vec4_u4", "vec16", "u2", "plain",
         BASELINE, "u2", "u2")
     var changed = 0
@@ -1149,7 +1388,8 @@ def main {
         q4_chunks_per_job = get_q4_chunks_per_job(), q8_batch_chunks_per_job = get_q8_batch_chunks_per_job(),
         jobque_spin_us = get_jobque_spin_us(), jobque_join_poll = get_jobque_join_poll(),
         threads = get_total_hw_jobs()))
-    let profile = JV((dot = dotw, axpy = axpyw, add_inplace = addw,
+    let profile = JV((dot = dotw, axpy = axpyw, dot_f16 = dotf16w, axpy_f16 = axpyf16w,
+        cvt_f32_to_f16 = cvt16w, cvt_f16_to_f32 = cvt32w, add_inplace = addw,
         mul_inplace = mulw, scale_inplace = scalew, copy_floats = copyw,
         softmax = softmaxw, softmax_sink = softmaxw, rmsnorm = rmsw,
         dot_q4 = dq4w, dot_q8q8 = dq8w, dot_mx4q8 = dmx4w, quantize_q8_0_into_ptr = quantw,

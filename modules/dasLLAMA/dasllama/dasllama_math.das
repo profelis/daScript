@@ -7,6 +7,7 @@ require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses th
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
 require dasllama/dasllama_tune  // [tuned]: reconstitute dot from dot_template with per-box loop hints
+require llvm/daslib/f16_cvt  // f16<->f32 converts: JIT half intrinsics on aarch64 / x64+F16C, exact bit-twiddle elsewhere
 
 // dasLLAMA numeric primitives — naive fp32 baseline (curriculum step 1).
 // Correctness first; optimization (blocking, float4, threading) comes later.
@@ -51,6 +52,60 @@ def template axpy_template(var d : float ?; s : float const ?; scale : float; n 
 }
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def axpy(var d : float?; s : float const?; scale : float; n : int64) {}
+
+// The f16 KV-codec kernels: the cache side is IEEE binary16 held in uint16, converted per element
+// inside the hot loop (ggml's lesson: convert the O(head_size) side in-loop, keep the bandwidth
+// win — f16_to_f32 lowers to vcvtph2ps/fcvtl inside the vectorized loop under the JIT).
+
+//! Dot of an f32 query row against an f16 (binary16-in-uint16) cache row.
+[hint(unsafe_range_check, noalias = a, noalias = b)]
+def template dot_f16_template(a : float const ?; b : uint16 const ?; n : int64) : float {
+    var acc = 0.0
+    for [tune = 1] (j in range64(n)) {
+        acc = mad(unsafe(a[j]), f16_to_f32(uint(unsafe(b[j]))), acc)
+    }
+    return acc
+}
+
+[hint(unsafe_range_check, noalias = a, noalias = b), tuned]
+def dot_f16(a : float const?; b : uint16 const?; n : int64) : float {}
+
+//! AXPY from an f16 cache row: d[j] += scale * f16(s[j]) — the V-accumulate under the f16 codec.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template axpy_f16_template(var d : float ?; s : uint16 const ?; scale : float; n : int64) : void {
+    for [tune = 1] (j in range64(n)) {
+        unsafe {
+            d[j] = mad(scale, f16_to_f32(uint(s[j])), d[j])
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def axpy_f16(var d : float?; s : uint16 const?; scale : float; n : int64) {}
+
+//! f32 -> f16 row convert (the codec store). Clamps to ±65504 so inf can NEVER enter the cache —
+//! O(kv_dim) per token, free next to the reads.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template cvt_f32_to_f16_template(var d : uint16 ?; s : float const ?; n : int64) : void {
+    for [tune = 1] (j in range64(n)) {
+        unsafe {
+            d[j] = uint16(f32_to_f16(clamp(s[j], -65504.0, 65504.0)))
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def cvt_f32_to_f16(var d : uint16?; s : float const?; n : int64) {}
+
+//! f16 -> f32 row convert (bulk dequant into f32 scratch).
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template cvt_f16_to_f32_template(var d : float ?; s : uint16 const ?; n : int64) : void {
+    for [tune = 1] (j in range64(n)) {
+        unsafe {
+            d[j] = f16_to_f32(uint(s[j]))
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def cvt_f16_to_f32(var d : float?; s : uint16 const?; n : int64) {}
 
 //! d[j] += s[j], width-8 vectorized (the residual-stream update). The plain `for k; a[k]+=b[k]`
 //! over bounds-checked arrays does NOT vectorize under the JIT — this pointer form is ~5x faster.

@@ -45,7 +45,8 @@ def create_session(model : Model; kv_dtype : KVDtype = KVDtype.f32) : Session {
     //! Create a fresh session (KV cache + scratch) sized to ``model.config.seq_len``. A model serves
     //! many sessions, each with its own position and cache — one model, many independent conversations.
     //! On large-context models cap ``model.config.seq_len`` BEFORE creating sessions to bound KV memory.
-    //! ``kv_dtype`` picks this session's KV-cache codec (``KVDtype.f32`` today; f16 lands next) —
+    //! ``kv_dtype`` picks this session's KV-cache codec: ``KVDtype.f32`` (bit-exact reference) or
+    //! ``KVDtype.f16`` (half the KV bytes, near-lossless — stores clamp to ±65504) —
     //! per-session state, so sessions with different codecs and parallel models never interact.
     return <- create_session_(model, kv_dtype, kv_dtype)
 }

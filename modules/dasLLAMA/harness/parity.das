@@ -4,6 +4,7 @@ require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires ea
 require daslib/jobque_boost
 require strings
 require daslib/strings_boost
+require daslib/clargs
 require daslib/fio   // has_env_variable / get_env_variable (the DASLLAMA_BATCH_GRID_2D A/B rail)
 require math
 require dasllama/dasllama_math  // setup_dasllama_jobque_ + the runtime knob setters (engine-level, not re-exported)
@@ -15,16 +16,32 @@ require dasllama/dasllama_math  // setup_dasllama_jobque_ + the runtime knob set
 // dispatch, so this validates any supported model with no harness change.
 //
 //   bin/daslang -jit modules/dasLLAMA/harness/parity.das -- \
-//     -m <model.gguf> -n 40 --quant q8 --ids 1,9038,2501,263,931
+//     -m <model.gguf> -n 40 --quant q8 --kv f16 --ids 1,9038,2501,263,931
 
-def private parse_quant(s : string) : QuantMode {
-    if (s == "fp32") {
-        return QuantMode.fp32
-    }
-    if (s == "q4") {
-        return QuantMode.q4
-    }
-    return QuantMode.q8
+[CommandLineArgs]
+struct Args {
+    @clarg_required
+    @clarg_short = "m"
+    @clarg_doc = "Model GGUF path"
+    model : string
+
+    @clarg_required
+    @clarg_doc = "Comma-separated prompt token ids (as the oracle tokenized them)"
+    ids : string
+
+    @clarg_short = "n"
+    @clarg_doc = "Continuation tokens to generate (default: 40)"
+    ngen : int = 40
+
+    @clarg_doc = "Weight quant mode (default: q8)"
+    quant : QuantMode = QuantMode.q8
+
+    @clarg_doc = "KV cache dtype (default: f32)"
+    kv : KVDtype = KVDtype.f32
+
+    @clarg_short = "?"
+    @clarg_doc = "Show this help and exit"
+    help : bool
 }
 
 def private parse_ids(s : string) : array<int64> {
@@ -34,36 +51,32 @@ def private parse_ids(s : string) : array<int64> {
 
 [export]
 def main {
-    var model = ""
-    var n_gen = 40
-    var quant = QuantMode.q8
-    var prompt : array<int64>
-    let args = get_command_line_arguments()
-    let na = length(args)
-    for (i in range(na)) {
-        if (args[i] == "-m" && i + 1 < na) {
-            model = args[i + 1]
-        } elif (args[i] == "-n" && i + 1 < na) {
-            n_gen = to_int(args[i + 1])
-        } elif (args[i] == "--quant" && i + 1 < na) {
-            quant = parse_quant(args[i + 1])
-        } elif (args[i] == "--ids" && i + 1 < na) {
-            prompt <- parse_ids(args[i + 1])
-        }
+    var res <- parse_args(type<Args>)
+    if (res |> is_err) {
+        print("error: {res |> unwrap_err}\n\n")
+        print_help(get_command_info(type<Args>), "parity")
+        return
     }
-    if (empty(model) || empty(prompt) || n_gen <= 0) {
-        print("usage: parity.das -- -m <model.gguf> -n <N> --quant <fp32|q8|q4> --ids <i0,i1,...>\n")
+    let cfg <- res |> move_unwrap
+    if (cfg.help) {
+        print_help(get_command_info(type<Args>), "parity")
+        return
+    }
+    let n_gen = cfg.ngen
+    let prompt <- parse_ids(cfg.ids)
+    if (empty(prompt) || n_gen <= 0) {
+        print_help(get_command_info(type<Args>), "parity")
         return
     }
 
-    var t <- load_gguf(model, quant)
+    var t <- load_gguf(cfg.model, cfg.quant)
     // Cap the KV context: only ~(prompt + n_gen) positions are used, and native seq_len (Llama-3 /
     // Phi / gemma4: 131072) would waste multi-GB KV allocations. Same cap test_parity.das applies.
     if (t.config.seq_len > 2048l) {
         t.config.seq_len = 2048l
     }
     let c = t.config
-    var s = make_run_state(c)
+    var s = make_run_state(c, cfg.kv, cfg.kv)
     with_job_que() {
         setup_dasllama_jobque_()
         // A/B rail: force the 2-D batch chunk grid (0 = 1-D, 1 = fine, 2 = aligned) — the
