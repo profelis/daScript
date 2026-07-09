@@ -57,6 +57,7 @@ var @in @location = 2 a_tangent  : float4
 var @in @location = 3 a_uv0      : float2
 
 var @uniform u_model    : float4x4
+var @uniform u_normal_matrix : float3x3  // inverse-transpose of u_model's 3x3 (correct normals under scale)
 var @uniform u_view     : float4x4
 var @uniform u_proj     : float4x4
 var @uniform u_light_vp : float4x4
@@ -110,10 +111,9 @@ def shadow_fs {
 [vertex_program]
 def gbuffer_vs {
     let world = u_model * float4(a_position, 1.0)
-    let nm = float3x3(u_model)
     gv_world_pos = world.xyz
-    gv_world_normal = normalize(nm * a_normal)
-    gv_world_tangent = nm * a_tangent.xyz
+    gv_world_normal = normalize(u_normal_matrix * a_normal)
+    gv_world_tangent = u_normal_matrix * a_tangent.xyz
     gv_tangent_w = a_tangent.w
     gv_uv0 = a_uv0
     gl_Position = u_proj * u_view * world
@@ -786,6 +786,7 @@ def draw_gltf_gbuffer {
             continue
         }
         u_model = g_root * node.world
+        u_normal_matrix = float3x3(transpose(inverse(u_model)))
         for (glp in g_model.meshes[node.mesh].primitives) {
             if (glp.material >= 0 && glp.material < length(g_scene.materials)) {
                 bind_gltf_material(g_scene.materials[glp.material])
@@ -802,6 +803,7 @@ def draw_gltf_gbuffer {
 def draw_floor_gbuffer {
     u_material = 1.0
     u_model = identity4x4()
+    u_normal_matrix = identity3x3()
     u_base_color_tex := g_model.whiteTex
     u_metal_rough_tex := g_model.whiteTex
     u_normal_tex := g_model.flatNormalTex

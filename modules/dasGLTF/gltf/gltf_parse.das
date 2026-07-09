@@ -301,6 +301,9 @@ def private decode_mat4(gltf : JGltf; buffers : array<array<uint8>>; ai : int) :
     var result : array<float4x4>
     if (ai < 0 || ai >= length(gltf.accessors)) return <- result
     let acc = gltf.accessors[ai]
+    // glTF requires MAT4 accessors to be FLOAT (5126); the reads below are gltf_rd_f32 (4 bytes),
+    // so reject any other componentType rather than mis-sizing the span check.
+    if (acc.componentType != 5126) return <- result
     result |> resize(acc.count)
     if (acc.bufferView >= 0 && acc.bufferView < length(gltf.bufferViews)) {
         let bv = gltf.bufferViews[acc.bufferView]
@@ -626,12 +629,18 @@ def private glb_chunk_string(bytes : array<uint8>; start : int64; len : int64) :
 }
 
 def private parse_glb(bytes : array<uint8>; var jsonText : string&; var binBytes : array<uint8>) {
-    let total = int64(gltf_rd_u32(bytes, 8l))
+    // fail-closed: a malformed/hostile .glb can declare a total or chunk length past the actual
+    // file; clamp the declared total to the real size and stop at the first chunk that runs past it,
+    // so the header/chunk reads below never index out of bounds.
+    let n = int64(length(bytes))
+    if (n < 12l) return
+    let total = min(int64(gltf_rd_u32(bytes, 8l)), n)
     var off = 12l
     while (off + 8l <= total) {
         let clen = int64(gltf_rd_u32(bytes, off))
         let ctype = gltf_rd_u32(bytes, off + 4l)
         let dataStart = off + 8l
+        if (dataStart + clen > total) break
         if (ctype == 0x4E4F534Au) {          // "JSON"
             jsonText = glb_chunk_string(bytes, dataStart, clen)
         } elif (ctype == 0x004E4942u) {       // "BIN\0"

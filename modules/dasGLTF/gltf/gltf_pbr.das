@@ -56,10 +56,12 @@ def gltf_pbr_vs {
         let p = float4(a_position, 1.0)
         let nn = float4(a_normal, 0.0)
         let tg = float4(a_tangent.xyz, 0.0)
-        let jx = int(a_joints0.x)
-        let jy = int(a_joints0.y)
-        let jz = int(a_joints0.z)
-        let jw = int(a_joints0.w)
+        // clamp to the palette size: a skin with > GLTF_MAX_JOINTS joints (or malformed JOINTS_0)
+        // would otherwise index u_joints out of range -> undefined shader behavior.
+        let jx = clamp(int(a_joints0.x), 0, GLTF_MAX_JOINTS - 1)
+        let jy = clamp(int(a_joints0.y), 0, GLTF_MAX_JOINTS - 1)
+        let jz = clamp(int(a_joints0.z), 0, GLTF_MAX_JOINTS - 1)
+        let jw = clamp(int(a_joints0.w), 0, GLTF_MAX_JOINTS - 1)
         world = ((u_joints[jx] * p) * a_weights0.x
                + (u_joints[jy] * p) * a_weights0.y
                + (u_joints[jz] * p) * a_weights0.z
