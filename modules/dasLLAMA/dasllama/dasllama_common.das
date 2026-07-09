@@ -156,6 +156,10 @@ struct ArchBlocks {
     ffn_decode : FfnDecodeFn
     attn_prefill : AttnPrefillFn
     ffn_prefill : FfnPrefillFn
+    // eval_batch gate: attention is the std QKV/RoPE/causal shape (attention_std_prefill), so the
+    // batched-decode worker applies. An arch registering custom attention sets this false and
+    // eval_batch falls back to per-row forward().
+    attn_is_std : bool = true
 }
 
 //! The whole model. `fblob` holds the fp32 embedding + norm weights at the *_off offsets below;
@@ -1837,6 +1841,37 @@ def private build_rope_table(var cos_tab : array<float>; var sin_tab : array<flo
             }
             for (pi in range64(npos)) {
                 let angle = float(start_pos + pi) * fscale * freq
+                cp[pi * half + j] = cos(angle) * scale
+                sp[pi * half + j] = sin(angle) * scale
+            }
+        }
+    }
+}
+
+// build_rope_table's batched-decode twin: row pi's angle uses positions[pi] instead of start_pos+pi
+// (batch rows come from different sequences at unrelated positions). Bit-identical per row to the
+// npos=1 decode table at that position, so rope_batch_tab consumes it unchanged.
+def private build_rope_table_rows(var cos_tab : array<float>; var sin_tab : array<float>; t : Model;
+                                  theta, fscale : float; positions : array<int64>; nrows, head_size : int64;
+                                  use_ff : bool = true) {
+    let c = t.config
+    let half = head_size / 2l
+    let scale = c.rope_neox ? c.rope_mscale : 1.0
+    let has_ff = use_ff && !empty(t.rope_freqs)
+    cos_tab |> resize(nrows * half)
+    sin_tab |> resize(nrows * half)
+    unsafe {
+        var cp = addr(cos_tab[0])
+        var sp = addr(sin_tab[0])
+        let pp = reinterpret<int64 const?>(addr(positions[0]))
+        let ffp = has_ff ? reinterpret<float const?>(addr(t.rope_freqs[0])) : null
+        for (j in range64(half)) {
+            var freq = 1.0 / pow(theta, float(2l * j) / float(head_size))
+            if (has_ff) {
+                freq /= ffp[j]
+            }
+            for (pi in range64(nrows)) {
+                let angle = float(pp[pi]) * fscale * freq
                 cp[pi * half + j] = cos(angle) * scale
                 sp[pi * half + j] = sin(angle) * scale
             }
@@ -5388,6 +5423,273 @@ def forward_batch(t : Model; var s : Session; tokens : array<int64>; npos, start
     } else {
         forward_prefill(t, s, tokens, npos, start_pos)
     }
+}
+
+// ===== batched decode =====
+// One decode step over B independent sessions through ONE pass of the weights: the weight-bound
+// GEMVs (qkv/wo/ffn/classifier) become B-row GEMMs via the batched prefill blocks, while attention
+// stays per-(row, head) by physics — each row reads only ITS session's KV cache. Reuses the
+// attn_qkv_rope_prefix / attn_out_suffix factoring and the KV codec seam workers unchanged.
+
+//! Caller-owned scratch for eval_batch, reused across calls (buffers grow to the largest B seen).
+//! `scr` wraps a cache-less Session so the batched prefill blocks (mm_b / rms_batch / ffn_prefill)
+//! apply unchanged; per call it impersonates the batch's cache geometry (dtypes + byte prefixes).
+struct BatchWorkspace {
+    scr : Session             // *_b scratch, rope tables, ple scratch — no KV cache / sampler state
+    positions : array<int64>  // row i's absolute position (sessions[i].n_past at entry)
+    logits_b : array<float>   // B x vocab classifier output, scattered per session after softcap
+    // row i's cache base pointers (into sessions[i]; valid per call). @do_not_delete is load-bearing:
+    // delete of a plain array<T?> CASCADES to the pointees, which would free the sessions' cache blobs
+    @do_not_delete kbase : array<uint8?>
+    @do_not_delete vbase : array<uint8?>
+}
+
+def create_batch_workspace_(model : Model) : BatchWorkspace {
+    var ws : BatchWorkspace
+    ws.scr <- make_run_state(model.config)
+    // the scratch Session never owns cache or sampler state — eval_batch reads/writes the real
+    // sessions' caches through kbase/vbase; drop the big allocations before they're ever touched
+    delete ws.scr.key_cache
+    delete ws.scr.value_cache
+    delete ws.scr.sample_scratch
+    return <- ws
+}
+
+// B-row slice of forward_prefill_alloc: exactly the buffers the batched-decode step touches (no
+// prefill attention scratch — att_b sizes per layer in attention_batch_decode, fa_* never used).
+def private batch_decode_alloc(t : Model; var s : Session; nrows : int64) {
+    let c = t.config
+    let dim = c.dim
+    let hidden = c.hidden_dim
+    let kv_dim = max_kv_dim(c)
+    let head_size = max_head_size(c)
+    let qd = c.n_heads * head_size
+    let xdim = max(dim, qd)
+    let maxn = max(xdim, hidden)
+    s.x_b |> resize(nrows * dim)
+    s.xb_b |> resize(nrows * xdim)
+    s.xb2_b |> resize(nrows * dim)
+    s.q_b |> resize(nrows * qd)
+    s.k_b |> resize(nrows * kv_dim)
+    s.v_b |> resize(nrows * kv_dim)
+    s.hb_b |> resize(nrows * hidden)
+    s.hb2_b |> resize(nrows * hidden)
+    s.xqb |> resize(nrows * maxn)
+    s.xsb |> resize(nrows * maxn / 32l)
+    if (has_ple(c)) {   // gemma-4 E-series PLE scratch (one row per batch slot)
+        let all = c.n_layers * c.n_embd_per_layer
+        s.ple_inp |> resize(nrows * all)
+        s.ple_proj |> resize(nrows * all)
+        s.ple_gate |> resize(nrows * c.n_embd_per_layer)
+    }
+}
+
+// One layer's batched-decode attention: shared prefix (norm → QKV GEMM → qk/v-norm → per-row RoPE
+// via the positions table) → scatter-store each row's k/v into ITS session's cache → per-(row, head)
+// decode attention through the codec seam worker → shared suffix (wo GEMM → post-norm → residual).
+def private attention_batch_decode(t : Model; var ws : BatchWorkspace; l, nrows : int64) {
+    let c = t.config
+    let kv_dim = layer_kv_dim(c, l)
+    let head_size = layer_head_size(c, l)
+    let n_heads = c.n_heads
+    let n_kv_heads = layer_n_kv_heads(c, l)
+    let qd = n_heads * head_size
+    let kv_mul = n_heads / n_kv_heads
+    let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
+    let is_sliding = layer_is_sliding(c, l)
+    let swin = c.sliding_window
+    let kv_shared = t.kv_src[l] != l
+    let kbb = kv_base_k(ws.scr, l, c.seq_len)   // layer slab base BYTES — uniform across the batch
+    let vbb = kv_base_v(ws.scr, l, c.seq_len)   // (ws.scr carries the batch's dtypes + prefixes)
+    let kdt = ws.scr.kv_dtype_k
+    let vdt = ws.scr.kv_dtype_v
+    // start_pos is only read by the classic (non-table) rope path, which eval_batch_ never routes
+    // here — the rows table already bakes each row's own position in
+    attn_qkv_rope_prefix(t, ws.scr, l, nrows, 0l)
+    if (!kv_shared) {
+        let ts_kv = ref_time_ticks()
+        unsafe {
+            let kbp = reinterpret<float const?>(addr(ws.scr.k_b[0]))
+            let vbp = reinterpret<float const?>(addr(ws.scr.v_b[0]))
+            for (i in range64(nrows)) {
+                kv_store_row(ws.kbase[i] + kbb, kdt, kv_dim, ws.positions[i], 0l, kv_dim, kbp + i * kv_dim)
+                kv_store_row(ws.vbase[i] + vbb, vdt, kv_dim, ws.positions[i], 0l, kv_dim, vbp + i * kv_dim)
+            }
+        }
+        prof_add("kv_store", ts_kv)
+    }
+    // per-(row, head) attention: row i attends to ITS cache kstart_i..positions[i]. att rows stride
+    // by the layer's window-clamped batch max so every lane writes a disjoint row; lanes are
+    // work-proportional to the summed KV traffic (deep rows invite more lanes).
+    let ts_attn = ref_time_ticks()
+    var maxctx = 0l
+    var work = 0l   // Σ 2·cnt_i·head_size MACs per head
+    for (i in range64(nrows)) {
+        let pos = ws.positions[i]
+        let kstart = (is_sliding && pos + 1l > swin) ? (pos + 1l - swin) : 0l
+        maxctx = max(maxctx, pos + 1l - kstart)
+        work += 2l * (pos + 1l - kstart) * head_size
+    }
+    ws.scr.att_b |> resize(nrows * n_heads * maxctx)
+    let attn_softcap = c.attn_logit_softcap
+    let attn_lanes = min(int(nrows * n_heads), lanes_for_work(work * n_heads, g_gemv_lane_cap))
+    let sinksp = (c.attn_sinks
+        ? unsafe(reinterpret<float const?>(unsafe(addr(t.fblob[t.sinks_off + l * n_heads]))))
+        : null)
+    unsafe {
+        let qp = reinterpret<float const?>(addr(ws.scr.q_b[0]))
+        var xbp = addr(ws.scr.xb_b[0])
+        var attp = addr(ws.scr.att_b[0])
+        let posp = reinterpret<int64 const?>(addr(ws.positions[0]))
+        var kbpp = addr(ws.kbase[0])
+        var vbpp = addr(ws.vbase[0])
+        maybe_parallel_for(0, int(nrows * n_heads), attn_lanes) $(rb, re) {
+            unsafe {
+                for (idx in range(rb, re)) {
+                    let ix = int64(idx)
+                    let ii = ix / n_heads
+                    let hh = ix % n_heads
+                    let pos = posp[ii]
+                    let kstart = (is_sliding && pos + 1l > swin) ? (pos + 1l - swin) : 0l
+                    let cnt = pos + 1l - kstart
+                    let qoff = hh * head_size
+                    let kvhoff = (hh / kv_mul) * head_size
+                    attn_head_decode_d(attp + ix * maxctx, xbp + ii * qd, qp + ii * qd,
+                        kbpp[ii] + kbb, vbpp[ii] + vbb, kdt, vdt,
+                        qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, sinksp)
+                }
+            }
+        }
+    }
+    prof_add("attn", ts_attn)
+    attn_out_suffix(t, ws.scr, l, nrows)
+}
+
+//! One synchronous batched decode step: row i evals tokens[i] at sessions[i]'s position, logits
+//! scatter into sessions[i].logits, and each session advances by one. Sessions must be distinct,
+//! same-geometry (one model, equal cache sizes, uniform KV dtype) and have room for one position.
+//! Ragged batches: pass only the still-active sessions (B may shrink between calls). B == 1, q4
+//! weights, a non-std attention arch, or the classic (non-table) rope path fall back to the exact
+//! per-row forward() loop.
+def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; tokens : array<int64>) {   // nolint:LINT014 — rows mutate THROUGH the pointers; a const array constifies the pointees
+    let c = t.config
+    let nrows = int64(length(sessions))
+    if (nrows <= 0l) {
+        return
+    }
+    if (int64(length(tokens)) != nrows) {
+        panic("eval_batch: {length(sessions)} sessions but {length(tokens)} tokens — one token per session")
+    }
+    for (i in range64(nrows)) {
+        if (sessions[i] == null) {
+            panic("eval_batch: sessions[{i}] is null")
+        }
+        if (sessions[i].n_past + 1l > c.seq_len) {
+            panic("eval_batch: sessions[{i}] is full (n_past={sessions[i].n_past}, seq_len={c.seq_len})")
+        }
+        for (j in range64(i)) {
+            if (sessions[i] == sessions[j]) {
+                panic("eval_batch: sessions[{j}] and sessions[{i}] are the same session — rows must be distinct")
+            }
+        }
+    }
+    let s0 = sessions[0]
+    for (i in range64(1l, nrows)) {
+        let sp = sessions[i]
+        if (sp.kv_dtype_k != s0.kv_dtype_k || sp.kv_dtype_v != s0.kv_dtype_v) {
+            panic("eval_batch: sessions[{i}] KV dtype differs from sessions[0] — the batch must be uniform")
+        }
+        if (length(sp.key_cache) != length(s0.key_cache) || length(sp.value_cache) != length(s0.value_cache)) {
+            panic("eval_batch: sessions[{i}] cache size differs from sessions[0] — same model + same seq_len required")
+        }
+    }
+    // per-row fallback keeps every configuration correct: B == 1 keeps the fused decode chain, q4
+    // has no batched kernels, non-std arches have no batch attention worker, and the classic rope
+    // path can't express per-row positions
+    if (nrows == 1l || t.quant == QuantMode.q4 || !t.blocks.attn_is_std || !g_use_rope_table) {
+        for (i in range64(nrows)) {
+            var sp = sessions[i]
+            forward(t, *sp, tokens[i], sp.n_past)
+            sp.n_past++
+        }
+        return
+    }
+    // snapshot the batch's cache geometry onto the scratch Session (kv_base_* and the store/read
+    // dispatch read it there) and capture each row's position + cache base
+    ws.scr.kv_dtype_k = s0.kv_dtype_k
+    ws.scr.kv_dtype_v = s0.kv_dtype_v
+    ws.scr.kv_bprefix_k := s0.kv_bprefix_k
+    ws.scr.kv_bprefix_v := s0.kv_bprefix_v
+    ws.positions |> resize(nrows)
+    ws.kbase |> resize(nrows)
+    ws.vbase |> resize(nrows)
+    for (i in range64(nrows)) {
+        var sp = sessions[i]
+        ws.positions[i] = sp.n_past
+        unsafe {
+            ws.kbase[i] = addr(sp.key_cache[0])
+            ws.vbase[i] = addr(sp.value_cache[0])
+        }
+    }
+    batch_decode_alloc(t, ws.scr, nrows)
+    // embed each row's token into the residual stream
+    let dim = c.dim
+    let ts_embed = ref_time_ticks()
+    for (i in range64(nrows)) {
+        embed_row(t, tokens[i], unsafe(addr(ws.scr.x_b[i * dim])))
+    }
+    if (c.embed_scale != 1.0) {  // Gemma2: scale the embedding by sqrt(dim)
+        scale_inplace(unsafe(addr(ws.scr.x_b[0])), c.embed_scale, nrows * dim)
+    }
+    prof_add("embed", ts_embed)
+    if (has_ple(c)) {  // gemma-4 E-series: per-(row, layer) side input (token-indexed, position-free)
+        let ts_ple = ref_time_ticks()
+        ple_pre_prefill(t, ws.scr, tokens, nrows)
+        prof_add("ple", ts_ple)
+    }
+    // per-row RoPE cos/sin table(s) — row i at sessions[i]'s own position
+    let ts_rope_build = ref_time_ticks()
+    build_rope_table_rows(ws.scr.rope_cos, ws.scr.rope_sin, t, c.rope_freq_base, c.rope_freq_scale,
+        ws.positions, nrows, c.head_size, true)
+    if (has_dual_rope(c)) {
+        let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
+        build_rope_table_rows(ws.scr.rope_cos_swa, ws.scr.rope_sin_swa, t, c.rope_freq_base_swa,
+            c.rope_freq_scale_swa, ws.positions, nrows, swa_hs, !c.rope_ff_global_only)
+    }
+    prof_add("rope_build", ts_rope_build)
+    // layer stack: batched attention (per-row cache scatter) + the arch's batched FFN (position-free)
+    for (l in range64(c.n_layers)) {
+        attention_batch_decode(t, ws, l, nrows)
+        t.blocks.ffn_prefill(t, ws.scr, l, nrows)
+    }
+    // final rmsnorm + classifier over ALL rows, then per-row softcap/pins scattered per session
+    let ts_final = ref_time_ticks()
+    let vocab = c.vocab_size
+    rms_batch(ws.scr.xb_b, ws.scr.x_b, t, t.rms_final_off, dim, nrows)
+    ws.logits_b |> resize(nrows * vocab)
+    if (c.shared_weights && !t.cls_q8) {
+        // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
+        mm_fblob_b(ws.logits_b, t, t.tok_emb_off, ws.scr.xb_b, dim, vocab, nrows)
+    } else {
+        mm_b(ws.logits_b, t, t.wcls_off, ws.scr.xb_b, ws.scr.xqb, ws.scr.xsb, dim, vocab, nrows)
+    }
+    if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits per row
+        unsafe {
+            var lbp = addr(ws.logits_b[0])
+            for (i in range64(nrows)) {
+                softcap(lbp + i * vocab, vocab, c.final_logit_softcap)
+            }
+        }
+    }
+    for (i in range64(nrows)) {
+        var sp = sessions[i]
+        copy_floats(ws.logits_b, i * vocab, sp.logits, 0l, vocab)
+        for (id in t.suppress) {  // gemma4: pin the checkpoint's suppressed token ids to -inf
+            sp.logits[id] = -1.0e30
+        }
+        sp.n_past++
+    }
+    prof_add("final", ts_final)
 }
 
 //! Greedy argmax over the current logits; returns the winning token id.

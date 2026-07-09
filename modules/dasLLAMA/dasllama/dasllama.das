@@ -85,6 +85,24 @@ def eval_embd(model : Model; var session : Session; embd : array<float>; npos : 
     eval_embd_(model, session, embd, npos)
 }
 
+def create_batch_workspace(model : Model) : BatchWorkspace {
+    //! Create the caller-owned scratch that ``eval_batch`` steps through — one per concurrent batch,
+    //! reused across calls (buffers grow to the largest batch seen). Holds no session state: the
+    //! sessions keep their own positions, caches and logits.
+    return <- create_batch_workspace_(model)
+}
+
+def eval_batch(model : Model; var ws : BatchWorkspace; var sessions : array<Session?>; tokens : array<int64>) {   // nolint:LINT014 — rows mutate THROUGH the pointers; a const array constifies the pointees
+    //! One synchronous batched decode step: row i evals ``tokens[i]`` at ``sessions[i]``'s current
+    //! position, logits land in ``sessions[i].logits``, and each session advances by one — B
+    //! independent conversations through ONE pass of the weights (the weight GEMVs batch into GEMMs;
+    //! attention stays per-session). Sessions must be distinct, same-geometry (one model, equal
+    //! cache sizes, uniform KV dtype) and each have room for one more position. Ragged batches:
+    //! pass only the still-active sessions — B may shrink between calls. B == 1 and q4 weights
+    //! delegate to the exact per-session ``forward`` path.
+    eval_batch_(model, ws, sessions, tokens)
+}
+
 def sample(var session : Session; params : SamplingParams) : int64 {
     //! Sample the next token from ``session.logits`` per ``params``: repetition penalty over the recent
     //! window, then temperature + top-k + softmax + CDF — or greedy argmax when ``params.temp <= 0``.
