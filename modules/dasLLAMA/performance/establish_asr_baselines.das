@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // the forward/prefill chain + generated kernels need more than the 16K default on arm64
 options indenting = 4
 
 // Batch ASR reference-baseline establisher — the audio sibling of establish_baselines.das (which is

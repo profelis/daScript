@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // the forward/prefill chain + generated kernels need more than the 16K default on arm64
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); the profile is a speed measurement
 
 // The das-side half of the profiling suite: for each tier-selected model it measures prefill (one
