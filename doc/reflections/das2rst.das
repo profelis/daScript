@@ -98,6 +98,7 @@ require daslib/remove_call_args
 // require daslib/spoof                           // depends on peg module
 require daslib/stringify
 require peg/peg
+require gltf/gltf_boost
 require daslib/temp_strings
 require daslib/type_traits
 require daslib/typemacro_boost
@@ -1719,6 +1720,20 @@ def document_module_spirv(_root : string) {
     document("SPIR-V shader reflection (dasSpirv): API-neutral descriptor + push-constant layout, host-consumed", mod, "spirv_reflect.rst", groups)
 }
 
+def document_module_gltf(_root : string) {
+    // The backend-neutral core only (gltf_types/accessor/parse/scene). The opt-in GL adapter
+    // (gltf_gl/gltf_pbr) requires dasOpenGL, which this doc generator does not load.
+    var mod = [find_module("gltf_types"), find_module("gltf_accessor"),
+        find_module("gltf_parse"), find_module("gltf_scene")]
+    var groups <- array<DocGroup>(
+        group_by_regex("Loading", mod, %regex~.*(load_gltf)$%%),
+        group_by_regex("Scene, skinning and animation", mod, %regex~.*(update_world_transforms|gltf_scene_bounds|evaluate_animation|gltf_joint_matrix)$%%),
+        group_by_regex("Accessor byte readers", mod, %regex~.*(gltf_rd_.*|gltf_read_comp_.*|gltf_comp_size|gltf_type_ncomp)$%%),
+        hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%))
+    )
+    documents("glTF 2.0 loader (dasGLTF): GLB/.gltf parse, accessor decode, node hierarchy, skinning and keyframe animation into a backend-neutral scene", mod, "gltf.rst", groups)
+}
+
 [export]
 def main {
     disable_profiler(this_context())
@@ -1759,6 +1774,7 @@ def main {
     document_module_strudel_pattern(root)
     // document dasPEG module
     document_module_peg(root)
+    document_module_gltf(root)
     // document dasSpirv reflection module
     document_module_spirv(root)
     // document the dasLLAMA facade module (the engine modules behind it stay undocumented by design)

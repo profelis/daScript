@@ -2069,12 +2069,19 @@ install(FILES
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/opengl/media
 )
 
-# dasGLTF sample assets (Khronos glTF-Sample-Assets; BoomBox is CC0). Loaded by
-# examples/opengl/10_hello_gltf.das via get_das_root()/examples/gltf/media. M4 adds the
-# GLTF_SAMPLE_ASSETS.LICENSE + PROVENANCE + the ImGui viewer tree here.
+# dasGLTF sample assets (Khronos glTF-Sample-Assets). BoomBox is CC0; Fox is a CC0 model with
+# CC-BY 4.0 rig/animation (attribution in GLTF_SAMPLE_ASSETS.LICENSE, shipped below). Loaded by
+# examples/opengl/10_hello_gltf.das (BoomBox) + 11_hello_gltf_animation.das (Fox) via
+# get_das_root()/examples/gltf/media.
 install(FILES
     ${PROJECT_SOURCE_DIR}/examples/gltf/media/BoomBox.glb
+    ${PROJECT_SOURCE_DIR}/examples/gltf/media/Fox.glb
+    ${PROJECT_SOURCE_DIR}/examples/gltf/PROVENANCE.md
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/media
+)
+# The Fox rig/animation is CC-BY 4.0, so its attribution must ship with the SDK.
+install(FILES ${PROJECT_SOURCE_DIR}/examples/gltf/GLTF_SAMPLE_ASSETS.LICENSE
+    DESTINATION ${DAS_INSTALL_DOCDIR}
 )
 
 add_subdirectory(tutorials)

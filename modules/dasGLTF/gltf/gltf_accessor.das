@@ -39,15 +39,15 @@ def gltf_rd_f32(b : array<uint8> | #; o : int64) : float {
 // glTF componentType enum: 5120 BYTE, 5121 UNSIGNED_BYTE, 5122 SHORT,
 // 5123 UNSIGNED_SHORT, 5125 UNSIGNED_INT, 5126 FLOAT.
 
-//! Byte size of one accessor component for the given glTF componentType.
 def gltf_comp_size(compType : int) : int64 {
+    //! Byte size of one accessor component for the given glTF componentType.
     if (compType == 5120 || compType == 5121) return 1l
     if (compType == 5122 || compType == 5123) return 2l
     return 4l
 }
 
-//! Number of components for a glTF accessor `type` string (SCALAR/VECn/MATn).
 def gltf_type_ncomp(t : string) : int {
+    //! Number of components for a glTF accessor `type` string (SCALAR/VECn/MATn).
     if (t == "SCALAR") return 1
     if (t == "VEC2") return 2
     if (t == "VEC3") return 3
@@ -57,9 +57,9 @@ def gltf_type_ncomp(t : string) : int {
     return 0
 }
 
-//! Read one component at byte offset `o` as float, applying glTF `normalized`
-//! integer→float conversion (unsigned: /max; signed: max(v/max, -1)).
 def gltf_read_comp_float(b : array<uint8> | #; o : int64; compType : int; normalized : bool) : float {
+    //! Read one component at byte offset `o` as float, applying glTF `normalized`
+    //! integer→float conversion (unsigned: /max; signed: max(v/max, -1)).
     if (compType == 5126) return gltf_rd_f32(b, o)
     if (compType == 5125) return float(gltf_rd_u32(b, o))
     if (!normalized) {
@@ -76,8 +76,8 @@ def gltf_read_comp_float(b : array<uint8> | #; o : int64; compType : int; normal
     return 0.
 }
 
-//! Read one component at byte offset `o` as uint (index accessors: u8/u16/u32).
 def gltf_read_comp_uint(b : array<uint8> | #; o : int64; compType : int) : uint {
+    //! Read one component at byte offset `o` as uint (index accessors: u8/u16/u32).
     if (compType == 5121) return gltf_rd_u8(b, o)
     if (compType == 5123) return gltf_rd_u16(b, o)
     return gltf_rd_u32(b, o)

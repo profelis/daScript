@@ -15,18 +15,18 @@ def private update_node_world(var scene : GltfScene; ni : int; parent : float4x4
     }
 }
 
-//! Recompute every node's `world` transform by walking the hierarchy from the
-//! scene roots (world = parent.world * local).
 def update_world_transforms(var scene : GltfScene) {
+    //! Recompute every node's `world` transform by walking the hierarchy from the
+    //! scene roots (world = parent.world * local).
     let id = identity4x4()
     for (r in scene.roots) {
         update_node_world(scene, r, id)
     }
 }
 
-//! World-space axis-aligned bounds (min, max) over every mesh vertex, using each node's `world`
-//! transform. Returns (0, 0) for a scene with no drawable vertices. Handy for auto-framing a camera.
 def gltf_scene_bounds(scene : GltfScene) : tuple<float3; float3> {
+    //! World-space axis-aligned bounds (min, max) over every mesh vertex, using each node's `world`
+    //! transform. Returns (0, 0) for a scene with no drawable vertices. Handy for auto-framing a camera.
     var lo = float3(1.0e30, 1.0e30, 1.0e30)
     var hi = float3(-1.0e30, -1.0e30, -1.0e30)
     var any = false
@@ -106,11 +106,12 @@ def private eval_sampler(samp : GltfAnimSampler; t : float; isRotation : bool) :
     return isRotation ? quat_slerp(f, v0, v1) : lerp(v0, v1, f)
 }
 
-//! Evaluate animation `animation` at time `t` (seconds): sample each channel and write the result into
-//! its target node's TRS, then recompose those nodes' local matrices and refresh every world transform.
-//! Nodes given by an explicit `matrix` are never animation targets (glTF forbids it), so only touched
-//! (hence TRS-defined) nodes are recomposed — matrix-defined nodes keep their parsed local.
 def evaluate_animation(var scene : GltfScene; animation : int; t : float) {
+    //!@nolint
+    //! Evaluate animation `animation` at time `t` (seconds): sample each channel and write the result into
+    //! its target node's TRS, then recompose those nodes' local matrices and refresh every world transform.
+    //! Nodes given by an explicit `matrix` are never animation targets (glTF forbids it), so only touched
+    //! (hence TRS-defined) nodes are recomposed — matrix-defined nodes keep their parsed local.
     if (animation < 0 || animation >= length(scene.animations)) return
     let nch = length(scene.animations[animation].channels)
     for (ci in range(nch)) {
@@ -140,10 +141,11 @@ def evaluate_animation(var scene : GltfScene; animation : int; t : float) {
     update_world_transforms(scene)
 }
 
-//! Skinning matrix for joint slot `j` of skin `skinIndex`: jointNode.world * inverseBind[j]. This is the
-//! palette the GPU multiplies each skinned vertex by; the mesh node's own transform is intentionally
-//! omitted (glTF renders skinned geometry directly in skin space). Returns identity for an invalid index.
 def gltf_joint_matrix(scene : GltfScene; skinIndex, j : int) : float4x4 {
+    //!@nolint
+    //! Skinning matrix for joint slot `j` of skin `skinIndex`: jointNode.world * inverseBind[j]. This is the
+    //! palette the GPU multiplies each skinned vertex by; the mesh node's own transform is intentionally
+    //! omitted (glTF renders skinned geometry directly in skin space). Returns identity for an invalid index.
     if (skinIndex < 0 || skinIndex >= length(scene.skins) ||
         j < 0 || j >= length(scene.skins[skinIndex].joints)) return identity4x4()
     let jn = scene.skins[skinIndex].joints[j]

@@ -639,9 +639,9 @@ def private parse_gltf_json(jsonText : string; var glbBin : array<uint8>; baseDi
     return <- scene
 }
 
-//! Load a glTF 2.0 file (.gltf, .glb, or base64-embedded .gltf) into a
-//! backend-agnostic `GltfScene`. Returns an empty scene on failure.
 def load_gltf(path : string) : GltfScene {
+    //! Load a glTF 2.0 file (.gltf, .glb, or base64-embedded .gltf) into a
+    //! backend-agnostic `GltfScene`. Returns an empty scene on failure.
     var scene : GltfScene
     var fileBytes : array<uint8>
     var haveFile = false
