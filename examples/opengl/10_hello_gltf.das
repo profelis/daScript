@@ -7,15 +7,19 @@ require gltf/gltf_pbr
 require daslib/defer
 require math
 require daslib/math_boost
+require strings
 
 // dasGLTF — minimal static glTF viewer (OpenGL). Loads a .glb, uploads it to GL, and renders it with
 // the metallic-roughness PBR shader under an orbit camera (drag to rotate, scroll to zoom). Sibling to
 // 09_hello_mesh but for full glTF PBR. Defaults to the shipped BoomBox; pass a path as argv[1].
 
 def model_path : string {
-    let args = get_command_line_arguments()
-    if (length(args) > 1 && !empty(args[1])) {
-        return args[1]
+    // get_command_line_arguments() includes the interpreter + script path, so pick the first
+    // argument that actually names a glTF file; otherwise fall back to the shipped BoomBox.
+    for (a in get_command_line_arguments()) {
+        if (ends_with(a, ".glb") || ends_with(a, ".gltf")) {
+            return a
+        }
     }
     return "{get_das_root()}/examples/gltf/media/BoomBox.glb"
 }
