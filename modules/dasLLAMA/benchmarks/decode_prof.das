@@ -38,6 +38,9 @@ struct Args {
     @clarg_doc = "Weight quant mode (default: q8)"
     quant : QuantMode = QuantMode.q8
 
+    @clarg_doc = "KV cache dtype (default: f32)"
+    kv : KVDtype = KVDtype.f32
+
     @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; 1 = thread everything, -1 = keep default)"
     target_work : int = -1
 
@@ -92,9 +95,10 @@ def private mb(v : double) : double => v / (1024.0lf * 1024.0lf)
 
 // Config-derived weight + KV bytes READ per decoded token, split by section, evaluated at context
 // depth `pos` (attention KV traffic grows with position; everything else is position-free).
-def private print_traffic_table(t : Model; pos : int64) {
+def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     let c = t.config
     let wb = wbytes(t.quant)
+    let kv_esize = double(kv_elem_bytes(kvdt))
     let dim = c.dim
     var attn = 0.0lf
     var kv_read = 0.0lf
@@ -104,7 +108,7 @@ def private print_traffic_table(t : Model; pos : int64) {
         let wv = t.wv_offs[l] >= 0l ? double(dim * kvd) : 0.0lf
         attn += (double(dim * qd) + double(dim * kvd) + wv + double(qd * dim)) * wb
         let cnt = layer_is_sliding(c, l) ? min(pos, c.sliding_window) : pos
-        kv_read += double(cnt * kvd) * 2.0lf * 4.0lf
+        kv_read += double(cnt * kvd) * 2.0lf * kv_esize
     }
     var ffn = 0.0lf
     var moe = 0.0lf
@@ -156,13 +160,13 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     print("decode: {n} tokens from ctx {p} in {us}us = {tps} tok/s\n\n")
     forward_profile_report()
     print("\n")
-    print_traffic_table(t, p + n / 2l)
+    print_traffic_table(t, p + n / 2l, s.kv_dtype_k)
     return tok
 }
 
-def private run_profile(var t : Model; p, n, p2 : int64; team : bool) {
+def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype) {
     let c = t.config
-    var s <- make_run_state(c)
+    var s <- make_run_state(c, kvdt, kvdt)
     with_job_que() {
         setup_dasllama_jobque_()   // pooled forks + batched dispatch + spin window + join poll (the engine standard)
         if (team) {   // needs the live job que — must sit inside with_job_que
@@ -249,5 +253,8 @@ def main() {
         set_fused_decode(get_env_variable("DASLLAMA_FUSED_DECODE") != "0")
         print("fused decode override: {get_fused_decode()}\n")
     }
-    run_profile(t, p, n, p2, cfg.team)
+    if (cfg.kv != KVDtype.f32) {
+        print("kv cache dtype: {cfg.kv}\n")
+    }
+    run_profile(t, p, n, p2, cfg.team, cfg.kv)
 }

@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // the respond()/prefill chain + generated NEON kernels overflow the 16K default on arm64 (M1)
 options persistent_heap   // + explicit deletes below: each test frees its model/session before the next loads, so multi-GB weights never accumulate in the process
 
 require dastest/testing_boost public

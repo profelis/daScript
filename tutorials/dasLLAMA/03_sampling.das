@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // the forward/prefill chain + generated kernels need more than the 16K default on arm64
 options persistent_heap   // six fresh sessions below — their deletes must really free (tutorial 04 explains)
 
 require dasllama/dasllama

@@ -403,6 +403,14 @@ var public g_target_is_x64 = false
 // either, so the intrinsics compile their portable fallback bodies: correct, just not fast.
 var public g_target_x64_avx2 = false
 
+// F16C (half<->float convert, VCVTPH2PS/VCVTPS2PH) gate for the f16_cvt intrinsic table — same
+// contract as g_target_x64_avx2, but its OWN cpuid bit, NOT tied to avx2 (Ivy Bridge has F16C
+// without AVX2). Without it, fpext/fptrunc through half on x86-64 lowers to a compiler-rt libcall
+// (__extendhfsf2/__truncsfhf2) the JIT doesn't link — so the gate must stay false there and the
+// calls compile their exact bit-twiddle daslang bodies instead. aarch64 needs no gate: scalar
+// fp16 convert is ARMv8.0 baseline.
+var public g_target_x64_f16c = false
+
 // The AVX kernel-matrix tiers (x64_avx dot32_vnni / dot64_acc16 / mx4_dequant64 families) gate on
 // finer cpuid truth, same contract as g_target_x64_avx2 — each flag guards its own lookup table in
 // llvm_jit_intrin, and a false flag means the call compiles its daslang body (which delegates to
@@ -601,6 +609,7 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
     // which keeps the pre-force cross behavior.
     let x64_cross = g_target_is_x64 && !empty(target_triple)
     g_target_x64_avx2 = g_target_is_x64 && (x64_cross ? x64_forced_feature("avx2") : cpu_supports("avx2"))
+    g_target_x64_f16c = g_target_is_x64 && (x64_cross ? x64_forced_feature("f16c") : cpu_supports("f16c"))
     // Matrix-tier gates (see the declaration comment): cpuid truth OR'd with the
     // DAS_JIT_X64_FORCE_FEATURES emission-only override; forced-only on cross triples.
     g_target_x64_vnni256 = g_target_x64_avx2 && (x64_tier_feature("avxvnni", x64_cross)

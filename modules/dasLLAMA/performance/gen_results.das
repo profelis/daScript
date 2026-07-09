@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // the forward/prefill chain + generated kernels need more than the 16K default on arm64
 options indenting = 4
 
 // The renderer half of the profiling suite: reads every committed profile_llm_<box>.json and emits the

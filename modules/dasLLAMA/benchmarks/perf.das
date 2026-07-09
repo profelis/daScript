@@ -3,10 +3,16 @@ options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%);
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require daslib/jobque_boost
+require daslib/fio
 
 // End-to-end throughput harness — the real metric for "reasonable performance".
 // Run under JIT: bin/daslang -jit modules/dasLLAMA/dasllama_perf.das
-let MODEL_PATH = "/Users/borisbatkin/Work/llama2.c/stories15M.bin"
+// override the machine-local llama2.c checkout with DASLLAMA_LLAMA2C_DIR (same contract as tests/dasLLAMA)
+def private llama2c_dir() : string {
+    let env = get_env_variable("DASLLAMA_LLAMA2C_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/llama2.c" : env
+}
+let MODEL_PATH = path_join(llama2c_dir(), "stories15M.bin")
 let N_TOKENS = 256  // == seq_len; greedy decode from BOS
 
 // matmul FLOPs per generated token: per layer Q/K/V/O + SwiGLU w1/w2/w3, plus the classifier.

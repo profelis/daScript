@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # dasLLAMA token-for-token parity check: reference oracle (simple_ids) vs dasLLAMA (parity.das).
 #
-# Usage:   parity.sh <model.gguf> [N] [quant] [prompt]
+# Usage:   parity.sh <model.gguf> [N] [quant] [prompt] [kv]
 #   N       generated tokens to compare (default 40)
 #   quant   dasLLAMA storage: fp32|q8|q4 — pick the file's native type (default q8; use fp32 for F16/F32)
 #   prompt  raw continuation prompt (default "Once upon a time")
+#   kv      dasLLAMA KV-cache dtype: f32|f16 (default f32; the oracle always runs its own default)
 #
 # Env overrides: LLAMA_CPP (default ~/Work/llama.cpp), DASLANG (default <repo>/bin/daslang)
 # The oracle binary must be built once — see harness/oracle/simple_ids.cpp for the one-line recipe.
@@ -14,6 +15,7 @@ MODEL="${1:?usage: parity.sh <model.gguf> [N] [quant] [prompt]}"
 N="${2:-40}"
 QUANT="${3:-q8}"
 PROMPT="${4:-Once upon a time}"
+KV="${5:-f32}"
 
 LLAMA_CPP="${LLAMA_CPP:-$HOME/Work/llama.cpp}"
 ORACLE="$LLAMA_CPP/build/bin/simple_ids"
@@ -30,7 +32,7 @@ REF_GEN="$(printf '%s\n' "$REF" | sed -n 's/^GEN_IDS: //p')"
 IDS_CSV="$(printf '%s' "$PROMPT_IDS" | tr ' ' ',')"
 
 # 2. dasLLAMA: same prompt ids -> greedy generated ids
-DAS="$("$DASLANG" -jit "$PARITY" -- -m "$MODEL" -n "$N" --quant "$QUANT" --ids "$IDS_CSV" 2>/dev/null)"
+DAS="$("$DASLANG" -jit "$PARITY" -- -m "$MODEL" -n "$N" --quant "$QUANT" --kv "$KV" --ids "$IDS_CSV" 2>/dev/null)"
 DAS_GEN="$(printf '%s\n' "$DAS" | sed -n 's/^GEN_IDS: //p')"
 
 # 3. token-for-token diff

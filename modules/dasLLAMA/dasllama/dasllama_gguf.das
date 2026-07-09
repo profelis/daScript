@@ -4,6 +4,7 @@ module dasllama_gguf shared public
 
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs
 require strings
+require llvm/daslib/f16_cvt public  // f16_to_f32 / f32_to_f16 (re-export: whisper/vad/parakeet/audio callers)
 
 // Generic GGUF (v2/v3) reader: parses the header, typed key-value metadata, and the
 // tensor-info table out of an mmap'd byte buffer, then exposes typed getters. Knows nothing
@@ -79,54 +80,6 @@ def private rd_str(b : array<uint8> | #; var o : int64&) : string {
     }
     o += n
     return s
-}
-
-//! Convert an IEEE-754 binary16 (held in the low 16 bits) to fp32.
-def f16_to_f32(h : uint) : float {
-    let exp = (h >> 10u) & 0x1Fu
-    let mant = h & 0x3FFu
-    let neg = (h & 0x8000u) != 0u
-    if (exp == 0u) {  // zero or subnormal: value = mant * 2^-24, exactly representable in fp32
-        let v = float(mant) * 5.9604644775390625e-8
-        return neg ? -v : v
-    }
-    let sign = (h & 0x8000u) << 16u
-    var bits : uint
-    if (exp == 0x1Fu) {  // inf / nan
-        bits = sign | 0x7F800000u | (mant << 13u)
-    } else {  // normal: rebias exponent 15 -> 127 (+112), widen mantissa 10 -> 23 bits
-        bits = sign | ((exp + 112u) << 23u) | (mant << 13u)
-    }
-    return unsafe(reinterpret<float>(bits))
-}
-
-//! Convert fp32 to IEEE-754 binary16 bits, round-to-nearest-even (matches ARM fcvt / x86
-//! F16C hardware conversion — what ggml's FP32_TO_FP16 compiles to on both oracles).
-def f32_to_f16(f : float) : uint {
-    let bits = unsafe(reinterpret<uint>(f))
-    let sign = (bits >> 16u) & 0x8000u
-    let absb = bits & 0x7FFFFFFFu
-    if (absb > 0x7F800000u) {          // nan -> quiet nan
-        return sign | 0x7E00u
-    }
-    if (absb >= 0x47800000u) {         // inf, or >= 65536 (overflows past f16 max)
-        return sign | 0x7C00u
-    }
-    if (absb >= 0x38800000u) {         // normal f16 range (>= 2^-14): rebias, RNE off 13 bits
-        let v = absb - 0x38000000u     // exponent field now f16-biased, aligned at bit 23
-        return sign | ((v + 0xFFFu + ((v >> 13u) & 1u)) >> 13u)  // mantissa carry -> inf is correct IEEE overflow
-    }
-    let e = absb >> 23u                // subnormal or zero: h = round(m·2^(e-126)) in 2^-24 units
-    let m = (absb & 0x7FFFFFu) | 0x800000u
-    if (e < 102u || (e == 102u && m == 0x800000u)) {  // below 2^-25, or exactly 2^-25 (tie to even 0)
-        return sign
-    }
-    let sh = 126u - e                  // e in [102,112] -> sh in [14,24]
-    let base = m >> sh
-    let rem = m & ((1u << sh) - 1u)
-    let half = 1u << (sh - 1u)
-    let up = rem > half || (rem == half && (base & 1u) == 1u)
-    return sign | (up ? base + 1u : base)  // carry into 0x0400 = smallest normal, also correct
 }
 
 // E8M0 block scale -> fp32 * 0.5 = 2^(e-128) (the half matches the doubled MXFP4_KVALUES).

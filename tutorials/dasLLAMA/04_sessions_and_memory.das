@@ -57,7 +57,7 @@ def section_kv_cache(var m : Model) {
     print("native ctx {c.seq_len} -> KV cache would be ~{mb(native_kv)} MB per session\n")
     m.config.seq_len = min(m.config.seq_len, CTX)
     var s = create_session(m)
-    let kv_bytes = int64(length(s.key_cache) + length(s.value_cache)) * 4l
+    let kv_bytes = int64(length(s.key_cache) + length(s.value_cache))   // codec-encoded byte blobs — length IS bytes
     print("capped ctx {m.config.seq_len} -> this session's KV cache is {mb(kv_bytes)} MB\n\n")
     delete s   // sessions are freed as soon as a section is done with them — Section 4 explains
 }

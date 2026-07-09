@@ -7,9 +7,11 @@ options gen2
 //! Gemma-2/3/4, Qwen-MoE, gpt-oss) — ``load_model`` dispatches on GGUF metadata, so the same
 //! program runs any of them.
 //!
-//! Run model programs with ``-jit`` (interpreted inference is far too slow), and wrap the
-//! generation in ``with_job_que()`` from ``daslib/jobque_boost`` so the kernels can thread —
-//! see ``examples/dasLLAMA/run.das`` and ``chat.das`` for the canonical shape.
+//! Run model programs with ``-jit`` (interpreted inference is far too slow), wrap the
+//! generation in ``with_job_que()`` from ``daslib/jobque_boost`` so the kernels can thread, and
+//! declare ``options stack = 65536`` — the forward chain outgrows the 16K default on arm64, and
+//! a required module cannot raise the program's stack for you. See ``examples/dasLLAMA/run.das``
+//! and ``chat.das`` for the canonical shape.
 
 module dasllama shared public
 
@@ -41,11 +43,15 @@ def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     return <- load_model_(path, mode)
 }
 
-def create_session(model : Model) : Session {
+def create_session(model : Model; kv_dtype : KVDtype = KVDtype.f16) : Session {
     //! Create a fresh session (KV cache + scratch) sized to ``model.config.seq_len``. A model serves
     //! many sessions, each with its own position and cache — one model, many independent conversations.
     //! On large-context models cap ``model.config.seq_len`` BEFORE creating sessions to bound KV memory.
-    return <- create_session_(model)
+    //! ``kv_dtype`` picks this session's KV-cache codec — the ``KVDtype.f16`` default halves the KV
+    //! bytes and speeds up deep-context decode (near-lossless: stores clamp to ±65504; llama.cpp's
+    //! default is F16 too); pass ``KVDtype.f32`` for the bit-exact reference. Per-session state, so
+    //! sessions with different codecs and parallel models never interact.
+    return <- create_session_(model, kv_dtype, kv_dtype)
 }
 
 def encode(model : Model; text : string; add_special = true; parse_special = false) : array<int64> {
@@ -80,6 +86,24 @@ def eval_embd(model : Model; var session : Session; embd : array<float>; npos : 
     //! entry — fill text spans with ``embed_text_rows`` and media spans with an encoder tower's
     //! soft tokens (see ``examples/dasLLAMA/audio.das``). Logits land in ``session.logits``.
     eval_embd_(model, session, embd, npos)
+}
+
+def create_batch_workspace(model : Model) : BatchWorkspace {
+    //! Create the caller-owned scratch that ``eval_batch`` steps through — one per concurrent batch,
+    //! reused across calls (buffers grow to the largest batch seen). Holds no session state: the
+    //! sessions keep their own positions, caches and logits.
+    return <- create_batch_workspace_(model)
+}
+
+def eval_batch(model : Model; var ws : BatchWorkspace; var sessions : array<Session?>; tokens : array<int64>) {   // nolint:LINT014 — rows mutate THROUGH the pointers; a const array constifies the pointees
+    //! One synchronous batched decode step: row i evals ``tokens[i]`` at ``sessions[i]``'s current
+    //! position, logits land in ``sessions[i].logits``, and each session advances by one — B
+    //! independent conversations through ONE pass of the weights (the weight GEMVs batch into GEMMs;
+    //! attention stays per-session). Sessions must be distinct, same-geometry (one model, equal
+    //! cache sizes, uniform KV dtype) and each have room for one more position. Ragged batches:
+    //! pass only the still-active sessions — B may shrink between calls. B == 1 and q4 weights
+    //! delegate to the exact per-session ``forward`` path.
+    eval_batch_(model, ws, sessions, tokens)
 }
 
 def sample(var session : Session; params : SamplingParams) : int64 {
@@ -133,20 +157,21 @@ def embed(model : Model; text : string) : array<float> {
 
 // ===== Chat =====
 
-def create_chat(model : Model; system : string = ""; max_new : int64 = 256l) : ChatSession {
+def create_chat(model : Model; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
     //! Start a conversation over ``model``: resolves the model's chat template (sniffed from the GGUF's
     //! embedded template, falling back to the arch registry) and creates the session. ``system`` is the
     //! system prompt (empty = none); ``max_new`` caps each reply. One model can drive many chats.
-    return <- create_chat_(model, system, max_new)
+    //! ``kv_dtype`` is the session's KV-cache codec (f16 default — see ``create_session``).
+    return <- create_chat_(model, system, max_new, kv_dtype)
 }
 
-def create_chat(model : Model; var tower : AudioTower; system : string = ""; max_new : int64 = 256l) : ChatSession {
+def create_chat(model : Model; var tower : AudioTower; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
     //! Start an AUDIO-CAPABLE conversation: the chat takes ownership of ``tower`` (moved in — load
     //! one with ``load_audio_tower``) so ``add_user_audio`` can splice audio into its turns. The
     //! prompt shape around the audio span comes from the model's chat template (qwen2-family audio
     //! markers, llama-3 bare embeddings, voxtral ``[BEGIN_AUDIO]``). Panics on a mismatched
-    //! decoder/mmproj pair.
-    return <- create_chat_(model, tower, system, max_new)
+    //! decoder/mmproj pair. ``kv_dtype`` is the session's KV-cache codec (f16 default).
+    return <- create_chat_(model, tower, system, max_new, kv_dtype)
 }
 
 def add_user(var chat : ChatSession; text : string) {
