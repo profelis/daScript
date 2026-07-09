@@ -2054,6 +2054,25 @@ expr_method_call_no_bracket
         delete $method_name;
         $$ = pInvoke;
     }
+    |   expr_no_bracket[left] RARROW[loc] NAME[method_name] '(' '[' make_struct_fields[list] ']' ')' {
+        auto nc = new ExprNamedCall(tokAt(scanner,@method_name),*$method_name);
+        nc->methodCall = true;
+        nc->arguments = $list;
+        nc->nonNamedArguments.push_back($left);
+        delete $method_name;
+        $$ = nc;
+    }
+    |   expr_no_bracket[left] RARROW[loc] NAME[method_name] '(' expr_list[arguments] ',' make_struct_fields[list] ')' {
+        // bracket-less mixed named method call: a->m(pos..., name = value)
+        auto nc = new ExprNamedCall(tokAt(scanner,@method_name),*$method_name);
+        nc->methodCall = true;
+        nc->arguments = $list;
+        nc->nonNamedArguments.push_back($left);
+        auto callArgs = sequenceToList($arguments);
+        nc->nonNamedArguments.insert ( nc->nonNamedArguments.end(), callArgs.begin(), callArgs.end() );
+        delete $method_name;
+        $$ = nc;
+    }
     ;
 
 func_addr_name

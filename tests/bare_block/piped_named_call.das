@@ -182,3 +182,28 @@ def test_piped_named_in_generic(t : T?) {
     // the piped named call lives in a generic body; the positional and block must survive the clone
     t |> equal(in_generic(5), 9)
 }
+
+[test]
+def test_arrow_named_piped_block(t : T?) {
+    // '->' arrow form parses to the same ExprNamedCall as '.', so the piped-block padding
+    // applies identically. free function via dot-target struct:
+    let h = Holder(v = 100)
+    let r = h->setv("go", x = 5) {
+        return 20
+    }
+    t |> equal(r, 125)
+    // genuine class method via '->', block param last behind a defaulted 'indent' -> pads
+    var f = new Frame(depth = 100)
+    let r1 = f->region("hdr", indent = 5) {
+        return 1
+    }
+    t |> equal(r1, 106)
+    unsafe { delete f }
+    // struct method via '->', block param last behind a defaulted 'pad' -> pads
+    var b = new Box(v = 10)
+    let r2 = b->cell("hdr", pad = 5) {
+        return 1
+    }
+    t |> equal(r2, 16)
+    unsafe { delete b }
+}
