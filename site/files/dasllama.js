@@ -13,7 +13,11 @@
   };
 
   function fmt(n, d) { return Number(n).toFixed(d == null ? 0 : d); }
-  function ratio(a, b) { return a / b; }
+  function tps(v) { return v > 0 ? fmt(v, 1) : '-'; }   // tok/s cell; '-' when unmeasured (matches gen_results cell_tps)
+  // das / reference throughput ratio, or null when the @optional reference wasn't measured
+  // (matches gen_results cell_ratio: both sides must be > 0). Null rows are excluded from
+  // win counts, sorting, bars, and get a '-' cell — never a NaN.
+  function ratio(das, ref) { return (ref > 0 && das > 0) ? das / ref : null; }
 
   // Map an LLM ratio to a 0–100 bar position, centered at 1.0× (50%),
   // one octave (2×) to full scale, in log space.
@@ -30,18 +34,26 @@
     var d = DATA['llm_' + box];
     var rows = d.tests.slice();
 
-    var wins = 0, ties = 0;
+    var wins = 0, ties = 0, measured = 0;
     rows.forEach(function (t) {
       var r = ratio(t[phase].das_tok_s, t[phase].llama_cpp_tok_s);
+      if (r === null) return;              // no reference on this box → not counted
+      measured++;
       if (r > 1.005) wins++; else if (r >= 0.995) ties++;
     });
 
-    // bars (sorted by ratio, descending)
-    var barRows = rows.slice().sort(function (a, b) {
-      return ratio(b[phase].das_tok_s, b[phase].llama_cpp_tok_s) - ratio(a[phase].das_tok_s, a[phase].llama_cpp_tok_s);
-    });
+    // bars (sorted by ratio, descending; unmeasured rows sort last)
+    function rval(t) { var r = ratio(t[phase].das_tok_s, t[phase].llama_cpp_tok_s); return r === null ? -Infinity : r; }
+    var barRows = rows.slice().sort(function (a, b) { return rval(b) - rval(a); });
     var barsHTML = barRows.map(function (t) {
       var r = ratio(t[phase].das_tok_s, t[phase].llama_cpp_tok_s);
+      if (r === null) {                    // no computable ratio → neutral bar, no NaN geometry
+        return '<div class="dl-bar">' +
+          '<div class="dl-bar__label">' + t.model + '</div>' +
+          '<div class="dl-bar__track"><div class="dl-bar__center"></div></div>' +
+          '<div class="dl-bar__val" style="color:var(--fg-faint)">-</div>' +
+        '</div>';
+      }
       var pos = octPos(r);
       var win = r >= 0.995;
       var left = Math.min(50, pos), width = Math.abs(pos - 50);
@@ -57,6 +69,11 @@
     }).join('');
 
     // full table
+    function rcell(r) {
+      return r === null
+        ? '<td class="dl-num dl-dim">-</td>'
+        : '<td class="dl-num ' + (r >= 0.995 ? 'dl-win' : 'dl-loss') + '">' + fmt(r, 2) + '×</td>';
+    }
     var tableHTML = rows.map(function (t) {
       var pr = ratio(t.prefill.das_tok_s, t.prefill.llama_cpp_tok_s);
       var er = ratio(t.emission.das_tok_s, t.emission.llama_cpp_tok_s);
@@ -64,18 +81,18 @@
         '<td class="dl-td-model">' + t.model + '</td>' +
         '<td class="dl-num">' + fmt(t.active_b, 2) + '</td>' +
         '<td class="dl-num">' + fmt(t.prefill.das_tok_s, 1) + '</td>' +
-        '<td class="dl-num dl-dim">' + fmt(t.prefill.llama_cpp_tok_s, 1) + '</td>' +
-        '<td class="dl-num ' + (pr >= 0.995 ? 'dl-win' : 'dl-loss') + '">' + fmt(pr, 2) + '×</td>' +
+        '<td class="dl-num dl-dim">' + tps(t.prefill.llama_cpp_tok_s) + '</td>' +
+        rcell(pr) +
         '<td class="dl-num">' + fmt(t.emission.das_tok_s, 1) + '</td>' +
-        '<td class="dl-num dl-dim">' + fmt(t.emission.llama_cpp_tok_s, 1) + '</td>' +
-        '<td class="dl-num ' + (er >= 0.995 ? 'dl-win' : 'dl-loss') + '">' + fmt(er, 2) + '×</td>' +
+        '<td class="dl-num dl-dim">' + tps(t.emission.llama_cpp_tok_s) + '</td>' +
+        rcell(er) +
         '</tr>';
     }).join('');
 
     var phaseLabel = phase === 'prefill' ? 'prefill · prompt processing' : 'decode · token generation';
     document.getElementById('llm-bars').innerHTML = barsHTML;
     document.getElementById('llm-caption').innerHTML =
-      '<span class="dl-win">' + wins + ' / ' + rows.length + '</span> models faster' +
+      '<span class="dl-win">' + wins + ' / ' + measured + '</span> models faster' +
       (ties ? ' · ' + ties + ' tie' + (ties > 1 ? 's' : '') : '') +
       ' &nbsp;·&nbsp; ' + phaseLabel + ' &nbsp;·&nbsp; ' + BOX_LABEL[box].name;
     document.getElementById('llm-table-body').innerHTML = tableHTML;
