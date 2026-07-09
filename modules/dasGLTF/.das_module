@@ -1,0 +1,10 @@
+options gen2
+require daslib/fio
+
+[export]
+def initialize(project_path : string) {
+    let gltf_paths = ["gltf_types", "gltf_accessor", "gltf_parse", "gltf_scene", "gltf_boost"]
+    for (path in gltf_paths) {
+        register_native_path("gltf", "{path}", "{project_path}/gltf/{path}.das")
+    }
+}

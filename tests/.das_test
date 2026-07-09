@@ -26,6 +26,10 @@ def can_visit_folder(folder_name : string; var result : bool?) {
         *result = has_module("stbimage")
         return
     }
+    if (folder_name == "dasGLTF") {
+        *result = has_module("gltf")
+        return
+    }
     if (folder_name == "minfft") {
         *result = has_module("minfft")
         return
