@@ -4302,8 +4302,9 @@ def private prefill_attention(var s : Session; kbase, vbase, npos, start_pos, he
 // every dense arch. Keep the per-section profiler buckets (prof_add) so forward_profile_report stays
 // intact. Bit-identical to the inlined form.
 
-// attn-norm → batched QKV(+bias) → RoPE → KV-store → prefill attention → out-proj(+post-norm) → residual.
-def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : int64; start_pos : int64) {
+// attn-norm → batched QKV(+bias) → qk/v-norm → RoPE, for npos rows of x_b into q_b/k_b/v_b — the
+// position-free head of the std attention block, shared by prefill and (later) batched decode.
+def private attn_qkv_rope_prefix(t : Model; var s : Session; l : int64; npos : int64; start_pos : int64) {
     let c = t.config
     let dim = c.dim
     let kv_dim = layer_kv_dim(c, l)
@@ -4311,11 +4312,7 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     let n_heads = c.n_heads
     let n_kv_heads = layer_n_kv_heads(c, l)
     let qd = n_heads * head_size
-    let kv_mul = n_heads / n_kv_heads
-    let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
     let use_rope_tab = g_use_rope_table
-    let kbase = kv_base_k(s, l, c.seq_len)   // this layer's slab base BYTES (aliases the source layer when shared)
-    let vbase = kv_base_v(s, l, c.seq_len)
     // sliding vs global attention per the arch's layer pattern (see attention_std_decode)
     let is_sliding = layer_is_sliding(c, l)
     // gemma-4 E-series shared-KV layer: project Q only, attend against the source layer's cache (loff aliases it)
@@ -4387,6 +4384,46 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
         rope_batch(s.q_b, s.k_b, t, theta, fscale, start_pos, npos, head_size, qd, rope_kv, use_ff)
     }
     prof_add("rope", ts_rope)
+}
+
+// out-proj(+bias, +post-norm) → residual, for npos rows of xb_b back into x_b — the position-free
+// tail of the std attention block, shared by prefill and (later) batched decode.
+def private attn_out_suffix(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let qd = c.n_heads * layer_head_size(c, l)
+    // output projection (batched, qd -> dim) + optional bias + post-attn norm + residual
+    let ts_wo = ref_time_ticks()
+    mm_b(s.xb2_b, t, t.wo_offs[l], s.xb_b, s.xqb, s.xsb, qd, dim, npos)
+    if (c.attn_out_bias) {  // gpt-oss: + bias per position on the projected attention output
+        for (p in range64(npos)) {
+            add_bias(s.xb2_b, p * dim, t.bo, l * dim, dim)
+        }
+    }
+    prof_add("mm_wo", ts_wo)
+    let ts_resid0 = ref_time_ticks()
+    if (c.pre_post_norm) {  // Gemma2: post-attention RMSNorm per position before residual
+        rms_batch(s.xb2_b, s.xb2_b, t, t.rms_post_att_off + l * dim, dim, npos)
+    }
+    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
+    prof_add("act_resid", ts_resid0)
+}
+
+// attn-norm → batched QKV(+bias) → RoPE → KV-store → prefill attention → out-proj(+post-norm) → residual.
+def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : int64; start_pos : int64) {
+    let c = t.config
+    let kv_dim = layer_kv_dim(c, l)
+    let head_size = layer_head_size(c, l)
+    let n_heads = c.n_heads
+    let n_kv_heads = layer_n_kv_heads(c, l)
+    let qd = n_heads * head_size
+    let kv_mul = n_heads / n_kv_heads
+    let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
+    let kbase = kv_base_k(s, l, c.seq_len)   // this layer's slab base BYTES (aliases the source layer when shared)
+    let vbase = kv_base_v(s, l, c.seq_len)
+    let is_sliding = layer_is_sliding(c, l)
+    let kv_shared = t.kv_src[l] != l
+    attn_qkv_rope_prefix(t, s, l, npos, start_pos)
     // store the roped k / raw v into the KV cache — a SEPARATE pass (provably identical to
     // interleaving: rope of pos p touches only q_b[p]/k_b[p], the copy reads only k_b[p]/v_b[p]).
     // Shared-KV layers store nothing — the source layer (processed earlier) already cached its K/V.
@@ -4406,21 +4443,7 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     prefill_attention(s, kbase, vbase, npos, start_pos, head_size, qd, kv_dim, n_heads, kv_mul, scale,
                       is_sliding, c.sliding_window, c.attn_logit_softcap, sinksp)
     prof_add("attn", ts_attn)
-    // output projection (batched, qd -> dim) + optional bias + post-attn norm + residual
-    let ts_wo = ref_time_ticks()
-    mm_b(s.xb2_b, t, t.wo_offs[l], s.xb_b, s.xqb, s.xsb, qd, dim, npos)
-    if (c.attn_out_bias) {  // gpt-oss: + bias per position on the projected attention output
-        for (p in range64(npos)) {
-            add_bias(s.xb2_b, p * dim, t.bo, l * dim, dim)
-        }
-    }
-    prof_add("mm_wo", ts_wo)
-    let ts_resid0 = ref_time_ticks()
-    if (c.pre_post_norm) {  // Gemma2: post-attention RMSNorm per position before residual
-        rms_batch(s.xb2_b, s.xb2_b, t, t.rms_post_att_off + l * dim, dim, npos)
-    }
-    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
-    prof_add("act_resid", ts_resid0)
+    attn_out_suffix(t, s, l, npos)
 }
 
 // ffn-norm → batched gated FFN → down-proj(+post-norm) → residual.
