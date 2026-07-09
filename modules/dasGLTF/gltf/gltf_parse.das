@@ -294,7 +294,35 @@ def private decode_uints(gltf : JGltf; buffers : array<array<uint8>>; ai : int) 
             }
         }
     }
+    apply_sparse_uints(gltf, buffers, acc, result)
     return <- result
+}
+
+// Sparse override for a uint (index) accessor, mirroring apply_sparse_floats. Rare for index
+// accessors, but glTF allows it and decode_floats already honors sparse, so keep the two consistent.
+def private apply_sparse_uints(gltf : JGltf; buffers : array<array<uint8>>; acc : JAccessor; var result : array<uint>) {
+    if (acc.sparse.count <= 0) return
+    let sp = acc.sparse
+    if (sp.indices.bufferView < 0 || sp.indices.bufferView >= length(gltf.bufferViews)
+            || sp.values.bufferView < 0 || sp.values.bufferView >= length(gltf.bufferViews)) return
+    let ibv = gltf.bufferViews[sp.indices.bufferView]
+    let iCompSize = gltf_comp_size(sp.indices.componentType)
+    let iStride = ibv.byteStride != 0 ? int64(ibv.byteStride) : iCompSize
+    let iBase = int64(ibv.byteOffset) + int64(sp.indices.byteOffset)
+    let vbv = gltf.bufferViews[sp.values.bufferView]
+    let vCompSize = gltf_comp_size(acc.componentType)
+    let vStride = vbv.byteStride != 0 ? int64(vbv.byteStride) : vCompSize
+    let vBase = int64(vbv.byteOffset) + int64(sp.values.byteOffset)
+    let iSpan = sp.count > 0 ? int64(sp.count - 1) * iStride + iCompSize : 0l
+    let vSpan = sp.count > 0 ? int64(sp.count - 1) * vStride + vCompSize : 0l
+    if (!buffer_range_ok(buffers, ibv.buffer, iBase, iSpan) || !buffer_range_ok(buffers, vbv.buffer, vBase, vSpan)) return
+    for (k in range(sp.count)) {
+        let target = int(gltf_read_comp_uint(buffers[ibv.buffer], iBase + int64(k) * iStride, sp.indices.componentType))
+        let v = gltf_read_comp_uint(buffers[vbv.buffer], vBase + int64(k) * vStride, acc.componentType)
+        if (target >= 0 && target < length(result)) {
+            result[target] = v
+        }
+    }
 }
 
 def private decode_mat4(gltf : JGltf; buffers : array<array<uint8>>; ai : int) : array<float4x4> {

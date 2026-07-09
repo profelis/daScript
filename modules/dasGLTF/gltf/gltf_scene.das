@@ -6,12 +6,14 @@ module gltf_scene shared
 require gltf/gltf_types
 require math
 
-def private update_node_world(var scene : GltfScene; ni : int; parent : float4x4) {
-    if (ni < 0 || ni >= length(scene.nodes)) return
+def private update_node_world(var scene : GltfScene; ni : int; parent : float4x4; var visited : array<bool>) {
+    // out of range, or already visited (cycle guard: a malformed glTF hierarchy could loop forever)
+    if (ni < 0 || ni >= length(scene.nodes) || visited[ni]) return
+    visited[ni] = true
     scene.nodes[ni].world = parent * scene.nodes[ni].local
     let w = scene.nodes[ni].world
     for (c in scene.nodes[ni].children) {
-        update_node_world(scene, c, w)
+        update_node_world(scene, c, w, visited)
     }
 }
 
@@ -19,9 +21,12 @@ def update_world_transforms(var scene : GltfScene) {
     //! Recompute every node's `world` transform by walking the hierarchy from the
     //! scene roots (world = parent.world * local).
     let id = identity4x4()
+    var visited : array<bool>
+    visited |> resize(length(scene.nodes))
     for (r in scene.roots) {
-        update_node_world(scene, r, id)
+        update_node_world(scene, r, id, visited)
     }
+    delete visited
 }
 
 def gltf_scene_bounds(scene : GltfScene) : tuple<float3; float3> {

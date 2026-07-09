@@ -265,6 +265,11 @@ def private bind_skin_palette(scene : GltfScene; skinIndex : int; root : float4x
     for (j in range(njoint)) {
         u_joints[j] = root * gltf_joint_matrix(scene, skinIndex, j)
     }
+    // clear the unused slots so a clamped / out-of-range joint index reads identity rather than a
+    // stale matrix left over from a previously-bound skin
+    for (j in range(njoint, GLTF_MAX_JOINTS)) {
+        u_joints[j] = identity4x4()
+    }
 }
 
 //! Render every mesh instance in `scene` with the PBR shader, using the GL objects in `model`. A node
