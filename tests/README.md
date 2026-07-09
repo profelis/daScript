@@ -107,8 +107,8 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_piped_block_mismatch.das | Piped block signature mismatch after padding | **expect** `30341` |
 | failed_piped_no_block_param.das | No block-like parameter for the piped block to land on | **expect** `30341` |
 | failed_piped_ambiguous.das | Two overloads with equal padding — ambiguous piped call | **expect** `30341` |
-| piped_named_call.das | Named-argument call + piped block — block becomes the trailing positional (free-fn and method forms) | |
-| failed_piped_named_padding.das | Piped block on a named call does not pad across a default param to a later block param (padding for named calls is a follow-up) | **expect** `30341` |
+| piped_named_call.das | Named-argument call + piped block — block pads across defaults to a later block param (free-fn, free-fn-via-dot, generic, and genuine class/struct-method forms, incl. implicit self) | |
+| failed_piped_named_padding.das | Piped block on a named call can't land — a non-default param blocks the pad, or there's no block param at all (free-fn and class-method forms) | **expect** `30341:4` |
 | failed_piped_field.das | Field access + piped block is a parse error | **expect** `30347` |
 | test_bare_block.das | Bare lexical blocks — scoping, nesting, finally, control flow, name reuse | |
 | test_block_in_finally.das | Block locals + finally/defer — invoked from defer/plain finally, declared after defer, early-return path, loop-iterator capture, by-ref mutation visibility (AOT hoisted-block codegen) | |
@@ -654,9 +654,9 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | failed_aka.das | Global aka and typedef aka produce errors | **expect** `20000:1` |
 | failed_aliasing.das | Aliasing errors with `no_aliasing` option | **expect** `40211:23` `40212:3` |
 | failed_block.das | Block variable initialization failures | **expect** `30108` `30113` |
-| failed_call_depth.das | Recursive default argument expansion — max call depth exceeded | **expect** `41000:1` `30301:50` |
 | failed_capture_self.das | Capturing `self` in lambda fails | **expect** `30508` `30124` |
 | failed_constants.das | Out-of-range numeric literal errors | **expect** `10006:12` `10010:4` |
+| failed_recursive_default.das | A struct method whose default argument calls itself — the recursive named call can't resolve and the auto return type can't be inferred through the recursion | **expect** `30161` `30237` `30341` `30344` `30805` |
 | failed_table_lookup_collision.das | Table lookup collision lint — same table indexed twice in one expression | **expect** `40216:7` |
 | finally.das | `finally` blocks — exceptions, loops, nested, return | |
 | for_const_array.das | For-loop over `fixed_array` constant | |
@@ -732,7 +732,7 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | move_lambda_local_ref.das | `capture(<- arr)` moving array into lambda | |
 | move_on_return.das | Move with `finally` delete — pipeline array return | |
 | failed_named_call.das | Named arguments — reordering, skipping, defaults, error cases | **expect** `30304:12` `30101:1` `30507:1` |
-| named_call.das | Bracket-less named call args — bare mixed `foo(pos, name=v)`, multi-named, bracketed regression, move `<-` / clone `:=`, overload + generic pick, piped block, method form | |
+| named_call.das | Bracket-less named call args — bare mixed `foo(pos, name=v)`, multi-named, bracketed regression, move `<-` / clone `:=`, overload + generic pick, piped block, free-fn-via-dot and genuine class-method forms (middle positional after self) | |
 | failed_named_call_bare.das | Bad named args — unknown/duplicate/missing/out-of-order name, overlap with a filled slot | **expect** `30341:5` |
 | failed_named_call_order.das | Named argument must be a strict suffix — a positional after a named arg is a syntax error | **expect** `30151` |
 | new_and_init.das | `new_and_init` — allocate and copy struct with `always_export_initializer` | |

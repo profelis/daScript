@@ -501,59 +501,14 @@ namespace das {
         if (pipedFns.empty() && pipedGens.empty()) {
             return false;
         }
-        // least padding wins; functions win over generics at equal padding
-        auto minPad = [&](const MatchingFunctions &fns) -> int {
-            int best = -1;
-            for (auto fn : fns) {
-                auto pad = landing[fn].second;
-                if (best < 0 || pad < best) best = pad;
-            }
-            return best;
-        };
-        int bestFn = minPad(pipedFns);
-        int bestGen = minPad(pipedGens);
-        bool useGenerics = bestFn < 0 || (bestGen >= 0 && bestGen < bestFn);
-        auto & pool = useGenerics ? pipedGens : pipedFns;
-        int best = useGenerics ? bestGen : bestFn;
-        MatchingFunctions winners;
-        for (auto fn : pool) {
-            if (landing[fn].second == best) {
-                winners.push_back(fn);
-            }
-        }
-        if (winners.size() > 1) {
-            // aligned substitute distance over the slots the user actually filled (cf. computeSubstituteDistance)
-            int p = int(types.size()) - 1;
-            vector<pair<int, Function *>> fnm;
-            for (auto fn : winners) {
-                int dist = 0;
-                for (int ai = 0, ais = int(types.size()); ai != ais; ++ai) {
-                    const auto &funType = fn->arguments[ai < p ? ai : landing[fn].first]->type;
-                    if (!types[ai]->isSameType(*funType, RefMatters::no, ConstMatters::no,
-                                               TemporaryMatters::no, AllowSubstitute::no)) {
-                        dist += 100;
-                    }
-                    if (funType->constant != types[ai]->constant) {
-                        dist += 1;
-                    }
-                }
-                fnm.push_back(make_pair(dist, fn));
-            }
-            stable_sort(fnm.begin(), fnm.end(), [](const pair<int, Function *> &a, const pair<int, Function *> &b) { return a.first < b.first; });
-            if (fnm[0].first != fnm[1].first) {
-                winners.resize(1);
-                winners[0] = fnm[0].second;
-            }
-        }
-        if (winners.size() != 1) {
-            // ambiguous; expose non-generic candidates so the regular excess report lists them.
-            // ambiguous generics stay hidden - the generic machinery downstream assumes positional alignment
-            if (!useGenerics) {
-                functions = winners;
-            }
+        bool useGenerics = false;
+        MatchingFunctions ambiguous;
+        auto winner = selectPipedWinner(pipedFns, pipedGens, types, landing, useGenerics, ambiguous);
+        if (!winner) {
+            // expose non-generic ambiguous candidates for the excess report (empty when generics are ambiguous)
+            if (!ambiguous.empty()) functions = ambiguous;
             return false;
         }
-        auto winner = winners.front();
         int p = int(types.size()) - 1;
         int k = landing[winner].first;
         // resolve all padded defaults first - bail without mutating the call if one is not ready yet
@@ -585,6 +540,294 @@ namespace das {
             functions.push_back(winner);
         }
         return true;
+    }
+    Function * InferTypes::selectPipedWinner(MatchingFunctions &pipedFns, MatchingFunctions &pipedGens,
+            const vector<TypeDeclPtr> &types, das_hash_map<Function *, pair<int, int>> &landing,
+            bool &useGenerics, MatchingFunctions &ambiguousFunctions) const {
+        // least padding wins; functions win over generics at equal padding
+        auto minPad = [&](const MatchingFunctions &fns) -> int {
+            int best = -1;
+            for (auto fn : fns) {
+                auto pad = landing[fn].second;
+                if (best < 0 || pad < best) best = pad;
+            }
+            return best;
+        };
+        int bestFn = minPad(pipedFns);
+        int bestGen = minPad(pipedGens);
+        useGenerics = bestFn < 0 || (bestGen >= 0 && bestGen < bestFn);
+        auto & pool = useGenerics ? pipedGens : pipedFns;
+        int best = useGenerics ? bestGen : bestFn;
+        MatchingFunctions winners;
+        for (auto fn : pool) {
+            if (landing[fn].second == best) {
+                winners.push_back(fn);
+            }
+        }
+        if (winners.size() > 1) {
+            // aligned substitute distance over the slots the user actually filled (cf. computeSubstituteDistance).
+            // types is positionals + block (block last) in both the positional and named cases, so paramAt aligns
+            // it the same way; named args match by name and don't participate in this distance.
+            int p = int(types.size()) - 1;
+            vector<pair<int, Function *>> fnm;
+            for (auto fn : winners) {
+                int dist = 0;
+                for (int ai = 0, ais = int(types.size()); ai != ais; ++ai) {
+                    const auto &funType = fn->arguments[ai < p ? ai : landing[fn].first]->type;
+                    if (!types[ai]->isSameType(*funType, RefMatters::no, ConstMatters::no,
+                                               TemporaryMatters::no, AllowSubstitute::no)) {
+                        dist += 100;
+                    }
+                    if (funType->constant != types[ai]->constant) {
+                        dist += 1;
+                    }
+                }
+                fnm.push_back(make_pair(dist, fn));
+            }
+            stable_sort(fnm.begin(), fnm.end(), [](const pair<int, Function *> &a, const pair<int, Function *> &b) { return a.first < b.first; });
+            if (fnm[0].first != fnm[1].first) {
+                winners.resize(1);
+                winners[0] = fnm[0].second;
+            }
+        }
+        if (winners.size() != 1) {
+            // ambiguous generics stay hidden - the generic machinery downstream assumes positional alignment
+            if (!useGenerics) {
+                ambiguousFunctions = winners;
+            }
+            return nullptr;
+        }
+        return winners.front();
+    }
+    bool InferTypes::isFunctionCompatiblePipedNamedAt(Function *pFn, const vector<TypeDeclPtr> &nonNamedTypes,
+            const vector<MakeFieldDeclPtr> &arguments, int blockParam, bool inferAuto) const {
+        int p = int(nonNamedTypes.size()) - 1;   // positionals fill 0..p-1; nonNamedTypes[p] is the piped block
+        int M = int(pFn->arguments.size());
+        if (p < 0 || blockParam <= p || blockParam >= M) {
+            return false;
+        }
+        // specialized annotations gate matching on positionally-aligned types - bail conservatively
+        for (const auto &ann : pFn->annotations) {
+            if (static_cast<FunctionAnnotation*>(ann->annotation)->isSpecialized()) {
+                return false;
+            }
+        }
+        vector<bool> filled(M, false);
+        // leading positionals
+        for (int i = 0; i < p; ++i) {
+            if (!isMatchingArgument(pFn, pFn->arguments[i]->type, nonNamedTypes[i], inferAuto, true)) {
+                return false;
+            }
+            filled[i] = true;
+        }
+        // the piped block lands on blockParam (a block-typed param - isMatchingArgument enforces the type)
+        if (!isMatchingArgument(pFn, pFn->arguments[blockParam]->type, nonNamedTypes[p], inferAuto, true)) {
+            return false;
+        }
+        filled[blockParam] = true;
+        // named args map by name, forward order, into slots at/after p (skipping the block slot)
+        int fnArgIndex = p;
+        for (auto &arg : arguments) {
+            for (;;) {
+                if (fnArgIndex >= M) {
+                    return false;
+                }
+                if (filled[fnArgIndex]) { // block slot (or already consumed) - skip it
+                    fnArgIndex++;
+                    continue;
+                }
+                auto &fnArg = pFn->arguments[fnArgIndex];
+                if (fnArg->name == arg->name) {
+                    break;
+                }
+                if (!fnArg->init) { // can't skip a non-default slot to reach the named arg
+                    return false;
+                }
+                fnArgIndex++;
+            }
+            if (!isMatchingArgument(pFn, pFn->arguments[fnArgIndex]->type, arg->value->type, inferAuto, true)) {
+                return false;
+            }
+            filled[fnArgIndex] = true;
+            fnArgIndex++;
+        }
+        // every remaining slot must have a default
+        for (int s = 0; s < M; ++s) {
+            if (!filled[s] && !pFn->arguments[s]->init) {
+                return false;
+            }
+        }
+        return true;
+    }
+    bool InferTypes::findPipedNamedLanding(Function *pFn, const vector<TypeDeclPtr> &nonNamedTypes,
+            const vector<MakeFieldDeclPtr> &arguments, bool inferAuto, int &blockParam, int &padCount) const {
+        int p = int(nonNamedTypes.size()) - 1;
+        int M = int(pFn->arguments.size());
+        if (p < 0 || M <= p + 1) {
+            return false; // need at least one parameter past the positional block position
+        }
+        // smallest landing slot wins; blockParam==p is the positional shape that normal matching already tried
+        for (int k = p + 1; k < M; ++k) {
+            if (isFunctionCompatiblePipedNamedAt(pFn, nonNamedTypes, arguments, k, inferAuto)) {
+                int pads = 0;
+                for (int ai = p; ai != k; ++ai) {
+                    auto bt = pFn->arguments[ai]->type->baseType;
+                    if (bt != Type::fakeContext && bt != Type::fakeLineInfo) {
+                        ++pads; // fake args are invisible at the call site - they don't count as padding
+                    }
+                }
+                blockParam = k;
+                padCount = pads;
+                return true;
+            }
+        }
+        return false;
+    }
+    void InferTypes::findMatchingPipedNamedFunctionsAndGenerics(MatchingFunctions &resultFunctions, MatchingFunctions &resultGenerics,
+            const string &name, const vector<TypeDeclPtr> &nonNamedTypes, const vector<MakeFieldDeclPtr> &arguments,
+            bool visCheck, das_hash_map<Function *, pair<int, int>> &landing) const {
+        string moduleName, funcName;
+        splitTypeName(name, moduleName, funcName);
+        auto inWhichModule = getSearchModule(moduleName);
+        auto hFuncName = hash64z(funcName.c_str());
+        program->library.foreach ([&](Module *mod) -> bool {
+                { // functions
+                    auto itFnList = mod->functionsByName.find(hFuncName);
+                    if ( itFnList ) {
+                        const bool modVis = visCheck ? isVisibleFunc(inWhichModule, mod) : true;
+                        const bool modVisFromThis = thisModule->isVisibleDirectly(mod);
+                        for ( auto & pFn : itFnList->second ) {
+                            if ( pFn->jitOnly && !jitEnabled() ) continue;
+                            if ( pFn->isTemplate ) continue;
+                            const bool funcVis = !visCheck ? true
+                                              : !pFn->fromGeneric ? modVis
+                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                            if ( funcVis && ( !pFn->fromGeneric || modVisFromThis ) ) {
+                                if ( !visCheck || canCallPrivate(pFn,inWhichModule,thisModule) ) {
+                                    int blockParam = -1, padCount = 0;
+                                    if ( findPipedNamedLanding(pFn, nonNamedTypes, arguments, false, blockParam, padCount) ) {
+                                        resultFunctions.push_back(pFn);
+                                        landing[pFn] = make_pair(blockParam, padCount);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                { // generics
+                    auto itFnList = mod->genericsByName.find(hFuncName);
+                    if ( itFnList ) {
+                        const bool modVis = visCheck ? isVisibleFunc(inWhichModule, mod) : true;
+                        for ( auto & pFn : itFnList->second ) {
+                            if ( pFn->isTemplate ) continue;
+                            const bool funcVis = !visCheck ? true
+                                              : !pFn->fromGeneric ? modVis
+                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                            if ( funcVis && ( !visCheck || canCallPrivate(pFn,inWhichModule,thisModule) ) ) {
+                                int blockParam = -1, padCount = 0;
+                                if ( findPipedNamedLanding(pFn, nonNamedTypes, arguments, true, blockParam, padCount) ) {
+                                    resultGenerics.push_back(pFn);
+                                    landing[pFn] = make_pair(blockParam, padCount);
+                                }
+                            }
+                        }
+                    }
+                }
+                return true; }, moduleName);
+    }
+    ExpressionPtr InferTypes::demoteNamedArgValue(MakeFieldDecl *arg) const {
+        // honor the named-arg binding sigil, consistent with a regular call (see demoteCallArguments)
+        if (arg->moveSemantics) {
+            auto moveExpr = new ExprCall(arg->at, "builtin::consume_argument");
+            moveExpr->arguments.push_back(arg->value->clone());
+            return moveExpr;
+        } else if (arg->cloneSemantics) {
+            auto cloneExpr = new ExprCall(arg->at, "builtin::clone_to_move");
+            cloneExpr->arguments.push_back(arg->value->clone());
+            return cloneExpr;
+        }
+        return arg->value->clone();
+    }
+    vector<ExpressionPtr> InferTypes::demotePipedNamedCallArguments(ExprNamedCall *expr, const FunctionPtr &pFn, int blockParam) {
+        int p = int(expr->nonNamedArguments.size()) - 1;  // the piped block is the last nonNamedArgument
+        int M = int(pFn->arguments.size());
+        vector<ExpressionPtr> result(M, nullptr);
+        for (int i = 0; i < p; ++i) {
+            result[i] = expr->nonNamedArguments[i]->clone();
+        }
+        result[blockParam] = expr->nonNamedArguments[p]->clone();
+        for (auto &arg : *expr->arguments) {
+            for (int s = 0; s < M; ++s) {
+                if (!result[s] && pFn->arguments[s]->name == arg->name) {
+                    result[s] = demoteNamedArgValue(arg);
+                    break;
+                }
+            }
+        }
+        for (int s = 0; s < M; ++s) {
+            if (result[s]) {
+                continue;
+            }
+            auto def = pFn->arguments[s]->init->clone();
+            if (!def->type) { // resolve a not-yet-inferred default, same as tryPipedCallPadding
+                inInfer.push_back(pFn);
+                def = def->visit(*this);
+                inInfer.pop_back();
+            }
+            if (!def->type) {
+                if (func) func->notInferred();
+                return {}; // not ready - signal the caller to retry next pass
+            }
+            if (def->type->baseType == Type::fakeLineInfo) {
+                def->at = expr->at;
+            }
+            result[s] = def;
+        }
+        return result;
+    }
+    ExpressionPtr InferTypes::tryPipedNamedCallPadding(ExprNamedCall *expr, const vector<TypeDeclPtr> &nonNamedTypes, MatchingFunctions &ambiguousFunctions) {
+        das_hash_map<Function *, pair<int, int>> landing;
+        MatchingFunctions pipedFns, pipedGens;
+        findMatchingPipedNamedFunctionsAndGenerics(pipedFns, pipedGens, expr->name, nonNamedTypes, *expr->arguments, true, landing);
+        if (pipedFns.empty() && pipedGens.empty()) {
+            return nullptr;
+        }
+        bool useGenerics = false;
+        auto winner = selectPipedWinner(pipedFns, pipedGens, nonNamedTypes, landing, useGenerics, ambiguousFunctions);
+        if (!winner) {
+            return nullptr;
+        }
+        int blockParam = landing[winner].first;
+        auto newArgs = demotePipedNamedCallArguments(expr, winner, blockParam);
+        if (newArgs.empty()) { // a padded default was not ready
+            return nullptr;
+        }
+        reportAstChanged();
+        auto newCall = new ExprCall(expr->at, winner->name);
+        newCall->arguments = das::move(newArgs);
+        return newCall;
+    }
+    ExpressionPtr InferTypes::tryPipedMemberCallPadding(ExprNamedCall *expr, Structure *st, const ExpressionPtr &selfExpr, const vector<TypeDeclPtr> &fullNonNamedTypes) {
+        // a class method is a single struct field (no name overloading), so there is exactly one candidate
+        auto methodFunc = findMethodFunction(st, expr->name);
+        if (!methodFunc) {
+            return nullptr;
+        }
+        int blockParam = -1, padCount = 0;
+        if (!findPipedNamedLanding(methodFunc, fullNonNamedTypes, *expr->arguments, false, blockParam, padCount)) {
+            return nullptr;
+        }
+        auto newArgs = demotePipedNamedCallArguments(expr, methodFunc, blockParam);
+        if (newArgs.empty()) { // a padded default was not ready
+            return nullptr;
+        }
+        reportAstChanged();
+        // self lands in the invoke receiver; the demoted self slot (result[0]) is dropped, same as the non-piped path
+        auto pInvoke = makeInvokeMethod(expr->at, st, selfExpr, expr->name);
+        for (size_t i = 1, n = newArgs.size(); i != n; ++i) {
+            pInvoke->arguments.push_back(newArgs[i]);
+        }
+        return pInvoke;
     }
     Function *InferTypes::findMethodFunction(Structure *st, const string &name) const {
         if (name.find("::") != string::npos) {
@@ -967,20 +1210,8 @@ namespace das {
                 }
                 fnArgIndex++;
             }
-            // honor the named-arg binding sigil, consistent with a regular call:
-            //   <-  (move)  -> builtin::consume_argument, same as positional foo(<- x)
-            //   :=  (clone) -> builtin::clone_to_move, a cloned movable temp (source preserved)
-            if (arg->moveSemantics) {
-                auto moveExpr = new ExprCall(arg->at, "builtin::consume_argument");
-                moveExpr->arguments.push_back(arg->value->clone());
-                newCallArguments.push_back(moveExpr);
-            } else if (arg->cloneSemantics) {
-                auto cloneExpr = new ExprCall(arg->at, "builtin::clone_to_move");
-                cloneExpr->arguments.push_back(arg->value->clone());
-                newCallArguments.push_back(cloneExpr);
-            } else {
-                newCallArguments.push_back(arg->value->clone());
-            }
+            // honor the named-arg binding sigil (=, <-, :=), consistent with a regular call
+            newCallArguments.push_back(demoteNamedArgValue(arg));
             fnArgIndex++;
         }
         while (fnArgIndex < pFn->arguments.size()) {

@@ -155,7 +155,7 @@ After Phase C-E land:
 1. Re-run `regen_expect.py` — every test will now mismatch.
 2. Run with `--write` to apply the new emitted codes in-place.
 3. Manual review of sample (~20 files) confirms correctness.
-4. Fix the 5 pre-existing under-specifications (`cant_get_field.das`, `failed_aliasing.das`, `failed_call_depth.das`, `failed_condition_must_be_bool.das`, `failed_const_ref.das`) — full multiset, not subset.
+4. Fix the 5 pre-existing under-specifications (`cant_get_field.das`, `failed_aliasing.das`, `failed_recursive_default.das` (formerly `failed_call_depth.das`), `failed_condition_must_be_bool.das`, `failed_const_ref.das`) — full multiset, not subset.
 
 ### Phase F.2 — Final verify
 

@@ -2751,7 +2751,14 @@ namespace das {
                 cexpr->arguments->push_back(arg->clone());
             }
         }
+        // the positionals (and the piped block, which lands last) live here - a named call
+        // inside a generic body is cloned before it demotes, so dropping these loses arguments
+        cexpr->nonNamedArguments.reserve(nonNamedArguments.size());
+        for ( auto & arg : nonNamedArguments ) {
+            cexpr->nonNamedArguments.push_back(arg->clone());
+        }
         cexpr->methodCall = methodCall;
+        cexpr->pipedCallArgument = pipedCallArgument;
         return cexpr;
     }
 

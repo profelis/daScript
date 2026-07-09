@@ -22,6 +22,11 @@ def over(a : int; count : int) : string { return "{a}:I:{count}" }
 // generic first argument + a named argument
 def gen_named(a; hint : string) : string { return "{a}:{hint}" }
 
+// a named call INSIDE a generic body: the body is cloned (clone_function) on instantiation,
+// before the named call demotes - the clone must carry the positional in nonNamedArguments,
+// else 'g' is dropped and matching fails "can't skip hint" (regression for ExprNamedCall::clone)
+def in_generic(g) : string { return three(g, hint = "gen") }
+
 // mutable-ref param: lets clone (:=) be observed vs by-ref (= / <-).
 // _tag is a leading positional so the array can be bound as a named arg.
 def drain(_tag : int; var a : array<int>) { a |> clear() }
@@ -40,6 +45,21 @@ def render(self : Widget; title : string; depth : int = 0) : string {
 // a name that is BOTH a struct and a function (struct construction must win)
 struct SameName { p : int }
 def SameName(p : int; q : int) : string { return "fn:{p}:{q}" }
+
+// genuine class method (def inside class {}) - a middle positional after self plus a
+// named/defaulted arg. render() above is a FREE function via dot, so it resolves through the
+// regular lookup; a class method is a struct field, unreachable by bare name, so it goes through
+// the member-call path where middle positionals after self used to be dropped.
+class Gadget {
+    id : int
+    def paint(title : string; depth : int = 0) : string {
+        return "G{id}:{title}:{depth}"
+    }
+    // calls its own method with implicit self
+    def repaint(title : string) : string {
+        return paint(title, depth = 5)
+    }
+}
 
 // ---- tests -------------------------------------------------------------------
 
@@ -122,4 +142,20 @@ def test_struct_beats_function(t : T?) {
     // SameName is both a struct and a function; all-named construction builds the STRUCT
     let s = SameName(p = 7)
     t |> equal(s.p, 7)
+}
+
+[test]
+def test_class_method_bare(t : T?) {
+    var g = new Gadget(id = 3)
+    // middle positional "hdr" after self + named depth -> the positional is kept (was dropped)
+    t |> equal(g.paint("hdr", depth = 2), "G3:hdr:2")
+    // implicit-self member call with a middle positional + named arg
+    t |> equal(g.repaint("hi"), "G3:hi:5")
+    unsafe { delete g }
+}
+
+[test]
+def test_named_call_in_generic(t : T?) {
+    // the named call lives in a generic body; its positional must survive the clone
+    t |> equal(in_generic(1), "1/gen/7")
 }
