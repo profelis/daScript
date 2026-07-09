@@ -156,6 +156,16 @@ def private parse_log_level(s : string) : int {
     return LOG_INFO
 }
 
+// Report a fatal startup error to BOTH the console and the log file, then the caller returns
+// false so main() exits non-zero. A bare panic() in a standalone -exe aborts the process
+// silently (panic in a jitted frame), turning a bad model path into a mysterious exit with no
+// message — so startup failures are reported explicitly here. Call after logger_set_path().
+def private fatal(msg : string) {
+    to_log(LOG_ERROR, "dictation: {msg}\n")   // console (stdout, level-tagged)
+    logger_error("dictation", msg)            // log file
+    logger_flush()
+}
+
 // ===== audio helpers =====
 
 def private tmpdir() : string {
@@ -396,34 +406,63 @@ def init(var out_rc : int&) : bool {
 
     var cerr = ""
     g_cfg = load_config(resolve_config_path(args.config), cerr)
-    if (!empty(cerr)) {
-        to_log(LOG_ERROR, "dictation: {cerr}\n")
-        out_rc = 1
-        return false
-    }
-    if (empty(g_cfg.bot_token)) {
-        to_log(LOG_ERROR, "dictation: no bot token — set TELEGRAM_BOT_TOKEN or bot_token in the config\n")
-        out_rc = 1
-        return false
-    }
-    if (empty(g_cfg.whisper_model) || empty(g_cfg.llm_model)) {
-        to_log(LOG_ERROR, "dictation: whisper_model and llm_model must be set in the config\n")
-        out_rc = 1
-        return false
-    }
 
-    // proper logging: operational events go to a leveled, categorized log file (dictation / dictation.msg);
-    // fatal startup errors above stay on the console. Engine (dasLLAMA/JIT) noise stays on stdout.
+    // Set up logging FIRST so every fatal startup error below is written to the log file as
+    // well as the console — not silently dropped. On a config failure g_cfg is defaulted, so
+    // this still resolves to <exe_dir>/dictation.log. Engine (dasLLAMA/JIT) noise stays on stdout.
     let logpath = empty(g_cfg.log_file) ? path_join(get_this_module_dir(), "dictation.log") : g_cfg.log_file
     logger_set_path(logpath)
     logger_set_min_level(parse_log_level(g_cfg.log_level))
     print("dictation: logging to {logpath}\n")
 
+    if (!empty(cerr)) {
+        fatal(cerr)
+        out_rc = 1
+        return false
+    }
+    if (empty(g_cfg.bot_token)) {
+        fatal("no bot token — set TELEGRAM_BOT_TOKEN or bot_token in the config")
+        out_rc = 1
+        return false
+    }
+    if (empty(g_cfg.whisper_model) || empty(g_cfg.llm_model)) {
+        fatal("whisper_model and llm_model must be set in the config")
+        out_rc = 1
+        return false
+    }
+    // The model files must exist before we load them: in a standalone -exe the loader's
+    // panic() on a missing file aborts the process SILENTLY (panic in a jitted frame), so
+    // check here and report a clear, logged error instead of a mysterious exit code 127.
+    if (!fexist(g_cfg.whisper_model)) {
+        fatal("whisper model file not found: {g_cfg.whisper_model}")
+        out_rc = 1
+        return false
+    }
+    if (!fexist(g_cfg.llm_model)) {
+        fatal("LLM model file not found: {g_cfg.llm_model}")
+        out_rc = 1
+        return false
+    }
+
     log_tune_status("dictation")
     set_jobque_threads_cap(g_cfg.threads)   // cap dasLLAMA to cfg.threads workers (DAS_JOBQUE_THREADS still overrides)
 
-    g_asr <- load_asr_model(g_cfg.whisper_model)
-    g_llm <- load_model(g_cfg.llm_model, QuantMode.q8)
+    // The files exist, but a corrupt or unsupported model still panics deep in the loader.
+    // Recover it so startup fails with a logged message rather than a silent abort. NOTE: a
+    // bare `return` from inside a recover block does not propagate in a jitted -exe (execution
+    // falls through) — so set a flag here and return AFTER the try/recover, in normal flow.
+    var load_failed = false
+    try {
+        g_asr <- load_asr_model(g_cfg.whisper_model)
+        g_llm <- load_model(g_cfg.llm_model, QuantMode.q8)
+    } recover {
+        fatal("failed to load models — check whisper_model / llm_model are valid model files: whisper='{g_cfg.whisper_model}' llm='{g_cfg.llm_model}'")
+        load_failed = true
+    }
+    if (load_failed) {
+        out_rc = 1
+        return false
+    }
     telegram_set_configuration(configuration(token = g_cfg.bot_token))
     logger_info("dictation", "bot started (whisper={g_cfg.whisper_model}, llm={g_cfg.llm_model}, threads={g_cfg.threads})")
     logger_flush()
