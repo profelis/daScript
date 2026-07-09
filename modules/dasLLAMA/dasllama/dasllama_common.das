@@ -1399,6 +1399,27 @@ def footprint(t : Model) : MemFootprint {
                         total = aux + wf + q8 + q8s + q4 + q4s + mx4 + mx4s)
 }
 
+//! A caller-owned paged KV-cache pool (``create_kv_pool_``). Pages chunk POSITIONS (codec blocks
+//! chunk features — they compose: a page holds whole rows). ONE allocation unit = a page GROUP:
+//! the {K,V}-pages of every owning layer for the same ``page_rows``-position span, so a session's
+//! block table is one int per span, uniform across layers and both sides. Shared-KV layers alias
+//! their source's blob (``blob_of``), mirroring the flat prefix walk. Keep the pool alive (and in
+//! place) as long as its sessions; it is plain data — ``delete`` frees everything at the end.
+struct KVPool {
+    page_rows : int64            // P: positions per page (fixed at create)
+    kdt : KVDtype                // KV codec of every session in this pool
+    vdt : KVDtype
+    nblobs : int64               // owning layers (shared-KV layers alias — see blob_of)
+    capacity_groups : int64      // groups each blob currently holds (grows geometrically)
+    blob_of : array<int64>       // layer -> owning blob index (shared layers -> their source's)
+    krow_bytes : array<int64>    // per blob: one position row's K bytes
+    vrow_bytes : array<int64>
+    kblobs : array<array<uint8>> // per blob: capacity_groups pages of page_rows rows each
+    vblobs : array<array<uint8>>
+    free_groups : array<int>     // LIFO free list
+    refcnt : array<int>          // per group; 0/1 today (the prefix cache bumps it later)
+}
+
 //! Per-step scratch buffers and the KV cache (allocated once, reused every token).
 struct Session {
     n_past : int64            // absolute position of the next token to eval (0 at session start); advanced by eval()
@@ -1449,6 +1470,11 @@ struct Session {
     kv_bprefix_k : array<int64>  // per-layer row-BYTE prefix (seq_len-independent)
     kv_bprefix_v : array<int64>
     kv_runs : array<KVRun>       // per-layer physical-run scratch (kv_runs fills it; flat = 1 entry)
+    // paged sessions (make_run_state_paged): the cache lives in a caller-owned pool and the flat
+    // slabs above stay EMPTY; block_table[i] = the page group holding positions [i*P, (i+1)*P),
+    // grown on demand by kv_ensure. Flat sessions: kv_pool == null, block_table empty.
+    @do_not_delete kv_pool : KVPool?   // borrowed — the pool outlives its sessions
+    block_table : array<int>
     // batched prefill scratch — empty until forward_prefill sizes them to npos × ... (see forward_prefill)
     x_b : array<float>        // residual stream (npos x dim)
     xb_b : array<float>       // rmsnorm / attention out (npos x dim)
@@ -1526,7 +1552,8 @@ struct Session {
 
 //! Allocate the run state sized to a model. `kdt`/`vdt` pick the KV-cache codec for THIS session
 //! (no process-global state — sessions with different codecs coexist, models run in parallel).
-def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32) : Session {
+//! `alloc_cache = false` skips the flat cache slabs (paged sessions and cache-less scratch).
+def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32; alloc_cache : bool = true) : Session {
     var s : Session
     // qd = n_heads * head_size, the query / attention-output width. == dim for the llama family,
     // but Gemma2 has qd (2048) != dim (2304), so q and the attention scratch xb size to max(dim, qd).
@@ -1602,8 +1629,10 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
             vrow += kv_row_bytes(s.kv_dtype_v, layer_kv_dim(c, l))
         }
     }
-    s.key_cache |> resize(c.seq_len * krow)
-    s.value_cache |> resize(c.seq_len * vrow)
+    if (alloc_cache) {
+        s.key_cache |> resize(c.seq_len * krow)
+        s.value_cache |> resize(c.seq_len * vrow)
+    }
     s.sample_scratch |> resize(c.vocab_size)
     s.rng = random_seed(1234)
     return <- s
@@ -1614,6 +1643,32 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
 //! `kdt`/`vdt` pick this session's KV-cache codec (per-session state, no globals).
 def create_session_(model : Model; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32) : Session {
     return <- make_run_state(model.config, kdt, vdt)
+}
+
+//! Allocate a PAGED run state over a caller-owned pool: the flat slabs stay empty and cache pages
+//! come from `pool` on demand (kv_ensure), so KV memory tracks actual context. The pool must
+//! outlive the session and stay in place; release the pages (release_kv_pages_) when done.
+def make_run_state_paged(c : Config; var pool : KVPool) : Session {
+    if (int64(length(pool.blob_of)) != c.n_layers) {
+        panic("make_run_state_paged: pool was built for a different model ({length(pool.blob_of)} layers vs {c.n_layers})")
+    }
+    for (l in range64(c.n_layers)) {
+        if (pool.krow_bytes[pool.blob_of[l]] != kv_row_bytes(pool.kdt, layer_kv_dim(c, l))) {
+            panic("make_run_state_paged: pool row bytes mismatch at layer {l} — pool built for a different geometry")
+        }
+    }
+    var s <- make_run_state(c, pool.kdt, pool.vdt, false)
+    unsafe {
+        s.kv_pool = addr(pool)
+    }
+    // paged run scratch: a window can span every page of the (post-cap) context
+    s.kv_runs |> resize(int((c.seq_len + pool.page_rows - 1l) / pool.page_rows + 1l))
+    return <- s
+}
+
+//! `create_session_`'s paged twin — see make_run_state_paged / create_kv_pool_.
+def create_session_(model : Model; var pool : KVPool) : Session {
+    return <- make_run_state_paged(model.config, pool)
 }
 
 //! THE eval primitive: run `tokens` at the session's current position and advance it. Prefill =
@@ -1947,22 +2002,159 @@ struct KVRun {
 }
 
 //! Fill `runs` with the physical runs covering absolute positions [lo, hi); returns the run count.
-//! THE flat/paged branch lives here: a flat session is always exactly one run. `runs` is caller
-//! scratch (Session.kv_runs / BatchWorkspace.runs_b), sized ahead to the worst case.
-[unused_argument(s)]   // the paged branch (block tables) reads the session; flat needs only the range
+//! THE flat/paged branch lives here: a flat session is always exactly one run; a paged one gets a
+//! run per block-table page span (physically-consecutive spans merge). `runs` is caller scratch
+//! (Session.kv_runs / BatchWorkspace.runs_b), sized ahead to the worst case.
 def kv_runs(s : Session; lo, hi : int64; var runs : array<KVRun>; at : int64 = 0l) : int64 {
     if (hi <= lo) {
         return 0l
     }
-    // flat cache: one contiguous slab — one run, physical row == absolute position
-    runs[at] = KVRun(j0 = lo, j1 = hi, row0 = lo)
-    return 1l
+    if (s.kv_pool == null) {
+        // flat cache: one contiguous slab — one run, physical row == absolute position
+        runs[at] = KVRun(j0 = lo, j1 = hi, row0 = lo)
+        return 1l
+    }
+    let pr = s.kv_pool.page_rows
+    var n = 0l
+    var j = lo
+    while (j < hi) {
+        let pj1 = min(hi, (j / pr + 1l) * pr)
+        let row0 = int64(s.block_table[j / pr]) * pr + j % pr
+        if (n > 0l && runs[at + n - 1l].row0 + (j - runs[at + n - 1l].j0) == row0) {
+            runs[at + n - 1l].j1 = pj1   // physically consecutive with the previous run: extend
+        } else {
+            runs[at + n] = KVRun(j0 = j, j1 = pj1, row0 = row0)
+            n ++
+        }
+        j = pj1
+    }
+    return n
 }
 
 //! Physical row index of absolute position `pos` — the single-row-store analog of kv_runs.
-//! Flat cache: identity. (Paged sessions translate through the block table.)
-[unused_argument(s)]   // same seam as kv_runs: the paged branch reads the session
-def kv_phys_row(s : Session; pos : int64) : int64 => pos
+//! Flat cache: identity; paged: through the block table (page group * P + in-page offset).
+def kv_phys_row(s : Session; pos : int64) : int64 {
+    if (s.kv_pool == null) {
+        return pos
+    }
+    let pr = s.kv_pool.page_rows
+    return int64(s.block_table[pos / pr]) * pr + pos % pr
+}
+
+//! Layer l's base byte pointer in the key cache — THE flat/paged storage branch, hoisted once per
+//! driver preamble. Flat: the session slab at its byte prefix; paged: the pool's owning blob for l
+//! (physical rows index it uniformly — group * page_rows + in-page offset, exactly what kv_runs /
+//! kv_phys_row produce; shared-KV layers alias their source's blob through blob_of). Hoist AFTER
+//! kv_ensure: pool growth resizes blobs, which would dangle this pointer.
+def kv_layer_kbase(var s : Session; l, seq_len : int64) : uint8? {
+    unsafe {
+        if (s.kv_pool != null) {
+            return addr(s.kv_pool.kblobs[s.kv_pool.blob_of[l]][0])
+        }
+        return addr(s.key_cache[0]) + kv_base_k(s, l, seq_len)
+    }
+}
+
+//! Layer l's base byte pointer in the value cache — see kv_layer_kbase.
+def kv_layer_vbase(var s : Session; l, seq_len : int64) : uint8? {
+    unsafe {
+        if (s.kv_pool != null) {
+            return addr(s.kv_pool.vblobs[s.kv_pool.blob_of[l]][0])
+        }
+        return addr(s.value_cache[0]) + kv_base_v(s, l, seq_len)
+    }
+}
+
+// ===== paged KV pool (E2) =====
+
+//! Create a paged KV pool for `c`'s cache geometry: sessions created over it (make_run_state_paged)
+//! allocate `page_rows`-position page groups on demand instead of the full seq_len slab, so cache
+//! memory tracks actual context and many sessions share one elastic pool.
+def create_kv_pool_(c : Config; page_rows : int64; kdt, vdt : KVDtype) : KVPool {
+    if (page_rows <= 0l) {
+        panic("create_kv_pool: page_rows must be positive (got {page_rows})")
+    }
+    var p = KVPool(page_rows = page_rows, kdt = kdt, vdt = vdt)
+    p.blob_of |> reserve(int(c.n_layers))
+    for (l in range64(c.n_layers)) {
+        let src = layer_kv_source(c, l)
+        if (src != l) {
+            p.blob_of |> push(p.blob_of[src])   // shared-KV layer: alias the source's blob
+        } else {
+            p.blob_of |> push(p.nblobs)
+            p.krow_bytes |> push(kv_row_bytes(kdt, layer_kv_dim(c, l)))
+            p.vrow_bytes |> push(kv_row_bytes(vdt, layer_kv_dim(c, l)))
+            p.nblobs ++
+        }
+    }
+    p.kblobs |> resize(int(p.nblobs))
+    p.vblobs |> resize(int(p.nblobs))
+    return <- p
+}
+
+// Double the pool's group capacity. Every blob resizes IN PLACE — a hoisted cache pointer would
+// dangle, which is why kv_ensure runs at the top of the forward entries, before any hoist.
+def private kv_pool_grow(var p : KVPool) {
+    let oldcap = p.capacity_groups
+    let newcap = oldcap <= 0l ? 4l : oldcap * 2l
+    for (b in range64(p.nblobs)) {
+        p.kblobs[b] |> resize(int(newcap * p.page_rows * p.krow_bytes[b]))
+        p.vblobs[b] |> resize(int(newcap * p.page_rows * p.vrow_bytes[b]))
+    }
+    p.refcnt |> resize(int(newcap))
+    var g = int(newcap)
+    while (g > int(oldcap)) {   // push high->low so the LOWEST new group pops first
+        g --
+        p.free_groups |> push(g)
+    }
+    p.capacity_groups = newcap
+}
+
+//! Allocate one page group (refcount 1): pop the free list, growing the pool when it runs dry.
+def kv_pool_alloc_group(var p : KVPool) : int {
+    if (empty(p.free_groups)) {
+        kv_pool_grow(p)
+    }
+    let g = p.free_groups[length(p.free_groups) - 1]
+    p.free_groups |> pop()
+    p.refcnt[g] = 1
+    return g
+}
+
+//! Drop one reference to group `g`; at zero the group returns to the free list.
+def kv_pool_release_group(var p : KVPool; g : int) {
+    verify(p.refcnt[g] > 0)
+    p.refcnt[g] --
+    if (p.refcnt[g] == 0) {
+        p.free_groups |> push(g)
+    }
+}
+
+//! Return every page this session holds to its pool (flat sessions: no-op). Call when the session
+//! is done — pages are pool-owned, so deleting the session alone leaks them from the pool. The
+//! session itself stays alive but loses its cached context; to reuse it, also reset n_past to 0.
+def release_kv_pages_(var s : Session) {
+    if (s.kv_pool == null) {
+        return
+    }
+    for (g in s.block_table) {
+        kv_pool_release_group(*s.kv_pool, g)
+    }
+    s.block_table |> clear()
+}
+
+//! Grow this session's block table to cover positions [0, upto) — the ONLY place a paged session
+//! allocates cache. Runs at the top of forward/forward_prefill/eval_batch, BEFORE any cache-pointer
+//! hoist: group allocation may resize the pool's blobs. Flat sessions: no-op.
+def kv_ensure(var s : Session; upto : int64) {
+    if (s.kv_pool == null) {
+        return
+    }
+    let np = (upto + s.kv_pool.page_rows - 1l) / s.kv_pool.page_rows
+    while (int64(length(s.block_table)) < np) {
+        s.block_table |> push(kv_pool_alloc_group(*s.kv_pool))
+    }
+}
 
 //! Store n f32 values into a KV-cache layer slab at (row, sub-row element offset). dst0 = the
 //! layer's base byte pointer (see kv_base_k/kv_base_v). Codec dispatch happens HERE, once per
@@ -2221,13 +2413,11 @@ def private flash_decode_check_g(qp : float const?; kcp, vcp : auto const?; xbv 
 // (the vectorized codec store; bounds-checked array copy doesn't vectorize) — a flat cache is one
 // run, making the chunk ONE multi-row call exactly as before. Threaded over positions (workers own
 // disjoint cache slices; runs partition positions). Self-gates on g_kv_store_par_threshold.
-// kbase/vbase = the layer's slab base BYTES; runs cover [start_pos, start_pos + npos).
-def private kv_store_batch(var key_cache : array<uint8>; var value_cache : array<uint8>;
+// kcp/vcp = the layer's base byte pointers (kv_layer_kbase); runs cover [start_pos, start_pos + npos).
+def private kv_store_batch(var kcp : uint8?; var vcp : uint8?;
                            kdt, vdt : KVDtype; k_b : array<float>; v_b : array<float>;
-                           runs : KVRun const?; nrun, kbase, vbase, start_pos, npos, kv_dim : int64) {
+                           runs : KVRun const?; nrun, start_pos, npos, kv_dim : int64) {
     unsafe {
-        var kcp = addr(key_cache[0]) + kbase
-        var vcp = addr(value_cache[0]) + vbase
         let kbp = reinterpret<float const?>(addr(k_b[0]))
         let vbp = reinterpret<float const?>(addr(v_b[0]))
         maybe_parallel_for(kv_dim * npos >= g_kv_store_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
@@ -2623,8 +2813,6 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let qd = n_heads * head_size
     let kv_mul = n_heads / n_kv_heads
     let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
-    let kbase = kv_base_k(s, l, c.seq_len)   // this layer's slab base BYTES (aliases the source layer when shared)
-    let vbase = kv_base_v(s, l, c.seq_len)
     let is_sliding = layer_is_sliding(c, l)
     let kstart = (is_sliding && pos + 1l > c.sliding_window) ? (pos + 1l - c.sliding_window) : 0l
     let cnt = pos + 1l - kstart
@@ -2692,8 +2880,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         var attp = addr(s.att[0])
         var xqp = addr(s.xq[0])
         var xsp = addr(s.xs[0])
-        var kcl = addr(s.key_cache[0]) + kbase     // layer-base byte pointers (stores + the _d read dispatch)
-        var vcl = addr(s.value_cache[0]) + vbase
+        var kcl = kv_layer_kbase(s, l, c.seq_len)  // layer-base byte pointers (stores + the _d read dispatch)
+        var vcl = kv_layer_vbase(s, l, c.seq_len)
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))   // this layer's physical runs (fork-safe hoist)
         // weight region bases (element offsets into the Q8 blob, scales at /32)
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
@@ -3068,13 +3256,13 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let qd = n_heads * head_size       // query / attention-output width (== dim except Gemma2/gemma4)
     let kv_mul = n_heads / n_kv_heads
     let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
-    let kbase = kv_base_k(s, l, c.seq_len)   // this layer's slab base BYTES (aliases the source layer when shared)
-    let vbase = kv_base_v(s, l, c.seq_len)
+    var kcl = kv_layer_kbase(s, l, c.seq_len)   // layer-base byte pointers (aliases the source layer when shared)
+    var vcl = kv_layer_vbase(s, l, c.seq_len)
     // Sliding-window (local) vs global attention per the arch's layer pattern (Gemma2 alternates,
     // Gemma3 5:1). The window covers all positions when pos < window, so it's a no-op for short contexts.
     let is_sliding = layer_is_sliding(c, l)
     // gemma-4 E-series shared-KV layer: no attn_k/attn_v of its own — project Q only and attend
-    // against the SOURCE layer's cached K/V (kbase/vbase already alias the source's slab).
+    // against the SOURCE layer's cached K/V (kcl/vcl already alias the source's slab).
     let kv_shared = t.kv_src[l] != l
     let kstart = (is_sliding && pos + 1l > c.sliding_window) ? (pos + 1l - c.sliding_window) : 0l
     let cnt = pos + 1l - kstart
@@ -3143,9 +3331,9 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     if (!kv_shared) {
         let ts_kv = ref_time_ticks()
         unsafe {
-            kv_store_row(addr(s.key_cache[0]) + kbase, s.kv_dtype_k, kv_dim, kv_phys_row(s, pos), 0l, kv_dim,
+            kv_store_row(kcl, s.kv_dtype_k, kv_dim, kv_phys_row(s, pos), 0l, kv_dim,
                 reinterpret<float const?>(addr(s.k[0])))
-            kv_store_row(addr(s.value_cache[0]) + vbase, s.kv_dtype_v, kv_dim, kv_phys_row(s, pos), 0l, kv_dim,
+            kv_store_row(vcl, s.kv_dtype_v, kv_dim, kv_phys_row(s, pos), 0l, kv_dim,
                 reinterpret<float const?>(addr(s.v[0])))
         }
         prof_add("kv_store", ts_kv)
@@ -3169,8 +3357,6 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let nrun = kv_runs(s, kstart, pos + 1l, s.kv_runs)   // physical runs of this layer's window (flat: 1)
     unsafe {
         let qp = reinterpret<float const?>(addr(s.q[0]))
-        let kcl = addr(s.key_cache[0]) + kbase   // layer-base byte pointers (the _d read dispatch)
-        let vcl = addr(s.value_cache[0]) + vbase
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))
         var xbp = addr(s.xb[0])
         var attp = addr(s.att[0])
@@ -3770,6 +3956,7 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
 def forward(t : Model; var s : Session; token, pos : int64) {
     let c = t.config
     let dim = c.dim
+    kv_ensure(s, pos + 1l)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
 
     // token embedding: row `token` into the residual stream
     let ts_embed = ref_time_ticks()
@@ -4382,7 +4569,7 @@ def private attn_head_classic_d(var attp_h : float?; var xbp : float?; qp : floa
     }
 }
 
-def private prefill_attention(var s : Session; kbase, vbase, npos, start_pos, head_size, qd, kv_dim,
+def private prefill_attention(var s : Session; kcl, vcl : uint8 const?; npos, start_pos, head_size, qd, kv_dim,
                               n_heads, kv_mul : int64; scale : float;
                               is_sliding : bool; sliding_window : int64; attn_softcap : float;
                               sinksp : float const?) {   // this layer's per-head sink logits; null = no sinks
@@ -4396,8 +4583,6 @@ def private prefill_attention(var s : Session; kbase, vbase, npos, start_pos, he
     let nrun = kv_runs(s, kstart_min, start_pos + npos, s.kv_runs)
     unsafe {
         let qp = reinterpret<float const?>(addr(s.q_b[0]))
-        let kcl = addr(s.key_cache[0]) + kbase   // layer-base byte pointers (the _d read dispatch)
-        let vcl = addr(s.value_cache[0]) + vbase
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))
         var xbp = addr(s.xb_b[0])
         // att_b is sized only for the blocked/classic modes (flash packs into fa_* instead), so the
@@ -4583,8 +4768,8 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     let qd = n_heads * head_size
     let kv_mul = n_heads / n_kv_heads
     let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
-    let kbase = kv_base_k(s, l, c.seq_len)   // this layer's slab base BYTES (aliases the source layer when shared)
-    let vbase = kv_base_v(s, l, c.seq_len)
+    var kcl = kv_layer_kbase(s, l, c.seq_len)   // layer-base byte pointers (aliases the source layer when shared)
+    var vcl = kv_layer_vbase(s, l, c.seq_len)
     let is_sliding = layer_is_sliding(c, l)
     let kv_shared = t.kv_src[l] != l
     attn_qkv_rope_prefix(t, s, l, npos, start_pos)
@@ -4595,8 +4780,8 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
         let ts_kv = ref_time_ticks()
         let store_nrun = kv_runs(s, start_pos, start_pos + npos, s.kv_runs)   // where the new rows land
         unsafe {
-            kv_store_batch(s.key_cache, s.value_cache, s.kv_dtype_k, s.kv_dtype_v, s.k_b, s.v_b,
-                reinterpret<KVRun const?>(addr(s.kv_runs[0])), store_nrun, kbase, vbase, start_pos, npos, kv_dim)
+            kv_store_batch(kcl, vcl, s.kv_dtype_k, s.kv_dtype_v, s.k_b, s.v_b,
+                reinterpret<KVRun const?>(addr(s.kv_runs[0])), store_nrun, start_pos, npos, kv_dim)
         }
         prof_add("kv_store", ts_kv)
     }
@@ -4607,7 +4792,7 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     let sinksp = (c.attn_sinks
         ? unsafe(reinterpret<float const?>(unsafe(addr(t.fblob[t.sinks_off + l * n_heads]))))
         : null)
-    prefill_attention(s, kbase, vbase, npos, start_pos, head_size, qd, kv_dim, n_heads, kv_mul, scale,
+    prefill_attention(s, kcl, vcl, npos, start_pos, head_size, qd, kv_dim, n_heads, kv_mul, scale,
                       is_sliding, c.sliding_window, c.attn_logit_softcap, sinksp)
     prof_add("attn", ts_attn)
     attn_out_suffix(t, s, l, npos)
@@ -5312,6 +5497,7 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
         }
         return
     }
+    kv_ensure(s, start_pos + npos)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
     forward_prefill_alloc(t, s, npos, start_pos)
 
     // token embeddings -> residual stream x_b [npos x dim]
@@ -5349,6 +5535,7 @@ def forward_prefill_embd(t : Model; var s : Session; embd : array<float>; npos, 
     if (int64(length(embd)) < npos * t.config.dim) {
         panic("forward_prefill_embd: embd has {length(embd)} floats — npos={npos} rows of dim={t.config.dim} need {npos * t.config.dim}")
     }
+    kv_ensure(s, start_pos + npos)   // paged sessions: grow the block table BEFORE any cache-pointer hoist
     forward_prefill_alloc(t, s, npos, start_pos)
     let dim = t.config.dim
     let ts_embed = ref_time_ticks()
@@ -5575,17 +5762,15 @@ struct BatchWorkspace {
     // delete of a plain array<T?> CASCADES to the pointees, which would free the sessions' cache blobs
     @do_not_delete kbase : array<uint8?>
     @do_not_delete vbase : array<uint8?>
-    runs_b : array<KVRun>     // per-row physical runs, flattened rows × max-runs (flat: 1 per row)
+    runs_b : array<KVRun>     // per-row physical runs, flattened rows × max-runs (flat rows: 1 each)
     nrun_b : array<int64>     // per-row run count
 }
 
 def create_batch_workspace_(model : Model) : BatchWorkspace {
     var ws : BatchWorkspace
-    ws.scr <- make_run_state(model.config)
     // the scratch Session never owns cache or sampler state — eval_batch reads/writes the real
-    // sessions' caches through kbase/vbase; drop the big allocations before they're ever touched
-    delete ws.scr.key_cache
-    delete ws.scr.value_cache
+    // sessions' caches through kbase/vbase (flat) or the batch's pool (paged)
+    ws.scr <- make_run_state(model.config, KVDtype.f32, KVDtype.f32, false)
     delete ws.scr.sample_scratch
     return <- ws
 }
@@ -5622,7 +5807,7 @@ def private batch_decode_alloc(t : Model; var s : Session; nrows : int64) {
 // One layer's batched-decode attention: shared prefix (norm → QKV GEMM → qk/v-norm → per-row RoPE
 // via the positions table) → scatter-store each row's k/v into ITS session's cache → per-(row, head)
 // decode attention through the codec seam worker → shared suffix (wo GEMM → post-norm → residual).
-def private attention_batch_decode(t : Model; var ws : BatchWorkspace; l, nrows : int64) {
+def private attention_batch_decode(t : Model; var ws : BatchWorkspace; sessions : array<Session?>; l, nrows : int64) {
     let c = t.config
     let kv_dim = layer_kv_dim(c, l)
     let head_size = layer_head_size(c, l)
@@ -5634,8 +5819,13 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; l, nrows 
     let is_sliding = layer_is_sliding(c, l)
     let swin = c.sliding_window
     let kv_shared = t.kv_src[l] != l
-    let kbb = kv_base_k(ws.scr, l, c.seq_len)   // layer slab base BYTES — uniform across the batch
-    let vbb = kv_base_v(ws.scr, l, c.seq_len)   // (ws.scr carries the batch's dtypes + prefixes)
+    // flat rows address each session's slab (per-row base + the uniform layer byte offset); paged
+    // rows all address the batch's ONE pool, whose owning blob for l is the uniform layer base
+    let paged = ws.scr.kv_pool != null
+    let kbb = paged ? 0l : kv_base_k(ws.scr, l, c.seq_len)   // layer slab base BYTES — uniform across the batch
+    let vbb = paged ? 0l : kv_base_v(ws.scr, l, c.seq_len)   // (ws.scr carries the batch's dtypes + prefixes)
+    var pkcl = paged ? kv_layer_kbase(ws.scr, l, c.seq_len) : null
+    var pvcl = paged ? kv_layer_vbase(ws.scr, l, c.seq_len) : null
     let kdt = ws.scr.kv_dtype_k
     let vdt = ws.scr.kv_dtype_v
     // start_pos is only read by the classic (non-table) rope path, which eval_batch_ never routes
@@ -5647,8 +5837,9 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; l, nrows 
             let kbp = reinterpret<float const?>(addr(ws.scr.k_b[0]))
             let vbp = reinterpret<float const?>(addr(ws.scr.v_b[0]))
             for (i in range64(nrows)) {
-                kv_store_row(ws.kbase[i] + kbb, kdt, kv_dim, ws.positions[i], 0l, kv_dim, kbp + i * kv_dim)
-                kv_store_row(ws.vbase[i] + vbb, vdt, kv_dim, ws.positions[i], 0l, kv_dim, vbp + i * kv_dim)
+                let prow = kv_phys_row(*sessions[i], ws.positions[i])   // flat: identity
+                kv_store_row(paged ? pkcl : ws.kbase[i] + kbb, kdt, kv_dim, prow, 0l, kv_dim, kbp + i * kv_dim)
+                kv_store_row(paged ? pvcl : ws.vbase[i] + vbb, vdt, kv_dim, prow, 0l, kv_dim, vbp + i * kv_dim)
             }
         }
         prof_add("kv_store", ts_kv)
@@ -5659,18 +5850,17 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; l, nrows 
     let ts_attn = ref_time_ticks()
     var maxctx = 0l
     var work = 0l   // Σ 2·cnt_i·head_size MACs per head
-    ws.runs_b |> resize(nrows)   // one run per row while rows are flat (paged rows re-size per table)
+    // runs_b row stride: a flat row is always one run; a paged row can span every page of the context
+    let maxruns = paged ? (c.seq_len + ws.scr.kv_pool.page_rows - 1l) / ws.scr.kv_pool.page_rows + 1l : 1l
+    ws.runs_b |> resize(nrows * maxruns)
     ws.nrun_b |> resize(nrows)
     for (i in range64(nrows)) {
         let pos = ws.positions[i]
         let kstart = (is_sliding && pos + 1l > swin) ? (pos + 1l - swin) : 0l
         maxctx = max(maxctx, pos + 1l - kstart)
         work += 2l * (pos + 1l - kstart) * head_size
-        // flat rows: one physical run per row (E2 routes this through the row's block table)
-        ws.runs_b[i] = KVRun(j0 = kstart, j1 = pos + 1l, row0 = kstart)
-        ws.nrun_b[i] = 1l
+        ws.nrun_b[i] = kv_runs(*sessions[i], kstart, pos + 1l, ws.runs_b, i * maxruns)   // flat: 1 identity run
     }
-    let maxruns = 1l   // runs_b row stride
     ws.scr.att_b |> resize(nrows * n_heads * maxctx)
     let attn_softcap = c.attn_logit_softcap
     let attn_lanes = min(int(nrows * n_heads), lanes_for_work(work * n_heads, g_gemv_lane_cap))
@@ -5698,8 +5888,9 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; l, nrows 
                     let qoff = hh * head_size
                     let kvhoff = (hh / kv_mul) * head_size
                     attn_head_decode_d(attp + ix * maxctx, xbp + ii * qd, qp + ii * qd,
-                        kbpp[ii] + kbb, vbpp[ii] + vbb, kdt, vdt, runsbp + ii * maxruns,
-                        nrunbp[ii], qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, sinksp)
+                        paged ? pkcl : kbpp[ii] + kbb, paged ? pvcl : vbpp[ii] + vbb, kdt, vdt,
+                        runsbp + ii * maxruns, nrunbp[ii], qoff, kvhoff, kstart, cnt, kv_dim, head_size,
+                        hh, scale, attn_softcap, sinksp)
                 }
             }
         }
@@ -5710,10 +5901,10 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; l, nrows 
 
 //! One synchronous batched decode step: row i evals tokens[i] at sessions[i]'s position, logits
 //! scatter into sessions[i].logits, and each session advances by one. Sessions must be distinct,
-//! same-geometry (one model, equal cache sizes, uniform KV dtype) and have room for one position.
-//! Ragged batches: pass only the still-active sessions (B may shrink between calls). B == 1, q4
-//! weights, a non-std attention arch, or the classic (non-table) rope path fall back to the exact
-//! per-row forward() loop.
+//! same-geometry (one model, equal cache sizes, uniform KV dtype; paged sessions share ONE pool —
+//! never mix paged and flat rows) and have room for one position. Ragged batches: pass only the
+//! still-active sessions (B may shrink between calls). B == 1, q4 weights, a non-std attention
+//! arch, or the classic (non-table) rope path fall back to the exact per-row forward() loop.
 def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; tokens : array<int64>) {   // nolint:LINT014 — rows mutate THROUGH the pointers; a const array constifies the pointees
     let c = t.config
     let nrows = int64(length(sessions))
@@ -5736,13 +5927,16 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
             }
         }
     }
-    let s0 = sessions[0]
+    var s0 = sessions[0]
     for (i in range64(1l, nrows)) {
         let sp = sessions[i]
         if (sp.kv_dtype_k != s0.kv_dtype_k || sp.kv_dtype_v != s0.kv_dtype_v) {
             panic("eval_batch: sessions[{i}] KV dtype differs from sessions[0] — the batch must be uniform")
         }
-        if (length(sp.key_cache) != length(s0.key_cache) || length(sp.value_cache) != length(s0.value_cache)) {
+        if (sp.kv_pool != s0.kv_pool) {
+            panic("eval_batch: sessions[{i}] KV pool differs from sessions[0] — one pool (or all-flat) per batch")
+        }
+        if (s0.kv_pool == null && (length(sp.key_cache) != length(s0.key_cache) || length(sp.value_cache) != length(s0.value_cache))) {
             panic("eval_batch: sessions[{i}] cache size differs from sessions[0] — same model + same seq_len required")
         }
     }
@@ -5757,21 +5951,30 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         }
         return
     }
-    // snapshot the batch's cache geometry onto the scratch Session (kv_base_* and the store/read
-    // dispatch read it there) and capture each row's position + cache base
+    // snapshot the batch's cache geometry onto the scratch Session (kv_base_* / kv_layer_* and the
+    // store/read dispatch read it there) and capture each row's position + cache base. kv_ensure
+    // runs for every row FIRST: paged growth resizes pool blobs, so no pool pointer may be hoisted
+    // until all rows have their pages.
     ws.scr.kv_dtype_k = s0.kv_dtype_k
     ws.scr.kv_dtype_v = s0.kv_dtype_v
     ws.scr.kv_bprefix_k := s0.kv_bprefix_k
     ws.scr.kv_bprefix_v := s0.kv_bprefix_v
+    ws.scr.kv_pool = s0.kv_pool
     ws.positions |> resize(nrows)
     ws.kbase |> resize(nrows)
     ws.vbase |> resize(nrows)
     for (i in range64(nrows)) {
         var sp = sessions[i]
+        kv_ensure(*sp, sp.n_past + 1l)
         ws.positions[i] = sp.n_past
-        unsafe {
-            ws.kbase[i] = addr(sp.key_cache[0])
-            ws.vbase[i] = addr(sp.value_cache[0])
+        if (s0.kv_pool == null) {
+            unsafe {
+                ws.kbase[i] = addr(sp.key_cache[0])
+                ws.vbase[i] = addr(sp.value_cache[0])
+            }
+        } else {
+            ws.kbase[i] = null   // paged rows address the pool blobs, hoisted per layer
+            ws.vbase[i] = null
         }
     }
     batch_decode_alloc(t, ws.scr, nrows)
@@ -5802,7 +6005,7 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
     prof_add("rope_build", ts_rope_build)
     // layer stack: batched attention (per-row cache scatter) + the arch's batched FFN (position-free)
     for (l in range64(c.n_layers)) {
-        attention_batch_decode(t, ws, l, nrows)
+        attention_batch_decode(t, ws, sessions, l, nrows)
         t.blocks.ffn_prefill(t, ws.scr, l, nrows)
     }
     // final rmsnorm + classifier over ALL rows, then per-row softcap/pins scattered per session

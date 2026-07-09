@@ -296,7 +296,7 @@ def private dasllama_type_stanza(f : FILE const?; lab : string; tname : string; 
 def document_module_dasllama(_root : string) {
     var mod = find_module("dasllama")
     var groups <- array<DocGroup>(
-        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
+        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
         group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
@@ -314,6 +314,8 @@ def document_module_dasllama(_root : string) {
             "One generation stream over a model: the KV cache, scratch buffers, sampling RNG, and the current position ``n_past``. ``logits`` holds the distribution produced by the last ``eval``. A model serves many independent sessions.")
         dasllama_type_stanza(f, "struct-dasllama_common-BatchWorkspace", "BatchWorkspace",
             "Caller-owned scratch for ``eval_batch``: the batched activation buffers a step of B sessions shares. One per concurrent batch, reused across calls; holds no session state — positions, caches and logits stay in the sessions.")
+        dasllama_type_stanza(f, "struct-dasllama_common-KVPool", "KVPool",
+            "A caller-owned paged KV-cache pool (``create_kv_pool``): sessions created over it allocate fixed-size page groups on demand, so cache memory tracks the actual context instead of the full ``seq_len`` slab. One pool serves many sessions; an ``eval_batch`` batch must share one pool. Keep it alive and in place while its sessions live.")
         dasllama_type_stanza(f, "enum-dasllama_common-KVDtype", "KVDtype",
             "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference.")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",

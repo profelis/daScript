@@ -41,6 +41,12 @@ struct Args {
     @clarg_doc = "KV cache dtype (default: f32)"
     kv : KVDtype = KVDtype.f32
 
+    @clarg_doc = "Page the KV cache through a KVPool instead of the flat slabs"
+    paged : bool
+
+    @clarg_doc = "Positions per page when --paged (default: 64)"
+    page_rows : int = 64
+
     @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; 1 = thread everything, -1 = keep default)"
     target_work : int = -1
 
@@ -164,9 +170,16 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     return tok
 }
 
-def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype) {
+def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype; paged : bool; page_rows : int64) {
     let c = t.config
-    var s <- make_run_state(c, kvdt, kvdt)
+    var pool <- create_kv_pool_(c, page_rows, kvdt, kvdt)   // empty (no groups) unless --paged
+    var s : Session
+    if (paged) {
+        s <- make_run_state_paged(c, pool)
+        print("paged KV: page_rows={page_rows}\n")
+    } else {
+        s <- make_run_state(c, kvdt, kvdt)
+    }
     with_job_que() {
         setup_dasllama_jobque_()   // pooled forks + batched dispatch + spin window + join poll (the engine standard)
         if (team) {   // needs the live job que — must sit inside with_job_que
@@ -256,5 +269,5 @@ def main() {
     if (cfg.kv != KVDtype.f32) {
         print("kv cache dtype: {cfg.kv}\n")
     }
-    run_profile(t, p, n, p2, cfg.team, cfg.kv)
+    run_profile(t, p, n, p2, cfg.team, cfg.kv, cfg.paged, int64(cfg.page_rows))
 }

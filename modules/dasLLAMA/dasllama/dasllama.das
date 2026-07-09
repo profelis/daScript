@@ -54,6 +54,31 @@ def create_session(model : Model; kv_dtype : KVDtype = KVDtype.f16) : Session {
     return <- create_session_(model, kv_dtype, kv_dtype)
 }
 
+def create_kv_pool(model : Model; page_rows : int64 = 64l; kv_dtype : KVDtype = KVDtype.f16) : KVPool {
+    //! Create a caller-owned PAGED KV pool over ``model``'s cache geometry. Sessions created over it
+    //! (``create_session(model, pool)``) allocate cache pages of ``page_rows`` positions on demand
+    //! instead of the full ``seq_len`` slab up front — KV memory tracks the ACTUAL context, and many
+    //! sessions share one elastic pool. ``kv_dtype`` fixes the codec for every session in the pool.
+    //! Keep the pool alive (and in place) as long as its sessions live; it is plain data — ``delete``
+    //! frees everything at the end.
+    return <- create_kv_pool_(model.config, page_rows, kv_dtype, kv_dtype)
+}
+
+def create_session(model : Model; var pool : KVPool) : Session {
+    //! Create a session whose KV cache is PAGED out of ``pool`` (see ``create_kv_pool``) — pages
+    //! allocate on demand as the context grows. Call ``release_kv_pages`` when the session is done
+    //! (before ``delete``), or its pages stay checked out of the pool. Everything else — ``eval``,
+    //! ``sample``, ``generate``, ``eval_batch`` — behaves exactly like a flat session.
+    return <- create_session_(model, pool)
+}
+
+def release_kv_pages(var session : Session) {
+    //! Return ``session``'s KV pages to its pool (no-op on flat sessions). The normal shape is
+    //! release + ``delete``; a released session stays alive but loses its cached context — to reuse
+    //! it, also reset ``session.n_past`` to 0.
+    release_kv_pages_(session)
+}
+
 def encode(model : Model; text : string; add_special = true; parse_special = false) : array<int64> {
     //! Encode ``text`` to token ids with the model's tokenizer. ``add_special`` prepends BOS where the
     //! model expects one. ``parse_special`` is reserved and not yet honored — special tokens reach the
@@ -100,9 +125,10 @@ def eval_batch(model : Model; var ws : BatchWorkspace; var sessions : array<Sess
     //! position, logits land in ``sessions[i].logits``, and each session advances by one — B
     //! independent conversations through ONE pass of the weights (the weight GEMVs batch into GEMMs;
     //! attention stays per-session). Sessions must be distinct, same-geometry (one model, equal
-    //! cache sizes, uniform KV dtype) and each have room for one more position. Ragged batches:
-    //! pass only the still-active sessions — B may shrink between calls. B == 1 and q4 weights
-    //! delegate to the exact per-session ``forward`` path.
+    //! cache sizes, uniform KV dtype; paged sessions must share ONE pool, never mixed with flat
+    //! rows) and each have room for one more position. Ragged batches: pass only the still-active
+    //! sessions — B may shrink between calls. B == 1 and q4 weights delegate to the exact
+    //! per-session ``forward`` path.
     eval_batch_(model, ws, sessions, tokens)
 }
 
