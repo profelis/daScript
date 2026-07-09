@@ -69,7 +69,7 @@ def replaceVariableWithList(var self : Template; name : string; expr : dasvector
     var vec : array<Expression?>
     unsafe {
         for (e in expr) {
-            vec |> push(reinterpret<Expression?> e)
+            vec |> push(reinterpret<Expression?> (e))
         }
     }
     swap(self.var2exprList[name], vec)

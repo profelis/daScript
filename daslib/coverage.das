@@ -306,7 +306,7 @@ class CoverageMacro : AstVisitor {
                 || fun.at.fileInfo == null || !(expr is ExprBlock)) return
         let file = resolve_file_path(string(fun.at.fileInfo.name))
         let fname = string(fun.name)
-        var blk = unsafe(reinterpret<ExprBlock?> expr)
+        var blk = unsafe(reinterpret<ExprBlock?> (expr))
         var prev : array<ExpressionPtr>
         for (ex in blk.list) {
             prev.emplace(ex)
@@ -345,7 +345,7 @@ class CoverageMacro : AstVisitor {
         }
         // instrument true branch
         if (ifte.if_true != null && ifte.if_true is ExprBlock) {
-            var true_blk = unsafe(reinterpret<ExprBlock?> ifte.if_true)
+            var true_blk = unsafe(reinterpret<ExprBlock?> (ifte.if_true))
             var prevTrue : array<ExpressionPtr>
             for (ex in true_blk.list) {
                 prevTrue.emplace(ex)
@@ -358,7 +358,7 @@ class CoverageMacro : AstVisitor {
         }
         // instrument false branch
         if (ifte.if_false != null && ifte.if_false is ExprBlock) {
-            var false_blk = unsafe(reinterpret<ExprBlock?> ifte.if_false)
+            var false_blk = unsafe(reinterpret<ExprBlock?> (ifte.if_false))
             var prevFalse : array<ExpressionPtr>
             for (ex in false_blk.list) {
                 prevFalse.emplace(ex)
@@ -454,7 +454,7 @@ class CoveragePass : AstPassMacro {
             var initFn = qmacro_function("__coverage_init") $() {
                 pass
             }
-            var blk = unsafe(reinterpret<ExprBlock?> initFn.body)
+            var blk = unsafe(reinterpret<ExprBlock?> (initFn.body))
             blk.list |> clear()
             for (file, values in keys(coverageData), values(coverageData)) {
                 // register lines

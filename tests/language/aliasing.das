@@ -177,10 +177,10 @@ def test_aliasing(t : T?) {
     t |> run("cast aliasing") @(t : T?) {
         var a = Foo(a = 1)
         var b = Foo(a = 2)
-        a = set2(unsafe(reinterpret<int&> a.b)) // (7) 40211: function set result aliases argument inc
+        a = set2(unsafe(reinterpret<int&> (a.b))) // (7) 40211: function set result aliases argument inc
         t |> equal(13, a.a)
         a = Foo(a = 1)
-        a = set2(unsafe(reinterpret<int&> b.b)) // this one ok
+        a = set2(unsafe(reinterpret<int&> (b.b))) // this one ok
         t |> equal(13, a.a)
     }
     t |> run("op3 aliasing") @(t : T?) {

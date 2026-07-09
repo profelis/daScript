@@ -27,7 +27,7 @@ require daslib/archive public       // [sql_table] @sql_blob adapter codegen cal
 
 def sqlite3_free(std : string) {
     //! Frees memory previously allocated by SQLite.
-    sqlite3_free(unsafe(reinterpret<void?> std))
+    sqlite3_free(unsafe(reinterpret<void?> (std)))
 }
 
 [expect_any_array(data)]

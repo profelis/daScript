@@ -140,7 +140,7 @@ def error(var st : TokenStream; error : string) {
 
 def loadI(data : void?; t : auto(TT)) {
     unsafe {
-        return *(reinterpret<TT?> data)
+        return *(reinterpret<TT?> (data))
     }
 }
 
@@ -153,17 +153,17 @@ def getPD(var st : TokenStream; result : Result; offset : int = 0) : void? {
         } else {
             data = addr(result.value)
             if (result.tinfo.flags.refType) {
-                let pdata = reinterpret<void ??> data
+                let pdata = reinterpret<void ??> (data)
                 if (pdata == null) return null
                 data = *pdata
             }
         }
         if (result.tinfo.flags.ref) {
-            let pdata = reinterpret<void ??> data
+            let pdata = reinterpret<void ??> (data)
             if (pdata == null) return null
             data = *pdata
         }
-        return (reinterpret<uint8 const?> data) + offset
+        return (reinterpret<uint8 const?> (data)) + offset
     }
 }
 
@@ -204,15 +204,15 @@ def func_call_length(var st : TokenStream; result : Result) : Result {
             return <- Result(int64(idim))
         }
         if (TypeInfo(basicType = Type.tString)) {
-            let pstr = unsafe(reinterpret<string?> getPD(st, result))
+            let pstr = unsafe(reinterpret<string?> (getPD(st, result)))
             return <- Result(int64(length(*pstr)))
         }
         if (TypeInfo(basicType = Type.tArray)) {
-            let parr = unsafe(reinterpret<DapiArray?> getPD(st, result))
+            let parr = unsafe(reinterpret<DapiArray?> (getPD(st, result)))
             return <- Result(int64(parr.size))
         }
         if (TypeInfo(basicType = Type.tTable)) {
-            let ptab = unsafe(reinterpret<DapiTable?> getPD(st, result))
+            let ptab = unsafe(reinterpret<DapiTable?> (getPD(st, result)))
             return <- Result(int64(ptab.size))
         }
     }
@@ -305,7 +305,7 @@ def getVectorOffset(var st : TokenStream; ident : string; result : Result) : tup
 [unused_argument(st)]
 def getHandleFieldOffset(var st : TokenStream; ident : string; result : Result) : tuple<offset : int; tinfo : TypeInfo> {
     unsafe {
-        var ann = unsafe(reinterpret<TypeAnnotation?> result.tinfo.annotation)
+        var ann = unsafe(reinterpret<TypeAnnotation?> (result.tinfo.annotation))
         if (ann == null) return (offset = -1, tinfo = TypeInfo(uninitialized))
         let ofs  = int(get_handled_type_field_offset(ann, ident))
         if (ofs == -1) return (offset = -1, tinfo = TypeInfo(uninitialized))
@@ -378,11 +378,11 @@ def opDimString(var st : TokenStream; index : int64; var result : Result) {
 
 def opArray(var st : TokenStream; index : int64; var result : Result) {
     unsafe {
-        let pArray = reinterpret<DapiArray?> getPD(st, result)
+        let pArray = reinterpret<DapiArray?> (getPD(st, result))
         if (pArray == null) return st |> error("null pointer")
         let dim = pArray.size
         if (index < 0l || uint64(index) >= dim) return st |> error("index out of range")
-        let pData = reinterpret<int8?> pArray.data
+        let pData = reinterpret<int8?> (pArray.data)
         let elemSize = get_type_size(result.tinfo.firstType)
         let offset = index * int64(elemSize)
         result.data = pData + offset
@@ -393,7 +393,7 @@ def opArray(var st : TokenStream; index : int64; var result : Result) {
 
 def opTable(var st : TokenStream; index : Result; var result : Result) {
     unsafe {
-        let pTable = reinterpret<DapiTable?> getPD(st, result)
+        let pTable = reinterpret<DapiTable?> (getPD(st, result))
         if (pTable == null) return st |> error("table - null pointer")
         let pKey = reinterpret<float4?>(getPD(st, index))
         if (pKey == null) return st |> error("key - null pointer")
@@ -402,7 +402,7 @@ def opTable(var st : TokenStream; index : Result; var result : Result) {
         let valueTypeSize = get_type_size(result.tinfo.secondType)
         let elementIndex = get_table_key_index(pTable, key, keyBaseType, valueTypeSize)
         if (elementIndex == -1) return st |> error("key not found")
-        let pValue = (reinterpret<uint8?> pTable.data) + elementIndex * valueTypeSize
+        let pValue = (reinterpret<uint8?> (pTable.data)) + elementIndex * valueTypeSize
         result.data = pValue
         result.tinfo = *result.tinfo.secondType
         return result

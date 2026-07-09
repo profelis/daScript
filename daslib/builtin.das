@@ -21,18 +21,18 @@ let {
 [generic]
 def intptr(p : void?) : uint64 {
     static_if (typeinfo sizeof(p) == 4) {
-        return uint64(unsafe(reinterpret<uint> p))
+        return uint64(unsafe(reinterpret<uint> (p)))
     } else {
-        return unsafe(reinterpret<uint64> p)
+        return unsafe(reinterpret<uint64> (p))
     }
 }
 
 [generic]
 def intptr(p : smart_ptr<auto>) : uint64 {
     static_if (typeinfo sizeof(p) == 4) {
-        return uint64(unsafe(reinterpret<uint> p))
+        return uint64(unsafe(reinterpret<uint> (p)))
     } else {
-        return unsafe(reinterpret<uint64> p)
+        return unsafe(reinterpret<uint64> (p))
     }
 }
 
@@ -713,7 +713,7 @@ def get(Tab : table<auto(keyT); auto(valT)> ==const#; at : keyT | #; blk : block
     var val = __builtin_table_find(Tab, at)
     if (val != null) {
         __builtin_table_lock_mutable(Tab)
-        invoke(blk, *(unsafe(reinterpret<valT?#> val)))
+        invoke(blk, *(unsafe(reinterpret<valT?#> (val))))
         __builtin_table_unlock_mutable(Tab)
         return true
     } else {
@@ -725,7 +725,7 @@ def get(Tab : table<auto(keyT); auto(valT)> ==const; at : keyT | #; blk : block<
     var val = __builtin_table_find(Tab, at)
     if (val != null) {
         __builtin_table_lock_mutable(Tab)
-        invoke(blk, *(unsafe(reinterpret<valT?> val)))
+        invoke(blk, *(unsafe(reinterpret<valT?> (val))))
         __builtin_table_unlock_mutable(Tab)
         return true
     } else {
@@ -737,7 +737,7 @@ def get(var Tab : table<auto(keyT); auto(valT)> ==const#; at : keyT | #; blk : b
     var val = __builtin_table_find(Tab, at)
     if (val != null) {
         __builtin_table_lock(Tab)
-        invoke(blk, *(unsafe(reinterpret<valT?#> val)))
+        invoke(blk, *(unsafe(reinterpret<valT?#> (val))))
         __builtin_table_unlock(Tab)
         return true
     } else {
@@ -749,7 +749,7 @@ def get(var Tab : table<auto(keyT); auto(valT)> ==const; at : keyT | #; blk : bl
     var val = __builtin_table_find(Tab, at)
     if (val != null) {
         __builtin_table_lock(Tab)
-        invoke(blk, *(unsafe(reinterpret<valT?> val)))
+        invoke(blk, *(unsafe(reinterpret<valT?> (val))))
         __builtin_table_unlock(Tab)
         return true
     } else {
@@ -994,7 +994,7 @@ def binary_load(var obj; data : array<uint8> implicit) {
 
 def copy_to_local(a : auto(TT)) : TT -const {
     static_if (typeinfo can_copy(a)) {
-        return unsafe(reinterpret<TT -const> a)
+        return unsafe(reinterpret<TT -const> (a))
     } else {
         concept_assert(false, "can't copy this type")
     }
@@ -1790,13 +1790,13 @@ def stable_sort(var a : auto(TT)[] | #) {
 
 def lock(var a : array<auto(TT)> ==const | #; blk : block<(var x : array<TT>#)>) {
     __builtin_array_lock(a)
-    invoke(blk, unsafe(reinterpret<array<auto(TT)> -const#> a))
+    invoke(blk, unsafe(reinterpret<array<auto(TT)> -const#> (a)))
     __builtin_array_unlock(a)
 }
 
 def lock(a : array<auto(TT)> ==const | #; blk : block<(x : array<TT>#)>) {
     __builtin_array_lock_mutable(a)
-    invoke(blk, unsafe(reinterpret<array<auto(TT)> const#> a))
+    invoke(blk, unsafe(reinterpret<array<auto(TT)> const#> (a)))
     __builtin_array_unlock_mutable(a)
 }
 
@@ -1805,12 +1805,12 @@ def lock_data(var a : array<auto(TT)> ==const | #; blk : block<(var p : TT?#; s 
     if (len != 0) {
         __builtin_array_lock(a)
         unsafe {   // nolint:STYLE025 addr() needs unsafe too -- not detected as an unsafe leaf by the lint
-            invoke(blk, reinterpret<TT?#> addr(a[0]), len)
+            invoke(blk, reinterpret<TT?#> (addr(a[0])), len)
         }
         __builtin_array_unlock(a)
     } else {
         var nullT : TT?
-        invoke(blk, unsafe(reinterpret<TT?#> nullT), 0)
+        invoke(blk, unsafe(reinterpret<TT?#> (nullT)), 0)
     }
 }
 
@@ -1819,11 +1819,11 @@ def lock_data(a : array<auto(TT)> ==const | #; blk : block<(p : TT const?#; s : 
     if (len != 0) {
         __builtin_array_lock_mutable(a)
         unsafe {   // nolint:STYLE025 addr() needs unsafe too -- not detected as an unsafe leaf by the lint
-            invoke(blk, reinterpret<TT const?#> addr(a[0]), len)
+            invoke(blk, reinterpret<TT const?#> (addr(a[0])), len)
         }
         __builtin_array_unlock_mutable(a)
     } else {
-        invoke(blk, unsafe(reinterpret<TT const?#> null), 0)
+        invoke(blk, unsafe(reinterpret<TT const?#> (null)), 0)
     }
 }
 
@@ -1899,32 +1899,32 @@ def has_value(var a : iterator<auto>; key) {
 
 def get_ptr(src : smart_ptr<auto(TT)> ==const) : TT? const {
     unsafe {
-        return reinterpret<TT?> src
+        return reinterpret<TT?> (src)
     }
 }
 
 def get_ptr(var src : smart_ptr<auto(TT)> ==const) : TT? {
     unsafe {
-        return reinterpret<TT?> src
+        return reinterpret<TT?> (src)
     }
 }
 
 def get_const_ptr(src : smart_ptr<auto(TT)>) : TT? const {
     unsafe {
-        return reinterpret<TT? const> src
+        return reinterpret<TT? const> (src)
     }
 }
 
 def add_ptr_ref(src : auto(TT)?) : smart_ptr<TT> {
     unsafe {
-        var dst := reinterpret<smart_ptr<TT>> src
+        var dst := reinterpret<smart_ptr<TT>> (src)
         return <- dst
     }
 }
 
 def add_ptr_ref(src : smart_ptr<auto(TT)>) : smart_ptr<TT> {
     unsafe {
-        var dst := reinterpret<smart_ptr<TT>> src
+        var dst := reinterpret<smart_ptr<TT>> (src)
         return <- dst
     }
 }

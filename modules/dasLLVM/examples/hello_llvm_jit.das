@@ -42,7 +42,7 @@ def main {
     )
     var res : float4
     unsafe {
-        res = invoke_code(reinterpret<void?> pfun, safe_addr(values[0]), null)
+        res = invoke_code(reinterpret<void?> (pfun), safe_addr(values[0]), null)
     }
     print("result = {float_bits_to_int(res)}\n")
     LLVMDumpModule(mod)

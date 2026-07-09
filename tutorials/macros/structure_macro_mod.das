@@ -149,7 +149,7 @@ class SerializableMacro : AstStructureAnnotation {
 
         // Get body as ExprBlock so we can append statements
         unsafe {
-            var blk = reinterpret<ExprBlock?> fn.body
+            var blk = reinterpret<ExprBlock?> (fn.body)
 
             // Append one print group per serializable field
             for (fld in st.fields) {

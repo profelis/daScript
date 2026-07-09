@@ -546,7 +546,7 @@ def private get_eid(var arch : Archetype; index : int64) : EntityId& {
     //! Gets entity ID component for the specific entity index in the archetype.
     unsafe {
         var ceid & = arch.components[arch.eidIndex]
-        return *(reinterpret<EntityId?> addr(ceid.data[index * int64(ceid.stride)]))
+        return *(reinterpret<EntityId?> (addr(ceid.data[index * int64(ceid.stride)])))
     }
 }
 
@@ -1143,7 +1143,7 @@ def private make_callbacks(var cv : ComponentValue; value : auto(TT)) {
     }
     cv.info.dumper = @@(elem : void?) {
         if (elem == null) return ""
-        var pTT = unsafe(reinterpret<TT -const -& -#?> elem)
+        var pTT = unsafe(reinterpret<TT -const -& -#?> (elem))
         return "{*pTT}"
     }
     cv.info.gc = @@(var src : array<uint8>) : lambda {
@@ -1214,7 +1214,7 @@ def private make_callbacks(var cv : ComponentValue; value : auto(TT)) {
             for (i in range(length(arr) / stride)) {
                 let offset = i * stride
                 unsafe {
-                    var adel = reinterpret<TT -const -& -#?> addr(arr[offset])
+                    var adel = reinterpret<TT -const -& -#?> (addr(arr[offset]))
                     delete * adel
                 }
             }

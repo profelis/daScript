@@ -92,7 +92,7 @@ def describe(prog : smart_ptr<Program>) {
 
 [generic]
 def get_mangled_name(decl : ExprBlock?) {
-    return get_mangled_name(unsafe(reinterpret<ExprBlock?> decl))
+    return get_mangled_name(unsafe(reinterpret<ExprBlock?> (decl)))
 }
 
 [macro_interface]

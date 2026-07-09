@@ -111,7 +111,7 @@ def test_foo_ptr(tt : T?) {
     }
     tt |> equal(delFoo, 1)
     tt |> equal(delFoo3D, 0)
-    f = cast<Foo?> new Foo3D()
+    f = cast<Foo?>(new Foo3D())
     f->ups()
     tt |> equal(f.x, -2)
     tt |> equal(f.y, -2)

@@ -45,7 +45,7 @@ class EsMacro : AstFunctionAnnotation {
         var stType = new TypeDecl(at = func.at, baseType = Type.tStructure)
         stType.structType = st
         var blk <- setup_call_list("register`es`{funcName}", func.at, true, true)
-        blk.list |> emplace_new <| qmacro(ecs_register(unsafe(reinterpret<void?> @@$c(funcName)), $v(funcName), typeinfo rtti_typeinfo(type<$t(stType)>)))
+        blk.list |> emplace_new <| qmacro(ecs_register(unsafe(reinterpret<void?> (@@$c(funcName))), $v(funcName), typeinfo rtti_typeinfo(type<$t(stType)>)))
         // Register @required globals — only if not already done
         var gblk <- setup_call_list("register`globals", func.at, true, true)
         if (length(gblk.list) == 0) {

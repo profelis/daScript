@@ -198,8 +198,8 @@ def main() {
     var d = 123
     unsafe {
         var pd = addr(d)
-        var vp : void? = reinterpret<void?> pd      // erase type
-        var pd2 = reinterpret<int?> vp               // restore type
+        var vp : void? = reinterpret<void?> (pd)      // erase type
+        var pd2 = reinterpret<int?> (vp)               // restore type
         print("  *pd2 = {*pd2}\n")
     }
 
@@ -225,10 +225,10 @@ def main() {
     print("=== reinterpret ===\n")
     unsafe {
         let float_val = 1.0
-        let int_bits = reinterpret<int> float_val
+        let int_bits = reinterpret<int> (float_val)
         print("  1.0 as int bits: 0x{int_bits:08x}\n")   // IEEE 754: 0x3f800000
 
-        let back = reinterpret<float> int_bits
+        let back = reinterpret<float> (int_bits)
         print("  back to float: {back}\n")
     }
 

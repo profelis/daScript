@@ -619,7 +619,7 @@ def match_any(what : TypeDeclPtr; wth : Expression?; access : Expression?; var t
             return false
         }
         log_m("\tadd condition {describe(access)} == {describe(wth)}\n")
-        var ee = unsafe(reinterpret<Expression?> wth)
+        var ee = unsafe(reinterpret<Expression?> (wth))
         var cond = qmacro($e(access) == $e(ee))
         cond |> force_at(wth.at)
         to.conditions |> emplace(cond)
@@ -627,7 +627,7 @@ def match_any(what : TypeDeclPtr; wth : Expression?; access : Expression?; var t
     } elif (wth._type != null && (is_same_type(what, wth._type, RefMatters.no, ConstMatters.no, TemporaryMatters.no) ||
             (is_string_like(what) && is_string_like(wth._type)))) {
         log_m("\tadd condition {describe(access)} == {describe(wth)}\n")
-        var ee = unsafe(reinterpret<Expression?> copy_to_local(wth))
+        var ee = unsafe(reinterpret<Expression?> (copy_to_local(wth)))
         var cond = qmacro($e(access) == $e(ee))
         cond |> force_at(wth.at)
         to.conditions |> emplace(cond)

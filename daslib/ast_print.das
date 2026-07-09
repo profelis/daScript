@@ -1230,7 +1230,7 @@ def allExpr(arg : int) {
     print("{easc}");
     // ExprCast
     unsafe {
-        let aaf = reinterpret<float> aa;
+        let aaf = reinterpret<float> (aa);
         print("{aaf}");
     }
     // ExprDelete

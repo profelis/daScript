@@ -89,7 +89,7 @@ def gather(ch : Channel?; blk : block<(arg : auto(TT)#) : void>) {
     //! reads input from the channel (in order it was pushed) and invokes the block on each input.
     //! afterwards input is consumed
     _builtin_channel_gather(ch) $(var data : void?) {
-        invoke(blk, *(unsafe(reinterpret<TT?#> data)))
+        invoke(blk, *(unsafe(reinterpret<TT?#> (data))))
     }
 }
 
@@ -97,7 +97,7 @@ def gather_ex(ch : Channel?; blk : block<(arg : auto(TT)#; info : TypeInfo const
     //! reads input from the channel (in order it was pushed) and invokes the block on each input.
     //! afterwards input is consumed
     _builtin_channel_gather_ex(ch) $(var data : void?; info : TypeInfo const?; var ctx : Context) {
-        invoke(blk, *(unsafe(reinterpret<TT?#> data)), info, ctx)
+        invoke(blk, *(unsafe(reinterpret<TT?#> (data))), info, ctx)
     }
 }
 
@@ -105,7 +105,7 @@ def gather_and_forward(ch, toCh : Channel?; blk : block<(arg : auto(TT)#) : void
     //! reads input from the channel (in order it was pushed) and invokes the block on each input.
     //! afterwards input is consumed
     _builtin_channel_gather_and_forward(ch, toCh) $(var data : void?) {
-        invoke(blk, *(unsafe(reinterpret<TT?#> data)))
+        invoke(blk, *(unsafe(reinterpret<TT?#> (data))))
     }
 }
 
@@ -113,7 +113,7 @@ def peek(ch : Channel?; blk : block<(arg : auto(TT)#) : void>) {
     //! reads input from the channel (in order it was pushed) and invokes the block on each input.
     //! afterwards input is not consumed
     _builtin_channel_peek(ch) $(var data : void?) {
-        invoke(blk, *(unsafe(reinterpret<TT?#> data)))
+        invoke(blk, *(unsafe(reinterpret<TT?#> (data))))
     }
 }
 
@@ -129,7 +129,7 @@ def for_each(channel : Channel?; blk : block<(res : auto(TT)#) : void>) {
             void_data = vd
         }
         if (void_data == null) break
-        let typed_data = unsafe(reinterpret<TT?#> void_data)
+        let typed_data = unsafe(reinterpret<TT?#> (void_data))
         invoke(blk, *typed_data)
     }
 }
@@ -144,11 +144,11 @@ def for_each_clone(channel : Channel?; blk : block<(res : auto(TT)#) : void>) {
         _builtin_channel_pop(channel) $(vd) {
             if (vd != null) {
                 any = true
-                temp := *(unsafe(reinterpret<TT -# -& -const?#> vd))
+                temp := *(unsafe(reinterpret<TT -# -& -const?#> (vd)))
             }
         }
         if (!any) break
-        invoke(blk, unsafe(reinterpret<TT -& -const#> temp))
+        invoke(blk, unsafe(reinterpret<TT -& -const#> (temp)))
         delete temp
     }
 }
@@ -161,7 +161,7 @@ def pop_one(channel : Channel?; blk : block<(res : auto(TT)#) : void>) {
         void_data = vd
     }
     if (void_data == null) return false
-    let typed_data = unsafe(reinterpret<TT?#> void_data)
+    let typed_data = unsafe(reinterpret<TT?#> (void_data))
     invoke(blk, *typed_data)
     return true
 }
@@ -173,11 +173,11 @@ def pop_and_clone_one(channel : Channel?; blk : block<(res : auto(TT)#) : void>)
     _builtin_channel_pop(channel) $(vd) {
         if (vd != null) {
             any = true
-            temp := *(unsafe(reinterpret<TT -# -& -const?#> vd))
+            temp := *(unsafe(reinterpret<TT -# -& -const?#> (vd)))
         }
     }
     if (!any) return false
-    invoke(blk, unsafe(reinterpret<TT -& -const#> temp))
+    invoke(blk, unsafe(reinterpret<TT -& -const#> (temp)))
     delete temp
     return true
 }
@@ -187,7 +187,7 @@ def try_pop(channel : Channel?; blk : block<(res : auto(TT)#) : void>) : bool {
     //! Does not wait for data — returns immediately.
     var result = false
     result = _builtin_channel_try_pop(channel) $(data) {
-        invoke(blk, *(unsafe(reinterpret<TT?#> data)))
+        invoke(blk, *(unsafe(reinterpret<TT?#> (data))))
     }
     return result
 }
@@ -198,10 +198,10 @@ def try_pop_clone(channel : Channel?; blk : block<(res : auto(TT)#) : void>) : b
     var temp : TT -# -& -const
     var any = false
     any = _builtin_channel_try_pop(channel) $(data) {
-        temp := *(unsafe(reinterpret<TT -# -& -const?#> data))
+        temp := *(unsafe(reinterpret<TT -# -& -const?#> (data)))
     }
     if (!any) return false
-    invoke(blk, unsafe(reinterpret<TT -& -const#> temp))
+    invoke(blk, unsafe(reinterpret<TT -& -const#> (temp)))
     delete temp
     return true
 }
@@ -211,7 +211,7 @@ def pop_with_timeout(channel : Channel?; timeout_ms : int; blk : block<(res : au
     //! Returns true if an item was available within the timeout, false if timed out or channel exhausted.
     var result = false
     result = _builtin_channel_pop_with_timeout(channel, timeout_ms) $(data) {
-        invoke(blk, *(unsafe(reinterpret<TT?#> data)))
+        invoke(blk, *(unsafe(reinterpret<TT?#> (data))))
     }
     return result
 }
@@ -222,10 +222,10 @@ def pop_with_timeout_clone(channel : Channel?; timeout_ms : int; blk : block<(re
     var temp : TT -# -& -const
     var any = false
     any = _builtin_channel_pop_with_timeout(channel, timeout_ms) $(data) {
-        temp := *(unsafe(reinterpret<TT -# -& -const?#> data))
+        temp := *(unsafe(reinterpret<TT -# -& -const?#> (data)))
     }
     if (!any) return false
-    invoke(blk, unsafe(reinterpret<TT -& -const#> temp))
+    invoke(blk, unsafe(reinterpret<TT -& -const#> (temp)))
     delete temp
     return true
 }
@@ -279,7 +279,7 @@ def get(box : LockBox?; blk : block<(res : auto(TT)#) : void>) {
     var res = false
     _builtin_lockbox_get(box) $(void_data) {
         if (void_data != null) {
-            let typed_data = unsafe(reinterpret<TT?#> void_data)
+            let typed_data = unsafe(reinterpret<TT?#> (void_data))
             invoke(blk, *typed_data)
             res = true
         }
@@ -291,13 +291,13 @@ def update(box : LockBox?; blk : block<(var res : auto(TT)#) : void>) {
     //! update value in the lock box and invokes the block on it
     _builtin_lockbox_update(box, unsafe(reinterpret<TypeInfo?>(typeinfo rtti_typeinfo(type<TT? -#>)))) $(var void_data : void?) {
         if (void_data != null) {
-            var typed_data = unsafe(reinterpret<TT?#> void_data)
+            var typed_data = unsafe(reinterpret<TT?#> (void_data))
             invoke(blk, *typed_data)
             return void_data
         } else {
             var heap_data = new TT
             invoke(blk, *heap_data)
-            return unsafe(reinterpret<void?> heap_data)
+            return unsafe(reinterpret<void?> (heap_data))
         }
     }
 }
@@ -307,7 +307,7 @@ def clear(box : LockBox?; type_ : auto(TT)) {
     //! clear value from the lock box
     _builtin_lockbox_update(box, unsafe(reinterpret<TypeInfo?>(typeinfo rtti_typeinfo(type<TT? -#>)))) $(var void_data : void?) : void? {
         if (void_data != null) {
-            var typed_data = unsafe(reinterpret<TT -const?> void_data)
+            var typed_data = unsafe(reinterpret<TT -const?> (void_data))
             unsafe {
                 delete typed_data
             }
@@ -328,7 +328,7 @@ def grab(box : LockBox?; blk : block<(var res : auto(TT)) : void>) : bool {
     var res = false
     _builtin_lockbox_grab(box) $(void_data) {
         if (void_data != null) {
-            var typed_data = unsafe(reinterpret<TT -const?> void_data)
+            var typed_data = unsafe(reinterpret<TT -const?> (void_data))
             invoke(blk, *typed_data)
             res = true
         }
@@ -350,7 +350,7 @@ def each(var channel : Channel?; tinfo : auto(TT)) {
                 }
                 if (void_data == null) break
                 unsafe {
-                    yield *reinterpret<TT?#> void_data
+                    yield *reinterpret<TT?#> (void_data)
                 }
             }
             return false
@@ -373,11 +373,11 @@ def each_clone(var channel : Channel?; tinfo : auto(TT)) {
                 _builtin_channel_pop(channel) $(vd) {
                     if (vd != null) {
                         any = true
-                        temp := *(unsafe(reinterpret<TT -# -& -const?#> vd))
+                        temp := *(unsafe(reinterpret<TT -# -& -const?#> (vd)))
                     }
                 }
                 if (!any) break
-                yield unsafe(reinterpret<TT -& -const#> temp)
+                yield unsafe(reinterpret<TT -& -const#> (temp))
                 delete temp
             }
             return false
