@@ -317,3 +317,221 @@ def upsert_llm(var tests : array<LlmRec>; rec : LlmRec) {
     }
     tests |> push(rec)
 }
+
+// ===== ASR: audio-model roots + corpus =====
+
+// whisper.cpp model root (the ggml-*.bin parakeet/whisper carriers, shared by das and the *-cli
+// references). Override with WHISPER_CPP_MODELS.
+def whisper_models_dir() : string {
+    let env = get_env_variable("WHISPER_CPP_MODELS")
+    return empty(env) ? "/Users/borisbatkin/Work/whisper.cpp/models/" : env
+}
+
+// The bench corpus (relative to the repo-root cwd these tools run in).
+def asr_corpus_dir() : string {
+    return "modules/dasLLAMA/benchmarks/asr/corpus/"
+}
+
+// The five standard corpus buckets, shortest→longest (11 s .. 547 s).
+def corpus_buckets() : array<string> {
+    return <- ["jfk.wav", "jfk3.wav", "gb1.wav", "hp0.wav", "hp0x2.wav"]
+}
+
+// ===== ASR: the audio-model catalog =====
+
+//! A reference tool bound to one ASR model + the per-tool handle to invoke it: the onnx variant key,
+//! the NeMo HF id, or the mtmd mmproj basename. Empty when the tool loads the model's own das_model
+//! directly (the whisper.cpp `parakeet-cli` / `whisper-cli`).
+struct AsrRef {
+    tool : string      // parakeet-cli | whisper-cli | onnx | nemo | mtmd
+    handle : string
+}
+
+//! One ASR model to profile: the das-side load (basename under `root`, plus `mmproj` for the two-file
+//! audio-chat models), its ordered reference tools, the corpus buckets to time, and a short tag (`v2` /
+//! `tiny` …) — non-empty only for models that also join the LibriSpeech dictation aggregate.
+struct AsrModelSpec {
+    display : string
+    das_model : string
+    das_mmproj : string
+    root : string
+    refs : array<AsrRef>
+    buckets : array<string>
+    libri_short : string
+}
+
+// The audio models the suite profiles. Absent files are skipped at run time. The das side is uniform
+// (load_asr_model + transcribe drives every entry); the heterogeneity is which reference tool(s) apply.
+def asr_catalog() : array<AsrModelSpec> {
+    let wroot = whisper_models_dir()
+    let lroot = models_dir()
+    return <- [
+        AsrModelSpec(display = "Parakeet-TDT v2", das_model = "ggml-parakeet-tdt-0.6b-v2-f32.bin",
+            das_mmproj = "", root = wroot,
+            refs <- [AsrRef(tool = "parakeet-cli", handle = ""), AsrRef(tool = "onnx", handle = "v2-int8")],
+            buckets <- corpus_buckets(), libri_short = "v2"),
+        AsrModelSpec(display = "Parakeet-TDT v3", das_model = "ggml-parakeet-tdt-0.6b-v3-f32.bin",
+            das_mmproj = "", root = wroot,
+            refs <- [AsrRef(tool = "parakeet-cli", handle = ""), AsrRef(tool = "onnx", handle = "int8")],
+            buckets <- corpus_buckets(), libri_short = "v3"),
+        AsrModelSpec(display = "Whisper tiny", das_model = "ggml-tiny.bin",
+            das_mmproj = "", root = wroot,
+            refs <- [AsrRef(tool = "whisper-cli", handle = ""), AsrRef(tool = "onnx", handle = "whisper-tiny-int8")],
+            buckets <- corpus_buckets(), libri_short = "tiny"),
+        AsrModelSpec(display = "Whisper large-v3-turbo", das_model = "ggml-large-v3-turbo.bin",
+            das_mmproj = "", root = wroot,
+            refs <- [AsrRef(tool = "whisper-cli", handle = ""), AsrRef(tool = "onnx", handle = "whisper-turbo-int8")],
+            buckets <- corpus_buckets(), libri_short = ""),
+        AsrModelSpec(display = "Canary-Qwen 2.5B", das_model = "canary-qwen-2.5b-decoder-f16.gguf",
+            das_mmproj = "", root = lroot,
+            refs <- [AsrRef(tool = "nemo", handle = "nvidia/canary-qwen-2.5b")],
+            buckets <- ["jfk.wav", "jfk3.wav", "gb1.wav"], libri_short = ""),
+        AsrModelSpec(display = "Gemma-4 E2B audio", das_model = "gemma-4-E2B-it-Q8_0.gguf",
+            das_mmproj = "mmproj-gemma-4-E2B-it-bf16.gguf", root = lroot,
+            refs <- [AsrRef(tool = "mtmd", handle = "mmproj-gemma-4-E2B-it-bf16.gguf")],
+            buckets <- ["gemma4a_test2.wav"], libri_short = ""),
+        AsrModelSpec(display = "Qwen3-Omni-30B audio", das_model = "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf",
+            das_mmproj = "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf", root = lroot,
+            refs <- [AsrRef(tool = "mtmd", handle = "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf")],
+            buckets <- ["jfk.wav", "jfk3.wav"], libri_short = "")
+    ]
+}
+
+// ===== ASR: baseline TSV I/O (reference tool times the establisher writes, the generator reads) =====
+
+//! One reference-tool baseline row: the tool, the das display name it references, the clip, its audio
+//! seconds, the best-of-reps transcribe ms, and (mtmd only) the encode+prefill split (-1 = N/A). `kind`
+//! is "corpus" (a named bucket) or "libri" (one of the 25 LibriSpeech dictation clips).
+struct AsrBaseRow {
+    tool : string
+    model : string
+    kind : string
+    wav : string
+    audio_s : double
+    ms : double
+    encode_ms : double
+}
+
+def baseline_asr_path() : string {
+    return "modules/dasLLAMA/performance/baseline_asr_{box_name()}.tsv"
+}
+
+def write_asr_baselines(rows : array<AsrBaseRow>) {
+    fopen(baseline_asr_path(), "wb") $(f) {
+        if (f == null) {
+            return
+        }
+        fwrite(f, "tool\tmodel\tkind\twav\taudio_s\tms\tencode_ms\n")
+        for (r in rows) {
+            fwrite(f, "{r.tool}\t{r.model}\t{r.kind}\t{r.wav}\t{r.audio_s}\t{r.ms}\t{r.encode_ms}\n")
+        }
+    }
+}
+
+def read_asr_baselines() : array<AsrBaseRow> {
+    var rows : array<AsrBaseRow>
+    let text = fread(baseline_asr_path())
+    var first = true
+    for (line in split(text, "\n")) {
+        if (first) {
+            first = false
+            continue
+        }
+        if (empty(strip(line))) {
+            continue
+        }
+        let col <- split(line, "\t")
+        if (length(col) < 7) {
+            continue
+        }
+        rows |> emplace(AsrBaseRow(
+            tool = col[0], model = col[1], kind = col[2], wav = col[3],
+            audio_s = to_double(col[4]), ms = to_double(col[5]), encode_ms = to_double(col[6])))
+    }
+    return <- rows
+}
+
+// ===== ASR: profile JSON (the deliverable — full-fidelity: N references/model, per-bucket ms) =====
+
+//! One measured reference time for a bucket. `encode_ms` is @optional (mtmd only — the audio-tower
+//! encode+prefill split); 0.0 means "not split-timed" and is omitted from the JSON.
+struct AsrRefTime {
+    tool : string
+    ms : double
+    @optional encode_ms : double
+}
+
+//! One corpus clip of an ASR model's profile: das transcribe ms (best-of-reps) + one reference time
+//! per tool that ran (a tool that can't run this clip is absent — the renderer shows "-"). Both
+//! `das_encode_ms` (mtmd-parity audio-chat models) are @optional.
+struct AsrBucket {
+    wav : string
+    audio_s : double
+    das_ms : double
+    @optional das_encode_ms : double
+    refs : array<AsrRefTime>
+}
+
+//! One text-per-side dictation statistic over the LibriSpeech short-clip set (per-clip latency case).
+struct LibriStat {
+    side : string
+    mean_ms : double
+    p50_ms : double
+    p95_ms : double
+}
+
+//! The LibriSpeech dictation aggregate (25 short clips): one stat row per side (das/cli/onnx × model).
+struct LibriAggregate {
+    n_clips : int
+    sides : array<LibriStat>
+}
+
+//! One ASR model row: display + das load + ordered reference tool names (the table's column order) +
+//! one bucket per corpus clip.
+struct AsrRec {
+    model : string
+    das_model : string
+    references : array<string>
+    buckets : array<AsrBucket>
+}
+
+//! A complete per-box ASR profile: platform block + one row per measured model + the LibriSpeech
+//! dictation aggregate. Round-tripped with sprint_json/sscan_json — the machine-readable handoff.
+struct AsrProfile {
+    platform : PlatformInfo
+    tests : array<AsrRec>
+    librispeech : LibriAggregate
+}
+
+def profile_asr_path() : string {
+    return "modules/dasLLAMA/performance/profile_asr_{box_name()}.json"
+}
+
+def write_asr_profile(p : AsrProfile) {
+    let text = sprint_json(p, true)
+    fopen(profile_asr_path(), "wb") $(f) {
+        if (f != null) {
+            fwrite(f, text)
+        }
+    }
+}
+
+// Load the existing per-box ASR profile into `p` for a merge run; false if none exists yet.
+def read_asr_profile(var p : AsrProfile) : bool {
+    let path = profile_asr_path()
+    if (!stat(path).is_valid) {
+        return false
+    }
+    return sscan_json(fread(path), p)
+}
+
+// Update-or-insert `rec` into `tests` keyed by model name (partial per-model runs merge into one file).
+def upsert_asr(var tests : array<AsrRec>; var rec : AsrRec) {
+    for (c in tests) {
+        if (c.model == rec.model) {
+            c <- rec
+            return
+        }
+    }
+    tests |> emplace(rec)
+}
