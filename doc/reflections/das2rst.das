@@ -1726,7 +1726,7 @@ def document_module_gltf(_root : string) {
     var mod = [find_module("gltf_types"), find_module("gltf_accessor"),
         find_module("gltf_parse"), find_module("gltf_scene")]
     var groups <- array<DocGroup>(
-        group_by_regex("Loading", mod, %regex~.*(load_gltf)$%%),
+        group_by_regex("Loading", mod, %regex~.*(load_gltf|load_gltf_from_memory)$%%),
         group_by_regex("Scene, skinning and animation", mod, %regex~.*(update_world_transforms|gltf_scene_bounds|evaluate_animation|gltf_joint_matrix)$%%),
         group_by_regex("Accessor byte readers", mod, %regex~.*(gltf_rd_.*|gltf_read_comp_.*|gltf_comp_size|gltf_type_ncomp)$%%),
         hide_group(group_by_regex("Internal finalize infrastructure", mod, %regex~finalize%%))
