@@ -419,7 +419,10 @@ jobs:
         key: sccache-${{ matrix.target }}-${{ matrix.architecture }}-${{ matrix.cmake_preset }}-${{ matrix.sanitizers }}
 
     - name: "Prewarm JIT cache"
-      if: env.das_llvm_disabled != 'ON' && matrix.jit_disabled != 'ON'
+      # Debug presets skip JIT entirely (prewarm + test sweep) — Debug+JIT is
+      # slow and, on LLVM ARM64, hangs mid-suite (see linux_arm64 note below).
+      # JIT stays covered by every Release cell and the mingw clang sweep.
+      if: env.das_llvm_disabled != 'ON' && matrix.jit_disabled != 'ON' && matrix.cmake_preset != 'Debug'
       run: |
         set -eux
         cmake --build ./build --config ${{ matrix.cmake_preset }} --target jit_cache_all_tests
@@ -467,7 +470,8 @@ jobs:
                 TEST_DIR=_dasroot_/tests
             fi
             # Use more time to pass UBSAN and disable leaks in JIT mode because we exit using exit(), and do not call destructors.
-            [ "${{ env.das_llvm_disabled }}" = "ON" ] || ASAN_OPTIONS=detect_leaks=0 bin/daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --timeout 900 --test $TEST_DIR || ASAN_OPTIONS=detect_leaks=0 bin/daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --isolated-mode --timeout 3600 --test $TEST_DIR
+            # Debug preset skips JIT (see "Prewarm JIT cache" note); sanitizer cells are Release, so they still run it.
+            [ "${{ env.das_llvm_disabled }}" = "ON" ] || [ "${{ matrix.cmake_preset }}" = "Debug" ] || ASAN_OPTIONS=detect_leaks=0 bin/daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --timeout 900 --test $TEST_DIR || ASAN_OPTIONS=detect_leaks=0 bin/daslang _dasroot_/dastest/dastest.das -jit -- $JIT_LINKER_STRING $JIT_PATH_TO_LINKER $JIT_OPT --color --failures-only --isolated-mode --timeout 3600 --test $TEST_DIR
             # Interpreter sweep: non-sanitizer only.
             if [ "${{ matrix.sanitizers }}" = "none" ]; then
                 cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter_isolated
@@ -477,7 +481,8 @@ jobs:
             cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter_isolated
             ;;
            windows*)
-            [ "${{ env.das_llvm_disabled }}" = "ON" ] || [ "${{ matrix.jit_disabled }}" = "ON" ] || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_jit || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_jit_isolated
+            # Debug preset skips JIT (see "Prewarm JIT cache" note) in addition to the jit_disabled cells.
+            [ "${{ env.das_llvm_disabled }}" = "ON" ] || [ "${{ matrix.jit_disabled }}" = "ON" ] || [ "${{ matrix.cmake_preset }}" = "Debug" ] || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_jit || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_jit_isolated
             cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter_isolated
             ;;
            linux_arm64)
@@ -491,7 +496,8 @@ jobs:
             cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter_isolated
             ;;
            *)
-            [ "${{ env.das_llvm_disabled }}" = "ON" ] || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_jit || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_jit_isolated
+            # Debug preset skips JIT (see "Prewarm JIT cache" note).
+            [ "${{ env.das_llvm_disabled }}" = "ON" ] || [ "${{ matrix.cmake_preset }}" = "Debug" ] || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_jit || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_jit_isolated
             cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter || cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_interpreter_isolated
             ;;
         esac
