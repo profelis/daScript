@@ -147,6 +147,13 @@ add_link_options("SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/../modules/dasS
 # the MEMFS cwd is "/", so the loader's "./modules/..." resolves to the embed.
 add_link_options("SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/../modules/dasStbImage/fonts@modules/dasStbImage/fonts")
 
+# Embed the dasGLTF .das source tree (a pure-daslang glTF 2.0 loader — no native
+# library; its dependencies stbimage / json_boost / base64 / fio / opengl / glsl are
+# already embedded or linked above). The native fs resolver looks for
+# getDasRoot()/modules/dasGLTF/gltf/<name>.das, so mount at /modules/dasGLTF/gltf.
+# Used by the OpenGL glTF PBR capstone playground card (gl_12_gltf).
+add_link_options("SHELL:--embed-file ${CMAKE_CURRENT_SOURCE_DIR}/../modules/dasGLTF/gltf@modules/dasGLTF/gltf")
+
 # Embed the dasAudio .das source trees (the matching halves of the statically
 # linked libDasModuleAudio). The native fs resolver looks for
 # getDasRoot()/modules/dasAudio/<subdir>/<name>.das (fs_file_info.cpp,

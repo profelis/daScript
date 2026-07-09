@@ -2069,6 +2069,33 @@ install(FILES
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/opengl/media
 )
 
+# dasGLTF sample assets (Khronos glTF-Sample-Assets). BoomBox is CC0; Fox is a CC0 model with
+# CC-BY 4.0 rig/animation (attribution in GLTF_SAMPLE_ASSETS.LICENSE, shipped below). Loaded by
+# examples/opengl/10_hello_gltf.das (BoomBox) + 11_hello_gltf_animation.das (Fox) via
+# get_das_root()/examples/gltf/media.
+install(FILES
+    ${PROJECT_SOURCE_DIR}/examples/gltf/media/BoomBox.glb
+    ${PROJECT_SOURCE_DIR}/examples/gltf/media/Fox.glb
+    ${PROJECT_SOURCE_DIR}/examples/gltf/PROVENANCE.md
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/media
+)
+# The Fox rig/animation is CC-BY 4.0, so its attribution must ship with the SDK.
+install(FILES ${PROJECT_SOURCE_DIR}/examples/gltf/GLTF_SAMPLE_ASSETS.LICENSE
+    DESTINATION ${DAS_INSTALL_DOCDIR}
+)
+
+# dasGLTF ImGui mesh viewer. The dasImgui dep is daspkg-installed into modules/ (gitignored) from the
+# .das_package; run with -project_root examples/gltf/mesh_viewer_opengl. Ships source + manifest only.
+file(GLOB DAS_GLTF_VIEWER_EXAMPLE
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/*.das
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/.gitignore
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_opengl/README.md
+)
+install(FILES ${DAS_GLTF_VIEWER_EXAMPLE}
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/mesh_viewer_opengl
+)
+
 add_subdirectory(tutorials)
 
 # Test-runner targets (run_tests_interpreter / _jit / _aot).

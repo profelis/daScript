@@ -540,6 +540,7 @@ Run any tutorial from the project root::
    tutorials/opengl/09_msaa.rst
    tutorials/opengl/10_deferred.rst
    tutorials/opengl/11_hdr.rst
+   tutorials/opengl/12_gltf.rst
 
 .. _tutorials_jsonrpc:
 

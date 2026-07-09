@@ -1,10 +1,10 @@
 .. _stdlib_media:
 
-**************************
-Image and Font Processing
-**************************
+********************************
+Image, Font and Model Processing
+********************************
 
-Image loading, saving, resizing, pixel manipulation, and TrueType font rendering.
+Image loading, saving, resizing, pixel manipulation, TrueType font rendering, and glTF 2.0 model loading.
 
 .. toctree::
 
@@ -13,3 +13,4 @@ Image loading, saving, resizing, pixel manipulation, and TrueType font rendering
    generated/raster.rst
    generated/stbtruetype.rst
    generated/stbimage_ttf.rst
+   generated/gltf.rst

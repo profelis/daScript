@@ -189,6 +189,7 @@ Image
 * :doc:`stbtruetype <generated/stbtruetype>` — TrueType font rasterization (C++ module, based on stb_truetype)
 * :doc:`stbimage_ttf <generated/stbimage_ttf>` — font rendering helpers for stbimage surfaces
 * :doc:`raster <generated/raster>` — software rasterizer: triangles, lines, circles, polygons
+* :doc:`gltf <generated/gltf>` — glTF 2.0 model loader: GLB/.gltf parse, accessor decode, node hierarchy, skinning, keyframe animation
 
 Audio
 -----

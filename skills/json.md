@@ -39,6 +39,7 @@ let ok = sscan_json(json_str, dst)             // returns bool
 Notes:
 - Supports the full set: structs, classes (deref via `*ptr`), arrays, tables, tuples, variants (key = active variant name), enums (string by default; int with `@enum_as_int`), bitfields, `floatN`/`intN` vectors, pointers, all primitives.
 - `sscan_json` returns `bool` — false on parse error. Missing fields keep their existing/default values; **unknown keys are silently ignored**, so validate required fields yourself if needed.
+- **Array-of-struct default gotcha:** the "missing fields keep defaults" rule holds only for the *top-level* struct **you** construct (`var dst = T()`). Elements of a nested `array<Struct>` that `sscan_json` allocates itself are **zero-filled — the element type's field defaults are NOT applied**. So a non-zero default (`rotation : float4 = float4(0,0,0,1)`, `index : int = -1`, `mode : int = 4`) comes out `0` for any array element whose JSON omits that key — silently wrong, no error. If array elements carry meaningful non-zero defaults, parse with **`read_json` + `from_JV(js, type<T>)`** instead: `from_JV` honors element field defaults (verified). (Discovered wiring up `modules/dasGLTF` — omitted node TRS decoded to a zero-basis matrix.)
 - Round-trip: `sscan_json(sprint_json(x, false), var y)` reproduces `x` for any supported shape.
 
 ## Field annotations
