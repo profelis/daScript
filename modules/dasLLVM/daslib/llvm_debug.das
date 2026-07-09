@@ -93,7 +93,7 @@ class ContextStateAgent : DapiDebugAgent {
     }
 }
 
-def state_agent(ctx : Context) {
+def state_agent(_ctx : Context) {
     install_new_debug_agent(new ContextStateAgent(), "llvm_debug")
 }
 

@@ -96,7 +96,7 @@ class AllocationTracker : DapiDebugAgent {
 var tracker : AllocationTracker?
 
 [export]
-def install_tracker(ctx : Context) {
+def install_tracker(_ctx : Context) {
     assert(this_context().category.debug_context)
     var agent = new AllocationTracker()
     tracker = agent

@@ -29,7 +29,7 @@ class TelnetServer : Server {
     def restart {
         if (_server != null) {
             var session : NetworkServer?
-            self->save(session)
+            self.save(session)
             gc0_save_ptr("telnet-session", session)
         }
     }
@@ -46,7 +46,7 @@ class TelnetServer : Server {
                 print("`{string(current_string)}` length={length(current_string)}\n")
                 var new_msg = "length = {length(current_string)}\n"
                 unsafe {
-                    self->send(reinterpret<uint8?>(new_msg), length(new_msg))
+                    self.send(reinterpret<uint8?>(new_msg), length(new_msg))
                 }
                 var str = string(current_string)
                 if (str == "quit") {
@@ -55,7 +55,7 @@ class TelnetServer : Server {
                     if (isContDev) {
                         print("restarting via telnet command")
                         done = true
-                        self->restart()
+                        self.restart()
                     } else {
                         print("restart request ignored, not running from dasContDev\n")
                     }

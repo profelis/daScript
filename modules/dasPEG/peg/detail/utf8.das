@@ -6,7 +6,6 @@ options no_aot = true
 options strict_smart_pointers = true
 
 require daslib/utf8_utils
-require daslib/strings
 
 module utf8 shared
 

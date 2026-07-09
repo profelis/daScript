@@ -42,8 +42,7 @@ class public MemSerializer : Serializer {
     }
     def getCopyOfData : array<uint8> {
         //! Returns copy of the data from the serializer.
-        var cdata := data
-        return <- cdata
+        return clone_to_move(data)
     }
     def getLastError {
         //! Returns last serialization error.

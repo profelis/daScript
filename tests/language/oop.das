@@ -13,7 +13,7 @@ class Foo {
         Foo`set(self, 1, 1)
     }
     def Foo(T : int) {
-        self->set(T, T)
+        self.set(T, T)
     }
     def Foo(X, Y : int) {
         Foo`set(self, X, Y)
@@ -126,11 +126,11 @@ def test_foo_ptr(tt : T?) {
 
 def test_rtti(tt : T?) {
     unsafe {
-        var g = Goo()
-        var f = Foo()
-        var f2 = Foo()
-        var f3d = Foo3D()
-        var f3d2 = Foo3D()
+        let g = Goo()
+        let f = Foo()
+        let f2 = Foo()
+        let f3d = Foo3D()
+        let f3d2 = Foo3D()
         tt |> success(f.__rtti != g.__rtti)
         tt |> success(f3d.__rtti != g.__rtti)
         tt |> equal(f.__rtti, f2.__rtti)

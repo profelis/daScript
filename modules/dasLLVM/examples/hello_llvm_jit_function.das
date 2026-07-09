@@ -1,6 +1,5 @@
 options gen2
 require daslib/safe_addr
-require daslib/math_bits
 
 require llvm/daslib/llvm_boost
 require jit
@@ -9,7 +8,7 @@ require llvm/daslib/llvm_targets
 
 // If for some reason you want to set jit function manually you should add [no_jit] attribute.
 // Otherwise it will be jitted by default jit-compiler.
-[sideeffects, no_jit]
+[sideeffects, no_jit, unused_argument(a, b)]
 def add_two_ints(a, b : int) : int {
     panic("not implemented")
     return 0

@@ -7,7 +7,6 @@ module glfw_boost shared
 
 require glfw public
 require daslib/safe_addr
-require math
 require daslib/rtti
 
 def glfwInitOpenGL(major : int = 3; minor : int = 3; dctx : bool = false; compat : bool = false) {

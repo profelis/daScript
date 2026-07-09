@@ -3,7 +3,6 @@ options strict_smart_pointers = false
 
 require dastest/testing_boost
 
-require jit
 require daslib/rtti
 require daslib/ast
 

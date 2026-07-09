@@ -16,7 +16,6 @@ module profiler shared private
 require daslib/debugger
 require daslib/fio
 require strings
-require uriparser
 require daslib/ast
 
 struct PerfNode {

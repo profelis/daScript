@@ -13,7 +13,7 @@ def iaac_join(a : array<auto(numt)>) : numt {
 [unsafe_operation]
 def iaac_findObject(objects : table<string; auto(TVal)>; guid : string) : TVal? {
     var foundObj : TVal?
-    get(objects, guid) <| $(obj) {
+    get(objects, guid) $(obj) {
         unsafe {
             foundObj = reinterpret<TVal?>(addr(obj))
         }

@@ -7,7 +7,6 @@ options no_aot
 module opengl_state shared private
 
 require opengl
-require glfw
 require daslib/debugger
 require daslib/rtti
 
@@ -269,7 +268,7 @@ class ContextStateAgent : DapiDebugAgent {
         var flags : int;
         glGetIntegerv(GL_CONTEXT_FLAGS, safe_addr(flags));
         if ((uint(flags) & GL_CONTEXT_FLAG_DEBUG_BIT) != 0u) {
-            self->logDebugMessages(ctx);
+            self.logDebugMessages(ctx);
         }
         // program
         report_uint(ctx, GL_CURRENT_PROGRAM, "OPENGL program", "GL_CURRENT_PROGRAM");
@@ -321,7 +320,7 @@ class ContextStateAgent : DapiDebugAgent {
 }
 
 [export]
-def opengl_state_agent(ctx : Context) {
+def opengl_state_agent(_ctx : Context) {
     install_new_debug_agent(new ContextStateAgent(), "opengl");
 }
 

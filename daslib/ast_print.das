@@ -248,7 +248,7 @@ class PrintVisitor : AstVisitor {
     }
     def override visitExprBlockExpression(blk : ExprBlock?; expr : ExpressionPtr) {
         //! Prints a newline after a block sub-expression.
-        self->newLine();
+        self.newLine();
         return expr;
     }
     def override preVisitExprBlockFinal(blk : ExprBlock?) {
@@ -265,7 +265,7 @@ class PrintVisitor : AstVisitor {
     }
     def override visitExprBlockFinalExpression(blk : ExprBlock?; expr : ExpressionPtr) {
         //! Prints a newline after a finally-block expression.
-        self->newLine();
+        self.newLine();
         return expr;
     }
 // let

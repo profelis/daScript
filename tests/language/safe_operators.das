@@ -41,7 +41,7 @@ def operator ?.(tf : SafeOpFoo; name : string) : string const?# {
 [test]
 def test_safe_operators(t : T?) {
     t |> run("operator [] on struct") @(t : T?) {
-        var tf = SafeOpFoo(a = "hello")
+        let tf = SafeOpFoo(a = "hello")
         t |> equal(tf["blah"], "hello-blah")
     }
     t |> run("operator ?[] miss and hit") @(t : T?) {
@@ -50,8 +50,8 @@ def test_safe_operators(t : T?) {
         t |> equal(tf?["hello"] ?? "this???", "hello")
     }
     t |> run("operator . on struct") @(t : T?) {
-        var tf = SafeOpFoo(a = "hello")
-        var ez = tf.fooBar
+        let tf = SafeOpFoo(a = "hello")
+        let ez = tf.fooBar
         t |> equal(ez . . a, "hello.fooBar")
     }
     t |> run("operator ?. hit and miss") @(t : T?) {
