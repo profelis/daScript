@@ -172,6 +172,8 @@ struct private JGltf {
     samplers : array<JSampler>
     skins : array<JSkin>
     animations : array<JAnimation>
+    extensionsUsed : array<string>
+    extensionsRequired : array<string>
 }
 
 // ===== string → enum helpers =====
@@ -208,6 +210,10 @@ def private parse_path(s : string) : GltfPath {
 def private attr(prim : JPrimitive; key : string) : int {
     return prim.attributes?[key] ?? -1
 }
+
+// dasGLTF implements no glTF extensions yet; when one lands, list its name here.
+[unused_argument(name)]
+def private extension_supported(name : string) : bool => false
 
 // ===== accessor decode =====
 // One float4 per element (missing lanes zero); handles interleaved byteStride,
@@ -699,6 +705,20 @@ def private parse_gltf_json(jsonText : string; var glbBin : array<uint8>; baseDi
     // ignores field defaults, so omitted glTF defaults (node rotation/scale, primitive
     // mode, texture index -1, ...) would come out zero. from_JV honors the defaults.
     var doc = from_JV(js, type<JGltf>)
+    // fail closed on extensionsRequired (per spec): decoding an asset whose required
+    // extension we don't implement (e.g. KHR_draco_mesh_compression) would silently
+    // yield degenerate zero-geometry, not a recognizable error
+    for (ext in doc.extensionsRequired) {
+        if (!extension_supported(ext)) {
+            to_log(LOG_ERROR, "gltf: asset requires unsupported extension {ext}\n")
+            return <- scene
+        }
+    }
+    for (ext in doc.extensionsUsed) {
+        if (!extension_supported(ext)) {
+            to_log(LOG_WARNING, "gltf: optional extension {ext} not supported; ignoring\n")
+        }
+    }
     var buffers : array<array<uint8>>
     decode_buffers(doc, glbBin, baseDir, buffers)
     build_scene(doc, buffers, baseDir, scene)

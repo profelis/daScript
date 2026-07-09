@@ -88,3 +88,8 @@ mesh optimization, `KHR_draco_mesh_compression`, and the strip/fan/loop primitiv
 (`LINE_LOOP`/`LINE_STRIP`/`TRIANGLE_STRIP`/`TRIANGLE_FAN`) are out of scope — geometry is expected as
 indexed `TRIANGLES`, which is what glTF exporters emit almost universally. The neutral scene format is
 designed to feed a separate mesh optimizer. A Vulkan backend (`gltf_vk`) is a planned parallel to `gltf_gl`.
+
+glTF extensions are not implemented. An asset whose `extensionsRequired` names any extension **fails
+closed** (empty scene + error log, per spec) instead of decoding to degenerate geometry — e.g. Draco-compressed
+assets; recompress with `gltf-transform` / `gltfpack` to plain glTF. Optional `extensionsUsed`-only
+extensions load with a warning and their features are ignored.

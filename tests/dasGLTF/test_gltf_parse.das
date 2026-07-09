@@ -4,9 +4,33 @@ options indenting = 4
 require dastest/testing_boost public
 require gltf/gltf_boost
 require math
+require daslib/fio
+require strings
 
 def private model_path(name : string) : string {
     return "{get_das_root()}/tests/dasGLTF/models/{name}"
+}
+
+// read a JSON fixture, inject `inject` right after the opening '{', parse from memory
+def private load_patched(name : string; inject : string) : GltfScene {
+    var bytes : array<uint8>
+    fopen(model_path(name), "rb") $(f) {
+        if (f != null) {
+            fmap(f) $(var data : array<uint8>#) {
+                bytes := data
+            }
+        }
+    }
+    let text = string(bytes)
+    delete bytes
+    let patched = "\{{inject}{slice(text, 1)}"
+    var pbytes : array<uint8>
+    peek_data(patched) $(arr) {
+        pbytes := arr
+    }
+    var scene <- load_gltf_from_memory(pbytes, "{get_das_root()}/tests/dasGLTF/models")
+    delete pbytes
+    return <- scene
 }
 
 [test]
@@ -60,6 +84,25 @@ def test_box_interleaved(t : T?) {
         t |> equal(scene.meshes[0].primitives[0].vertices[0].position, float3(-0.5, -0.5, 0.5))
         t |> equal(scene.meshes[0].primitives[0].vertices[0].normal, float3(0., 0., 1.))
         t |> equal(scene.meshes[0].primitives[0].vertices[1].position, float3(0.5, -0.5, 0.5))
+        delete scene
+    }
+}
+
+[test]
+def test_extensions_gate(t : T?) {
+    // extensionsRequired naming an unsupported extension (e.g. Draco) must fail
+    // closed - empty scene + error log - instead of silently-degenerate geometry;
+    // the same extension under extensionsUsed only (optional) must still load.
+    t |> run("unsupported extensionsRequired yields empty scene") @(t : T?) {
+        var scene <- load_patched("SimpleSkin.gltf", "\"extensionsRequired\":[\"KHR_draco_mesh_compression\"],")
+        t |> equal(length(scene.meshes), 0)
+        t |> equal(length(scene.nodes), 0)
+        delete scene
+    }
+    t |> run("unsupported extensionsUsed (optional) still loads") @(t : T?) {
+        var scene <- load_patched("SimpleSkin.gltf", "\"extensionsUsed\":[\"KHR_texture_transform\"],")
+        t |> equal(length(scene.meshes), 1)
+        t |> equal(length(scene.nodes), 3)
         delete scene
     }
 }
