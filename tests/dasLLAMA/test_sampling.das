@@ -61,7 +61,7 @@ def test_sampling_greedy_matches_oracle(t : T?) {
         var got : array<int64>
         with_job_que() {
             setup_dasllama_jobque()
-            var s = create_session(m)
+            var s = create_session(m, KVDtype.f32)   // frozen f32 oracle — the facade default is f16
             generate(m, s, GEMMA2_PROMPT, SamplingParams(), int64(length(GEMMA2_GEN))) $(id, piece) {
                 got |> push(id)
                 return true

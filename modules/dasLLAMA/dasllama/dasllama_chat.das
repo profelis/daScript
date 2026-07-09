@@ -221,9 +221,10 @@ def private render_prompt_audio(m : Model; c : ChatSession; var head : array<int
 // ===== Public API =====
 
 //! Start a conversation over `model`. `system` is the system prompt (empty = none); `max_new` caps
-//! each reply. A model can drive many independent ChatSessions.
-def create_chat_(model : Model; system : string = ""; max_new : int64 = 256l) : ChatSession {
-    var c = ChatSession(session <- create_session_(model), tmpl <- chat_template(model),
+//! each reply; `kv_dtype` is the session's KV-cache codec (f16 default, f32 = bit-exact reference).
+//! A model can drive many independent ChatSessions.
+def create_chat_(model : Model; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
+    var c = ChatSession(session <- create_session_(model, kv_dtype, kv_dtype), tmpl <- chat_template(model),
                         system = system, max_new = max_new)
     for (sp in c.tmpl.stop) {
         let id = special_id(model, sp)
@@ -252,11 +253,11 @@ def create_chat_(model : Model; system : string = ""; max_new : int64 = 256l) : 
 //! audio tower (moved in) so ``add_user_audio`` can splice soft tokens into its turns. The
 //! tower must project into the decoder's embedding width (a mismatched decoder/mmproj pair
 //! panics here, not at respond time).
-def create_chat_(model : Model; var tower : AudioTower; system : string = ""; max_new : int64 = 256l) : ChatSession {
+def create_chat_(model : Model; var tower : AudioTower; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
     if (tower.proj_dim != model.config.dim) {
         panic("dasLLAMA chat: mmproj projects to {tower.proj_dim} but the decoder is {model.config.dim}-wide — mismatched pair")
     }
-    var c <- create_chat_(model, system, max_new)
+    var c <- create_chat_(model, system, max_new, kv_dtype)
     c.enc <- make_encoder_state(tower)
     c.tower <- tower
     return <- c

@@ -43,13 +43,14 @@ def load_model(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     return <- load_model_(path, mode)
 }
 
-def create_session(model : Model; kv_dtype : KVDtype = KVDtype.f32) : Session {
+def create_session(model : Model; kv_dtype : KVDtype = KVDtype.f16) : Session {
     //! Create a fresh session (KV cache + scratch) sized to ``model.config.seq_len``. A model serves
     //! many sessions, each with its own position and cache — one model, many independent conversations.
     //! On large-context models cap ``model.config.seq_len`` BEFORE creating sessions to bound KV memory.
-    //! ``kv_dtype`` picks this session's KV-cache codec: ``KVDtype.f32`` (bit-exact reference) or
-    //! ``KVDtype.f16`` (half the KV bytes, near-lossless — stores clamp to ±65504) —
-    //! per-session state, so sessions with different codecs and parallel models never interact.
+    //! ``kv_dtype`` picks this session's KV-cache codec — the ``KVDtype.f16`` default halves the KV
+    //! bytes and speeds up deep-context decode (near-lossless: stores clamp to ±65504; llama.cpp's
+    //! default is F16 too); pass ``KVDtype.f32`` for the bit-exact reference. Per-session state, so
+    //! sessions with different codecs and parallel models never interact.
     return <- create_session_(model, kv_dtype, kv_dtype)
 }
 
@@ -156,20 +157,21 @@ def embed(model : Model; text : string) : array<float> {
 
 // ===== Chat =====
 
-def create_chat(model : Model; system : string = ""; max_new : int64 = 256l) : ChatSession {
+def create_chat(model : Model; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
     //! Start a conversation over ``model``: resolves the model's chat template (sniffed from the GGUF's
     //! embedded template, falling back to the arch registry) and creates the session. ``system`` is the
     //! system prompt (empty = none); ``max_new`` caps each reply. One model can drive many chats.
-    return <- create_chat_(model, system, max_new)
+    //! ``kv_dtype`` is the session's KV-cache codec (f16 default — see ``create_session``).
+    return <- create_chat_(model, system, max_new, kv_dtype)
 }
 
-def create_chat(model : Model; var tower : AudioTower; system : string = ""; max_new : int64 = 256l) : ChatSession {
+def create_chat(model : Model; var tower : AudioTower; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
     //! Start an AUDIO-CAPABLE conversation: the chat takes ownership of ``tower`` (moved in — load
     //! one with ``load_audio_tower``) so ``add_user_audio`` can splice audio into its turns. The
     //! prompt shape around the audio span comes from the model's chat template (qwen2-family audio
     //! markers, llama-3 bare embeddings, voxtral ``[BEGIN_AUDIO]``). Panics on a mismatched
-    //! decoder/mmproj pair.
-    return <- create_chat_(model, tower, system, max_new)
+    //! decoder/mmproj pair. ``kv_dtype`` is the session's KV-cache codec (f16 default).
+    return <- create_chat_(model, tower, system, max_new, kv_dtype)
 }
 
 def add_user(var chat : ChatSession; text : string) {
