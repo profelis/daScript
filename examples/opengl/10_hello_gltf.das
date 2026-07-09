@@ -85,7 +85,7 @@ def main {
             let cur = glfwGetCursorPos(window)
             if (dragging) {
                 let d = cur - cursor_prev
-                camera_yaw += float(d.x) * 0.01
+                camera_yaw -= float(d.x) * 0.01
                 camera_pitch = clamp(camera_pitch + float(d.y) * 0.01, -1.5, 1.5)
             }
             cursor_prev = cur
