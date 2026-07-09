@@ -59,7 +59,9 @@ def private greedy_top(s : Session; vocab : int64) : int64 {
 // decode of `emission_ctx` tokens from position 0) tok/s for one loaded model, both from a warmed
 // JIT + live jobque. Token content doesn't affect speed, so synthetic ids are fine.
 def private measure(var t : Model; prefill_ctx, emission_ctx : int) : tuple<prefill : double; emission : double> {
-    var s <- make_run_state(t.config)
+    // F16 KV — the create_session facade default; llama-bench's KV default is F16 too, so the
+    // reference rows in the baseline TSV are measured at the same codec.
+    var s <- make_run_state(t.config, KVDtype.f16, KVDtype.f16)
     var pf = 0.0lf
     var em = 0.0lf
     with_job_que() {

@@ -264,12 +264,14 @@ struct LlmBaseline {
     n_params : int64
 }
 
-def baseline_llm_path() : string {
-    return "modules/dasLLAMA/performance/baseline_llm_{box_name()}.tsv"
+// `suffix` distinguishes measurement axes on the same box (e.g. "_metal" for the GPU-offload sweep);
+// the default "" is the canonical CPU baseline that gen_profile merges.
+def baseline_llm_path(suffix : string = "") : string {
+    return "modules/dasLLAMA/performance/baseline_llm_{box_name()}{suffix}.tsv"
 }
 
-def write_llm_baselines(rows : array<LlmBaseline>) {
-    fopen(baseline_llm_path(), "wb") $(f) {
+def write_llm_baselines(rows : array<LlmBaseline>; suffix : string = "") {
+    fopen(baseline_llm_path(suffix), "wb") $(f) {
         if (f == null) {
             return
         }
@@ -280,9 +282,9 @@ def write_llm_baselines(rows : array<LlmBaseline>) {
     }
 }
 
-def read_llm_baselines() : array<LlmBaseline> {
+def read_llm_baselines(suffix : string = "") : array<LlmBaseline> {
     var rows : array<LlmBaseline>
-    let text = fread(baseline_llm_path())
+    let text = fread(baseline_llm_path(suffix))
     var first = true
     for (line in split(text, "\n")) {
         if (first) {   // header
