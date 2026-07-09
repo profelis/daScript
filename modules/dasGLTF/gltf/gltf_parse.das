@@ -182,6 +182,10 @@ def private parse_alpha_mode(s : string) : GltfAlphaMode {
     return GltfAlphaMode.opaque
 }
 
+// glTF primitive.mode -> one of our three supported topologies. dasGLTF targets indexed TRIANGLES
+// (what glTF exporters emit almost universally); the strip/fan/loop modes (LINE_LOOP/LINE_STRIP 2/3,
+// TRIANGLE_STRIP/FAN 5/6) are NOT supported and collapse to their base lines/triangles here — an
+// asset that actually relies on strip/fan connectivity will render with wrong topology.
 def private parse_mode(m : int) : GltfPrimitiveMode {
     if (m == 0) return GltfPrimitiveMode.points
     if (m == 1 || m == 2 || m == 3) return GltfPrimitiveMode.lines
@@ -223,6 +227,8 @@ def private decode_floats(gltf : JGltf; buffers : array<array<uint8>>; ai : int)
     let acc = gltf.accessors[ai]
     let ncomp = gltf_type_ncomp(acc._type)
     result |> resize(acc.count)
+    // unknown accessor type -> ncomp 0 makes elemSize/span degenerate; leave the result zero-filled
+    if (ncomp <= 0) return <- result
     if (acc.bufferView >= 0 && acc.bufferView < length(gltf.bufferViews)) {
         let bv = gltf.bufferViews[acc.bufferView]
         let compSize = gltf_comp_size(acc.componentType)

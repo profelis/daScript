@@ -81,5 +81,7 @@ Sample `.glb` assets ship under `examples/gltf/media/` (see `examples/gltf/PROVE
 ## Scope
 
 Full metallic-roughness PBR and skeletal skinning + TRS keyframe animation. Morph targets, saving/export,
-and mesh optimization are out of scope (the neutral scene format is designed to feed a separate mesh
-optimizer). A Vulkan backend (`gltf_vk`) is a planned parallel to `gltf_gl`.
+mesh optimization, `KHR_draco_mesh_compression`, and the strip/fan/loop primitive topologies
+(`LINE_LOOP`/`LINE_STRIP`/`TRIANGLE_STRIP`/`TRIANGLE_FAN`) are out of scope — geometry is expected as
+indexed `TRIANGLES`, which is what glTF exporters emit almost universally. The neutral scene format is
+designed to feed a separate mesh optimizer. A Vulkan backend (`gltf_vk`) is a planned parallel to `gltf_gl`.

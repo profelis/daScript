@@ -58,10 +58,11 @@ surface needs more channels, so the geometry pass writes **four**:
 * attachment 0 -- ``GL_RGBA8``: albedo in ``.rgb``, baked occlusion in ``.a``;
 * attachment 1 -- ``GL_RGBA16F``: world-space (normal-mapped) normal in ``.xyz``, roughness in ``.a``;
 * attachment 2 -- ``GL_RGBA16F``: world-space position in ``.xyz``, metallic in ``.a``;
-* attachment 3 -- ``GL_RGBA8``: raw emissive in ``.rgb``.
+* attachment 3 -- ``GL_RGBA16F``: raw emissive in ``.rgb``.
 
-Signed normals and out-of-``[0, 1]`` positions need the float format; albedo and emissive fit
-in 8-bit. WebGL2 guarantees at least four draw buffers, so ``glDrawBuffers(4, ...)`` enables
+Signed normals, out-of-``[0, 1]`` positions, and above-one emissive (a material's
+``emissiveFactor`` may exceed 1) all need the float format; only albedo fits in 8-bit. WebGL2
+guarantees at least four draw buffers, so ``glDrawBuffers(4, ...)`` enables
 all of them and the geometry fragment shader's four ``@out @location = N`` writes land in one
 draw. As in rung 10, the ``@location`` on a fragment output is load-bearing: GLSL ES 3.00
 requires an explicit ``layout(location = N)`` on every output once there is more than one.

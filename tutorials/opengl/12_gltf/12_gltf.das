@@ -644,7 +644,7 @@ def create_gbuffer {
     g_albedo = make_color_attachment(RENDER_W, RENDER_H, int(GL_RGBA8), GL_RGBA, GL_UNSIGNED_BYTE, GL_COLOR_ATTACHMENT0, GL_NEAREST)
     g_normal = make_color_attachment(RENDER_W, RENDER_H, int(GL_RGBA16F), GL_RGBA, GL_HALF_FLOAT, GL_COLOR_ATTACHMENT1, GL_NEAREST)
     g_worldpos = make_color_attachment(RENDER_W, RENDER_H, int(GL_RGBA16F), GL_RGBA, GL_HALF_FLOAT, GL_COLOR_ATTACHMENT2, GL_NEAREST)
-    g_emissive_tex = make_color_attachment(RENDER_W, RENDER_H, int(GL_RGBA8), GL_RGBA, GL_UNSIGNED_BYTE, GL_COLOR_ATTACHMENT3, GL_NEAREST)
+    g_emissive_tex = make_color_attachment(RENDER_W, RENDER_H, int(GL_RGBA16F), GL_RGBA, GL_HALF_FLOAT, GL_COLOR_ATTACHMENT3, GL_NEAREST)
     glGenRenderbuffers(1, safe_addr(g_depth))
     glBindRenderbuffer(GL_RENDERBUFFER, g_depth)
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, RENDER_W, RENDER_H)
