@@ -6,6 +6,7 @@ options no_unused_function_arguments = false
 module gltf_pbr shared
 
 require gltf/gltf_types
+require gltf/gltf_scene
 require gltf/gltf_gl public
 require opengl/opengl_boost public
 require glsl/glsl_opengl public
@@ -13,20 +14,28 @@ require daslib/safe_addr
 require math
 require daslib/math_boost
 
+// Max joints in the palette uniform. Desktop GL guarantees >= 1024 vec4 of vertex uniforms; 64 mat4 is
+// 256 vec4, leaving ample room for the rest. Skins with more joints are clamped (rare for game assets).
+let GLTF_MAX_JOINTS = 64
+
 // OPT-IN metallic-roughness PBR renderer for a GltfGlModel. The shader is authored once in the
 // portable shader DSL (Cook-Torrance GGX) and lowered to GLSL by the [*_program] macros — the same
 // body ports to Vulkan by swapping the annotation name. The shader globals below are module-private:
 // the app never touches them, it drives everything through gltf_pbr_create / gltf_pbr_render.
 
 // ===== vertex stage =====
-// @location order is the contract with gltf_gl's GltfGlVertex (0..7); we consume 0..3 here.
+// @location order is the contract with gltf_gl's GltfGlVertex (0..7); we consume 0..3 + 6..7 (skinning).
 var @in @location = 0 a_position : float3
 var @in @location = 1 a_normal   : float3
 var @in @location = 2 a_tangent  : float4
 var @in @location = 3 a_uv0      : float2
+var @in @location = 6 a_joints0  : float4   // joint indices (decoded to float at parse time)
+var @in @location = 7 a_weights0 : float4   // per-joint blend weights (sum to 1)
 
 var @uniform u_model    : float4x4
 var @uniform u_viewProj : float4x4
+var @uniform u_skinned  : float                    // 1 = blend the joint palette, 0 = rigid (use u_model)
+var @uniform u_joints   : float4x4[GLTF_MAX_JOINTS] // world-space skinning palette (joint.world * inverseBind)
 
 var @inout v_world_pos     : float3
 var @inout v_world_normal  : float3
@@ -36,11 +45,41 @@ var @inout v_uv0           : float2
 
 [vertex_program]
 def gltf_pbr_vs {
-    let world = u_model * float4(a_position, 1.0)
+    var world = float4(0.0, 0.0, 0.0, 1.0)
+    var wnormal = float3(0.0, 0.0, 0.0)
+    var wtangent = float3(0.0, 0.0, 0.0)
+    if (u_skinned > 0.5) {
+        // Linear-blend skinning in VECTOR space: daslang shader math has mat*vec, vec*scalar and vec+vec,
+        // but no mat+mat / scalar*mat, so we blend the transformed vectors rather than the matrices. The
+        // palette already maps into world space (joint.world * inverseBind), so u_model is not applied.
+        let p = float4(a_position, 1.0)
+        let nn = float4(a_normal, 0.0)
+        let tg = float4(a_tangent.xyz, 0.0)
+        let jx = int(a_joints0.x)
+        let jy = int(a_joints0.y)
+        let jz = int(a_joints0.z)
+        let jw = int(a_joints0.w)
+        world = ((u_joints[jx] * p) * a_weights0.x
+               + (u_joints[jy] * p) * a_weights0.y
+               + (u_joints[jz] * p) * a_weights0.z
+               + (u_joints[jw] * p) * a_weights0.w)
+        wnormal = ((u_joints[jx] * nn).xyz * a_weights0.x
+                 + (u_joints[jy] * nn).xyz * a_weights0.y
+                 + (u_joints[jz] * nn).xyz * a_weights0.z
+                 + (u_joints[jw] * nn).xyz * a_weights0.w)
+        wtangent = ((u_joints[jx] * tg).xyz * a_weights0.x
+                  + (u_joints[jy] * tg).xyz * a_weights0.y
+                  + (u_joints[jz] * tg).xyz * a_weights0.z
+                  + (u_joints[jw] * tg).xyz * a_weights0.w)
+    } else {
+        world = u_model * float4(a_position, 1.0)
+        let nm = float3x3(u_model)
+        wnormal = nm * a_normal
+        wtangent = nm * a_tangent.xyz
+    }
     v_world_pos = world.xyz
-    let nm = float3x3(u_model)
-    v_world_normal = normalize(nm * a_normal)
-    v_world_tangent = nm * a_tangent.xyz
+    v_world_normal = normalize(wnormal)
+    v_world_tangent = wtangent
     v_tangent_w = a_tangent.w
     v_uv0 = a_uv0
     gl_Position = u_viewProj * world
@@ -214,9 +253,19 @@ def private bind_material(model : GltfGlModel; mat : GltfMaterial) {
     }
 }
 
-//! Render every mesh instance in `scene` with the PBR shader, using the GL objects in `model`. Each
-//! node's precomputed `world` matrix is the model transform; per primitive the material factors +
-//! textures are bound and doubleSided/alpha GL state is set. The caller owns clear + depth-test state.
+// Fill the joint-palette uniform for a skin (clamped to GLTF_MAX_JOINTS). gltf_pbr_vs_bind_uniform then
+// uploads u_joints, since the vertex program references it.
+def private bind_skin_palette(scene : GltfScene; skinIndex : int) {
+    let njoint = min(length(scene.skins[skinIndex].joints), GLTF_MAX_JOINTS)
+    for (j in range(njoint)) {
+        u_joints[j] = gltf_joint_matrix(scene, skinIndex, j)
+    }
+}
+
+//! Render every mesh instance in `scene` with the PBR shader, using the GL objects in `model`. A node
+//! with a `skin` is drawn skinned (its joint palette is uploaded and the mesh-node transform ignored);
+//! otherwise the node's precomputed `world` matrix is the model transform. Per primitive the material
+//! factors + textures are bound and doubleSided/alpha GL state is set. Caller owns clear + depth state.
 def gltf_pbr_render(r : GltfPbrRenderer; model : GltfGlModel; scene : GltfScene;
                     view, proj : float4x4; camPos : float3; light : GltfPbrLight) {
     glUseProgram(r.program)
@@ -229,7 +278,14 @@ def gltf_pbr_render(r : GltfPbrRenderer; model : GltfGlModel; scene : GltfScene;
         if (node.mesh < 0 || node.mesh >= length(model.meshes)) {
             continue
         }
-        u_model = node.world
+        if (node.skin >= 0 && node.skin < length(scene.skins)) {
+            bind_skin_palette(scene, node.skin)
+            u_skinned = 1.0
+            u_model = identity4x4()   // palette is already world-space; no per-node model transform
+        } else {
+            u_skinned = 0.0
+            u_model = node.world
+        }
         for (glp in model.meshes[node.mesh].primitives) {
             if (glp.material >= 0 && glp.material < length(scene.materials)) {
                 bind_material(model, scene.materials[glp.material])

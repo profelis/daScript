@@ -1,0 +1,28 @@
+glTF Sample Assets — attribution and licenses
+==============================================
+
+The glTF (.glb) models under examples/gltf/media/ are from the Khronos
+glTF-Sample-Assets repository (https://github.com/KhronosGroup/glTF-Sample-Assets)
+and are redistributed here under their original licenses, reproduced below.
+
+--------------------------------------------------------------------------------
+BoomBox  (examples/gltf/media/BoomBox.glb)
+--------------------------------------------------------------------------------
+(c) 2017, Public. CC0 1.0 Universal.
+    https://creativecommons.org/publicdomain/zero/1.0/legalcode
+  - Microsoft for Everything
+
+--------------------------------------------------------------------------------
+Fox  (examples/gltf/media/Fox.glb)
+--------------------------------------------------------------------------------
+(c) 2014, Public. CC0 1.0 Universal.
+    https://creativecommons.org/publicdomain/zero/1.0/legalcode
+  - PixelMannen for Model
+
+(c) 2014, tomkranis. CC BY 4.0 International.
+    https://creativecommons.org/licenses/by/4.0/legalcode
+  - tomkranis for Rigging & Animation
+
+(c) 2017, @AsoboStudio and @scurest. CC BY 4.0 International.
+    https://creativecommons.org/licenses/by/4.0/legalcode
+  - glTF conversion
