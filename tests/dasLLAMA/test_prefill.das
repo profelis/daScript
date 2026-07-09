@@ -32,6 +32,19 @@ def feq(a, b : array<float>) : bool {
     return true
 }
 
+// KV caches are codec-encoded byte blobs now — byte equality IS bit-exactness for a same-dtype pair
+def feq(a, b : array<uint8>) : bool {
+    if (length(a) != length(b)) {
+        return false
+    }
+    for (i in range(length(a))) {
+        if (a[i] != b[i]) {
+            return false
+        }
+    }
+    return true
+}
+
 // forward_batch over the whole prompt (one batched pass from position 0) == N× forward. Only the
 // bit-exact-by-design modes (classic, blocked) are checked here; flash is online-softmax (tolerance,
 // not bit-exact) and has its own oracle test.

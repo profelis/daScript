@@ -64,6 +64,13 @@ enum AttnPrefillMode {
     flash
 }
 
+//! KV-cache storage codec, chosen per session at create time (llama.cpp -ctk/-ctv analog; K and V
+//! carry independent dtypes). f32 is today's exact baseline. Select via set_kv_cache_dtype.
+enum KVDtype {
+    f32
+    f16
+}
+
 //! Model hyperparameters (the 7-int checkpoint header plus derived sizes).
 struct Config {
     dim : int64
@@ -1426,8 +1433,16 @@ struct Session {
     fl_m : array<float>
     fl_l : array<float>
     fl_o : array<float>
-    key_cache : array<float>  // (n_layers * seq_len * kv_dim)
-    value_cache : array<float>
+    // KV cache — codec-encoded byte blobs (dtype fixed per session at create; see KVDtype). Layout
+    // is ragged per layer: layer l's slab starts at byte kv_bprefix_*[l] * seq_len, holding seq_len
+    // rows of kv_row_bytes(dtype, layer_kv_dim(c, l)) each. Shared-KV layers alias their source
+    // layer's slab (same prefix value), mirroring Model.kv_row_prefix.
+    kv_dtype_k : KVDtype      // key codec, snapshotted from the module knob in make_run_state
+    kv_dtype_v : KVDtype      // value codec (independent of K by design)
+    key_cache : array<uint8>
+    value_cache : array<uint8>
+    kv_bprefix_k : array<int64>  // per-layer row-BYTE prefix (seq_len-independent)
+    kv_bprefix_v : array<int64>
     // batched prefill scratch — empty until forward_prefill sizes them to npos × ... (see forward_prefill)
     x_b : array<float>        // residual stream (npos x dim)
     xb_b : array<float>       // rmsnorm / attention out (npos x dim)
@@ -1502,8 +1517,9 @@ struct Session {
     ple_gate : array<float>     // per-(position) gate vector for the layer block (npos x ple)
 }
 
-//! Allocate the run state sized to a model.
-def make_run_state(c : Config) : Session {
+//! Allocate the run state sized to a model. `kdt`/`vdt` pick the KV-cache codec for THIS session
+//! (no process-global state — sessions with different codecs coexist, models run in parallel).
+def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32) : Session {
     var s : Session
     // qd = n_heads * head_size, the query / attention-output width. == dim for the llama family,
     // but Gemma2 has qd (2048) != dim (2304), so q and the attention scratch xb size to max(dim, qd).
@@ -1555,8 +1571,31 @@ def make_run_state(c : Config) : Session {
     s.xq2 |> resize(ffw)        // fused-FFN chain requant (see the Session field comment)
     s.xs2 |> resize(ffw / 32l)
     s.chain_stages |> resize(3)
-    s.key_cache |> resize(c.seq_len * kv_row_total(c))
-    s.value_cache |> resize(c.seq_len * kv_row_total(c))
+    // KV cache: walk the per-layer row-byte prefixes (the byte analog of layout_offsets'
+    // kv_row_prefix walk — shared-KV layers alias their source's slab and contribute no width).
+    // Sizing is exact per dtype; for uniform models this equals seq_len * kv_row_total *
+    // elem_bytes, and for shared-KV models it's tighter than the old kv_row_total sizing
+    // (which counted shared layers) at identical addresses.
+    s.kv_dtype_k = kdt
+    s.kv_dtype_v = vdt
+    s.kv_bprefix_k |> reserve(int(c.n_layers))
+    s.kv_bprefix_v |> reserve(int(c.n_layers))
+    var krow = 0l
+    var vrow = 0l
+    for (l in range64(c.n_layers)) {
+        let src = layer_kv_source(c, l)
+        if (src != l) {
+            s.kv_bprefix_k |> push(s.kv_bprefix_k[src])
+            s.kv_bprefix_v |> push(s.kv_bprefix_v[src])
+        } else {
+            s.kv_bprefix_k |> push(krow)
+            s.kv_bprefix_v |> push(vrow)
+            krow += kv_row_bytes(s.kv_dtype_k, layer_kv_dim(c, l))
+            vrow += kv_row_bytes(s.kv_dtype_v, layer_kv_dim(c, l))
+        }
+    }
+    s.key_cache |> resize(c.seq_len * krow)
+    s.value_cache |> resize(c.seq_len * vrow)
     s.sample_scratch |> resize(c.vocab_size)
     s.rng = random_seed(1234)
     return <- s
@@ -1564,8 +1603,9 @@ def make_run_state(c : Config) : Session {
 
 //! Create a fresh session (KV cache + scratch) sized to `model`. A model serves many sessions,
 //! each with its own position and cache — so one model drives many independent conversations.
-def create_session_(model : Model) : Session {
-    return <- make_run_state(model.config)
+//! `kdt`/`vdt` pick this session's KV-cache codec (per-session state, no globals).
+def create_session_(model : Model; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32) : Session {
+    return <- make_run_state(model.config, kdt, vdt)
 }
 
 //! THE eval primitive: run `tokens` at the session's current position and advance it. Prefill =
@@ -1836,25 +1876,138 @@ def private rope_batch_tab(var q_b : array<float>; var k_b : array<float>; cos_t
     }
 }
 
-// Store the roped k / raw v for all npos positions into the layer's KV cache. The destination offset
-// loff + (start_pos+p)*kv_dim and the source offset p*kv_dim both advance by kv_dim per position, so
-// the whole k_b -> key_cache store is ONE contiguous block of npos*kv_dim floats (v likewise) — copied
-// with the vectorized copy_floats (bounds-checked array copy doesn't vectorize), threaded over the
-// positions (each worker owns a disjoint cache slice). Self-gates on g_kv_store_par_threshold.
-def private kv_store_batch(var key_cache : array<float>; var value_cache : array<float>;
-                           k_b : array<float>; v_b : array<float>; loff, start_pos, npos, kv_dim : int64) {
-    let dstbase = loff + start_pos * kv_dim
+// ===== KV-cache codec seam =====
+// Every cache byte is written by kv_store_row/kv_store_batch and read via the kv_dot/kv_axpy/
+// kv_load overloads inside the codec-generic attention workers below. Coordinates stay DECOMPOSED
+// (layer-base pointer, row index, sub-row element offset) — never pre-flattened element indices —
+// so a block codec (q8_0-class, per-block metadata) slots in as: a kv_row_bytes case, its own
+// kernel overloads / worker variant, and an arm at each dispatch point. Call sites don't change.
+
+//! Bytes per stored element (scalar codecs only; block codecs size via kv_row_bytes directly).
+def kv_elem_bytes(dt : KVDtype) : int64 => dt == KVDtype.f16 ? 2l : 4l
+
+//! Byte stride of one position row of width kv_dim under codec dt — THE layout seam.
+def kv_row_bytes(dt : KVDtype; kv_dim : int64) : int64 => kv_dim * kv_elem_bytes(dt)
+
+//! Layer l's slab base (BYTES) in the key cache; the byte analog of kv_cache_off, reading the
+//! LIVE seq_len so post-load seq_len caps keep working.
+def kv_base_k(s : Session; l, seq_len : int64) : int64 => s.kv_bprefix_k[l] * seq_len
+
+//! Layer l's slab base (BYTES) in the value cache.
+def kv_base_v(s : Session; l, seq_len : int64) : int64 => s.kv_bprefix_v[l] * seq_len
+
+// Rung-1 guard: the attention read paths are wired for codec dispatch but only f32 kernels exist
+// yet; the f16 arms land with the codec kernels (next rungs) and replace these panics.
+def private kv_require_f32(s : Session) {
+    if (s.kv_dtype_k != KVDtype.f32 || s.kv_dtype_v != KVDtype.f32) {
+        panic("KV cache codec not yet implemented (only f32)")
+    }
+}
+
+//! Store n f32 values into a KV-cache layer slab at (row, sub-row element offset). dst0 = the
+//! layer's base byte pointer (see kv_base_k/kv_base_v). Codec dispatch happens HERE, once per
+//! row-store — never per element. Contract: either one partial row (sub + n <= kv_dim), or whole
+//! consecutive rows (sub == 0, n a multiple of kv_dim) — both stay valid block-codec shapes.
+def kv_store_row(var dst0 : uint8?; dt : KVDtype; kv_dim, row, sub, n : int64; src : float const?) {
+    if (dt == KVDtype.f32) {
+        unsafe {
+            // bind the cast first: reinterpret is a PREFIX operator, so an inline
+            // `reinterpret<float?>(dst0) + off` would swallow the addition into its operand
+            // and scale off in BYTES (uint8 arithmetic), not elements
+            var d = reinterpret<float?>(dst0)
+            copy_floats(d + row * kv_dim + sub, src, n)
+        }
+    } else {
+        panic("KV cache codec not yet implemented (only f32)")
+    }
+}
+
+// Read-side glue: overload per cache element type, resolved inside the monomorphized workers.
+def private kv_dot(a : float const?; b : float const?; n : int64) : float => dot(a, b, n)
+def private kv_axpy(var d : float?; s : float const?; scale : float; n : int64) {
+    axpy(d, s, scale, n)
+}
+def private kv_load(p : float const?; i : int64) : float => unsafe(p[i])
+
+// One decode attention head over one layer's cache slab — the attention_std_decode /
+// chain-decode stage-1 worker body, generic over the cache element type (float = f32; further
+// codecs add kv_dot/kv_axpy overloads and monomorphize here). kcp/vcp are LAYER-BASE typed
+// pointers; arow is this head's score row.
+def private attn_head_decode(var arow : float?; var xbp : float?; qp : float const?;
+                             kcp, vcp : auto const?;
+                             qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh : int64;
+                             scale, attn_softcap : float; sinksp : float const?) {
     unsafe {
-        var kcp = addr(key_cache[0])
-        var vcp = addr(value_cache[0])
+        for (j in range64(cnt)) {
+            arow[j] = kv_dot(qp + qoff, kcp + (kstart + j) * kv_dim + kvhoff, head_size) * scale
+        }
+        if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
+            softcap(arow, cnt, attn_softcap)
+        }
+        if (sinksp != null) {  // gpt-oss: this head's sink logit joins the softmax denominator
+            softmax_sink(arow, cnt, sinksp[hh])
+        } else {
+            softmax(arow, cnt)
+        }
+        // weighted sum of values into xb[qoff..]
+        for (i in range64(head_size)) {
+            xbp[qoff + i] = 0.0
+        }
+        for (j in range64(cnt)) {
+            kv_axpy(xbp + qoff, vcp + (kstart + j) * kv_dim + kvhoff, arow[j], head_size)
+        }
+    }
+}
+
+// Flash-decode sliced K pass (chain stage 1, nsl > 1): the slice's K rows stream once, dotted
+// against every q-head of the GQA group. Codec-generic like attn_head_decode.
+def private kv_slice_scores(var attp : float?; qp : float const?; kcp : auto const?;
+                            kstart, j0, j1, kv_dim, kvhoff, head_size, qh0, kv_mul, seq_len : int64;
+                            scale : float) {
+    unsafe {
+        for (j in range64(j0, j1)) {
+            let koff = (kstart + j) * kv_dim + kvhoff
+            for (g in range64(kv_mul)) {
+                attp[(qh0 + g) * seq_len + j] = kv_dot(qp + (qh0 + g) * head_size, kcp + koff, head_size) * scale
+            }
+        }
+    }
+}
+
+// Flash-decode sliced V pass: each V row read once, weighted into every group head's partial.
+def private kv_slice_av(var flop : float?; attp : float const?; vcp : auto const?;
+                        kstart, j0, j1, kv_dim, kvhoff, head_size, qh0, kv_mul, seq_len, nsl, sl : int64) {
+    unsafe {
+        for (j in range64(j0, j1)) {
+            let voff = (kstart + j) * kv_dim + kvhoff
+            for (g in range64(kv_mul)) {
+                let hh = qh0 + g
+                kv_axpy(flop + (hh * nsl + sl) * head_size, vcp + voff, attp[hh * seq_len + j], head_size)
+            }
+        }
+    }
+}
+
+// Store the roped k / raw v for all npos positions into the layer's KV cache. The destination row
+// start_pos+p and the source offset p*kv_dim both advance by one row per position, so the whole
+// k_b -> key_cache store is ONE contiguous run of npos rows (v likewise) — handed to kv_store_row
+// in whole-row chunks (the vectorized codec store; bounds-checked array copy doesn't vectorize),
+// threaded over the positions (each worker owns a disjoint cache slice). Self-gates on
+// g_kv_store_par_threshold. kbase/vbase = the layer's slab base BYTES.
+def private kv_store_batch(var key_cache : array<uint8>; var value_cache : array<uint8>;
+                           kdt, vdt : KVDtype; k_b : array<float>; v_b : array<float>;
+                           kbase, vbase, start_pos, npos, kv_dim : int64) {
+    unsafe {
+        var kcp = addr(key_cache[0]) + kbase
+        var vcp = addr(value_cache[0]) + vbase
         let kbp = reinterpret<float const?>(addr(k_b[0]))
         let vbp = reinterpret<float const?>(addr(v_b[0]))
         maybe_parallel_for(kv_dim * npos >= g_kv_store_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             let m0 = int64(rb) * kv_dim
             let cnt = (int64(re) - int64(rb)) * kv_dim
             unsafe {
-                copy_floats(kcp + dstbase + m0, kbp + m0, cnt)
-                copy_floats(vcp + dstbase + m0, vbp + m0, cnt)
+                kv_store_row(kcp, kdt, kv_dim, start_pos + int64(rb), 0l, cnt, kbp + m0)
+                kv_store_row(vcp, vdt, kv_dim, start_pos + int64(rb), 0l, cnt, vbp + m0)
             }
         }
     }
@@ -2237,7 +2390,9 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let qd = n_heads * head_size
     let kv_mul = n_heads / n_kv_heads
     let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
-    let loff = kv_cache_off(t, l)
+    kv_require_f32(s)
+    let kbase = kv_base_k(s, l, c.seq_len)   // this layer's slab base BYTES (aliases the source layer when shared)
+    let vbase = kv_base_v(s, l, c.seq_len)
     let is_sliding = layer_is_sliding(c, l)
     let kstart = (is_sliding && pos + 1l > c.sliding_window) ? (pos + 1l - c.sliding_window) : 0l
     let cnt = pos + 1l - kstart
@@ -2287,7 +2442,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let eps = c.norm_eps
     let seq_len = c.seq_len
     let attn_softcap = c.attn_logit_softcap
-    let kvoff = loff + pos * kv_dim
+    let kdt = s.kv_dtype_k
+    let vdt = s.kv_dtype_v
     // Gemma2/3: the post-attention norm is a whole-vector reduction over the wo output, so the
     // chain can't fold the residual add into stage 2 — it lands serially after the rendezvous
     let post_norm = c.pre_post_norm
@@ -2302,8 +2458,10 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         var attp = addr(s.att[0])
         var xqp = addr(s.xq[0])
         var xsp = addr(s.xs[0])
-        var kcp = addr(s.key_cache[0])
-        var vcp = addr(s.value_cache[0])
+        var kcl = addr(s.key_cache[0]) + kbase     // layer-base byte pointers (store side)
+        var vcl = addr(s.value_cache[0]) + vbase
+        let kcp = reinterpret<float const?>(kcl)   // typed read views, f32 codec
+        let vcp = reinterpret<float const?>(vcl)
         // weight region bases (element offsets into the Q8 blob, scales at /32)
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
         let wsb = reinterpret<float const?>(addr(t.qscales[0]))
@@ -2374,7 +2532,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             } else {
                                 rope_scaled_tab(kp + r0, head_size, head_size, crow, srow)
                             }
-                            copy_floats(kcp + kvoff + r0, kp + r0, head_size)
+                            kv_store_row(kcl, kdt, kv_dim, pos, r0, head_size, kp + r0)
                         } else {
                             let r0 = (sl - n_heads - n_kv_heads) * head_size
                             invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r0 + head_size)
@@ -2386,7 +2544,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             if (rvp != null) {
                                 rmsnorm(vp + r0, vp + r0, rvp, head_size, eps)
                             }
-                            copy_floats(vcp + kvoff + r0, vp + r0, head_size)
+                            kv_store_row(vcl, vdt, kv_dim, pos, r0, head_size, vp + r0)
                         }
                     }
                 }
@@ -2400,27 +2558,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         let hh = int64(h)
                         let qoff = hh * head_size
                         let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
-                        var arow = attp + hh * seq_len          // scores for keys kstart..pos
-                        for (j in range64(cnt)) {
-                            let koff = loff + (kstart + j) * kv_dim + kvhoff
-                            arow[j] = dot(qp + qoff, kcp + koff, head_size) * scale
-                        }
-                        if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                            softcap(arow, cnt, attn_softcap)
-                        }
-                        if (sinksp != null) {  // gpt-oss: this head's sink logit joins the softmax denominator
-                            softmax_sink(arow, cnt, sinksp[hh])
-                        } else {
-                            softmax(arow, cnt)
-                        }
-                        // weighted sum of values into xb[qoff..]
-                        for (i in range64(head_size)) {
-                            xbp[qoff + i] = 0.0
-                        }
-                        for (j in range64(cnt)) {
-                            let voff = loff + (kstart + j) * kv_dim + kvhoff
-                            axpy(xbp + qoff, vcp + voff, arow[j], head_size)
-                        }
+                        attn_head_decode(attp + hh * seq_len, xbp, qp, kcp, vcp,
+                            qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, sinksp)
                         quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
                     }
                 }
@@ -2440,12 +2579,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         let j0 = sl * slice_len
                         let j1 = min(j0 + slice_len, cnt)
                         // K pass: each K row read once, dotted against every group q-head
-                        for (j in range64(j0, j1)) {
-                            let koff = loff + (kstart + j) * kv_dim + kvhoff
-                            for (g in range64(kv_mul)) {
-                                attp[(qh0 + g) * seq_len + j] = dot(qp + (qh0 + g) * head_size, kcp + koff, head_size) * scale
-                            }
-                        }
+                        kv_slice_scores(attp, qp, kcp, kstart, j0, j1, kv_dim, kvhoff, head_size,
+                            qh0, kv_mul, seq_len, scale)
                         for (g in range64(kv_mul)) {
                             let hh = qh0 + g
                             var arow = attp + hh * seq_len
@@ -2489,13 +2624,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             fllp[hh * int64(nsl) + sl] = lsum
                         }
                         // V pass: each V row read once, weighted into every group head's partial
-                        for (j in range64(j0, j1)) {
-                            let voff = loff + (kstart + j) * kv_dim + kvhoff
-                            for (g in range64(kv_mul)) {
-                                let hh = qh0 + g
-                                axpy(flop + (hh * int64(nsl) + sl) * head_size, vcp + voff, attp[hh * seq_len + j], head_size)
-                            }
-                        }
+                        kv_slice_av(flop, attp, vcp, kstart, j0, j1, kv_dim, kvhoff, head_size,
+                            qh0, kv_mul, seq_len, int64(nsl), sl)
                     }
                 }
             } elif (stage == 2 && nsl > 1) {
@@ -2563,8 +2693,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                 let qoff = hh * head_size
                 let kvhoff = (hh / kv_mul) * head_size
                 for (j in range64(cnt)) {
-                    let koff = loff + (kstart + j) * kv_dim + kvhoff
-                    let sc = dot(qp + qoff, kcp + koff, head_size) * scale
+                    let koff = (kstart + j) * kv_dim + kvhoff   // kcp is layer-base (codec seam)
+                    let sc = kv_dot(qp + qoff, kcp + koff, head_size) * scale
                     sref[j] = attn_softcap > 0.0 ? attn_softcap * tanh(sc / attn_softcap) : sc
                 }
                 var m2 = sref[0]
@@ -2585,8 +2715,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                 for (i in range64(head_size)) {
                     var acc = 0.0
                     for (j in range64(cnt)) {
-                        let voff = loff + (kstart + j) * kv_dim + kvhoff
-                        acc += exp(sref[j] - m2) / l2 * vcp[voff + i]
+                        let voff = (kstart + j) * kv_dim + kvhoff   // vcp is layer-base (codec seam)
+                        acc += exp(sref[j] - m2) / l2 * kv_load(vcp, voff + i)
                     }
                     worstd = max(worstd, abs(acc - s.xb[qoff + i]))
                 }
@@ -2728,12 +2858,14 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let qd = n_heads * head_size       // query / attention-output width (== dim except Gemma2/gemma4)
     let kv_mul = n_heads / n_kv_heads
     let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
-    let loff = kv_cache_off(t, l)
+    kv_require_f32(s)
+    let kbase = kv_base_k(s, l, c.seq_len)   // this layer's slab base BYTES (aliases the source layer when shared)
+    let vbase = kv_base_v(s, l, c.seq_len)
     // Sliding-window (local) vs global attention per the arch's layer pattern (Gemma2 alternates,
     // Gemma3 5:1). The window covers all positions when pos < window, so it's a no-op for short contexts.
     let is_sliding = layer_is_sliding(c, l)
     // gemma-4 E-series shared-KV layer: no attn_k/attn_v of its own — project Q only and attend
-    // against the SOURCE layer's cached K/V (loff already aliases the source's slot).
+    // against the SOURCE layer's cached K/V (kbase/vbase already alias the source's slab).
     let kv_shared = t.kv_src[l] != l
     let kstart = (is_sliding && pos + 1l > c.sliding_window) ? (pos + 1l - c.sliding_window) : 0l
     let cnt = pos + 1l - kstart
@@ -2798,12 +2930,15 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     }
     prof_add("rope", ts_rope)
     // store k, v for this position into the KV cache (shared-KV layers: nothing to store — the
-    // source layer already cached its K/V, which loff points at)
+    // source layer already cached its K/V, which kbase/vbase point at)
     if (!kv_shared) {
         let ts_kv = ref_time_ticks()
-        let kvoff = loff + pos * kv_dim
-        copy_floats(unsafe(addr(s.key_cache[kvoff])), unsafe(addr(s.k[0])), kv_dim)
-        copy_floats(unsafe(addr(s.value_cache[kvoff])), unsafe(addr(s.v[0])), kv_dim)
+        unsafe {
+            kv_store_row(addr(s.key_cache[0]) + kbase, s.kv_dtype_k, kv_dim, pos, 0l, kv_dim,
+                reinterpret<float const?>(addr(s.k[0])))
+            kv_store_row(addr(s.value_cache[0]) + vbase, s.kv_dtype_v, kv_dim, pos, 0l, kv_dim,
+                reinterpret<float const?>(addr(s.v[0])))
+        }
         prof_add("kv_store", ts_kv)
     }
     // multi-head attention, threaded over heads past the decode threshold — each head reads its own
@@ -2822,8 +2957,8 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         : null)
     unsafe {
         let qp = reinterpret<float const?>(addr(s.q[0]))
-        let kcp = reinterpret<float const?>(addr(s.key_cache[0]))
-        let vcp = reinterpret<float const?>(addr(s.value_cache[0]))
+        let kcp = reinterpret<float const?>(addr(s.key_cache[0]) + kbase)   // layer-base, f32 codec
+        let vcp = reinterpret<float const?>(addr(s.value_cache[0]) + vbase)
         var xbp = addr(s.xb[0])
         var attp = addr(s.att[0])
         maybe_parallel_for(0, int(n_heads), attn_lanes) $(rb, re) {
@@ -2832,27 +2967,8 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
                     let hh = int64(h)
                     let qoff = hh * head_size
                     let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
-                    var arow = attp + hh * seq_len          // scores for keys kstart..pos
-                    for (j in range64(cnt)) {
-                        let koff = loff + (kstart + j) * kv_dim + kvhoff
-                        arow[j] = dot(qp + qoff, kcp + koff, head_size) * scale
-                    }
-                    if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                        softcap(arow, cnt, attn_softcap)
-                    }
-                    if (sinksp != null) {  // gpt-oss: this head's sink logit joins the softmax denominator
-                        softmax_sink(arow, cnt, sinksp[hh])
-                    } else {
-                        softmax(arow, cnt)
-                    }
-                    // weighted sum of values into xb[qoff..]
-                    for (i in range64(head_size)) {
-                        xbp[qoff + i] = 0.0
-                    }
-                    for (j in range64(cnt)) {
-                        let voff = loff + (kstart + j) * kv_dim + kvhoff
-                        axpy(xbp + qoff, vcp + voff, arow[j], head_size)
-                    }
+                    attn_head_decode(attp + hh * seq_len, xbp, qp, kcp, vcp,
+                        qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, sinksp)
                 }
             }
         }
@@ -3716,9 +3832,9 @@ def forward_profile_report() {
 // private scratch, QKᵀ and P·V run through the register-tiled gemm_f32 (no per-pair reduce), and a
 // per-query running max/sum (mrun/srun) folds each KV tile in. All pointers are pre-offset to this
 // head; qpk/kpk/vpk/kqp/vkqp are this head's scratch bases. NOT bit-exact vs classic (online reorder).
-def private attn_head_flash(qp, kcp, vcp : float const?; var xbp : float?;
+def private attn_head_flash(qp : float const?; kcp, vcp : auto const?; var xbp : float?;
                             var qpk, kpk, vpk, kqp, vkqp : float?;
-                            loff, npos, start_pos, head_size, qd, kv_dim, kvhoff, qoff : int64;
+                            npos, start_pos, head_size, qd, kv_dim, kvhoff, qoff : int64;
                             scale : float; is_sliding : bool; sliding_window : int64; attn_softcap : float;
                             has_sink : bool; sink : float) {
     let QT = ATTN_FLASH_QT
@@ -3755,10 +3871,10 @@ def private attn_head_flash(qp, kcp, vcp : float const?; var xbp : float?;
                 // pack Kᵀ tile [head_size × KV] and V tile [KV × head_size], zero-padding the tail
                 for (kt in range64(KV)) {
                     if (kt < kvalid) {
-                        let ksrc = loff + (kt0 + kt) * kv_dim + kvhoff
-                        for (d in range64(head_size)) {
-                            kpk[d * KV + kt] = kcp[ksrc + d]
-                            vpk[kt * head_size + d] = vcp[ksrc + d]
+                        let ksrc = (kt0 + kt) * kv_dim + kvhoff   // kcp/vcp are layer-base (codec seam);
+                        for (d in range64(head_size)) {           // the dequant seam is THIS pack step —
+                            kpk[d * KV + kt] = kv_load(kcp, ksrc + d)      // the GEMMs read f32 scratch
+                            vpk[kt * head_size + d] = kv_load(vcp, ksrc + d)
                         }
                     } else {
                         for (d in range64(head_size)) {
@@ -3833,16 +3949,125 @@ def private attn_head_flash(qp, kcp, vcp : float const?; var xbp : float?;
     }
 }
 
-def private prefill_attention(var s : Session; loff, npos, start_pos, head_size, qd, kv_dim,
+// One head of BLOCKED prefill attention (see prefill_attention) — codec-generic over the cache
+// element type like attn_head_decode. kcp/vcp are layer-base typed pointers; attp_h = this head's
+// ATTN_BLOCK_Q score rows (maxctx-strided).
+def private attn_head_blocked(var attp_h : float?; var xbp : float?; qp : float const?;
+                              kcp, vcp : auto const?;
+                              npos, start_pos, maxctx, qd, head_size, kv_dim, kvhoff, qoff, hh : int64;
+                              scale : float; is_sliding : bool; sliding_window : int64;
+                              attn_softcap : float; sinksp : float const?) {
+    unsafe {
+        var p0 = 0l
+        while (p0 < npos) {
+            let bq = min(ATTN_BLOCK_Q, npos - p0)
+            let ap_first = start_pos + p0
+            let ap_last = ap_first + bq - 1l
+            let kstart_block = (is_sliding && ap_first + 1l > sliding_window) ? (ap_first + 1l - sliding_window) : 0l
+            // PASS 1: scores — each K[kk] loaded once, reused across the block's queries
+            for (kk in range64(kstart_block, ap_last + 1l)) {
+                let koff = kk * kv_dim + kvhoff
+                let bi_lo = max(0l, kk - ap_first)            // causal: keep queries with ap >= kk
+                var bi_hi = bq
+                if (is_sliding) {                            // window: keep queries with kstart_p <= kk
+                    bi_hi = min(bq, kk + sliding_window - ap_first)
+                }
+                for (bi in range64(bi_lo, bi_hi)) {
+                    let p = p0 + bi
+                    let ap = start_pos + p
+                    let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
+                    let qbase = p * qd + qoff
+                    attp_h[bi * maxctx + (kk - kstart_p)] = kv_dot(qp + qbase, kcp + koff, head_size) * scale
+                }
+            }
+            // softcap + softmax per query, then zero its output slice
+            for (bi in range64(bq)) {
+                let p = p0 + bi
+                let ap = start_pos + p
+                let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
+                let cnt = ap + 1l - kstart_p
+                let rbase = bi * maxctx
+                if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
+                    softcap(attp_h + rbase, cnt, attn_softcap)
+                }
+                if (sinksp != null) {  // gpt-oss: sink joins the denominator
+                    softmax_sink(attp_h + rbase, cnt, sinksp[hh])
+                } else {
+                    softmax(attp_h + rbase, cnt)
+                }
+                let qbase = p * qd + qoff
+                for (i in range64(head_size)) {
+                    xbp[qbase + i] = 0.0
+                }
+            }
+            // PASS 2: output += Σ att[j]·V[j] — each V[kk] loaded once, reused across the block
+            for (kk in range64(kstart_block, ap_last + 1l)) {
+                let voff = kk * kv_dim + kvhoff
+                let bi_lo = max(0l, kk - ap_first)
+                var bi_hi = bq
+                if (is_sliding) {
+                    bi_hi = min(bq, kk + sliding_window - ap_first)
+                }
+                for (bi in range64(bi_lo, bi_hi)) {
+                    let p = p0 + bi
+                    let ap = start_pos + p
+                    let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
+                    let qbase = p * qd + qoff
+                    kv_axpy(xbp + qbase, vcp + voff, attp_h[bi * maxctx + (kk - kstart_p)], head_size)
+                }
+            }
+            p0 += ATTN_BLOCK_Q
+        }
+    }
+}
+
+// One head of CLASSIC prefill attention (see prefill_attention) — codec-generic. attp_h = this
+// head's private score row (maxctx wide).
+def private attn_head_classic(var attp_h : float?; var xbp : float?; qp : float const?;
+                              kcp, vcp : auto const?;
+                              npos, start_pos, qd, head_size, kv_dim, kvhoff, qoff, hh : int64;
+                              scale : float; is_sliding : bool; sliding_window : int64;
+                              attn_softcap : float; sinksp : float const?) {
+    unsafe {
+        for (p in range64(npos)) {
+            let ap = start_pos + p
+            let kstart = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
+            let cnt = ap + 1l - kstart
+            let qbase = p * qd + qoff           // q row == output row (both qd-strided)
+            for (j in range64(cnt)) {
+                let koff = (kstart + j) * kv_dim + kvhoff
+                attp_h[j] = kv_dot(qp + qbase, kcp + koff, head_size) * scale
+            }
+            if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
+                softcap(attp_h, cnt, attn_softcap)
+            }
+            if (sinksp != null) {  // gpt-oss: sink joins the denominator
+                softmax_sink(attp_h, cnt, sinksp[hh])
+            } else {
+                softmax(attp_h, cnt)
+            }
+            for (i in range64(head_size)) {
+                xbp[qbase + i] = 0.0
+            }
+            for (j in range64(cnt)) {   // output += Σ att[j]·V[j]
+                let voff = (kstart + j) * kv_dim + kvhoff
+                kv_axpy(xbp + qbase, vcp + voff, attp_h[j], head_size)
+            }
+        }
+    }
+}
+
+def private prefill_attention(var s : Session; kbase, vbase, npos, start_pos, head_size, qd, kv_dim,
                               n_heads, kv_mul : int64; scale : float;
                               is_sliding : bool; sliding_window : int64; attn_softcap : float;
                               sinksp : float const?) {   // this layer's per-head sink logits; null = no sinks
     let maxctx = start_pos + npos          // per-head att row width (= max cnt over this call)
     let attn_par = npos * maxctx * n_heads >= g_attn_par_threshold
+    kv_require_f32(s)
     unsafe {
         let qp = reinterpret<float const?>(addr(s.q_b[0]))
-        let kcp = reinterpret<float const?>(addr(s.key_cache[0]))
-        let vcp = reinterpret<float const?>(addr(s.value_cache[0]))
+        let kcp = reinterpret<float const?>(addr(s.key_cache[0]) + kbase)   // layer-base, f32 codec
+        let vcp = reinterpret<float const?>(addr(s.value_cache[0]) + vbase)
         var xbp = addr(s.xb_b[0])
         // att_b is sized only for the blocked/classic modes (flash packs into fa_* instead), so the
         // base pointer must not index an empty array under flash — null there, never dereferenced.
@@ -3863,7 +4088,7 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
                             vpk0 + hh * ATTN_FLASH_KV * head_size,
                             kqp0 + hh * ATTN_FLASH_QT * ATTN_FLASH_KV,
                             vkqp0 + hh * ATTN_FLASH_QT * head_size,
-                            loff, npos, start_pos, head_size, qd, kv_dim, kvhoff, qoff,
+                            npos, start_pos, head_size, qd, kv_dim, kvhoff, qoff,
                             scale, is_sliding, sliding_window, attn_softcap,
                             sinksp != null, sinksp != null ? sinksp[hh] : 0.0)
                     }
@@ -3876,67 +4101,9 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
                         let hh = int64(h)
                         let qoff = hh * head_size
                         let kvhoff = (hh / kv_mul) * head_size
-                        let hblock = hh * ATTN_BLOCK_Q * maxctx   // this head's ATTN_BLOCK_Q score rows
-                        var p0 = 0l
-                        while (p0 < npos) {
-                            let bq = min(ATTN_BLOCK_Q, npos - p0)
-                            let ap_first = start_pos + p0
-                            let ap_last = ap_first + bq - 1l
-                            let kstart_block = (is_sliding && ap_first + 1l > sliding_window) ? (ap_first + 1l - sliding_window) : 0l
-                            // PASS 1: scores — each K[kk] loaded once, reused across the block's queries
-                            for (kk in range64(kstart_block, ap_last + 1l)) {
-                                let koff = loff + kk * kv_dim + kvhoff
-                                let bi_lo = max(0l, kk - ap_first)            // causal: keep queries with ap >= kk
-                                var bi_hi = bq
-                                if (is_sliding) {                            // window: keep queries with kstart_p <= kk
-                                    bi_hi = min(bq, kk + sliding_window - ap_first)
-                                }
-                                for (bi in range64(bi_lo, bi_hi)) {
-                                    let p = p0 + bi
-                                    let ap = start_pos + p
-                                    let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
-                                    let qbase = p * qd + qoff
-                                    attp[hblock + bi * maxctx + (kk - kstart_p)] = dot(qp + qbase, kcp + koff, head_size) * scale
-                                }
-                            }
-                            // softcap + softmax per query, then zero its output slice
-                            for (bi in range64(bq)) {
-                                let p = p0 + bi
-                                let ap = start_pos + p
-                                let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
-                                let cnt = ap + 1l - kstart_p
-                                let rbase = hblock + bi * maxctx
-                                if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                                    softcap(attp + rbase, cnt, attn_softcap)
-                                }
-                                if (sinksp != null) {  // gpt-oss: sink joins the denominator
-                                    softmax_sink(attp + rbase, cnt, sinksp[hh])
-                                } else {
-                                    softmax(attp + rbase, cnt)
-                                }
-                                let qbase = p * qd + qoff
-                                for (i in range64(head_size)) {
-                                    xbp[qbase + i] = 0.0
-                                }
-                            }
-                            // PASS 2: output += Σ att[j]·V[j] — each V[kk] loaded once, reused across the block
-                            for (kk in range64(kstart_block, ap_last + 1l)) {
-                                let voff = loff + kk * kv_dim + kvhoff
-                                let bi_lo = max(0l, kk - ap_first)
-                                var bi_hi = bq
-                                if (is_sliding) {
-                                    bi_hi = min(bq, kk + sliding_window - ap_first)
-                                }
-                                for (bi in range64(bi_lo, bi_hi)) {
-                                    let p = p0 + bi
-                                    let ap = start_pos + p
-                                    let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
-                                    let qbase = p * qd + qoff
-                                    axpy(xbp + qbase, vcp + voff, attp[hblock + bi * maxctx + (kk - kstart_p)], head_size)
-                                }
-                            }
-                            p0 += ATTN_BLOCK_Q
-                        }
+                        attn_head_blocked(attp + hh * ATTN_BLOCK_Q * maxctx, xbp, qp, kcp, vcp,
+                            npos, start_pos, maxctx, qd, head_size, kv_dim, kvhoff, qoff, hh,
+                            scale, is_sliding, sliding_window, attn_softcap, sinksp)
                     }
                 }
             }
@@ -3947,32 +4114,9 @@ def private prefill_attention(var s : Session; loff, npos, start_pos, head_size,
                         let hh = int64(h)
                         let qoff = hh * head_size
                         let kvhoff = (hh / kv_mul) * head_size
-                        let abase = hh * maxctx                // this head's private score row
-                        for (p in range64(npos)) {
-                            let ap = start_pos + p
-                            let kstart = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
-                            let cnt = ap + 1l - kstart
-                            let qbase = p * qd + qoff           // q row == output row (both qd-strided)
-                            for (j in range64(cnt)) {
-                                let koff = loff + (kstart + j) * kv_dim + kvhoff
-                                attp[abase + j] = dot(qp + qbase, kcp + koff, head_size) * scale
-                            }
-                            if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                                softcap(attp + abase, cnt, attn_softcap)
-                            }
-                            if (sinksp != null) {  // gpt-oss: sink joins the denominator
-                                softmax_sink(attp + abase, cnt, sinksp[hh])
-                            } else {
-                                softmax(attp + abase, cnt)
-                            }
-                            for (i in range64(head_size)) {
-                                xbp[qbase + i] = 0.0
-                            }
-                            for (j in range64(cnt)) {   // output += Σ att[j]·V[j]
-                                let voff = loff + (kstart + j) * kv_dim + kvhoff
-                                axpy(xbp + qbase, vcp + voff, attp[abase + j], head_size)
-                            }
-                        }
+                        attn_head_classic(attp + hh * maxctx, xbp, qp, kcp, vcp,
+                            npos, start_pos, qd, head_size, kv_dim, kvhoff, qoff, hh,
+                            scale, is_sliding, sliding_window, attn_softcap, sinksp)
                     }
                 }
             }
@@ -4002,7 +4146,8 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     let kv_mul = n_heads / n_kv_heads
     let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
     let use_rope_tab = g_use_rope_table
-    let loff = kv_cache_off(t, l)
+    let kbase = kv_base_k(s, l, c.seq_len)   // this layer's slab base BYTES (aliases the source layer when shared)
+    let vbase = kv_base_v(s, l, c.seq_len)
     // sliding vs global attention per the arch's layer pattern (see attention_std_decode)
     let is_sliding = layer_is_sliding(c, l)
     // gemma-4 E-series shared-KV layer: project Q only, attend against the source layer's cache (loff aliases it)
@@ -4079,7 +4224,8 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     // Shared-KV layers store nothing — the source layer (processed earlier) already cached its K/V.
     if (!kv_shared) {
         let ts_kv = ref_time_ticks()
-        kv_store_batch(s.key_cache, s.value_cache, s.k_b, s.v_b, loff, start_pos, npos, kv_dim)
+        kv_store_batch(s.key_cache, s.value_cache, s.kv_dtype_k, s.kv_dtype_v, s.k_b, s.v_b,
+            kbase, vbase, start_pos, npos, kv_dim)
         prof_add("kv_store", ts_kv)
     }
     // causal attention into xb_b (position ap attends to cached keys kstart..ap; kstart = 0 unless a
@@ -4089,7 +4235,7 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     let sinksp = (c.attn_sinks
         ? unsafe(reinterpret<float const?>(unsafe(addr(t.fblob[t.sinks_off + l * n_heads]))))
         : null)
-    prefill_attention(s, loff, npos, start_pos, head_size, qd, kv_dim, n_heads, kv_mul, scale,
+    prefill_attention(s, kbase, vbase, npos, start_pos, head_size, qd, kv_dim, n_heads, kv_mul, scale,
                       is_sliding, c.sliding_window, c.attn_logit_softcap, sinksp)
     prof_add("attn", ts_attn)
     // output projection (batched, qd -> dim) + optional bias + post-attn norm + residual
