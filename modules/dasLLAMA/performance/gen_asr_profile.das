@@ -200,26 +200,38 @@ def main() {
 
     var prof : AsrProfile
     read_asr_profile(prof)
-    let date = run_capture("date +%Y-%m-%d", true)
+    let date = format_time(get_clock(), "%Y-%m-%d")   // portable (no shell) — Windows cmd `date` prompts and hangs
     prof.platform = gather_platform(cfg.threads, lcpp_commit, date, box_profile_tag(), cfg.parsec_off)
 
     apply_box_profile_runtime()
 
+    logger_set_name(prof_log_name())
     print("gen_asr_profile: box={box_name()} threads={cfg.threads} reps={cfg.reps} libri={cfg.libri}\n")
+    print("log: {logger_get_path()}  (tail for live, timestamped progress)\n")
     print("baselines: {length(baselines)} row(s) from {baseline_asr_path()}\n\n")
 
     with_job_que() {
         setup_dasllama_jobque_()
+        let lanes = get_dispatch_lanes()
+        prof.platform.threads = lanes   // record the ACTUAL das lane count, not the advisory flag
+        logger_info("profile.asr.gen", "run start", JV({"box" => JV(box_name()), "reps" => JV(cfg.reps),
+            "libri" => JV(cfg.libri), "requested_threads" => JV(cfg.threads), "dispatch_lanes" => JV(lanes)}))
+        if (lanes != cfg.threads) {
+            logger_warning("profile.asr.gen", "dispatch lanes != requested threads — set DAS_JOBQUE_THREADS",
+                JV({"dispatch_lanes" => JV(lanes), "requested_threads" => JV(cfg.threads)}))
+            print("WARNING: das dispatch lanes = {lanes}, requested {cfg.threads}. Set DAS_JOBQUE_THREADS={cfg.threads}.\n")
+        }
         for (spec in asr_catalog()) {
             if (!empty(cfg.only) && find(spec.display, cfg.only) < 0) {
                 continue
             }
             let model_path = "{spec.root}{spec.das_model}"
             if (!stat(model_path).is_valid) {
-                print("{spec.display}: model absent — skipped\n")
+                logger_warning("profile.asr.gen", "model absent — skipped", JV({"model" => JV(spec.display), "path" => JV(model_path)}))
                 continue
             }
-            print("{spec.display} ...\n")
+            logger_info("profile.asr.gen", "model start", JV({"model" => JV(spec.display)}))
+            let t0 = ref_time_ticks()
             var m <- (empty(spec.das_mmproj)
                 ? load_asr_model(model_path)
                 : load_asr_model(model_path, "{spec.root}{spec.das_mmproj}"))
@@ -235,7 +247,8 @@ def main() {
                 let das_ms = measure_das(m, samples, cfg.reps, spec.lang)
                 buckets |> emplace(AsrBucket(wav = wav, audio_s = audio_s, das_ms = das_ms,
                     refs <- ref_times_for(baselines, spec.display, wav)))
-                print("  {wav}: das {das_ms} ms ({audio_s} s)\n")
+                logger_info("profile.asr.gen", "bucket done", JV({"model" => JV(spec.display), "wav" => JV(wav),
+                    "das_ms" => JV(das_ms), "audio_s" => JV(audio_s)}))
             }
             // NB: under -jit, a comprehension used INLINE as a `<-` move-init inside a struct
             // constructor silently yields an EMPTY array (interp is fine) — hoist it to a local
@@ -248,10 +261,13 @@ def main() {
             if (cfg.libri && !empty(spec.libri_short)) {
                 add_libri_sides(prof.librispeech.sides, m, spec, baselines, cfg.reps)
                 prof.librispeech.n_clips = 25
-                print("  librispeech dictation aggregate updated\n")
+                logger_info("profile.asr.gen", "librispeech aggregate updated", JV({"model" => JV(spec.display)}))
             }
+            write_asr_profile(prof)   // persist now — a crash on a later model never costs this one
+            let ms = double(get_time_usec(t0)) / 1000.0lf
+            logger_info("profile.asr.gen", "model done", JV({"model" => JV(spec.display), "elapsed_ms" => JV(ms), "buckets" => JV(length(spec.buckets))}))
         }
     }
-    write_asr_profile(prof)
-    print("\nwrote {length(prof.tests)} model row(s) -> {profile_asr_path()}\n")
+    logger_info("profile.asr.gen", "run done", JV({"profiled" => JV(length(prof.tests)), "path" => JV(profile_asr_path())}))
+    print("profiled {length(prof.tests)} model row(s) -> {profile_asr_path()}\n")
 }

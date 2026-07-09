@@ -203,16 +203,39 @@ def libri_clips() : array<tuple<name : string; path : string>> {
     return <- out
 }
 
-// Run one reference tool over `clips`, appending baseline rows (kind = "corpus" | "libri").
-def run_ref_over(var rows : array<AsrBaseRow>; spec : AsrModelSpec; ref : AsrRef;
+// Upsert one measured clip into the live baseline (match on tool+model+kind+wav), PERSIST the whole
+// file, and log a timestamped event — called after every single clip so a crash/hang never costs a
+// completed measurement (a Whisper-turbo hp0x2 clip is minutes) and partial runs accumulate.
+def private emit_asr_row(var merged : array<AsrBaseRow>; nr : AsrBaseRow) {
+    var found = false
+    for (m in merged) {
+        if (m.tool == nr.tool && m.model == nr.model && m.kind == nr.kind && m.wav == nr.wav) {
+            m = nr
+            found = true
+            break
+        }
+    }
+    if (!found) {
+        merged |> push(nr)
+    }
+    write_asr_baselines(merged)   // persist now — before the next clip
+    if (nr.ms > 0.0lf) {
+        logger_info("profile.asr.baseline", "clip done", JV({"tool" => JV(nr.tool), "model" => JV(nr.model),
+            "kind" => JV(nr.kind), "wav" => JV(nr.wav), "ms" => JV(nr.ms), "encode_ms" => JV(nr.encode_ms)}))
+    } else {
+        logger_error("profile.asr.baseline", "clip failed (parse)", JV({"tool" => JV(nr.tool), "model" => JV(nr.model),
+            "kind" => JV(nr.kind), "wav" => JV(nr.wav)}))
+    }
+}
+
+// Run one reference tool over `clips`, upserting+persisting each measured row into the live baseline.
+def run_ref_over(var merged : array<AsrBaseRow>; spec : AsrModelSpec; ref : AsrRef;
                  clips : array<tuple<name : string; path : string>>; kind : string; threads, reps : int) {
     let model_path = "{spec.root}{spec.das_model}"
-    rows |> reserve(length(rows) + length(clips))
     if (ref.tool == "parakeet-cli" || ref.tool == "whisper-cli") {
         for (c in clips) {
             let ms = run_cli(ref.tool, model_path, c.path, threads, reps)
-            print("  {ref.tool} {c.name}: {ms} ms\n")
-            rows |> emplace(AsrBaseRow(tool = ref.tool, model = spec.display, kind = kind,
+            emit_asr_row(merged, AsrBaseRow(tool = ref.tool, model = spec.display, kind = kind,
                 wav = c.name, audio_s = -1.0lf, ms = ms, encode_ms = -1.0lf))
         }
     } elif (ref.tool == "mtmd") {
@@ -220,8 +243,7 @@ def run_ref_over(var rows : array<AsrBaseRow>; spec : AsrModelSpec; ref : AsrRef
         for (c in clips) {
             var enc = -1.0lf
             let ms = run_mtmd(model_path, mmproj_path, c.path, threads, reps, enc)
-            print("  mtmd {c.name}: {ms} ms (encode {enc})\n")
-            rows |> emplace(AsrBaseRow(tool = ref.tool, model = spec.display, kind = kind,
+            emit_asr_row(merged, AsrBaseRow(tool = ref.tool, model = spec.display, kind = kind,
                 wav = c.name, audio_s = -1.0lf, ms = ms, encode_ms = enc))
         }
     } elif (ref.tool == "onnx" || ref.tool == "nemo") {
@@ -238,8 +260,7 @@ def run_ref_over(var rows : array<AsrBaseRow>; spec : AsrModelSpec; ref : AsrRef
         for (c in clips) {
             var audio_s = -1.0lf
             let ms = parse_bench_best(out, c.name, audio_s)
-            print("  {ref.tool} {c.name}: {ms} ms\n")
-            rows |> emplace(AsrBaseRow(tool = ref.tool, model = spec.display, kind = kind,
+            emit_asr_row(merged, AsrBaseRow(tool = ref.tool, model = spec.display, kind = kind,
                 wav = c.name, audio_s = audio_s, ms = ms, encode_ms = -1.0lf))
         }
     }
@@ -258,47 +279,37 @@ def main() {
         print_help(get_command_info(type<Args>), "establish_asr_baselines")
         return
     }
+    logger_set_name(prof_log_name())
+    logger_info("profile.asr.baseline", "run start", JV({"box" => JV(box_name()), "threads" => JV(cfg.threads),
+        "reps" => JV(cfg.reps), "libri" => JV(cfg.libri)}))
     print("establishing ASR baselines: box={box_name()} threads={cfg.threads} reps={cfg.reps} libri={cfg.libri}\n")
+    print("log: {logger_get_path()}  (tail for live, timestamped progress)\n")
     print("NOTE: this runs the reference engines (a measurement) — Parsec must be off.\n\n")
 
     var libri : array<tuple<name : string; path : string>>
     if (cfg.libri) {
         libri <- libri_clips()
     }
-    var rows : array<AsrBaseRow>
+    // per-clip persistence: load the baseline once; run_ref_over upserts+writes each measured clip so
+    // partial runs (-o Parakeet, then -o Whisper) accumulate and a crash never costs a completed clip.
+    var merged <- read_asr_baselines()
     for (spec in asr_catalog()) {
         if (!empty(cfg.only) && find(spec.display, cfg.only) < 0) {
             continue
         }
         if (!stat("{spec.root}{spec.das_model}").is_valid) {
-            print("{spec.display}: model absent — skipped\n")
+            logger_warning("profile.asr.baseline", "model absent — skipped", JV({"model" => JV(spec.display)}))
             continue
         }
-        print("{spec.display}\n")
+        logger_info("profile.asr.baseline", "model start", JV({"model" => JV(spec.display)}))
         let corpus <- bucket_paths(spec)
         for (ref in spec.refs) {
-            run_ref_over(rows, spec, ref, corpus, "corpus", cfg.threads, cfg.reps)
+            run_ref_over(merged, spec, ref, corpus, "corpus", cfg.threads, cfg.reps)
             if (cfg.libri && !empty(spec.libri_short) && !empty(libri)) {
-                run_ref_over(rows, spec, ref, libri, "libri", cfg.threads, cfg.reps)
+                run_ref_over(merged, spec, ref, libri, "libri", cfg.threads, cfg.reps)
             }
         }
     }
-    // merge into any existing baseline so partial per-model runs (-o Parakeet, then -o Whisper)
-    // accumulate; a fresh row for the same tool+model+kind+wav wins over the stored one.
-    var merged <- read_asr_baselines()
-    for (nr in rows) {
-        var found = false
-        for (m in merged) {
-            if (m.tool == nr.tool && m.model == nr.model && m.kind == nr.kind && m.wav == nr.wav) {
-                m = nr
-                found = true
-                break
-            }
-        }
-        if (!found) {
-            merged |> push(nr)
-        }
-    }
-    write_asr_baselines(merged)
-    print("\nwrote {length(rows)} new row(s); baseline now {length(merged)} row(s) -> {baseline_asr_path()}\n")
+    logger_info("profile.asr.baseline", "run done", JV({"rows" => JV(length(merged)), "path" => JV(baseline_asr_path())}))
+    print("baseline now {length(merged)} row(s) -> {baseline_asr_path()}\n")
 }

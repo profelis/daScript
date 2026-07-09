@@ -11,9 +11,19 @@ module profile_common shared public
 require daslib/fio public
 require strings public
 require daslib/strings_boost public
+require daslib/logger public              // structured, ISO-8601-timestamped ndjson event log
+require daslib/json public                // JV(...) for logger field payloads
 require dasllama/dasllama_common public   // QuantMode
 
 // ===== Box + model roots =====
+
+//! Shared log name for the whole profiling suite: one timestamped ndjson file per box
+//! ({das_root}/logs/dasllama_profile_<box>.log), appended across all four tools (LLM/ASR ×
+//! establisher/generator). `tail`/`type` it for live, per-model, wall-clock-stamped progress — the
+//! logger fflushes every record, so there is no stdout-buffering blind spot.
+def public prof_log_name() : string {
+    return "dasllama_profile_{box_name()}"
+}
 
 // Machine-local model root; override with DASLLAMA_MODELS_DIR (the x64/handoff boxes).
 def models_dir() : string {
@@ -185,16 +195,54 @@ def das_version() : string {
     return empty(toks) ? "unknown" : toks[length(toks) - 1]
 }
 
+// True on a Windows box (cmd sets OS=Windows_NT). macOS/Linux leave it empty.
+def private is_windows() : bool {
+    return get_env_variable("OS") == "Windows_NT"
+}
+
+// Windows CPU marketing name from the registry — non-interactive (no `date`-style prompt/hang).
+def private win_cpu_name() : string {
+    let raw = run_capture("reg query \"HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\" /v ProcessorNameString", false)
+    for (ln in split(raw, "\n")) {
+        let i = find(ln, "REG_SZ")
+        if (i >= 0 && find(ln, "ProcessorNameString") >= 0) {
+            return strip(slice(ln, i + length("REG_SZ")))
+        }
+    }
+    return ""
+}
+
+// The CPU brand string: env override (DASLLAMA_CPU) → OS-native probe.
+def private platform_cpu() : string {
+    let ov = get_env_variable("DASLLAMA_CPU")
+    if (!empty(ov)) {
+        return ov
+    }
+    return is_windows() ? win_cpu_name() : run_capture("sysctl -n machdep.cpu.brand_string", true)
+}
+
+// The OS string: env override (DASLLAMA_OS) → OS-native probe (`ver` on Windows, sw_vers on macOS).
+def private platform_os() : string {
+    let ov = get_env_variable("DASLLAMA_OS")
+    if (!empty(ov)) {
+        return ov
+    }
+    if (is_windows()) {
+        return run_capture("ver", true)
+    }
+    return "{run_capture("sw_vers -productName", true)} {run_capture("sw_vers -productVersion", true)}"
+}
+
 // Gather the platform block. `llama_cpp` (the reference commit) and `date` are passed in — the caller
-// reads them from the freshly-run baseline / the environment so they stay honest per run.
+// reads them from the freshly-run baseline / the environment so they stay honest per run. CPU/OS come
+// from OS-native probes with DASLLAMA_CPU / DASLLAMA_OS env overrides for boxes without a clean probe.
 def gather_platform(threads : int; llama_cpp, date, box_profile : string; parsec_off : bool) : PlatformInfo {
-    let cpu = run_capture("sysctl -n machdep.cpu.brand_string", true)
-    let os_name = run_capture("sw_vers -productName", true)
-    let os_ver = run_capture("sw_vers -productVersion", true)
+    let cpu = platform_cpu()
+    let os = platform_os()
     let das_ver = das_version()
     return PlatformInfo(
         cpu = empty(cpu) ? "unknown" : cpu,
-        os = "{os_name} {os_ver}",
+        os = empty(os) ? "unknown" : os,
         threads = threads,
         daslang = empty(das_ver) ? "unknown" : das_ver,
         llama_cpp = llama_cpp,

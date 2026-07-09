@@ -85,6 +85,17 @@ def bench_one(display, path : string; threads, nprompt, ngen : int) : LlmBaselin
     return LlmBaseline(model = display, prefill_tok_s = prefill, emission_tok_s = emission, lcpp_commit = commit, n_params = nparams)
 }
 
+// Replace the row for the same model, or append it. Keeps the baseline one-row-per-model.
+def private upsert_baseline(var rows : array<LlmBaseline>; b : LlmBaseline) {
+    for (row in rows) {
+        if (row.model == b.model) {
+            row = b
+            return
+        }
+    }
+    rows |> push(b)
+}
+
 [export]
 def main() {
     var r <- parse_args(type<Args>)
@@ -99,10 +110,16 @@ def main() {
         return
     }
     let tier = parse_tier(cfg.tier)
+    logger_set_name(prof_log_name())
+    logger_info("profile.llm.baseline", "run start", JV({"box" => JV(box_name()), "tier" => JV(cfg.tier),
+        "threads" => JV(cfg.threads), "bench" => JV(llama_bench_bin())}))
     print("establishing LLM baselines: box={box_name()} tier={cfg.tier} threads={cfg.threads}\n")
-    print("bench: {llama_bench_bin()}\n")
+    print("log: {logger_get_path()}  (tail for live, timestamped progress)\n")
     print("NOTE: this runs llama.cpp llama-bench (a measurement) — Parsec must be off.\n\n")
-    var rows : array<LlmBaseline>
+    // The baseline is persisted after EVERY model (upsert into the loaded file, rewrite): a crash or
+    // hang on any model never costs the ones already measured, and partial / repeat runs accumulate.
+    var merged <- read_llm_baselines()
+    var n = 0
     for (m in llm_catalog()) {
         if (!empty(cfg.only) && find(m.display, cfg.only) < 0) {
             continue
@@ -111,11 +128,21 @@ def main() {
         if (!model_selected(m, tier, sz)) {
             continue
         }
-        print("{m.display} ({int(sz / (1024ul * 1024ul))} MB) ...\n")
+        let mb = int(sz / (1024ul * 1024ul))
+        logger_info("profile.llm.baseline", "model start", JV({"model" => JV(m.display), "size_mb" => JV(mb)}))
+        let t0 = ref_time_ticks()
         let b = bench_one(m.display, model_path(m), cfg.threads, cfg.nprompt, cfg.ngen)
-        print("  prefill {b.prefill_tok_s} tok/s  emission {b.emission_tok_s} tok/s  (lcpp {b.lcpp_commit})\n")
-        rows |> push(b)
+        let ms = double(get_time_usec(t0)) / 1000.0lf
+        if (b.prefill_tok_s < 0.0lf || b.emission_tok_s < 0.0lf) {
+            logger_error("profile.llm.baseline", "model failed (llama-bench parse)", JV({"model" => JV(m.display), "elapsed_ms" => JV(ms)}))
+        } else {
+            logger_info("profile.llm.baseline", "model done", JV({"model" => JV(m.display), "elapsed_ms" => JV(ms),
+                "prefill_tok_s" => JV(b.prefill_tok_s), "emission_tok_s" => JV(b.emission_tok_s), "lcpp" => JV(b.lcpp_commit)}))
+        }
+        upsert_baseline(merged, b)
+        write_llm_baselines(merged)   // persist now — before moving to the next model
+        n++
     }
-    write_llm_baselines(rows)
-    print("\nwrote {length(rows)} baseline row(s) -> {baseline_llm_path()}\n")
+    logger_info("profile.llm.baseline", "run done", JV({"measured" => JV(n), "rows" => JV(length(merged)), "path" => JV(baseline_llm_path())}))
+    print("measured {n} model(s); baseline now {length(merged)} row(s) -> {baseline_llm_path()}\n")
 }

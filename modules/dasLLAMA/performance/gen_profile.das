@@ -141,12 +141,30 @@ def main() {
     // load-or-start the persistent per-box profile (the merge target)
     var prof : LlmProfile
     read_llm_profile(prof)
-    let date = run_capture("date +%Y-%m-%d", true)
+    let date = format_time(get_clock(), "%Y-%m-%d")   // portable (no shell) — Windows cmd `date` prompts and hangs
     prof.platform = gather_platform(cfg.threads, lcpp_commit, date, box_profile_tag(), cfg.parsec_off)
 
     apply_box_profile_runtime()   // the tuned per-box stack (backend pin + dispatch knobs)
 
-    print("gen_profile: box={box_name()} tier={cfg.tier} threads={cfg.threads}\n")
+    logger_set_name(prof_log_name())
+    // The das side runs on the jobque, NOT llama-bench's -t. On a many-core box you MUST set
+    // DAS_JOBQUE_THREADS=<threads> or das dispatches wide (~cores lanes) and the comparison is invalid.
+    // Probe the ACTUAL lane count, record it (not just the advisory flag), and warn hard on a mismatch.
+    var lanes = 0
+    with_job_que() {
+        setup_dasllama_jobque_()
+        lanes = get_dispatch_lanes()
+    }
+    prof.platform.threads = lanes
+    logger_info("profile.llm.gen", "run start", JV({"box" => JV(box_name()), "tier" => JV(cfg.tier),
+        "requested_threads" => JV(cfg.threads), "dispatch_lanes" => JV(lanes), "lcpp" => JV(lcpp_commit)}))
+    if (lanes != cfg.threads) {
+        logger_warning("profile.llm.gen", "dispatch lanes != requested threads — set DAS_JOBQUE_THREADS",
+            JV({"dispatch_lanes" => JV(lanes), "requested_threads" => JV(cfg.threads)}))
+        print("WARNING: das dispatch lanes = {lanes}, requested {cfg.threads}. Set DAS_JOBQUE_THREADS={cfg.threads} to match.\n")
+    }
+    print("gen_profile: box={box_name()} tier={cfg.tier} threads={cfg.threads} das_lanes={lanes}\n")
+    print("log: {logger_get_path()}  (tail for live, timestamped progress)\n")
     print("baselines: {length(baselines)} row(s) from {baseline_llm_path()} (lcpp {lcpp_commit})\n\n")
     for (m in llm_catalog()) {
         if (!empty(cfg.only) && find(m.display, cfg.only) < 0) {
@@ -156,10 +174,12 @@ def main() {
         if (!model_selected(m, tier, sz)) {
             continue
         }
-        print("{m.display} ({int(sz / (1024ul * 1024ul))} MB) ...\n")
+        logger_info("profile.llm.gen", "model start", JV({"model" => JV(m.display), "size_mb" => JV(int(sz / (1024ul * 1024ul)))}))
+        let t0 = ref_time_ticks()
         var t <- load_gguf(model_path(m), m.quant)
         t.config.seq_len = min(t.config.seq_len, 2048l)   // cap KV; both phases fit under this
         let meas = measure(t, m.prefill_ctx, m.emission_ctx)
+        let ms = double(get_time_usec(t0)) / 1000.0lf
         var pf_ref = 0.0lf
         var em_ref = 0.0lf
         ref_for(baselines, m.display, pf_ref, em_ref)
@@ -171,8 +191,11 @@ def main() {
             prefill = PhaseRec(context = m.prefill_ctx, das_tok_s = meas.prefill, llama_cpp_tok_s = pf_ref),
             emission = PhaseRec(context = m.emission_ctx, das_tok_s = meas.emission, llama_cpp_tok_s = em_ref))
         upsert_llm(prof.tests, rec)
-        print("  prefill das {meas.prefill} tok/s (lcpp {pf_ref})  emission das {meas.emission} tok/s (lcpp {em_ref})\n")
+        write_llm_profile(prof)   // persist now — a crash on a later model never costs this one
+        logger_info("profile.llm.gen", "model done", JV({"model" => JV(m.display), "elapsed_ms" => JV(ms),
+            "das_prefill_tok_s" => JV(meas.prefill), "das_emission_tok_s" => JV(meas.emission),
+            "lcpp_prefill_tok_s" => JV(pf_ref), "lcpp_emission_tok_s" => JV(em_ref)}))
     }
-    write_llm_profile(prof)
-    print("\nwrote {length(prof.tests)} model row(s) -> {profile_llm_path()}\n")
+    logger_info("profile.llm.gen", "run done", JV({"profiled" => JV(length(prof.tests)), "path" => JV(profile_llm_path())}))
+    print("profiled {length(prof.tests)} model row(s) -> {profile_llm_path()}\n")
 }
