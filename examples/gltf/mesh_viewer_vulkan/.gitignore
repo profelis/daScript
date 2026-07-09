@@ -1,0 +1,4 @@
+# daspkg install populates modules/ with the dasVulkan + dasImgui deps and writes daspkg.lock;
+# both are build artifacts, resolved from the package index / .das_package at install time.
+modules/
+daspkg.lock
