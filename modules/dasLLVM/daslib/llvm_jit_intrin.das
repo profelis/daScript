@@ -184,6 +184,17 @@ let g_x64_avx512vnni_intrin_lookup <- {   // zmm VPDPBUSD (the bw gate is a prer
     "x64_avx::dot64_acc16_vnni" => @@intrinsic_dot64_acc16_vnni_x64
 }
 
+// Half<->float converts (the llvm/daslib/f16_cvt module) — one TARGET-INDEPENDENT table, consulted
+// when the target lowers fpext/fptrunc through half in hardware: any aarch64 (scalar fcvt is
+// ARMv8.0 baseline, no finer gate) or x86-64 with F16C (g_target_x64_f16c). Elsewhere the calls
+// compile their exact bit-twiddle daslang bodies — a half convert without hardware support would
+// lower to a compiler-rt libcall the JIT doesn't link, so the gate is emission-correctness, not
+// just speed.
+let g_f16_cvt_intrin_lookup <- {
+    "f16_cvt::f16_to_f32" => @@intrinsic_f16_to_f32,
+    "f16_cvt::f32_to_f16" => @@intrinsic_f32_to_f16
+}
+
 def public has_intrinsic(expr : ExprCallFunc?) {
     var result = false
     assume argType = expr.arguments[0]._type
@@ -230,6 +241,11 @@ def public has_intrinsic(expr : ExprCallFunc?) {
             result = true
         }
     }
+    if (!result && (g_target_is_aarch64 || g_target_x64_f16c)) {
+        g_f16_cvt_intrin_lookup |> get(call_name) $(_pfun) {
+            result = true
+        }
+    }
     return result
 }
 
@@ -261,6 +277,11 @@ def public lookup_intinsic(g_ctx : LLVMContextRef; g_builder : LLVMOpaqueBuilder
     }
     if (result == null && g_target_x64_avx512vnni) {
         g_x64_avx512vnni_intrin_lookup |> get(call_name) $(pfun) {
+            result = pfun |> invoke(JitCtx(ctx = g_ctx, builder = g_builder, types = types), expr, arguments)
+        }
+    }
+    if (result == null && (g_target_is_aarch64 || g_target_x64_f16c)) {
+        g_f16_cvt_intrin_lookup |> get(call_name) $(pfun) {
             result = pfun |> invoke(JitCtx(ctx = g_ctx, builder = g_builder, types = types), expr, arguments)
         }
     }
@@ -1500,6 +1521,24 @@ def intrinsic_math_gather(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : a
     res = LLVMBuildInsertElement(ctx.builder, res, LLVMBuildLoad2(ctx.builder, ctx.types.t_int32, zaddr, ""), ctx.types.ConstI32(2ul), "")
     res = LLVMBuildInsertElement(ctx.builder, res, LLVMBuildLoad2(ctx.builder, ctx.types.t_int32, waddr, ""), ctx.types.ConstI32(3ul), "")
     return res
+}
+
+// Emitters for f16_cvt::f16_to_f32 / f32_to_f16 (gated by g_f16_cvt_intrin_lookup: aarch64, or
+// x64 with F16C). Target-independent half IR — trunc/bitcast-to-half/fpext (resp.
+// fptrunc/bitcast/zext) — which the backend lowers to scalar fcvt / vcvtph2ps+vcvtps2ph, and the
+// loop vectorizer widens to the packed forms inside auto-vectorized loops. NaN caveat (documented
+// at the f16_cvt module): the hardware convert quietens sNaN and keeps payloads where the daslang
+// fallback bodies flatten f32->f16 NaN to sign|0x7E00 — both stay NaN.
+def intrinsic_f16_to_f32(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    let h16 = LLVMBuildTrunc(ctx.builder, arguments[0], ctx.types.t_int16, "")
+    let hval = LLVMBuildBitCast(ctx.builder, h16, LLVMHalfTypeInContext(ctx.ctx), "")
+    return LLVMBuildFPExt(ctx.builder, hval, ctx.types.t_float, "f16_to_f32")
+}
+
+def intrinsic_f32_to_f16(var ctx : JitCtx; _expr : ExprCallFunc?; arguments : array<LLVMOpaqueValue?>) : LLVMOpaqueValue? {   // nolint:LINT014 — table-uniform signature required by g_intrin_lookup
+    let hval = LLVMBuildFPTrunc(ctx.builder, arguments[0], LLVMHalfTypeInContext(ctx.ctx), "")
+    let h16 = LLVMBuildBitCast(ctx.builder, hval, ctx.types.t_int16, "")
+    return LLVMBuildZExt(ctx.builder, h16, ctx.types.t_int32, "f32_to_f16")
 }
 
 // Emitter for aarch64_neon::sdot4 (gated by g_aarch64_intrin_lookup, only reached on aarch64).
