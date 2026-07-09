@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>dasLLAMA — CPU inference benchmarks · daslang</title>
+    <meta name="description" content="dasLLAMA — a CPU LLM + speech-to-text inference engine written in daslang and JIT-compiled. Measured CPU-only benchmarks vs llama.cpp, whisper.cpp, parakeet, ONNX-Runtime and NeMo, on Apple M1 and AMD Threadripper." />
+    <meta name="keywords" content="daslang, dasLLAMA, llama.cpp, CPU inference, LLM benchmark, whisper, parakeet, speech to text, ASR" />
+
+    <link rel="icon" type="image/svg+xml" href="files/daslang-favicon.svg" />
+    <link rel="alternate icon" type="image/x-icon" href="files/daslang.ico" />
+    <link rel="alternate" type="application/atom+xml" title="Daslang blog" href="blog/feed.xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" />
+    <link rel="stylesheet" href="files/forge.css" />
+    <link rel="stylesheet" href="files/nav-dropdown.css" />
+
+    <!-- Analytics -->
+    <script data-goatcounter="https://borisbat.goatcounter.com/count"
+            async src="//gc.zgo.at/count.js"></script>
+
+    <!-- Algolia DocSearch -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@docsearch/css@3" />
+    <link rel="stylesheet" href="files/docsearch.css" />
+    <script src="https://cdn.jsdelivr.net/npm/@docsearch/js@3" defer></script>
+    <script src="files/docsearch.js" defer></script>
+
+<style>
+  /* ── dasLLAMA page-specific styling (dl-*), built on Forge tokens ── */
+  .dl-hero__badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0.04em;
+    color: var(--amber); border: 1px solid var(--amber-dim); border-radius: 999px;
+    padding: 5px 12px; margin-bottom: 26px;
+  }
+  .dl-hero__badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); }
+
+  .dl-run {
+    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.9; color: var(--fg-dim);
+  }
+  .dl-run .prompt { color: var(--green); }
+  .dl-run .dim { color: var(--fg-faint); }
+  .dl-run .ok { color: var(--green); }
+  .dl-run .amber { color: var(--amber); }
+  .dl-run .metric { color: var(--fg); }
+
+  /* toggles */
+  .dl-toggles { display: flex; flex-wrap: wrap; gap: 22px; align-items: center; margin: 8px 0 26px; }
+  .dl-seg { display: inline-flex; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; }
+  .dl-seg button {
+    font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim);
+    background: transparent; border: 0; padding: 8px 15px; cursor: pointer;
+    transition: background 80ms ease, color 80ms ease; white-space: nowrap;
+  }
+  .dl-seg button + button { border-left: 1px solid var(--rule); }
+  .dl-seg button:hover { color: var(--fg); }
+  .dl-seg button.is-active { background: var(--amber); color: #17130a; }
+  .dl-seg__caption { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: 0.1em; }
+
+  /* diverging ratio bars (LLM) */
+  .dl-bars { display: flex; flex-direction: column; gap: 7px; }
+  .dl-bar { display: grid; grid-template-columns: 150px 1fr 58px; align-items: center; gap: 14px; }
+  .dl-bar__label { font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim); text-align: right; }
+  .dl-bar__track { position: relative; height: 20px; background: var(--bg-2); border: 1px solid var(--rule); border-radius: 4px; }
+  .dl-bar__center { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--fg-faint); opacity: 0.7; }
+  .dl-bar__fill { position: absolute; top: 2px; bottom: 2px; border-radius: 2px; }
+  .dl-bar--win .dl-bar__fill { background: var(--amber); }
+  .dl-bar--loss .dl-bar__fill { background: #7a4a3c; }
+  .dl-bar__val { font-family: var(--font-mono); font-size: 12px; text-align: left; }
+  .dl-bar--win .dl-bar__val { color: var(--amber); }
+  .dl-bar--loss .dl-bar__val { color: var(--fg-dim); }
+  .dl-bar--tie .dl-bar__fill { background: var(--fg-faint); }
+  .dl-bar--tie .dl-bar__val { color: var(--fg-dim); }
+  .dl-caption { font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim); margin-top: 18px; }
+  .dl-axis { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 10px; color: var(--fg-faint); margin: 10px 0 0; padding: 0 58px 0 150px; }
+
+  .dl-win { color: var(--amber); }
+  .dl-loss { color: var(--fg-dim); }
+
+  /* data table */
+  .dl-table-wrap { margin-top: 34px; border: 1px solid var(--rule); border-radius: 8px; overflow-x: auto; }
+  table.dl-table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 12px; min-width: 720px; }
+  .dl-table thead th {
+    text-align: right; padding: 12px 14px; color: var(--fg-faint); font-weight: 400;
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid var(--rule);
+    background: var(--bg-2); white-space: nowrap;
+  }
+  .dl-table thead th:first-child { text-align: left; }
+  .dl-table thead th.dl-grp { color: var(--amber); }
+  .dl-table tbody td { padding: 9px 14px; border-bottom: 1px solid var(--rule); }
+  .dl-table tbody tr:last-child td { border-bottom: 0; }
+  .dl-table tbody tr:hover td { background: rgba(232,161,58,0.04); }
+  .dl-num { text-align: right; color: var(--fg); }
+  .dl-dim { color: var(--fg-faint); }
+  .dl-td-model { color: var(--fg); }
+  .dl-plat { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); margin-top: 14px; }
+
+  /* ASR */
+  .dl-asr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  .dl-asr-model { border: 1px solid var(--rule); border-radius: 8px; padding: 20px 22px; background: var(--bg-2); }
+  .dl-asr-model__head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 16px; }
+  .dl-asr-model__name { font-family: var(--font-sans); font-size: 17px; font-weight: 600; color: var(--fg); }
+  .dl-asr-model__ref { font-family: var(--font-mono); font-size: 10.5px; color: var(--fg-faint); }
+  .dl-asr-row { display: grid; grid-template-columns: 120px 1fr 108px; align-items: center; gap: 12px; padding: 5px 0; }
+  .dl-asr-row__file { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-dim); display: flex; justify-content: space-between; padding-right: 6px; }
+  .dl-asr-row__dur { color: var(--fg-faint); }
+  .dl-asr-row__track { height: 14px; background: var(--bg-3); border-radius: 3px; overflow: hidden; }
+  .dl-asr-row__fill { height: 100%; background: var(--green); border-radius: 3px; }
+  .dl-asr-row__speed { font-family: var(--font-mono); font-size: 12px; color: var(--green); text-align: right; }
+  .dl-asr-row__xrt { color: var(--fg-faint); font-size: 10px; }
+
+  /* blowout callouts */
+  .dl-blowouts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 8px; }
+  .dl-blowout { border: 1px solid var(--amber-dim); border-radius: 10px; padding: 26px 28px; background: linear-gradient(180deg, rgba(232,161,58,0.06), transparent); }
+  .dl-blowout__n { font-family: var(--font-sans); font-size: 52px; font-weight: 600; letter-spacing: -0.03em; color: var(--amber); line-height: 1; }
+  .dl-blowout__t { font-family: var(--font-sans); font-size: 16px; font-weight: 600; color: var(--fg); margin-top: 12px; }
+  .dl-blowout__s { font-family: var(--font-mono); font-size: 11px; color: var(--fg-faint); margin-top: 6px; }
+
+  /* caveats */
+  .dl-caveats { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 40px; }
+  .dl-caveat { display: flex; gap: 12px; padding: 14px 0; border-top: 1px solid var(--rule); }
+  .dl-caveat__k { font-family: var(--font-mono); font-size: 11px; color: var(--amber); white-space: nowrap; padding-top: 2px; min-width: 118px; }
+  .dl-caveat__v { font-size: 14px; line-height: 1.55; color: var(--fg-dim); }
+
+  @media (max-width: 900px) {
+    .dl-asr-grid, .dl-blowouts, .dl-caveats { grid-template-columns: 1fr; }
+    .dl-bar { grid-template-columns: 110px 1fr 52px; }
+    .dl-axis { padding: 0 52px 0 110px; }
+  }
+</style>
+</head>
+<body>
+<div class="forge-page">
+
+    <!-- ───── Nav ───── -->
+    <nav class="forge-nav">
+        <div class="forge-container forge-nav__inner">
+            <div class="forge-nav__left">
+                <a class="forge-mark" href="index.html">
+                    <span class="forge-mark__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M 19,2 C 6.848484,12.699956 12.591844,7.4593088 6.8243462,13.056243 16.852307,10.274014 6.8079126,19.737584 5,22 L 17.120536,11.596175 C 6.7139271,14.121239 17.627482,3.775356 19,2 Z m -7,1 c -5,0 -9,4 -9,9 0,2.5 0.9875,4.80625 2.6875,6.40625 L 7.09375,17 C 5.79375,15.8 5,14 5,12 5,8.1 8.1,5 12,5 12.4,5 12.69375,4.99375 13.09375,5.09375 L 14.8125,3.40625 C 13.9125,3.20625 13,3 12,3 Z M 18.3125,5.59375 16.90625,7 C 18.20625,8.2 19,10 19,12 c 0,3.9 -3.1,7 -7,7 -0.4,0 -0.69375,0.0063 -1.09375,-0.09375 L 9.1875,20.59375 C 10.0875,20.79375 11,21 12,21 c 5,0 9,-4 9,-9 0,-2.5 -0.9875,-4.80625 -2.6875,-6.40625 z"/></svg></span>
+                    <span>daslang</span>
+                    <span class="forge-mark__tld">.io</span>
+                </a>
+                <div class="forge-nav__links">
+                    <a href="doc/index.html">docs</a>
+                    <a href="playground/index.html">playground</a>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">performance <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="index.html#benchmarks"><span class="forge-nav__menu-label">benchmarks</span><span class="forge-nav__menu-desc">Cross-language CPU speed — interpreter &amp; JIT.</span></a>
+                            <a href="dasllama.html" class="is-active"><span class="forge-nav__menu-label">dasLLAMA <span class="forge-nav__menu-new">NEW</span></span><span class="forge-nav__menu-desc">CPU LLM + speech-to-text, das vs llama.cpp.</span></a>
+                        </div>
+                    </div>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">ecosystem <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="daspkg.html"><span class="forge-nav__menu-label">daspkg</span><span class="forge-nav__menu-desc">The package manager that compiles in.</span></a>
+                            <a href="examples.html"><span class="forge-nav__menu-label">examples</span><span class="forge-nav__menu-desc">Games &amp; demos built in daslang.</span></a>
+                            <a href="downloads.html"><span class="forge-nav__menu-label">downloads</span><span class="forge-nav__menu-desc">Pre-built binaries &amp; source.</span></a>
+                        </div>
+                    </div>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">community <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="blog/index.html"><span class="forge-nav__menu-label">blog</span><span class="forge-nav__menu-desc">Release notes &amp; deep dives.</span></a>
+                            <a href="index.html#news"><span class="forge-nav__menu-label">news</span><span class="forge-nav__menu-desc">Latest releases &amp; ecosystem activity.</span></a>
+                            <a href="https://t.me/daScript"><span class="forge-nav__menu-label">telegram</span><span class="forge-nav__menu-desc">Chat with the daslang team.</span></a>
+                            <a href="https://github.com/GaijinEntertainment/daScript"><span class="forge-nav__menu-label">github</span><span class="forge-nav__menu-desc">Source, issues &amp; releases.</span></a>
+                            <a href="changelist.html"><span class="forge-nav__menu-label">change list</span><span class="forge-nav__menu-desc">Every release, version by version.</span></a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="forge-nav__right">
+                <button class="forge-nav__burger" type="button" aria-label="menu"
+                    onclick="this.closest('.forge-nav').classList.toggle('is-open')">≡</button>
+                <span class="forge-nav__version">v0.6.3</span>
+                <div id="docsearch"></div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ───── Hero ───── -->
+    <section class="forge-hero">
+        <div class="forge-container forge-hero__grid">
+            <div>
+                <span class="dl-hero__badge"><span class="dot"></span>dasLLAMA · CPU inference</span>
+                <h1>A scripting language that <em>holds its own on CPU.</em></h1>
+                <p class="forge-hero__lede">
+                    dasLLAMA is an LLM + speech-to-text stack written entirely in daslang and
+                    JIT-compiled — no hand-written assembly. These are CPU-only comparisons. llama.cpp
+                    is a broader, more mature engine with GPU backends we don't try to match; on the
+                    CPU path alone, das keeps pace on prompt processing and often edges ahead.
+                </p>
+                <div class="forge-hero__ctas">
+                    <a class="forge-btn-primary" href="#llm">$ view the scoreboard →</a>
+                    <a class="forge-btn-secondary" href="#method">methodology</a>
+                </div>
+                <div class="forge-stats">
+                    <div class="forge-stat"><div class="forge-stat__n">up to 1.75×</div><div class="forge-stat__l">LLM prefill vs llama.cpp · gemma-4 E2B, M1</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n">30 / 32</div><div class="forge-stat__l">runs das ≥ llama.cpp · 16 models × 2 boxes</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n">~5×</div><div class="forge-stat__l">Qwen3-Omni audio vs mtmd, CPU-only (M1)</div></div>
+                </div>
+            </div>
+
+            <div class="forge-terminal">
+                <div class="forge-terminal__header">
+                    <div class="forge-terminal__dots"><span class="forge-terminal__dot forge-terminal__dot--red"></span><span class="forge-terminal__dot forge-terminal__dot--amber"></span><span class="forge-terminal__dot forge-terminal__dot--green"></span></div>
+                    <div class="forge-terminal__label">dasllama.das</div>
+                </div>
+                <pre class="forge-hero__code" style="display:block"><code class="language-daslang">// LLM inference in daslang — JIT, no C++
+require dasllama/dasllama
+require daslib/jobque_boost
+
+[export]
+def main() {
+    let path = "Llama-3.1-8B.gguf"
+    var m &lt;- load_model(path, QuantMode.q8)
+    let ids &lt;- encode(m, "Summarize the results:")
+    with_job_que() {
+        setup_dasllama_jobque()
+        var s = create_session(m)
+        let sp = SamplingParams()
+        generate(m, s, ids, sp, 128l) $(_id, p) {
+            print(p)
+            return true
+        }
+    }
+}</code></pre>
+                <div class="forge-output">
+                    <div class="dl-run">
+                        <div><span class="prompt">$</span> daslang -jit dasllama.das</div>
+                        <div class="dim">  loaded Llama-3.1-8B · q8 · 8.03B active · CPU / 8 threads</div>
+                        <div><span class="metric">prefill</span> <span class="amber">132.1 tok/s</span> <span class="dim">· das/llama.cpp 1.11×</span></div>
+                        <div><span class="metric">decode&nbsp;</span> <span class="amber">13.6 tok/s</span> <span class="dim">· das/llama.cpp 0.96×</span></div>
+                        <div class="ok">  ✓ no hand-written assembly · Apple M1 Max</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- § 01 LLM -->
+    <section class="forge-section" id="llm">
+        <div class="forge-container">
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 01</span><span class="forge-section-label__rule"></span><span>llm cpu scoreboard</span></div>
+            <h2 class="forge-h2">das ÷ llama.cpp, CPU only. <em>Right of the line, das is ahead on prefill.</em></h2>
+            <p class="forge-p">A like-for-like CPU comparison: llama.cpp built with no Accelerate/AMX BLAS, so this reflects scalar/SIMD kernels — not its GPU backends, which are out of scope here. pp512 = prefill over a 512-token prompt; tg128 = greedy generation of 128 tokens. All Q8.</p>
+
+            <div class="dl-toggles">
+                <span class="dl-seg__caption">machine</span>
+                <div class="dl-seg">
+                    <button class="js-llm-box is-active" data-box="m1" type="button">Apple M1 Max</button>
+                    <button class="js-llm-box" data-box="zen2" type="button">Threadripper 3990X</button>
+                </div>
+                <span class="dl-seg__caption">phase</span>
+                <div class="dl-seg">
+                    <button class="js-llm-phase is-active" data-phase="prefill" type="button">prefill (pp512)</button>
+                    <button class="js-llm-phase" data-phase="emission" type="button">decode (tg128)</button>
+                </div>
+            </div>
+
+            <div class="dl-bars" id="llm-bars"></div>
+            <div class="dl-axis"><span>0.5× (llama.cpp 2× faster)</span><span>1.0×</span><span>2.0× (das 2× faster)</span></div>
+            <div class="dl-caption" id="llm-caption"></div>
+
+            <div class="dl-table-wrap">
+                <table class="dl-table">
+                    <thead>
+                        <tr>
+                            <th>model</th><th>active B</th>
+                            <th class="dl-grp">pp512 das</th><th>pp512 lcpp</th><th class="dl-grp">das/lcpp</th>
+                            <th class="dl-grp">tg128 das</th><th>tg128 lcpp</th><th class="dl-grp">das/lcpp</th>
+                        </tr>
+                    </thead>
+                    <tbody id="llm-table-body"></tbody>
+                </table>
+            </div>
+            <div class="dl-plat" id="llm-plat"></div>
+        </div>
+    </section>
+
+    <!-- § 02 ASR -->
+    <section class="forge-section forge-section--alt">
+        <div class="forge-container">
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 02</span><span class="forge-section-label__rule"></span><span>speech-to-text</span></div>
+            <h2 class="forge-h2">Competitive with the dedicated engines on CPU.</h2>
+            <p class="forge-p">Transcription time, CPU only, greedy decode. Bars show speed relative to the reference CLI (longer = faster); the small figure is real-time factor — seconds of audio per second of compute. Note the macOS *-cli tools do get Apple's AMX matrix unit here, so this isn't scalar-only on their side.</p>
+
+            <div class="dl-toggles">
+                <span class="dl-seg__caption">machine</span>
+                <div class="dl-seg">
+                    <button class="js-asr-box is-active" data-box="m1" type="button">Apple M1 Max</button>
+                    <button class="js-asr-box" data-box="zen2" type="button">Threadripper 3990X</button>
+                </div>
+            </div>
+
+            <div class="dl-asr-grid" id="asr-models"></div>
+            <div class="dl-plat" id="asr-plat"></div>
+        </div>
+    </section>
+
+    <!-- § 03 audio-chat blowout -->
+    <section class="forge-section">
+        <div class="forge-container">
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 03</span><span class="forge-section-label__rule"></span><span>audio-chat models</span></div>
+            <div class="forge-bench__grid">
+                <div>
+                    <h2 class="forge-h2">Where the CPU-only gap is widest: audio chat.</h2>
+                    <p class="forge-p">This is a narrow, CPU-only slice: llama.cpp's Conformer/AuT audio encoders don't route through BLAS/AMX on CPU, so the reference spends ~99% of its time in the audio encoder. das's optimized fp32 scalar encoder comes out well ahead on that path — a GPU build of llama.cpp would tell a different story.</p>
+                    <p class="forge-p" style="color:var(--fg-faint);font-size:13px">Canary-Qwen 2.5B (the only engine with a SALM reference, NeMo) — das leads on short dictation clips: 0.66× on jfk, 0.77× on jfk3. It trails on a 3-minute clip where it runs an un-quantized fp32 decoder — a known follow-up.</p>
+                </div>
+                <div class="dl-blowouts" id="audiochat-cards"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- § 04 methodology -->
+    <section class="forge-section forge-section--alt" id="method">
+        <div class="forge-container">
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 04</span><span class="forge-section-label__rule"></span><span>methodology &amp; honest caveats</span></div>
+            <h2 class="forge-h2" style="margin-bottom:36px">The framing, in full.</h2>
+            <div class="dl-caveats">
+                <div class="dl-caveat"><div class="dl-caveat__k">what das is</div><div class="dl-caveat__v">An LLM + ASR inference engine written entirely in daslang and JIT-compiled — no hand-written SIMD/assembly. The point is narrow but real: a scripting language keeping pace with hand-tuned C++ on the CPU path.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">apples-to-apples</div><div class="dl-caveat__v">Everything here is CPU. The llama.cpp reference is built with no Accelerate/AMX BLAS on M1 (pure NEON/i8mm) for a like-for-like kernel comparison — not a comment on its GPU backends, which are broader and out of scope. Where a reference does get AMX (ASR *-cli on macOS), that's noted.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">prefill vs decode</div><div class="dl-caveat__v">das wins prompt-processing (compute-bound); it trails single-token generation (memory-bandwidth-bound). Neither is cherry-picked without the other — the toggle above shows both.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">quantization</div><div class="dl-caveat__v">LLM numbers are Q8. ASR is q8 encoder/decoder except audio-chat and Canary, which run fp32 for correctness. das output is verified token-for-token against each reference.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">two machines</div><div class="dl-caveat__v">An Arm laptop (Apple M1 Max) and an x86 workstation (Ryzen Threadripper 3990X) show the same pattern — that's the point; it's not one lucky box.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">dates &amp; versions</div><div class="dl-caveat__v">daslang 0.6.3; measured 2026-07-09, Parsec off. llama.cpp ebd048f (M1) / fdb1db877 (zen2). Raw data lives in the JSON these charts render from.</div></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- ───── Footer ───── -->
+    <footer class="forge-footer">
+        <div class="forge-container forge-footer__grid">
+            <div>
+                <a class="forge-mark" href="index.html">
+                    <span class="forge-mark__glyph" aria-hidden="true"><svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M 19,2 C 6.848484,12.699956 12.591844,7.4593088 6.8243462,13.056243 16.852307,10.274014 6.8079126,19.737584 5,22 L 17.120536,11.596175 C 6.7139271,14.121239 17.627482,3.775356 19,2 Z m -7,1 c -5,0 -9,4 -9,9 0,2.5 0.9875,4.80625 2.6875,6.40625 L 7.09375,17 C 5.79375,15.8 5,14 5,12 5,8.1 8.1,5 12,5 12.4,5 12.69375,4.99375 13.09375,5.09375 L 14.8125,3.40625 C 13.9125,3.20625 13,3 12,3 Z M 18.3125,5.59375 16.90625,7 C 18.20625,8.2 19,10 19,12 c 0,3.9 -3.1,7 -7,7 -0.4,0 -0.69375,0.0063 -1.09375,-0.09375 L 9.1875,20.59375 C 10.0875,20.79375 11,21 12,21 c 5,0 9,-4 9,-9 0,-2.5 -0.9875,-4.80625 -2.6875,-6.40625 z"/></svg></span>
+                    <span>daslang</span>
+                    <span class="forge-mark__tld">.io</span>
+                </a>
+                <div class="forge-footer__about">
+                    High-performance scripting for C++.<br />
+                    © 2018–2026 Gaijin Entertainment · BSD 3-Clause
+                </div>
+            </div>
+            <div>
+                <div class="forge-footer__col-head">performance</div>
+                <a class="forge-footer__link" href="index.html#benchmarks">benchmarks</a>
+                <a class="forge-footer__link" href="dasllama.html">dasLLAMA</a>
+            </div>
+            <div>
+                <div class="forge-footer__col-head">ecosystem</div>
+                <a class="forge-footer__link" href="daspkg.html">daspkg · package index</a>
+                <a class="forge-footer__link" href="playground/index.html">playground</a>
+                <a class="forge-footer__link" href="https://edenspark.io">edenspark · games on daslang</a>
+                <a class="forge-footer__link" href="https://github.com/profelis/daScript-plugin">vs code extension</a>
+            </div>
+            <div>
+                <div class="forge-footer__col-head">community</div>
+                <a class="forge-footer__link" href="https://t.me/daScript">telegram</a>
+                <a class="forge-footer__link" href="https://github.com/GaijinEntertainment/daScript">github</a>
+                <a class="forge-footer__link" href="changelist.html">change list</a>
+                <a class="forge-footer__link" href="downloads.html">downloads</a>
+            </div>
+        </div>
+    </footer>
+
+</div>
+<script src="files/highlight.js" defer></script>
+<script src="files/dasllama.js" defer></script>
+</body>
+</html>

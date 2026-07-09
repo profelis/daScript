@@ -1,0 +1,586 @@
+options gen2
+options indenting = 4
+
+// Shared foundation for the dasLLAMA profiling suite: the model catalog, the small/large tier gate,
+// the per-box platform block, and the baseline-TSV I/O that the reference establisher writes and the
+// das-side generator reads. The suite is deliberately self-contained (it does not cross-require the
+// tests/ tier helper) so it lives entirely under modules/dasLLAMA/performance/.
+
+module profile_common shared public
+
+require daslib/fio public
+require strings public
+require daslib/strings_boost public
+require daslib/logger public              // structured, ISO-8601-timestamped ndjson event log
+require daslib/json public                // JV(...) for logger field payloads
+require dasllama/dasllama_common public   // QuantMode
+
+// ===== Box + model roots =====
+
+//! Shared log name for the whole profiling suite: one timestamped ndjson file per box
+//! ({das_root}/logs/dasllama_profile_<box>.log), appended across all four tools (LLM/ASR ×
+//! establisher/generator). `tail`/`type` it for live, per-model, wall-clock-stamped progress — the
+//! logger fflushes every record, so there is no stdout-buffering blind spot.
+def public prof_log_name() : string {
+    return "dasllama_profile_{box_name()}"
+}
+
+// Machine-local model root; override with DASLLAMA_MODELS_DIR (the x64/handoff boxes).
+def models_dir() : string {
+    let env = get_env_variable("DASLLAMA_MODELS_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+}
+
+// Short box tag baked into the JSON/TSV filenames (profile_llm_<box>.json). Override with DASLLAMA_BOX.
+def box_name() : string {
+    let env = get_env_variable("DASLLAMA_BOX")
+    return empty(env) ? "m1" : env
+}
+
+// Models at or above this are large-tier (deferred unless --tier large|all). 6 GiB splits the
+// ~5GB-and-under carriers (incl. gemma-4-E2B at 4.63GB) from the 7GB+ heavies.
+let LARGE_TIER_BYTES = 6ul * 1024ul * 1024ul * 1024ul
+
+// ===== The text-LLM catalog =====
+
+//! One profiled text model: its GGUF basename under [[models_dir]], a scoreboard display name, the
+//! quant to load das-side, and the prefill / emission context sizes to measure at.
+struct LlmModel {
+    file : string
+    display : string
+    quant : QuantMode
+    prefill_ctx : int
+    emission_ctx : int
+}
+
+// The text LLMs the suite profiles. Absent files are skipped at run time, so this can list every box's
+// models; each box measures the subset it actually has. Audio models live in the ASR path, not here.
+def llm_catalog() : array<LlmModel> {
+    return <- [
+        LlmModel(file="SmolLM2-135M-Instruct-Q8_0.gguf", display="SmolLM2-135M", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Qwen2.5-0.5B-Instruct-Q8_0.gguf", display="Qwen2.5-0.5B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Qwen3-0.6B-Q8_0.gguf", display="Qwen3-0.6B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="gemma-3-1b-it-Q8_0.gguf", display="gemma-3-1B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="tinyllama-1.1b-chat-v1.0.Q8_0.gguf", display="TinyLlama-1.1B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Llama-3.2-1B-Instruct-Q8_0.gguf", display="Llama-3.2-1B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Qwen2.5-1.5B-Instruct-Q8_0.gguf", display="Qwen2.5-1.5B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="SmolLM2-1.7B-Instruct-Q8_0.gguf", display="SmolLM2-1.7B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="gemma-2-2b-it-Q8_0.gguf", display="gemma-2-2B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Phi-3.5-mini-instruct-Q8_0.gguf", display="Phi-3.5-mini", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="gemma-3-4b-it-Q8_0.gguf", display="gemma-3-4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Qwen3-4B-Instruct-2507-Q8_0.gguf", display="Qwen3-4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="gemma-4-E2B-it-Q8_0.gguf", display="gemma-4-E2B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Mistral-7B-Instruct-v0.3-Q8_0.gguf", display="Mistral-7B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="gemma-4-E4B-it-Q8_0.gguf", display="gemma-4-E4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", display="Llama-3.1-8B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128)
+    ]
+}
+
+//! Tier selector matching the --tier flag.
+enum Tier {
+    small
+    large
+    all
+}
+
+def parse_tier(s : string) : Tier {
+    if (s == "large") {
+        return Tier.large
+    }
+    if (s == "all") {
+        return Tier.all
+    }
+    return Tier.small
+}
+
+// Full path to a catalog entry's GGUF.
+def model_path(m : LlmModel) : string {
+    return "{models_dir()}{m.file}"
+}
+
+//! The scoreboard spelling of a quant mode (the JSON `quant` cell).
+def quant_str(q : QuantMode) : string {
+    if (q == QuantMode.q8) {
+        return "q8"
+    }
+    if (q == QuantMode.q4) {
+        return "q4"
+    }
+    return "fp32"
+}
+
+//! Active (per-token) parameter count in billions, derived from `t`'s Config geometry: the full
+//! embedding (also the tied classifier) + attention + FFN, counting only the `n_expert_used` routed
+//! experts for MoE. Dense models get ~total; MoE gets the compute-relevant active size. Norms/biases
+//! (negligible) and the per-layer PLE embedding table (an embedding lookup, not a matmul) are omitted.
+def active_params_b(t : Model) : double {
+    let c = t.config
+    var p = c.vocab_size * c.dim   // token embedding (also the tied classifier when shared_weights)
+    for (l in range64(c.n_layers)) {
+        let qd = layer_qd(c, l)
+        let kvd = layer_kv_dim(c, l)
+        p += c.dim * qd + c.dim * kvd + qd * c.dim   // wq, wk, wo
+        if (t.wv_offs[l] >= 0l) {
+            p += c.dim * kvd                         // wv (absent on gemma-4 V-from-K layers)
+        }
+        if (c.moe) {
+            p += c.dim * c.n_expert                        // router
+            p += c.n_expert_used * 3l * c.dim * c.n_ff_exp // ACTIVE routed experts only
+            if (c.n_ff_shexp > 0l) {
+                p += 3l * c.dim * c.n_ff_shexp             // shared expert
+            }
+        } else {
+            p += 3l * c.dim * layer_hidden(t, l)           // dense gate / up / down
+        }
+    }
+    if (!c.shared_weights) {
+        p += c.dim * c.vocab_size                          // untied classifier
+    }
+    return double(p) / 1.0e9lf
+}
+
+//! True when `m` is present on disk AND in the requested tier. `sz` receives the file size (0 if absent).
+def model_selected(m : LlmModel; tier : Tier; var sz : uint64&) : bool {
+    let st = stat(model_path(m))
+    sz = st.is_valid ? st.size : 0ul
+    if (!st.is_valid) {
+        return false
+    }
+    let is_large = st.size >= LARGE_TIER_BYTES
+    if (tier == Tier.all) {
+        return true
+    }
+    return tier == Tier.large ? is_large : !is_large
+}
+
+// ===== Platform block =====
+
+//! The per-box platform header stored at the top of every profile JSON.
+struct PlatformInfo {
+    cpu : string
+    os : string
+    threads : int
+    daslang : string
+    llama_cpp : string
+    date : string
+    box_profile : string
+    parsec_off : bool
+}
+
+// Run `cmd`, return its trimmed stdout (first line only when `first_line`). Uses fread_to_eof (fio's
+// pipe-safe reader) — fread(f) whole-file sizes via seek and returns empty on a non-seekable pipe.
+def run_capture(cmd : string; first_line : bool) : string {
+    var out = ""
+    unsafe {
+        popen(cmd) $(f) {
+            out = fread_to_eof(f)
+        }
+    }
+    out = strip(out)
+    if (first_line) {
+        let nl = find(out, "\n")
+        if (nl >= 0) {
+            out = slice(out, 0, nl)
+        }
+    }
+    return out
+}
+
+// The running daslang's version, via the box's binary (DASLANG_BIN, default bin/daslang from the
+// repo-root cwd these tools run in). Takes the last token of the first --version line ("0.6.3").
+def das_version() : string {
+    let bin = empty(get_env_variable("DASLANG_BIN")) ? "bin/daslang" : get_env_variable("DASLANG_BIN")
+    let line = run_capture("{bin} --version", true)
+    let toks <- split(line, " ")
+    return empty(toks) ? "unknown" : toks[length(toks) - 1]
+}
+
+// True on a Windows box (cmd sets OS=Windows_NT). macOS/Linux leave it empty.
+def private is_windows() : bool {
+    return get_env_variable("OS") == "Windows_NT"
+}
+
+// Windows CPU marketing name from the registry — non-interactive (no `date`-style prompt/hang).
+def private win_cpu_name() : string {
+    let raw = run_capture("reg query \"HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\" /v ProcessorNameString", false)
+    for (ln in split(raw, "\n")) {
+        let i = find(ln, "REG_SZ")
+        if (i >= 0 && find(ln, "ProcessorNameString") >= 0) {
+            return strip(slice(ln, i + length("REG_SZ")))
+        }
+    }
+    return ""
+}
+
+// The CPU brand string: env override (DASLLAMA_CPU) → OS-native probe.
+def private platform_cpu() : string {
+    let ov = get_env_variable("DASLLAMA_CPU")
+    if (!empty(ov)) {
+        return ov
+    }
+    return is_windows() ? win_cpu_name() : run_capture("sysctl -n machdep.cpu.brand_string", true)
+}
+
+// The OS string: env override (DASLLAMA_OS) → OS-native probe (`ver` on Windows, sw_vers on macOS).
+def private platform_os() : string {
+    let ov = get_env_variable("DASLLAMA_OS")
+    if (!empty(ov)) {
+        return ov
+    }
+    if (is_windows()) {
+        return run_capture("ver", true)
+    }
+    return "{run_capture("sw_vers -productName", true)} {run_capture("sw_vers -productVersion", true)}"
+}
+
+// Gather the platform block. `llama_cpp` (the reference commit) and `date` are passed in — the caller
+// reads them from the freshly-run baseline / the environment so they stay honest per run. CPU/OS come
+// from OS-native probes with DASLLAMA_CPU / DASLLAMA_OS env overrides for boxes without a clean probe.
+def gather_platform(threads : int; llama_cpp, date, box_profile : string; parsec_off : bool) : PlatformInfo {
+    let cpu = platform_cpu()
+    let os = platform_os()
+    let das_ver = das_version()
+    return PlatformInfo(
+        cpu = empty(cpu) ? "unknown" : cpu,
+        os = empty(os) ? "unknown" : os,
+        threads = threads,
+        daslang = empty(das_ver) ? "unknown" : das_ver,
+        llama_cpp = llama_cpp,
+        date = date,
+        box_profile = box_profile,
+        parsec_off = parsec_off)
+}
+
+// ===== Baseline TSV I/O (reference tok/s the establisher writes, the generator reads) =====
+
+//! One reference-tool baseline row for a model: llama.cpp prefill / emission tok/s (CPU), the lcpp
+//! build commit, and the total parameter count llama-bench reported. -1 means "not measured".
+struct LlmBaseline {
+    model : string
+    prefill_tok_s : double
+    emission_tok_s : double
+    lcpp_commit : string
+    n_params : int64
+}
+
+def baseline_llm_path() : string {
+    return "modules/dasLLAMA/performance/baseline_llm_{box_name()}.tsv"
+}
+
+def write_llm_baselines(rows : array<LlmBaseline>) {
+    fopen(baseline_llm_path(), "wb") $(f) {
+        if (f == null) {
+            return
+        }
+        fwrite(f, "model\tprefill_tok_s\temission_tok_s\tlcpp_commit\tn_params\n")
+        for (r in rows) {
+            fwrite(f, "{r.model}\t{r.prefill_tok_s}\t{r.emission_tok_s}\t{r.lcpp_commit}\t{r.n_params}\n")
+        }
+    }
+}
+
+def read_llm_baselines() : array<LlmBaseline> {
+    var rows : array<LlmBaseline>
+    let text = fread(baseline_llm_path())
+    var first = true
+    for (line in split(text, "\n")) {
+        if (first) {   // header
+            first = false
+            continue
+        }
+        if (empty(strip(line))) {
+            continue
+        }
+        let col <- split(line, "\t")
+        if (length(col) < 5) {
+            continue
+        }
+        rows |> emplace(LlmBaseline(
+            model = col[0],
+            prefill_tok_s = to_double(col[1]),
+            emission_tok_s = to_double(col[2]),
+            lcpp_commit = col[3],
+            n_params = to_int64(col[4])))
+    }
+    return <- rows
+}
+
+// ===== Profile JSON (the deliverable — one per box, das + reference tok/s) =====
+
+//! One phase (prefill or emission) of a model's LLM profile. `llama_cpp_tok_s` is @optional: when the
+//! reference wasn't measured on this box it stays 0.0 and is omitted from the JSON (absent key = no ref).
+struct PhaseRec {
+    context : int
+    das_tok_s : double
+    @optional llama_cpp_tok_s : double
+}
+
+//! One text-LLM row in a profile: model + metadata, plus its prefill and emission phases.
+struct LlmRec {
+    model : string
+    arch : string
+    quant : string
+    active_b : double
+    prefill : PhaseRec
+    emission : PhaseRec
+}
+
+//! A complete per-box LLM profile: the platform block + one row per measured model. Serialized with
+//! `sprint_json` and round-tripped with `sscan_json` — the machine-readable handoff for the website.
+struct LlmProfile {
+    platform : PlatformInfo
+    tests : array<LlmRec>
+}
+
+def profile_llm_path() : string {
+    return "modules/dasLLAMA/performance/profile_llm_{box_name()}.json"
+}
+
+def write_llm_profile(p : LlmProfile) {
+    let text = sprint_json(p, true)
+    fopen(profile_llm_path(), "wb") $(f) {
+        if (f != null) {
+            fwrite(f, text)
+        }
+    }
+}
+
+// Load the existing per-box profile into `p` for a merge run; false if none exists yet.
+def read_llm_profile(var p : LlmProfile) : bool {
+    let path = profile_llm_path()
+    if (!stat(path).is_valid) {
+        return false
+    }
+    return sscan_json(fread(path), p)
+}
+
+// Update-or-insert `rec` into `tests` keyed by model name — lets a small-tier run and a later
+// large-tier run merge into one file without clobbering each other's rows.
+def upsert_llm(var tests : array<LlmRec>; rec : LlmRec) {
+    for (c in tests) {
+        if (c.model == rec.model) {
+            c = rec
+            return
+        }
+    }
+    tests |> push(rec)
+}
+
+// ===== ASR: audio-model roots + corpus =====
+
+// whisper.cpp model root (the ggml-*.bin parakeet/whisper carriers, shared by das and the *-cli
+// references). Override with WHISPER_CPP_MODELS.
+def whisper_models_dir() : string {
+    let env = get_env_variable("WHISPER_CPP_MODELS")
+    return empty(env) ? "/Users/borisbatkin/Work/whisper.cpp/models/" : env
+}
+
+// The bench corpus (relative to the repo-root cwd these tools run in).
+def asr_corpus_dir() : string {
+    return "modules/dasLLAMA/benchmarks/asr/corpus/"
+}
+
+// The five standard corpus buckets, shortest→longest (11 s .. 547 s).
+def corpus_buckets() : array<string> {
+    return <- ["jfk.wav", "jfk3.wav", "gb1.wav", "hp0.wav", "hp0x2.wav"]
+}
+
+// ===== ASR: the audio-model catalog =====
+
+//! A reference tool bound to one ASR model + the per-tool handle to invoke it: the onnx variant key,
+//! the NeMo HF id, or the mtmd mmproj basename. Empty when the tool loads the model's own das_model
+//! directly (the whisper.cpp `parakeet-cli` / `whisper-cli`).
+struct AsrRef {
+    tool : string      // parakeet-cli | whisper-cli | onnx | nemo | mtmd
+    handle : string
+}
+
+//! One ASR model to profile: the das-side load (basename under `root`, plus `mmproj` for the two-file
+//! audio-chat models), its ordered reference tools, the corpus buckets to time, and a short tag (`v2` /
+//! `tiny` …) — non-empty only for models that also join the LibriSpeech dictation aggregate.
+struct AsrModelSpec {
+    display : string
+    das_model : string
+    das_mmproj : string
+    root : string
+    refs : array<AsrRef>
+    buckets : array<string>
+    libri_short : string
+    lang : string          // create_session language: "en" for the pure-ASR models, "auto" for audio-chat
+}
+
+// The audio models the suite profiles. Absent files are skipped at run time. The das side is uniform
+// (load_asr_model + transcribe drives every entry); the heterogeneity is which reference tool(s) apply.
+def asr_catalog() : array<AsrModelSpec> {
+    let wroot = whisper_models_dir()
+    let lroot = models_dir()
+    return <- [
+        AsrModelSpec(display = "Parakeet-TDT v2", das_model = "ggml-parakeet-tdt-0.6b-v2-f32.bin",
+            das_mmproj = "", root = wroot,
+            refs <- [AsrRef(tool = "parakeet-cli", handle = ""), AsrRef(tool = "onnx", handle = "v2-int8")],
+            buckets <- corpus_buckets(), libri_short = "v2", lang = "en"),
+        AsrModelSpec(display = "Parakeet-TDT v3", das_model = "ggml-parakeet-tdt-0.6b-v3-f32.bin",
+            das_mmproj = "", root = wroot,
+            refs <- [AsrRef(tool = "parakeet-cli", handle = ""), AsrRef(tool = "onnx", handle = "int8")],
+            buckets <- corpus_buckets(), libri_short = "v3", lang = "en"),
+        AsrModelSpec(display = "Whisper tiny", das_model = "ggml-tiny.bin",
+            das_mmproj = "", root = wroot,
+            refs <- [AsrRef(tool = "whisper-cli", handle = ""), AsrRef(tool = "onnx", handle = "whisper-tiny-int8")],
+            buckets <- corpus_buckets(), libri_short = "tiny", lang = "en"),
+        AsrModelSpec(display = "Whisper large-v3-turbo", das_model = "ggml-large-v3-turbo.bin",
+            das_mmproj = "", root = wroot,
+            refs <- [AsrRef(tool = "whisper-cli", handle = ""), AsrRef(tool = "onnx", handle = "whisper-turbo-int8")],
+            buckets <- corpus_buckets(), libri_short = "", lang = "en"),
+        AsrModelSpec(display = "Canary-Qwen 2.5B", das_model = "canary-qwen-2.5b-decoder-f16.gguf",
+            das_mmproj = "canary-qwen-2.5b-encoder-f32.bin", root = lroot,
+            refs <- [AsrRef(tool = "nemo", handle = "nvidia/canary-qwen-2.5b")],
+            buckets <- ["jfk.wav", "jfk3.wav", "gb1.wav"], libri_short = "", lang = "auto"),
+        AsrModelSpec(display = "Gemma-4 E2B audio", das_model = "gemma-4-E2B-it-Q8_0.gguf",
+            das_mmproj = "mmproj-gemma-4-E2B-it-bf16.gguf", root = lroot,
+            refs <- [AsrRef(tool = "mtmd", handle = "mmproj-gemma-4-E2B-it-bf16.gguf")],
+            buckets <- ["gemma4a_test2.wav"], libri_short = "", lang = "auto"),
+        AsrModelSpec(display = "Qwen3-Omni-30B audio", das_model = "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf",
+            das_mmproj = "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf", root = lroot,
+            refs <- [AsrRef(tool = "mtmd", handle = "mmproj-Qwen3-Omni-30B-A3B-Instruct-bf16.gguf")],
+            buckets <- ["jfk.wav", "jfk3.wav"], libri_short = "", lang = "auto")
+    ]
+}
+
+// ===== ASR: baseline TSV I/O (reference tool times the establisher writes, the generator reads) =====
+
+//! One reference-tool baseline row: the tool, the das display name it references, the clip, its audio
+//! seconds, the best-of-reps transcribe ms, and (mtmd only) the encode+prefill split (-1 = N/A). `kind`
+//! is "corpus" (a named bucket) or "libri" (one of the 25 LibriSpeech dictation clips).
+struct AsrBaseRow {
+    tool : string
+    model : string
+    kind : string
+    wav : string
+    audio_s : double
+    ms : double
+    encode_ms : double
+}
+
+def baseline_asr_path() : string {
+    return "modules/dasLLAMA/performance/baseline_asr_{box_name()}.tsv"
+}
+
+def write_asr_baselines(rows : array<AsrBaseRow>) {
+    fopen(baseline_asr_path(), "wb") $(f) {
+        if (f == null) {
+            return
+        }
+        fwrite(f, "tool\tmodel\tkind\twav\taudio_s\tms\tencode_ms\n")
+        for (r in rows) {
+            fwrite(f, "{r.tool}\t{r.model}\t{r.kind}\t{r.wav}\t{r.audio_s}\t{r.ms}\t{r.encode_ms}\n")
+        }
+    }
+}
+
+def read_asr_baselines() : array<AsrBaseRow> {
+    var rows : array<AsrBaseRow>
+    let text = fread(baseline_asr_path())
+    var first = true
+    for (line in split(text, "\n")) {
+        if (first) {
+            first = false
+            continue
+        }
+        if (empty(strip(line))) {
+            continue
+        }
+        let col <- split(line, "\t")
+        if (length(col) < 7) {
+            continue
+        }
+        rows |> emplace(AsrBaseRow(
+            tool = col[0], model = col[1], kind = col[2], wav = col[3],
+            audio_s = to_double(col[4]), ms = to_double(col[5]), encode_ms = to_double(col[6])))
+    }
+    return <- rows
+}
+
+// ===== ASR: profile JSON (the deliverable — full-fidelity: N references/model, per-bucket ms) =====
+
+//! One measured reference time for a bucket. `encode_ms` is @optional (mtmd only — the audio-tower
+//! encode+prefill split); 0.0 means "not split-timed" and is omitted from the JSON.
+struct AsrRefTime {
+    tool : string
+    ms : double
+    @optional encode_ms : double
+}
+
+//! One corpus clip of an ASR model's profile: das transcribe ms (best-of-reps) + one reference time
+//! per tool that ran (a tool that can't run this clip is absent — the renderer shows "-"). Both
+//! `das_encode_ms` (mtmd-parity audio-chat models) are @optional.
+struct AsrBucket {
+    wav : string
+    audio_s : double
+    das_ms : double
+    @optional das_encode_ms : double
+    refs : array<AsrRefTime>
+}
+
+//! One text-per-side dictation statistic over the LibriSpeech short-clip set (per-clip latency case).
+struct LibriStat {
+    side : string
+    mean_ms : double
+    p50_ms : double
+    p95_ms : double
+}
+
+//! The LibriSpeech dictation aggregate (25 short clips): one stat row per side (das/cli/onnx × model).
+struct LibriAggregate {
+    n_clips : int
+    sides : array<LibriStat>
+}
+
+//! One ASR model row: display + das load + ordered reference tool names (the table's column order) +
+//! one bucket per corpus clip.
+struct AsrRec {
+    model : string
+    das_model : string
+    references : array<string>
+    buckets : array<AsrBucket>
+}
+
+//! A complete per-box ASR profile: platform block + one row per measured model + the LibriSpeech
+//! dictation aggregate. Round-tripped with sprint_json/sscan_json — the machine-readable handoff.
+struct AsrProfile {
+    platform : PlatformInfo
+    tests : array<AsrRec>
+    librispeech : LibriAggregate
+}
+
+def profile_asr_path() : string {
+    return "modules/dasLLAMA/performance/profile_asr_{box_name()}.json"
+}
+
+def write_asr_profile(p : AsrProfile) {
+    let text = sprint_json(p, true)
+    fopen(profile_asr_path(), "wb") $(f) {
+        if (f != null) {
+            fwrite(f, text)
+        }
+    }
+}
+
+// Load the existing per-box ASR profile into `p` for a merge run; false if none exists yet.
+def read_asr_profile(var p : AsrProfile) : bool {
+    let path = profile_asr_path()
+    if (!stat(path).is_valid) {
+        return false
+    }
+    return sscan_json(fread(path), p)
+}
+
+// Update-or-insert `rec` into `tests` keyed by model name (partial per-model runs merge into one file).
+def upsert_asr(var tests : array<AsrRec>; var rec : AsrRec) {
+    for (c in tests) {
+        if (c.model == rec.model) {
+            c <- rec
+            return
+        }
+    }
+    tests |> emplace(rec)
+}

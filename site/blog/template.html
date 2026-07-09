@@ -12,6 +12,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" />
     <link rel="stylesheet" href="{{root}}files/forge.css" />
+    <link rel="stylesheet" href="{{root}}files/nav-dropdown.css" />
     <script src="{{root}}files/cm/daslang-keywords.js" defer></script>
     <script src="{{root}}files/highlight.js" defer></script>
     <script src="{{root}}files/blog-counter.js" defer></script>
@@ -38,15 +39,33 @@
                     <span class="forge-mark__tld">.io</span>
                 </a>
                 <div class="forge-nav__links">
-                    <a href="{{root}}index.html#news">news</a>
                     <a href="{{root}}doc/index.html">docs</a>
-                    <a href="{{root}}examples.html">examples</a>
-                    <a href="{{root}}index.html#benchmarks">benchmarks</a>
-                    <a href="{{root}}downloads.html">downloads</a>
-                    <a href="{{root}}daspkg.html">daspkg</a>
-                    <a href="{{root}}blog/index.html">blog</a>
-                    <a href="https://t.me/daScript">community</a>
                     <a href="{{root}}playground/index.html">playground</a>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">performance <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="{{root}}index.html#benchmarks"><span class="forge-nav__menu-label">benchmarks</span><span class="forge-nav__menu-desc">Cross-language CPU speed — interpreter &amp; JIT.</span></a>
+                            <a href="{{root}}dasllama.html"><span class="forge-nav__menu-label">dasLLAMA <span class="forge-nav__menu-new">NEW</span></span><span class="forge-nav__menu-desc">CPU LLM + speech-to-text, das vs llama.cpp.</span></a>
+                        </div>
+                    </div>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">ecosystem <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="{{root}}daspkg.html"><span class="forge-nav__menu-label">daspkg</span><span class="forge-nav__menu-desc">The package manager that compiles in.</span></a>
+                            <a href="{{root}}examples.html"><span class="forge-nav__menu-label">examples</span><span class="forge-nav__menu-desc">Games &amp; demos built in daslang.</span></a>
+                            <a href="{{root}}downloads.html"><span class="forge-nav__menu-label">downloads</span><span class="forge-nav__menu-desc">Pre-built binaries &amp; source.</span></a>
+                        </div>
+                    </div>
+                    <div class="forge-nav__group">
+                        <button class="forge-nav__trigger" type="button">community <span class="forge-nav__chev">▾</span></button>
+                        <div class="forge-nav__menu">
+                            <a href="{{root}}blog/index.html"><span class="forge-nav__menu-label">blog</span><span class="forge-nav__menu-desc">Release notes &amp; deep dives.</span></a>
+                            <a href="{{root}}index.html#news"><span class="forge-nav__menu-label">news</span><span class="forge-nav__menu-desc">Latest releases &amp; ecosystem activity.</span></a>
+                            <a href="https://t.me/daScript"><span class="forge-nav__menu-label">telegram</span><span class="forge-nav__menu-desc">Chat with the daslang team.</span></a>
+                            <a href="https://github.com/GaijinEntertainment/daScript"><span class="forge-nav__menu-label">github</span><span class="forge-nav__menu-desc">Source, issues &amp; releases.</span></a>
+                            <a href="{{root}}changelist.html"><span class="forge-nav__menu-label">change list</span><span class="forge-nav__menu-desc">Every release, version by version.</span></a>
+                        </div>
+                    </div>
                 </div>
             </div>
             <div class="forge-nav__right">

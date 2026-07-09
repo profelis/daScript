@@ -11,6 +11,7 @@ require jobque
 require daslib/ast_boost
 require daslib/strings_boost
 require daslib/strings_convert
+require daslib/md_boost
 require daslib/rst
 require daslib/rst_comment
 require daslib/functional
@@ -773,6 +774,15 @@ def document_module_math_boost(_root : string) {
         group_by_regex("Color packing and unpacking", mod, %regex~(RGBA_TO_UCOLOR|UCOLOR_TO_RGBA|UCOLOR_TO_RGB)$%%)
     )
     document("Boost package for math", mod, "math_boost.rst", groups)
+}
+
+def document_module_md_boost(_root : string) {
+    var mod = find_module("md_boost")
+    var groups <- array<DocGroup>(
+        group_by_regex("Tables", mod, %regex~(render_md_table|ColAlign)$%%),
+        group_by_regex("Text helpers", mod, %regex~(md_bold|md_escape)$%%)
+    )
+    document("Markdown generation helpers", mod, "md_boost.rst", groups)
 }
 
 def document_module_array_boost(_root : string) {
@@ -1851,6 +1861,7 @@ def main {
     // document_module_live(root)                  // uses multiple_contexts
     document_module_lpipe(root)
     document_module_macro_boost(root)
+    document_module_md_boost(root)
     document_module_match(root)
     document_module_math_bits(root)
     document_module_math_boost(root)

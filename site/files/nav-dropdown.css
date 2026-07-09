@@ -1,0 +1,133 @@
+/* ───────────────────────────────────────────────────────────────
+   Forge nav — grouped dropdown menus.
+   Extends the base `.forge-nav` in forge.css with submenu groups, so
+   the top bar can be decluttered from a long flat link list into a
+   few labelled dropdowns (Performance, Ecosystem, Community, …).
+   Uses only existing Forge tokens; no new colors.
+   ─────────────────────────────────────────────────────────────── */
+
+.forge-nav__group {
+    position: relative;
+    display: flex;
+    align-items: center;
+    /* hover bridge so the cursor can cross the gap into the menu */
+    padding-bottom: 18px;
+    margin-bottom: -18px;
+}
+
+.forge-nav__trigger {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--fg-dim);
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: color 80ms ease;
+}
+.forge-nav__trigger:hover,
+.forge-nav__group:hover .forge-nav__trigger,
+.forge-nav__group:focus-within .forge-nav__trigger,
+.forge-nav__group.is-open .forge-nav__trigger { color: var(--fg); }
+
+.forge-nav__trigger .forge-nav__chev {
+    font-size: 8px;
+    color: var(--fg-faint);
+    transition: transform 140ms ease, color 80ms ease;
+}
+.forge-nav__group:hover .forge-nav__trigger .forge-nav__chev,
+.forge-nav__group:focus-within .forge-nav__trigger .forge-nav__chev,
+.forge-nav__group.is-open .forge-nav__trigger .forge-nav__chev {
+    transform: rotate(180deg);
+    color: var(--amber);
+}
+
+.forge-nav__menu {
+    position: absolute;
+    top: 100%;
+    left: -14px;
+    min-width: 234px;
+    background: var(--bg-2);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 6px;
+    display: none;
+    flex-direction: column;
+    z-index: 40;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+}
+.forge-nav__group:hover .forge-nav__menu,
+.forge-nav__group:focus-within .forge-nav__menu,
+.forge-nav__group.is-open .forge-nav__menu { display: flex; }
+
+.forge-nav__menu a {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 9px 12px;
+    border-radius: 5px;
+    text-decoration: none;
+    transition: background 80ms ease;
+}
+.forge-nav__menu a:hover { background: var(--bg-3); }
+
+.forge-nav__menu-label {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--fg);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: color 80ms ease;
+}
+.forge-nav__menu a:hover .forge-nav__menu-label { color: var(--amber); }
+
+/* current-page marker within a group */
+.forge-nav__menu a.is-active .forge-nav__menu-label { color: var(--amber); }
+
+.forge-nav__menu-desc {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    line-height: 1.4;
+    color: var(--fg-faint);
+}
+
+/* "NEW" chip on a fresh menu item */
+.forge-nav__menu-new {
+    font-family: var(--font-mono);
+    font-size: 8.5px;
+    letter-spacing: 0.08em;
+    color: var(--amber);
+    border: 1px solid var(--amber-dim);
+    border-radius: 3px;
+    padding: 1px 4px;
+    line-height: 1.2;
+}
+
+/* Mobile: inside the collapsed `.forge-nav.is-open` panel, flatten each
+   group into a static labelled block (no floating dropdown). */
+@media (max-width: 767px) {
+    .forge-nav__group {
+        flex-direction: column;
+        align-items: flex-start;
+        padding-bottom: 0;
+        margin-bottom: 0;
+        width: 100%;
+    }
+    .forge-nav__trigger { pointer-events: none; color: var(--fg-faint); }
+    .forge-nav__trigger .forge-nav__chev { display: none; }
+    .forge-nav__menu {
+        position: static;
+        display: flex;
+        border: 0;
+        box-shadow: none;
+        background: transparent;
+        padding: 4px 0 8px 12px;
+        min-width: 0;
+    }
+    .forge-nav__menu a { padding: 6px 0; }
+    .forge-nav__menu-desc { display: none; }
+}

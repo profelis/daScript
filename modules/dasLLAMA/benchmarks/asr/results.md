@@ -8,87 +8,98 @@ int8 (engine-level `onnx_bench.py`, no HTTP). Rows marked with the date+rev they
 a das-only re-sweep compares against the stored cli/onnx TSV baselines (never re-benched
 without cause — noise policy: >2-3% run-to-run swings mean other software, not thermals).
 
-## Parakeet-TDT 0.6B v2 — das vs parakeet-cli
+## Parakeet-TDT 0.6B v2 — das vs parakeet-cli vs ONNX-Runtime int8
 
-### Apple M1 Max, 8 threads — das 2026-07-07 @ `52cf2e741`; cli TSV 2026-07-06 (Parsec off)
+### Apple M1 Max, 8 threads
 
-| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT |
-|---|---|---|---|---|---|---|
-| jfk.wav | 11 | 207 | 339 | **0.61x** | 53.0 | 32.5 |
-| jfk3.wav | 33 | 638 | 749 | **0.85x** | 51.7 | 44.1 |
-| gb1.wav | 199 | 5928 | 6635 | **0.89x** | 33.5 | 30.0 |
-| hp0.wav | 273 | 9455 | 11041 | **0.86x** | 28.9 | 24.8 |
-| hp0x2.wav | 547 | 28874 | 38021 | **0.76x** | 18.9 | 14.4 |
+<!-- GEN:asr Parakeet-TDT v2 m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
-TSVs: das `results_pk_m1_t8_jo.tsv`, cli `results_pk_m1_t8_p0.tsv`.
+| file      | audio s | das ms | parakeet-cli ms | onnx ms | das/parakeet-cli |  das/onnx | das xRT |
+| :-------- | ------: | -----: | --------------: | ------: | ---------------: | --------: | ------: |
+| jfk.wav   |      11 |    197 |             336 |     483 |        **0.59x** | **0.41x** |    55.8 |
+| jfk3.wav  |      33 |    638 |             749 |     874 |        **0.85x** | **0.73x** |    51.7 |
+| gb1.wav   |     199 |   6585 |            6662 |    7188 |        **0.99x** | **0.92x** |    30.2 |
+| hp0.wav   |     273 |   9470 |           10955 |   11552 |        **0.86x** | **0.82x** |    28.9 |
+| hp0x2.wav |     547 |  27899 |           37610 |       - |        **0.74x** |         - |    19.6 |
+<!-- /GEN:asr Parakeet-TDT v2 m1 -->
 
-### AMD EPYC Zen 2, 16 threads — das 2026-07-07 @ `17abcd32d` (post-TUNE); cli TSV 2026-07-06
+Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
 
-| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT |
-|---|---|---|---|---|---|---|
-| jfk.wav | 11 | 419 | 666 | **0.63x** | 26.2 | 16.5 |
-| jfk3.wav | 33 | 1133 | 1782 | **0.64x** | 29.1 | 18.5 |
-| gb1.wav | 199 | 10277 | 17052 | **0.60x** | 19.3 | 11.7 |
-| hp0.wav | 273 | 15339 | 29698 | **0.52x** | 17.8 | 9.2 |
-| hp0x2.wav | 547 | 44789 | 95549 | **0.47x** | 12.2 | 5.7 |
+### AMD Ryzen Threadripper 3990X, 16 threads
 
-TSVs: das `results_pk_zen2_t16_jo.tsv`, cli `results_parakeet_zen2_t16.tsv`.
+<!-- GEN:asr Parakeet-TDT v2 zen2 -->
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+
+| file      | audio s | das ms | parakeet-cli ms | onnx ms | das/parakeet-cli | das/onnx | das xRT |
+| :-------- | ------: | -----: | --------------: | ------: | ---------------: | -------: | ------: |
+| jfk.wav   |      11 |    394 |             679 |       - |        **0.58x** |        - |    27.9 |
+| jfk3.wav  |      33 |   1126 |            1781 |       - |        **0.63x** |        - |    29.3 |
+| gb1.wav   |     199 |  10063 |           16753 |       - |        **0.60x** |        - |    19.7 |
+| hp0.wav   |     273 |  15378 |           27991 |       - |        **0.55x** |        - |    17.8 |
+| hp0x2.wav |     547 |  41438 |           92567 |       - |        **0.45x** |        - |    13.2 |
+<!-- /GEN:asr Parakeet-TDT v2 zen2 -->
+
+Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references).
 
 ## Parakeet-TDT 0.6B v3 — das vs parakeet-cli vs ONNX-Runtime int8
 
 onnx's exported graph bakes a max input length: hp0x2 overflows its rel-pos table → skipped
 (das/cli handle it).
 
-### Apple M1 Max, 8 threads — das 2026-07-07 @ `52cf2e741`; cli/onnx TSV 2026-07-06 (Parsec off)
+### Apple M1 Max, 8 threads
 
-| file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
-|---|---|---|---|---|---|---|
-| jfk.wav | 11 | 218 | 344 | 468 | **0.63x** | **0.47x** |
-| jfk3.wav | 33 | 678 | 773 | 931 | **0.88x** | **0.73x** |
-| gb1.wav | 199 | 6046 | 6725 | 7215 | **0.90x** | **0.84x** |
-| hp0.wav | 273 | 9706 | 11123 | 11563 | **0.87x** | **0.84x** |
-| hp0x2.wav | 547 | 29455 | 38078 | - | **0.77x** | - |
+<!-- GEN:asr Parakeet-TDT v3 m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
-TSVs: das `results_pk_m1_t8_jo.tsv`, cli/onnx `results_pk_m1_t8_p0.tsv`.
+| file      | audio s | das ms | parakeet-cli ms | onnx ms | das/parakeet-cli |  das/onnx | das xRT |
+| :-------- | ------: | -----: | --------------: | ------: | ---------------: | --------: | ------: |
+| jfk.wav   |      11 |    203 |             343 |     472 |        **0.59x** | **0.43x** |    54.2 |
+| jfk3.wav  |      33 |    642 |             770 |     906 |        **0.83x** | **0.71x** |    51.4 |
+| gb1.wav   |     199 |   5683 |            6784 |    7212 |        **0.84x** | **0.79x** |    35.0 |
+| hp0.wav   |     273 |   9148 |           11101 |   11535 |        **0.82x** | **0.79x** |    29.9 |
+| hp0x2.wav |     547 |  27965 |           38062 |       - |        **0.73x** |         - |    19.5 |
+<!-- /GEN:asr Parakeet-TDT v3 m1 -->
 
-### AMD EPYC Zen 2, 16 threads — ALL THREE sides 2026-07-07 @ `17abcd32d`, interleaved A/B/C
+Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
 
-| file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
-|---|---|---|---|---|---|---|
-| jfk.wav | 11 | 414 | 673 | 570 | **0.61x** | **0.73x** |
-| jfk3.wav | 33 | 1171 | 1757 | 1776 | **0.67x** | **0.66x** |
-| gb1.wav | 199 | 9654 | 16670 | 17286 | **0.58x** | **0.56x** |
-| hp0.wav | 273 | 14902 | 27775 | 26868 | **0.54x** | **0.55x** |
-| hp0x2.wav | 547 | 41436 | 88198 | - | **0.47x** | - |
+### AMD Ryzen Threadripper 3990X, 16 threads
 
-TSV (all sides): `results_pk_zen2_t16_v3.tsv`. onnx = ORT `intra_op=16`.
+<!-- GEN:asr Parakeet-TDT v3 zen2 -->
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+
+| file      | audio s | das ms | parakeet-cli ms | onnx ms | das/parakeet-cli | das/onnx | das xRT |
+| :-------- | ------: | -----: | --------------: | ------: | ---------------: | -------: | ------: |
+| jfk.wav   |      11 |    411 |             692 |       - |        **0.59x** |        - |    26.8 |
+| jfk3.wav  |      33 |   1117 |            1799 |       - |        **0.62x** |        - |    29.6 |
+| gb1.wav   |     199 |   9314 |           17054 |       - |        **0.55x** |        - |    21.3 |
+| hp0.wav   |     273 |  14939 |           28987 |       - |        **0.52x** |        - |    18.3 |
+| hp0x2.wav |     547 |  41774 |           94314 |       - |        **0.44x** |        - |    13.1 |
+<!-- /GEN:asr Parakeet-TDT v3 zen2 -->
+
+Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references).
 
 ## LibriSpeech test-clean, 25 short clips — per-clip latency (dictation case)
 
-### Apple M1 Max, 8 threads — das 2026-07-07 @ `52cf2e741`; cli/onnx TSV 2026-07-06 (best-of-2)
+### Apple M1 Max, 8 threads
 
-| side | mean ms | p50 | p95 |
-|---|---|---|---|
-| das v2 | **182** | **183** | **304** |
-| cli v2 | 314 | 310 | 446 |
-| das v3 | **191** | **194** | **321** |
-| cli v3 | 320 | 319 | 453 |
-| onnx-int8 v3 | 396 | 398 | 529 |
+<!-- GEN:asr librispeech m1 -->
+| side             | mean ms |     p50 |     p95 |
+| :--------------- | ------: | ------: | ------: |
+| das v2           | **173** | **174** | **305** |
+| parakeet-cli v2  |     310 |     306 |     437 |
+| onnx v2          |     381 |     396 |     542 |
+| das v3           | **184** | **185** | **310** |
+| parakeet-cli v3  |     316 |     317 |     456 |
+| onnx v3          |     401 |     383 |     572 |
+| das tiny         | **115** | **115** | **135** |
+| whisper-cli tiny |     127 |     126 |     163 |
+| onnx tiny        |     422 |     418 |     510 |
+<!-- /GEN:asr librispeech m1 -->
 
-TSVs: das `results_pk_ls_m1_t8_jo.tsv`, cli/onnx `results_pk_ls_m1_t8_p0.tsv`.
-
-### Apple M1 Max, 8 threads, whisper tiny — das 2026-07-08 @ `cab95ee9c`; cli/onnx TSV 2026-07-08
-
-| side | mean ms | p50 | p95 |
-|---|---|---|---|
-| das tiny | **117** | **117** | **139** |
-| cli tiny | 129 | 129 | 167 |
-| onnx tiny-int8 | 431 | 421 | 528 |
-
-TSVs: das `results_wh_ls_m1_t8_attnidx.tsv` (best-of-2), cli/onnx sides of
-`results_wh_ls_m1_t8.tsv`. das now leads AMX whisper-cli on short-clip latency (p50 0.91x,
-p95 0.83x), 3.6x faster than onnx-int8. (whisper-tiny p50 117 vs parakeet v2 183 — tiny is
-the quicker dictation model, parakeet the stronger one.)
+Source: `performance/profile_asr_m1.json` (das rows bold). das leads AMX cli on every side —
+parakeet v2/v3 and whisper tiny — and runs 2–3.6× faster than onnx-int8. whisper-tiny is the
+quicker dictation model (p50 ~115 ms), parakeet v2/v3 the stronger.
 
 ## Whisper — das vs whisper-cli (`-bs 1 -bo 1 -nf -ng`)
 
@@ -99,134 +110,173 @@ passes (`cb26a05d0`) + flattened tower attention (`cab95ee9c`: (head × query-bl
 units over the slot-indexed team dispatch — killed the head-unit raggedness that
 dominated encode; bit-exact, fingerprints byte-identical).
 
-### Apple M1 Max, 8 threads — das 2026-07-08 @ `cab95ee9c` (flattened tower attention, Parsec off); cli TSV 2026-07-07
+### Apple M1 Max, 8 threads
 
-| model | file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
-|---|---|---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 112 | 122 | 463 | **0.92x** | **0.24x** |
-| tiny | jfk3.wav | 33 | 246 | 298 | - | **0.82x** | - |
-| tiny | gb1.wav | 199 | 1173 | 1672 | - | **0.70x** | - |
-| tiny | hp0.wav | 273 | 1523 | 2102 | - | **0.72x** | - |
-| tiny | hp0x2.wav | 547 | 3001 | 4836 | - | **0.62x** | - |
-| large-v3-turbo | jfk.wav | 11 | 2629 | 2150 | 2406 | 1.22x | 1.09x |
-| large-v3-turbo | jfk3.wav | 33 | 5331 | 4494 | - | 1.19x | - |
-| large-v3-turbo | gb1.wav | 199 | 21891 | 25415 | - | **0.86x** | - |
-| large-v3-turbo | hp0.wav | 273 | 32420 | 32878 | - | **0.99x** | - |
-| large-v3-turbo | hp0x2.wav | 547 | 62128 | 64621 | - | **0.96x** | - |
+_tiny:_
 
-TSVs: das `results_wh_m1_t8_attnidx.tsv` (best-of-2), cli side of `results_wh_m1_t8.tsv`,
-onnx `results_wh_m1_t8_onnx.tsv` (jfk-only — single-window adapter). The flattened tower
-attention took the das side another ~9-10% on every row: **tiny now beats AMX cli on ALL
-FIVE rows** (jfk was the last holdout at 1.03x) and turbo wins every row past jfk3
-(hp0 0.99x, hp0x2 0.96x — both were cli's). Clean-window stage (per rep, jfk): tiny
-encode 81.7 (attn_heads 40.4 — the 6-units-on-8-lanes floor is gone; 1.30x on the bucket
-vs the 1.33x theoretical), decode 23.3, cross_kv 5.6; turbo encode 2540 (attn_heads 1048,
-1.22x on the bucket), decode 107, cross_kv 41.
+<!-- GEN:asr Whisper tiny m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
-### AMD EPYC Zen 2, 16 threads — das 2026-07-08 @ `cab95ee9c` (flattened tower attention); cli TSV 2026-07-07
+| file      | audio s | das ms | whisper-cli ms | onnx ms | das/whisper-cli |  das/onnx | das xRT |
+| :-------- | ------: | -----: | -------------: | ------: | --------------: | --------: | ------: |
+| jfk.wav   |      11 |    110 |            124 |     416 |       **0.89x** | **0.26x** |   100.2 |
+| jfk3.wav  |      33 |    242 |            314 |       - |       **0.77x** |         - |   136.2 |
+| gb1.wav   |     199 |   1167 |           1955 |       - |       **0.60x** |         - |   170.3 |
+| hp0.wav   |     273 |   1487 |           2121 |       - |       **0.70x** |         - |   183.8 |
+| hp0x2.wav |     547 |   3009 |           4701 |       - |       **0.64x** |         - |   181.6 |
+<!-- /GEN:asr Whisper tiny m1 -->
 
-| model | file | audio s | das ms | cli ms | onnx ms | das/cli | das/onnx |
-|---|---|---|---|---|---|---|---|
-| tiny | jfk.wav | 11 | 216 | 213 | 643 | 1.01x | **0.34x** |
-| tiny | jfk3.wav | 33 | 520 | 500 | - | 1.04x | - |
-| tiny | gb1.wav | 199 | 2782 | 2845 | - | **0.98x** | - |
-| tiny | hp0.wav | 273 | 3398 | 3546 | - | **0.96x** | - |
-| tiny | hp0x2.wav | 547 | 6841 | 7327 | - | **0.93x** | - |
-| large-v3-turbo | jfk.wav | 11 | 3693 | 6728 | 3730 | **0.55x** | **0.99x** |
-| large-v3-turbo | jfk3.wav | 33 | 7908 | 13657 | - | **0.58x** | - |
-| large-v3-turbo | gb1.wav | 199 | 34182 | 76720 | - | **0.45x** | - |
-| large-v3-turbo | hp0.wav | 273 | 48737 | 100852 | - | **0.48x** | - |
-| large-v3-turbo | hp0x2.wav | 547 | 93820 | 189313 | - | **0.50x** | - |
+_large-v3-turbo:_
 
-TSVs: das `results_wh_zen2_t16_attnidx.tsv` (best-of-2), cli side of `results_wh_zen2_t16.tsv`,
-onnx `results_wh_zen2_t16_onnx.tsv` (2026-07-08). onnx = onnx-community exports, int8, ORT
-`intra_op=16` — the adapter is a SINGLE 30 s window (no long-form chunking; >30 s clips
-return truncated/empty text — skipped, `63e2ac191`), so jfk is its only valid row. The
-flattened tower attention (`cab95ee9c` — (head × query-block) units, slot-indexed score
-scratch, chunk-per-unit team self-serve) took the das side another 12-24% on this box:
-stage probe attn_heads tiny 151 → 66 ms/rep (2.3x; encode 200 → 114) and turbo
-2495 → 1492 ms/rep (1.67x; encode 4361 → 3297). tiny now sits at cli parity short and
-LEADS long (0.93-0.98x, was 1.09-1.33x); turbo's lead widens to 0.45-0.58x and its jfk
-row now edges onnx-int8 (0.99x). das beats onnx-int8 3.0x on the comparable tiny row.
-tiny's next wall is decode (~59 ms/rep vs encode 114); decoder q8 stays net-neutral here
-(logits/cross_kv wins vs cache-hot per-layer GEMV losses — no VNNI).
+<!-- GEN:asr Whisper large-v3-turbo m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+
+| file      | audio s | das ms | whisper-cli ms | onnx ms | das/whisper-cli | das/onnx | das xRT |
+| :-------- | ------: | -----: | -------------: | ------: | --------------: | -------: | ------: |
+| jfk.wav   |      11 |   2607 |           2144 |    2318 |           1.22x |    1.12x |     4.2 |
+| jfk3.wav  |      33 |   5301 |           4447 |       - |           1.19x |        - |     6.2 |
+| gb1.wav   |     199 |  21815 |          25355 |       - |       **0.86x** |        - |     9.1 |
+| hp0.wav   |     273 |  32234 |          32876 |       - |       **0.98x** |        - |     8.5 |
+| hp0x2.wav |     547 |  61843 |          64500 |       - |       **0.96x** |        - |     8.8 |
+<!-- /GEN:asr Whisper large-v3-turbo m1 -->
+
+Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references);
+onnx is jfk-only (single-window adapter). The flattened tower attention (`cab95ee9c`) had das
+**beat AMX cli on all five tiny rows** and win every turbo row past jfk3 (hp0 0.99x, hp0x2 0.96x —
+both were cli's). Stage breakdown (per rep, jfk): tiny encode 81.7 / decode 23.3 / cross_kv 5.6;
+turbo encode 2540 / decode 107 / cross_kv 41.
+
+### AMD Ryzen Threadripper 3990X, 16 threads
+
+_tiny:_
+
+<!-- GEN:asr Whisper tiny zen2 -->
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+
+| file      | audio s | das ms | whisper-cli ms | onnx ms | das/whisper-cli |  das/onnx | das xRT |
+| :-------- | ------: | -----: | -------------: | ------: | --------------: | --------: | ------: |
+| jfk.wav   |      11 |    203 |            263 |     606 |       **0.77x** | **0.33x** |    54.2 |
+| jfk3.wav  |      33 |    498 |            563 |       - |       **0.89x** |         - |    66.2 |
+| gb1.wav   |     199 |   2658 |           3090 |       - |       **0.86x** |         - |    74.8 |
+| hp0.wav   |     273 |   3233 |           3894 |       - |       **0.83x** |         - |    84.5 |
+| hp0x2.wav |     547 |   6457 |           8069 |       - |       **0.80x** |         - |    84.7 |
+<!-- /GEN:asr Whisper tiny zen2 -->
+
+_large-v3-turbo:_
+
+<!-- GEN:asr Whisper large-v3-turbo zen2 -->
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+
+| file      | audio s | das ms | whisper-cli ms | onnx ms | das/whisper-cli |  das/onnx | das xRT |
+| :-------- | ------: | -----: | -------------: | ------: | --------------: | --------: | ------: |
+| jfk.wav   |      11 |   3589 |           6972 |    3890 |       **0.51x** | **0.92x** |     3.1 |
+| jfk3.wav  |      33 |   7528 |          14234 |       - |       **0.53x** |         - |     4.4 |
+| gb1.wav   |     199 |  32874 |          80386 |       - |       **0.41x** |         - |     6.0 |
+| hp0.wav   |     273 |  46789 |         103665 |       - |       **0.45x** |         - |     5.8 |
+| hp0x2.wav |     547 |  90366 |         199539 |       - |       **0.45x** |         - |     6.0 |
+<!-- /GEN:asr Whisper large-v3-turbo zen2 -->
+
+Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references);
+onnx is jfk-only (single-window adapter, >30 s clips skipped). Same flattened tower attention
+(`cab95ee9c`) as on M1: das leads whisper-cli on every turbo row and sits at cli parity / leads long
+on tiny; das beats onnx-int8 ~3x on the comparable tiny row. No VNNI on Zen 2 (plain AVX2).
 
 ## Canary-Qwen 2.5B — das vs the NeMo SALM reference engine
 
-llama.cpp has **zero** canary/SALM/FastConformer support and onnx-asr ships no canary export,
-so the only reference is **NeMo SALM greedy** (`canary_qwen_bench.py`, engine-level python, CPU,
-timed transcribe excludes model load — same shape as `asr_bench.das`'s BENCH line). das runs
-**fp32** here (the token-for-token parity load: LoRA-merged Qwen3-1.7B decoder + f32 FastConformer
-encoder); a q8 decoder + q8 encoder is the obvious perf follow-up (not chased — the parity gate is
-fp32). Correctness is token-for-token on every clip (model matrix + `test_canary_qwen_oracle`).
+llama.cpp has **zero** canary/SALM/FastConformer support and onnx-asr ships no canary export, so the
+only reference is **NeMo SALM greedy** (`canary_qwen_bench.py`, engine-level python, **CPU** — torch
+threads, no MPS). das runs **fp32** (the token-for-token parity load: LoRA-merged Qwen3-1.7B decoder
++ f32 FastConformer encoder; a q8 path is the perf follow-up). Correctness is token-for-token
+(`test_canary_qwen_oracle`).
 
-### Apple M1 Max, 8 threads — both sides 2026-07-08 @ `daf12e7b7` (Parsec off)
+### Apple M1 Max, 8 threads
 
-| file | audio s | das ms | nemo ms | das/nemo | das xRT | nemo xRT |
-|---|---|---|---|---|---|---|
-| jfk.wav | 11 | 5433 | 8952 | **0.61x** | 2.0 | 1.2 |
-| jfk3.wav | 33 | 17488 | 24098 | **0.73x** | 1.9 | 1.4 |
-| 05_1089-134686-0004.wav | 5.2 | 2817 | 5693 | **0.49x** | 1.9 | 0.9 |
-| 09_1089-134686-0008.wav | 6.7 | 3664 | 7947 | **0.46x** | 1.8 | 0.8 |
-| 15_1089-134686-0014.wav | 2.2 | 1461 | 4317 | **0.34x** | 1.5 | 0.5 |
-| gb1.wav | 199 | 131609 | 35466 | 3.71x | 1.5 | 5.6 |
+<!-- GEN:asr Canary-Qwen 2.5B m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
-das **leads on every short/dictation clip (1.4–3x — the Canary-Qwen use case)**: NeMo carries a
-heavy fixed per-`generate` overhead that dominates a few-second clip (its xRT stays < 1 on the
-LibriSpeech clips). It **trails 3.7x on the 3-minute gb1** — the fp32 1.7B decoder is
+| file     | audio s | das ms | nemo ms |  das/nemo | das xRT |
+| :------- | ------: | -----: | ------: | --------: | ------: |
+| jfk.wav  |      11 |   5235 |    7918 | **0.66x** |     2.1 |
+| jfk3.wav |      33 |  16809 |   21722 | **0.77x** |     2.0 |
+| gb1.wav  |     199 | 128980 |   35319 |     3.65x |     1.5 |
+<!-- /GEN:asr Canary-Qwen 2.5B m1 -->
+
+Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
+das **leads on the short/dictation clips** (jfk/jfk3 ~0.7–0.8x — the Canary-Qwen use case): NeMo
+carries a heavy fixed per-`generate` overhead that dominates a few-second clip. It **trails 3.7x on
+the 3-minute gb1** — the fp32 1.7B decoder is
 bandwidth-bound prefilling gb1's ~2500 audio soft tokens (exactly the knob a q8 decoder would
 halve), where NeMo's batched-BLAS decode scales better. das xRT holds ~1.5–2.0 across the board.
 
-TSVs: das `results_cq_m1_t8.tsv`, nemo `results_cq_m1_nemo.tsv`.
+## Gemma-4 E2B audio — das vs llama-mtmd-cli (CPU-only)
 
-## Gemma-4 E2B audio — das vs llama-mtmd-cli
+das = gemma4a Conformer encoder **fp32** (correctness-first — encode is not the perf gate) + Gemma-4
+decoder q8 (matching mtmd). Reference = `llama-mtmd-cli --temp 0 --jinja --reasoning off` (no-think),
+**CPU-only** (Accelerate/AMX, Metal off). Transcribe excludes model load; both greedy, one 17.4 s clip.
 
-The gemma4a Conformer audio path benched vs the CLI oracle `llama-mtmd-cli` (`--temp 0 --jinja`,
-no-think turn — a bare user turn; the reasoning channel is near-tie-brittle, disabled both sides).
-das runs the encoder **fp32** (correctness-first; the mmproj is bf16 and the Conformer is a scalar
-fp32 forward — encode runs once per clip and is explicitly not the perf gate), the Gemma-4 decoder
-q8 (matching mtmd). Transcribe time excludes model load; both sides greedy, one 17.4 s clip.
+### Apple M1 Max, 8 threads
 
-### Apple M1 Max, 8 threads — das 2026-07-08 (Parsec off); mtmd-cli same box/build
+<!-- GEN:asr Gemma-4 E2B audio m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
-| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT | das encode ms | cli encode ms |
-|---|---|---|---|---|---|---|---|---|
-| gemma4a_test2.wav | 17.4 | 6028 | 1547 | 3.90x | 2.89 | 11.3 | 1888 | 117 |
+| file              | audio s | das ms | mtmd ms |  das/mtmd | das xRT |
+| :---------------- | ------: | -----: | ------: | --------: | ------: |
+| gemma4a_test2.wav |      17 |   5881 |   18687 | **0.31x** |     3.0 |
+<!-- /GEN:asr Gemma-4 E2B audio m1 -->
 
-das **trails 3.9x** — the gap is the fp32 **scalar** Conformer encoder (1888 ms vs mtmd's 117 ms
-= 16x; ggml runs the audio tower as bf16-weight SIMD GEMMs, das as a plain fp32 forward) plus a
-long-context decode gap (~495 audio+prompt positions: das 21.7 tok/s vs cli 78). Both are the
-obvious perf follow-ups (a gemm-gen tuned Q8 audio-tower kernel + the long-context decode path);
-neither is chased — the A2 gate is fp32 encoder correctness. Ledger note in `model_expansion_plan.md`.
+Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
+**das leads ~3x.** On a genuine CPU-only basis, ggml's Conformer audio ops don't route through
+BLAS/AMX, so mtmd's encode is ~16 s (≈99% of its total) — das's optimized fp32 scalar Conformer
+(~1.9 s) beats it ~9x on encode. The prior "das trails 3.9x" compared das-CPU against an mtmd whose
+audio encode was silently **Metal/GPU**-offloaded (mislabeled CPU-only) — a CPU-vs-GPU mismatch.
 
-TSVs: das `results_g4a_m1_t8.tsv`, cli `results_g4a_m1_mtmd.tsv`.
+### AMD Ryzen Threadripper 3990X, 16 threads
 
-## Qwen3-Omni-30B audio — das vs llama-mtmd-cli
+<!-- GEN:asr Gemma-4 E2B audio zen2 -->
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
-Qwen3-Omni-30B-A3B (audio-in/text-out; Talker out of scope) transcription benched vs the CLI oracle
-`llama-mtmd-cli` (`--temp 0 --jinja`, a bare user turn on the non-thinking Instruct thinker:
-"Transcribe the audio."). das runs the SHARED qwen3a AuT tower **fp32** (correctness-first; the
-mmproj is bf16, the tower a scalar fp32 forward — not the perf gate) + the qwen3vlmoe (30B-A3B)
-thinker q8 (matching mtmd). Transcribe time excludes model load; both sides greedy, transcribe-only
-timers (mtmd measured with an in-`main` `std::chrono` wrap of encode+prefill+generate).
+| file              | audio s | das ms | mtmd ms | das/mtmd | das xRT |
+| :---------------- | ------: | -----: | ------: | -------: | ------: |
+| gemma4a_test2.wav |      17 |   9069 |    8252 |    1.10x |     1.9 |
+<!-- /GEN:asr Gemma-4 E2B audio zen2 -->
 
-### Apple M1 Max, 8 threads — das 2026-07-08 (Parsec host daemon idle, no active session); mtmd-cli same box/build
+Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references).
 
-| file | audio s | das ms | cli ms | das/cli | das xRT | cli xRT | das encode ms | cli encode ms |
-|---|---|---|---|---|---|---|---|---|
-| jfk.wav | 11 | 3625 | 1173 | 3.09x | 3.03 | 9.4 | 1665 | 349 |
-| jfk3.wav | 33 | 8263 | 2079 | 3.97x | 3.99 | 15.9 | 4760 | 1191 |
+## Qwen3-Omni-30B audio — das vs llama-mtmd-cli (CPU-only)
 
-das **trails 3.1x (jfk) → 4.0x (jfk3)** — the gap is the fp32 **scalar** qwen3a AuT tower (d_model
-1280 × ff 5120, 32 blocks: 1665/4760 ms vs mtmd's bf16-SIMD 349/1191 ms = ~4.8x/4.0x). The output is
-a fixed ~27-token transcription both clips, so the gap widens with clip length as the linear-in-audio
-encode dominates. The thinker side is das's grouped q8 MoE prefill (~207 tok/s — the Wave-Q path,
-engaged for the audio-embd prefill) + q8 decode, and it too trails ggml here. Both are perf-ledger
-items (a gemm-gen tuned Q8 audio-tower kernel for the 1280/5120 dims + the MoE prefill/decode path);
-neither chased — the A3 gate is fp32 encoder correctness + token-for-token parity. Ledger note in
-`model_expansion_plan.md`.
+Audio-in/text-out (Talker out of scope). das = SHARED qwen3a AuT tower **fp32** (d_model 1280 × ff
+5120, 32 blocks — correctness-first, not the perf gate) + qwen3vlmoe (30B-A3B) thinker q8 (matching
+mtmd). Reference = `llama-mtmd-cli --temp 0 --jinja --reasoning off` (no-think), **CPU-only** (Metal
+off). Transcribe excludes model load; both greedy.
 
-TSVs: das `results_q3o_m1_t8.tsv`, cli `results_q3o_m1_mtmd.tsv`.
+### Apple M1 Max, 8 threads
+
+<!-- GEN:asr Qwen3-Omni-30B audio m1 -->
+_Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+
+| file     | audio s | das ms | mtmd ms |  das/mtmd | das xRT |
+| :------- | ------: | -----: | ------: | --------: | ------: |
+| jfk.wav  |      11 |   3686 |   21791 | **0.17x** |     3.0 |
+| jfk3.wav |      33 |   8012 |   45163 | **0.18x** |     4.1 |
+<!-- /GEN:asr Qwen3-Omni-30B audio m1 -->
+
+Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
+**das leads ~5x.** CPU-only, the AuT tower is entirely encode-bound in ggml (~21 s jfk / ~45 s jfk3,
+≈99% of mtmd's total); das's tower does it in ~1.7 / 4.8 s. Same CPU-vs-GPU correction as gemma4a —
+the prior "das trails 3-4x" measured mtmd's Metal-offloaded encode, mislabeled CPU-only.
+
+### AMD Ryzen Threadripper 3990X, 16 threads
+
+<!-- GEN:asr Qwen3-Omni-30B audio zen2 -->
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+
+| file     | audio s | das ms | mtmd ms |  das/mtmd | das xRT |
+| :------- | ------: | -----: | ------: | --------: | ------: |
+| jfk.wav  |      11 |   5773 |  318961 | **0.02x** |     1.9 |
+| jfk3.wav |      33 |  10171 |   11763 | **0.86x** |     3.2 |
+<!-- /GEN:asr Qwen3-Omni-30B audio zen2 -->
+
+Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references).
 
 ## Correctness
 
@@ -249,6 +299,21 @@ TSVs: das `results_q3o_m1_t8.tsv`, cli `results_q3o_m1_mtmd.tsv`.
 
 ## Changelog
 
+- 2026-07-08: M1 Class-2 (Canary, Gemma-4 E2B, Qwen3-Omni-30B) now GENERATED by the suite too — all
+  M1 model sections are suite-driven; only zen2 rows stay hand-authored. **Methodology correction:**
+  the mtmd (gemma4a/qwen3omni) reference is now genuine **CPU-only** (Accelerate/AMX, Metal off). The
+  prior "das trails 3–4x" was a CPU-vs-GPU mismatch — the fast mtmd numbers rode Metal (GPU), since
+  ggml's Conformer/AuT audio ops don't hit BLAS/AMX; on CPU-only the encode is 16–45 s and **das
+  leads 3–5x** (gemma4a 0.32x, q3o 0.17x/0.19x). Reference no-think via a fresh llama.cpp patch
+  (`harness/mtmd_bench.patch`: expose `--reasoning` to mtmd-cli + thread `enable_thinking`; run
+  `--reasoning off`), CPU-only build `llama.cpp-clean/build-amx`. Canary das now loads its encoder
+  (2-file); NeMo ref is CPU (torch, no MPS); das leads short (0.69x/0.81x), trails gb1 (3.74x).
+- 2026-07-08: the M1 Parakeet v2/v3, Whisper tiny/turbo, and LibriSpeech dictation tables are now
+  GENERATED by the profiling suite (`performance/gen_asr_profile.das` → `profile_asr_m1.json` →
+  `gen_results.das`, spliced between `<!-- GEN:asr … -->` markers; prose hand-maintained). All
+  references (parakeet-cli/whisper-cli + onnx) re-established fresh this round (Parsec off) into
+  `baseline_asr_m1.tsv` — within noise of the prior stored rows. Parakeet v2 gains onnx columns.
+  Class-2 (Canary/Gemma-4/Qwen3-Omni) + zen2 rows remain hand-authored pending their suite run.
 - 2026-07-08: NEW Qwen3-Omni-30B audio section (Wave A3) — das (fp32 SHARED qwen3a AuT tower + q8
   qwen3vlmoe MoE thinker) vs `llama-mtmd-cli`. FULL token-for-token (jfk + 2 LibriSpeech, incl.
   trailing `<|im_end|>`). das trails 3.1x→4.0x: fp32 scalar audio tower (~4.8x/4.0x on encode) + the
