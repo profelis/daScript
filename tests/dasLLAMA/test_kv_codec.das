@@ -119,6 +119,35 @@ def test_kv_layout_f16(t : T?) {
 }
 
 [test]
+def test_kv_runs_flat(t : T?) {
+    t |> run("flat sessions: every window is exactly one identity run; kv_phys_row is identity") @(t : T?) {
+        let c = mk_config(2l, 4l, 2l, 64l, 16l)
+        var s <- make_run_state(c)
+        t |> equal(1, length(s.kv_runs))   // make_run_state sizes the flat scratch to one entry
+        // whole-window, offset-window, single-row — all one run with row0 == j0
+        var nrun = kv_runs(s, 0l, 16l, s.kv_runs)
+        t |> equal(1l, nrun)
+        t |> equal(0l, s.kv_runs[0].j0)
+        t |> equal(16l, s.kv_runs[0].j1)
+        t |> equal(0l, s.kv_runs[0].row0)
+        nrun = kv_runs(s, 5l, 12l, s.kv_runs)   // sliding-window shape
+        t |> equal(1l, nrun)
+        t |> equal(5l, s.kv_runs[0].j0)
+        t |> equal(12l, s.kv_runs[0].j1)
+        t |> equal(5l, s.kv_runs[0].row0)       // flat: physical row == absolute position
+        nrun = kv_runs(s, 7l, 8l, s.kv_runs)    // one row
+        t |> equal(1l, nrun)
+        t |> equal(7l, s.kv_runs[0].row0)
+        t |> equal(0l, kv_runs(s, 9l, 9l, s.kv_runs))   // empty window: no runs
+        t |> equal(0l, kv_runs(s, 9l, 3l, s.kv_runs))   // inverted window: no runs
+        for (pos in range64(16l)) {
+            t |> equal(pos, kv_phys_row(s, pos))
+        }
+        delete s
+    }
+}
+
+[test]
 def test_kv_store_row_f16(t : T?) {
     t |> run("f16 kv_store_row: RNE convert on store, clamp to ±65504, exact read-back") @(t : T?) {
         let c = mk_config(3l, 4l, 2l, 16l, 4l)
