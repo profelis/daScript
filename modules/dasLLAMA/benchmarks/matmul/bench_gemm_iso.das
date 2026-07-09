@@ -12,17 +12,58 @@ require daslib/fio
 require math
 require strings
 
-// Isolated batched-GEMM throughput, ours (production matmul_q8q8_batch) on the REAL Llama matmul
+// Isolated batched-GEMM throughput, ours (production matmul_q8q8_batch) on REAL model matmul
 // shapes at the prefill batch width (ntok = 512), THREADED, reported as GMAC/s aggregate AND per
-// core. This is the apples-to-apples number against llama.cpp's NEON Q8 MUL_MAT (~207 GMAC/s/core,
-// ~1.66 TMAC/s across 8 Firestorm cores). Sweep DAS_JOBQUE_THREADS=1,2,4,6,8,9 to read the
-// parallel_for scaling curve: per-core GMAC/s at 1 thread is the raw kernel ceiling; how far the
-// aggregate climbs as threads grow tells us whether parallel_for or the kernel is the wall.
+// core. This is the das half of the pure-GEMM ladder (harness/pure_gemm_ladder.sh) — the lcpp
+// half is `test-backend-ops perf -o MUL_MAT` with the same shapes (harness/backend_ops_shapes.patch);
+// lcpp reports GFLOPS = 2·GMAC/s. Sweep DAS_JOBQUE_THREADS=1,2,4,… to read the parallel_for
+// scaling curve: per-core GMAC/s at 1 thread is the raw kernel ceiling; how far the aggregate
+// climbs as threads grow tells us whether parallel_for or the kernel is the wall.
 //
 //   bin/daslang -jit dastest/dastest.das -- --bench --test modules/dasLLAMA/benchmarks/matmul/bench_gemm_iso.das
-//   DAS_JOBQUE_THREADS=1 bin/daslang -jit dastest/dastest.das -- --bench --test .../bench_gemm_iso.das
+//   DASLLAMA_BENCH_MODEL=llama8b DAS_JOBQUE_THREADS=8 bin/daslang -jit dastest/dastest.das -- --bench --test .../bench_gemm_iso.das
+//
+// DASLLAMA_BENCH_MODEL: tinyllama (default) | smol135m | qwen06b | gemma1b | llama1b | qwen4b | llama8b
+// DASLLAMA_BENCH_NTOK: batch width override (default 512; 32 = one amx token block)
 
-let NTOK = 512l
+var NTOK = 512l
+
+// Fleet GEMM geometries (from GGUF metadata, 2026-07-09), (name, n, d) triples: n = reduction
+// (input dim), d = output rows. kv (dim→kv_dim), q (dim→qd), wo (qd→dim), w13 (dim→ffn),
+// w2 (ffn→dim), cls (dim→vocab). tinyllama keeps the original row set for comparability.
+def private shapes_for(tag : string) : array<tuple<string; int64; int64>> {
+    if (tag == "smol135m") {
+        return <- [("kv ", 576l, 192l), ("q  ", 576l, 576l), ("w13", 576l, 1536l),
+                   ("w2 ", 1536l, 576l), ("cls", 576l, 49152l)]
+    }
+    if (tag == "qwen06b") {
+        return <- [("kv ", 1024l, 1024l), ("q  ", 1024l, 2048l), ("wo ", 2048l, 1024l),
+                   ("w13", 1024l, 3072l), ("w2 ", 3072l, 1024l), ("cls", 1024l, 151936l)]
+    }
+    if (tag == "gemma1b") {
+        return <- [("kv ", 1152l, 256l), ("q  ", 1152l, 1024l), ("wo ", 1024l, 1152l),
+                   ("w13", 1152l, 6912l), ("w2 ", 6912l, 1152l), ("cls", 1152l, 262144l)]
+    }
+    if (tag == "llama1b") {
+        return <- [("kv ", 2048l, 512l), ("q  ", 2048l, 2048l), ("w13", 2048l, 8192l),
+                   ("w2 ", 8192l, 2048l), ("cls", 2048l, 128256l)]
+    }
+    if (tag == "qwen4b") {
+        return <- [("kv ", 2560l, 1024l), ("q  ", 2560l, 4096l), ("wo ", 4096l, 2560l),
+                   ("w13", 2560l, 9728l), ("w2 ", 9728l, 2560l), ("cls", 2560l, 151936l)]
+    }
+    if (tag == "llama8b") {
+        return <- [("kv ", 4096l, 1024l), ("q  ", 4096l, 4096l), ("w13", 4096l, 14336l),
+                   ("w2 ", 14336l, 4096l), ("cls", 4096l, 128256l)]
+    }
+    // tinyllama — the original set
+    return <- [("kv ", 2048l, 512l), ("qo ", 2048l, 2048l), ("w13", 2048l, 5632l),
+               ("w2 ", 5632l, 2048l), ("cls", 2048l, 32000l)]
+}
+
+// reps from a fixed MAC budget so every shape runs comparably long; floor 3 (best-of needs
+// signal), cap 200 (tiny shapes would spin forever)
+def private reps_for(n, d : int64) : int => clamp(int(100000000000l / (n * d * NTOK)), 3, 200)
 
 def fillf(var a : array<float>; cnt : int64) {
     a |> resize(cnt)
@@ -137,21 +178,23 @@ def bench_gemm_iso(b : B?) {
         if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
             pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
         }
+        if (has_env_variable("DASLLAMA_BENCH_NTOK")) {
+            NTOK = int64(to_int(get_env_variable("DASLLAMA_BENCH_NTOK")))
+        }
+        let model = has_env_variable("DASLLAMA_BENCH_MODEL") ? get_env_variable("DASLLAMA_BENCH_MODEL") : "tinyllama"
+        var shapes <- shapes_for(model)
+        to_log(LOG_INFO, "model={model} ntok={NTOK}\n")
         to_log(LOG_INFO, "=== {active_kernel_backend()} backend (row-major) ===\n")
-        bench_one("kv  2048x512  ", 2048l, 512l, 100, false)
-        bench_one("qo  2048x2048 ", 2048l, 2048l, 30, false)
-        bench_one("w13 2048x5632 ", 2048l, 5632l, 20, false)
-        bench_one("w2  5632x2048 ", 5632l, 2048l, 20, false)
-        bench_one("cls 2048x32000", 2048l, 32000l, 6, false)
+        for (s in shapes) {
+            bench_one("{s._0} {model} {s._1}x{s._2}", s._1, s._2, reps_for(s._1, s._2), false)
+        }
 
         // switch to the arch's repack tier for the rest of the run; each shape repacks its own weight
         let repack_backend = get_architecture_name() == "arm64" ? "arm64-gen" : "x64-gen"
         select_kernel_backend(repack_backend)
         to_log(LOG_INFO, "=== {repack_backend} backend (tiled, interleaved repack) ===\n")
-        bench_one("kv  2048x512  ", 2048l, 512l, 100, true)
-        bench_one("qo  2048x2048 ", 2048l, 2048l, 30, true)
-        bench_one("w13 2048x5632 ", 2048l, 5632l, 20, true)
-        bench_one("w2  5632x2048 ", 5632l, 2048l, 20, true)
-        bench_one("cls 2048x32000", 2048l, 32000l, 6, true)
+        for (s in shapes) {
+            bench_one("{s._0} {model} {s._1}x{s._2}", s._1, s._2, reps_for(s._1, s._2), true)
+        }
     }
 }

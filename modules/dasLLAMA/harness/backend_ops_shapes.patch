@@ -1,0 +1,48 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 15b5020..138a8e2 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -48,7 +48,9 @@
+ #ifdef __EMSCRIPTEN__
+ #   define N_THREADS 1
+ #else
+-#   define N_THREADS std::thread::hardware_concurrency()
++// GGML_BENCH_THREADS pins the backend thread count (dasLLAMA pure-GEMM ladder: thread parity
++// with the das side's DAS_JOBQUE_THREADS); default = all hardware threads as before
++#   define N_THREADS (getenv("GGML_BENCH_THREADS") ? (size_t) atoi(getenv("GGML_BENCH_THREADS")) : std::thread::hardware_concurrency())
+ #endif
+ 
+ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+@@ -9432,6 +9434,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // dasLLAMA pure-GEMM ladder: fleet geometries matching the daScript tree's
++    // benchmarks/matmul/bench_gemm_iso.das — rows are (m = output dim, k = reduction dim) per
++    // model, Q8_0 weights x F32 activations, bs = token batch (32 = one AMX token block,
++    // 512 = prefill width). GGML_BENCH_THREADS pins the CPU backend thread count.
++    for (int bs : {32, 512}) {
++        const std::array<int, 2> ladder_shapes[] = {
++            // {m, k}          // smol135m: kv q w13 w2 cls
++            {192, 576}, {576, 576}, {1536, 576}, {576, 1536}, {49152, 576},
++            // qwen06b: kv q wo w13 w2 cls
++            {1024, 1024}, {2048, 1024}, {1024, 2048}, {3072, 1024}, {1024, 3072}, {151936, 1024},
++            // gemma1b: kv q wo w13 w2 cls
++            {256, 1152}, {1024, 1152}, {1152, 1024}, {6912, 1152}, {1152, 6912}, {262144, 1152},
++            // llama1b: kv q w13 w2 cls
++            {512, 2048}, {2048, 2048}, {8192, 2048}, {2048, 8192}, {128256, 2048},
++            // qwen4b: kv q wo w13 w2 cls
++            {1024, 2560}, {4096, 2560}, {2560, 4096}, {9728, 2560}, {2560, 9728}, {151936, 2560},
++            // llama8b: kv q w13 w2 cls
++            {1024, 4096}, {4096, 4096}, {14336, 4096}, {4096, 14336}, {128256, 4096},
++            // tinyllama: w13 w2 cls (kv/q shared with llama1b)
++            {5632, 2048}, {2048, 5632}, {32000, 2048},
++        };
++        for (const auto & s : ladder_shapes) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, s[0], bs, s[1], {1, 1}, {1, 1}));
++        }
++    }
++
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
