@@ -22,6 +22,11 @@ def over(a : int; count : int) : string { return "{a}:I:{count}" }
 // generic first argument + a named argument
 def gen_named(a; hint : string) : string { return "{a}:{hint}" }
 
+// a named call INSIDE a generic body: the body is cloned (clone_function) on instantiation,
+// before the named call demotes - the clone must carry the positional in nonNamedArguments,
+// else 'g' is dropped and matching fails "can't skip hint" (regression for ExprNamedCall::clone)
+def in_generic(g) : string { return three(g, hint = "gen") }
+
 // mutable-ref param: lets clone (:=) be observed vs by-ref (= / <-).
 // _tag is a leading positional so the array can be bound as a named arg.
 def drain(_tag : int; var a : array<int>) { a |> clear() }
@@ -147,4 +152,10 @@ def test_class_method_bare(t : T?) {
     // implicit-self member call with a middle positional + named arg
     t |> equal(g.repaint("hi"), "G3:hi:5")
     unsafe { delete g }
+}
+
+[test]
+def test_named_call_in_generic(t : T?) {
+    // the named call lives in a generic body; its positional must survive the clone
+    t |> equal(in_generic(1), "1/gen/7")
 }

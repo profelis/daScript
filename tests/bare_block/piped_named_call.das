@@ -27,6 +27,15 @@ def two(tag : int; a : int = 0; b : int = 0; body : block<() : int>) : int {
     return tag + a + b + invoke(body)
 }
 
+// a piped named call INSIDE a generic body: the body is cloned (clone_function) on
+// instantiation, before it demotes - the clone must carry nonNamedArguments (the positional
+// and the piped block, which lands last), else they are lost (ExprNamedCall::clone regression)
+def in_generic(g) : int {
+    return sec(g, opt = 3) {
+        return 1
+    }
+}
+
 // overload set - least padding wins (the 3-arg one, block closer)
 def ov(a : int; x : int = 0; body : block<() : int>) : int { return 100 + a + x + invoke(body) }
 def ov(a : int; x : int = 0; y : int = 0; body : block<() : int>) : int { return 200 + a + x + y + invoke(body) }
@@ -166,4 +175,10 @@ def test_struct_method_padding(t : T?) {
     }
     t |> equal(r, 16)
     unsafe { delete b }
+}
+
+[test]
+def test_piped_named_in_generic(t : T?) {
+    // the piped named call lives in a generic body; the positional and block must survive the clone
+    t |> equal(in_generic(5), 9)
 }
