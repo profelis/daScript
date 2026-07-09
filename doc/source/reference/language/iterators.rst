@@ -174,7 +174,7 @@ A semantic equivalent of the for loop can be explicitly written using these oper
     var i : int
     var pi : void?
     unsafe {
-        pi = reinterpret<void?> ( addr(i) )
+        pi = reinterpret<void?>( addr(i) )
     }
     if ( _builtin_iterator_first(it,pi) ) {
         print("i = {i}\n")
@@ -195,7 +195,7 @@ Once the iterator is sequenced out, it calls ``close``:
     var i : int
     var pi : void?
     unsafe {
-        pi = reinterpret<void?> ( addr(i) )
+        pi = reinterpret<void?>( addr(i) )
     }
     while ( _builtin_iterator_iterate(it,pi) ) {     // this is equivalent to the example above
         print("i = {i}\n")

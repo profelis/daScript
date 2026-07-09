@@ -137,7 +137,7 @@ A lambda function is generated:
         __this._loop_at_8 = true
         __this._source_0_at_8 <- __::builtin`each(range(0,10))
         memzero(__this.x)
-        __this._pvar_0_at_8 = reinterpret<void?> addr(__this.x)
+        __this._pvar_0_at_8 = reinterpret<void?>(addr(__this.x))
         __this._loop_at_8 &&= _builtin_iterator_first(__this._source_0_at_8,__this._pvar_0_at_8,__context__)
         label 3: /*begin for at line 8*/
         if ( !__this._loop_at_8 ) {

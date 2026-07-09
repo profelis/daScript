@@ -315,14 +315,14 @@ The required ``is`` and ``as`` operators:
     def operator as CmdMove ( cmd:Cmd ==const ) : CmdMove const& {
         assert(cmd.rtti=="CmdMove")
         unsafe {
-            return reinterpret<CmdMove const&> cmd
+            return reinterpret<CmdMove const&>(cmd)
         }
     }
 
     def operator as CmdMove ( var cmd:Cmd ==const ) : CmdMove& {
         assert(cmd.rtti=="CmdMove")
         unsafe {
-            return reinterpret<CmdMove&> cmd
+            return reinterpret<CmdMove&>(cmd)
         }
     }
 
@@ -372,7 +372,7 @@ The ``match_copy`` function attempts to copy the source into the target type, re
             return false
         }
         unsafe {
-            cmdm = reinterpret<CmdLocate const&> cmd
+            cmdm = reinterpret<CmdLocate const&>(cmd)
         }
         return true
     }

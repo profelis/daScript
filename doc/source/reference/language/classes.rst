@@ -225,7 +225,7 @@ When an ancestor has a user-defined finalizer, a derived class finalizer must ca
 * zero ``delete super.self`` calls on any reachable path → error;
 * two or more calls on any path → error;
 * a call inside a loop body → error (call count is not bounded to one);
-* a hand-written ``delete cast<Ancestor> self`` that skips the immediate parent does
+* a hand-written ``delete cast<Ancestor>(self)`` that skips the immediate parent does
   NOT count — it would bypass the parent's field-slice cleanup.
 
 A derived class with *no* finalizer of its own inherits finalization automatically:
@@ -721,7 +721,7 @@ Calling virtual methods is implemented via invoke:
 
 .. code-block:: das
 
-    invoke(f3d.set,cast<Foo> f3d,1,2)
+    invoke(f3d.set,cast<Foo>(f3d),1,2)
 
 Every base class gets an ``__rtti`` pointer, and a ``__finalize`` function pointer.
 Additionally, a function pointer is added for each member function:

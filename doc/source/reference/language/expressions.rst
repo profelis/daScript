@@ -404,7 +404,7 @@ Cast, Upcast, and Reinterpret
 .. code-block:: das
 
     var derived : Derived = Derived()
-    var base : Base = cast<Base> derived
+    var base : Base = cast<Base>(derived)
 
 **upcast** performs an unsafe upcast from a base type to a derived type.
 This requires ``unsafe`` because the actual runtime type may not match:
@@ -412,7 +412,7 @@ This requires ``unsafe`` because the actual runtime type may not match:
 .. code-block:: das
 
     unsafe {
-        var d = upcast<Derived> base_ref
+        var d = upcast<Derived>(base_ref)
     }
 
 **reinterpret** reinterprets the raw bits of a value as a different type.
@@ -421,7 +421,7 @@ This is unsafe and should be used with extreme caution:
 .. code-block:: das
 
     unsafe {
-        let p = reinterpret<void?> 13
+        let p = reinterpret<void?>(13)
     }
 
 ^^^^^^^^^^^^^^^^^^^

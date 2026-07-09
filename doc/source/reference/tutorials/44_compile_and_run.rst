@@ -155,7 +155,7 @@ immediately before the context goes out of scope:
     // Read back the global variable "result"
     let ptr = unsafe(get_context_global_variable(context, "result"))
     if (ptr != null) {
-        let value = *unsafe(reinterpret<int?> ptr)
+        let value = *unsafe(reinterpret<int?>(ptr))
         print("result = {value}\n")
     }
     // output:

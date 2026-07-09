@@ -107,7 +107,7 @@ When you discover something new about daslang syntax, semantics, or conventions 
 
 ## daslang Language — Gen2 Syntax (REQUIRED)
 
-All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key rules:
+**gen2 is the DEFAULT parser** — every `.das` file parses as gen2 unless it explicitly opts out with `options gen2 = false` (the only gen1 discriminator; the `options gen2` markers around the tree are historical no-ops — NEVER infer gen1 from their absence). All code MUST use gen2 syntax; house style still adds `options gen2` at the top of new files. Key rules:
 
 - **Parentheses** on control flow: `if (x > 0)`, `for (i in range(10))`, `while (running)`
 - **Braces** on all blocks: `def foo() { ... }`, `if (x) { ... }`
@@ -300,7 +300,7 @@ A generic that should accept `array<T>`, `array<array<T>>`, … (any nesting) �
 | 6 qmacro arms differing only in the call target (`if isTry { qmacro(_::try_run_select(…)) } elif … { … }`) | `let fname = (isTry ? "try_run_select" : "run_select") + suffix; qmacro($c(fname)(…))` | `$c(stringVar)` splices a function name; resolution at splice site uses user's `require` chain. Note: `_::$c(…)` is a parse error — drop `_::` |
 | `if (true) { ... }` | `{ ... }` | bare blocks create lexical scope in gen2 |
 | `var inscope r <- expr; return <- r` | `return <- expr` | direct return avoids intermediate |
-| `unsafe { (reinterpret<ExprBlock?> blk).list }` / `unsafe(reinterpret<T?> x)` | make param `var` + plain `x.list` | `var` param gives non-const field access without reinterpret |
+| `unsafe { (reinterpret<ExprBlock?>(blk)).list }` / `unsafe(reinterpret<T?>(x))` | make param `var` + plain `x.list` | `var` param gives non-const field access without reinterpret |
 | `if (cond) { return X }` (or `{ break }` / `{ continue }`) | `if (cond) return X` or postfix `return X if (cond)` | STYLE005: braces around a single-statement early-exit are noise |
 | `for (i in range(length(arr))) { ... arr[i] ... }` where `i` is used only as `arr[i]` | `for (c in arr) { ... c ... }` | PERF018: direct iteration drops the index variable |
 | `from_JV(v, type<int>, 13)` | `v ?? 13` | STYLE020: json_boost provides `operator ??` for every scalar `from_JV` overload |

@@ -105,7 +105,7 @@ The ``ecs_macro`` module provides the ``[es]`` function annotation:
            var blk <- setup_call_list("register`es`{funcName}", ...)
            blk.list |> emplace_new <| qmacro(
                ecs_register(
-                   unsafe(reinterpret<void?> @@$c(funcName)),
+                   unsafe(reinterpret<void?>(@@$c(funcName))),
                    $v(funcName),
                    typeinfo rtti_typeinfo(type<$t(stType)>)))
            return true

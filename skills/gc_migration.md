@@ -157,7 +157,7 @@ When `TPtr` and `T?` become the same type, overload pairs become ambiguous:
 ```das
 // REMOVE this trampoline — TypeDecl? IS TypeDeclPtr now
 def foo(td : TypeDecl?) {
-    unsafe { return foo(reinterpret<TypeDeclPtr> td) }
+    unsafe { return foo(reinterpret<TypeDeclPtr>(td)) }
 }
 // KEEP the real implementation  
 def foo(td : TypeDeclPtr) { ... }
@@ -189,7 +189,7 @@ TypeDecl's `enumType` field changed from `Enumeration*` (already raw) to... it's
 |---|---|
 | `decl.annotation := unsafe(reinterpret<smart_ptr<Annotation>> ann)` | `unsafe { decl.annotation = reinterpret<Annotation?>(ann); }` |
 | `decl.annotation := reinterpret<smart_ptr<Annotation>> ann` | `decl.annotation = reinterpret<Annotation?>(ann)` |
-| `var ann <- unsafe(reinterpret<smart_ptr<TypeAnnotation>> ptr)` | `var ann = unsafe(reinterpret<TypeAnnotation?> ptr)` |
+| `var ann <- unsafe(reinterpret<smart_ptr<TypeAnnotation>> ptr)` | `var ann = unsafe(reinterpret<TypeAnnotation?>(ptr))` |
 | `typedef FunctionAnnotationPtr = smart_ptr<FunctionAnnotation>` | `typedef FunctionAnnotationPtr = FunctionAnnotation?` |
 | `typedef AnnotationDeclarationPtr = smart_ptr<AnnotationDeclaration>` | `typedef AnnotationDeclarationPtr = AnnotationDeclaration?` |
 | `foo : smart_ptr<Annotation>` (parameter) | `foo : Annotation?` |
