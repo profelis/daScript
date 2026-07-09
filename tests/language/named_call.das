@@ -129,6 +129,15 @@ def test_method_bare(t : T?) {
 }
 
 [test]
+def test_method_arrow(t : T?) {
+    // the '->' arrow method-call form parses to the same ExprNamedCall as '.'
+    let w = Widget(id = 7)
+    t |> equal(w->render("hdr", depth = 2), "W7:hdr:2")
+    // all-named bracketed '->' form (rule mirrors the '.' bracketed rule 'm([name=v])')
+    t |> equal(w->render([title = "brk", depth = 3]), "W7:brk:3")
+}
+
+[test]
 def test_all_named(t : T?) {
     // pure all-named (no positional at all) resolves as a function call
     t |> equal(three(a = 1, hint = "an"), "1/an/7")
@@ -151,6 +160,14 @@ def test_class_method_bare(t : T?) {
     t |> equal(g.paint("hdr", depth = 2), "G3:hdr:2")
     // implicit-self member call with a middle positional + named arg
     t |> equal(g.repaint("hi"), "G3:hi:5")
+    unsafe { delete g }
+}
+
+[test]
+def test_class_method_arrow(t : T?) {
+    var g = new Gadget(id = 3)
+    // '->' on a genuine class method: middle positional after self + named depth
+    t |> equal(g->paint("hdr", depth = 2), "G3:hdr:2")
     unsafe { delete g }
 }
 
