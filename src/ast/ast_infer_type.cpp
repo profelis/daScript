@@ -3743,6 +3743,12 @@ namespace das {
         if (!TypeDecl::buildSwizzleMask(expr->mask, dim, expr->fields)) {
             error("invalid swizzle mask " + expr->mask, "", "",
                   expr->at, CompilationError::invalid_swizzle_mask);
+        } else if (int rdim = int(expr->fields.size());
+                   valT->isRange() ? (rdim > 2) : !TypeDecl::hasVectorType(valT->getVectorBaseType(), rdim)) {
+            // e.g. .s01230123 on a float4 — 8 lanes, but the float family has no 8-wide vector
+            error("swizzle ." + expr->mask + " yields " + to_string(rdim)
+                    + " lane(s) — no such vector of '" + das_to_string(valT->getVectorBaseType()) + "'", "", "",
+                  expr->at, CompilationError::invalid_swizzle_mask);
         } else {
             auto bt = valT->getVectorBaseType();
             auto rt = valT->isRange() ? TypeDecl::getRangeType(bt, int(expr->fields.size())) : TypeDecl::getVectorType(bt, int(expr->fields.size()));

@@ -7830,6 +7830,9 @@ class public DisableJitVisitor : AstVisitor {
     def override preVisitExprLetVariable(expr : ExprLet?; arg : VariablePtr; lastArg : bool) : void {
         lattice_fallback(arg._type, arg.at)
     }
+    def override preVisitExprSwizzle(expr : ExprSwizzle?) : void {
+        lattice_fallback(expr.value._type, expr.at)
+    }
     def override preVisitFunction(fun : FunctionPtr) : void {
         // signature-level gate: the interp<->jit wrappers marshal args/results through
         // vec4f slots, and that marshaling is not lattice-aware yet (a vec4f <-> <4 x half>

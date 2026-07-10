@@ -657,6 +657,35 @@ namespace das {
         DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override;
     };
 
+    // 16/8-bit lattice lane shuffle — up to maxLanes indices over byte-packed lanes.
+    // A 1-lane result lands in the low bytes, which is exactly the widened-lane-0 scalar
+    // convention little-endian consumers truncate from.
+    template <typename TT, int maxLanes>
+    struct SimNode_SwizzleSmall : SimNode {
+        SimNode_SwizzleSmall ( const LineInfo & at, SimNode * rv, const uint8_t * fi, uint8_t cnt )
+            : SimNode(at), value(rv), count(cnt) {
+            for ( int i = 0; i != maxLanes; ++i ) fields[i] = i < cnt ? fi[i] : 0;
+        }
+        virtual SimNode * visit ( SimVisitor & vis ) override {
+            V_BEGIN();
+            V_OP_TT(SwizzleSmall);
+            V_SUB(value);
+            V_END();
+        }
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+            DAS_PROFILE_NODE
+            auto vec = value->eval(context);
+            vec4f r = v_zero();
+            const TT * s = (const TT *) &vec;
+            TT * d = (TT *) &r;
+            for ( int i = 0; i != count; ++i ) d[i] = s[fields[i]];
+            return r;
+        }
+        SimNode *   value;
+        uint8_t     fields[maxLanes];
+        uint8_t     count;
+    };
+
     // FIELD .
     struct SimNode_FieldDeref : SimNode {
         DAS_PTR_NODE;

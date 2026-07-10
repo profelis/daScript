@@ -2025,6 +2025,29 @@ namespace das
 
     bool TypeDecl::buildSwizzleMask ( const string & mask, int dim, vector<uint8_t> & fields ) {
         fields.clear();
+        // OpenCL-style `.s` namespace: `s` followed by hex lane digits (s0..s9, sa..sf),
+        // one lane per digit, repeats allowed. Never mixes with xyzw/rgba (the `s` prefix
+        // consumes the whole mask). `.lo`/`.hi` are the canonical half-swizzles of the
+        // 8/16-lane forms.
+        if ( mask.size()>=2 && (mask[0]=='s' || mask[0]=='S') ) {
+            for ( size_t i=1; i!=mask.size(); ++i ) {
+                char ch = mask[i];
+                int field;
+                if ( ch>='0' && ch<='9' ) field = ch - '0';
+                else if ( ch>='a' && ch<='f' ) field = ch - 'a' + 10;
+                else if ( ch>='A' && ch<='F' ) field = ch - 'A' + 10;
+                else return false;
+                if ( field>=dim ) return false;
+                fields.push_back(uint8_t(field));
+            }
+            return fields.size()>=1 && fields.size()<=16;
+        } else if ( (mask=="lo" || mask=="hi") && (dim==8 || dim==16) ) {
+            int base = mask=="lo" ? 0 : dim / 2;
+            for ( int i=0; i!=dim/2; ++i ) {
+                fields.push_back(uint8_t(base + i));
+            }
+            return true;
+        }
         for ( auto ch : mask ) {
             int field = getMaskFieldIndex(ch);
             if ( field==-1 || field>=dim ) {
@@ -2253,6 +2276,21 @@ namespace das
             DAS_ASSERTF(0, "we should not be here. we are calling getVectorType on an unsuppored baseType."
                    "likely new vector type been added.");
             return Type::none;
+        }
+    }
+
+    bool TypeDecl::hasVectorType ( Type bt, int dim ) {
+        if ( dim==1 ) return true;
+        switch ( bt ) {
+            case Type::tFloat:
+            case Type::tInt:
+            case Type::tUInt:       return dim>=2 && dim<=4;
+            case Type::tFloat16:
+            case Type::tInt16:
+            case Type::tUInt16:     return dim==2 || dim==3 || dim==4 || dim==8;
+            case Type::tInt8:
+            case Type::tUInt8:      return dim==2 || dim==3 || dim==4 || dim==8 || dim==16;
+            default:                return false;
         }
     }
 

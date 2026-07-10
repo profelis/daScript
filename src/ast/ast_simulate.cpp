@@ -2309,18 +2309,29 @@ namespace das
             if (seq && expr->value->type->ref) {
                 setE(expr, sv_trySimulate(expr, 0, expr->type));
             } else {
-                auto fsz = expr->fields.size();
-                uint8_t fs[4];
-                fs[0] = expr->fields[0];
-                fs[1] = fsz >= 2 ? expr->fields[1] : expr->fields[0];
-                fs[2] = fsz >= 3 ? expr->fields[2] : expr->fields[0];
-                fs[3] = fsz >= 4 ? expr->fields[3] : expr->fields[0];
-                auto simV = getE(expr->value);
-                if ( expr->type->baseType==Type::tInt64 || expr->type->baseType==Type::tUInt64
-                    || expr->type->baseType==Type::tRange64 || expr->type->baseType==Type::tURange64 ) {
-                    setE(expr, context.code->makeNode<SimNode_Swizzle64>(at, simV, fs));
+                auto srcBT = expr->value->type->getVectorBaseType();
+                if ( srcBT==Type::tFloat16 || srcBT==Type::tInt16 || srcBT==Type::tUInt16 ) {
+                    auto simV = getE(expr->value);
+                    setE(expr, context.code->makeNode<SimNode_SwizzleSmall<uint16_t,8>>(at, simV,
+                        expr->fields.data(), uint8_t(expr->fields.size())));
+                } else if ( srcBT==Type::tInt8 || srcBT==Type::tUInt8 ) {
+                    auto simV = getE(expr->value);
+                    setE(expr, context.code->makeNode<SimNode_SwizzleSmall<uint8_t,16>>(at, simV,
+                        expr->fields.data(), uint8_t(expr->fields.size())));
                 } else {
-                    setE(expr, context.code->makeNode<SimNode_Swizzle>(at, simV, fs));
+                    auto fsz = expr->fields.size();
+                    uint8_t fs[4];
+                    fs[0] = expr->fields[0];
+                    fs[1] = fsz >= 2 ? expr->fields[1] : expr->fields[0];
+                    fs[2] = fsz >= 3 ? expr->fields[2] : expr->fields[0];
+                    fs[3] = fsz >= 4 ? expr->fields[3] : expr->fields[0];
+                    auto simV = getE(expr->value);
+                    if ( expr->type->baseType==Type::tInt64 || expr->type->baseType==Type::tUInt64
+                        || expr->type->baseType==Type::tRange64 || expr->type->baseType==Type::tURange64 ) {
+                        setE(expr, context.code->makeNode<SimNode_Swizzle64>(at, simV, fs));
+                    } else {
+                        setE(expr, context.code->makeNode<SimNode_Swizzle>(at, simV, fs));
+                    }
                 }
             }
         } else {
