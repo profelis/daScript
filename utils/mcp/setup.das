@@ -271,8 +271,10 @@ def main() : int {
         return 1
     }
 
-    ensure_sgconfig(root)
+    // grammar first: its build target's POST_BUILD step stamps sgconfig.yml from the platform
+    // template, so ensure_sgconfig must report AFTER any such stamp to describe the final state
     ensure_grammar(root)
+    ensure_sgconfig(root)
     stage_jit_backend(root)
     if (!emit_mcp_config(root)) {
         return 1
