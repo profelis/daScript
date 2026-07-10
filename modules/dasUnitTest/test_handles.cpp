@@ -438,6 +438,8 @@ struct BigEntityIdAnnotation final: das::ManagedValueAnnotation <BigEntityId> {
 
 MAKE_TYPE_FACTORY(EntityId,EntityId);
 
+MAKE_DISTINCT_TYPE_FACTORY(NativeId,NativeId);
+
 struct EntityIdAnnotation final: das::ManagedValueAnnotation <EntityId> {
     EntityIdAnnotation(ModuleLibrary & mlib) : ManagedValueAnnotation  (mlib,"EntityId","EntityId") {}
     virtual void walk ( das::DataWalker & walker, void * data ) override {
@@ -686,6 +688,10 @@ Module_UnitTest::Module_UnitTest() : Module("UnitTest") {
         SideEffects::none, "eidToInt");
     addExtern<DAS_BIND_FUN(intToEid)>(*this, lib, "EntityId",
         SideEffects::none, "intToEid");
+    // NativeId - C++-registered distinct type (`distinct NativeId = int` from C++)
+    addAnnotation(new DistinctTypeAnnotation("NativeId", makeType<int32_t>(lib), "NativeId"));
+    addExtern<DAS_BIND_FUN(nativeIdNext)>(*this, lib, "native_id_next",
+        SideEffects::none, "nativeIdNext");
     // FancyClass
     addAnnotation(new FancyClassAnnotation(lib));
     addCtorAndUsing<FancyClass>(*this,lib,"FancyClass","FancyClass");

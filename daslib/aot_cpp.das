@@ -365,6 +365,17 @@ def describeCppTypeEx(typeDecl : TypeDeclPtr;
         } elif (baseType == Type.tHandle) {
             let handle_name = string(typeDecl.annotation.cppName.empty() ? typeDecl.annotation.name : typeDecl.annotation.cppName)
             write(writer, "{handle_name}")
+        } elif (baseType == Type.tDistinct) {
+            // ABI-identical to the underlying type; a C++-registered distinct may carry its own cppName
+            let dname = typeDecl.annotation != null ? string(typeDecl.annotation.name) : "?"
+            if (typeDecl.annotation != null && !typeDecl.annotation.cppName.empty()) {
+                write(writer, "DAS_COMMENT(distinct {dname}) {typeDecl.annotation.cppName}")
+            } elif (typeDecl.firstType != null) {
+                let under = describeCppTypeEx(typeDecl.firstType, DescribeConfig(skip_const = true, cross_platform = cfg.cross_platform), useAlias)
+                write(writer, "DAS_COMMENT(distinct {dname}) {under}")
+            } else {
+                write(writer, "DAS_COMMENT(unspecified distinct)")
+            }
         } elif (baseType == Type.tArray) {
             if (typeDecl.firstType != null) {
                 let cpp_typeDecl = describeCppTypeEx(typeDecl.firstType, DescribeConfig(cross_platform = cfg.cross_platform), useAlias);
@@ -2994,15 +3005,23 @@ class public CppAot : AstVisitor {
         return tc;
     }
 // ptr2ref
+    def isDistinctDeref(ptr2ref : ExprPtr2Ref?) {
+        // deref of a distinct value is a compile-time relabel, not a pointer deref
+        return ptr2ref.subexpr._type != null && ptr2ref.subexpr._type.baseType == Type.tDistinct
+    }
     def override preVisitExprPtr2Ref(ptr2ref : ExprPtr2Ref?) {
-        if (ptr2ref.unsafeDeref) {
+        if (isDistinctDeref(ptr2ref)) {
+            write(*ss, "(");
+        } elif (ptr2ref.unsafeDeref) {
             write(*ss, "(*(");
         } else {
             write(*ss, "das_deref(__context__,");
         }
     }
     def override visitExprPtr2Ref(var ptr2ref : ExprPtr2Ref?) : ExpressionPtr {
-        if (ptr2ref.unsafeDeref) {
+        if (isDistinctDeref(ptr2ref)) {
+            write(*ss, ")");
+        } elif (ptr2ref.unsafeDeref) {
             write(*ss, "))");
         } else {
             write(*ss, ",__FILE__,__LINE__)");

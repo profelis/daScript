@@ -2,6 +2,7 @@
 
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_visitor.h"
+#include "daScript/ast/ast_handle.h"
 #include "daScript/misc/das_common.h"
 #include "daScript/daScriptModule.h"
 #include "daScript/misc/handle_registry.h"
@@ -1205,6 +1206,26 @@ namespace das {
             }
             DAS_FATAL_ERROR("makeHandleType(%s) failed, duplicate annotation\n", name.c_str());
             return nullptr;
+        }
+        return t;
+    }
+
+    TypeDeclPtr ModuleLibrary::makeDistinctType ( const string & name ) const {
+        auto handles = findAnnotation(name,nullptr);
+        if ( handles.size()!=1 ) {
+            DAS_FATAL_ERROR("makeDistinctType(%s) failed, %s annotation\n", name.c_str(),
+                handles.size()==0 ? "missing" : "duplicate");
+            return nullptr;
+        }
+        if ( !handles.back()->rtti_isDistinctTypeAnnotation() ) {
+            DAS_FATAL_ERROR("makeDistinctType(%s) failed, not a distinct type\n", name.c_str());
+            return nullptr;
+        }
+        auto dann = static_cast<DistinctTypeAnnotation *>(handles.back());
+        auto t = new TypeDecl(Type::tDistinct);
+        t->annotation = dann;
+        if ( dann->underlyingType ) {
+            t->firstType = new TypeDecl(*dann->underlyingType);
         }
         return t;
     }

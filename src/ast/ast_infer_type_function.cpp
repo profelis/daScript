@@ -2019,6 +2019,8 @@ namespace das {
                             error("can only generate default structure constructor without arguments",
                                   "", "", expr->at, CompilationError::invalid_function_argument_count);
                         }
+                    } else if (aliasT->isDistinct()) {
+                        // Foo(expr) distinct construction - rewritten in visit(ExprCall); stay silent here
                     } else {
                         const char * missingMsg = expr->pipedCallArgument
                             ? "no matching functions or generics (the last argument is a piped block; no overload accepts it even after padding defaults): "

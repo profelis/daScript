@@ -71,9 +71,12 @@ namespace das
         tBlock,
         tTuple,
         tVariant,
-        tFixedArray     // AST-only (FIXED_ARRAY_REWORK.md): structural fixed-array TypeDecl node.
+        tFixedArray,    // AST-only (FIXED_ARRAY_REWORK.md): structural fixed-array TypeDecl node.
                         //  Runtime TypeInfo never carries it — fixed arrays stay flattened to dim[]
                         //  at the single AST->TypeInfo conversion point (ast_debug_info_helper.cpp).
+        tDistinct       // AST-only: nominal `distinct Foo = int` type. ABI-identical to firstType
+                        //  (the underlying workhorse type); annotation points at DistinctTypeAnnotation.
+                        //  Erased to the underlying type at the same AST->TypeInfo conversion point.
     };
 
     enum class RefMatters {

@@ -294,6 +294,7 @@ void das_accept_cpp_comment ( vector<CommentReader *> & crdi, yyscan_t scanner, 
 <normal>"try"                                           return DAS_TRY;
 <normal>"recover"                                       return DAS_CATCH;
 <normal>"typedef"                                       return DAS_TYPEDEF;
+<normal>"distinct"/[ \t]+((private|public)[ \t]+)?[_[:alpha:]][_[:alnum:]\`]*[ \t]*=    return DAS_DISTINCT;
 <normal>"typedecl"                                      return DAS_TYPEDECL;
 <normal>"label"                                         return DAS_LABEL;
 <normal>"goto"                                          return DAS_GOTO;

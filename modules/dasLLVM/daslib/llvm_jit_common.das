@@ -1354,6 +1354,11 @@ def public base_type_to_llvm_type(t : Type) {
 }
 
 def public type_to_llvm_abi_type(t : TypeDeclPtr) {
+    // distinct types are ABI-identical to their underlying type - erased for the JIT,
+    // same boundary as runtime TypeInfo (ref-ness lives on the head, so peel after isRef)
+    if (t.baseType == Type.tDistinct && t.firstType != null && !t.isRef) {
+        return type_to_llvm_abi_type(t.firstType)
+    }
     if (t.baseType == Type.tBlock) {
         return LLVMPointerType(g_t_block, 0u)
     } elif (t.isRef) {
@@ -1394,6 +1399,10 @@ def public type_to_llvm_abi_type(t : TypeDeclPtr) {
 }
 
 def public type_to_llvm_type(t : TypeDeclPtr) {
+    // distinct types are ABI-identical to their underlying type - erased for the JIT
+    if (t.baseType == Type.tDistinct && t.firstType != null) {
+        return type_to_llvm_type(t.firstType)
+    }
     var res : LLVMOpaqueType?
     if (t.baseType == Type.tFixedArray && t.firstType != null) {
         // natural recursion: [outer x [inner x elem]] — same nesting the reversed flat walk built

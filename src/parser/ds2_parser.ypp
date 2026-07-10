@@ -207,6 +207,7 @@
 %token  DAS_DELETE          "delete"
 %token  DAS_DEREF           "deref"
 %token  DAS_TYPEDEF         "typedef"
+%token  DAS_DISTINCT        "distinct"
 %token  DAS_TYPEDECL        "typedecl"
 %token  DAS_WITH            "with"
 %token  DAS_AKA             "aka"
@@ -581,6 +582,7 @@ program
     |   program require_declaration SEMICOLON
     |   program options_declaration SEMICOLON
     |   program alias_declaration               { yyextra->das_has_type_declarations = true; }
+    |   program distinct_declaration            { yyextra->das_has_type_declarations = true; }
     |   program variant_alias_declaration       { yyextra->das_has_type_declarations = true; }
     |   program tuple_alias_declaration         { yyextra->das_has_type_declarations = true; }
     |   program bitfield_alias_declaration      { yyextra->das_has_type_declarations = true; }
@@ -2986,6 +2988,13 @@ single_alias
 
 alias_declaration
     :   DAS_TYPEDEF single_alias SEMICOLON
+    ;
+
+distinct_declaration
+    :   DAS_DISTINCT optional_public_or_private_alias[pubA] NAME[name] '=' type_declaration[tdecl] SEMICOLON {
+        ast_distinctDeclaration(scanner,$name,tokAt(scanner,@name),!$pubA,$tdecl);
+        delete $name;
+    }
     ;
 
 optional_public_or_private_enum

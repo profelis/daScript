@@ -249,9 +249,11 @@ namespace das {
         // (size, quals, gc, names) stay on the chain head
         vector<int32_t> dims;
         const TypeDecl * elemType = type;
-        while ( elemType->baseType==Type::tFixedArray ) {
-            dims.push_back(elemType->fixedDim);
-            DAS_ASSERTF(elemType->firstType, "tFixedArray chain without an element");
+        // tDistinct erases to its underlying type here, same boundary as the fixed-array flatten -
+        // runtime TypeInfo (interpreter, JIT, fusion, RTTI) never observes a distinct type
+        while ( elemType->baseType==Type::tFixedArray || elemType->baseType==Type::tDistinct ) {
+            if ( elemType->baseType==Type::tFixedArray ) dims.push_back(elemType->fixedDim);
+            DAS_ASSERTF(elemType->firstType, "tFixedArray/tDistinct chain without an element");
             elemType = elemType->firstType;
         }
         if ( info==nullptr ) {

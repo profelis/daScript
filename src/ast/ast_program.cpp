@@ -3,6 +3,7 @@
 #include "daScript/ast/ast.h"
 #include "daScript/ast/ast_expressions.h"
 #include "daScript/ast/ast_visitor.h"
+#include "daScript/ast/ast_handle.h"
 
 namespace das {
 
@@ -247,7 +248,21 @@ namespace das {
             }
         } else if ( handles.size() ) {
             if ( handles.size()==1 ) {
-                if ( handles.back()->rtti_isHandledTypeAnnotation() ) {
+                if ( handles.back()->rtti_isDistinctTypeAnnotation() ) {
+                    auto dann = static_cast<DistinctTypeAnnotation *>(handles.back());
+                    if ( dann->isPrivate && dann->module && dann->module!=thisModule.get() ) {
+                        error("can't access private distinct type "+name,"","",
+                            at,CompilationError::invalid_distinct_type);
+                        return nullptr;
+                    }
+                    auto pTD = new TypeDecl(Type::tDistinct);
+                    pTD->annotation = dann;
+                    if ( dann->underlyingType ) {
+                        pTD->firstType = new TypeDecl(*dann->underlyingType);
+                    }
+                    pTD->at = at;
+                    return pTD;
+                } else if ( handles.back()->rtti_isHandledTypeAnnotation() ) {
                     auto pTD = new TypeDecl(Type::tHandle);
                     pTD->annotation = static_cast<TypeAnnotation *>(handles.back());
                     pTD->at = at;
@@ -328,6 +343,9 @@ namespace das {
 
     ExpressionPtr Program::makeConst ( const LineInfo & at, const TypeDeclPtr & type, vec4f value ) {
         if ( type->ref || type->baseType==Type::tFixedArray ) return nullptr;
+        if ( type->baseType==Type::tDistinct ) {    // ABI-identical: the const node is the underlying's
+            return type->firstType ? makeConst(at, type->firstType, value) : nullptr;
+        }
         switch ( type->baseType ) {
             case Type::tBool:           return new ExprConstBool(at, cast<bool>::to(value));
             case Type::tInt8:           return new ExprConstInt8(at, cast<int8_t>::to(value));

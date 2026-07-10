@@ -476,6 +476,15 @@ namespace das {
                 return Visitor::visit(expr);
             }
         }
+        // distinct types borrow == and != (language-level, not overridable): lower to a compare
+        // of the underlyings. Both sides must be the SAME distinct type; Foo == int stays an error
+        if ((expr->op == "==" || expr->op == "!=") && expr->left->type->isDistinct() &&
+            expr->left->type->isSameType(*expr->right->type, RefMatters::no, ConstMatters::no, TemporaryMatters::no)) {
+            reportAstChanged();
+            return new ExprOp2(expr->at, expr->op,
+                new ExprPtr2Ref(expr->left->at, expr->left),
+                new ExprPtr2Ref(expr->right->at, expr->right));
+        }
         auto opName = "_::" + expr->op;
         auto tempCall = new ExprLooksLikeCall(expr->at, opName);
         tempCall->arguments.push_back(expr->left);

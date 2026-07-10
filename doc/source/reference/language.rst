@@ -22,6 +22,7 @@
    language/variants.rst
    language/bitfields.rst
    language/aliases.rst
+   language/distinct.rst
    language/arrays.rst
    language/tables.rst
    language/iterators.rst

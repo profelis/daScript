@@ -295,6 +295,7 @@ namespace das
     ,   invalid_yield                                               =   30294    // 1 site(s)
     ,   invalid_yield_in_block                                      =   30295    // 1 site(s)
     ,   invalid_empty_name                                          =   30296    // AST node with empty name; usually a macro emission bug
+    ,   invalid_distinct_type                                       =   30297    // distinct underlying must be a workhorse type, not another distinct
 
 // missing_*
 
@@ -337,6 +338,7 @@ namespace das
     ,   mismatching_tuple_field_names                               =   30410    // 1 site(s)
     ,   mismatching_type                                            =   30411    // 3 site(s)
     ,   mismatching_variant_dimension                               =   30412    // 1 site(s)
+    ,   mismatching_distinct_type                                   =   30413    // distinct <-> underlying conversion is explicit-only
 
 // exceeds_*
 

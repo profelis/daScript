@@ -1205,6 +1205,11 @@ namespace das {
                 DAS_VERIFYF_MULTI(!!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
+            case tDistinct:
+                ser << alias << annotation << firstType;
+                DAS_VERIFYF_MULTI(!!annotation, !structType, !enumType, !secondType,
+                                argTypes.empty(), argNames.empty());
+                break;
             case tEnumeration:
             case tEnumeration8:
             case tEnumeration16:
@@ -2378,6 +2383,38 @@ namespace das {
         ser.tag(HASH_TAG("Module"));
         ser << name << nameHash << moduleFlags;
         ser << annotationData << requireModule;
+        // das-declared distinct types round-trip with the module (C++-module annotations
+        // re-register on load, parser-created ones don't). they stream BEFORE aliasTypes and
+        // enumerations - any TypeDecl deserialized below resolves tDistinct annotation
+        // pointers via findAnnotation, so the entities must exist first
+        if ( ser.writing ) {
+            uint64_t dtSize = 0;
+            for ( auto & [key, ann] : handleTypes ) {
+                (void) key;
+                if ( ann->rtti_isDistinctTypeAnnotation() ) dtSize ++;
+            }
+            ser << dtSize;
+            for ( auto & [key, ann] : handleTypes ) {
+                (void) key;
+                if ( !ann->rtti_isDistinctTypeAnnotation() ) continue;
+                auto dann = static_cast<DistinctTypeAnnotation *>(ann);
+                ser << dann->name << dann->cppName << dann->at << dann->isPrivate << dann->underlyingType;
+            }
+        } else {
+            uint64_t dtSize = 0;
+            ser << dtSize;
+            for ( uint64_t i=0; i<dtSize; ++i ) {
+                string dname, dcppName;
+                LineInfo dat;
+                bool dpriv = false;
+                TypeDeclPtr dunder = nullptr;
+                ser << dname << dcppName << dat << dpriv << dunder;
+                auto dann = new DistinctTypeAnnotation(dname, dunder, dcppName);
+                dann->at = dat;
+                dann->isPrivate = dpriv;
+                addAnnotation(dann, true);
+            }
+        }
         ser << aliasTypes     << enumerations;
         /*
         // serialize handleTypes (annotation lookup table)

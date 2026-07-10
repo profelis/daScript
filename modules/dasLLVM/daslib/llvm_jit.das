@@ -4528,7 +4528,9 @@ class public LlvmJitVisitor : AstVisitor {
 // ExprPtr2Ref
     def override visitExprPtr2Ref(expr : ExprPtr2Ref?) : ExpressionPtr {
         var tsrc = getE(expr.subexpr)
-        if (thisFunc != null && !thisFunc.flags.unsafeDeref) {
+        // deref of a distinct value is a compile-time relabel - no pointer, no null check
+        let isDistinctDeref = expr.subexpr._type != null && expr.subexpr._type.baseType == Type.tDistinct
+        if (!isDistinctDeref && thisFunc != null && !thisFunc.flags.unsafeDeref) {
             check_ptr_zero(tsrc, expr.at, "dereferencing null pointer, {expr.subexpr.describe()} is null")
         }
         setE(expr, tsrc)
@@ -6788,6 +6790,10 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def cast_from_vec4f(expr : ExpressionPtr; etype : TypeDeclPtr; v4f : LLVMOpaqueValue?) {
+        // distinct types marshal exactly as their underlying type (ref-ness stays on the head)
+        if (etype.baseType == Type.tDistinct && etype.firstType != null && !etype.isRef) {
+            return cast_from_vec4f(expr, etype.firstType, v4f)
+        }
         var tres : LLVMOpaqueValue?
         if (etype.baseType == Type.anyArgument) {
             tres = v4f
@@ -6836,6 +6842,10 @@ class public LlvmJitVisitor : AstVisitor {
     }
 
     def cast_to_vec4f(etype : TypeDeclPtr; tsrc : LLVMOpaqueValue?) {
+        // distinct types marshal exactly as their underlying type (ref-ness stays on the head)
+        if (etype.baseType == Type.tDistinct && etype.firstType != null && !etype.isRef) {
+            return cast_to_vec4f(etype.firstType, tsrc)
+        }
         // Zero-fill (not undef) the unused lanes: a wrapped scalar return
         // (lane 0 = value) is sometimes consumed as a full vec4f by a vector
         // `icmp` (e.g. block-key comparison in order_by). undef sibling lanes

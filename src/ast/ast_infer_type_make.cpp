@@ -1140,6 +1140,23 @@ namespace das {
                 return ews;
             }
         } else if (expr->type->isWorkhorseType()) {
+            if (expr->type->isDistinct()) {
+                // no fields to initialize - Foo(a=...) is invalid (preVisit reported); don't fold,
+                // or the astChanged rerun would discard the error
+                if (expr->structs.size()) {
+                    return Visitor::visit(expr);
+                }
+                // default<Foo> - zero constant of the underlying, relabeled (the raw const node
+                // would re-infer as the underlying type on the next pass, losing the distinct)
+                expr->type->ref = false;
+                reportAstChanged();
+                auto ews = Program::makeConst(expr->at, expr->type->firstType, v_zero());
+                ews->type = new TypeDecl(*expr->type->firstType);
+                auto ecast = new ExprCast(expr->at, ews, new TypeDecl(*expr->type));
+                ecast->reinterpret = true;
+                ecast->alwaysSafe = true;
+                return ecast;
+            }
             expr->type->ref = false;
             reportAstChanged();
             auto ews = Program::makeConst(expr->at, expr->type, v_zero());

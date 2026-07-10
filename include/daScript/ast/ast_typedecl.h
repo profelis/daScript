@@ -121,6 +121,7 @@ namespace das {
         __forceinline bool isEnum() const;
         __forceinline bool isEnumT() const;
         __forceinline bool isHandle() const;
+        __forceinline bool isDistinct() const;
         __forceinline bool isStructure() const;
         bool isClass() const;
         __forceinline bool isFunction() const;
@@ -764,6 +765,8 @@ namespace das {
 
     das::TypeDeclPtr DAS_API makeHandleType(const das::ModuleLibrary & library, const char * typeName);
 
+    das::TypeDeclPtr DAS_API makeDistinctType(const das::ModuleLibrary & library, const char * typeName);
+
     DAS_API bool splitTypeName ( const string & name, string & moduleName, string & funcName );
 
     DAS_API bool isCircularType ( const TypeDeclPtr & type );
@@ -832,6 +835,10 @@ namespace das {
 
     __forceinline bool TypeDecl::isHandle() const {
         return baseType==Type::tHandle;
+    }
+
+    __forceinline bool TypeDecl::isDistinct() const {
+        return baseType==Type::tDistinct;
     }
 
     __forceinline bool TypeDecl::isStructure() const {

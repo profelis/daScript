@@ -4,6 +4,7 @@
 #include "parser_state.h"
 
 #include "daScript/ast/ast_generate.h"
+#include "daScript/ast/ast_handle.h"
 
 #undef yyextra
 #define yyextra (*((das::DasParserState **)(scanner)))
@@ -536,6 +537,37 @@ namespace das {
             return pEnum;
         } else {
             return pEnum;
+        }
+    }
+
+    void ast_distinctDeclaration ( yyscan_t scanner, string * name, const LineInfo & atName, bool isPrivate, TypeDecl * tdecl ) {
+        das_checkName(scanner,*name,atName);
+        if ( tdecl->baseType==Type::tDistinct ) {
+            das_yyerror(scanner,"distinct type can't be defined in terms of another distinct type "+*name, atName,
+                CompilationError::invalid_distinct_type);
+            return;
+        }
+        if ( tdecl->isAutoOrAlias() ) {
+            das_yyerror(scanner,"distinct type underlying type is not fully resolved "+*name+" = "+tdecl->describe(), atName,
+                CompilationError::invalid_distinct_type);
+            return;
+        }
+        if ( tdecl->ref || tdecl->constant || tdecl->temporary ) {
+            das_yyerror(scanner,"distinct type underlying type can't be a reference, const, or temporary "+*name, atName,
+                CompilationError::invalid_distinct_type);
+            return;
+        }
+        if ( !tdecl->isWorkhorseType() ) {
+            das_yyerror(scanner,"distinct type underlying type must be a workhorse type "+*name+" = "+tdecl->describe(), atName,
+                CompilationError::invalid_distinct_type);
+            return;
+        }
+        auto dann = new DistinctTypeAnnotation(*name, tdecl);
+        dann->at = atName;
+        dann->isPrivate = isPrivate;
+        if ( !yyextra->g_Program->thisModule->addAnnotation(dann, true) ) {
+            das_yyerror(scanner,"distinct type is already defined "+*name, atName,
+                CompilationError::invalid_distinct_type);
         }
     }
 
