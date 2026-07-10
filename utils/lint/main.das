@@ -477,7 +477,11 @@ def main() : int {
     var cache : table<string; void?>
     var skipped = 0
     for (p in paths) {
-        scan_das_files(p, files, cache, skipped)
+        // absolutize: module identity is spelling-sensitive — a relative root file registers
+        // same-dir requires under a relative key while module-mount-routed requires register
+        // absolute, tripping error 20605 "several modules with the same name" (e.g. dasPEG)
+        let full = get_full_file_name(p)
+        scan_das_files(empty(full) ? p : replace(full, "\\", "/"), files, cache, skipped)
     }
     if (empty(files)) {
         // All inputs were intentionally skipped (e.g. builtin.das) -- success.
