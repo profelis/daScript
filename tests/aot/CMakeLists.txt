@@ -110,6 +110,7 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_tokenizer.das
     modules/dasLLAMA/dasllama/dasllama_bpe.das
     modules/dasLLAMA/dasllama/dasllama_common.das
+    modules/dasLLAMA/dasllama/dasllama_prefix.das
     modules/dasLLAMA/dasllama/dasllama_audio.das
     modules/dasLLAMA/dasllama/dasllama_whisper.das
     modules/dasLLAMA/dasllama/dasllama_qwen3a.das

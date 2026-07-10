@@ -251,7 +251,7 @@ def document_module_dashv(_root : string) {
         group_by_regex("Request configuration", mod, %regex~(set_basic_auth|set_bearer_token_auth|set_timeout|set_connect_timeout|allow_redirect|set_param|get_param|each_param)$%%),
         group_by_regex("Cookies", mod, %regex~(add_cookie|get_cookie|each_cookie)$%%),
         group_by_regex("Form data", mod, %regex~(set_form_data|set_form_file|get_form_data|each_form_field|save_form_file|set_url_encoded|get_url_encoded)$%%),
-        group_by_regex("SSE response writer", mod, %regex~(respond|sse_event|end_headers|write_chunked|close_writer|release_writer)$%%)
+        group_by_regex("SSE response writer", mod, %regex~(respond|sse_event|end_headers|write_chunked|close_writer|release_writer|is_writer_connected)$%%)
     )
     document("HTTP and WebSocket library (libhv)", mod, "dashv.rst", groups)
 }
@@ -296,12 +296,13 @@ def private dasllama_type_stanza(f : FILE const?; lab : string; tname : string; 
 def document_module_dasllama(_root : string) {
     var mod = find_module("dasllama")
     var groups <- array<DocGroup>(
-        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
+        group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
+        group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_release|prefix_held_groups)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
         group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|add_user|add_user_audio|add_assistant|render_turn|respond)$%%)
+        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_assistant|render_turn|render_assistant|render_close|respond)$%%)
     )
     var hook = DocsHook()
     hook.afterEnums <- @(var f : FILE const?; _was_enums : bool) {
@@ -314,8 +315,12 @@ def document_module_dasllama(_root : string) {
             "One generation stream over a model: the KV cache, scratch buffers, sampling RNG, and the current position ``n_past``. ``logits`` holds the distribution produced by the last ``eval``. A model serves many independent sessions.")
         dasllama_type_stanza(f, "struct-dasllama_common-BatchWorkspace", "BatchWorkspace",
             "Caller-owned scratch for ``eval_batch``: the batched activation buffers a step of B sessions shares. One per concurrent batch, reused across calls; holds no session state — positions, caches and logits stay in the sessions.")
+        dasllama_type_stanza(f, "struct-dasllama_common-KVPool", "KVPool",
+            "A caller-owned paged KV-cache pool (``create_kv_pool``): sessions created over it allocate fixed-size page groups on demand, so cache memory tracks the actual context instead of the full ``seq_len`` slab. One pool serves many sessions; an ``eval_batch`` batch must share one pool. Keep it alive and in place while its sessions live.")
+        dasllama_type_stanza(f, "struct-dasllama_prefix-PrefixCache", "PrefixCache",
+            "A page-granular prefix cache over one pool's sessions (``create_prefix_cache``): finished streams donate their KV pages keyed by a chained page hash of the token history, and later requests attach the longest cached prefix instead of re-prefilling it. Pages are refcounted with the pool; an LRU budget bounds retention.")
         dasllama_type_stanza(f, "enum-dasllama_common-KVDtype", "KVDtype",
-            "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference.")
+            "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference; ``q8_0`` — block-quantized (llama.cpp ``-ctk``/``-ctv q8_0``), half the f16 bytes again and near-lossless in practice; needs head_size and kv_dim to be multiples of 32 (checked at create).")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",
             "Weight representation picked at load: ``fp32`` — the token-exact reference; ``q8`` — int8 quantization, the fast CPU path; ``q4`` — 4-bit, smallest footprint.")
         dasllama_type_stanza(f, "struct-dasllama_common-SamplingParams", "SamplingParams",

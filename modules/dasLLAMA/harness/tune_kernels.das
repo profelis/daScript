@@ -65,6 +65,16 @@ struct GridAxpyF16 {}
 struct GridCvtToF16 {}
 [dasllama_grid(src = "cvt_f16_to_f32_template")]
 struct GridCvtToF32 {}
+[dasllama_grid(src = "dot_q8kv_template")]
+struct GridDotQ8Kv {}
+[dasllama_grid(src = "dot_q8q8kv_template")]
+struct GridDotQ8Q8Kv {}
+[dasllama_grid(src = "axpy_q8kv_template")]
+struct GridAxpyQ8Kv {}
+[dasllama_grid(src = "cvt_q8kv_to_f32_template")]
+struct GridCvtQ8Kv {}
+[dasllama_grid(src = "quantize_q8kv_row_template")]
+struct GridQuantQ8Kv {}
 
 // Registry fn-ptr signatures (== function_to_type of each template).
 typedef DotFn = function<(a : float const?; b : float const?; n : int64) : float>
@@ -875,6 +885,345 @@ def bench_dot_q8q8() : string {
     return report("dot_q8q8", names, best, ok, "vec16")
 }
 
+// ===== q8_0 KV-codec kernels: dot_q8kv / dot_q8q8kv / axpy_q8kv / cvt_q8kv_to_f32 /
+// quantize_q8kv_row. The cache side is interleaved ggml block_q8_0 ({f16 d; int8 qs[32]} = 34
+// bytes per 32 elements); the reference row below IS the quantize_q8kv_row contract, so the
+// quantize bench gates byte-EXACT against it, the cvt gates element-exact, and the dots gate
+// f64-relative on the exact int block sums / dequantized values.
+
+// reference q8_0 row builder — scalar amax (order-free == the kernel's float4 form), f16 scale,
+// f32-id rounding: quantize_q8kv_row's exact semantics
+def private build_q8kv_row(src : array<float>; n : int64; var row : array<uint8>) {
+    row |> resize(int(n / 32l * 34l))
+    for (bi in range64(n / 32l)) {
+        let base = bi * 32l
+        var amax = 0.0
+        for (k in range64(32l)) {
+            amax = max(amax, abs(src[base + k]))
+        }
+        let d = amax / 127.0
+        let id = d != 0.0 ? 1.0 / d : 0.0
+        let dh = f32_to_f16(d)
+        let bb = bi * 34l
+        row[bb] = uint8(dh & 0xFF)
+        row[bb + 1l] = uint8((dh >> 8u) & 0xFF)
+        for (k in range64(32l)) {
+            row[bb + 2l + k] = uint8(int(round(src[base + k] * id)) & int(0xFF))
+        }
+    }
+}
+
+// dequantized element (bi*32 + k) of a reference row, in f64 — for the dot/axpy references
+def private q8kv_elem(row : array<uint8>; i : int64) : double {
+    let bb = i / 32l * 34l
+    let dh = uint(row[bb]) | (uint(row[bb + 1l]) << 8u)
+    let q = int(int8(row[bb + 2l + i % 32l]))
+    return double(q) * double(f16_to_f32(dh))
+}
+
+def bench_dot_q8kv() : string {
+    var a : array<float>
+    var wf : array<float>
+    var row : array<uint8>
+    a |> resize(int(N))
+    wf |> resize(int(N))
+    for (i in range(int(N))) {
+        a[i] = sin(float(i) * 0.1f)
+        wf[i] = cos(float(i) * 0.07f)
+    }
+    build_q8kv_row(wf, N, row)
+    var want = 0.0lf
+    for (j in range64(N)) {
+        want += double(a[j]) * q8kv_elem(row, j)
+    }
+    let pa = unsafe(addr(a[0]))
+    let pb = unsafe(addr(row[0]))
+
+    let vs <- dot_q8kv_template_variants()
+    let nv = length(vs)
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        let f = vs[i]._1
+        let got = double(f(pa, pb, N))
+        ok[i] = abs(got - want) / (abs(want) + 1.0lf) <= TOL
+    }
+
+    var sink = 0.0f
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                sink += f(pa, pb, N)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+    }
+    if (sink == 12345.678f) {
+        print("")   // keep sink live
+    }
+    return report("dot_q8kv", names, best, ok)
+}
+
+def bench_dot_q8q8kv() : string {
+    var xf : array<float>
+    var wf : array<float>
+    var row : array<uint8>
+    xf |> resize(int(N))
+    wf |> resize(int(N))
+    for (i in range(int(N))) {
+        xf[i] = sin(float(i) * 0.1f)
+        wf[i] = cos(float(i) * 0.07f)
+    }
+    build_q8kv_row(wf, N, row)
+    let xq <- quantize_q8_0(xf, N)   // the query planes (int8 quants + f32 scales)
+    var want = 0.0lf
+    for (bi in range64(N / 32l)) {
+        let bb = bi * 34l
+        let dh = uint(row[bb]) | (uint(row[bb + 1l]) << 8u)
+        var iacc = 0
+        for (k in range64(32l)) {
+            iacc += int(xq.q[bi * 32l + k]) * int(int8(row[bb + 2l + k]))
+        }
+        want += double(iacc) * double(xq.scales[bi]) * double(f16_to_f32(dh))
+    }
+    let qp = unsafe(addr(xq.q[0]))
+    let sp = unsafe(addr(xq.scales[0]))
+    let pb = unsafe(addr(row[0]))
+
+    let vs <- dot_q8q8kv_template_variants()
+    let nv = length(vs)
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        let f = vs[i]._1
+        let got = double(f(qp, sp, pb, N))
+        ok[i] = abs(got - want) / (abs(want) + 1.0lf) <= TOL
+    }
+
+    var sink = 0.0f
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                sink += f(qp, sp, pb, N)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+    }
+    if (sink == 12345.678f) {
+        print("")   // keep sink live
+    }
+    return report("dot_q8q8kv", names, best, ok, "vec16")
+}
+
+def bench_axpy_q8kv() : string {
+    let vs <- axpy_q8kv_template_variants()
+    let nv = length(vs)
+    let scale = 0.5f
+    var d0 : array<float>
+    var wf : array<float>
+    var row : array<uint8>
+    var d : array<float>
+    d0 |> resize(int(N))
+    wf |> resize(int(N))
+    d |> resize(int(N))
+    for (i in range(int(N))) {
+        d0[i] = 0.5f + 0.3f * sin(float(i) * 0.05f)
+        wf[i] = cos(float(i) * 0.03f)
+    }
+    build_q8kv_row(wf, N, row)
+    var dp = unsafe(addr(d[0]))
+    let sp = unsafe(addr(row[0]))
+
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        reset(d, d0)
+        let f = vs[i]._1
+        invoke(f, dp, sp, scale, N)
+        var maxrel = 0.0lf
+        for (j in range64(N)) {
+            let want = double(d0[j]) + double(scale) * q8kv_elem(row, j)
+            let rel = abs(double(d[j]) - want) / (abs(want) + 1.0lf)
+            if (rel > maxrel) {
+                maxrel = rel
+            }
+        }
+        ok[i] = maxrel <= TOL
+    }
+
+    var sink = 0.0f
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            reset(d, d0)
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                invoke(f, dp, sp, scale, N)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+        sink += d[0]
+    }
+    print("  checksum {sink}\n")
+    return report("axpy_q8kv", names, best, ok)
+}
+
+def bench_cvt_q8kv_to_f32() : string {
+    let vs <- cvt_q8kv_to_f32_template_variants()
+    let nv = length(vs)
+    var wf : array<float>
+    var row : array<uint8>
+    var d : array<float>
+    wf |> resize(int(N))
+    d |> resize(int(N))
+    for (i in range(int(N))) {
+        wf[i] = 300.0f * cos(float(i) * 0.09f)
+    }
+    build_q8kv_row(wf, N, row)
+    var dp = unsafe(addr(d[0]))
+    let sp = unsafe(addr(row[0]))
+
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        for (j in range(int(N))) {
+            d[j] = -1.0e30f
+        }
+        let f = vs[i]._1
+        invoke(f, dp, sp, N)
+        var exact = true
+        for (j in range64(N)) {
+            exact &&= double(d[j]) == q8kv_elem(row, j)   // float(q)*f16(d) is exact in f32
+        }
+        ok[i] = exact
+    }
+
+    var sink = 0.0f
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                invoke(f, dp, sp, N)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+        sink += d[0]
+    }
+    print("  checksum {sink}\n")
+    return report("cvt_q8kv_to_f32", names, best, ok)
+}
+
+def bench_quantize_q8kv_row() : string {
+    let vs <- quantize_q8kv_row_template_variants()
+    let nv = length(vs)
+    var src : array<float>
+    var ref_row : array<uint8>
+    var d : array<uint8>
+    src |> resize(int(N))
+    for (i in range(int(N))) {
+        src[i] = 300.0f * sin(float(i) * 0.11f)
+    }
+    build_q8kv_row(src, N, ref_row)   // the contract: byte-exact ggml quantize_row_q8_0
+    d |> resize(length(ref_row))
+    var dp = unsafe(addr(d[0]))
+    let sp = unsafe(addr(src[0]))
+
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        for (b in d) {
+            b = uint8(0xA5)
+        }
+        let f = vs[i]._1
+        invoke(f, dp, sp, N)
+        var exact = true
+        for (j in range(length(d))) {
+            exact &&= d[j] == ref_row[j]
+        }
+        ok[i] = exact
+    }
+
+    var sink = 0
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                invoke(f, dp, sp, N)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+        sink += int(d[0])
+    }
+    print("  checksum {sink}\n")
+    return report("quantize_q8kv_row", names, best, ok, "plain")
+}
+
 // ===== dot_mx4q8: native-MXFP4 weight planes (deterministic nibbles + E8M0 bytes) vs Q8 activation.
 // The vec* perms are inert (straight-line tbl16/sdot4_w intrinsic body — the hint is ignored), so
 // only the unroll rows genuinely compete, exactly like laneq4x4.
@@ -1337,6 +1686,11 @@ def main {
     let rmsw = bench_rmsnorm()
     let dq4w = bench_dot_q4()
     let dq8w = bench_dot_q8q8()
+    let dq8kvw = bench_dot_q8kv()
+    let dq8q8kvw = bench_dot_q8q8kv()
+    let axq8kvw = bench_axpy_q8kv()
+    let cvtq8kvw = bench_cvt_q8kv_to_f32()
+    let quantq8kvw = bench_quantize_q8kv_row()
     let dmx4w = bench_dot_mx4q8()
     let quantw = bench_quantize()
     let ropew = bench_rope_tab()
@@ -1348,13 +1702,19 @@ def main {
     print("\n===== summary (winner per kernel) =====\n")
     let knames = fixed_array("dot", "axpy", "dot_f16", "axpy_f16", "cvt_f32_to_f16", "cvt_f16_to_f32",
         "add_inplace", "mul_inplace", "scale_inplace", "copy_floats",
-        "softmax", "rmsnorm", "dot_q4", "dot_q8q8", "dot_mx4q8", "quantize_q8_0_into_ptr",
+        "softmax", "rmsnorm", "dot_q4", "dot_q8q8",
+        "dot_q8kv", "dot_q8q8kv", "axpy_q8kv", "cvt_q8kv_to_f32", "quantize_q8kv_row",
+        "dot_mx4q8", "quantize_q8_0_into_ptr",
         "rope_scaled_neox_tab", "gemm_f32_uk_4x16", "dot_q8q8_laneq4x4")
     let kwin = fixed_array(dotw, axpyw, dotf16w, axpyf16w, cvt16w, cvt32w, addw, mulw, scalew, copyw,
-        softmaxw, rmsw, dq4w, dq8w, dmx4w, quantw, ropew, gemmw, laneqw)
+        softmaxw, rmsw, dq4w, dq8w,
+        dq8kvw, dq8q8kvw, axq8kvw, cvtq8kvw, quantq8kvw,
+        dmx4w, quantw, ropew, gemmw, laneqw)
     let kfall = fixed_array(BASELINE, BASELINE, BASELINE, BASELINE, BASELINE, BASELINE,
         BASELINE, BASELINE, BASELINE, BASELINE,
-        BASELINE, "plain", "vec4_u4", "vec16", "u2", "plain",
+        BASELINE, "plain", "vec4_u4", "vec16",
+        BASELINE, "vec16", BASELINE, BASELINE, "plain",
+        "u2", "plain",
         BASELINE, "u2", "u2")
     var changed = 0
     for (k, w, f in knames, kwin, kfall) {
@@ -1392,7 +1752,10 @@ def main {
         cvt_f32_to_f16 = cvt16w, cvt_f16_to_f32 = cvt32w, add_inplace = addw,
         mul_inplace = mulw, scale_inplace = scalew, copy_floats = copyw,
         softmax = softmaxw, softmax_sink = softmaxw, rmsnorm = rmsw,
-        dot_q4 = dq4w, dot_q8q8 = dq8w, dot_mx4q8 = dmx4w, quantize_q8_0_into_ptr = quantw,
+        dot_q4 = dq4w, dot_q8q8 = dq8w,
+        dot_q8kv = dq8kvw, dot_q8q8kv = dq8q8kvw, axpy_q8kv = axq8kvw,
+        cvt_q8kv_to_f32 = cvtq8kvw, quantize_q8kv_row = quantq8kvw,
+        dot_mx4q8 = dmx4w, quantize_q8_0_into_ptr = quantw,
         rope_scaled_neox_tab = ropew, gemm_f32_uk_4x16 = gemmw, dot_q8q8_laneq4x4 = laneqw,
         runtime = runtime))
     let js = write_json(profile)

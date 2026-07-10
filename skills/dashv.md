@@ -59,9 +59,14 @@ STREAM("/events") <| @(var req : HttpRequest?; var writer : HttpResponseWriter?)
 ```
 
 - **Writer ops are handle-first** — `respond` / `sse_event` / `write_chunked` / `end_headers` /
-  `close_writer` / `release_writer` all take the **server handle first**, then the `writer`. That
-  is deliberate: generation runs on the tick thread, and the op posts the socket write to the
-  connection's event loop (`adapter->loop()->runInLoop`) so writes marshal to the right loop.
+  `close_writer` / `release_writer` / `is_writer_connected` all take the **server handle first**,
+  then the `writer`. That is deliberate: generation runs on the tick thread, and the op posts the
+  socket write to the connection's event loop (`adapter->loop()->runInLoop`) so writes marshal to
+  the right loop.
+- `is_writer_connected(server, writer)` — true while the writer's client connection is still open
+  (false for null / unknown / released writers). The async write ops never report a dead peer, so
+  a long-lived stream **polls this to evict abandoned clients** (see `openai_server.das`'s
+  `reap_disconnected`).
 - `sse_event(server, writer, data, "")` emits exact `data: <json>\n\n` framing. Terminate an SSE
   stream with a final `sse_event(server, writer, "[DONE]", "")` then `close_writer`.
 - One `STREAM` route serves both streaming and non-streaming responses: stream with `sse_event`,

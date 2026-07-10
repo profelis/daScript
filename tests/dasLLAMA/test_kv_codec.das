@@ -119,6 +119,123 @@ def test_kv_layout_f16(t : T?) {
 }
 
 [test]
+def test_kv_layout_q8(t : T?) {
+    t |> run("q8_0 sessions: 34-bytes-per-32 prefixes, mixed dtypes walk independently") @(t : T?) {
+        let c = mk_config(4l, 4l, 2l, 64l, 8l)
+        let ref <- ref_prefix_elems(c)
+        var sq <- make_run_state(c, KVDtype.q8_0, KVDtype.q8_0)
+        for (l in range64(c.n_layers)) {
+            t |> equal(sq.kv_bprefix_k[l], ref[l] / 32l * 34l)   // block codec: 34 bytes per 32 elements
+            t |> equal(sq.kv_bprefix_v[l], sq.kv_bprefix_k[l])
+        }
+        let wantq = c.seq_len * own_row_elems(c) / 32l * 34l
+        t |> success(int64(length(sq.key_cache)) == wantq, "q8_0 key cache sized exactly (34/32 of the element count)")
+        t |> success(int64(length(sq.value_cache)) == wantq, "q8_0 value cache sized exactly")
+        delete sq
+        var smix <- make_run_state(c, KVDtype.q8_0, KVDtype.f16)   // K/V dtypes stay independent
+        for (l in range64(c.n_layers)) {
+            t |> equal(smix.kv_bprefix_k[l], ref[l] / 32l * 34l)
+            t |> equal(smix.kv_bprefix_v[l], ref[l] * 2l)
+        }
+        delete smix
+    }
+}
+
+// block bi's dequantized element k, read back from stored q8_0 row bytes
+def private q8_row_elem(p : uint8 const?; bi, k : int64) : float {
+    unsafe {
+        let bb = bi * 34l
+        let dh = uint(p[bb]) | (uint(p[bb + 1l]) << 8u)
+        return float(int8(p[bb + 2l + k])) * f16_to_f32(dh)
+    }
+}
+
+[test]
+def test_kv_store_row_q8(t : T?) {
+    t |> run("q8_0 kv_store_row: round-trip within d/2, idempotent re-quantize, head-slot placement") @(t : T?) {
+        let c = mk_config(3l, 4l, 2l, 32l, 6l)
+        let kv_dim = layer_kv_dim(c, 1l)   // 64 = 2 blocks per row
+        var s <- make_run_state(c, KVDtype.q8_0, KVDtype.q8_0)
+        var src : array<float>
+        src |> resize(int(kv_dim))
+        for (i in range(length(src))) {
+            src[i] = 3.0 * sin(float(i) * 0.37 + 0.11)   // no exact-zero block, spans +/-
+        }
+        let rowb = kv_row_bytes(KVDtype.q8_0, kv_dim)
+        t |> equal(rowb, kv_dim / 32l * 34l)
+        unsafe {
+            let kbase = kv_base_k(s, 1l, c.seq_len)
+            var kcl = addr(s.key_cache[0]) + kbase
+            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 3l, 0l, kv_dim, reinterpret<float const?>(addr(src[0])))
+            // round-trip: |src - dequant| <= d/2 per element (d = that block's stored scale)
+            let row3 = reinterpret<uint8 const?>(kcl + 3l * rowb)
+            var ok_rt = true
+            var dq : array<float>
+            dq |> resize(int(kv_dim))
+            for (bi in range64(kv_dim / 32l)) {
+                let dh = uint(row3[bi * 34l]) | (uint(row3[bi * 34l + 1l]) << 8u)
+                let d = f16_to_f32(dh)
+                for (k in range64(32l)) {
+                    let v = q8_row_elem(row3, bi, k)
+                    dq[bi * 32l + k] = v
+                    // d/2 from the round, + up to 127·(f16 rounding of d) — quants round with the
+                    // UN-rounded f32 scale but dequant reads the stored f16 one (ggml semantics)
+                    ok_rt &&= abs(src[bi * 32l + k] - v) <= d * 0.57 + 1.0e-7
+                }
+            }
+            t |> success(ok_rt, "every element within half a quantization step (+ f16-scale rounding)")
+            // idempotence: re-quantizing the dequantized row reproduces the bytes exactly
+            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 4l, 0l, kv_dim, reinterpret<float const?>(addr(dq[0])))
+            var idem = true
+            for (b in range64(rowb)) {
+                idem &&= kcl[3l * rowb + b] == kcl[4l * rowb + b]
+            }
+            t |> success(idem, "quantize(dequantize(row)) is byte-identical")
+            // head-slot partial store (sub = head_size = 32): lands at whole-block offset in row 1
+            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 1l, 32l, 32l, reinterpret<float const?>(addr(src[0])))
+            let row1 = reinterpret<uint8 const?>(kcl + 1l * rowb)
+            var ok_sub = true
+            for (k in range64(32l)) {
+                ok_sub &&= abs(src[k] - q8_row_elem(row1, 1l, k)) <= f16_to_f32(uint(row1[34l]) | (uint(row1[35l]) << 8u)) * 0.57 + 1.0e-7
+            }
+            t |> success(ok_sub, "head-slot store lands at the right block")
+            delete dq
+        }
+        delete src
+        delete s
+    }
+}
+
+[test]
+def test_kv_runs_flat(t : T?) {
+    t |> run("flat sessions: every window is exactly one identity run; kv_phys_row is identity") @(t : T?) {
+        let c = mk_config(2l, 4l, 2l, 64l, 16l)
+        var s <- make_run_state(c)
+        t |> equal(1, length(s.kv_runs))   // make_run_state sizes the flat scratch to one entry
+        // whole-window, offset-window, single-row — all one run with row0 == j0
+        var nrun = kv_runs(s, 0l, 16l, s.kv_runs)
+        t |> equal(1l, nrun)
+        t |> equal(0l, s.kv_runs[0].j0)
+        t |> equal(16l, s.kv_runs[0].j1)
+        t |> equal(0l, s.kv_runs[0].row0)
+        nrun = kv_runs(s, 5l, 12l, s.kv_runs)   // sliding-window shape
+        t |> equal(1l, nrun)
+        t |> equal(5l, s.kv_runs[0].j0)
+        t |> equal(12l, s.kv_runs[0].j1)
+        t |> equal(5l, s.kv_runs[0].row0)       // flat: physical row == absolute position
+        nrun = kv_runs(s, 7l, 8l, s.kv_runs)    // one row
+        t |> equal(1l, nrun)
+        t |> equal(7l, s.kv_runs[0].row0)
+        t |> equal(0l, kv_runs(s, 9l, 9l, s.kv_runs))   // empty window: no runs
+        t |> equal(0l, kv_runs(s, 9l, 3l, s.kv_runs))   // inverted window: no runs
+        for (pos in range64(16l)) {
+            t |> equal(pos, kv_phys_row(s, pos))
+        }
+        delete s
+    }
+}
+
+[test]
 def test_kv_store_row_f16(t : T?) {
     t |> run("f16 kv_store_row: RNE convert on store, clamp to ±65504, exact read-back") @(t : T?) {
         let c = mk_config(3l, 4l, 2l, 16l, 4l)
@@ -317,6 +434,164 @@ def test_kv_f16_prefill_vs_decode(t : T?) {
         set_prefill_attn_mode(prev_mode)
         set_target_chunk_work(prev_thresh)
         delete tr
+    }
+}
+
+// q8_0 model tests run a GGUF carrier (stories15M's head_size 48 is rejected by the create-time
+// 32-block check — by design); SmolLM2-135M is the small head_size-64 carrier, same rail as
+// test_fused_decode. Override the model root with DASLLAMA_MODELS_DIR.
+def private models_dir() : string {
+    let env = get_env_variable("DASLLAMA_MODELS_DIR")
+    return empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+}
+let GGUF_PATH = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
+
+def private gguf_missing(t : T?) : bool {
+    if (!jit_enabled()) {
+        t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+        return true
+    }
+    if (!stat(GGUF_PATH).is_valid) {
+        t |> success(true, "skipped: {GGUF_PATH} not present")
+        return true
+    }
+    return false
+}
+
+// teacher-forced per-step logits under one KV config: the SAME deterministic token stream into a
+// fresh session, all N_STEPS logit rows out — trajectory-compounding-free comparisons
+def private forced_logits(tr : Model; kdt, vdt : KVDtype; var out : array<float>) {
+    let c = tr.config
+    out |> resize(int(int64(N_STEPS) * c.vocab_size))
+    var s <- make_run_state(c, kdt, vdt)
+    var pos = 0l
+    for (st in range(N_STEPS)) {
+        forward(tr, s, int64(st * 37 % 100 + 2), pos)
+        pos++
+        let base = int64(st) * c.vocab_size
+        for (i in range64(c.vocab_size)) {
+            out[base + i] = s.logits[i]
+        }
+    }
+    delete s
+}
+
+def private worst_diff(a : array<float>; b : array<float>) : float {
+    var w = 0.0
+    for (i in range(length(a))) {
+        w = max(w, abs(a[i] - b[i]))
+    }
+    return w
+}
+
+[test]
+def test_kv_q8_decode(t : T?) {
+    t |> run("q8_0 KV: teacher-forced logits track f16, fused==std bit-exact under q8 (needs SmolLM2-135M)") @(t : T?) {
+        if (gguf_missing(t)) {
+            return
+        }
+        let prev_backend = active_kernel_backend()
+        let prev_thresh = get_target_chunk_work()
+        with_job_que() {
+            setup_dasllama_jobque_()
+            set_target_chunk_work(1l)
+            pin_kernel_backend("portable")   // the rows core every host shares — the fused gate needs one
+            var tr <- load_gguf(GGUF_PATH, QuantMode.q8)
+            tr.config.seq_len = min(tr.config.seq_len, 128l)
+            var lg16 : array<float>
+            var lg8 : array<float>
+            var lg8m : array<float>
+            var lg8f : array<float>
+            set_fused_decode(false)
+            forced_logits(tr, KVDtype.f16, KVDtype.f16, lg16)
+            forced_logits(tr, KVDtype.q8_0, KVDtype.q8_0, lg8)
+            forced_logits(tr, KVDtype.q8_0, KVDtype.f16, lg8m)   // K quantized, V half
+            set_fused_decode(true)
+            forced_logits(tr, KVDtype.q8_0, KVDtype.q8_0, lg8f)
+            // q8 vs f16, teacher-forced: per-step logits stay within the structural bound (greedy
+            // trajectories are NOT compared — on a 135M model a near-tie argmax flips under f16
+            // noise too, and one flip compounds the whole stream). Measured here: q8-vs-f32 noise
+            // is the same order as f16-vs-f32 (~0.4-1.8 worst per step).
+            let w8 = worst_diff(lg16, lg8)
+            t |> success(w8 < 4.0, "q8/q8-vs-f16 teacher-forced logits within the structural bound (worst |diff| = {w8})")
+            let w8m = worst_diff(lg16, lg8m)
+            t |> success(w8m < 4.0, "q8-K/f16-V-vs-f16 within the structural bound (worst |diff| = {w8m})")
+            // fused vs std, BOTH under q8: identical kernels + identical query quants -> bit-exact
+            var lg_bad = 0
+            for (i in range(length(lg8))) {
+                if (lg8[i] != lg8f[i]) {
+                    lg_bad++
+                }
+            }
+            t |> equal(0, lg_bad)
+            delete lg16
+            delete lg8
+            delete lg8m
+            delete lg8f
+            delete tr
+            clear_kernel_backend_pin()
+        }
+        set_target_chunk_work(prev_thresh)
+        select_kernel_backend(prev_backend)
+    }
+}
+
+[test]
+def test_kv_q8_prefill_vs_decode(t : T?) {
+    t |> run("q8_0 KV: blocked prefill == per-token decode, logits + cache bit-exact (needs SmolLM2-135M)") @(t : T?) {
+        if (gguf_missing(t)) {
+            return
+        }
+        let prev_thresh = get_target_chunk_work()
+        let prev_mode = get_prefill_attn_mode()
+        with_job_que() {
+            setup_dasllama_jobque_()
+            set_target_chunk_work(1l)
+            set_prefill_attn_mode(AttnPrefillMode.blocked)   // the bit-exact prefill mode (flash reorders)
+            var tr <- load_gguf(GGUF_PATH, QuantMode.q8)
+            tr.config.seq_len = min(tr.config.seq_len, 64l)
+            let c = tr.config
+            var prompt : array<int64>
+            for (i in range(16)) {
+                prompt |> push(int64(i % 50 + 2))
+            }
+            let n = int64(length(prompt))
+            var sp <- make_run_state(c, KVDtype.q8_0, KVDtype.q8_0)
+            forward_batch(tr, sp, prompt, n, 0l)
+            var sd <- make_run_state(c, KVDtype.q8_0, KVDtype.q8_0)
+            var pos = 0l
+            for (tok in prompt) {
+                forward(tr, sd, tok, pos)
+                pos++
+            }
+            // blocked prefill quantizes its queries and runs the SAME int8×int8 score dot as
+            // decode — the prefill==decode contract stays bit-exact under the block codec
+            var lg_bad = 0
+            for (i in range64(c.vocab_size)) {
+                if (sp.logits[i] != sd.logits[i]) {
+                    lg_bad++
+                }
+            }
+            t |> equal(0, lg_bad)
+            var kv_bad = 0
+            for (i in range(length(sd.key_cache))) {
+                if (sp.key_cache[i] != sd.key_cache[i]) {
+                    kv_bad++
+                }
+            }
+            for (i in range(length(sd.value_cache))) {
+                if (sp.value_cache[i] != sd.value_cache[i]) {
+                    kv_bad++
+                }
+            }
+            t |> equal(0, kv_bad)
+            delete sp
+            delete sd
+            delete prompt
+            delete tr
+        }
+        set_prefill_attn_mode(prev_mode)
+        set_target_chunk_work(prev_thresh)
     }
 }
 

@@ -4,15 +4,17 @@ A drop-in OpenAI-compatible server for [dasLLAMA](../../modules/dasLLAMA) CPU in
 entirely in daslang over the public dasLLAMA facade + the `dasHV` HTTP layer. Point any OpenAI
 client (opencode, Open WebUI, the `llm` CLI, the `openai` Python SDK, …) at `http://127.0.0.1:<port>/v1`.
 
-It reaches **only** public facade verbs (`load_model` / `create_chat` / `add_user` / `add_assistant` /
-`respond` / `transcribe` / `embed`) — that is the point: the server is the acceptance test for the
-API rework. If it builds with no reach into engine internals, the facade is complete.
+It reaches **only** public facade verbs (`load_model` / `create_chat_renderer` / `add_user` /
+`render_assistant` / `render_turn` / `eval_batch` via `llm_scheduler` / `transcribe` / `embed`) —
+that is the point: the server is the acceptance test for the API rework. If it builds with no
+reach into engine internals, the facade is complete.
 
 ## Run
 
 ```sh
 bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 8080] [--quant q8] \
-                                                    [--asr <asr.bin>] [--mmproj <mmproj.gguf>] [--ctx 4096]
+                                                    [--asr <asr.bin>] [--mmproj <mmproj.gguf>] [--ctx 4096] \
+                                                    [--streams 4] [--chunk 64] [--page-rows 64] [--prefix N]
 ```
 
 Run under `-jit` — interpreted inference is far too slow. Flags:
@@ -25,11 +27,24 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--asr` | `-a` | — | ASR model (whisper/parakeet/qwen3-asr) — enables the `/v1/audio/*` routes |
 | `--mmproj` | — | — | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
 | `--ctx` | — | `4096` | Context-length cap in tokens |
+| `--streams` | `-s` | `4` | Max concurrent generation streams |
+| `--chunk` | — | `64` | Prefill quantum in tokens — decode stalls at most this per tick |
+| `--page-rows` | — | `64` | KV page size in positions for paged serving |
+| `--prefix` | — | *auto* | Prefix-cache retention cap in pages (auto: one full context per stream; `-1` = unbounded) |
+| `--flat` | — | — | Flat preallocated KV sessions — disables paged serving and the prefix cache |
 | `--help` | `-?` | — | Show help and exit |
 
-The server is single-context and serializes requests on the tick thread (one in-flight request),
-matching dasLLAMA's one-generation-loop. OpenAI is stateless — the client resends the full
-transcript each turn.
+Chat and completion requests **batch continuously** (`llm_scheduler.das`): up to `--streams`
+generations run concurrently through one `eval_batch` decode step per tick, with long prompts
+prefilled in `--chunk`-token slices so a new arrival never stalls running streams for more than
+one chunk. Requests beyond `--streams` queue (up to 32; then 503). KV is **paged** by default —
+cache memory tracks each stream's actual context, and finished streams donate their pages to a
+**prefix cache**, so a repeated prompt prefix (a shared system prompt, the next turn of the same
+conversation) attaches instead of re-prefilling — time-to-first-token collapses on warm prompts.
+Clients whose connection drops mid-generation are evicted within a tick. The buffered endpoints
+(`/v1/models`, `/v1/embeddings`, `/v1/audio/*`) still run to completion in-handler and pause
+generation for their duration. OpenAI is stateless — the client resends the full transcript each
+turn.
 
 ## Endpoints
 
@@ -41,6 +56,7 @@ transcript each turn.
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |
 | `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`) |
 | `POST` | `/v1/audio/translations` | Speech→English text (needs `--asr`) |
+| `GET`  | `/v1/stats` | Scheduler counters: active/queued/peak_active, decode_steps, avg_batch, evicted, cached_tokens, prefix_pages, … |
 | `POST` | `/shutdown` | Graceful stop |
 
 ### Chat
@@ -77,14 +93,26 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 
 ## Testing
 
-`test_openai_server.das` (in this directory) is a model-gated, JIT-only conformance test: it starts
-the server on its own thread, then drives `/v1/models`, `/v1/embeddings`, and `/v1/chat/completions`
-over the real dashv HTTP client. It skips cleanly when the model GGUF is absent; set
-`DASLLAMA_MODELS_DIR` to point at a directory containing `tinyllama-1.1b-chat-v1.0.Q8_0.gguf`, then:
+All tests in this directory are model-gated and JIT-only (they skip cleanly when the GGUF is
+absent; set `DASLLAMA_MODELS_DIR`):
+
+- `test_openai_server.das` — endpoint conformance (`/v1/models`, `/v1/embeddings`, buffered chat)
+  over the real dashv HTTP client; needs `tinyllama-1.1b-chat-v1.0.Q8_0.gguf`.
+- `test_llm_scheduler.das` — the continuous-batching scheduler against `generate()` references
+  (bit-exact single stream, chunk invariance, staggered admits, eviction); needs
+  `SmolLM2-135M-Instruct-Q8_0.gguf`.
+- `test_openai_server_stream.das` — SSE chunk framing, the over-long-prompt 400, two concurrent
+  clients batching on one server (`peak_active >= 2` via `/v1/stats`), mid-generation disconnect
+  eviction, and the prefix cache returning an identical completion for a repeated request; needs
+  `SmolLM2-135M-Instruct-Q8_0.gguf`.
 
 ```sh
 bin/daslang -jit dastest/dastest.das -- --test utils/dasllama-server/test_openai_server.das
 ```
+
+`server_bench.das` (same directory) measures the serving latencies directly through the scheduler
+seam: tok/s + TTFT + inter-token percentiles vs batch size, decode stall per prefill chunk size,
+and warm-vs-cold TTFT for the prefix cache.
 
 ## Not yet implemented
 

@@ -60,6 +60,7 @@ namespace das {
     int das_writer_write_chunked ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * data );
     void das_writer_close ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w );
     void das_writer_release ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w );
+    bool das_writer_is_connected ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w );
 
     // response helpers
     http_status das_resp_string ( HttpResponse * resp, const char * msg, http_status status );

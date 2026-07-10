@@ -220,12 +220,21 @@ def private render_prompt_audio(m : Model; c : ChatSession; var head : array<int
 
 // ===== Public API =====
 
-//! Start a conversation over `model`. `system` is the system prompt (empty = none); `max_new` caps
-//! each reply; `kv_dtype` is the session's KV-cache codec (f16 default, f32 = bit-exact reference).
-//! A model can drive many independent ChatSessions.
-def create_chat_(model : Model; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
-    var c = ChatSession(session <- create_session_(model, kv_dtype, kv_dtype), tmpl <- chat_template(model),
-                        system = system, max_new = max_new)
+// Consume the pending user turn once its render is done — render_prompt_audio reads c.pending
+// gated only on n_audio_rows, so a leftover would silently re-inject the text into a later
+// audio-only turn.
+def private consume_pending_(var c : ChatSession) {
+    c.first = false
+    c.has_pending = false
+    c.pending = ""
+}
+
+//! `create_chat_`'s RENDER-ONLY twin: resolves the chat template, stop ids, and turn close exactly
+//! like `create_chat_`, but creates NO KV session — a queued request can render its whole prompt
+//! (`add_user_` / `render_assistant_` / `render_turn_` / `render_close_`) holding tokens only, no
+//! cache memory. Do not eval/respond on it.
+def create_chat_renderer_(model : Model; system : string = ""; max_new : int64 = 256l) : ChatSession {
+    var c = ChatSession(tmpl <- chat_template(model), system = system, max_new = max_new)
     for (sp in c.tmpl.stop) {
         let id = special_id(model, sp)
         if (id >= 0l) {
@@ -246,6 +255,15 @@ def create_chat_(model : Model; system : string = ""; max_new : int64 = 256l; kv
             }
         }
     }
+    return <- c
+}
+
+//! Start a conversation over `model`. `system` is the system prompt (empty = none); `max_new` caps
+//! each reply; `kv_dtype` is the session's KV-cache codec (f16 default, f32 = bit-exact reference).
+//! A model can drive many independent ChatSessions.
+def create_chat_(model : Model; system : string = ""; max_new : int64 = 256l; kv_dtype : KVDtype = KVDtype.f16) : ChatSession {
+    var c <- create_chat_renderer_(model, system, max_new)
+    c.session <- create_session_(model, kv_dtype, kv_dtype)
     return <- c
 }
 
@@ -292,6 +310,31 @@ def render_turn_(m : Model; c : ChatSession) : array<int64> {
     return <- out
 }
 
+//! Render the tokens that TERMINATE an assistant turn — the template's explicit assistant_close,
+//! else the user template's post-content parts — exactly what respond_/add_assistant_ eval after
+//! the reply. For schedulers that close a finished stream's turn themselves.
+def render_close_(m : Model; c : ChatSession) : array<int64> {
+    var out : array<int64>
+    render_parts(m, c.close_parts, "", out)
+    return <- out
+}
+
+//! `add_assistant_`'s render half: append the exact token stream a KNOWN assistant reply prefills —
+//! the pending user turn, the assistant-open prompt, `text`, and the turn close — to `out`, WITHOUT
+//! running the model, advancing the transcript exactly like `add_assistant_`. Replaying a stateless
+//! request's history on a `create_chat_renderer_` chat renders its full prompt while holding NO KV
+//! memory. Precondition: a user message is pending (`add_user_` first); a no-op otherwise.
+def render_assistant_(m : Model; var c : ChatSession; text : string; var out : array<int64>) {
+    if (!c.has_pending) {
+        return
+    }
+    render_prompt(m, c, out)
+    out |> push_from(encode_(m, text, false, false))
+    consume_pending_(c)
+    render_parts(m, c.close_parts, "", out)
+    c.history |> push(Message(role = Role.assistant, content = text))
+}
+
 //! Queue a user message for the next respond().
 def add_user_(var c : ChatSession; text : string) {
     c.pending = text
@@ -309,15 +352,14 @@ def add_assistant_(m : Model; var c : ChatSession; text : string) {
     if (!c.has_pending) {
         return
     }
+    // in lockstep with render_assistant_ (rendered ≡ evaled; test_chat's render-seam case proves
+    // it) — but evaled as the SAME three spans as always, so flash-prefill numerics never shift
     var pre : array<int64>
     render_prompt(m, c, pre)   // user turn + the assistant-open generation prompt
     eval_(m, c.session, pre)
     let body <- encode_(m, text, false, false)
     eval_(m, c.session, body)
-    c.first = false
-    c.has_pending = false
-    c.pending = ""   // consumed — render_prompt_audio reads it gated only on n_audio_rows, so a
-                     // leftover would silently re-inject this text into a later audio-only turn
+    consume_pending_(c)
     var close : array<int64>
     render_parts(m, c.close_parts, "", close)
     eval_(m, c.session, close)
@@ -386,10 +428,7 @@ def respond_(m : Model; var c : ChatSession; params : SamplingParams;
             return invoke(blk, piece)
         }
     }
-    c.first = false
-    c.has_pending = false
-    c.pending = ""   // consumed — render_prompt_audio reads it gated only on n_audio_rows, so a
-                     // leftover would silently re-inject this text into a later audio-only turn
+    consume_pending_(c)
     // close the assistant turn so the next turn continues cleanly
     var close : array<int64>
     render_parts(m, c.close_parts, "", close)

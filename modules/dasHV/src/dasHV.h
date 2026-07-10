@@ -61,6 +61,7 @@ int das_writer_sse_event ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter
 int das_writer_write_chunked ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * data );
 void das_writer_close ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w );
 void das_writer_release ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w );
+bool das_writer_is_connected ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w );
 
 http_status das_resp_string ( HttpResponse * resp, const char * msg, http_status status = HTTP_STATUS_OK );
 http_status das_resp_json ( HttpResponse * resp, const char * json_str, http_status status = HTTP_STATUS_OK );

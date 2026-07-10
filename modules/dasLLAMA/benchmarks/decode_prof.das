@@ -41,6 +41,12 @@ struct Args {
     @clarg_doc = "KV cache dtype (default: f32)"
     kv : KVDtype = KVDtype.f32
 
+    @clarg_doc = "Page the KV cache through a KVPool instead of the flat slabs"
+    paged : bool
+
+    @clarg_doc = "Positions per page when --paged (default: 64)"
+    page_rows : int = 64
+
     @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; 1 = thread everything, -1 = keep default)"
     target_work : int = -1
 
@@ -98,7 +104,6 @@ def private mb(v : double) : double => v / (1024.0lf * 1024.0lf)
 def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     let c = t.config
     let wb = wbytes(t.quant)
-    let kv_esize = double(kv_elem_bytes(kvdt))
     let dim = c.dim
     var attn = 0.0lf
     var kv_read = 0.0lf
@@ -108,7 +113,7 @@ def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
         let wv = t.wv_offs[l] >= 0l ? double(dim * kvd) : 0.0lf
         attn += (double(dim * qd) + double(dim * kvd) + wv + double(qd * dim)) * wb
         let cnt = layer_is_sliding(c, l) ? min(pos, c.sliding_window) : pos
-        kv_read += double(cnt * kvd) * 2.0lf * kv_esize
+        kv_read += double(cnt * kv_row_bytes(kvdt, kvd)) * 2.0lf   // row bytes: codec-exact (q8_0 incl. block scales)
     }
     var ffn = 0.0lf
     var moe = 0.0lf
@@ -164,9 +169,16 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     return tok
 }
 
-def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype) {
+def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype; paged : bool; page_rows : int64) {
     let c = t.config
-    var s <- make_run_state(c, kvdt, kvdt)
+    var pool <- create_kv_pool_(c, page_rows, kvdt, kvdt)   // empty (no groups) unless --paged
+    var s : Session
+    if (paged) {
+        s <- make_run_state_paged(c, pool)
+        print("paged KV: page_rows={page_rows}\n")
+    } else {
+        s <- make_run_state(c, kvdt, kvdt)
+    }
     with_job_que() {
         setup_dasllama_jobque_()   // pooled forks + batched dispatch + spin window + join poll (the engine standard)
         if (team) {   // needs the live job que — must sit inside with_job_que
@@ -256,5 +268,5 @@ def main() {
     if (cfg.kv != KVDtype.f32) {
         print("kv cache dtype: {cfg.kv}\n")
     }
-    run_profile(t, p, n, p2, cfg.team, cfg.kv)
+    run_profile(t, p, n, p2, cfg.team, cfg.kv, cfg.paged, int64(cfg.page_rows))
 }
