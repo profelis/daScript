@@ -2781,6 +2781,16 @@ namespace das {
 
     // Used in daNetGame currently
     void Program::serialize ( AstSerializer & ser ) {
+        // version gate: any layout change shifts every subsequent field, so a stale stream must
+        // fail cleanly here — not misparse into a patch() throw thousands of fields later
+        uint32_t version = AstSerializer::getVersion();
+        ser << version;
+        if ( !ser.writing && version != AstSerializer::getVersion() ) {
+            LOG(LogLevel::warning) << "das: deserialize: stream version " << version
+                << " does not match serializer version " << AstSerializer::getVersion() << "\n";
+            failToCompile = true;
+            return;
+        }
         // Bump epoch so reused pointer addresses across program boundaries
         // get distinct SerializeNodeIds on this persistent serializer.
         ser.epoch++;
@@ -2936,7 +2946,14 @@ namespace das {
         auto prog = make_smart<Program>();
         {
             gc_guard deserialize_gc_scope;
-            prog->serialize(*state->serializer);
+            // same-version streams can still be truncated/corrupt: the stream readers throw
+            // dasException — turn it into the clean failToCompile path (mirrors serializeScript)
+            try {
+                prog->serialize(*state->serializer);
+            } catch ( const dasException & r ) {
+                prog->failToCompile = true;
+                LOG(LogLevel::warning) << "das: deserialize: " << r.what() << "\n";
+            }
             /*
             // THIS ONES ARE FROM THE "already exist" MODULES
             auto leftover = deserialize_gc_scope.guard_root.gc_count;
