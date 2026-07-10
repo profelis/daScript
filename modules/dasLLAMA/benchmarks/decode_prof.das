@@ -62,6 +62,12 @@ struct Args {
     @clarg_doc = "Team dispatch: workers self-serve chunks off one published atomic instead of per-chunk fifo jobs"
     team : bool
 
+    @clarg_doc = "Save a per-lane jobque event trace of the FIRST decode window to this path (Perfetto/chrome-tracing JSON)"
+    trace : string
+
+    @clarg_doc = "GEMV chunks per lane (>1 = fine-grain self-serve tail A/B; default 1 = equal split)"
+    fine : int = 1
+
     @clarg_doc = "A/B: size chunk counts to workers only (the pre-fix split), not workers + caller lane"
     legacy_lanes : bool
 
@@ -169,7 +175,7 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     return tok
 }
 
-def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype; paged : bool; page_rows : int64) {
+def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype; paged : bool; page_rows : int64; trace : string) {
     let c = t.config
     var pool <- create_kv_pool_(c, page_rows, kvdt, kvdt)   // empty (no groups) unless --paged
     var s : Session
@@ -195,7 +201,18 @@ def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVD
         let prompt <- build_prompt(p)
         forward_prefill(t, s, prompt, p, 0l)
         var tok = greedy_top(s, c.vocab_size)
+        if (!empty(trace)) {
+            jobque_trace_start(1 << 17)
+        }
         tok = profile_window(t, s, p, n, tok)
+        if (!empty(trace)) {
+            jobque_trace_stop()
+            if (jobque_trace_save(trace)) {
+                print("jobque trace saved: {trace}\n")
+            } else {
+                print("jobque trace: nothing recorded\n")
+            }
+        }
         if (p2 > p + n) {   // second window, deeper into the context, off the same load
             let fill = p2 - (p + n)
             let more <- build_prompt(fill)
@@ -259,6 +276,10 @@ def main() {
         set_dispatch_caller_lane(false)
         print("dispatch lanes: workers only (legacy)\n")
     }
+    if (cfg.fine > 1) {
+        set_gemv_chunks_per_lane(cfg.fine)
+        print("gemv_chunks_per_lane override: {cfg.fine}\n")
+    }
     // A/B the fused per-block decode chains (default on; 0 = per-op dispatches) — same rail
     // as emission_bench
     if (has_env_variable("DASLLAMA_FUSED_DECODE")) {
@@ -268,5 +289,5 @@ def main() {
     if (cfg.kv != KVDtype.f32) {
         print("kv cache dtype: {cfg.kv}\n")
     }
-    run_profile(t, p, n, p2, cfg.team, cfg.kv, cfg.paged, int64(cfg.page_rows))
+    run_profile(t, p, n, p2, cfg.team, cfg.kv, cfg.paged, int64(cfg.page_rows), cfg.trace)
 }

@@ -542,6 +542,14 @@ var g_matmul_min_chunk_rows_gemv = 64
 def public set_matmul_min_chunk_rows_gemv(v : int) { g_matmul_min_chunk_rows_gemv = max(v, 0) }
 def public get_matmul_min_chunk_rows_gemv() : int { return g_matmul_min_chunk_rows_gemv }
 
+// GEMV tail A/B (per-lane trace, 3990X 2026-07-10): the one-chunk-per-lane equal split leaves
+// the join waiting out the SLOWEST lane's whole chunk — the median lane idles the last 14-24%
+// of every GEMV stage. >1 publishes up to this many wave-aligned chunks per lane (grain-floored)
+// so finished lanes keep serving and the tail shrinks to one small chunk. 1 = historical split.
+var g_gemv_chunks_per_lane = 1
+def public set_gemv_chunks_per_lane(v : int) { g_gemv_chunks_per_lane = max(v, 1) }
+def public get_gemv_chunks_per_lane() : int { return g_gemv_chunks_per_lane }
+
 // Wave fill: when the grain-derived count lands in [lanes/2, lanes), round UP to one full wave —
 // chunks shrink but stay >= grain/2 (the grain is chosen halvable), and no lane idles. Counts
 // below lanes/2 stay grain-limited (filling would shred chunks below the halvable bound).
@@ -563,10 +571,34 @@ def public matmul_chunks_gemv(rows : int; oversplit : int; work : int64) : int {
     if (g_matmul_min_chunk_rows_gemv <= 0) {
         return L * max(oversplit, 1)
     }
+    if (g_gemv_chunks_per_lane > 1) {
+        let waves = min(rows / (g_matmul_min_chunk_rows_gemv * L), g_gemv_chunks_per_lane)
+        if (waves >= 1) {
+            let chunks = waves * L
+            assert_wave_aligned(chunks, L)
+            return chunks
+        }
+        // fewer than one grain-sized chunk per lane — the grain-limited split below applies
+    }
     let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, L)
     let chunks = (g_gemv_wave_fill && n < L && 2 * n >= L) ? L : n
     assert_wave_aligned(chunks, L)
     return chunks
+}
+
+//! Chunk count for a fused-chain stage over `groups` 32-row quant groups: the GEMV shaper's
+//! count, except fine-grain mode (gemv_chunks_per_lane > 1) splits at GROUP granularity (capped
+//! at lanes × fine) — chain chunks self-serve, so a ragged last wave costs one 32-row chunk,
+//! not one lane's whole share. Narrow (dim-sized) stages sit under the 64-row-grain × lane
+//! floor and kept a ~25% join tail otherwise (per-lane trace, 3990X).
+def public chain_stage_chunks(groups : int; rows : int; work : int64) : int {
+    if (g_gemv_chunks_per_lane > 1) {
+        let L = lanes_for_work(work, g_gemv_lane_cap)
+        if (L > 1) {
+            return min(groups, L * g_gemv_chunks_per_lane)
+        }
+    }
+    return matmul_chunks_gemv(rows, 1, work)
 }
 
 //! y = W·x — matrix-vector product, the dominant LLM compute kernel.

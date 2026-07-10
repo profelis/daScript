@@ -2944,14 +2944,18 @@ def has_dual_rope(c : Config) : bool => (c.sliding_window > 0l
 // here without touching forward(). Bit-identical to the inlined form.
 
 // Flash-decode slicing (fused attention chain): a decode context deeper than FLASH_DECODE_SLICE
-// positions splits each head's KV pass into ceil(cnt/slice) slices (capped) with a per-head
+// positions splits each head's KV pass into ceil(cnt/SLICE_LEN) slices (capped) with a per-head
 // combine stage — the KV stream stops being limited to n_heads lanes (Qwen3-0.6B zen2: T>16 bought
 // nothing, attn_chain 68% of token time at ctx 2048). Slice count derives from CONTEXT ONLY —
 // never lane count — so generation stays deterministic and box/T-independent; ctx <= 256 keeps
 // the exact single-pass body (bit-identical to the un-fused path). The sliced path reassociates
 // the softmax/AV sums (flash-decode partials), so deep-ctx fused output is tolerance-equal, not
-// bit-equal, to the un-fused path (test_fused_flash_deep_ctx). Slice length tuning = ledger.
-let FLASH_DECODE_SLICE = 256l
+// bit-equal, to the un-fused path (test_fused_flash_deep_ctx). SLICE_LEN < SLICE keeps the
+// bit-exact region while giving a 1-kv-head arch (Gemma) enough slice units to feed the lanes —
+// per-lane trace 3990X: 256-len slices left 14 of 16 lanes idle through the longest stage at
+// ctx 512. Slice length tuning = ledger.
+let FLASH_DECODE_SLICE = 256l       // single-pass threshold: cnt <= this never slices
+let FLASH_DECODE_SLICE_LEN = 32l    // slice granularity once slicing engages
 let FLASH_DECODE_MAX_SLICES = 16l
 
 // attn-norm → QKV(+bias) → RoPE → KV-store → GQA multi-head attention → out-proj(+post-norm) → residual.
@@ -2969,18 +2973,20 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
         && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
 }
 
-// Fused attention block: ONE team rendezvous runs [qkv rows + bias/qk-norm/rope/kv-store] →
-// [attn heads + per-head wo-input requant] → [wo rows + bias + residual add] as three stages
-// (team_parallel_stages). At ctx <= FLASH_DECODE_SLICE this is bit-identical to
-// attention_std_decode — the same backend row dots, the same per-head norm/rope/store/softmax
-// order, the same adds — only the scheduling changes: the per-op fork/joins collapse into
-// worker-side stage barriers, and every piece of serial glue between the old dispatches becomes
-// a chunk-local epilogue. Deeper contexts switch to the 4-stage flash shape (see
-// FLASH_DECODE_SLICE above): stage 1 becomes (head x kv-slice) partials and a per-head combine
-// stage rescales + requants — tolerance-equal, not bit-equal, to the un-fused path. Stage
-// geometry: stage 0 splits over HEAD slots (q heads, then k heads, then v heads — each
-// head_size rows, so rope/norm/store are chunk-local), stage 1 over query heads (or
-// head x slice units), then [combine +] 32-row output groups.
+// Fused attention block: ONE team rendezvous runs [qkv rows + bias] → [per-head-slot
+// qk-norm/rope/kv-store] → [attn heads + per-head wo-input requant] → [wo rows + bias +
+// residual add] as four stages (team_parallel_stages). At ctx <= FLASH_DECODE_SLICE this is
+// bit-identical to attention_std_decode — the same backend row dots, the same per-head
+// norm/rope/store/softmax order, the same adds — only the scheduling changes: the per-op
+// fork/joins collapse into worker-side stage barriers, and every piece of serial glue between
+// the old dispatches becomes a chunk-local epilogue. Deeper contexts switch to the 5-stage
+// flash shape (see FLASH_DECODE_SLICE above): the attn stage becomes (kv-head x kv-slice)
+// partials and a per-head combine stage rescales + requants — tolerance-equal, not bit-equal,
+// to the un-fused path. Stage geometry: stage 0 splits the qkv rows over 32-row groups (row
+// dots + bias are row-local, so ALL lanes serve — one chunk per whole head left 10 of 16 lanes
+// idle on a 4-head model); stage 1 runs the head-local epilogue over HEAD slots (q heads, then
+// k heads, then v heads — norm/rope/store need the whole head); stage 2 over query heads (or
+// kv-head x slice units), then [combine +] 32-row output groups.
 def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : int64) {
     let c = t.config
     let dim = c.dim
@@ -3004,15 +3010,16 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let ts_chain = ref_time_ticks()
     // stage geometry (same grain math as the per-op dispatches; the C++ side clamps chunks <= range)
     let nslots = int(n_heads + 2l * n_kv_heads)
-    let n0 = matmul_chunks_gemv(int(qd + 2l * kv_dim), 1, dim * (qd + 2l * kv_dim))
+    let ngq = int((qd + 2l * kv_dim) / 32l)   // stage-0 domain: 32-row groups (head_size % 32 == 0 by the fuse gate)
+    let n0 = chain_stage_chunks(ngq, int(qd + 2l * kv_dim), dim * (qd + 2l * kv_dim))
     let n1 = get_dispatch_lanes()
     let ngrp = int(dim / 32l)
-    let n2 = matmul_chunks_gemv(int(dim), 1, qd * dim)
-    // flash-decode slicing: nsl slices per head past FLASH_DECODE_SLICE positions (ctx-derived
-    // ONLY — deterministic, box/T-independent); nsl == 1 keeps the exact single-pass body and
-    // today's 3-stage shape. Sliced shape inserts a per-head combine stage: [qkv][partials]
-    // [combine+requant][wo].
-    let nsl = int(min(FLASH_DECODE_MAX_SLICES, 1l + (cnt - 1l) / FLASH_DECODE_SLICE))
+    let n2 = chain_stage_chunks(ngrp, int(dim), qd * dim)
+    // flash-decode slicing: FLASH_DECODE_SLICE_LEN-position slices once cnt crosses
+    // FLASH_DECODE_SLICE (ctx-derived ONLY — deterministic, box/T-independent); nsl == 1 keeps
+    // the exact single-pass body and the 4-stage shape. Sliced shape inserts a per-head combine
+    // stage: [qkv rows][head epilogue][partials][combine+requant][wo].
+    let nsl = cnt <= FLASH_DECODE_SLICE ? 1 : int(min(FLASH_DECODE_MAX_SLICES, (cnt + FLASH_DECODE_SLICE_LEN - 1l) / FLASH_DECODE_SLICE_LEN))
     let slice_len = (cnt + int64(nsl) - 1l) / int64(nsl)
     if (nsl > 1) {
         let need = int(n_heads) * nsl
@@ -3024,18 +3031,20 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         if (length(s.fl_o) < needo) {
             s.fl_o |> resize(needo)
         }
-        s.chain_stages |> resize(4)
-        s.chain_stages[0] = int3(0, nslots, n0)
-        s.chain_stages[1] = int3(0, int(n_kv_heads) * nsl, int(n_kv_heads) * nsl)
-        s.chain_stages[2] = int3(0, int(n_heads), int(n_heads))
-        s.chain_stages[3] = int3(0, ngrp, n2)
-        count_parallel_dispatch(min(n0, nslots) + int(n_kv_heads) * nsl + int(n_heads) + min(n2, ngrp))
+        s.chain_stages |> resize(5)
+        s.chain_stages[0] = int3(0, ngq, n0)
+        s.chain_stages[1] = int3(0, nslots, nslots)
+        s.chain_stages[2] = int3(0, int(n_kv_heads) * nsl, int(n_kv_heads) * nsl)
+        s.chain_stages[3] = int3(0, int(n_heads), int(n_heads))
+        s.chain_stages[4] = int3(0, ngrp, n2)
+        count_parallel_dispatch(min(n0, ngq) + nslots + int(n_kv_heads) * nsl + int(n_heads) + min(n2, ngrp))
     } else {
-        s.chain_stages |> resize(3)
-        s.chain_stages[0] = int3(0, nslots, n0)
-        s.chain_stages[1] = int3(0, int(n_heads), n1)
-        s.chain_stages[2] = int3(0, ngrp, n2)
-        count_parallel_dispatch(min(n0, nslots) + min(n1, int(n_heads)) + min(n2, ngrp))
+        s.chain_stages |> resize(4)
+        s.chain_stages[0] = int3(0, ngq, n0)
+        s.chain_stages[1] = int3(0, nslots, nslots)
+        s.chain_stages[2] = int3(0, int(n_heads), n1)
+        s.chain_stages[3] = int3(0, ngrp, n2)
+        count_parallel_dispatch(min(n0, ngq) + nslots + min(n1, int(n_heads)) + min(n2, ngrp))
     }
     let mmrows = mm_q8q8_rows_fn()
     let neox = c.rope_neox
@@ -3101,18 +3110,54 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         var flop = nsl > 1 ? addr(s.fl_o[0]) : null
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             if (stage == 0) {
-                // qkv rows by head slot; per-slot epilogue = bias → norm → rope → cache store
+                // qkv rows in 32-row groups — dots + bias are row-local, so every lane serves;
+                // the head-local epilogue (norm/rope/store/quant) is stage 1's head slots. A
+                // group never straddles a q/k/v region boundary (all regions are head_size
+                // multiples and head_size % 32 == 0 by the fuse gate).
+                unsafe {
+                    var r = int64(jb) * 32l
+                    let rend = int64(je) * 32l
+                    while (r < rend) {
+                        if (r < qd) {
+                            let r1 = min(rend, qd)
+                            invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r, r1)
+                            if (bqp != null) {
+                                for (i in range64(r, r1)) {
+                                    qp[i] += bqp[bqoff + i]
+                                }
+                            }
+                            r = r1
+                        } elif (r < qd + kv_dim) {
+                            let r0 = r - qd
+                            let r1 = min(rend, qd + kv_dim) - qd
+                            invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r1)
+                            if (bkp != null) {
+                                for (i in range64(r0, r1)) {
+                                    kp[i] += bkp[bkvoff + i]
+                                }
+                            }
+                            r = r1 + qd
+                        } else {
+                            let r0 = r - qd - kv_dim
+                            let r1 = min(rend, qd + 2l * kv_dim) - qd - kv_dim
+                            invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r1)
+                            if (bvp != null) {
+                                for (i in range64(r0, r1)) {
+                                    vp[i] += bvp[bkvoff + i]
+                                }
+                            }
+                            r = r1 + qd + kv_dim
+                        }
+                    }
+                }
+            } elif (stage == 1) {
+                // head-local epilogue by head slot: norm → rope → cache store (k/v), roped-query
+                // quantize (q, q8 K) — whole-head reductions, so the split floor is the slot
                 unsafe {
                     for (slot in range(jb, je)) {
                         let sl = int64(slot)
                         if (sl < n_heads) {
                             let r0 = sl * head_size
-                            invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r0, r0 + head_size)
-                            if (bqp != null) {
-                                for (i in range64(r0, r0 + head_size)) {
-                                    qp[i] += bqp[bqoff + i]
-                                }
-                            }
                             if (rqp != null) {
                                 rmsnorm(qp + r0, qp + r0, rqp, head_size, eps)
                             }
@@ -3126,12 +3171,6 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             }
                         } elif (sl < n_heads + n_kv_heads) {
                             let r0 = (sl - n_heads) * head_size
-                            invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r0 + head_size)
-                            if (bkp != null) {
-                                for (i in range64(r0, r0 + head_size)) {
-                                    kp[i] += bkp[bkvoff + i]
-                                }
-                            }
                             if (rkp != null) {
                                 rmsnorm(kp + r0, kp + r0, rkp, head_size, eps)
                             }
@@ -3143,12 +3182,6 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             kv_store_row(kcl, kdt, kv_dim, prow, r0, head_size, kp + r0)
                         } else {
                             let r0 = (sl - n_heads - n_kv_heads) * head_size
-                            invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r0 + head_size)
-                            if (bvp != null) {
-                                for (i in range64(r0, r0 + head_size)) {
-                                    vp[i] += bvp[bkvoff + i]
-                                }
-                            }
                             if (rvp != null) {
                                 rmsnorm(vp + r0, vp + r0, rvp, head_size, eps)
                             }
@@ -3156,7 +3189,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         }
                     }
                 }
-            } elif (stage == 1 && nsl == 1) {
+            } elif (stage == 2 && nsl == 1) {
                 // multi-head attention (the attention_std_decode worker body) + per-head requant of
                 // the wo input — each head's xb slice is final here, and head_size % 32 == 0, so the
                 // quant groups are chunk-local. Overwrites xq/xs; stage 0 (the only reader of the
@@ -3171,7 +3204,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
                     }
                 }
-            } elif (stage == 1) {
+            } elif (stage == 2) {
                 // flash-decode partials: unit = (KV-head, slice) — the slice's K/V rows stream
                 // ONCE and serve all kv_mul q-heads of the group (a GQA logical-read halving;
                 // deep-ctx decode attention is DRAM-bound on many-lane boxes, so the per-q-head
@@ -3236,9 +3269,9 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             qh0, kv_mul, seq_len, int64(nsl), sl)
                     }
                 }
-            } elif (stage == 2 && nsl > 1) {
+            } elif (stage == 3 && nsl > 1) {
                 // per-head combine (flash rescale; sink joins max + denominator, softmax_sink
-                // contract) + the wo-input requant that the single-pass body does in stage 1
+                // contract) + the wo-input requant that the single-pass body does in stage 2
                 unsafe {
                     for (h in range(jb, je)) {
                         let hh = int64(h)
@@ -3344,8 +3377,8 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
     let post_norm = c.pre_post_norm
     let ngrp0 = int(hidden / 32l)
     let ngrp1 = int(dim / 32l)
-    let n0 = matmul_chunks_gemv(int(hidden), 1, 2l * dim * hidden)
-    let n1 = matmul_chunks_gemv(int(dim), 1, hidden * dim)
+    let n0 = chain_stage_chunks(ngrp0, int(hidden), 2l * dim * hidden)
+    let n1 = chain_stage_chunks(ngrp1, int(dim), hidden * dim)
     s.chain_stages |> resize(2)
     s.chain_stages[0] = int3(0, ngrp0, n0)
     s.chain_stages[1] = int3(0, ngrp1, n1)

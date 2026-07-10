@@ -152,7 +152,7 @@ namespace das {
         // before advancing — stage s+1 may read anything stage s wrote. One publish + one join
         // for the whole chain; the inter-stage barriers are worker-side spins, so a fused
         // norm→matmul→matmul chain pays the dispatch rendezvous once instead of per op.
-        static constexpr int MAX_TEAM_STAGES = 4;
+        static constexpr int MAX_TEAM_STAGES = 6;
         struct TeamStage {
             const JobChunk * work;      // work(chunkIndex, workerSlot)
             int numChunks;
@@ -171,6 +171,16 @@ namespace das {
         void setTeamProf ( bool on ) { mTeamProf = on; }
         void resetTeamProf ();
         TeamProfSnapshot getTeamProf () const;
+        // Per-lane event tracer (opt-in): every lane records events into its OWN pre-allocated
+        // ring (plain stores, no atomics on the record path) stamped with the global
+        // ref_time_ticks clock, so all lanes' parallel event chains line up on one timeline.
+        // traceSave writes chrome://tracing JSON (open in Perfetto / chrome://tracing): one row
+        // per lane — chunks, stage waits, wakes and fifo jobs as spans; the gaps ARE the view.
+        // Arm/disarm from the dispatching thread with no dispatch in flight. Ring full = that
+        // lane stops recording (no wrap — the window you armed is the window you get).
+        void traceStart ( int eventsPerLane );
+        void traceStop () { mTraceOn.store(0, std::memory_order_seq_cst); }
+        bool traceSave ( const char * path );   // false = nothing recorded or io error
     protected:
         struct JobEntry {
             JobEntry( Job&& _function, JobCategory _category, JobPriority _priority) {
@@ -260,6 +270,28 @@ namespace das {
         uint64_t mTPn = 0, mTPchunks = 0, mTPcallerChunks = 0, mTPsolo = 0;
         uint64_t mTPpub = 0, mTPserve = 0, mTPtail = 0, mTPtotal = 0;
         uint64_t mTPreact = 0, mTPreactN = 0, mTPlastRel = 0, mTPlastN = 0;
+        // per-lane trace rings (see traceStart). lane == worker threadIndex; the dispatching
+        // caller records as lane getNumWorkers().
+        enum class TraceTag : uint32_t { ChainPublish, Chunk, StageWait, Wake, FifoJob };
+        struct TraceEvent {
+            uint64_t t0, t1;        // ref_time_ticks (ns, one clock for every lane)
+            uint32_t tag, stage;    // TraceTag; stage index (Chunk/StageWait) or stage count (ChainPublish)
+            uint32_t arg, chain;    // chunk index / total chunks / parked flag; team seq of the chain
+        };
+        struct LaneTrace {
+            vector<TraceEvent> ev;
+            uint32_t n = 0;
+            char pad[64];           // keep the hot write index off the neighbor lane's cache line
+        };
+        atomic<int32_t> mTraceOn{0};
+        vector<LaneTrace> mTrace;
+        __forceinline void traceEvent ( int lane, TraceTag tag, uint64_t t0, uint64_t t1,
+                uint32_t stage, uint32_t arg, uint32_t chain ) {
+            if ( uint32_t(lane) >= uint32_t(mTrace.size()) ) return;
+            auto & L = mTrace[lane];
+            if ( L.n >= uint32_t(L.ev.size()) ) return;
+            L.ev[L.n++] = { t0, t1, uint32_t(tag), stage, arg, chain };
+        }
     protected:
         mutex mEvalMainThreadMutex;
         vector<Job> mEvalMainThread;
