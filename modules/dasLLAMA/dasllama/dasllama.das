@@ -202,6 +202,14 @@ def create_chat(model : Model; var tower : AudioTower; system : string = ""; max
     return <- create_chat_(model, tower, system, max_new, kv_dtype)
 }
 
+def create_chat_renderer(model : Model; system : string = ""; max_new : int64 = 256l) : ChatSession {
+    //! ``create_chat``'s RENDER-ONLY twin: resolves the chat template, stop ids, and turn close
+    //! exactly like ``create_chat``, but creates NO KV session — a queued request can render its
+    //! whole prompt (``add_user`` / ``render_assistant`` / ``render_turn`` / ``render_close``)
+    //! holding tokens only, no cache memory. It cannot ``respond``/``eval``.
+    return <- create_chat_renderer_(model, system, max_new)
+}
+
 def add_user(var chat : ChatSession; text : string) {
     //! Queue a user message for the next ``respond``.
     add_user_(chat, text)
@@ -235,6 +243,21 @@ def render_turn(model : Model; chat : ChatSession) : array<int64> {
     //! Render the next turn's prefill token ids — BOS + system on the first turn, then the user turn
     //! and the generation prompt — WITHOUT running the model. For inspection, token budgeting, tests.
     return <- render_turn_(model, chat)
+}
+
+def render_assistant(model : Model; var chat : ChatSession; text : string; var out : array<int64>) {
+    //! ``add_assistant``'s render half: append the exact token stream a known assistant reply
+    //! prefills — the pending user turn, the assistant-open prompt, ``text``, and the turn close —
+    //! to ``out`` WITHOUT running the model, advancing the transcript exactly like ``add_assistant``.
+    //! Replay a stateless request's history on a ``create_chat_renderer`` chat to render its full
+    //! prompt with no KV memory. Precondition: a user message is pending; a no-op otherwise.
+    render_assistant_(model, chat, text, out)
+}
+
+def render_close(model : Model; chat : ChatSession) : array<int64> {
+    //! The tokens that TERMINATE an assistant turn (what ``respond`` evals after the reply) — for
+    //! schedulers that close a finished stream's turn themselves.
+    return <- render_close_(model, chat)
 }
 
 def respond(model : Model; var chat : ChatSession; params : SamplingParams;

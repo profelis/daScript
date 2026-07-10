@@ -35,6 +35,19 @@ def private same(a, b : array<int64>) : bool {
     return true
 }
 
+// KV caches are codec-encoded byte blobs — byte equality IS bit-exactness for a same-dtype pair
+def private same(a, b : array<uint8>) : bool {
+    if (length(a) != length(b)) {
+        return false
+    }
+    for (i in range(length(a))) {
+        if (a[i] != b[i]) {
+            return false
+        }
+    }
+    return true
+}
+
 // Load capped to a tiny context: these cases only render prompts, and the session's KV cache is sized
 // to config.seq_len — Phi/Llama-3's native 131072 would allocate ~64GB.
 def private load_capped(path : string) : Model {
@@ -331,6 +344,58 @@ def test_chat_pending_cleared_on_consume(t : T?) {
             add_assistant(m, c, "One, two, three, four.")
             t |> equal(c.pending, "", "add_assistant() cleared the consumed text")
             delete c
+            delete m
+        }
+    }
+}
+
+// ===== render seam: render_assistant produces EXACTLY the tokens add_assistant evals =====
+
+[test]
+def test_chat_render_seam(t : T?) {
+    t |> run("render_assistant ≡ add_assistant evals; renderer chat holds no KV (needs SmolLM2-135M)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: {path} not present")
+            return
+        }
+        with_job_que() {
+            setup_dasllama_jobque()
+            var m <- load_capped(path)
+            // classic prefill is bit-exact under ANY chunking (test_prefill's contract), so a
+            // byte-equal cache proves the render and eval paths agree token for token
+            let saved_mode = get_prefill_attn_mode()
+            set_prefill_attn_mode(AttnPrefillMode.classic)
+            var a = create_chat(m, SYS, 4l)   // the eval path: two replayed turns
+            add_user(a, "Count to three.")
+            add_assistant(m, a, "One, two, three.")
+            add_user(a, "And four?")
+            add_assistant(m, a, "Four.")
+            var b = create_chat_renderer(m, SYS, 4l)   // the render path: same turns, tokens only
+            var toks : array<int64>
+            add_user(b, "Count to three.")
+            render_assistant(m, b, "One, two, three.", toks)
+            add_user(b, "And four?")
+            render_assistant(m, b, "Four.", toks)
+            t |> equal(length(b.session.key_cache), 0, "renderer chat allocates no KV")
+            t |> equal(b.session.n_past, 0l, "renderer chat never evals")
+            t |> equal(a.session.n_past, int64(length(toks)), "rendered token count == evaled positions")
+            t |> equal(length(b.history), length(a.history), "transcripts advance in lockstep")
+            t |> equal(b.pending, "", "render_assistant consumed the pending text")
+            t |> success(same(b.stop_ids, a.stop_ids), "renderer resolves the same stop ids")
+            // eval the rendered stream on a fresh session: byte-equal caches ⟺ identical tokens
+            var s <- create_session(m)
+            eval(m, s, toks)
+            t |> success(same(a.session.key_cache, s.key_cache), "key cache byte-equal: rendered ≡ evaled")
+            t |> success(same(a.session.value_cache, s.value_cache), "value cache byte-equal: rendered ≡ evaled")
+            set_prefill_attn_mode(saved_mode)
+            delete s
+            delete b
+            delete a
             delete m
         }
     }
