@@ -822,6 +822,11 @@ namespace das {
         return g_jobQue->traceSave(path ? path : "");
     }
 
+    void jobque_trace_tag ( int32_t tag, Context *, LineInfoArg * ) {
+        // op tag for subsequent trace publishes (viewer color channel); no-op without a que
+        if ( g_jobQue ) g_jobQue->traceSetTag(tag);
+    }
+
     void team_parallel_for_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
         if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
         int total = rangeEnd - rangeBegin;
@@ -1479,6 +1484,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(jobque_trace_save)>(*this, lib,  "jobque_trace_save",
                 SideEffects::modifyExternal, "jobque_trace_save")
                     ->args({"path","context","line"});
+            addExtern<DAS_BIND_FUN(jobque_trace_tag)>(*this, lib,  "jobque_trace_tag",
+                SideEffects::modifyExternal, "jobque_trace_tag")
+                    ->args({"tag","context","line"});
             addExtern<DAS_BIND_FUN(team_parallel_for_invoke)>(*this, lib,  "team_parallel_for_invoke",
                 SideEffects::modifyExternal, "team_parallel_for_invoke")
                     ->args({"range_begin","range_end","num_chunks","lambda","function","lambdaSize","context","line"});

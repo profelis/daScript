@@ -195,9 +195,11 @@ def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVD
         var tok = greedy_top(s, c.vocab_size)
         if (!empty(trace)) {
             jobque_trace_start(1 << 17)
+            set_trace_tags(true)
         }
         tok = profile_window(t, s, p, n, tok)
         if (!empty(trace)) {
+            set_trace_tags(false)
             jobque_trace_stop()
             if (jobque_trace_save(trace)) {
                 print("jobque trace saved: {trace}\n")

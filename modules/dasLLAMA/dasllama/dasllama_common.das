@@ -3001,6 +3001,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
     prof_add("norm", ts_norm0)
     let ts_chain = ref_time_ticks()
+    trace_tag(TRACE_TAG_ATTN_CHAIN)
     // stage geometry (same grain math as the per-op dispatches; the C++ side clamps chunks <= range)
     let nslots = int(n_heads + 2l * n_kv_heads)
     let ngq = int((qd + 2l * kv_dim) / 32l)   // stage-0 domain: 32-row groups (head_size % 32 == 0 by the fuse gate)
@@ -3352,14 +3353,15 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     }
 }
 
-// Can the dense FFN run as the fused 2-stage chain? Q8, no post-block scale, team mode + a
-// backend row core, and the size threshold. pre_post_norm (Gemma2/3) is handled: the chain
-// defers the residual add and the caller runs the serial post-norm + add after the rendezvous.
-def private fused_ffn_ok(t : Model) : bool {
+// Can layer l's dense FFN run as the fused 2-stage chain? Q8, team mode + a backend row core,
+// and the size threshold (per-layer width — gemma-4 E2B varies it). pre_post_norm (Gemma2/3)
+// and layer_out_scale (gemma4) are handled: the chain defers the residual add and the caller's
+// serial tail runs post-norm and/or the fused add+scale after the rendezvous.
+def private fused_ffn_ok(t : Model; l : int64) : bool {
     let c = t.config
-    return (g_fused_decode && t.quant == QuantMode.q8 && !c.layer_out_scale
+    return (g_fused_decode && t.quant == QuantMode.q8
         && get_jobque_team_mode() && kernel_backend_has_rows()
-        && lanes_for_work(c.dim * c.hidden_dim, g_gemv_lane_cap) > 1)
+        && lanes_for_work(c.dim * layer_hidden(t, l), g_gemv_lane_cap) > 1)
 }
 
 // Fused dense FFN block: ONE team rendezvous runs [w1+w3 rows + act + requant] → [w2 rows +
@@ -3371,19 +3373,24 @@ def private fused_ffn_ok(t : Model) : bool {
 def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
     let c = t.config
     let dim = c.dim
-    let hidden = c.hidden_dim
+    let hidden = layer_hidden(t, l)   // gemma-4 E2B varies FFN width per layer
     let ts_norm1 = ref_time_ticks()
     rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
     quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
     prof_add("norm", ts_norm1)
     let ts_chain = ref_time_ticks()
+    trace_tag(TRACE_TAG_FFN_CHAIN)
     let mmrows = mm_q8q8_rows_fn()
     let is_gelu = c.ffn_act == FfnAct.gelu
     let is_oai = c.ffn_act == FfnAct.swiglu_oai
     let vec = g_act_vec
     // Gemma2/3: the post-FFN norm is a whole-vector reduction over the down-proj output, so the
-    // chain can't fold the residual add into stage 1 — it lands serially after the rendezvous
+    // chain can't fold the residual add into stage 1 — it lands serially after the rendezvous.
+    // gemma4's layer_out_scale (applied after the residual, unless PLE owns it later) defers the
+    // add the same way; the tail finishes with the fused add+scale.
     let post_norm = c.pre_post_norm
+    let out_scale_here = c.layer_out_scale && !has_ple(c)
+    let defer_add = post_norm || out_scale_here
     let ngrp0 = int(hidden / 32l)
     let ngrp1 = int(dim / 32l)
     let n0 = chain_stage_chunks(ngrp0, int(hidden), 2l * dim * hidden)
@@ -3402,7 +3409,7 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         var xs2p = addr(s.xs2[0])
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
         let wsb = reinterpret<float const?>(addr(t.qscales[0]))
-        let w1o = t.w1_offs[l]   // fused chain runs only for uniform-width arches (layer_out_scale gates it off)
+        let w1o = t.w1_offs[l]
         let w3o = t.w3_offs[l]
         let w2o = t.w2_offs[l]
         let wp1 = wqb + w1o
@@ -3438,10 +3445,10 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
                     }
                     quantize_q8_0_into_ptr(gup + r0, r1 - r0, xq2p, xs2p, r0, r0 / 32l)
                 } else {
-                    // down-projection rows + residual add (post-norm arches defer the add —
-                    // the caller's serial tail owns it)
+                    // down-projection rows + residual add (post-norm / layer_out_scale arches
+                    // defer the add — the caller's serial tail owns it)
                     invoke(mmrows, xbp, wp2, ws2, xq2p, xs2p, hidden, r0, r1)
-                    if (!post_norm) {
+                    if (!defer_add) {
                         add_inplace(xp + r0, xbp + r0, r1 - r0)
                     }
                 }
@@ -3449,11 +3456,16 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         }
     }
     prof_add("ffn_chain", ts_chain)
-    if (post_norm) {  // Gemma2/3: post-FFN RMSNorm before the residual add — same serial tail
-        // as the un-fused path (dim-sized, microseconds), bit-identical order
+    if (defer_add) {  // same serial tail as the un-fused path (dim-sized, microseconds), bit-identical order
         let ts_resid = ref_time_ticks()
-        rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
-        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
+        if (post_norm) {  // Gemma2/3/4: post-FFN RMSNorm before the residual add
+            rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
+        }
+        if (out_scale_here) {  // gemma4 12B/31B: residual + per-layer output scale, one pass
+            add_scale_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), t.fblob[t.out_scale_off + l], dim)
+        } else {
+            add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
+        }
         prof_add("act_resid", ts_resid)
     }
 }
@@ -3463,6 +3475,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         attention_chain_decode(t, s, l, pos)
         return
     }
+    trace_tag(TRACE_TAG_ATTN_STD)
     let c = t.config
     let dim = c.dim
     let kv_dim = layer_kv_dim(c, l)
@@ -3654,10 +3667,11 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
 }
 
 def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
-    if (fused_ffn_ok(t)) {
+    if (fused_ffn_ok(t, l)) {
         ffn_chain_decode(t, s, l)
         return
     }
+    trace_tag(TRACE_TAG_FFN_STD)
     let c = t.config
     let dim = c.dim
     // ffn rmsnorm
@@ -3785,6 +3799,7 @@ def private moe_shexp_gate(t : Model; l : int64; xp : float const?) : float {
 // qwen2moe / gpt-oss (via moe_ffn_core) and gemma4 (which folds its per-expert down scale into
 // s.moe_w before the call). The router + select + any shared-expert steps live in the callers.
 def private moe_experts_apply(t : Model; var s : Session; l : int64) {
+    trace_tag(TRACE_TAG_MOE)
     let c = t.config
     let dim = c.dim
     let ne = c.n_expert
@@ -3923,6 +3938,7 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     if (c.n_ff_shexp > 0l) {
         let pre_q8 = t.quant == QuantMode.q8
         let ts_sh = ref_time_ticks()
+        trace_tag(TRACE_TAG_SHEXP)
         let g = moe_shexp_gate(t, l, unsafe(addr(s.xb[0])))
         let nsh = c.n_ff_shexp
         let she = dim * nsh
@@ -3999,6 +4015,7 @@ def private ple_pre_prefill_pad(t : Model; var s : Session; npos : int64) {
 
 // Per-layer block (decode): cur += post_norm(proj · (gelu(inp_gate·cur) ⊙ ple_inp[l])). In place on s.x.
 def private ple_block_decode(t : Model; var s : Session; l : int64) {
+    trace_tag(TRACE_TAG_PLE)
     let c = t.config
     let dim = c.dim
     let ple = c.n_embd_per_layer
@@ -4078,6 +4095,7 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     rms_at(s.moe_acc, t, t.rms_post_ffn2_off + l * dim, s.moe_acc, dim)
     // dense parallel shared expert (its own pre/post norms), into s.xb
     let ts_sh = ref_time_ticks()
+    trace_tag(TRACE_TAG_SHEXP)
     rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.moe_ao, dim)
     dense_ffn_inplace(t, s, l)
     rms_at(s.xb, t, t.rms_post_ffn1_off + l * dim, s.xb, dim)
@@ -4234,6 +4252,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {
 
     // final rmsnorm (into xb to avoid aliasing x as both in/out), then classifier
     let ts_final = ref_time_ticks()
+    trace_tag(TRACE_TAG_CLS)
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
     if (c.shared_weights && !t.cls_q8) {
         // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table

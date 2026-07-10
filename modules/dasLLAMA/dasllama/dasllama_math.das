@@ -340,6 +340,25 @@ var g_team_rank_gate = -1
 def public set_team_rank_gate(v : int) { g_team_rank_gate = clamp(v, -1, 1) }
 def public get_team_rank_gate() : int { return g_team_rank_gate }
 
+// Trace op tags (jobque_trace_tag): stamped before dispatches so the lane-timeline viewer colors
+// by OP rather than stage-count. Gated — set_trace_tags(true) rides with jobque_trace_start in
+// the profiling harness; production dispatches never pay the extern call.
+var g_trace_tags = false
+def public set_trace_tags(on : bool) { g_trace_tags = on }
+let public TRACE_TAG_ATTN_CHAIN = 1
+let public TRACE_TAG_ATTN_STD = 2
+let public TRACE_TAG_FFN_CHAIN = 3
+let public TRACE_TAG_FFN_STD = 4
+let public TRACE_TAG_CLS = 5
+let public TRACE_TAG_MOE = 6
+let public TRACE_TAG_SHEXP = 7
+let public TRACE_TAG_PLE = 8
+def public trace_tag(t : int) {
+    if (g_trace_tags) {
+        jobque_trace_tag(t)
+    }
+}
+
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
 //! batched dispatch, the spin-before-park window (box_profile.json "runtime" `jobque_spin_us`
 //! overrides the shipped 30000us; 0 disables the spin), and the join-poll level ("jobque_join_poll",

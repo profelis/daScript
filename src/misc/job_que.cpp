@@ -685,7 +685,8 @@ namespace das {
         }
         if ( mTeamProf ) tp = uint64_t(ref_time_ticks());
         if ( tracing ) traceEvent(nW, TraceTag::ChainPublish, tt0, uint64_t(ref_time_ticks()),
-            uint32_t(numStages), uint32_t(totalChunks), chainSeq);
+            uint32_t(numStages) | (uint32_t(mTraceTag.load(std::memory_order_relaxed)) << 8),
+            uint32_t(totalChunks), chainSeq);
         // caller serves every stage and participates in every barrier (slot nW)
         for ( int s = 0; s != numStages; ++s ) {
             for (;;) {

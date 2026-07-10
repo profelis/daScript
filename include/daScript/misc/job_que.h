@@ -181,6 +181,10 @@ namespace das {
         void traceStart ( int eventsPerLane );
         void traceStop () { mTraceOn.store(0, std::memory_order_seq_cst); }
         bool traceSave ( const char * path );   // false = nothing recorded or io error
+        // Op tag for subsequent publishes (viewer color channel): the dispatching code stamps a
+        // small app-defined id before a dispatch; ChainPublish records numStages | (tag << 8) in
+        // its stage field, and workers' chunk events join to it via the chain id.
+        void traceSetTag ( int tag ) { mTraceTag.store(tag, std::memory_order_relaxed); }
     protected:
         struct JobEntry {
             JobEntry( Job&& _function, JobCategory _category, JobPriority _priority) {
@@ -284,6 +288,7 @@ namespace das {
             char pad[64];           // keep the hot write index off the neighbor lane's cache line
         };
         atomic<int32_t> mTraceOn{0};
+        atomic<int32_t> mTraceTag{0};   // current op tag (traceSetTag) — folded into ChainPublish.stage's high bits
         vector<LaneTrace> mTrace;
         __forceinline void traceEvent ( int lane, TraceTag tag, uint64_t t0, uint64_t t1,
                 uint32_t stage, uint32_t arg, uint32_t chain ) {
