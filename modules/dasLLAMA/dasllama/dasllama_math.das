@@ -107,6 +107,135 @@ def template cvt_f16_to_f32_template(var d : float ?; s : uint16 const ?; n : in
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def cvt_f16_to_f32(var d : float?; s : uint16 const?; n : int64) {}
 
+// The q8_0 KV-codec kernels: the cache side is ggml block_q8_0 — 32 int8 quants sharing one f16
+// scale, INTERLEAVED {f16 d; int8 qs[32]} = 34 bytes per block (llama.cpp -ctk/-ctv q8_0 layout,
+// so the oracle cross-checks stay honest). Rows are whole blocks (kv_dim % 32 == 0, validated at
+// session create), so a row is n/32 blocks and the scale sits 2-byte aligned at each 34-byte step
+// (17 uint16s). n is always a multiple of 32.
+
+//! Dot of an f32 query row against a q8_0 cache row: the block scale factors out —
+//! d * Σ a[j]·q[j] per 32-block (the prefill read; decode uses the int8×int8 twin below).
+[hint(unsafe_range_check, noalias = a, noalias = b)]
+def template dot_q8kv_template(a : float const ?; b : uint8 const ?; n : int64) : float {
+    var acc = 0.0
+    unsafe {
+        let b16 = reinterpret<uint16 const?>(b)
+        let bq = reinterpret<int8 const?>(b)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 34l + 2l
+            var facc = 0.0
+            for [tune = 1] (k in range64(32l)) {
+                facc = mad(a[base + k], float(bq[qb + k]), facc)
+            }
+            acc = mad(facc, f16_to_f32(uint(b16[bi * 17l])), acc)
+        }
+    }
+    return acc
+}
+[hint(unsafe_range_check, noalias = a, noalias = b), tuned]
+def dot_q8kv(a : float const?; b : uint8 const?; n : int64) : float {}
+
+//! THE q8_0 decode hot path: a Q8-quantized query (int8 quants + f32 scales per 32, the
+//! quantize_q8_0_into planes) against a q8_0 cache row. The inner loop is pure int8·int8
+//! multiply-accumulate — the same SDOT/VNNI shape as dot_q8q8 — with both block scales
+//! multiplying in once per 32-block.
+[hint(unsafe_range_check, noalias = q, noalias = qs, noalias = b)]
+def template dot_q8q8kv_template(q : int8 const ?; qs : float const ?; b : uint8 const ?; n : int64) : float {
+    var acc = 0.0
+    unsafe {
+        let b16 = reinterpret<uint16 const?>(b)
+        let bq = reinterpret<int8 const?>(b)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 34l + 2l
+            var iacc = 0
+            for [tune = 1] (k in range64(32l)) {
+                iacc += int(q[base + k]) * int(bq[qb + k])
+            }
+            acc += float(iacc) * qs[bi] * f16_to_f32(uint(b16[bi * 17l]))
+        }
+    }
+    return acc
+}
+[hint(unsafe_range_check, noalias = q, noalias = qs, noalias = b), tuned(fallback = "vec16")]
+def dot_q8q8kv(q : int8 const?; qs : float const?; b : uint8 const?; n : int64) : float {}
+
+//! AXPY from a q8_0 cache row: d[j] += scale * (q[j] * d_block) — the V-accumulate under the
+//! q8_0 codec; scale * d_block hoists per 32-block.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template axpy_q8kv_template(var d : float ?; s : uint8 const ?; scale : float; n : int64) : void {
+    unsafe {
+        let s16 = reinterpret<uint16 const?>(s)
+        let sq = reinterpret<int8 const?>(s)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 34l + 2l
+            let c = scale * f16_to_f32(uint(s16[bi * 17l]))
+            for [tune = 1] (k in range64(32l)) {
+                d[base + k] = mad(c, float(sq[qb + k]), d[base + k])
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def axpy_q8kv(var d : float?; s : uint8 const?; scale : float; n : int64) {}
+
+//! q8_0 -> f32 row convert (the flash pack's bulk dequant): d[j] = q[j] * d_block.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template cvt_q8kv_to_f32_template(var d : float ?; s : uint8 const ?; n : int64) : void {
+    unsafe {
+        let s16 = reinterpret<uint16 const?>(s)
+        let sq = reinterpret<int8 const?>(s)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 34l + 2l
+            let db = f16_to_f32(uint(s16[bi * 17l]))
+            for [tune = 1] (k in range64(32l)) {
+                d[base + k] = float(sq[qb + k]) * db
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def cvt_q8kv_to_f32(var d : float?; s : uint8 const?; n : int64) {}
+
+//! Quantize n f32s (a whole number of 32-blocks) into q8_0 blocks at dst — the codec store.
+//! ggml's exact quantize_row_q8_0 semantics: per block d = amax/127 stored as f16, quants
+//! round with the UN-rounded f32 1/d — which makes the codec idempotent (re-quantizing a
+//! dequantized row is byte-identical: the max element quantizes to ±127, so the recovered
+//! d equals the stored f16 exactly). amax uses quantize_q8_0_into_ptr's two-lane float4 max
+//! (exact — max is order-free on finite input).
+[hint(unsafe_range_check, noalias = dst, noalias = src)]
+def template quantize_q8kv_row_template(var dst : uint8 ?; src : float const ?; n : int64) : void {
+    unsafe {
+        let p4 = reinterpret<float4 const?>(src)
+        var d16 = reinterpret<uint16?>(dst)
+        var dq = reinterpret<int8?>(dst)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let f4 = base / 4l
+            var m0 = abs(p4[f4])
+            var m1 = abs(p4[f4 + 1l])
+            for (k in range64(1l, 4l)) {
+                m0 = max(m0, abs(p4[f4 + 2l * k]))
+                m1 = max(m1, abs(p4[f4 + 2l * k + 1l]))
+            }
+            let m = max(m0, m1)
+            let amax = max(max(m.x, m.y), max(m.z, m.w))
+            let d = amax / 127.0
+            let id = d != 0.0 ? 1.0 / d : 0.0
+            d16[bi * 17l] = uint16(f32_to_f16(d))
+            let qb = bi * 34l + 2l
+            for [tune = 1] (i in range64(32l)) {
+                dq[qb + i] = int8(round(src[base + i] * id))
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = dst, noalias = src), tuned(fallback = "plain")]
+def quantize_q8kv_row(var dst : uint8?; src : float const?; n : int64) {}
+
 //! d[j] += s[j], width-8 vectorized (the residual-stream update). The plain `for k; a[k]+=b[k]`
 //! over bounds-checked arrays does NOT vectorize under the JIT — this pointer form is ~5x faster.
 [hint(unsafe_range_check, noalias = d, noalias = s)]

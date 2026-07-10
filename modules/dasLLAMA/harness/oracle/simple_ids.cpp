@@ -23,7 +23,7 @@
 #include <vector>
 
 static void print_usage(const char * argv0) {
-    fprintf(stderr, "\nusage: %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-p prompt]\n\n", argv0);
+    fprintf(stderr, "\nusage: %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-p prompt] [-ctk f16|q8_0]\n\n", argv0);
 }
 
 int main(int argc, char ** argv) {
@@ -31,6 +31,7 @@ int main(int argc, char ** argv) {
 
     std::string model_path;
     std::string prompt = "Once upon a time";
+    std::string ctk;      // KV-cache type override (K AND V) — "" keeps llama.cpp's default (f16)
     int ngl = 0;          // CPU only — match dasLLAMA's CPU forward so argmax ties agree
     int n_predict = 40;
 
@@ -43,10 +44,16 @@ int main(int argc, char ** argv) {
             ngl = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             prompt = argv[++i];
+        } else if (strcmp(argv[i], "-ctk") == 0 && i + 1 < argc) {
+            ctk = argv[++i];
         } else {
             print_usage(argv[0]);
             return 1;
         }
+    }
+    if (!ctk.empty() && ctk != "f16" && ctk != "q8_0") {
+        fprintf(stderr, "simple_ids: unsupported -ctk %s (f16|q8_0)\n", ctk.c_str());
+        return 1;
     }
     if (model_path.empty()) {
         print_usage(argv[0]);
@@ -83,6 +90,15 @@ int main(int argc, char ** argv) {
     ctx_params.n_ctx   = n_prompt + n_predict;
     ctx_params.n_batch = n_prompt;
     ctx_params.no_perf = true;
+    if (ctk == "q8_0") {
+        // the dasLLAMA q8_0 KV parity arm: quantized V needs flash attention in llama.cpp
+        ctx_params.type_k = GGML_TYPE_Q8_0;
+        ctx_params.type_v = GGML_TYPE_Q8_0;
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    } else if (ctk == "f16") {
+        ctx_params.type_k = GGML_TYPE_F16;
+        ctx_params.type_v = GGML_TYPE_F16;
+    }
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (ctx == NULL) {
         fprintf(stderr, "simple_ids: failed to create context\n");

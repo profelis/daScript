@@ -66,10 +66,13 @@ enum AttnPrefillMode {
 
 //! KV-cache storage codec, chosen per session at create time via ``create_session``/``create_chat``
 //! (llama.cpp -ctk/-ctv analog; K and V carry independent dtypes). f16 is the facade default
-//! (half the KV bytes, near-lossless); f32 is the bit-exact reference.
+//! (half the KV bytes, near-lossless); f32 is the bit-exact reference. q8_0 is the block codec
+//! (32 int8 quants + one f16 scale per block, ggml block_q8_0 layout — 34 bytes per 32 elements,
+//! ~half the f16 bytes again); it needs kv_dim and head_size multiples of 32 (checked at create).
 enum KVDtype {
     f32
     f16
+    q8_0
 }
 
 //! Model hyperparameters (the 7-int checkpoint header plus derived sizes).
@@ -1447,6 +1450,11 @@ struct Session {
     logits : array<float>     // output logits (vocab_size)
     xq : array<int8>          // activation quantized to Q8 (sized max(dim, hidden_dim)) for the Q8·Q8 kernel
     xs : array<float>         // per-block activation scales (sized max(dim, hidden_dim) / 32)
+    // q8_0-K decode query, quantized ONCE per token after RoPE (empty unless kv_dtype_k == q8_0;
+    // batched decode resizes to nrows × qd). Dedicated planes: xq/xs hold the LIVE input quants
+    // while the fused chain's stage-0 q epilogues fill these
+    attq : array<int8>        // quantized query rows (qd)
+    atts : array<float>       // ... and their per-32-block scales (qd / 32)
     // fused decode-chain scratch (team_parallel_stages): the FFN chain's stage-0 workers requant
     // their activated-hidden rows while OTHER chunks still read the input quants in xq/xs, so the
     // requant needs its own buffers; chain_stages is the reused stage-def array (no per-layer alloc)
@@ -1550,10 +1558,27 @@ struct Session {
     ple_gate : array<float>     // per-(position) gate vector for the layer block (npos x ple)
 }
 
+// q8_0 KV needs whole 32-blocks everywhere the cache is sliced: rows (kv_dim) and head slots
+// (head_size — reads offset per head, the fused chain stores per head slot). Real GGUF targets
+// pass (head sizes 64/128/256); llama2.c stories15M (head_size 48) is rejected by design.
+def private kv_validate_q8(c : Config; kdt, vdt : KVDtype) {
+    if (kdt != KVDtype.q8_0 && vdt != KVDtype.q8_0) {
+        return
+    }
+    for (l in range64(c.n_layers)) {
+        let kvd = layer_kv_dim(c, l)
+        let hs = layer_head_size(c, l)
+        if (kvd % 32l != 0l || hs % 32l != 0l) {
+            panic("q8_0 KV cache needs layer kv_dim and head_size to be multiples of 32 — layer {l} has kv_dim={kvd}, head_size={hs}")
+        }
+    }
+}
+
 //! Allocate the run state sized to a model. `kdt`/`vdt` pick the KV-cache codec for THIS session
 //! (no process-global state — sessions with different codecs coexist, models run in parallel).
 //! `alloc_cache = false` skips the flat cache slabs (paged sessions and cache-less scratch).
 def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32; alloc_cache : bool = true) : Session {
+    kv_validate_q8(c, kdt, vdt)
     var s : Session
     // qd = n_heads * head_size, the query / attention-output width. == dim for the llama family,
     // but Gemma2 has qd (2048) != dim (2304), so q and the attention scratch xb size to max(dim, qd).
@@ -1604,6 +1629,10 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
     s.xs |> resize(maxn / 32l)
     s.xq2 |> resize(ffw)        // fused-FFN chain requant (see the Session field comment)
     s.xs2 |> resize(ffw / 32l)
+    if (kdt == KVDtype.q8_0) {  // q8_0 K: the roped query quantizes ONCE per token (ggml lesson)
+        s.attq |> resize(qd)
+        s.atts |> resize(qd / 32l)
+    }
     s.chain_stages |> resize(3)
     s.kv_runs |> resize(1)      // flat cache: every window is one physical run (paged sessions re-size)
     // KV cache: walk the per-layer row-byte prefixes (the byte analog of layout_offsets'
@@ -1981,7 +2010,17 @@ def private rope_batch_tab(var q_b : array<float>; var k_b : array<float>; cos_t
 def kv_elem_bytes(dt : KVDtype) : int64 => dt == KVDtype.f16 ? 2l : 4l
 
 //! Byte stride of one position row of width kv_dim under codec dt — THE layout seam.
-def kv_row_bytes(dt : KVDtype; kv_dim : int64) : int64 => kv_dim * kv_elem_bytes(dt)
+//! q8_0: kv_dim/32 blocks of {f16 d; int8 qs[32]} = 34 bytes each (kv_dim % 32 == 0 by create).
+def kv_row_bytes(dt : KVDtype; kv_dim : int64) : int64 {
+    return dt == KVDtype.q8_0 ? kv_dim / 32l * 34l : kv_dim * kv_elem_bytes(dt)
+}
+
+//! Head-slot offset in the side's own addressing units: elements for scalar codecs, bytes for
+//! q8_0 (whole blocks — head_size % 32 == 0 by create). The _d dispatch wrappers prescale with
+//! this so the codec-generic workers' `(rowbase + j) * kdim + khoff` walks stay unit-correct.
+def kv_side_off(dt : KVDtype; elems : int64) : int64 {
+    return dt == KVDtype.q8_0 ? elems / 32l * 34l : elems
+}
 
 //! Layer l's slab base (BYTES) in the key cache; the byte analog of kv_cache_off, reading the
 //! LIVE seq_len so post-load seq_len caps keep working.
@@ -2074,6 +2113,7 @@ def create_kv_pool_(c : Config; page_rows : int64; kdt, vdt : KVDtype) : KVPool 
     if (page_rows <= 0l) {
         panic("create_kv_pool: page_rows must be positive (got {page_rows})")
     }
+    kv_validate_q8(c, kdt, vdt)
     var p = KVPool(page_rows = page_rows, kdt = kdt, vdt = vdt)
     p.blob_of |> reserve(int(c.n_layers))
     for (l in range64(c.n_layers)) {
@@ -2174,6 +2214,12 @@ def kv_store_row(var dst0 : uint8?; dt : KVDtype; kv_dim, row, sub, n : int64; s
             var d = reinterpret<uint16?>(dst0)
             cvt_f32_to_f16(d + row * kv_dim + sub, src, n)   // clamps to ±65504: inf never enters the cache
         }
+    } elif (dt == KVDtype.q8_0) {
+        unsafe {
+            // sub is 0 or a head boundary and head_size/kv_dim are 32-multiples (create-time
+            // contract), so the destination is always a whole-block offset
+            quantize_q8kv_row(dst0 + (row * kv_dim + sub) / 32l * 34l, src, n)
+        }
     } else {
         panic("KV cache codec not yet implemented")
     }
@@ -2190,6 +2236,28 @@ def private kv_axpy(var d : float?; s : uint16 const?; scale : float; n : int64)
     axpy_f16(d, s, scale, n)
 }
 def private kv_load(p : uint16 const?; base, i : int64) : float => f16_to_f32(uint(unsafe(p[base + i])))
+// q8_0: the cache pointer stays uint8 (byte units — the _d wrappers prescale stride/offset via
+// kv_side_off), so `base` here is a whole-block BYTE offset and `i` an element index within it
+def private kv_dot(a : float const?; b : uint8 const?; n : int64) : float => dot_q8kv(a, b, n)
+def private kv_axpy(var d : float?; s : uint8 const?; scale : float; n : int64) {
+    axpy_q8kv(d, s, scale, n)
+}
+def private kv_load(p : uint8 const?; base, i : int64) : float {
+    unsafe {
+        let blk = p + base + i / 32l * 34l
+        let b16 = reinterpret<uint16 const?>(blk)   // bind first: reinterpret would swallow the index
+        let bq = reinterpret<int8 const?>(blk)
+        return float(bq[2l + i % 32l]) * f16_to_f32(uint(b16[0]))
+    }
+}
+// kv_side_off's pointer-typed twin for code that is generic over the cache element type (the
+// flash-decode witness): element offset -> the side's own addressing units
+[unused_argument(p)]
+def private kv_head_off(p : float const?; elems : int64) : int64 => elems
+[unused_argument(p)]
+def private kv_head_off(p : uint16 const?; elems : int64) : int64 => elems
+[unused_argument(p)]
+def private kv_head_off(p : uint8 const?; elems : int64) : int64 => elems / 32l * 34l
 
 // Bulk one-row dequant into f32 scratch — the flash pack's per-row primitive (and any future
 // codec's bulk-dequant seam: q8_0 adds a cvt overload here, never a new pack shape).
@@ -2203,6 +2271,30 @@ def private kv_row_to_f32(var d : float?; p : uint16 const?; base, n : int64) {
         cvt_f16_to_f32(d, p + base, n)
     }
 }
+def private kv_row_to_f32(var d : float?; p : uint8 const?; base, n : int64) {
+    unsafe {
+        cvt_q8kv_to_f32(d, p + base, n)
+    }
+}
+
+// Decode-read score dot, resolved on the K-cache pointer type: scalar codecs dot the f32 query;
+// q8_0 dots the PRE-QUANTIZED query planes (qq/qs — filled once per token after RoPE) through the
+// int8×int8 kernel. Lets the flash-decode witness recompute scores exactly as the sliced path did.
+[unused_argument(qq, qs)]
+def private kv_score(qp : float const?; qq : int8 const?; qs : float const?; kcp : float const?;
+                     koff, qoff, head_size : int64) : float {
+    return kv_dot(unsafe(qp + qoff), unsafe(kcp + koff), head_size)
+}
+[unused_argument(qq, qs)]
+def private kv_score(qp : float const?; qq : int8 const?; qs : float const?; kcp : uint16 const?;
+                     koff, qoff, head_size : int64) : float {
+    return kv_dot(unsafe(qp + qoff), unsafe(kcp + koff), head_size)
+}
+[unused_argument(qp)]
+def private kv_score(qp : float const?; qq : int8 const?; qs : float const?; kcp : uint8 const?;
+                     koff, qoff, head_size : int64) : float {
+    return dot_q8q8kv(unsafe(qq + qoff), unsafe(qs + qoff / 32l), unsafe(kcp + koff), head_size)
+}
 
 // One decode attention head over one layer's cache slab — the attention_std_decode /
 // chain-decode stage-1 worker body, generic over the cache element type (float = f32; further
@@ -2210,8 +2302,11 @@ def private kv_row_to_f32(var d : float?; p : uint16 const?; base, n : int64) {
 // pointers; arow is this head's score row (window-relative: arow[j - kstart]). Cache rows are
 // found through `runs` (physical position runs, kv_runs contract): the flat single-run case is
 // instruction-identical to a direct kstart..kstart+cnt walk. kdim/khoff and vdim/vhoff are the
-// PER-SIDE row stride / head offset in the side's own units (elements for scalar codecs).
+// PER-SIDE row stride / head offset in the side's own units (elements for scalar codecs, BYTES
+// for q8_0). Scores go through kv_score, which resolves on the K pointer type: scalar codecs dot
+// the f32 query, q8_0 runs the int8×int8 dot against the pre-quantized planes qq/qs.
 def private attn_head_decode(var arow : float?; var xbp : float?; qp : float const?;
+                             qq : int8 const?; qsp : float const?;
                              kcp, vcp : auto const?; runs : KVRun const?;
                              nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh : int64;
                              scale, attn_softcap : float; sinksp : float const?) {
@@ -2221,7 +2316,7 @@ def private attn_head_decode(var arow : float?; var xbp : float?; qp : float con
             let rj1 = min(runs[r].j1, kstart + cnt)
             let rowbase = runs[r].row0 - runs[r].j0
             for (j in range64(rj0, rj1)) {
-                arow[j - kstart] = kv_dot(qp + qoff, kcp + (rowbase + j) * kdim + khoff, head_size) * scale
+                arow[j - kstart] = kv_score(qp, qq, qsp, kcp, (rowbase + j) * kdim + khoff, qoff, head_size) * scale
             }
         }
         if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
@@ -2248,9 +2343,11 @@ def private attn_head_decode(var arow : float?; var xbp : float?; qp : float con
 }
 
 // Flash-decode sliced K pass (chain stage 1, nsl > 1): the slice's K rows stream once, dotted
-// against every q-head of the GQA group. Codec-generic + run-walking like attn_head_decode;
-// the slice sub-window [kstart+j0, kstart+j1) intersects each run.
-def private kv_slice_scores(var attp : float?; qp : float const?; kcp : auto const?; runs : KVRun const?;
+// against every q-head of the GQA group. Codec-generic + run-walking like attn_head_decode
+// (scores through kv_score — q8_0 K reads the pre-quantized query planes qq/qs); the slice
+// sub-window [kstart+j0, kstart+j1) intersects each run.
+def private kv_slice_scores(var attp : float?; qp : float const?; qq : int8 const?; qsp : float const?;
+                            kcp : auto const?; runs : KVRun const?;
                             nrun, kstart, j0, j1, kdim, khoff, head_size, qh0, kv_mul, seq_len : int64;
                             scale : float) {
     unsafe {
@@ -2262,7 +2359,7 @@ def private kv_slice_scores(var attp : float?; qp : float const?; kcp : auto con
                 let j = aj - kstart
                 let koff = (rowbase + aj) * kdim + khoff
                 for (g in range64(kv_mul)) {
-                    attp[(qh0 + g) * seq_len + j] = kv_dot(qp + (qh0 + g) * head_size, kcp + koff, head_size) * scale
+                    attp[(qh0 + g) * seq_len + j] = kv_score(qp, qq, qsp, kcp, koff, (qh0 + g) * head_size, head_size) * scale
                 }
             }
         }
@@ -2296,40 +2393,69 @@ def private kv_slice_av(var flop : float?; attp : float const?; vcp : auto const
 // per element.
 
 def private attn_head_decode_d(var arow : float?; var xbp : float?; qp : float const?;
+                               qq : int8 const?; qsp : float const?;
                                kcl, vcl : uint8 const?; kdt, vdt : KVDtype; runs : KVRun const?;
                                nrun, qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh : int64;
                                scale, attn_softcap : float; sinksp : float const?) {
-    // per-side stride/offset in the side's own units — identical for scalar codecs; a block codec
-    // (q8_0) rescales its side to bytes here, once per head
+    // per-side stride/offset in the side's own units — elements for scalar codecs, BYTES for the
+    // q8_0 block codec, rescaled here once per head. qq/qsp = the pre-quantized query planes
+    // (q8_0-K callers only; null otherwise)
+    let kdim = kv_side_off(kdt, kv_dim)
+    let khoff = kv_side_off(kdt, kvhoff)
+    let vdim = kv_side_off(vdt, kv_dim)
+    let vhoff = kv_side_off(vdt, kvhoff)
     unsafe {
-        if (kdt == KVDtype.f16) {
-            if (vdt == KVDtype.f16) {
-                attn_head_decode(arow, xbp, qp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl),
-                    runs, nrun, qoff, kv_dim, kvhoff, kv_dim, kvhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
+        if (kdt == KVDtype.q8_0) {
+            if (vdt == KVDtype.q8_0) {
+                attn_head_decode(arow, xbp, qp, qq, qsp, kcl, vcl,
+                    runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
+            } elif (vdt == KVDtype.f16) {
+                attn_head_decode(arow, xbp, qp, qq, qsp, kcl, reinterpret<uint16 const?>(vcl),
+                    runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
             } else {
-                attn_head_decode(arow, xbp, qp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl),
-                    runs, nrun, qoff, kv_dim, kvhoff, kv_dim, kvhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
+                attn_head_decode(arow, xbp, qp, qq, qsp, kcl, reinterpret<float const?>(vcl),
+                    runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
             }
+        } elif (kdt == KVDtype.f16) {
+            if (vdt == KVDtype.q8_0) {
+                attn_head_decode(arow, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), vcl,
+                    runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
+            } elif (vdt == KVDtype.f16) {
+                attn_head_decode(arow, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl),
+                    runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
+            } else {
+                attn_head_decode(arow, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl),
+                    runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
+            }
+        } elif (vdt == KVDtype.q8_0) {
+            attn_head_decode(arow, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), vcl,
+                runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
         } elif (vdt == KVDtype.f16) {
-            attn_head_decode(arow, xbp, qp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl),
-                runs, nrun, qoff, kv_dim, kvhoff, kv_dim, kvhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
+            attn_head_decode(arow, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl),
+                runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
         } else {
-            attn_head_decode(arow, xbp, qp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl),
-                runs, nrun, qoff, kv_dim, kvhoff, kv_dim, kvhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
+            attn_head_decode(arow, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl),
+                runs, nrun, qoff, kdim, khoff, vdim, vhoff, kstart, cnt, head_size, hh, scale, attn_softcap, sinksp)
         }
     }
 }
 
-def private kv_slice_scores_d(var attp : float?; qp : float const?; kcl : uint8 const?; kdt : KVDtype;
+def private kv_slice_scores_d(var attp : float?; qp : float const?; qq : int8 const?; qsp : float const?;
+                              kcl : uint8 const?; kdt : KVDtype;
                               runs : KVRun const?;
                               nrun, kstart, j0, j1, kv_dim, kvhoff, head_size, qh0, kv_mul, seq_len : int64;
                               scale : float) {
+    let kdim = kv_side_off(kdt, kv_dim)
+    let khoff = kv_side_off(kdt, kvhoff)
     unsafe {
-        if (kdt == KVDtype.f16) {
-            kv_slice_scores(attp, qp, reinterpret<uint16 const?>(kcl), runs, nrun, kstart, j0, j1, kv_dim, kvhoff,
+        if (kdt == KVDtype.q8_0) {
+            kv_slice_scores(attp, qp, qq, qsp, kcl, runs, nrun, kstart, j0, j1, kdim, khoff,
+                head_size, qh0, kv_mul, seq_len, scale)
+        } elif (kdt == KVDtype.f16) {
+            kv_slice_scores(attp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), runs, nrun, kstart, j0, j1, kdim, khoff,
                 head_size, qh0, kv_mul, seq_len, scale)
         } else {
-            kv_slice_scores(attp, qp, reinterpret<float const?>(kcl), runs, nrun, kstart, j0, j1, kv_dim, kvhoff,
+            kv_slice_scores(attp, qp, qq, qsp, reinterpret<float const?>(kcl), runs, nrun, kstart, j0, j1, kdim, khoff,
                 head_size, qh0, kv_mul, seq_len, scale)
         }
     }
@@ -2338,12 +2464,17 @@ def private kv_slice_scores_d(var attp : float?; qp : float const?; kcl : uint8 
 def private kv_slice_av_d(var flop : float?; attp : float const?; vcl : uint8 const?; vdt : KVDtype;
                           runs : KVRun const?;
                           nrun, kstart, j0, j1, kv_dim, kvhoff, head_size, qh0, kv_mul, seq_len, nsl, sl : int64) {
+    let vdim = kv_side_off(vdt, kv_dim)
+    let vhoff = kv_side_off(vdt, kvhoff)
     unsafe {
-        if (vdt == KVDtype.f16) {
-            kv_slice_av(flop, attp, reinterpret<uint16 const?>(vcl), runs, nrun, kstart, j0, j1, kv_dim, kvhoff,
+        if (vdt == KVDtype.q8_0) {
+            kv_slice_av(flop, attp, vcl, runs, nrun, kstart, j0, j1, vdim, vhoff,
+                head_size, qh0, kv_mul, seq_len, nsl, sl)
+        } elif (vdt == KVDtype.f16) {
+            kv_slice_av(flop, attp, reinterpret<uint16 const?>(vcl), runs, nrun, kstart, j0, j1, vdim, vhoff,
                 head_size, qh0, kv_mul, seq_len, nsl, sl)
         } else {
-            kv_slice_av(flop, attp, reinterpret<float const?>(vcl), runs, nrun, kstart, j0, j1, kv_dim, kvhoff,
+            kv_slice_av(flop, attp, reinterpret<float const?>(vcl), runs, nrun, kstart, j0, j1, vdim, vhoff,
                 head_size, qh0, kv_mul, seq_len, nsl, sl)
         }
     }
@@ -2351,24 +2482,27 @@ def private kv_slice_av_d(var flop : float?; attp : float const?; vcl : uint8 co
 
 // The flash-decode witness body (see the call in attention_chain_decode): exact single-pass
 // recompute of every head's attention output vs the sliced result in xb. Codec-generic like the
-// workers; test-only and serial, so the extraction costs nothing.
-def private flash_decode_check_g(qp : float const?; kcp, vcp : auto const?; xbv : float const?;
+// workers (per-side kdim/vdim strides in the side's own units; kv_score reruns the q8_0 K path
+// through the SAME quantized-query dot); test-only and serial, so the extraction costs nothing.
+def private flash_decode_check_g(qp : float const?; qq : int8 const?; qsp : float const?;
+                                 kcp, vcp : auto const?; xbv : float const?;
                                  runs : KVRun const?;
-                                 nrun, n_heads, kv_mul, head_size, kv_dim, kstart, cnt, l, nsl : int64;
+                                 nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl : int64;
                                  scale, attn_softcap : float; sinksp : float const?) {
     var sref : array<float>
     sref |> resize(int(cnt))
     unsafe {
         for (hh in range64(n_heads)) {
             let qoff = hh * head_size
-            let kvhoff = (hh / kv_mul) * head_size
+            let khoff = kv_head_off(kcp, (hh / kv_mul) * head_size)
+            let vhoff = kv_head_off(vcp, (hh / kv_mul) * head_size)
             for (r in range64(nrun)) {
                 let rj0 = max(runs[r].j0, kstart)
                 let rj1 = min(runs[r].j1, kstart + cnt)
                 let rowbase = runs[r].row0 - runs[r].j0
                 for (aj in range64(rj0, rj1)) {
-                    let koff = (rowbase + aj) * kv_dim + kvhoff   // kcp is layer-base (codec seam)
-                    let sc = kv_dot(qp + qoff, kcp + koff, head_size) * scale
+                    let koff = (rowbase + aj) * kdim + khoff   // kcp is layer-base (codec seam)
+                    let sc = kv_score(qp, qq, qsp, kcp, koff, qoff, head_size) * scale
                     sref[aj - kstart] = attn_softcap > 0.0 ? attn_softcap * tanh(sc / attn_softcap) : sc
                 }
             }
@@ -2394,7 +2528,7 @@ def private flash_decode_check_g(qp : float const?; kcp, vcp : auto const?; xbv 
                     let rj1 = min(runs[r].j1, kstart + cnt)
                     let rowbase = runs[r].row0 - runs[r].j0
                     for (aj in range64(rj0, rj1)) {
-                        let voff = (rowbase + aj) * kv_dim + kvhoff   // vcp is layer-base (codec seam)
+                        let voff = (rowbase + aj) * vdim + vhoff   // vcp is layer-base (codec seam)
                         acc += exp(sref[aj - kstart] - m2) / l2 * kv_load(vcp, voff, i)
                     }
                 }
@@ -2406,6 +2540,50 @@ def private flash_decode_check_g(qp : float const?; kcp, vcp : auto const?; xbv 
         }
     }
     delete sref
+}
+
+// The witness' codec dispatch — the K×V matrix spelled once, like the worker wrappers.
+def private flash_decode_check_d(qp : float const?; qq : int8 const?; qsp : float const?;
+                                 kcl, vcl : uint8 const?; kdt, vdt : KVDtype; xbv : float const?;
+                                 runs : KVRun const?;
+                                 nrun, n_heads, kv_mul, head_size, kv_dim, kstart, cnt, l, nsl : int64;
+                                 scale, attn_softcap : float; sinksp : float const?) {
+    let kdim = kv_side_off(kdt, kv_dim)
+    let vdim = kv_side_off(vdt, kv_dim)
+    unsafe {
+        if (kdt == KVDtype.q8_0) {
+            if (vdt == KVDtype.q8_0) {
+                flash_decode_check_g(qp, qq, qsp, kcl, vcl, xbv, runs,
+                    nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+            } elif (vdt == KVDtype.f16) {
+                flash_decode_check_g(qp, qq, qsp, kcl, reinterpret<uint16 const?>(vcl), xbv, runs,
+                    nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+            } else {
+                flash_decode_check_g(qp, qq, qsp, kcl, reinterpret<float const?>(vcl), xbv, runs,
+                    nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+            }
+        } elif (kdt == KVDtype.f16) {
+            if (vdt == KVDtype.q8_0) {
+                flash_decode_check_g(qp, qq, qsp, reinterpret<uint16 const?>(kcl), vcl, xbv, runs,
+                    nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+            } elif (vdt == KVDtype.f16) {
+                flash_decode_check_g(qp, qq, qsp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl), xbv, runs,
+                    nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+            } else {
+                flash_decode_check_g(qp, qq, qsp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl), xbv, runs,
+                    nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+            }
+        } elif (vdt == KVDtype.q8_0) {
+            flash_decode_check_g(qp, qq, qsp, reinterpret<float const?>(kcl), vcl, xbv, runs,
+                nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+        } elif (vdt == KVDtype.f16) {
+            flash_decode_check_g(qp, qq, qsp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl), xbv, runs,
+                nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+        } else {
+            flash_decode_check_g(qp, qq, qsp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl), xbv, runs,
+                nrun, n_heads, kv_mul, head_size, kdim, vdim, kstart, cnt, l, nsl, scale, attn_softcap, sinksp)
+        }
+    }
 }
 
 // Store the roped k / raw v for all npos positions into the layer's KV cache. Each worker chunk
@@ -2880,6 +3058,12 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         var attp = addr(s.att[0])
         var xqp = addr(s.xq[0])
         var xsp = addr(s.xs[0])
+        // q8_0 K: the quantized-query planes each stage-0 q slot fills after its rope (chunk-local
+        // whole blocks — head_size % 32 == 0 by create; per-32-block quants are grouping-free, so
+        // the per-slot fill is byte-identical to one serial whole-row quantize)
+        let kq8 = kdt == KVDtype.q8_0
+        var attqp = kq8 ? addr(s.attq[0]) : null
+        var attsp = kq8 ? addr(s.atts[0]) : null
         var kcl = kv_layer_kbase(s, l, c.seq_len)  // layer-base byte pointers (stores + the _d read dispatch)
         var vcl = kv_layer_vbase(s, l, c.seq_len)
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))   // this layer's physical runs (fork-safe hoist)
@@ -2937,6 +3121,9 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             } else {
                                 rope_scaled_tab(qp + r0, head_size, head_size, crow, srow)
                             }
+                            if (kq8) {   // quantize this head's roped query for the int8×int8 score dot
+                                quantize_q8_0_into_ptr(qp + r0, head_size, attqp, attsp, r0, r0 / 32l)
+                            }
                         } elif (sl < n_heads + n_kv_heads) {
                             let r0 = (sl - n_heads) * head_size
                             invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r0 + head_size)
@@ -2979,7 +3166,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         let hh = int64(h)
                         let qoff = hh * head_size
                         let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
-                        attn_head_decode_d(attp + hh * seq_len, xbp, qp, kcl, vcl, kdt, vdt, runsp,
+                        attn_head_decode_d(attp + hh * seq_len, xbp, qp, attqp, attsp, kcl, vcl, kdt, vdt, runsp,
                             nrun, qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, sinksp)
                         quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
                     }
@@ -3000,7 +3187,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         let j0 = sl * slice_len
                         let j1 = min(j0 + slice_len, cnt)
                         // K pass: each K row read once, dotted against every group q-head
-                        kv_slice_scores_d(attp, qp, kcl, kdt, runsp, nrun, kstart, j0, j1, kv_dim, kvhoff, head_size,
+                        kv_slice_scores_d(attp, qp, attqp, attsp, kcl, kdt, runsp, nrun, kstart, j0, j1, kv_dim, kvhoff, head_size,
                             qh0, kv_mul, seq_len, scale)
                         for (g in range64(kv_mul)) {
                             let hh = qh0 + g
@@ -3108,21 +3295,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
             // reassociation tolerance. Logit-level A/Bs can't gate this — a 1-ulp xb difference can
             // cross an int8 requant boundary and amplify through the remaining Q8 layers — so the
             // contract is checked HERE, per layer, at the attention output itself.
-            if (kdt == KVDtype.f16) {
-                if (vdt == KVDtype.f16) {
-                    flash_decode_check_g(qp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl), xbp, runsp,
-                        nrun, n_heads, kv_mul, head_size, kv_dim, kstart, cnt, l, int64(nsl), scale, attn_softcap, sinksp)
-                } else {
-                    flash_decode_check_g(qp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl), xbp, runsp,
-                        nrun, n_heads, kv_mul, head_size, kv_dim, kstart, cnt, l, int64(nsl), scale, attn_softcap, sinksp)
-                }
-            } elif (vdt == KVDtype.f16) {
-                flash_decode_check_g(qp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl), xbp, runsp,
-                    nrun, n_heads, kv_mul, head_size, kv_dim, kstart, cnt, l, int64(nsl), scale, attn_softcap, sinksp)
-            } else {
-                flash_decode_check_g(qp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl), xbp, runsp,
-                    nrun, n_heads, kv_mul, head_size, kv_dim, kstart, cnt, l, int64(nsl), scale, attn_softcap, sinksp)
-            }
+            flash_decode_check_d(qp, attqp, attsp, kcl, vcl, kdt, vdt, xbp, runsp,
+                nrun, n_heads, kv_mul, head_size, kv_dim, kstart, cnt, l, int64(nsl), scale, attn_softcap, sinksp)
             g_flash_decode_checked++
         }
     }
@@ -3326,6 +3500,11 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         }
     }
     prof_add("rope", ts_rope)
+    if (s.kv_dtype_k == KVDtype.q8_0) {
+        // quantize the roped query ONCE for the int8×int8 score dot (ggml's convert-the-query
+        // lesson) — O(qd) serial, dwarfed by the attention reads it feeds
+        quantize_q8_0_into(s.q, qd, s.attq, s.atts, 0l, 0l)
+    }
     // store k, v for this position into the KV cache (shared-KV layers: nothing to store — the
     // source layer already cached its K/V, which kbase/vbase point at)
     if (!kv_shared) {
@@ -3357,6 +3536,8 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     let nrun = kv_runs(s, kstart, pos + 1l, s.kv_runs)   // physical runs of this layer's window (flat: 1)
     unsafe {
         let qp = reinterpret<float const?>(addr(s.q[0]))
+        let qqp = kdt == KVDtype.q8_0 ? reinterpret<int8 const?>(addr(s.attq[0])) : null
+        let qsp = kdt == KVDtype.q8_0 ? reinterpret<float const?>(addr(s.atts[0])) : null
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))
         var xbp = addr(s.xb[0])
         var attp = addr(s.att[0])
@@ -3366,7 +3547,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
                     let hh = int64(h)
                     let qoff = hh * head_size
                     let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
-                    attn_head_decode_d(attp + hh * seq_len, xbp, qp, kcl, vcl, kdt, vdt, runsp,
+                    attn_head_decode_d(attp + hh * seq_len, xbp, qp, qqp, qsp, kcl, vcl, kdt, vdt, runsp,
                         nrun, qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, sinksp)
                 }
             }
@@ -4359,7 +4540,10 @@ def private attn_head_flash(qp : float const?; kcp, vcp : auto const?; var xbp :
 // One head of BLOCKED prefill attention (see prefill_attention) — codec-generic + run-walking.
 // kcp/vcp are layer-base typed pointers; attp_h = this head's ATTN_BLOCK_Q score rows
 // (maxctx-strided, window-relative). The block's key range intersects the layer's physical runs.
+// Scores go through kv_score (q8_0 K: the pre-quantized qq/qs planes — the same dot decode runs,
+// keeping prefill == decode bit-exact under the block codec too).
 def private attn_head_blocked(var attp_h : float?; var xbp : float?; qp : float const?;
+                              qq : int8 const?; qsp : float const?;
                               kcp, vcp : auto const?; runs : KVRun const?;
                               nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh : int64;
                               scale : float; is_sliding : bool; sliding_window : int64;
@@ -4388,7 +4572,7 @@ def private attn_head_blocked(var attp_h : float?; var xbp : float?; qp : float 
                         let ap = start_pos + p
                         let kstart_p = (is_sliding && ap + 1l > sliding_window) ? (ap + 1l - sliding_window) : 0l
                         let qbase = p * qd + qoff
-                        attp_h[bi * maxctx + (kk - kstart_p)] = kv_dot(qp + qbase, kcp + koff, head_size) * scale
+                        attp_h[bi * maxctx + (kk - kstart_p)] = kv_score(qp, qq, qsp, kcp, koff, qbase, head_size) * scale
                     }
                 }
             }
@@ -4440,8 +4624,9 @@ def private attn_head_blocked(var attp_h : float?; var xbp : float?; qp : float 
 
 // One head of CLASSIC prefill attention (see prefill_attention) — codec-generic + run-walking.
 // attp_h = this head's private score row (maxctx wide, window-relative); each query's window
-// [kstart, ap] intersects the layer's physical runs.
+// [kstart, ap] intersects the layer's physical runs. Scores through kv_score (see attn_head_blocked).
 def private attn_head_classic(var attp_h : float?; var xbp : float?; qp : float const?;
+                              qq : int8 const?; qsp : float const?;
                               kcp, vcp : auto const?; runs : KVRun const?;
                               nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh : int64;
                               scale : float; is_sliding : bool; sliding_window : int64;
@@ -4457,7 +4642,7 @@ def private attn_head_classic(var attp_h : float?; var xbp : float?; qp : float 
                 let rj1 = min(runs[r].j1, ap + 1l)
                 let rowbase = runs[r].row0 - runs[r].j0
                 for (aj in range64(rj0, rj1)) {
-                    attp_h[aj - kstart] = kv_dot(qp + qbase, kcp + (rowbase + aj) * kdim + khoff, head_size) * scale
+                    attp_h[aj - kstart] = kv_score(qp, qq, qsp, kcp, (rowbase + aj) * kdim + khoff, qbase, head_size) * scale
                 }
             }
             if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
@@ -4484,86 +4669,168 @@ def private attn_head_classic(var attp_h : float?; var xbp : float?; qp : float 
 }
 
 // Prefill codec dispatch (same contract as attn_head_decode_d): one wrapper per prefill worker,
-// the 2x2 scalar K×V matrix spelled once.
+// the 3x3 K×V matrix spelled once (per-side strides in the side's own units — bytes for q8_0,
+// whose reads here go through the f32-query kv_dot/kv_row_to_f32 overloads: prefill is
+// compute-bound, so the dequant-in-dot form is fine and no query quantize is needed).
 def private attn_head_flash_d(qp : float const?; kcl, vcl : uint8 const?; kdt, vdt : KVDtype; var xbp : float?;
                               var qpk, kpk, vpk, kqp, vkqp, tmpp : float?; runs : KVRun const?;
                               nrun, npos, start_pos, head_size, qd, kv_dim, kvhoff, qoff : int64;
                               scale : float; is_sliding : bool; sliding_window : int64; attn_softcap : float;
                               has_sink : bool; sink : float) {
+    let kdim = kv_side_off(kdt, kv_dim)
+    let khoff = kv_side_off(kdt, kvhoff)
+    let vdim = kv_side_off(vdt, kv_dim)
+    let vhoff = kv_side_off(vdt, kvhoff)
     unsafe {
-        if (kdt == KVDtype.f16) {
-            if (vdt == KVDtype.f16) {
+        if (kdt == KVDtype.q8_0) {
+            if (vdt == KVDtype.q8_0) {
+                attn_head_flash(qp, kcl, vcl, xbp,
+                    qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
+                    kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
+            } elif (vdt == KVDtype.f16) {
+                attn_head_flash(qp, kcl, reinterpret<uint16 const?>(vcl), xbp,
+                    qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
+                    kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
+            } else {
+                attn_head_flash(qp, kcl, reinterpret<float const?>(vcl), xbp,
+                    qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
+                    kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
+            }
+        } elif (kdt == KVDtype.f16) {
+            if (vdt == KVDtype.q8_0) {
+                attn_head_flash(qp, reinterpret<uint16 const?>(kcl), vcl, xbp,
+                    qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
+                    kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
+            } elif (vdt == KVDtype.f16) {
                 attn_head_flash(qp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl), xbp,
                     qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
-                    kv_dim, kvhoff, kv_dim, kvhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
+                    kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
             } else {
                 attn_head_flash(qp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl), xbp,
                     qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
-                    kv_dim, kvhoff, kv_dim, kvhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
+                    kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
             }
+        } elif (vdt == KVDtype.q8_0) {
+            attn_head_flash(qp, reinterpret<float const?>(kcl), vcl, xbp,
+                qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
+                kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
         } elif (vdt == KVDtype.f16) {
             attn_head_flash(qp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl), xbp,
                 qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
-                kv_dim, kvhoff, kv_dim, kvhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
+                kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
         } else {
             attn_head_flash(qp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl), xbp,
                 qpk, kpk, vpk, kqp, vkqp, tmpp, runs, nrun, npos, start_pos, head_size, qd,
-                kv_dim, kvhoff, kv_dim, kvhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
+                kdim, khoff, vdim, vhoff, qoff, scale, is_sliding, sliding_window, attn_softcap, has_sink, sink)
         }
     }
 }
 
 def private attn_head_blocked_d(var attp_h : float?; var xbp : float?; qp : float const?;
+                                qq : int8 const?; qsp : float const?;
                                 kcl, vcl : uint8 const?; kdt, vdt : KVDtype; runs : KVRun const?;
                                 nrun, npos, start_pos, maxctx, qd, head_size, kv_dim, kvhoff, qoff, hh : int64;
                                 scale : float; is_sliding : bool; sliding_window : int64;
                                 attn_softcap : float; sinksp : float const?) {
+    let kdim = kv_side_off(kdt, kv_dim)
+    let khoff = kv_side_off(kdt, kvhoff)
+    let vdim = kv_side_off(vdt, kv_dim)
+    let vhoff = kv_side_off(vdt, kvhoff)
     unsafe {
-        if (kdt == KVDtype.f16) {
-            if (vdt == KVDtype.f16) {
-                attn_head_blocked(attp_h, xbp, qp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl),
-                    runs, nrun, npos, start_pos, maxctx, qd, head_size, kv_dim, kvhoff, kv_dim, kvhoff, qoff, hh,
+        if (kdt == KVDtype.q8_0) {
+            if (vdt == KVDtype.q8_0) {
+                attn_head_blocked(attp_h, xbp, qp, qq, qsp, kcl, vcl,
+                    runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                    scale, is_sliding, sliding_window, attn_softcap, sinksp)
+            } elif (vdt == KVDtype.f16) {
+                attn_head_blocked(attp_h, xbp, qp, qq, qsp, kcl, reinterpret<uint16 const?>(vcl),
+                    runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
                     scale, is_sliding, sliding_window, attn_softcap, sinksp)
             } else {
-                attn_head_blocked(attp_h, xbp, qp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl),
-                    runs, nrun, npos, start_pos, maxctx, qd, head_size, kv_dim, kvhoff, kv_dim, kvhoff, qoff, hh,
+                attn_head_blocked(attp_h, xbp, qp, qq, qsp, kcl, reinterpret<float const?>(vcl),
+                    runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
                     scale, is_sliding, sliding_window, attn_softcap, sinksp)
             }
+        } elif (kdt == KVDtype.f16) {
+            if (vdt == KVDtype.q8_0) {
+                attn_head_blocked(attp_h, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), vcl,
+                    runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                    scale, is_sliding, sliding_window, attn_softcap, sinksp)
+            } elif (vdt == KVDtype.f16) {
+                attn_head_blocked(attp_h, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl),
+                    runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                    scale, is_sliding, sliding_window, attn_softcap, sinksp)
+            } else {
+                attn_head_blocked(attp_h, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl),
+                    runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                    scale, is_sliding, sliding_window, attn_softcap, sinksp)
+            }
+        } elif (vdt == KVDtype.q8_0) {
+            attn_head_blocked(attp_h, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), vcl,
+                runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                scale, is_sliding, sliding_window, attn_softcap, sinksp)
         } elif (vdt == KVDtype.f16) {
-            attn_head_blocked(attp_h, xbp, qp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl),
-                runs, nrun, npos, start_pos, maxctx, qd, head_size, kv_dim, kvhoff, kv_dim, kvhoff, qoff, hh,
+            attn_head_blocked(attp_h, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl),
+                runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
                 scale, is_sliding, sliding_window, attn_softcap, sinksp)
         } else {
-            attn_head_blocked(attp_h, xbp, qp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl),
-                runs, nrun, npos, start_pos, maxctx, qd, head_size, kv_dim, kvhoff, kv_dim, kvhoff, qoff, hh,
+            attn_head_blocked(attp_h, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl),
+                runs, nrun, npos, start_pos, maxctx, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
                 scale, is_sliding, sliding_window, attn_softcap, sinksp)
         }
     }
 }
 
 def private attn_head_classic_d(var attp_h : float?; var xbp : float?; qp : float const?;
+                                qq : int8 const?; qsp : float const?;
                                 kcl, vcl : uint8 const?; kdt, vdt : KVDtype; runs : KVRun const?;
                                 nrun, npos, start_pos, qd, head_size, kv_dim, kvhoff, qoff, hh : int64;
                                 scale : float; is_sliding : bool; sliding_window : int64;
                                 attn_softcap : float; sinksp : float const?) {
+    let kdim = kv_side_off(kdt, kv_dim)
+    let khoff = kv_side_off(kdt, kvhoff)
+    let vdim = kv_side_off(vdt, kv_dim)
+    let vhoff = kv_side_off(vdt, kvhoff)
     unsafe {
-        if (kdt == KVDtype.f16) {
-            if (vdt == KVDtype.f16) {
-                attn_head_classic(attp_h, xbp, qp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl),
-                    runs, nrun, npos, start_pos, qd, head_size, kv_dim, kvhoff, kv_dim, kvhoff, qoff, hh,
+        if (kdt == KVDtype.q8_0) {
+            if (vdt == KVDtype.q8_0) {
+                attn_head_classic(attp_h, xbp, qp, qq, qsp, kcl, vcl,
+                    runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                    scale, is_sliding, sliding_window, attn_softcap, sinksp)
+            } elif (vdt == KVDtype.f16) {
+                attn_head_classic(attp_h, xbp, qp, qq, qsp, kcl, reinterpret<uint16 const?>(vcl),
+                    runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
                     scale, is_sliding, sliding_window, attn_softcap, sinksp)
             } else {
-                attn_head_classic(attp_h, xbp, qp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl),
-                    runs, nrun, npos, start_pos, qd, head_size, kv_dim, kvhoff, kv_dim, kvhoff, qoff, hh,
+                attn_head_classic(attp_h, xbp, qp, qq, qsp, kcl, reinterpret<float const?>(vcl),
+                    runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
                     scale, is_sliding, sliding_window, attn_softcap, sinksp)
             }
+        } elif (kdt == KVDtype.f16) {
+            if (vdt == KVDtype.q8_0) {
+                attn_head_classic(attp_h, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), vcl,
+                    runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                    scale, is_sliding, sliding_window, attn_softcap, sinksp)
+            } elif (vdt == KVDtype.f16) {
+                attn_head_classic(attp_h, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), reinterpret<uint16 const?>(vcl),
+                    runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                    scale, is_sliding, sliding_window, attn_softcap, sinksp)
+            } else {
+                attn_head_classic(attp_h, xbp, qp, qq, qsp, reinterpret<uint16 const?>(kcl), reinterpret<float const?>(vcl),
+                    runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                    scale, is_sliding, sliding_window, attn_softcap, sinksp)
+            }
+        } elif (vdt == KVDtype.q8_0) {
+            attn_head_classic(attp_h, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), vcl,
+                runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
+                scale, is_sliding, sliding_window, attn_softcap, sinksp)
         } elif (vdt == KVDtype.f16) {
-            attn_head_classic(attp_h, xbp, qp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl),
-                runs, nrun, npos, start_pos, qd, head_size, kv_dim, kvhoff, kv_dim, kvhoff, qoff, hh,
+            attn_head_classic(attp_h, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), reinterpret<uint16 const?>(vcl),
+                runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
                 scale, is_sliding, sliding_window, attn_softcap, sinksp)
         } else {
-            attn_head_classic(attp_h, xbp, qp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl),
-                runs, nrun, npos, start_pos, qd, head_size, kv_dim, kvhoff, kv_dim, kvhoff, qoff, hh,
+            attn_head_classic(attp_h, xbp, qp, qq, qsp, reinterpret<float const?>(kcl), reinterpret<float const?>(vcl),
+                runs, nrun, npos, start_pos, qd, head_size, kdim, khoff, vdim, vhoff, qoff, hh,
                 scale, is_sliding, sliding_window, attn_softcap, sinksp)
         }
     }
@@ -4581,8 +4848,21 @@ def private prefill_attention(var s : Session; kcl, vcl : uint8 const?; npos, st
     // sub-windows with each run (two max/min per run)
     let kstart_min = (is_sliding && start_pos + 1l > sliding_window) ? (start_pos + 1l - sliding_window) : 0l
     let nrun = kv_runs(s, kstart_min, start_pos + npos, s.kv_runs)
+    // q8_0 K, blocked/classic: quantize every query row once so scores run the SAME int8×int8 dot
+    // as decode — the bit-exact prefill==decode contract survives the block codec. Flash never
+    // reads these (it packs the cache to f32 tiles and GEMMs the f32 queries; tolerance-validated).
+    if (kdt == KVDtype.q8_0 && g_attn_prefill_mode != AttnPrefillMode.flash) {
+        if (int64(length(s.attq)) < npos * qd) {
+            s.attq |> resize(int(npos * qd))
+            s.atts |> resize(int(npos * qd / 32l))
+        }
+        quantize_q8_0_into(s.q_b, npos * qd, s.attq, s.atts, 0l, 0l)
+    }
     unsafe {
         let qp = reinterpret<float const?>(addr(s.q_b[0]))
+        let kq8bc = kdt == KVDtype.q8_0 && g_attn_prefill_mode != AttnPrefillMode.flash
+        let qqp = kq8bc ? reinterpret<int8 const?>(addr(s.attq[0])) : null
+        let qsp = kq8bc ? reinterpret<float const?>(addr(s.atts[0])) : null
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))
         var xbp = addr(s.xb_b[0])
         // att_b is sized only for the blocked/classic modes (flash packs into fa_* instead), so the
@@ -4618,7 +4898,7 @@ def private prefill_attention(var s : Session; kcl, vcl : uint8 const?; npos, st
                         let hh = int64(h)
                         let qoff = hh * head_size
                         let kvhoff = (hh / kv_mul) * head_size
-                        attn_head_blocked_d(attp + hh * ATTN_BLOCK_Q * maxctx, xbp, qp, kcl, vcl, kdt, vdt, runsp,
+                        attn_head_blocked_d(attp + hh * ATTN_BLOCK_Q * maxctx, xbp, qp, qqp, qsp, kcl, vcl, kdt, vdt, runsp,
                             nrun, npos, start_pos, maxctx, qd, head_size, kv_dim, kvhoff, qoff, hh,
                             scale, is_sliding, sliding_window, attn_softcap, sinksp)
                     }
@@ -4631,7 +4911,7 @@ def private prefill_attention(var s : Session; kcl, vcl : uint8 const?; npos, st
                         let hh = int64(h)
                         let qoff = hh * head_size
                         let kvhoff = (hh / kv_mul) * head_size
-                        attn_head_classic_d(attp + hh * maxctx, xbp, qp, kcl, vcl, kdt, vdt, runsp,
+                        attn_head_classic_d(attp + hh * maxctx, xbp, qp, qqp, qsp, kcl, vcl, kdt, vdt, runsp,
                             nrun, npos, start_pos, qd, head_size, kv_dim, kvhoff, qoff, hh,
                             scale, is_sliding, sliding_window, attn_softcap, sinksp)
                     }
@@ -5796,6 +6076,10 @@ def private batch_decode_alloc(t : Model; var s : Session; nrows : int64) {
     s.hb2_b |> resize(nrows * hidden)
     s.xqb |> resize(nrows * maxn)
     s.xsb |> resize(nrows * maxn / 32l)
+    if (s.kv_dtype_k == KVDtype.q8_0) {   // batch query-quant planes (dtypes snapshotted before this)
+        s.attq |> resize(nrows * qd)
+        s.atts |> resize(nrows * qd / 32l)
+    }
     if (has_ple(c)) {   // gemma-4 E-series PLE scratch (one row per batch slot)
         let all = c.n_layers * c.n_embd_per_layer
         s.ple_inp |> resize(nrows * all)
@@ -5831,6 +6115,11 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; sessions 
     // start_pos is only read by the classic (non-table) rope path, which eval_batch_ never routes
     // here — the rows table already bakes each row's own position in
     attn_qkv_rope_prefix(t, ws.scr, l, nrows, 0l)
+    if (kdt == KVDtype.q8_0) {
+        // quantize every row's roped query in one pass (q_b rows are contiguous and qd % 32 == 0,
+        // so per-32-block quants equal the per-row form byte-for-byte)
+        quantize_q8_0_into(ws.scr.q_b, nrows * qd, ws.scr.attq, ws.scr.atts, 0l, 0l)
+    }
     if (!kv_shared) {
         let ts_kv = ref_time_ticks()
         unsafe {
@@ -5869,6 +6158,9 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; sessions 
         : null)
     unsafe {
         let qp = reinterpret<float const?>(addr(ws.scr.q_b[0]))
+        let kq8 = kdt == KVDtype.q8_0
+        let qqp0 = kq8 ? reinterpret<int8 const?>(addr(ws.scr.attq[0])) : null
+        let qsp0 = kq8 ? reinterpret<float const?>(addr(ws.scr.atts[0])) : null
         var xbp = addr(ws.scr.xb_b[0])
         var attp = addr(ws.scr.att_b[0])
         let posp = reinterpret<int64 const?>(addr(ws.positions[0]))
@@ -5888,6 +6180,7 @@ def private attention_batch_decode(t : Model; var ws : BatchWorkspace; sessions 
                     let qoff = hh * head_size
                     let kvhoff = (hh / kv_mul) * head_size
                     attn_head_decode_d(attp + ix * maxctx, xbp + ii * qd, qp + ii * qd,
+                        kq8 ? qqp0 + ii * qd : null, kq8 ? qsp0 + ii * qd / 32l : null,
                         paged ? pkcl : kbpp[ii] + kbb, paged ? pvcl : vbpp[ii] + vbb, kdt, vdt,
                         runsbp + ii * maxruns, nrunbp[ii], qoff, kvhoff, kstart, cnt, kv_dim, head_size,
                         hh, scale, attn_softcap, sinksp)

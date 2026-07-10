@@ -49,7 +49,9 @@ def create_session(model : Model; kv_dtype : KVDtype = KVDtype.f16) : Session {
     //! On large-context models cap ``model.config.seq_len`` BEFORE creating sessions to bound KV memory.
     //! ``kv_dtype`` picks this session's KV-cache codec — the ``KVDtype.f16`` default halves the KV
     //! bytes and speeds up deep-context decode (near-lossless: stores clamp to ±65504; llama.cpp's
-    //! default is F16 too); pass ``KVDtype.f32`` for the bit-exact reference. Per-session state, so
+    //! default is F16 too); pass ``KVDtype.f32`` for the bit-exact reference, or ``KVDtype.q8_0``
+    //! (llama.cpp ``-ctk/-ctv q8_0``) to halve the bytes again — block-quantized, near-lossless in
+    //! practice, needs head_size/kv_dim multiples of 32 (checked at create). Per-session state, so
     //! sessions with different codecs and parallel models never interact.
     return <- create_session_(model, kv_dtype, kv_dtype)
 }

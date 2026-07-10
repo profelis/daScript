@@ -89,6 +89,17 @@ def private kv_blob_max_diff(blob : array<uint8>; refb : array<uint8>; pref : ar
                     for (e in range64(kvd)) {
                         maxd = max(maxd, abs(f16_to_f32(uint(hb[e])) - f16_to_f32(uint(hr[e]))))
                     }
+                } elif (dt == KVDtype.q8_0) {
+                    let qb = bp + base + row * rowb
+                    let qr = rp + base + row * rowb
+                    for (bi in range64(kvd / 32l)) {
+                        let bb = bi * 34l
+                        let db = f16_to_f32(uint(qb[bb]) | (uint(qb[bb + 1l]) << 8u))
+                        let dr = f16_to_f32(uint(qr[bb]) | (uint(qr[bb + 1l]) << 8u))
+                        for (k in range64(32l)) {
+                            maxd = max(maxd, abs(float(int8(qb[bb + 2l + k])) * db - float(int8(qr[bb + 2l + k])) * dr))
+                        }
+                    }
                 } else {
                     let fb = reinterpret<float const?>(bp + base + row * rowb)
                     let fr = reinterpret<float const?>(rp + base + row * rowb)
@@ -222,6 +233,34 @@ def test_batch_decode_f16_kv(t : T?) {
         set_fused_decode(false)
         with_job_que() {
             batch_vs_ref(t, tr, KVDtype.f16, 8l, 1.0e-6, "f16kv")
+        }
+        set_fused_decode(prev_fused)
+        delete tr
+    }
+}
+
+[test]
+def test_batch_decode_q8_kv(t : T?) {
+    t |> run("batched decode == sequential under the q8_0 KV codec (needs SmolLM2-135M)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        // stories15M's head_size 48 is rejected by the q8_0 32-block check (by design) — this arm
+        // runs the SmolLM2 GGUF carrier instead, same rail as test_fused_decode
+        let env = get_env_variable("DASLLAMA_MODELS_DIR")
+        let mdir = empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+        let path = path_join(mdir, "SmolLM2-135M-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: {path} not present")
+            return
+        }
+        var tr <- load_gguf(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 64l)
+        let prev_fused = get_fused_decode()
+        set_fused_decode(false)
+        with_job_que() {
+            batch_vs_ref(t, tr, KVDtype.q8_0, 8l, 1.0e-6, "q8_0kv")
         }
         set_fused_decode(prev_fused)
         delete tr

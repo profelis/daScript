@@ -348,6 +348,67 @@ def test_kv_paged_decode(t : T?) {
 }
 
 [test]
+def test_kv_paged_q8(t : T?) {
+    t |> run("paged q8_0 sessions == flat q8_0, bit-exact under fragmentation (needs SmolLM2-135M)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        // q8_0 needs a head_size-64 carrier (stories15M's 48 is rejected by the 32-block check)
+        let env = get_env_variable("DASLLAMA_MODELS_DIR")
+        let mdir = empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+        let path = path_join(mdir, "SmolLM2-135M-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> success(true, "skipped: {path} not present")
+            return
+        }
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 64l) {   // cap the KV allocation (no math require here)
+            tr.config.seq_len = 64l
+        }
+        let c = tr.config
+        let prev_thresh = get_target_chunk_work()
+        with_job_que() {
+            setup_dasllama_jobque_()
+            set_target_chunk_work(1l)
+            // two q8 paged sessions interleave on ONE pool (P=16): fragmented BYTE-strided runs
+            var pool <- create_kv_pool_(c, 16l, KVDtype.q8_0, KVDtype.q8_0)
+            var pa <- make_run_state_paged(c, pool)
+            var pb <- make_run_state_paged(c, pool)
+            var fa <- make_run_state(c, KVDtype.q8_0, KVDtype.q8_0)
+            var fb <- make_run_state(c, KVDtype.q8_0, KVDtype.q8_0)
+            let nsteps = 40l
+            var bad = 0
+            for (i in range64(nsteps)) {
+                let ta = 2l + (i * 7l) % (c.vocab_size - 2l)
+                let tb = 2l + (i * 11l) % (c.vocab_size - 2l)
+                forward(tr, pa, ta, i)
+                forward(tr, pb, tb, i)
+                forward(tr, fa, ta, i)
+                forward(tr, fb, tb, i)
+                if (!logits_equal(pa, fa, c.vocab_size) || !logits_equal(pb, fb, c.vocab_size)) {
+                    bad ++
+                }
+            }
+            t |> equal(0, bad)
+            t |> success(pa.block_table[1] != pa.block_table[0] + 1,
+                "interleaved sessions actually fragment the pool")
+            t |> success(cache_rows_equal(fa, pa, c, nsteps), "session A q8 cache rows byte-equal flat")
+            t |> success(cache_rows_equal(fb, pb, c, nsteps), "session B q8 cache rows byte-equal flat")
+            release_kv_pages_(pa)
+            release_kv_pages_(pb)
+            delete pa
+            delete pb
+            delete fa
+            delete fb
+            delete pool
+        }
+        set_target_chunk_work(prev_thresh)
+        delete tr
+    }
+}
+
+[test]
 def test_kv_paged_prefill(t : T?) {
     t |> run("paged prefill == flat prefill: logits and cache rows bit-exact (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {

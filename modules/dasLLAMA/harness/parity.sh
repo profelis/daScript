@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # dasLLAMA token-for-token parity check: reference oracle (simple_ids) vs dasLLAMA (parity.das).
 #
-# Usage:   parity.sh <model.gguf> [N] [quant] [prompt] [kv]
+# Usage:   parity.sh <model.gguf> [N] [quant] [prompt] [kv] [ctk]
 #   N       generated tokens to compare (default 40)
 #   quant   dasLLAMA storage: fp32|q8|q4 — pick the file's native type (default q8; use fp32 for F16/F32)
 #   prompt  raw continuation prompt (default "Once upon a time")
-#   kv      dasLLAMA KV-cache dtype: f32|f16 (default f32; the oracle always runs its own default)
+#   kv      dasLLAMA KV-cache dtype: f32|f16|q8_0 (default f32)
+#   ctk     ORACLE KV-cache type: f16|q8_0 (default: llama.cpp's own default; pass q8_0 with kv=q8_0
+#           for the both-sides-quantized run — the oracle then also turns flash attention on)
 #
 # Env overrides: LLAMA_CPP (default ~/Work/llama.cpp), DASLANG (default <repo>/bin/daslang)
 # The oracle binary must be built once — see harness/oracle/simple_ids.cpp for the one-line recipe.
@@ -16,6 +18,7 @@ N="${2:-40}"
 QUANT="${3:-q8}"
 PROMPT="${4:-Once upon a time}"
 KV="${5:-f32}"
+CTK="${6:-}"
 
 LLAMA_CPP="${LLAMA_CPP:-$HOME/Work/llama.cpp}"
 ORACLE="$LLAMA_CPP/build/bin/simple_ids"
@@ -26,7 +29,11 @@ PARITY="$DAS_ROOT/modules/dasLLAMA/harness/parity.das"
 [ -x "$ORACLE" ] || { echo "missing oracle: $ORACLE — build it (see harness/oracle/simple_ids.cpp)"; exit 2; }
 
 # 1. reference: prompt ids (as llama.cpp tokenizes) + greedy generated ids
-REF="$("$ORACLE" -m "$MODEL" -n "$N" -p "$PROMPT" 2>/dev/null)"
+if [ -n "$CTK" ]; then
+    REF="$("$ORACLE" -m "$MODEL" -n "$N" -p "$PROMPT" -ctk "$CTK" 2>/dev/null)"
+else
+    REF="$("$ORACLE" -m "$MODEL" -n "$N" -p "$PROMPT" 2>/dev/null)"
+fi
 PROMPT_IDS="$(printf '%s\n' "$REF" | sed -n 's/^PROMPT_IDS: //p')"
 REF_GEN="$(printf '%s\n' "$REF" | sed -n 's/^GEN_IDS: //p')"
 IDS_CSV="$(printf '%s' "$PROMPT_IDS" | tr ' ' ',')"

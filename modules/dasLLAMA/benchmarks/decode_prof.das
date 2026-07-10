@@ -104,7 +104,6 @@ def private mb(v : double) : double => v / (1024.0lf * 1024.0lf)
 def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     let c = t.config
     let wb = wbytes(t.quant)
-    let kv_esize = double(kv_elem_bytes(kvdt))
     let dim = c.dim
     var attn = 0.0lf
     var kv_read = 0.0lf
@@ -114,7 +113,7 @@ def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
         let wv = t.wv_offs[l] >= 0l ? double(dim * kvd) : 0.0lf
         attn += (double(dim * qd) + double(dim * kvd) + wv + double(qd * dim)) * wb
         let cnt = layer_is_sliding(c, l) ? min(pos, c.sliding_window) : pos
-        kv_read += double(cnt * kvd) * 2.0lf * kv_esize
+        kv_read += double(cnt * kv_row_bytes(kvdt, kvd)) * 2.0lf   // row bytes: codec-exact (q8_0 incl. block scales)
     }
     var ffn = 0.0lf
     var moe = 0.0lf
