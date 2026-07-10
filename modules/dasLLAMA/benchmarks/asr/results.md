@@ -17,11 +17,11 @@ _Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
 | file      | audio s | das ms | parakeet-cli ms | onnx ms | das/parakeet-cli |  das/onnx | das xRT |
 | :-------- | ------: | -----: | --------------: | ------: | ---------------: | --------: | ------: |
-| jfk.wav   |      11 |    197 |             336 |     483 |        **0.59x** | **0.41x** |    55.8 |
-| jfk3.wav  |      33 |    638 |             749 |     874 |        **0.85x** | **0.73x** |    51.7 |
-| gb1.wav   |     199 |   6585 |            6662 |    7188 |        **0.99x** | **0.92x** |    30.2 |
-| hp0.wav   |     273 |   9470 |           10955 |   11552 |        **0.86x** | **0.82x** |    28.9 |
-| hp0x2.wav |     547 |  27899 |           37610 |       - |        **0.74x** |         - |    19.6 |
+| jfk.wav   |      11 |    198 |             336 |     483 |        **0.59x** | **0.41x** |    55.6 |
+| jfk3.wav  |      33 |    605 |             749 |     874 |        **0.81x** | **0.69x** |    54.5 |
+| gb1.wav   |     199 |   5681 |            6662 |    7188 |        **0.85x** | **0.79x** |    35.0 |
+| hp0.wav   |     273 |   9126 |           10955 |   11552 |        **0.83x** | **0.79x** |    29.9 |
+| hp0x2.wav |     547 |  28277 |           37610 |       - |        **0.75x** |         - |    19.3 |
 <!-- /GEN:asr Parakeet-TDT v2 m1 -->
 
 Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
@@ -29,15 +29,15 @@ Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.t
 ### AMD Ryzen Threadripper 3990X, 16 threads
 
 <!-- GEN:asr Parakeet-TDT v2 zen2 -->
-_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang unknown, 2026-07-09 (Parsec off)._
 
 | file      | audio s | das ms | parakeet-cli ms | onnx ms | das/parakeet-cli | das/onnx | das xRT |
 | :-------- | ------: | -----: | --------------: | ------: | ---------------: | -------: | ------: |
-| jfk.wav   |      11 |    394 |             679 |       - |        **0.58x** |        - |    27.9 |
-| jfk3.wav  |      33 |   1126 |            1781 |       - |        **0.63x** |        - |    29.3 |
-| gb1.wav   |     199 |  10063 |           16753 |       - |        **0.60x** |        - |    19.7 |
-| hp0.wav   |     273 |  15378 |           27991 |       - |        **0.55x** |        - |    17.8 |
-| hp0x2.wav |     547 |  41438 |           92567 |       - |        **0.45x** |        - |    13.2 |
+| jfk.wav   |      11 |    380 |             679 |       - |        **0.56x** |        - |    28.9 |
+| jfk3.wav  |      33 |   1130 |            1781 |       - |        **0.63x** |        - |    29.2 |
+| gb1.wav   |     199 |   9180 |           16753 |       - |        **0.55x** |        - |    21.6 |
+| hp0.wav   |     273 |  14288 |           27991 |       - |        **0.51x** |        - |    19.1 |
+| hp0x2.wav |     547 |  41048 |           92567 |       - |        **0.44x** |        - |    13.3 |
 <!-- /GEN:asr Parakeet-TDT v2 zen2 -->
 
 Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references).
@@ -54,11 +54,11 @@ _Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
 | file      | audio s | das ms | parakeet-cli ms | onnx ms | das/parakeet-cli |  das/onnx | das xRT |
 | :-------- | ------: | -----: | --------------: | ------: | ---------------: | --------: | ------: |
-| jfk.wav   |      11 |    203 |             343 |     472 |        **0.59x** | **0.43x** |    54.2 |
-| jfk3.wav  |      33 |    642 |             770 |     906 |        **0.83x** | **0.71x** |    51.4 |
-| gb1.wav   |     199 |   5683 |            6784 |    7212 |        **0.84x** | **0.79x** |    35.0 |
-| hp0.wav   |     273 |   9148 |           11101 |   11535 |        **0.82x** | **0.79x** |    29.9 |
-| hp0x2.wav |     547 |  27965 |           38062 |       - |        **0.73x** |         - |    19.5 |
+| jfk.wav   |      11 |    203 |             343 |     472 |        **0.59x** | **0.43x** |    54.3 |
+| jfk3.wav  |      33 |    631 |             770 |     906 |        **0.82x** | **0.70x** |    52.3 |
+| gb1.wav   |     199 |   5559 |            6784 |    7212 |        **0.82x** | **0.77x** |    35.7 |
+| hp0.wav   |     273 |   9019 |           11101 |   11535 |        **0.81x** | **0.78x** |    30.3 |
+| hp0x2.wav |     547 |  27901 |           38062 |       - |        **0.73x** |         - |    19.6 |
 <!-- /GEN:asr Parakeet-TDT v3 m1 -->
 
 Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
@@ -66,15 +66,15 @@ Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.t
 ### AMD Ryzen Threadripper 3990X, 16 threads
 
 <!-- GEN:asr Parakeet-TDT v3 zen2 -->
-_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang unknown, 2026-07-09 (Parsec off)._
 
 | file      | audio s | das ms | parakeet-cli ms | onnx ms | das/parakeet-cli | das/onnx | das xRT |
 | :-------- | ------: | -----: | --------------: | ------: | ---------------: | -------: | ------: |
-| jfk.wav   |      11 |    411 |             692 |       - |        **0.59x** |        - |    26.8 |
-| jfk3.wav  |      33 |   1117 |            1799 |       - |        **0.62x** |        - |    29.6 |
-| gb1.wav   |     199 |   9314 |           17054 |       - |        **0.55x** |        - |    21.3 |
-| hp0.wav   |     273 |  14939 |           28987 |       - |        **0.52x** |        - |    18.3 |
-| hp0x2.wav |     547 |  41774 |           94314 |       - |        **0.44x** |        - |    13.1 |
+| jfk.wav   |      11 |    426 |             692 |       - |        **0.62x** |        - |    25.8 |
+| jfk3.wav  |      33 |   1153 |            1799 |       - |        **0.64x** |        - |    28.6 |
+| gb1.wav   |     199 |   9178 |           17054 |       - |        **0.54x** |        - |    21.7 |
+| hp0.wav   |     273 |  14203 |           28987 |       - |        **0.49x** |        - |    19.2 |
+| hp0x2.wav |     547 |  41213 |           94314 |       - |        **0.44x** |        - |    13.3 |
 <!-- /GEN:asr Parakeet-TDT v3 zen2 -->
 
 Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references).
@@ -86,13 +86,13 @@ Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_ze
 <!-- GEN:asr librispeech m1 -->
 | side             | mean ms |     p50 |     p95 |
 | :--------------- | ------: | ------: | ------: |
-| das v2           | **173** | **174** | **305** |
+| das v2           | **175** | **182** | **287** |
 | parakeet-cli v2  |     310 |     306 |     437 |
 | onnx v2          |     381 |     396 |     542 |
-| das v3           | **184** | **185** | **310** |
+| das v3           | **180** | **186** | **294** |
 | parakeet-cli v3  |     316 |     317 |     456 |
 | onnx v3          |     401 |     383 |     572 |
-| das tiny         | **115** | **115** | **135** |
+| das tiny         | **121** | **122** | **147** |
 | whisper-cli tiny |     127 |     126 |     163 |
 | onnx tiny        |     422 |     418 |     510 |
 <!-- /GEN:asr librispeech m1 -->
@@ -119,11 +119,11 @@ _Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
 | file      | audio s | das ms | whisper-cli ms | onnx ms | das/whisper-cli |  das/onnx | das xRT |
 | :-------- | ------: | -----: | -------------: | ------: | --------------: | --------: | ------: |
-| jfk.wav   |      11 |    110 |            124 |     416 |       **0.89x** | **0.26x** |   100.2 |
-| jfk3.wav  |      33 |    242 |            314 |       - |       **0.77x** |         - |   136.2 |
-| gb1.wav   |     199 |   1167 |           1955 |       - |       **0.60x** |         - |   170.3 |
-| hp0.wav   |     273 |   1487 |           2121 |       - |       **0.70x** |         - |   183.8 |
-| hp0x2.wav |     547 |   3009 |           4701 |       - |       **0.64x** |         - |   181.6 |
+| jfk.wav   |      11 |    117 |            124 |     416 |       **0.94x** | **0.28x** |    94.1 |
+| jfk3.wav  |      33 |    264 |            314 |       - |       **0.84x** |         - |   125.0 |
+| gb1.wav   |     199 |   1302 |           1955 |       - |       **0.67x** |         - |   152.6 |
+| hp0.wav   |     273 |   1647 |           2121 |       - |       **0.78x** |         - |   165.9 |
+| hp0x2.wav |     547 |   3397 |           4701 |       - |       **0.72x** |         - |   160.9 |
 <!-- /GEN:asr Whisper tiny m1 -->
 
 _large-v3-turbo:_
@@ -133,11 +133,11 @@ _Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
 | file      | audio s | das ms | whisper-cli ms | onnx ms | das/whisper-cli | das/onnx | das xRT |
 | :-------- | ------: | -----: | -------------: | ------: | --------------: | -------: | ------: |
-| jfk.wav   |      11 |   2607 |           2144 |    2318 |           1.22x |    1.12x |     4.2 |
-| jfk3.wav  |      33 |   5301 |           4447 |       - |           1.19x |        - |     6.2 |
-| gb1.wav   |     199 |  21815 |          25355 |       - |       **0.86x** |        - |     9.1 |
-| hp0.wav   |     273 |  32234 |          32876 |       - |       **0.98x** |        - |     8.5 |
-| hp0x2.wav |     547 |  61843 |          64500 |       - |       **0.96x** |        - |     8.8 |
+| jfk.wav   |      11 |   2490 |           2144 |    2318 |           1.16x |    1.07x |     4.4 |
+| jfk3.wav  |      33 |   5147 |           4447 |       - |           1.16x |        - |     6.4 |
+| gb1.wav   |     199 |  21589 |          25355 |       - |       **0.85x** |        - |     9.2 |
+| hp0.wav   |     273 |  31634 |          32876 |       - |       **0.96x** |        - |     8.6 |
+| hp0x2.wav |     547 |  60608 |          64500 |       - |       **0.94x** |        - |     9.0 |
 <!-- /GEN:asr Whisper large-v3-turbo m1 -->
 
 Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references);
@@ -151,29 +151,29 @@ turbo encode 2540 / decode 107 / cross_kv 41.
 _tiny:_
 
 <!-- GEN:asr Whisper tiny zen2 -->
-_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang unknown, 2026-07-09 (Parsec off)._
 
 | file      | audio s | das ms | whisper-cli ms | onnx ms | das/whisper-cli |  das/onnx | das xRT |
 | :-------- | ------: | -----: | -------------: | ------: | --------------: | --------: | ------: |
-| jfk.wav   |      11 |    203 |            263 |     606 |       **0.77x** | **0.33x** |    54.2 |
-| jfk3.wav  |      33 |    498 |            563 |       - |       **0.89x** |         - |    66.2 |
-| gb1.wav   |     199 |   2658 |           3090 |       - |       **0.86x** |         - |    74.8 |
-| hp0.wav   |     273 |   3233 |           3894 |       - |       **0.83x** |         - |    84.5 |
-| hp0x2.wav |     547 |   6457 |           8069 |       - |       **0.80x** |         - |    84.7 |
+| jfk.wav   |      11 |    210 |            263 |     606 |       **0.80x** | **0.35x** |    52.3 |
+| jfk3.wav  |      33 |    503 |            563 |       - |       **0.89x** |         - |    65.6 |
+| gb1.wav   |     199 |   2662 |           3090 |       - |       **0.86x** |         - |    74.7 |
+| hp0.wav   |     273 |   3288 |           3894 |       - |       **0.84x** |         - |    83.1 |
+| hp0x2.wav |     547 |   6587 |           8069 |       - |       **0.82x** |         - |    83.0 |
 <!-- /GEN:asr Whisper tiny zen2 -->
 
 _large-v3-turbo:_
 
 <!-- GEN:asr Whisper large-v3-turbo zen2 -->
-_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang unknown, 2026-07-09 (Parsec off)._
 
 | file      | audio s | das ms | whisper-cli ms | onnx ms | das/whisper-cli |  das/onnx | das xRT |
 | :-------- | ------: | -----: | -------------: | ------: | --------------: | --------: | ------: |
-| jfk.wav   |      11 |   3589 |           6972 |    3890 |       **0.51x** | **0.92x** |     3.1 |
-| jfk3.wav  |      33 |   7528 |          14234 |       - |       **0.53x** |         - |     4.4 |
-| gb1.wav   |     199 |  32874 |          80386 |       - |       **0.41x** |         - |     6.0 |
-| hp0.wav   |     273 |  46789 |         103665 |       - |       **0.45x** |         - |     5.8 |
-| hp0x2.wav |     547 |  90366 |         199539 |       - |       **0.45x** |         - |     6.0 |
+| jfk.wav   |      11 |   3638 |           6972 |    3890 |       **0.52x** | **0.94x** |     3.0 |
+| jfk3.wav  |      33 |   7711 |          14234 |       - |       **0.54x** |         - |     4.3 |
+| gb1.wav   |     199 |  33630 |          80386 |       - |       **0.42x** |         - |     5.9 |
+| hp0.wav   |     273 |  48139 |         103665 |       - |       **0.46x** |         - |     5.7 |
+| hp0x2.wav |     547 |  93666 |         199539 |       - |       **0.47x** |         - |     5.8 |
 <!-- /GEN:asr Whisper large-v3-turbo zen2 -->
 
 Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references);
@@ -196,9 +196,9 @@ _Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
 | file     | audio s | das ms | nemo ms |  das/nemo | das xRT |
 | :------- | ------: | -----: | ------: | --------: | ------: |
-| jfk.wav  |      11 |   5235 |    7918 | **0.66x** |     2.1 |
-| jfk3.wav |      33 |  16809 |   21722 | **0.77x** |     2.0 |
-| gb1.wav  |     199 | 128980 |   35319 |     3.65x |     1.5 |
+| jfk.wav  |      11 |   5206 |    7918 | **0.66x** |     2.1 |
+| jfk3.wav |      33 |  16981 |   21722 | **0.78x** |     1.9 |
+| gb1.wav  |     199 | 127742 |   35319 |     3.62x |     1.6 |
 <!-- /GEN:asr Canary-Qwen 2.5B m1 -->
 
 Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
@@ -221,7 +221,7 @@ _Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
 | file              | audio s | das ms | mtmd ms |  das/mtmd | das xRT |
 | :---------------- | ------: | -----: | ------: | --------: | ------: |
-| gemma4a_test2.wav |      17 |   5881 |   18687 | **0.31x** |     3.0 |
+| gemma4a_test2.wav |      17 |   5966 |   18687 | **0.32x** |     2.9 |
 <!-- /GEN:asr Gemma-4 E2B audio m1 -->
 
 Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
@@ -233,11 +233,11 @@ audio encode was silently **Metal/GPU**-offloaded (mislabeled CPU-only) — a CP
 ### AMD Ryzen Threadripper 3990X, 16 threads
 
 <!-- GEN:asr Gemma-4 E2B audio zen2 -->
-_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang unknown, 2026-07-09 (Parsec off)._
 
 | file              | audio s | das ms | mtmd ms | das/mtmd | das xRT |
 | :---------------- | ------: | -----: | ------: | -------: | ------: |
-| gemma4a_test2.wav |      17 |   9069 |    8252 |    1.10x |     1.9 |
+| gemma4a_test2.wav |      17 |   9268 |    8252 |    1.12x |     1.9 |
 <!-- /GEN:asr Gemma-4 E2B audio zen2 -->
 
 Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references).
@@ -256,8 +256,8 @@ _Apple M1 Max, 8 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
 
 | file     | audio s | das ms | mtmd ms |  das/mtmd | das xRT |
 | :------- | ------: | -----: | ------: | --------: | ------: |
-| jfk.wav  |      11 |   3686 |   21791 | **0.17x** |     3.0 |
-| jfk3.wav |      33 |   8012 |   45163 | **0.18x** |     4.1 |
+| jfk.wav  |      11 |   4011 |   21791 | **0.18x** |     2.7 |
+| jfk3.wav |      33 |   8222 |   45163 | **0.18x** |     4.0 |
 <!-- /GEN:asr Qwen3-Omni-30B audio m1 -->
 
 Source: `performance/profile_asr_m1.json` (das) + `performance/baseline_asr_m1.tsv` (references).
@@ -268,12 +268,12 @@ the prior "das trails 3-4x" measured mtmd's Metal-offloaded encode, mislabeled C
 ### AMD Ryzen Threadripper 3990X, 16 threads
 
 <!-- GEN:asr Qwen3-Omni-30B audio zen2 -->
-_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang 0.6.3, 2026-07-09 (Parsec off)._
+_AMD Ryzen Threadripper 3990X 64-Core Processor, 16 threads — daslang unknown, 2026-07-09 (Parsec off)._
 
 | file     | audio s | das ms | mtmd ms |  das/mtmd | das xRT |
 | :------- | ------: | -----: | ------: | --------: | ------: |
-| jfk.wav  |      11 |   5773 |  318961 | **0.02x** |     1.9 |
-| jfk3.wav |      33 |  10171 |   11763 | **0.86x** |     3.2 |
+| jfk.wav  |      11 |   5984 |  318961 | **0.02x** |     1.8 |
+| jfk3.wav |      33 |  10139 |   11763 | **0.86x** |     3.3 |
 <!-- /GEN:asr Qwen3-Omni-30B audio zen2 -->
 
 Source: `performance/profile_asr_zen2.json` (das) + `performance/baseline_asr_zen2.tsv` (references).

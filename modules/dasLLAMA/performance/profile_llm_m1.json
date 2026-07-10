@@ -7,7 +7,8 @@
     "llama_cpp":"ebd048f",
     "date":"2026-07-09",
     "box_profile":"default",
-    "parsec_off":true
+    "parsec_off":true,
+    "tune":"q8q8_tile_gen=kstep4_nrsplit2_mr8_gkstep2 (manifest)"
   },
   "tests":[
     {
@@ -17,12 +18,12 @@
       "active_b":0.134479872,
       "prefill":{
         "context":512,
-        "das_tok_s":4511.3709457137575,
+        "das_tok_s":4416.9154057178357,
         "llama_cpp_tok_s":3905.2639220000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":343.71366503492186,
+        "das_tok_s":346.92483656587774,
         "llama_cpp_tok_s":409.61511200000001
       }
     },
@@ -33,12 +34,12 @@
       "active_b":0.49396121599999998,
       "prefill":{
         "context":512,
-        "das_tok_s":2040.2389311060726,
+        "das_tok_s":2025.3565141715619,
         "llama_cpp_tok_s":1814.018403
       },
       "emission":{
         "context":128,
-        "das_tok_s":159.41216763185753,
+        "das_tok_s":160.95587671282831,
         "llama_cpp_tok_s":173.66653700000001
       }
     },
@@ -49,12 +50,12 @@
       "active_b":0.59598438399999998,
       "prefill":{
         "context":512,
-        "das_tok_s":1494.3800220070807,
+        "das_tok_s":1532.3514711471985,
         "llama_cpp_tok_s":1364.3294989999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":125.58142729178748,
+        "das_tok_s":130.95781316821737,
         "llama_cpp_tok_s":138.90971099999999
       }
     },
@@ -65,12 +66,12 @@
       "active_b":0.99975168000000003,
       "prefill":{
         "context":512,
-        "das_tok_s":1075.9105313148805,
+        "das_tok_s":1085.7187691511674,
         "llama_cpp_tok_s":1027.844218
       },
       "emission":{
         "context":128,
-        "das_tok_s":82.5137823802132,
+        "das_tok_s":83.743929382931555,
         "llama_cpp_tok_s":90.405986999999996
       }
     },
@@ -81,12 +82,12 @@
       "active_b":1.099956224,
       "prefill":{
         "context":512,
-        "das_tok_s":838.14475349213342,
+        "das_tok_s":865.95608655501701,
         "llama_cpp_tok_s":784.90319799999997
       },
       "emission":{
         "context":128,
-        "das_tok_s":87.57490048617754,
+        "das_tok_s":88.896914304763627,
         "llama_cpp_tok_s":93.684067999999996
       }
     },
@@ -97,12 +98,12 @@
       "active_b":1.235746816,
       "prefill":{
         "context":512,
-        "das_tok_s":850.28364931113731,
+        "das_tok_s":866.9913368600013,
         "llama_cpp_tok_s":857.22170000000006
       },
       "emission":{
         "context":128,
-        "das_tok_s":72.425841313850029,
+        "das_tok_s":76.355048589847527,
         "llama_cpp_tok_s":81.390786000000006
       }
     },
@@ -113,12 +114,12 @@
       "active_b":1.543569408,
       "prefill":{
         "context":512,
-        "das_tok_s":607.97853075813259,
+        "das_tok_s":628.85279808789448,
         "llama_cpp_tok_s":607.27225799999997
       },
       "emission":{
         "context":128,
-        "das_tok_s":60.776418749525185,
+        "das_tok_s":59.546460660723803,
         "llama_cpp_tok_s":64.058931000000001
       }
     },
@@ -129,12 +130,12 @@
       "active_b":1.711276032,
       "prefill":{
         "context":512,
-        "das_tok_s":552.4754569252583,
+        "das_tok_s":545.30040514116035,
         "llama_cpp_tok_s":497.70351799999997
       },
       "emission":{
         "context":128,
-        "das_tok_s":57.705407582761048,
+        "das_tok_s":55.51885624216284,
         "llama_cpp_tok_s":58.783225999999999
       }
     },
@@ -145,12 +146,12 @@
       "active_b":2.6140999680000001,
       "prefill":{
         "context":512,
-        "das_tok_s":442.6408367295067,
+        "das_tok_s":438.33139565743716,
         "llama_cpp_tok_s":393.01093500000002
       },
       "emission":{
         "context":128,
-        "das_tok_s":36.31900113667124,
+        "das_tok_s":35.662662418352006,
         "llama_cpp_tok_s":36.481406999999997
       }
     },
@@ -161,12 +162,12 @@
       "active_b":3.8208798719999999,
       "prefill":{
         "context":512,
-        "das_tok_s":252.54904359381237,
+        "das_tok_s":250.63944878902475,
         "llama_cpp_tok_s":224.22273999999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":27.027449330922821,
+        "das_tok_s":26.441866729686449,
         "llama_cpp_tok_s":27.509620999999999
       }
     },
@@ -177,12 +178,12 @@
       "active_b":3.8797312000000002,
       "prefill":{
         "context":512,
-        "das_tok_s":283.55329943616096,
+        "das_tok_s":281.05029373049257,
         "llama_cpp_tok_s":252.85812300000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":25.805234188548365,
+        "das_tok_s":24.876748344675903,
         "llama_cpp_tok_s":25.472218000000002
       }
     },
@@ -193,12 +194,12 @@
       "active_b":4.0222720000000001,
       "prefill":{
         "context":512,
-        "das_tok_s":244.70222081603413,
+        "das_tok_s":236.29489603024575,
         "llama_cpp_tok_s":218.75239199999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":25.298837577707456,
+        "das_tok_s":24.43905682042525,
         "llama_cpp_tok_s":25.676604999999999
       }
     },
@@ -209,12 +210,12 @@
       "active_b":2.2476226559999999,
       "prefill":{
         "context":512,
-        "das_tok_s":408.37226960864859,
+        "das_tok_s":391.36669530573994,
         "llama_cpp_tok_s":233.19858199999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":37.922240445965549,
+        "das_tok_s":37.113056518256002,
         "llama_cpp_tok_s":37.579093
       }
     },
@@ -225,12 +226,12 @@
       "active_b":7.2477573120000001,
       "prefill":{
         "context":512,
-        "das_tok_s":131.0780065185707,
+        "das_tok_s":121.17898633304577,
         "llama_cpp_tok_s":114.281701
       },
       "emission":{
         "context":128,
-        "das_tok_s":14.587067470657201,
+        "das_tok_s":14.195485813330915,
         "llama_cpp_tok_s":14.812841000000001
       }
     },
@@ -241,12 +242,12 @@
       "active_b":4.5888307199999998,
       "prefill":{
         "context":512,
-        "das_tok_s":208.00764428092734,
+        "das_tok_s":202.66079372574848,
         "llama_cpp_tok_s":119.847145
       },
       "emission":{
         "context":128,
-        "das_tok_s":19.690662764633664,
+        "das_tok_s":19.292996099800256,
         "llama_cpp_tok_s":19.405933000000001
       }
     },
@@ -257,12 +258,12 @@
       "active_b":8.0299950080000002,
       "prefill":{
         "context":512,
-        "das_tok_s":132.1375231595527,
+        "das_tok_s":119.52786493351262,
         "llama_cpp_tok_s":119.10648999999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":13.64902970327436,
+        "das_tok_s":13.632261855301849,
         "llama_cpp_tok_s":14.244004
       }
     }
