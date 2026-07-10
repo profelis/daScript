@@ -13,14 +13,15 @@ require daslib/fio                                      // get_env_variable / st
 require strings                                         // starts_with / build_string
 require math                                            // min
 
-// S3 conformance for the continuous-batching server wiring: SSE chunk framing on a streaming chat,
-// the mandatory 400 on a prompt that cannot fit the context (the scheduler would panic), and two
-// client THREADS batching on one server (proven by /v1/stats peak_active >= 2). Same skip contract
+// S3/S4 conformance for the continuous-batching server wiring: SSE chunk framing on a streaming
+// chat, the mandatory 400 on a prompt that cannot fit the context (the scheduler would panic), two
+// client THREADS batching on one server (proven by /v1/stats peak_active >= 2), and disconnect
+// eviction (an abandoned client's stream finishes "evicted", proven via stats). Same skip contract
 // as test_openai_server; SmolLM2-135M — small, chatml template (real stop ids). In-dir like its
 // siblings: a require path can't contain the '-' of "dasllama-server".
 
 let TEST_PORT = 18101
-let TEST_CTX = 192l   // small context so the 400 over-long-prompt arm stays cheap to drive
+let TEST_CTX = 1024l   // big enough that the eviction arm's 900-token budget outlasts a 1s client timeout
 
 def private models_dir() : string {
     let env = get_env_variable("DASLLAMA_MODELS_DIR")
@@ -170,7 +171,7 @@ def test_openai_server_stream(t : T?) {
         }
         t |> run("over-long prompt answers 400 before the scheduler (mandatory pre-check)") @(t : T?) {
             let big = build_string() $(w) {
-                for (_i in range(400)) {   // ~400 tokens — far beyond the TEST_CTX-token context
+                for (_i in range(1400)) {   // ~1400 tokens — far beyond the TEST_CTX-token context
                     w |> write("word ")
                 }
             }
@@ -242,6 +243,45 @@ def test_openai_server_stream(t : T?) {
                         delete js
                     }
                 }
+            }
+        }
+        t |> run("disconnected client is evicted mid-generation (observed via /v1/stats)") @(t : T?) {
+            // Non-streaming: the client receives ZERO bytes until finish, so its 1s idle-read
+            // timeout fires deterministically while the server is still generating the 900-token
+            // budget (a 135M model is nowhere near 900 tok/s); the serve loop's
+            // is_writer_connected poll then evicts the stream and reaps its session.
+            with_http_request() <| $(var req) {
+                req.method = http_method.POST
+                req.url := "{base_url}/v1/chat/completions"
+                req.body := "\{\"messages\":[\{\"role\":\"user\",\"content\":\"Tell me a very long story.\"}],\"max_tokens\":900}"
+                set_content_type(req, "application/json")
+                set_timeout(req, 1)
+                request(req) $(_resp) {}   // times out — the abort IS the test stimulus
+            }
+            var evicted = 0l
+            for (_attempt in range(300)) {   // up to ~30s; generation stops at eviction, so usually instant
+                GET("{base_url}/v1/stats") $(resp) {
+                    if (resp != null && resp.status_code == http_status.OK) {
+                        var perr = ""
+                        var js = read_json(string(resp.body), perr)
+                        if (js != null) {
+                            evicted = int64(js?["evicted"] ?? 0l)
+                            unsafe {
+                                delete js
+                            }
+                        }
+                    }
+                }
+                if (evicted >= 1l) {
+                    break
+                }
+                sleep(100u)
+            }
+            t |> success(evicted >= 1l, "the abandoned stream was evicted (evicted = {evicted})")
+            // the server survives the eviction and still serves
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"messages\":[\{\"role\":\"user\",\"content\":\"Hi\"}],\"max_tokens\":4}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
             }
         }
     }

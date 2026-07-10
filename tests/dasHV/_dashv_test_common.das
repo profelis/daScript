@@ -27,6 +27,7 @@ let PORT_COOKIES        = 19005
 let PORT_FORMS          = 19006
 let PORT_WEBSOCKETS     = 19007
 let PORT_SSE            = 19008
+let PORT_WRITER_CONNECTED = 19009
 
 // ──────────────────────────────────────────────────────────────────────────
 // Generic server lifecycle
@@ -70,7 +71,7 @@ def with_test_server(server_type : auto(ServerType); port : int; blk : block<(ba
 // ──────────────────────────────────────────────────────────────────────────
 
 def write_test_file(path, content : string) {
-    fopen(path, "w") <| $(f) {
+    fopen(path, "w") $(f) {
         if (f != null) {
             fwrite(f, content)
         }
@@ -79,7 +80,7 @@ def write_test_file(path, content : string) {
 
 def read_test_file(path : string) : string {
     var result = ""
-    fopen(path, "r") <| $(f) {
+    fopen(path, "r") $(f) {
         if (f != null) {
             result = fread(f)
         }

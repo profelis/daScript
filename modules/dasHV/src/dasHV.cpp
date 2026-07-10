@@ -741,6 +741,17 @@ void das_writer_release ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter 
     if ( auto adapter = lookup_server(h) ) adapter->release_writer(w);
 }
 
+// True while the writer's connection is still open (isOpened: io alive + not disconnected). The
+// async write ops never report a dead peer, so a server polls this to evict abandoned streams.
+// False for null / unknown / already-released writers.
+bool das_writer_is_connected ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w ) {
+    auto adapter = lookup_server(h);
+    if ( !adapter || !w ) return false;
+    auto sp = adapter->find_writer(w);
+    if ( !sp ) return false;
+    return sp->isOpened();
+}
+
 void das_wss_set_document_root ( Handle<hv::WebSocketServer> h, const char * dir ) {
     if ( auto adapter = lookup_server(h) ) adapter->SET_DOCUMENT_ROOT(dir);
 }
@@ -1530,6 +1541,9 @@ public:
                 ->args({"server","writer"});
         addExtern<DAS_BIND_FUN(das_writer_release)> (*this, lib, "release_writer",
             SideEffects::worstDefault, "das_writer_release")
+                ->args({"server","writer"});
+        addExtern<DAS_BIND_FUN(das_writer_is_connected)> (*this, lib, "is_writer_connected",
+            SideEffects::worstDefault, "das_writer_is_connected")
                 ->args({"server","writer"});
 
     }

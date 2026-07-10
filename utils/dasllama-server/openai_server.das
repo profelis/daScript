@@ -440,9 +440,20 @@ def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var
     register_request(srv, writer, toks, none_stop, none_close, params, max_new, streaming, false, "cmpl")
 }
 
+// Evict streams whose client vanished: is_writer_connected reads false once the connection is
+// gone (the async writer ops themselves never report a dead peer). The scheduler appends the
+// "evicted" finished event; flush_events below releases the writer and drops the wire.
+def private reap_disconnected(srv : WebSocketServer) {
+    for (id, w in keys(g_wires), values(g_wires)) {
+        if (!is_writer_connected(srv, w.writer)) {
+            evict(g_sched, id, g_events)
+        }
+    }
+}
+
 // Route drained SchedEvents to their writers: streaming wires emit SSE chunks, buffered wires
 // accumulate pieces and respond once at finish. "evicted" releases the writer with no bytes —
-// the client is gone (S4's disconnect poll produces it). Finished wires unregister.
+// the client is gone (reap_disconnected produced it). Finished wires unregister.
 def private flush_events(srv : WebSocketServer) {
     for (e in g_events) {
         // interior pointer into g_wires — nothing inserts into the table between here and the erase
@@ -605,8 +616,9 @@ class OpenAiServer : HvWebServer {
 }
 
 //! Run the server on the calling thread until ``request_stop`` (or ``POST /shutdown``). Sets up the
-//! job queue, then drives the serve loop: pump HTTP (handlers parse + render + submit), one
-//! scheduler step (continuous batching over every live stream), flush events to the writers.
+//! job queue, then drives the serve loop: pump HTTP (handlers parse + render + submit), evict
+//! streams whose client disconnected, one scheduler step (continuous batching over every live
+//! stream), flush events to the writers.
 //! ``max_streams`` concurrent generation streams (each holds a full KV cache — cap the context with
 //! ``--ctx`` to bound memory), ``max_queue`` waiting requests (503 beyond), ``chunk_tokens`` the
 //! prefill quantum (decode stalls at most this many tokens per tick). Call after ``set_model``.
@@ -624,6 +636,7 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
             to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens})\n")
             while (!g_should_stop) {
                 server->tick()   // drains queued handlers: requests parse + render + submit here
+                reap_disconnected(server.server)
                 let busy = scheduler_step(g_model, g_sched, g_events)
                 flush_events(server.server)
                 if (!busy) {
