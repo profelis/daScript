@@ -1487,7 +1487,7 @@ namespace das
                 valueType = valueT->baseType;
                 val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
             }
-            setE(expr, context.code->makeValueNode<SimNode_TableErase>(valueType, at, cont, val, valueTypeSize));
+            setE(expr, context.code->makeTableKeyValueNode<SimNode_TableErase>(valueType, at, cont, val, valueTypeSize));
         } else {
             DAS_ASSERTF(0, "we should not even be here. erase can only accept tables. infer type should have failed.");
             context.thisProgram->error("internal compilation error, generating erase for non-table type", "", "", at, CompilationError::internal_table);
@@ -1510,7 +1510,7 @@ namespace das
                 valueType = valueT->baseType;
                 val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
             }
-            setE(expr, context.code->makeValueNode<SimNode_TableSetInsert>(valueType, at, cont, val));
+            setE(expr, context.code->makeTableKeyValueNode<SimNode_TableSetInsert>(valueType, at, cont, val));
         } else {
             DAS_ASSERTF(0, "we should not even be here. erase can only accept tables. infer type should have failed.");
             context.thisProgram->error("internal compilation error, generating set insert for non-table type", "", "", at, CompilationError::internal_table);
@@ -1538,7 +1538,7 @@ namespace das
                     valueType = valueT->baseType;
                     val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
                 }
-                setE(expr, context.code->makeValueNode<SimNode_TableFind>(valueType, at, cont, val, valueTypeSize));
+                setE(expr, context.code->makeTableKeyValueNode<SimNode_TableFind>(valueType, at, cont, val, valueTypeSize));
             }
         } else {
             DAS_ASSERTF(0, "we should not even be here. find can only accept tables. infer type should have failed.");
@@ -1567,7 +1567,7 @@ namespace das
                     valueType = valueT->baseType;
                     val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
                 }
-                setE(expr, context.code->makeValueNode<SimNode_KeyExists>(valueType, at, cont, val, valueTypeSize));
+                setE(expr, context.code->makeTableKeyValueNode<SimNode_KeyExists>(valueType, at, cont, val, valueTypeSize));
             }
         } else {
             DAS_ASSERTF(0, "we should not even be here. find can only accept tables. infer type should have failed.");
@@ -1990,7 +1990,7 @@ namespace das
                     keyType = keyValueType->baseType;
                     pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
                 }
-                res = context.code->makeValueNode<SimNode_TableIndex>(keyType, at, prv, pidx, valueTypeSize, 0);
+                res = context.code->makeTableKeyValueNode<SimNode_TableIndex>(keyType, at, prv, pidx, valueTypeSize, 0);
             }
             if ( expr->r2v ) {
                 setE(expr, GetR2V(context, at, expr->type, res));
@@ -2037,7 +2037,7 @@ namespace das
                         valueType = valueT->baseType;
                         pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
                     }
-                    setE(expr, context.code->makeValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
+                    setE(expr, context.code->makeTableKeyValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
                 }
             } else if ( seT->baseType==Type::tFixedArray ) {
                 uint32_t range = uint32_t(seT->fixedDim);
@@ -2097,7 +2097,7 @@ namespace das
                         valueType = valueT->baseType;
                         pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
                     }
-                    setE(expr, context.code->makeValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
+                    setE(expr, context.code->makeTableKeyValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
                 }
             } else if ( seT->baseType==Type::tFixedArray ) {
                 uint32_t range = uint32_t(seT->fixedDim);

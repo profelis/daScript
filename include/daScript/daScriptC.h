@@ -810,7 +810,32 @@ typedef enum das_base_type {
     DAS_TYPE_TABLE,
     DAS_TYPE_BLOCK,
     DAS_TYPE_TUPLE,
-    DAS_TYPE_VARIANT
+    DAS_TYPE_VARIANT,
+    // 16/8-bit type lattice. The +2 gap skips two AST-only internal tags (fixed array,
+    // distinct) that never appear in runtime type info. byte = SIGNED int8, ubyte = uint8.
+    DAS_TYPE_FLOAT16 = DAS_TYPE_VARIANT + 3,
+    DAS_TYPE_HALF2,
+    DAS_TYPE_HALF3,
+    DAS_TYPE_HALF4,
+    DAS_TYPE_HALF8,
+    DAS_TYPE_SHORT2,
+    DAS_TYPE_SHORT3,
+    DAS_TYPE_SHORT4,
+    DAS_TYPE_SHORT8,
+    DAS_TYPE_USHORT2,
+    DAS_TYPE_USHORT3,
+    DAS_TYPE_USHORT4,
+    DAS_TYPE_USHORT8,
+    DAS_TYPE_BYTE2,
+    DAS_TYPE_BYTE3,
+    DAS_TYPE_BYTE4,
+    DAS_TYPE_BYTE8,
+    DAS_TYPE_BYTE16,
+    DAS_TYPE_UBYTE2,
+    DAS_TYPE_UBYTE3,
+    DAS_TYPE_UBYTE4,
+    DAS_TYPE_UBYTE8,
+    DAS_TYPE_UBYTE16
 } das_base_type;
 
 // --- Type introspection: flag constants ---

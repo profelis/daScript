@@ -151,5 +151,221 @@ namespace das
     typedef vec2<uint32_t> uint2;
     typedef vec3<uint32_t> uint3;
     typedef vec4<uint32_t> uint4;
+
+    // ===== 16/8-bit type lattice =====
+    // Unlike vec2/3/4 above (32-bit lane extraction), small-element vectors are byte-packed
+    // in the low bytes of the vec4f slot, so all conversions are memcpy-based — correct for
+    // every element size, including the odd ones (half3 = 6B, byte3 = 3B).
+
+    // scalar IEEE-754 binary16 carrier. NOT named `half` — that word means "low 64 bits of a
+    // vec4f register" throughout the C++ internals (v_ldu_half / cast_fVec_half).
+    __forceinline float das_float16_to_float ( uint16_t h ) {
+        uint32_t sign = uint32_t(h & 0x8000u) << 16;
+        uint32_t em = h & 0x7fffu;
+        uint32_t r;
+        if ( em >= (31u << 10) ) {              // inf / nan
+            r = sign | 0x7f800000u | ((em & 0x3ffu) << 13);
+        } else if ( em >= (1u << 10) ) {        // normal
+            r = sign | ((em + ((127u - 15u) << 10)) << 13);
+        } else if ( em != 0 ) {                 // subnormal -> normalized float
+            uint32_t m = em;
+            int e = -1;
+            do { m <<= 1; e++; } while ( (m & (1u << 10)) == 0 );
+            r = sign | ((uint32_t(127 - 15 - e) << 23) | ((m & 0x3ffu) << 13));
+        } else {                                // +-0
+            r = sign;
+        }
+        float f;
+        memcpy(&f, &r, sizeof(f));
+        return f;
+    }
+
+    __forceinline uint16_t das_float_to_float16 ( float f ) {   // round-to-nearest-even
+        uint32_t x;
+        memcpy(&x, &f, sizeof(x));
+        uint32_t sign = (x >> 16) & 0x8000u;
+        uint32_t em = x & 0x7fffffffu;
+        if ( em >= 0x7f800000u ) {              // inf / nan
+            uint32_t mant = (em > 0x7f800000u) ? ((em >> 13) & 0x3ffu) | 1u : 0u;
+            return uint16_t(sign | (31u << 10) | mant);
+        }
+        if ( em >= ((127u + 16u) << 23) ) {     // overflow -> inf
+            return uint16_t(sign | (31u << 10));
+        }
+        if ( em < ((127u - 25u) << 23) ) {      // underflow -> +-0
+            return uint16_t(sign);
+        }
+        uint32_t base, sh;
+        if ( em < ((127u - 14u) << 23) ) {      // subnormal half
+            sh = 126u - (em >> 23) + 13u + 1u;
+            base = (em & 0x7fffffu) | 0x800000u;
+        } else {                                // normal half
+            sh = 13u;
+            base = em - ((127u - 15u) << 23);
+        }
+        uint32_t rem = base & ((1u << sh) - 1u);
+        base >>= sh;
+        uint32_t halfway = 1u << (sh - 1u);
+        if ( rem > halfway || (rem == halfway && (base & 1u)) ) base++;
+        return uint16_t(sign | base);
+    }
+
+    struct float16_t {
+        uint16_t bits;
+        __forceinline float16_t() = default;
+        __forceinline float16_t(const float16_t &) = default;
+        __forceinline float16_t & operator = (const float16_t &) = default;
+        __forceinline explicit float16_t(float f) : bits(das_float_to_float16(f)) {}
+        __forceinline float toFloat() const { return das_float16_to_float(bits); }
+        // IEEE semantics via promote-compare: -0 == +0, NaN != NaN (bitwise would violate both)
+        __forceinline bool operator == ( const float16_t & v ) const { return toFloat() == v.toFloat(); }
+        __forceinline bool operator != ( const float16_t & v ) const { return toFloat() != v.toFloat(); }
+        __forceinline friend StringWriter & operator<< (StringWriter & stream, const float16_t & v) {
+            stream << v.toFloat();
+            return stream;
+        }
+    };
+    static_assert(sizeof(float16_t) == 2, "float16_t must be 2 bytes");
+
+    // print 8-bit lanes numerically, not as characters
+    template <typename TT> struct svec_print { typedef TT type; };
+    template <> struct svec_print<int8_t>  { typedef int32_t type; };
+    template <> struct svec_print<uint8_t> { typedef uint32_t type; };
+
+    template <typename TT>
+    struct svec2 {
+        TT x, y;
+        __forceinline friend StringWriter & operator<< (StringWriter & stream, const svec2<TT> & vec) {
+            stream << typename svec_print<TT>::type(vec.x) << DAS_PRINT_VEC_SEPARATROR << typename svec_print<TT>::type(vec.y);
+            return stream;
+        }
+        __forceinline bool operator == ( const svec2<TT> & vec ) const { return x==vec.x && y==vec.y; }
+        __forceinline bool operator != ( const svec2<TT> & vec ) const { return x!=vec.x || y!=vec.y; }
+        __forceinline svec2() = default;
+        __forceinline svec2(const svec2 &) = default;
+        __forceinline svec2 & operator = (const svec2 &) = default;
+        __forceinline svec2(vec4f t) { memcpy(this, &t, sizeof(*this)); }
+        __forceinline svec2(TT X, TT Y) : x(X), y(Y) {}
+        __forceinline svec2(TT t) : x(t), y(t) {}
+        __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
+    };
+
+    template <typename TT>
+    struct svec3 {
+        TT x, y, z;
+        __forceinline friend StringWriter & operator<< (StringWriter & stream, const svec3<TT> & vec) {
+            stream << typename svec_print<TT>::type(vec.x) << DAS_PRINT_VEC_SEPARATROR << typename svec_print<TT>::type(vec.y)
+                << DAS_PRINT_VEC_SEPARATROR << typename svec_print<TT>::type(vec.z);
+            return stream;
+        }
+        __forceinline bool operator == ( const svec3<TT> & vec ) const { return x==vec.x && y==vec.y && z==vec.z; }
+        __forceinline bool operator != ( const svec3<TT> & vec ) const { return x!=vec.x || y!=vec.y || z!=vec.z; }
+        __forceinline svec3() = default;
+        __forceinline svec3(const svec3 &) = default;
+        __forceinline svec3 & operator = (const svec3 &) = default;
+        __forceinline svec3(vec4f t) { memcpy(this, &t, sizeof(*this)); }
+        __forceinline svec3(TT X, TT Y, TT Z) : x(X), y(Y), z(Z) {}
+        __forceinline svec3(TT t) : x(t), y(t), z(t) {}
+        __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
+    };
+
+    template <typename TT>
+    struct svec4 {
+        TT x, y, z, w;
+        __forceinline friend StringWriter & operator<< (StringWriter & stream, const svec4<TT> & vec) {
+            stream << typename svec_print<TT>::type(vec.x) << DAS_PRINT_VEC_SEPARATROR << typename svec_print<TT>::type(vec.y)
+                << DAS_PRINT_VEC_SEPARATROR << typename svec_print<TT>::type(vec.z) << DAS_PRINT_VEC_SEPARATROR << typename svec_print<TT>::type(vec.w);
+            return stream;
+        }
+        __forceinline bool operator == ( const svec4<TT> & vec ) const { return x==vec.x && y==vec.y && z==vec.z && w==vec.w; }
+        __forceinline bool operator != ( const svec4<TT> & vec ) const { return x!=vec.x || y!=vec.y || z!=vec.z || w!=vec.w; }
+        __forceinline svec4() = default;
+        __forceinline svec4(const svec4 &) = default;
+        __forceinline svec4 & operator = (const svec4 &) = default;
+        __forceinline svec4(vec4f t) { memcpy(this, &t, sizeof(*this)); }
+        __forceinline svec4(TT X, TT Y, TT Z, TT W) : x(X), y(Y), z(Z), w(W) {}
+        __forceinline svec4(TT t) : x(t), y(t), z(t), w(t) {}
+        __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
+    };
+
+    template <typename TT>
+    struct svec8 {
+        TT s[8];
+        __forceinline friend StringWriter & operator<< (StringWriter & stream, const svec8<TT> & vec) {
+            for ( int i = 0; i != 8; ++i ) {
+                if ( i ) stream << DAS_PRINT_VEC_SEPARATROR;
+                stream << typename svec_print<TT>::type(vec.s[i]);
+            }
+            return stream;
+        }
+        __forceinline bool operator == ( const svec8<TT> & vec ) const {
+            for ( int i = 0; i != 8; ++i ) if ( !(s[i] == vec.s[i]) ) return false;
+            return true;
+        }
+        __forceinline bool operator != ( const svec8<TT> & vec ) const { return !(*this == vec); }
+        __forceinline svec8() = default;
+        __forceinline svec8(const svec8 &) = default;
+        __forceinline svec8 & operator = (const svec8 &) = default;
+        __forceinline svec8(vec4f t) { memcpy(this, &t, sizeof(*this)); }
+        __forceinline svec8(TT s0, TT s1, TT s2, TT s3, TT s4, TT s5, TT s6, TT s7) : s{s0, s1, s2, s3, s4, s5, s6, s7} {}
+        __forceinline svec8(TT t) { for ( int i = 0; i != 8; ++i ) s[i] = t; }
+        __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
+    };
+
+    template <typename TT>
+    struct svec16 {
+        TT s[16];
+        __forceinline friend StringWriter & operator<< (StringWriter & stream, const svec16<TT> & vec) {
+            for ( int i = 0; i != 16; ++i ) {
+                if ( i ) stream << DAS_PRINT_VEC_SEPARATROR;
+                stream << typename svec_print<TT>::type(vec.s[i]);
+            }
+            return stream;
+        }
+        __forceinline bool operator == ( const svec16<TT> & vec ) const {
+            for ( int i = 0; i != 16; ++i ) if ( !(s[i] == vec.s[i]) ) return false;
+            return true;
+        }
+        __forceinline bool operator != ( const svec16<TT> & vec ) const { return !(*this == vec); }
+        __forceinline svec16() = default;
+        __forceinline svec16(const svec16 &) = default;
+        __forceinline svec16 & operator = (const svec16 &) = default;
+        __forceinline svec16(vec4f t) { memcpy(this, &t, sizeof(*this)); }
+        __forceinline svec16(TT s0, TT s1, TT s2, TT s3, TT s4, TT s5, TT s6, TT s7,
+                             TT s8, TT s9, TT sa, TT sb, TT sc, TT sd, TT se, TT sf)
+            : s{s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, sa, sb, sc, sd, se, sf} {}
+        __forceinline svec16(TT t) { for ( int i = 0; i != 16; ++i ) s[i] = t; }
+        __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
+    };
+
+    typedef svec2<float16_t> half2;
+    typedef svec3<float16_t> half3;
+    typedef svec4<float16_t> half4;
+    typedef svec8<float16_t> half8;
+
+    typedef svec2<int16_t> short2;
+    typedef svec3<int16_t> short3;
+    typedef svec4<int16_t> short4;
+    typedef svec8<int16_t> short8;
+
+    typedef svec2<uint16_t> ushort2;
+    typedef svec3<uint16_t> ushort3;
+    typedef svec4<uint16_t> ushort4;
+    typedef svec8<uint16_t> ushort8;
+
+    typedef svec2<int8_t> byte2;      // byte = SIGNED int8 (house naming: bare=signed)
+    typedef svec3<int8_t> byte3;
+    typedef svec4<int8_t> byte4;
+    typedef svec8<int8_t> byte8;
+    typedef svec16<int8_t> byte16;
+
+    typedef svec2<uint8_t> ubyte2;
+    typedef svec3<uint8_t> ubyte3;
+    typedef svec4<uint8_t> ubyte4;
+    typedef svec8<uint8_t> ubyte8;
+    typedef svec16<uint8_t> ubyte16;
+
+    static_assert(sizeof(half3) == 6 && sizeof(half8) == 16 && sizeof(byte3) == 3 && sizeof(byte16) == 16,
+        "small-element vectors must be tightly packed");
 }
 

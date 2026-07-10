@@ -74,9 +74,36 @@ namespace das
         tFixedArray,    // AST-only (FIXED_ARRAY_REWORK.md): structural fixed-array TypeDecl node.
                         //  Runtime TypeInfo never carries it — fixed arrays stay flattened to dim[]
                         //  at the single AST->TypeInfo conversion point (ast_debug_info_helper.cpp).
-        tDistinct       // AST-only: nominal `distinct Foo = int` type. ABI-identical to firstType
+        tDistinct,      // AST-only: nominal `distinct Foo = int` type. ABI-identical to firstType
                         //  (the underlying workhorse type); annotation points at DistinctTypeAnnotation.
                         //  Erased to the underlying type at the same AST->TypeInfo conversion point.
+        // ===== 16/8-bit type lattice — appended (NEVER insert above: das_base_type in
+        // daScriptC.h pins the numeric values of everything before this point). Vectors are
+        // byte-packed in the low bytes of the vec4f slot; scalars ride widened in lane 0.
+        tFloat16,       // IEEE-754 binary16 scalar (das name "float16"; "half" is a builtin alias)
+        tHalf2,         // 16-bit fp vectors: {2,3,4,8} lanes, 8-lane form fills the 128-bit slot
+        tHalf3,
+        tHalf4,
+        tHalf8,
+        tShort2,        // int16 vectors (storage + convert only, no closed arithmetic)
+        tShort3,
+        tShort4,
+        tShort8,
+        tUShort2,       // uint16 vectors
+        tUShort3,
+        tUShort4,
+        tUShort8,
+        tByte2,         // int8 vectors — byte = SIGNED int8 (house naming: bare=signed)
+        tByte3,
+        tByte4,
+        tByte8,
+        tByte16,
+        tUByte2,        // uint8 vectors
+        tUByte3,
+        tUByte4,
+        tUByte8,
+        tUByte16
+        // (reserved next: bfloat16 family — bfloat, bfloat2/3/4/8 — decided OUT for now)
     };
 
     enum class RefMatters {

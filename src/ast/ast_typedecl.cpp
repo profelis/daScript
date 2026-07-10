@@ -2050,6 +2050,28 @@ namespace das
             case tURange:
             case tRange64:
             case tURange64:
+            case tHalf2:
+            case tHalf3:
+            case tHalf4:
+            case tHalf8:
+            case tShort2:
+            case tShort3:
+            case tShort4:
+            case tShort8:
+            case tUShort2:
+            case tUShort3:
+            case tUShort4:
+            case tUShort8:
+            case tByte2:
+            case tByte3:
+            case tByte4:
+            case tByte8:
+            case tByte16:
+            case tUByte2:
+            case tUByte3:
+            case tUByte4:
+            case tUByte8:
+            case tUByte16:
                 return true;
             default:
                 return false;
@@ -2065,15 +2087,39 @@ namespace das
             case tURange:
             case tRange64:
             case tURange64:
+            case tHalf2:
+            case tShort2:
+            case tUShort2:
+            case tByte2:
+            case tUByte2:
                 return 2;
             case tInt3:
             case tUInt3:
             case tFloat3:
+            case tHalf3:
+            case tShort3:
+            case tUShort3:
+            case tByte3:
+            case tUByte3:
                 return 3;
             case tInt4:
             case tUInt4:
             case tFloat4:
+            case tHalf4:
+            case tShort4:
+            case tUShort4:
+            case tByte4:
+            case tUByte4:
                 return 4;
+            case tHalf8:
+            case tShort8:
+            case tUShort8:
+            case tByte8:
+            case tUByte8:
+                return 8;
+            case tByte16:
+            case tUByte16:
+                return 16;
             default:
                 DAS_ASSERTF(0,
                         "we should not even be here. we are calling getVectorDim on an unsupported baseType."
@@ -2097,6 +2143,28 @@ namespace das
             case tURange:   return Type::tUInt;
             case tRange64:  return Type::tInt64;
             case tURange64: return Type::tUInt64;
+            case tHalf2:
+            case tHalf3:
+            case tHalf4:
+            case tHalf8:    return Type::tFloat16;
+            case tShort2:
+            case tShort3:
+            case tShort4:
+            case tShort8:   return Type::tInt16;
+            case tUShort2:
+            case tUShort3:
+            case tUShort4:
+            case tUShort8:  return Type::tUInt16;
+            case tByte2:
+            case tByte3:
+            case tByte4:
+            case tByte8:
+            case tByte16:   return Type::tInt8;
+            case tUByte2:
+            case tUByte3:
+            case tUByte4:
+            case tUByte8:
+            case tUByte16:  return Type::tUInt8;
             default:
                 DAS_ASSERTF(0,
                        "we should not even be here. we are calling getVectorBaseType on an unsuppored baseType."
@@ -2132,6 +2200,53 @@ namespace das
                 case 4:     return Type::tUInt4;
                 default:    DAS_ASSERTF(0, "we should not be here. we are calling getVectorType on an unsuppored baseType."
                                    "likely new vector type been added.");
+                    return Type::none;
+            }
+        } else if ( bt==Type::tFloat16 ) {
+            switch ( dim ) {
+                case 2:     return Type::tHalf2;
+                case 3:     return Type::tHalf3;
+                case 4:     return Type::tHalf4;
+                case 8:     return Type::tHalf8;
+                default:    DAS_ASSERTF(0, "no half vector of dim %d", dim);
+                    return Type::none;
+            }
+        } else if ( bt==Type::tInt16 ) {
+            switch ( dim ) {
+                case 2:     return Type::tShort2;
+                case 3:     return Type::tShort3;
+                case 4:     return Type::tShort4;
+                case 8:     return Type::tShort8;
+                default:    DAS_ASSERTF(0, "no short vector of dim %d", dim);
+                    return Type::none;
+            }
+        } else if ( bt==Type::tUInt16 ) {
+            switch ( dim ) {
+                case 2:     return Type::tUShort2;
+                case 3:     return Type::tUShort3;
+                case 4:     return Type::tUShort4;
+                case 8:     return Type::tUShort8;
+                default:    DAS_ASSERTF(0, "no ushort vector of dim %d", dim);
+                    return Type::none;
+            }
+        } else if ( bt==Type::tInt8 ) {
+            switch ( dim ) {
+                case 2:     return Type::tByte2;
+                case 3:     return Type::tByte3;
+                case 4:     return Type::tByte4;
+                case 8:     return Type::tByte8;
+                case 16:    return Type::tByte16;
+                default:    DAS_ASSERTF(0, "no byte vector of dim %d", dim);
+                    return Type::none;
+            }
+        } else if ( bt==Type::tUInt8 ) {
+            switch ( dim ) {
+                case 2:     return Type::tUByte2;
+                case 3:     return Type::tUByte3;
+                case 4:     return Type::tUByte4;
+                case 8:     return Type::tUByte8;
+                case 16:    return Type::tUByte16;
+                default:    DAS_ASSERTF(0, "no ubyte vector of dim %d", dim);
                     return Type::none;
             }
         } else {
@@ -2473,6 +2588,29 @@ namespace das
             case Type::tURange:
             case Type::tRange64:
             case Type::tURange64:
+            case Type::tFloat16:
+            case Type::tHalf2:
+            case Type::tHalf3:
+            case Type::tHalf4:
+            case Type::tHalf8:
+            case Type::tShort2:
+            case Type::tShort3:
+            case Type::tShort4:
+            case Type::tShort8:
+            case Type::tUShort2:
+            case Type::tUShort3:
+            case Type::tUShort4:
+            case Type::tUShort8:
+            case Type::tByte2:
+            case Type::tByte3:
+            case Type::tByte4:
+            case Type::tByte8:
+            case Type::tByte16:
+            case Type::tUByte2:
+            case Type::tUByte3:
+            case Type::tUByte4:
+            case Type::tUByte8:
+            case Type::tUByte16:
                 return true;
             default:
                 return false;
@@ -2510,6 +2648,29 @@ namespace das
             case Type::tURange64:
             case Type::tString:
             case Type::tDouble:
+            case Type::tFloat16:
+            case Type::tHalf2:
+            case Type::tHalf3:
+            case Type::tHalf4:
+            case Type::tHalf8:
+            case Type::tShort2:
+            case Type::tShort3:
+            case Type::tShort4:
+            case Type::tShort8:
+            case Type::tUShort2:
+            case Type::tUShort3:
+            case Type::tUShort4:
+            case Type::tUShort8:
+            case Type::tByte2:
+            case Type::tByte3:
+            case Type::tByte4:
+            case Type::tByte8:
+            case Type::tByte16:
+            case Type::tUByte2:
+            case Type::tUByte3:
+            case Type::tUByte4:
+            case Type::tUByte8:
+            case Type::tUByte16:
             // case Type::tPointer:
                 return true;
             default:
@@ -2519,6 +2680,11 @@ namespace das
 
     bool TypeDecl::isTableKeyType() const {
         if ( baseType==Type::tDistinct ) {  // nominal opacity: never hashable, by design
+            return false;
+        } else if ( baseType>=Type::tFloat16 && baseType<=Type::tUByte16 ) {
+            // 16/8-bit lattice types are workhorse but not table keys (yet) — the runtime
+            // table key machinery (runtime_table.cpp, jit_abi.h, daScriptC.cpp) has no rows
+            // for them; rejecting here makes it a clean compile error instead of a throw
             return false;
         } else if ( isWorkhorseType() ) {
             return true;
@@ -2564,6 +2730,29 @@ namespace das
             case Type::tURange64:
             case Type::tString:
             case Type::tDouble:
+            case Type::tFloat16:
+            case Type::tHalf2:
+            case Type::tHalf3:
+            case Type::tHalf4:
+            case Type::tHalf8:
+            case Type::tShort2:
+            case Type::tShort3:
+            case Type::tShort4:
+            case Type::tShort8:
+            case Type::tUShort2:
+            case Type::tUShort3:
+            case Type::tUShort4:
+            case Type::tUShort8:
+            case Type::tByte2:
+            case Type::tByte3:
+            case Type::tByte4:
+            case Type::tByte8:
+            case Type::tByte16:
+            case Type::tUByte2:
+            case Type::tUByte3:
+            case Type::tUByte4:
+            case Type::tUByte8:
+            case Type::tUByte16:
                 return true;
             case Type::tPointer:
                 return !smartPtr;
@@ -2594,6 +2783,7 @@ namespace das
             case Type::tFloat:
             case Type::tDouble:
             case Type::tString:
+            case Type::tFloat16:
                 return true;
             case Type::tPointer:
                 return !smartPtr;
@@ -2917,6 +3107,7 @@ namespace das
         case Type::tUInt64:
         case Type::tFloat:
         case Type::tDouble:
+        case Type::tFloat16:
             return true;
         default:;
         }
@@ -3105,7 +3296,7 @@ namespace das
     }
 
     int TypeDecl::getVectorFieldOffset ( int index ) const {
-        DAS_ASSERT(index>=0 && index<=3);
+        DAS_ASSERT(index>=0 && index<=15);
         switch ( baseType ) {
             case Type::tRange64:
             case Type::tURange64:
@@ -3122,6 +3313,30 @@ namespace das
             case Type::tRange:
             case Type::tURange:
                 return index * 4;
+            case Type::tHalf2:
+            case Type::tHalf3:
+            case Type::tHalf4:
+            case Type::tHalf8:
+            case Type::tShort2:
+            case Type::tShort3:
+            case Type::tShort4:
+            case Type::tShort8:
+            case Type::tUShort2:
+            case Type::tUShort3:
+            case Type::tUShort4:
+            case Type::tUShort8:
+                return index * 2;
+            case Type::tByte2:
+            case Type::tByte3:
+            case Type::tByte4:
+            case Type::tByte8:
+            case Type::tByte16:
+            case Type::tUByte2:
+            case Type::tUByte3:
+            case Type::tUByte4:
+            case Type::tUByte8:
+            case Type::tUByte16:
+                return index;
             default:
                 return -1;
         }
@@ -3484,6 +3699,31 @@ namespace das
                 case Type::tFloat2:         ss << "f2"; break;
                 case Type::tFloat3:         ss << "f3"; break;
                 case Type::tFloat4:         ss << "f4"; break;
+                // 16/8-bit lattice codes (must match the TypeInfo-side emitter in
+                // debug_info.cpp): h=float16/half, w=short, x=ushort, c=byte, q=ubyte
+                case Type::tFloat16:        ss << "h"; break;
+                case Type::tHalf2:          ss << "h2"; break;
+                case Type::tHalf3:          ss << "h3"; break;
+                case Type::tHalf4:          ss << "h4"; break;
+                case Type::tHalf8:          ss << "h8"; break;
+                case Type::tShort2:         ss << "w2"; break;
+                case Type::tShort3:         ss << "w3"; break;
+                case Type::tShort4:         ss << "w4"; break;
+                case Type::tShort8:         ss << "w8"; break;
+                case Type::tUShort2:        ss << "x2"; break;
+                case Type::tUShort3:        ss << "x3"; break;
+                case Type::tUShort4:        ss << "x4"; break;
+                case Type::tUShort8:        ss << "x8"; break;
+                case Type::tByte2:          ss << "c2"; break;
+                case Type::tByte3:          ss << "c3"; break;
+                case Type::tByte4:          ss << "c4"; break;
+                case Type::tByte8:          ss << "c8"; break;
+                case Type::tByte16:         ss << "c16"; break;
+                case Type::tUByte2:         ss << "q2"; break;
+                case Type::tUByte3:         ss << "q3"; break;
+                case Type::tUByte4:         ss << "q4"; break;
+                case Type::tUByte8:         ss << "q8"; break;
+                case Type::tUByte16:        ss << "q16"; break;
                 case Type::tRange:          ss << "r"; break;
                 case Type::tURange:         ss << "z"; break;
                 case Type::tRange64:        ss << "r64"; break;
@@ -3659,6 +3899,29 @@ namespace das
         {   Type::tFloat2,      "tFloat2"},
         {   Type::tFloat3,      "tFloat3"},
         {   Type::tFloat4,      "tFloat4"},
+        {   Type::tFloat16,     "tFloat16"},
+        {   Type::tHalf2,       "tHalf2" },
+        {   Type::tHalf3,       "tHalf3" },
+        {   Type::tHalf4,       "tHalf4" },
+        {   Type::tHalf8,       "tHalf8" },
+        {   Type::tShort2,      "tShort2"},
+        {   Type::tShort3,      "tShort3"},
+        {   Type::tShort4,      "tShort4"},
+        {   Type::tShort8,      "tShort8"},
+        {   Type::tUShort2,     "tUShort2"},
+        {   Type::tUShort3,     "tUShort3"},
+        {   Type::tUShort4,     "tUShort4"},
+        {   Type::tUShort8,     "tUShort8"},
+        {   Type::tByte2,       "tByte2" },
+        {   Type::tByte3,       "tByte3" },
+        {   Type::tByte4,       "tByte4" },
+        {   Type::tByte8,       "tByte8" },
+        {   Type::tByte16,      "tByte16"},
+        {   Type::tUByte2,      "tUByte2"},
+        {   Type::tUByte3,      "tUByte3"},
+        {   Type::tUByte4,      "tUByte4"},
+        {   Type::tUByte8,      "tUByte8"},
+        {   Type::tUByte16,     "tUByte16"},
         {   Type::tDouble,      "tDouble" },
         {   Type::tRange,       "tRange" },
         {   Type::tURange,      "tURange"},
@@ -3700,6 +3963,29 @@ namespace das
         {   Type::tFloat2,      "float2"   },
         {   Type::tFloat3,      "float3"   },
         {   Type::tFloat4,      "float4"   },
+        {   Type::tFloat16,     "float16_t"},
+        {   Type::tHalf2,       "half2"    },
+        {   Type::tHalf3,       "half3"    },
+        {   Type::tHalf4,       "half4"    },
+        {   Type::tHalf8,       "half8"    },
+        {   Type::tShort2,      "short2"   },
+        {   Type::tShort3,      "short3"   },
+        {   Type::tShort4,      "short4"   },
+        {   Type::tShort8,      "short8"   },
+        {   Type::tUShort2,     "ushort2"  },
+        {   Type::tUShort3,     "ushort3"  },
+        {   Type::tUShort4,     "ushort4"  },
+        {   Type::tUShort8,     "ushort8"  },
+        {   Type::tByte2,       "byte2"    },
+        {   Type::tByte3,       "byte3"    },
+        {   Type::tByte4,       "byte4"    },
+        {   Type::tByte8,       "byte8"    },
+        {   Type::tByte16,      "byte16"   },
+        {   Type::tUByte2,      "ubyte2"   },
+        {   Type::tUByte3,      "ubyte3"   },
+        {   Type::tUByte4,      "ubyte4"   },
+        {   Type::tUByte8,      "ubyte8"   },
+        {   Type::tUByte16,     "ubyte16"  },
         {   Type::tDouble,      "double"   },
         {   Type::tRange,       "range"    },
         {   Type::tURange,      "urange"   },
