@@ -130,6 +130,11 @@ def test_prefill_q8(t : T?) {
             t |> success(true, "skipped: stories15M.bin not present")
             return
         }
+        // bit-exactness across forward_batch (batch tile) and forward (GEMV) needs same-dot
+        // kernels on both paths: portable's batch and GEMV share dot_q8q8, so the contract holds
+        // under any tune stamp; a tuned tile (e.g. kstep4 vs the gemv's gkstep2) legally folds in
+        // a different order. Tuned-tier cross-kernel numerics live in test_batch_decode_tuned.
+        pin_kernel_backend("portable")
         var tr <- load_checkpoint(MODEL_PATH)
         quantize_weights(tr)
         var tk <- load_tokenizer(TOKENIZER_PATH, tr.config.vocab_size)
@@ -140,6 +145,7 @@ def test_prefill_q8(t : T?) {
             check_continuation(t, tr, prompt, 4l, mode)
             check_prefill(t, tr, long_prompt, mode)   // 200 tok trips g_attn_par_threshold (threaded arm)
         }
+        clear_kernel_backend_pin()
         delete tk
         delete tr
     }
