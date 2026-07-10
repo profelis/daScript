@@ -31,6 +31,16 @@ t/s) and `wav2txt` (audio → text, reporting decode/transcribe time + real-time
 the same `[tune_policy(missing = "auto")]`, so whichever of the three you run first tunes the box
 and the rest are instant. Tune once, and every dasLLAMA app on the box is tuned.
 
+The profiling suite drivers (`performance/gen_profile.das`, `performance/gen_asr_profile.das`)
+carry the same policy — an untuned box tunes itself before the first measurement, and the
+profile's platform block records the stamp provenance (`"tune"`: `fname=suffix (manifest|
+fallback|reference)`), so fallback-tier numbers can never masquerade as tuned ones. (This
+happened: a deleted manifest silently cost ~5% prefill across a whole published M1 sweep.)
+Set `DASLLAMA_CONFIRM_MODEL=<q8 gguf>` so a divergent crown must prove itself in real prefill.
+The tuner benches declined perms ONCE (they share the reference body) — a foreign-ISA grid
+(arm64 skipping the x64 legs) tunes in ~1 minute, and the winner-picker no longer gets N
+noise-lottery tickets for one body.
+
 This zero-config path covers only the **gen GEMM manifest** (`gen_tune_probe`). The
 `[tuned]` loop-hint kernels (`box_profile.json`, below), the backend/thread/token-block runtime
 knobs, and the measurement discipline are still the manual, hands-on story — read on.

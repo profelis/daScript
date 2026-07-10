@@ -12,6 +12,7 @@ options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%);
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require dasllama/dasllama_math          // setup_dasllama_jobque_ + apply_box_profile_runtime knobs (engine-level, not re-exported)
 require dasllama/dasllama_tune          // box_profile_path (the applied per-box manifest, recorded in the platform block)
+require llvm/daslib/llvm_tune           // [tune_policy] + log_tune_status — the box tunes itself before measuring
 require daslib/jobque_boost
 require profile_common
 require daslib/clargs
@@ -115,7 +116,10 @@ def private ref_for(baselines : array<LlmBaseline>; display : string; var prefil
     }
 }
 
-[export]
+// tune_policy: measuring an untuned box silently publishes fallback-tier numbers (it cost a
+// day to notice). missing="auto" runs the scope's tuner and re-execs with the winners stamped;
+// set DASLLAMA_CONFIRM_MODEL=<q8 gguf> so a divergent crown must prove itself in real prefill.
+[export, tune_policy(missing = "auto")]
 def main() {
     if (!jit_enabled()) {
         print("gen_profile is JIT-only — run with: daslang -jit <file>\n")
@@ -151,6 +155,7 @@ def main() {
     prof.platform = gather_platform(cfg.threads, lcpp_commit, date, box_profile_tag(), cfg.parsec_off)
 
     apply_box_profile_runtime()   // the tuned per-box stack (backend pin + dispatch knobs)
+    log_tune_status("gen_profile")
 
     logger_set_name(prof_log_name())
     // The das side runs on the jobque, NOT llama-bench's -t. On a many-core box you MUST set

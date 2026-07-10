@@ -17,6 +17,7 @@ options stack = 131072   // the ASR model structs (decoder + tower) need a deep 
 require dasllama/dasllama        // nolint:STYLE029 — umbrella pulls the ASR API + every arch [init]
 require dasllama/dasllama_math   // setup_dasllama_jobque_ + apply_box_profile_runtime (engine-level, not re-exported)
 require dasllama/dasllama_tune   // box_profile_path (the applied per-box manifest, recorded in the platform block)
+require llvm/daslib/llvm_tune    // [tune_policy] + log_tune_status — the box tunes itself before measuring
 require audio
 require daslib/jobque_boost
 require profile_common
@@ -180,7 +181,8 @@ def add_libri_sides(var sides : array<LibriStat>; var m : AsrModel; spec : AsrMo
     }
 }
 
-[export]
+// tune_policy: an untuned box silently publishes fallback-tier numbers — see gen_profile.das
+[export, tune_policy(missing = "auto")]
 def main() {
     if (!jit_enabled()) {
         print("gen_asr_profile is JIT-only — run with: daslang -jit <file>\n")
@@ -207,6 +209,7 @@ def main() {
     prof.platform = gather_platform(cfg.threads, lcpp_commit, date, box_profile_tag(), cfg.parsec_off)
 
     apply_box_profile_runtime()
+    log_tune_status("gen_asr_profile")
 
     logger_set_name(prof_log_name())
     print("gen_asr_profile: box={box_name()} threads={cfg.threads} reps={cfg.reps} libri={cfg.libri}\n")
