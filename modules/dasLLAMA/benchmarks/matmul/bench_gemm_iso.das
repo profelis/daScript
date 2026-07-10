@@ -184,14 +184,20 @@ def bench_gemm_iso(b : B?) {
         let model = has_env_variable("DASLLAMA_BENCH_MODEL") ? get_env_variable("DASLLAMA_BENCH_MODEL") : "tinyllama"
         var shapes <- shapes_for(model)
         to_log(LOG_INFO, "model={model} ntok={NTOK}\n")
-        to_log(LOG_INFO, "=== {active_kernel_backend()} backend (row-major) ===\n")
-        for (s in shapes) {
-            bench_one("{s._0} {model} {s._1}x{s._2}", s._1, s._2, reps_for(s._1, s._2), false)
+        // DASLLAMA_BENCH_SKIP_ROWMAJOR skips the row-major half — a pin-lattice sweep re-runs
+        // the repack half per manifest and the row-major rows would repeat identically
+        if (!has_env_variable("DASLLAMA_BENCH_SKIP_ROWMAJOR")) {
+            to_log(LOG_INFO, "=== {active_kernel_backend()} backend (row-major) ===\n")
+            for (s in shapes) {
+                bench_one("{s._0} {model} {s._1}x{s._2}", s._1, s._2, reps_for(s._1, s._2), false)
+            }
         }
 
-        // switch to the arch's repack tier for the rest of the run; each shape repacks its own weight
+        // switch to the arch's repack tier for the rest of the run; each shape repacks its own
+        // weight. pin (not select): pin runs the backend's available() witness — on amx stamps
+        // that witness IS the per-process XTILEDATA enable, skipping it SIGILLs the first tile op
         let repack_backend = get_architecture_name() == "arm64" ? "arm64-gen" : "x64-gen"
-        select_kernel_backend(repack_backend)
+        pin_kernel_backend(repack_backend)
         to_log(LOG_INFO, "=== {repack_backend} backend (tiled, interleaved repack) ===\n")
         for (s in shapes) {
             bench_one("{s._0} {model} {s._1}x{s._2}", s._1, s._2, reps_for(s._1, s._2), true)
