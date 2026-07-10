@@ -202,5 +202,6 @@ def bench_gemm_iso(b : B?) {
         for (s in shapes) {
             bench_one("{s._0} {model} {s._1}x{s._2}", s._1, s._2, reps_for(s._1, s._2), true)
         }
+        clear_kernel_backend_pin()   // a standing pin would leak into later files in a dastest --bench process
     }
 }

@@ -10,7 +10,7 @@
 #              SPR: the box tree's build — apply backend_ops_shapes.patch + rebuild first)
 #   DAS_ROOT   daScript root (default: two levels up from this script)
 # Output: TSV rows on stdout —  engine  model  shape  n  d  ntok  threads  gmacs
-set -e
+set -e -o pipefail   # daslang failures must not hide behind a successful awk at the end of a pipe
 T=${1:-8}
 MODEL=${2:-all}
 NTOK=${3:-512}
