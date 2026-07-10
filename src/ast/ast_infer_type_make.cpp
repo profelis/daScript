@@ -1108,6 +1108,13 @@ namespace das {
             }
         }
         expr->type = resT;
+        // no fields to initialize on a non-composite make-type - E(a=1) on an enum, or V(x=1)
+        // via an alias of a workhorse/pointer type (preVisit reported invalid_structure_type);
+        // don't fold to a constant, or the astChanged rerun would discard the error. the
+        // zero-value folds below stay for the legitimate empty forms (default<T>, T())
+        if (expr->structs.size() && (expr->type->isWorkhorseType() || expr->type->isPointer())) {
+            return Visitor::visit(expr);
+        }
         if (expr->type->isString()) {
             reportAstChanged();
             auto ecs = new ExprConstString(expr->at);
@@ -1141,11 +1148,6 @@ namespace das {
             }
         } else if (expr->type->isWorkhorseType()) {
             if (expr->type->isDistinct()) {
-                // no fields to initialize - Foo(a=...) is invalid (preVisit reported); don't fold,
-                // or the astChanged rerun would discard the error
-                if (expr->structs.size()) {
-                    return Visitor::visit(expr);
-                }
                 // default<Foo> - zero constant of the underlying, relabeled (the raw const node
                 // would re-infer as the underlying type on the next pass, losing the distinct).
                 // string and pointer underlyings route the same way the non-distinct default<>
