@@ -969,10 +969,17 @@ def register_kernel_backend(be : KernelBackend) {
 }
 
 //! Activate a registered backend by name (explicit control / A/B benchmarking). No-op if unknown.
+//! Runs the availability witness first — for some backends it doubles as the runtime enable
+//! (amx = XTILEDATA arch_prctl); activating past it would SIGILL on the first tile op.
 def select_kernel_backend(name : string) {
-    if (key_exists(g_kernel_backends, name)) {
-        activate(g_kernel_backends[name])
+    if (!key_exists(g_kernel_backends, name)) {
+        return
     }
+    if (!invoke(g_kernel_backends[name].available)) {
+        to_log(LOG_WARNING, "dasLLAMA: select_kernel_backend('{name}') — backend reports itself unavailable in this configuration; keeping '{g_active_backend}'\n")
+        return
+    }
+    activate(g_kernel_backends[name])
 }
 
 //! Pin the active backend to `name` (forces it; suppresses auto-select on later registrations). For A/B

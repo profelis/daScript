@@ -15,6 +15,7 @@ require daslib/strings_boost public
 require daslib/logger public              // structured, ISO-8601-timestamped ndjson event log
 require daslib/json public                // JV(...) for logger field payloads
 require dasllama/dasllama_common public   // QuantMode
+require llvm/daslib/llvm_tune             // tune_status — stamp provenance for the platform block
 
 // ===== Box + model roots =====
 
@@ -166,6 +167,9 @@ struct PlatformInfo {
     date : string
     box_profile : string
     parsec_off : bool
+    // gen-kernel stamp provenance ("fname=suffix (manifest|fallback|reference)") — an untuned
+    // box publishing fallback-tier numbers must be visible in the profile itself
+    @optional tune : string
 }
 
 // Run `cmd`, return its trimmed stdout (first line only when `first_line`). Uses fread_to_eof (fio's
@@ -234,6 +238,22 @@ def private platform_os() : string {
     return "{run_capture("sw_vers -productName", true)} {run_capture("sw_vers -productVersion", true)}"
 }
 
+def private tune_row_str(r : TuneStatus) : string {
+    let sfx = empty(r.suffix) ? "reference" : r.suffix
+    return "{r.fname}={sfx} ({r.source})"
+}
+
+//! One-line gen-kernel stamp provenance — "" (omitted from JSON) when the driver declares no
+//! `[tune_policy]` (tune_status is empty then).
+def tune_summary() : string {
+    var st <- tune_status()
+    var parts <- [for (r in st); tune_row_str(r)]
+    let s = join(parts, "; ")
+    delete parts
+    delete st
+    return s
+}
+
 // Gather the platform block. `llama_cpp` (the reference commit) and `date` are passed in — the caller
 // reads them from the freshly-run baseline / the environment so they stay honest per run. CPU/OS come
 // from OS-native probes with DASLLAMA_CPU / DASLLAMA_OS env overrides for boxes without a clean probe.
@@ -249,7 +269,8 @@ def gather_platform(threads : int; llama_cpp, date, box_profile : string; parsec
         llama_cpp = llama_cpp,
         date = date,
         box_profile = box_profile,
-        parsec_off = parsec_off)
+        parsec_off = parsec_off,
+        tune = tune_summary())
 }
 
 // ===== Baseline TSV I/O (reference tok/s the establisher writes, the generator reads) =====
@@ -264,12 +285,14 @@ struct LlmBaseline {
     n_params : int64
 }
 
-def baseline_llm_path() : string {
-    return "modules/dasLLAMA/performance/baseline_llm_{box_name()}.tsv"
+// `suffix` distinguishes measurement axes on the same box (e.g. "_metal" for the GPU-offload sweep);
+// the default "" is the canonical CPU baseline that gen_profile merges.
+def baseline_llm_path(suffix : string = "") : string {
+    return "modules/dasLLAMA/performance/baseline_llm_{box_name()}{suffix}.tsv"
 }
 
-def write_llm_baselines(rows : array<LlmBaseline>) {
-    fopen(baseline_llm_path(), "wb") $(f) {
+def write_llm_baselines(rows : array<LlmBaseline>; suffix : string = "") {
+    fopen(baseline_llm_path(suffix), "wb") $(f) {
         if (f == null) {
             return
         }
@@ -280,9 +303,9 @@ def write_llm_baselines(rows : array<LlmBaseline>) {
     }
 }
 
-def read_llm_baselines() : array<LlmBaseline> {
+def read_llm_baselines(suffix : string = "") : array<LlmBaseline> {
     var rows : array<LlmBaseline>
-    let text = fread(baseline_llm_path())
+    let text = fread(baseline_llm_path(suffix))
     var first = true
     for (line in split(text, "\n")) {
         if (first) {   // header

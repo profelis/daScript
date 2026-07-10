@@ -512,6 +512,25 @@ def private emit_block(var te : TileEmit; var bi : LLVMOpaqueValue?; var f : LLV
     emit_scale_fold(te, bi, a, f, tokBase, tokCount)
 }
 
+// the fold's a·b+c as @llvm.fmuladd — the SAME intrinsic daslang's mad() lowers to
+// (intrinsic_mad in llvm_jit_intrin): generated IR never passes das-level lowering, so the
+// generator must license the fusion itself. Falls back to fmul+fadd when unresolvable.
+def private fold_fma(var te : TileEmit; var a, b, c : LLVMOpaqueValue?; name : string) : LLVMOpaqueValue? {
+    let bld = te.builder
+    let id = LLVMLookupIntrinsicID("llvm.fmuladd")
+    if (id != 0u) {
+        var mod = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(bld)))
+        var tys <- [te.vnf32]
+        var decl = LLVMGetIntrinsicDeclaration(mod, id, tys)
+        if (decl != null) {
+            var fty = LLVMFunctionType(te.vnf32, [te.vnf32, te.vnf32, te.vnf32])
+            var args <- [a, b, c]
+            return LLVMBuildCall2(bld, fty, decl, args, name)
+        }
+    }
+    return LLVMBuildFAdd(bld, LLVMBuildFMul(bld, a, b, ""), c, name)
+}
+
 // the per-block Q8 scale fold shared by the sdot/x64 lattice and the smmla MMA form: f[acc] +=
 // float(a[acc]) * s[qd] * splat(q[i]) — the exact op order of the hand template
 // dot_q8q8_laneq4x4_template, so every emitter's fast-math contraction sees the same input and
@@ -532,9 +551,8 @@ def private emit_scale_fold(var te : TileEmit; var bi : LLVMOpaqueValue?; a : LL
         var q = LLVMBuildLoad2Aligned(b, te.types.t_float, qp, 4u, "q{tk}")
         for (qd in range(rq)) {
             var af = LLVMBuildSIToFP(b, a[i * rq + qd], te.vnf32, "af{tk}")
-            var m = LLVMBuildFMul(b, af, s4[qd], "")
-            m = LLVMBuildFMul(b, m, splat_f32(te, q, "qs{tk}"), "")
-            f[i * rq + qd] = LLVMBuildFAdd(b, f[i * rq + qd], m, "f{tk}")
+            var sq = LLVMBuildFMul(b, s4[qd], splat_f32(te, q, "qs{tk}"), "")
+            f[i * rq + qd] = fold_fma(te, af, sq, f[i * rq + qd], "f{tk}")
         }
     }
 }
@@ -707,9 +725,8 @@ def private emit_block_mx4(var te : TileEmit; var bi : LLVMOpaqueValue?; var f :
         var q = LLVMBuildLoad2Aligned(b, te.types.t_float, qp, 4u, "q{tk}")
         for (qd in range(rq)) {
             var af = LLVMBuildSIToFP(b, a[i * rq + qd], te.vnf32, "af{tk}")
-            var m = LLVMBuildFMul(b, af, s4[qd], "")
-            m = LLVMBuildFMul(b, m, splat_f32(te, q, "qs{tk}"), "")
-            f[i * rq + qd] = LLVMBuildFAdd(b, f[i * rq + qd], m, "f{tk}")
+            var sq = LLVMBuildFMul(b, s4[qd], splat_f32(te, q, "qs{tk}"), "")
+            f[i * rq + qd] = fold_fma(te, af, sq, f[i * rq + qd], "f{tk}")
         }
     }
 }
@@ -1168,21 +1185,23 @@ def private emit_amx_tile(var gc : LlvmCodeCtx; p : TilePerm) : bool {
         var trow = ts == 0 ? t0 : LLVMBuildAdd(b, t0, te.types->ConstI64(uint64(ts * 16)), "")
         xbase[ts] = LLVMBuildGEP2(b, te.types.t_int8, xqp, LLVMBuildMul(b, trow, n, ""), "xbase{ts}")
     }
-    // y row pointers + zero init, and the fold's xs (bias: + bsum) row bases
-    var yptr : LLVMOpaqueValue? [64]      // [t * nt + r]
-    var xsrow : LLVMOpaqueValue? [32]
-    var xbsrow : LLVMOpaqueValue? [32]
+    // fold bases: y rows start at t0·d + col, xs/xbs rows at t0·nb — the fold walks them with
+    // running pointers (see amx_fold_tile: a precomputed 64/32-entry pointer array is live
+    // across the k-loop and spills). Zero-init walks y with the same running pointer.
+    var ybase = LLVMBuildGEP2(b, te.types.t_float, yp, LLVMBuildAdd(b, LLVMBuildMul(b, t0, d, ""), col, ""), "ybase")
+    var xsbase = LLVMBuildGEP2(b, te.types.t_float, xsp, LLVMBuildMul(b, t0, nb, ""), "xsbase")
+    var xbsbase : LLVMOpaqueValue?
+    if (te.bias != 0) {
+        xbsbase = LLVMBuildGEP2(b, te.types.t_int32, xbsp, LLVMBuildMul(b, t0, nb, ""), "xbsbase")
+    }
+    var zrow = ybase
     for (t in range(16 * nt)) {
-        var trow = LLVMBuildAdd(b, t0, te.types->ConstI64(uint64(t)), "")
-        var yoffBase = LLVMBuildAdd(b, LLVMBuildMul(b, trow, d, ""), col, "")
-        for (r in range(nt)) {
-            var yoff = r == 0 ? yoffBase : LLVMBuildAdd(b, yoffBase, te.types->ConstI64(uint64(r * 16)), "")
-            yptr[t * nt + r] = LLVMBuildGEP2(b, te.types.t_float, yp, yoff, "y{t}_{r}")
-            LLVMBuildStoreAligned(b, LLVMConstNull(te.vnf32), yptr[t * nt + r], 4u)
+        if (t != 0) {
+            zrow = LLVMBuildGEP2(b, te.types.t_float, zrow, d, "zr{t}")
         }
-        xsrow[t] = LLVMBuildGEP2(b, te.types.t_float, xsp, LLVMBuildMul(b, trow, nb, ""), "xs{t}")
-        if (te.bias != 0) {
-            xbsrow[t] = LLVMBuildGEP2(b, te.types.t_int32, xbsp, LLVMBuildMul(b, trow, nb, ""), "xbs{t}")
+        for (r in range(nt)) {
+            var zp = r == 0 ? zrow : LLVMBuildGEP2(b, te.types.t_float, zrow, te.types->ConstI64(uint64(r * 16)), "")
+            LLVMBuildStoreAligned(b, LLVMConstNull(te.vnf32), zp, 4u)
         }
     }
     LLVMBuildBr(b, head)
@@ -1218,7 +1237,7 @@ def private emit_amx_tile(var gc : LlvmCodeCtx; p : TilePerm) : bool {
         for (ts in range(nt)) {
             var cd = amx_dot(te, nt, r, ts, As[ts], Bs[r])
             amx_store(te, nt, r, ts, cd, scratch)
-            amx_fold_tile(te, scratch, biPhi, ws, nt, r, ts, yptr, xsrow, xbsrow)
+            amx_fold_tile(te, scratch, biPhi, ws, r, ts, ybase, d, xsbase, xbsbase, nb)
         }
     }
     var biNext = LLVMBuildAdd(b, biPhi, te.types->ConstI64(1ul), "binext")
@@ -1233,29 +1252,48 @@ def private emit_amx_tile(var gc : LlvmCodeCtx; p : TilePerm) : bool {
 }
 
 // fold ONE spilled C tile — tile (r, ts) of k-block `bi`, 16 token rows — into its yp cells:
-// cvt(i32 row)·ws·splat(xs[t][bi]) f32-accumulated onto yptr (the serial tile's fold order,
+// cvt(i32 row)·ws·splat(xs[t][bi]) f32-accumulated onto yp (the serial tile's fold order,
 // so the one grp4 oracle serves both amx structures). A bias perm lands the −128·Σx bsum on
 // the raw i32 rows first (one embedded-broadcast vpaddd per row — "keep tilezero": the
-// correction is fold-stage arithmetic, never an accumulator init)
-def private amx_fold_tile(var te : TileEmit; var region, bi, ws : LLVMOpaqueValue?; nt, r, ts : int;
-                          yptr : LLVMOpaqueValue? [64]; xsrow : LLVMOpaqueValue? [32]; xbsrow : LLVMOpaqueValue? [32]) {
+// correction is fold-stage arithmetic, never an accumulator init). Addressing is RUNNING
+// POINTERS off three live bases (ybase/xsbase/xbsbase + row strides) — the previous
+// precomputed pointer arrays (64 y rows + 32 xs rows) stayed live across the k-loop and
+// spilled: ~140 movq reloads per k-iteration, 28% of the steady loop (2026-07-09 census).
+def private amx_fold_tile(var te : TileEmit; var region, bi, ws : LLVMOpaqueValue?; r, ts : int;
+                          var ybase, d, xsbase, xbsbase, nb : LLVMOpaqueValue?) {
     let b = te.builder
+    // tile row 0: y at (ts·16)·d + r·16, xs/xbs at (ts·16)·nb + bi — then step d / nb per row
+    var yoff = LLVMBuildMul(b, d, te.types->ConstI64(uint64(ts * 16)), "")
+    if (r != 0) {
+        yoff = LLVMBuildAdd(b, yoff, te.types->ConstI64(uint64(r * 16)), "")
+    }
+    var yrow = LLVMBuildGEP2(b, te.types.t_float, ybase, yoff, "yr{ts}_{r}")
+    var xoff = LLVMBuildAdd(b, LLVMBuildMul(b, nb, te.types->ConstI64(uint64(ts * 16)), ""), bi, "")
+    var xsp = LLVMBuildGEP2(b, te.types.t_float, xsbase, xoff, "xr{ts}")
+    var xbp : LLVMOpaqueValue?
+    if (te.bias != 0) {
+        xbp = LLVMBuildGEP2(b, te.types.t_int32, xbsbase, xoff, "br{ts}")
+    }
     for (t16 in range(16)) {
         let t = ts * 16 + t16
+        if (t16 != 0) {   // advance one token row: y by d floats, xs/xbs by nb elements
+            yrow = LLVMBuildGEP2(b, te.types.t_float, yrow, d, "yr{t}_{r}")
+            xsp = LLVMBuildGEP2(b, te.types.t_float, xsp, nb, "xr{t}")
+            if (te.bias != 0) {
+                xbp = LLVMBuildGEP2(b, te.types.t_int32, xbp, nb, "br{t}")
+            }
+        }
         var crp = t16 == 0 ? region : LLVMBuildGEP2(b, te.types.t_int8, region, te.types->ConstI64(uint64(t16 * 64)), "")
         var crow = LLVMBuildLoad2Aligned(b, te.vni32, crp, 64u, "c{t}_{r}")
         if (te.bias != 0) {
-            var bp = LLVMBuildGEP2(b, te.types.t_int32, xbsrow[t], bi, "bp{t}")
-            var bsv = LLVMBuildLoad2Aligned(b, te.types.t_int32, bp, 4u, "bsum{t}")
+            var bsv = LLVMBuildLoad2Aligned(b, te.types.t_int32, xbp, 4u, "bsum{t}")
             crow = LLVMBuildAdd(b, crow, splat_i32(te, bsv, "bss{t}"), "cb{t}_{r}")
         }
         var cf = LLVMBuildSIToFP(b, crow, te.vnf32, "cf{t}_{r}")
-        var qp = LLVMBuildGEP2(b, te.types.t_float, xsrow[t], bi, "qp{t}")
-        var q = LLVMBuildLoad2Aligned(b, te.types.t_float, qp, 4u, "q{t}")
-        var m = LLVMBuildFMul(b, cf, ws, "")
-        m = LLVMBuildFMul(b, m, splat_f32(te, q, "qs{t}"), "")
-        var yv = LLVMBuildLoad2Aligned(b, te.vnf32, yptr[t * nt + r], 4u, "")
-        LLVMBuildStoreAligned(b, LLVMBuildFAdd(b, yv, m, "f{t}_{r}"), yptr[t * nt + r], 4u)
+        var q = LLVMBuildLoad2Aligned(b, te.types.t_float, xsp, 4u, "q{t}")
+        var sq = LLVMBuildFMul(b, ws, splat_f32(te, q, "qs{t}"), "")
+        var yv = LLVMBuildLoad2Aligned(b, te.vnf32, yrow, 4u, "")
+        LLVMBuildStoreAligned(b, fold_fma(te, cf, sq, yv, "f{t}_{r}"), yrow, 4u)
     }
 }
 
@@ -1307,21 +1345,23 @@ def private emit_amx_tile_pipelined(var gc : LlvmCodeCtx; p : TilePerm) : bool {
         var trow = ts == 0 ? t0 : LLVMBuildAdd(b, t0, te.types->ConstI64(uint64(ts * 16)), "")
         xbase[ts] = LLVMBuildGEP2(b, te.types.t_int8, xqp, LLVMBuildMul(b, trow, n, ""), "xbase{ts}")
     }
-    // y row pointers + zero init, and the fold's xs (bias: + bsum) row bases
-    var yptr : LLVMOpaqueValue? [64]      // [t * nt + r]
-    var xsrow : LLVMOpaqueValue? [32]
-    var xbsrow : LLVMOpaqueValue? [32]
+    // fold bases: y rows start at t0·d + col, xs/xbs rows at t0·nb — the fold walks them with
+    // running pointers (see amx_fold_tile: a precomputed 64/32-entry pointer array is live
+    // across the k-loop and spills). Zero-init walks y with the same running pointer.
+    var ybase = LLVMBuildGEP2(b, te.types.t_float, yp, LLVMBuildAdd(b, LLVMBuildMul(b, t0, d, ""), col, ""), "ybase")
+    var xsbase = LLVMBuildGEP2(b, te.types.t_float, xsp, LLVMBuildMul(b, t0, nb, ""), "xsbase")
+    var xbsbase : LLVMOpaqueValue?
+    if (te.bias != 0) {
+        xbsbase = LLVMBuildGEP2(b, te.types.t_int32, xbsp, LLVMBuildMul(b, t0, nb, ""), "xbsbase")
+    }
+    var zrow = ybase
     for (t in range(16 * nt)) {
-        var trow = LLVMBuildAdd(b, t0, te.types->ConstI64(uint64(t)), "")
-        var yoffBase = LLVMBuildAdd(b, LLVMBuildMul(b, trow, d, ""), col, "")
-        for (r in range(nt)) {
-            var yoff = r == 0 ? yoffBase : LLVMBuildAdd(b, yoffBase, te.types->ConstI64(uint64(r * 16)), "")
-            yptr[t * nt + r] = LLVMBuildGEP2(b, te.types.t_float, yp, yoff, "y{t}_{r}")
-            LLVMBuildStoreAligned(b, LLVMConstNull(te.vnf32), yptr[t * nt + r], 4u)
+        if (t != 0) {
+            zrow = LLVMBuildGEP2(b, te.types.t_float, zrow, d, "zr{t}")
         }
-        xsrow[t] = LLVMBuildGEP2(b, te.types.t_float, xsp, LLVMBuildMul(b, trow, nb, ""), "xs{t}")
-        if (te.bias != 0) {
-            xbsrow[t] = LLVMBuildGEP2(b, te.types.t_int32, xbsp, LLVMBuildMul(b, trow, nb, ""), "xbs{t}")
+        for (r in range(nt)) {
+            var zp = r == 0 ? zrow : LLVMBuildGEP2(b, te.types.t_float, zrow, te.types->ConstI64(uint64(r * 16)), "")
+            LLVMBuildStoreAligned(b, LLVMConstNull(te.vnf32), zp, 4u)
         }
     }
     // peel: block 0's TMUL chain into buf0 (its fold runs in the first loop iteration)
@@ -1381,7 +1421,7 @@ def private emit_amx_tile_pipelined(var gc : LlvmCodeCtx; p : TilePerm) : bool {
             // the deferral: fold tile (r, ts) of block bi−1 from C[pre] before this chain's
             // dot — vector ports work while the TMUL chain owns block bi
             var preReg = idx == 0 ? cPrePhi : LLVMBuildGEP2(b, te.types.t_int8, cPrePhi, te.types->ConstI64(uint64(idx * 1024)), "")
-            amx_fold_tile(te, preReg, ii, ws, nt, r, ts, yptr, xsrow, xbsrow)
+            amx_fold_tile(te, preReg, ii, ws, r, ts, ybase, d, xsbase, xbsbase, nb)
             var cd = amx_dot(te, nt, r, ts, As[ts], Bs[r])
             var curReg = idx == 0 ? cCurPhi : LLVMBuildGEP2(b, te.types.t_int8, cCurPhi, te.types->ConstI64(uint64(idx * 1024)), "")
             amx_store(te, nt, r, ts, cd, curReg)
@@ -1409,7 +1449,7 @@ def private emit_amx_tile_pipelined(var gc : LlvmCodeCtx; p : TilePerm) : bool {
         for (ts in range(nt)) {
             let idx = r * nt + ts
             var preReg = idx == 0 ? cPrePhi : LLVMBuildGEP2(b, te.types.t_int8, cPrePhi, te.types->ConstI64(uint64(idx * 1024)), "")
-            amx_fold_tile(te, preReg, iiF, ws, nt, r, ts, yptr, xsrow, xbsrow)
+            amx_fold_tile(te, preReg, iiF, ws, r, ts, ybase, d, xsbase, xbsbase, nb)
         }
     }
     LLVMBuildRetVoid(b)

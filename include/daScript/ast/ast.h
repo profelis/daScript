@@ -1522,6 +1522,7 @@ namespace das
         /*option*/ bool        standalone_context = false;         // generate standalone context class in aot mode
         bool        aot_module = false;                 // this is how AOT tool knows module is module, and not an entry point
         bool        aot_macros = false;                 // enables aot of macro code (like 'qmacro_block')
+        bool        tune_frozen = false;                // never apply per-box [tune] stamps to this compile (cross-box artifacts: -aot generation, AST serialization)
         bool        paranoid_validation = false;        // todo
         bool        validate_ast = false;               // validate AST after compilation (uniqueness, etc.)
         bool        cross_platform = false;             // aot supports platform independent mode

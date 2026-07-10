@@ -29,7 +29,7 @@ runs the reference body.
 - **`find_module(name)` resolves against `this_program()`** — the *runtime* program, NULL in macro context → null-`Program` AV. In a macro use `compiling_program()` (walk it) or `find_compiling_module(name)`, never `find_module(name)`.
 - **`get_command_line_arguments()` aliases a process-global locked Array** — never `delete` it.
 - **`--tune` is read at macro time** from the compiler argv (after `--`), and stripped from the re-exec so the child converges instead of looping.
-- **Gates:** AOT (`policies.aot`/`aot_module`) is fully tune-free (per-box stamps would desync AOT hashes across boxes). `-exe` (`jit_exe_mode`) still STAMPS (an exe next to a manifest ships those winners; else the generic fallback) but the policy rail is dead. Split as `tune_aot_gate()` vs `tune_exe_gate()`.
+- **Gates:** cross-box artifacts (`policies.tune_frozen` — set by the `-aot` driver and dastest's AST serializer) are fully tune-free, and AOT-consuming runs (`policies.aot`) only when the JIT is off (a stamp changes the semantic hash → AOT link fails; under `-jit` the JIT supersedes AOT bodies, stamps stay live). `aot_module` is NOT a tune signal (it means "module-shaped compile" — dastest sets it on every test compile and the serializer needs it). `-exe` (`jit_exe_mode`) still STAMPS (an exe next to a manifest ships those winners; else the generic fallback) but the policy rail is dead. Split as `tune_aot_gate()` vs `tune_exe_gate()`.
 - **`stamp_llvm_code` records `tune_suffix`/`tune_from`** as extra `[llvm_code]` args — generators ignore unknown args by contract, and `tune_status` reads that stamped truth back off the AST (no macro-state bank).
 
 ## Adding a kernel family to a scope

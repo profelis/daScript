@@ -645,6 +645,38 @@ def tune_mode_run : bool {
         verify(wtab |> key_exists(v._0))
         invoke(wtab[v._0])
     }
+    // Declined perms all run the SAME reference body — benching each at best-of-ROUNDS is
+    // duplicate measurement, and N identical rows hand the winner-picker N noise-lottery
+    // tickets for one body. Keep a single declined representative (the explicit "reference"
+    // row when the grid carries one), erase the rest. On a foreign-ISA box (e.g. arm64
+    // skipping the x64 legs) this cuts the grid from ~34 rows to the live handful.
+    var rep = -1
+    for (i in range(length(vs))) {
+        if (vs[i]._0 == "reference") {
+            rep = i
+        }
+    }
+    if (rep < 0) {
+        for (i in range(length(vs))) {
+            if (!invoke(wtab[vs[i]._0])) {
+                rep = i
+                break
+            }
+        }
+    }
+    let repname = rep >= 0 ? vs[rep]._0 : ""
+    var skipped = 0
+    let nvs0 = length(vs)
+    for (k in range(nvs0)) {
+        let i = nvs0 - 1 - k
+        if (i != rep && !invoke(wtab[vs[i]._0])) {
+            vs |> erase(i)
+            skipped++
+        }
+    }
+    if (skipped > 0) {
+        print("skipped {skipped} declined perm(s) — the shared reference body benches once as '{repname}'\n")
+    }
     delete wtab
     let nv = length(vs)
     // per-variant repacked buffers, built once outside the timing loop
