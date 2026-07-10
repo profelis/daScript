@@ -566,6 +566,9 @@ class AstVisitor {
 // const int 16
     def abstract preVisitExprConstInt16(expr : ExprConstInt16?) : void
     def abstract visitExprConstInt16(expr : ExprConstInt16?) : ExpressionPtr
+// const float 16
+    def abstract preVisitExprConstFloat16(expr : ExprConstFloat16?) : void
+    def abstract visitExprConstFloat16(expr : ExprConstFloat16?) : ExpressionPtr
 // const int 64
     def abstract preVisitExprConstInt64(expr : ExprConstInt64?) : void
     def abstract visitExprConstInt64(expr : ExprConstInt64?) : ExpressionPtr

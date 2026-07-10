@@ -366,6 +366,9 @@ class CanonicalVisitor : AstVisitor {
     def override preVisitExprConstInt16(expr : ExprConstInt16?) {
         emit("LIT")
     }
+    def override preVisitExprConstFloat16(expr : ExprConstFloat16?) {
+        emit("LIT")
+    }
     def override preVisitExprConstInt(expr : ExprConstInt?) {
         emit("LIT")
     }

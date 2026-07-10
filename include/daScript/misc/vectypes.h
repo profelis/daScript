@@ -217,6 +217,7 @@ namespace das
         __forceinline float16_t & operator = (const float16_t &) = default;
         __forceinline explicit float16_t(float f) : bits(das_float_to_float16(f)) {}
         __forceinline float toFloat() const { return das_float16_to_float(bits); }
+        __forceinline explicit operator float() const { return toFloat(); }
         // IEEE semantics via promote-compare: -0 == +0, NaN != NaN (bitwise would violate both)
         __forceinline bool operator == ( const float16_t & v ) const { return toFloat() == v.toFloat(); }
         __forceinline bool operator != ( const float16_t & v ) const { return toFloat() != v.toFloat(); }

@@ -6626,6 +6626,12 @@ class public LlvmJitVisitor : AstVisitor {
         return expr
     }
 
+// ExprConstFloat16
+    def override visitExprConstFloat16(expr : ExprConstFloat16?) : ExpressionPtr {
+        setE(expr, types.ConstHalf(float(expr.value) |> double()))
+        return expr
+    }
+
 // ExprConstFloat2
     def override visitExprConstFloat2(expr : ExprConstFloat2?) : ExpressionPtr {
         var x = types.ConstReal(expr.value.x |> double())
@@ -7810,6 +7816,29 @@ class public DisableJitVisitor : AstVisitor {
     def TypeInfoVisitor {
         disable = false
     }
+    // 16/8-bit lattice floor: plain loads/stores/moves of lattice values lower natively
+    // (the types are mapped), and lattice calls/ops fall back via the builtin-address gates
+    // below. What has no lowering yet is indexing and locals-with-init — gate those two
+    // RARE node kinds only (a generic preVisitExpression gate costs an adapter call per
+    // expression and blows the per-file JIT budget on daslib-sized programs).
+    def lattice_fallback(t : TypeDeclPtr; at : LineInfo) {
+        if (!disable && t != null && is_lattice_small_type(t.baseType)) {
+            to_log(LOG_WARNING, "LLVM JIT: 16/8-bit lattice type `{describe(t)}` at {at}, falling back to interpreter.\n")
+            disable = true
+        }
+    }
+    def override preVisitExprLetVariable(expr : ExprLet?; arg : VariablePtr; lastArg : bool) : void {
+        lattice_fallback(arg._type, arg.at)
+    }
+    def override preVisitFunction(fun : FunctionPtr) : void {
+        // signature-level gate: the interp<->jit wrappers marshal args/results through
+        // vec4f slots, and that marshaling is not lattice-aware yet (a vec4f <-> <4 x half>
+        // bitcast is invalid IR — one bad function fails the whole module)
+        lattice_fallback(fun.result, fun.at)
+        for (arg in fun.arguments) {
+            lattice_fallback(arg._type, arg.at)
+        }
+    }
     def override preVisitExprTypeInfo(expr : ExprTypeInfo?) : void {
         if (expr.trait == "ast_typedecl" || expr.trait == "rtti_classinfo" || expr.trait == "rtti_typeinfo") {
             pass
@@ -7862,6 +7891,7 @@ class public DisableJitVisitor : AstVisitor {
                 "type {type_str} to be used in JIT, keeping interpreter mode.\n")
             disable = true
         }
+        lattice_fallback(expr.subexpr._type, expr.at)
     }
 
     def override preVisitExprForSource(var expr : ExprFor?, var source : ExpressionPtr, last : bool) {

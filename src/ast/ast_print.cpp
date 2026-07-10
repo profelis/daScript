@@ -919,6 +919,10 @@ namespace das {
             ss << c->getValue() << "f";
             return Visitor::visit(c);
         }
+        virtual ExpressionPtr visit ( ExprConstFloat16 * c ) override {
+            ss << c->getValue().toFloat() << "h";
+            return Visitor::visit(c);
+        }
         virtual ExpressionPtr visit ( ExprConstString * c ) override {
             ss << "\"" << escapeString(c->text) << "\"";
             return Visitor::visit(c);

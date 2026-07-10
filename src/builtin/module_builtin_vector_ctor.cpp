@@ -262,6 +262,97 @@ addFunction ( (new BuiltInFn<SimNode_VecCtor<uint32_t,SimPolicy<VTYPE>,4>,const 
         }
     };
 
+    // ===== 16/8-bit lattice ctors =====
+    // Byte-packed lanes converted per element from the scalar argument type. No SimPolicy
+    // dependency — the storage-only int families deliberately have none.
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable:4244)
+#endif
+
+    template <typename ET> struct SVecConv {
+        template <typename AT> static __forceinline ET conv ( AT v ) { return ET(v); }
+    };
+    template <> struct SVecConv<float16_t> {
+        template <typename AT> static __forceinline float16_t conv ( AT v ) { return float16_t(float(v)); }
+    };
+
+    template <typename VT, typename ET, typename AT>
+    struct SimNode_SVecSplat : SimNode_CallBase {
+        SimNode_SVecSplat(const LineInfo & at) : SimNode_CallBase(at,"") {}
+        virtual SimNode * visit ( SimVisitor & vis ) override {
+            V_BEGIN();
+            V_OP(SVecSplat);
+            V_SUB(arguments[0]);
+            V_END();
+        }
+        DAS_EVAL_ABI virtual vec4f eval(Context & context) override {
+            DAS_PROFILE_NODE
+            vec4f argValue;
+            evalArgs(context, &argValue);
+            VT ret ( SVecConv<ET>::conv(cast<AT>::to(argValue)) );
+            return (vec4f) ret;
+        }
+    };
+
+    template <typename VT, typename ET, typename AT, int vecS>
+    struct SimNode_SVecCtor : SimNode_CallBase {
+        SimNode_SVecCtor(const LineInfo & at) : SimNode_CallBase(at,"") {}
+        virtual SimNode * visit ( SimVisitor & vis ) override {
+            V_BEGIN();
+            V_OP(SVecCtor);
+            for ( int i=0; i!=vecS; ++i ) {
+                arguments[i] = vis.sub(arguments[i],"argument");
+            }
+            V_END();
+        }
+        DAS_EVAL_ABI virtual vec4f eval(Context & context) override {
+            DAS_PROFILE_NODE
+            vec4f argValues[vecS];
+            evalArgs(context, argValues);
+            VT ret;
+            memset(&ret, 0, sizeof(VT));
+            ET * el = (ET *) &ret;
+            for ( int i=0; i!=vecS; ++i ) {
+                el[i] = SVecConv<ET>::conv(cast<AT>::to(argValues[i]));
+            }
+            return (vec4f) ret;
+        }
+    };
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+#define ADD_SVEC_SPLAT(VTYPE,ETYPE,ATYPE) \
+addFunction ( (new BuiltInFn<SimNode_SVecSplat<VTYPE,ETYPE,ATYPE>,const VTYPE,ATYPE>(#VTYPE,lib,#VTYPE,false)) );
+
+#define ADD_SVEC_CTOR_2(VTYPE,ETYPE,ATYPE) \
+addFunction ( (new BuiltInFn<SimNode_SVecCtor<VTYPE,ETYPE,ATYPE,2>,const VTYPE,ATYPE,ATYPE>(#VTYPE,lib,#VTYPE,false)) );
+
+#define ADD_SVEC_CTOR_3(VTYPE,ETYPE,ATYPE) \
+addFunction ( (new BuiltInFn<SimNode_SVecCtor<VTYPE,ETYPE,ATYPE,3>,const VTYPE,ATYPE,ATYPE,ATYPE>(#VTYPE,lib,#VTYPE,false)) );
+
+#define ADD_SVEC_CTOR_4(VTYPE,ETYPE,ATYPE) \
+addFunction ( (new BuiltInFn<SimNode_SVecCtor<VTYPE,ETYPE,ATYPE,4>,const VTYPE,ATYPE,ATYPE,ATYPE,ATYPE>(#VTYPE,lib,#VTYPE,false)) );
+
+#define ADD_SVEC_CTOR_8(VTYPE,ETYPE,ATYPE) \
+addFunction ( (new BuiltInFn<SimNode_SVecCtor<VTYPE,ETYPE,ATYPE,8>,const VTYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE>(#VTYPE,lib,#VTYPE,false)) );
+
+#define ADD_SVEC_CTOR_16(VTYPE,ETYPE,ATYPE) \
+addFunction ( (new BuiltInFn<SimNode_SVecCtor<VTYPE,ETYPE,ATYPE,16>,const VTYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE,ATYPE>(#VTYPE,lib,#VTYPE,false)) );
+
+// zero + pass-through + {float,double,int,uint} x {splat, N-arg} — mirrors the arg-type
+// coverage the 32-bit vector families get from ADD_VEC_CTOR_*
+#define ADD_SVEC_FAMILY(VTYPE,ETYPE,N) \
+addFunction ( (new BuiltInFn<SimNode_Zero,const VTYPE>(#VTYPE,lib,"v_zero",false)) ); \
+addFunction ( (new BuiltInFn<SimNode_VecPassThrough, VTYPE, VTYPE>(#VTYPE,lib,#VTYPE,false)) ); \
+ADD_SVEC_SPLAT(VTYPE,ETYPE,float)    ADD_SVEC_CTOR_##N(VTYPE,ETYPE,float) \
+ADD_SVEC_SPLAT(VTYPE,ETYPE,double)   ADD_SVEC_CTOR_##N(VTYPE,ETYPE,double) \
+ADD_SVEC_SPLAT(VTYPE,ETYPE,int32_t)  ADD_SVEC_CTOR_##N(VTYPE,ETYPE,int32_t) \
+ADD_SVEC_SPLAT(VTYPE,ETYPE,uint32_t) ADD_SVEC_CTOR_##N(VTYPE,ETYPE,uint32_t)
+
     void Module_BuiltIn::addVectorCtor(ModuleLibrary & lib) {
         // float2
         ADD_VEC_CTOR_1(float2,"v_splats");
@@ -361,6 +452,29 @@ addFunction ( (new BuiltInFn<SimNode_VecCtor<uint32_t,SimPolicy<VTYPE>,4>,const 
         ADD_VEC64_CTOR_2(urange64,"urange64");
         addFunction( (new BuiltInFn<SimNode_VecPassThrough, urange64, urange64>("urange64",lib,"urange64",false)) );
         addFunction ( (new BuiltInFn<SimNode_VecCtor<uint64_t,SimPolicy<urange64>,2>,urange64,uint64_t,uint64_t>("interval",lib,"urange64",false)) );
+        // ===== 16/8-bit lattice =====
+        ADD_SVEC_FAMILY(half2,  float16_t, 2);
+        ADD_SVEC_FAMILY(half3,  float16_t, 3);
+        ADD_SVEC_FAMILY(half4,  float16_t, 4);
+        ADD_SVEC_FAMILY(half8,  float16_t, 8);
+        ADD_SVEC_FAMILY(short2, int16_t,   2);
+        ADD_SVEC_FAMILY(short3, int16_t,   3);
+        ADD_SVEC_FAMILY(short4, int16_t,   4);
+        ADD_SVEC_FAMILY(short8, int16_t,   8);
+        ADD_SVEC_FAMILY(ushort2, uint16_t, 2);
+        ADD_SVEC_FAMILY(ushort3, uint16_t, 3);
+        ADD_SVEC_FAMILY(ushort4, uint16_t, 4);
+        ADD_SVEC_FAMILY(ushort8, uint16_t, 8);
+        ADD_SVEC_FAMILY(byte2,  int8_t,    2);
+        ADD_SVEC_FAMILY(byte3,  int8_t,    3);
+        ADD_SVEC_FAMILY(byte4,  int8_t,    4);
+        ADD_SVEC_FAMILY(byte8,  int8_t,    8);
+        ADD_SVEC_FAMILY(byte16, int8_t,    16);
+        ADD_SVEC_FAMILY(ubyte2,  uint8_t,  2);
+        ADD_SVEC_FAMILY(ubyte3,  uint8_t,  3);
+        ADD_SVEC_FAMILY(ubyte4,  uint8_t,  4);
+        ADD_SVEC_FAMILY(ubyte8,  uint8_t,  8);
+        ADD_SVEC_FAMILY(ubyte16, uint8_t,  16);
     }
 }
 

@@ -231,6 +231,7 @@ namespace das
         SV_CONST_VISIT(ExprConstURange64)
         SV_CONST_VISIT(ExprConstBool)
         SV_CONST_VISIT(ExprConstFloat)
+        SV_CONST_VISIT(ExprConstFloat16)
         SV_CONST_VISIT(ExprConstFloat2)
         SV_CONST_VISIT(ExprConstFloat3)
         SV_CONST_VISIT(ExprConstFloat4)
@@ -1950,6 +1951,11 @@ namespace das
                     case tBitfield64:
                                     setE(expr, (SimNode *) context.code->makeNode<SimNode_AtVectorU<uint64_t>>(at, prv, pidx, range)); break;
                     case tFloat:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtVectorU<float>>(at, prv, pidx, range)); break;
+                    case tFloat16:  setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<float16_t>>(at, prv, pidx, range)); break;
+                    case tInt16:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<int16_t>>(at, prv, pidx, range)); break;
+                    case tUInt16:   setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<uint16_t>>(at, prv, pidx, range)); break;
+                    case tInt8:     setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<int8_t>>(at, prv, pidx, range)); break;
+                    case tUInt8:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<uint8_t>>(at, prv, pidx, range)); break;
                     default:
                         DAS_ASSERTF(0, "we should not even be here. infer type should have failed on unsupported_vector[blah]");
                         context.thisProgram->error("internal compilation error, generating vector at for unsupported vector type.", "", "", at, CompilationError::internal_expression);
@@ -1966,6 +1972,11 @@ namespace das
                     case tBitfield64:
                                     setE(expr, (SimNode *) context.code->makeNode<SimNode_AtVector<uint64_t>>(at, prv, pidx, range, errorMessage)); break;
                     case tFloat:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtVector<float>>(at, prv, pidx, range, errorMessage)); break;
+                    case tFloat16:  setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<float16_t>>(at, prv, pidx, range, errorMessage)); break;
+                    case tInt16:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<int16_t>>(at, prv, pidx, range, errorMessage)); break;
+                    case tUInt16:   setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<uint16_t>>(at, prv, pidx, range, errorMessage)); break;
+                    case tInt8:     setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<int8_t>>(at, prv, pidx, range, errorMessage)); break;
+                    case tUInt8:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<uint8_t>>(at, prv, pidx, range, errorMessage)); break;
                     default:
                         DAS_ASSERTF(0, "we should not even be here. infer type should have failed on unsupported_vector[blah]");
                         context.thisProgram->error("internal compilation error, generating vector at for unsupported vector type.", "", "", at, CompilationError::internal_expression);

@@ -83,6 +83,29 @@ def das_to_cppString(t : Type) {
         if (Type.tFloat2) { return "float2"; }
         if (Type.tFloat3) { return "float3"; }
         if (Type.tFloat4) { return "float4"; }
+        if (Type.tFloat16) { return "float16_t"; }
+        if (Type.tHalf2) { return "half2"; }
+        if (Type.tHalf3) { return "half3"; }
+        if (Type.tHalf4) { return "half4"; }
+        if (Type.tHalf8) { return "half8"; }
+        if (Type.tShort2) { return "short2"; }
+        if (Type.tShort3) { return "short3"; }
+        if (Type.tShort4) { return "short4"; }
+        if (Type.tShort8) { return "short8"; }
+        if (Type.tUShort2) { return "ushort2"; }
+        if (Type.tUShort3) { return "ushort3"; }
+        if (Type.tUShort4) { return "ushort4"; }
+        if (Type.tUShort8) { return "ushort8"; }
+        if (Type.tByte2) { return "byte2"; }
+        if (Type.tByte3) { return "byte3"; }
+        if (Type.tByte4) { return "byte4"; }
+        if (Type.tByte8) { return "byte8"; }
+        if (Type.tByte16) { return "byte16"; }
+        if (Type.tUByte2) { return "ubyte2"; }
+        if (Type.tUByte3) { return "ubyte3"; }
+        if (Type.tUByte4) { return "ubyte4"; }
+        if (Type.tUByte8) { return "ubyte8"; }
+        if (Type.tUByte16) { return "ubyte16"; }
         if (Type.tDouble) { return "double"; }
         if (Type.tRange) { return "range"; }
         if (Type.tURange) { return "urange"; }
@@ -138,6 +161,29 @@ def das_to_cppCTypeString(t : Type) {
         if (Type.tFloat2) { return "tFloat2"; }
         if (Type.tFloat3) { return "tFloat3"; }
         if (Type.tFloat4) { return "tFloat4"; }
+        if (Type.tFloat16) { return "tFloat16"; }
+        if (Type.tHalf2) { return "tHalf2"; }
+        if (Type.tHalf3) { return "tHalf3"; }
+        if (Type.tHalf4) { return "tHalf4"; }
+        if (Type.tHalf8) { return "tHalf8"; }
+        if (Type.tShort2) { return "tShort2"; }
+        if (Type.tShort3) { return "tShort3"; }
+        if (Type.tShort4) { return "tShort4"; }
+        if (Type.tShort8) { return "tShort8"; }
+        if (Type.tUShort2) { return "tUShort2"; }
+        if (Type.tUShort3) { return "tUShort3"; }
+        if (Type.tUShort4) { return "tUShort4"; }
+        if (Type.tUShort8) { return "tUShort8"; }
+        if (Type.tByte2) { return "tByte2"; }
+        if (Type.tByte3) { return "tByte3"; }
+        if (Type.tByte4) { return "tByte4"; }
+        if (Type.tByte8) { return "tByte8"; }
+        if (Type.tByte16) { return "tByte16"; }
+        if (Type.tUByte2) { return "tUByte2"; }
+        if (Type.tUByte3) { return "tUByte3"; }
+        if (Type.tUByte4) { return "tUByte4"; }
+        if (Type.tUByte8) { return "tUByte8"; }
+        if (Type.tUByte16) { return "tUByte16"; }
         if (Type.tDouble) { return "tDouble"; }
         if (Type.tRange) { return "tRange"; }
         if (Type.tURange) { return "tURange"; }

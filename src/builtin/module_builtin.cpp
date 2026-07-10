@@ -120,6 +120,10 @@ namespace das
         // storage
         ADD_NUMERIC_CASTS(int8, int8_t);
         ADD_NUMERIC_CASTS(int16, int16_t);
+        // scalar float16 <-> float converts — the floor for literals, printers, and JIT
+        // const lowering; the full numeric cast matrix lands with the fp16 operator wave
+        addFunction ( (new BuiltInFn<SimNode_Cast<float16_t,float>,float16_t,float>("float16",lib,"float16_t",false)) );
+        addFunction ( (new BuiltInFn<SimNode_Cast<float,float16_t>,float,float16_t>("float",lib,"float",false)) );
         ADD_NUMERIC_CASTS(uint8, uint8_t);
         ADD_NUMERIC_CASTS(uint16, uint16_t);
         // int32
@@ -240,6 +244,13 @@ namespace das
         addEquNeqVal<uint16_t>(*this,lib);
         // misc types
         addMiscTypes(lib);
+        // `half` spells float16 without reserving the identifier (audit: `half` is a common
+        // local name — 107 uses in-tree; an alias coexists with same-named locals)
+        {
+            auto halfT = new TypeDecl(Type::tFloat16);
+            halfT->alias = "half";
+            addAlias(halfT);
+        }
         // VECTOR & MATRIX TYPES
         addVectorTypes(lib);
         addVectorCtor(lib);
