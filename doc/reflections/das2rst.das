@@ -297,6 +297,7 @@ def document_module_dasllama(_root : string) {
     var mod = find_module("dasllama")
     var groups <- array<DocGroup>(
         group_by_regex("Model loading and sessions", mod, %regex~(load_model|create_session|create_kv_pool|release_kv_pages|create_batch_workspace|setup_dasllama_jobque|caps)$%%),
+        group_by_regex("Prefix cache", mod, %regex~(create_prefix_cache|prefix_attach|prefix_insert|prefix_release|prefix_held_groups)$%%),
         group_by_regex("Tokenizer", mod, %regex~(encode|decode|piece)$%%),
         group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
@@ -316,6 +317,8 @@ def document_module_dasllama(_root : string) {
             "Caller-owned scratch for ``eval_batch``: the batched activation buffers a step of B sessions shares. One per concurrent batch, reused across calls; holds no session state — positions, caches and logits stay in the sessions.")
         dasllama_type_stanza(f, "struct-dasllama_common-KVPool", "KVPool",
             "A caller-owned paged KV-cache pool (``create_kv_pool``): sessions created over it allocate fixed-size page groups on demand, so cache memory tracks the actual context instead of the full ``seq_len`` slab. One pool serves many sessions; an ``eval_batch`` batch must share one pool. Keep it alive and in place while its sessions live.")
+        dasllama_type_stanza(f, "struct-dasllama_prefix-PrefixCache", "PrefixCache",
+            "A page-granular prefix cache over one pool's sessions (``create_prefix_cache``): finished streams donate their KV pages keyed by a chained page hash of the token history, and later requests attach the longest cached prefix instead of re-prefilling it. Pages are refcounted with the pool; an LRU budget bounds retention.")
         dasllama_type_stanza(f, "enum-dasllama_common-KVDtype", "KVDtype",
             "Per-session KV-cache codec picked at ``create_session``/``create_chat``: ``f16`` — the default, half the KV bytes and faster deep-context decode (stores clamp to ±65504); ``f32`` — the bit-exact reference.")
         dasllama_type_stanza(f, "enum-dasllama_common-QuantMode", "QuantMode",

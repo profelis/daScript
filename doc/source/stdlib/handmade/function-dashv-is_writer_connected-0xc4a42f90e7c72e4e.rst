@@ -1,0 +1,1 @@
+Returns true while the writer's client connection is still open (false for null, unknown, or released writers). The asynchronous writer operations never report a dead peer, so a long-lived stream polls this to evict clients that disconnected.

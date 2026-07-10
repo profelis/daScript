@@ -324,6 +324,58 @@ def test_scheduler_batching(t : T?) {
     }
 }
 
+// ===== paged serving + prefix cache: a repeat request attaches pages and skips their prefill =====
+
+[test]
+def test_scheduler_prefix_cache(t : T?) {
+    t |> run("paged scheduler: repeat request attaches cached pages, identical stream (needs SmolLM2-135M)") @(t : T?) {
+        if (model_missing(t)) {
+            return
+        }
+        with_job_que() {
+            setup_dasllama_jobque()
+            var m <- load_capped(128l)
+            // classic prefill: the warm run re-chunks the prompt (tail-only), and only classic is
+            // bit-exact under re-chunking — the same pin as the chunk-size arm above
+            let saved_mode = get_prefill_attn_mode()
+            set_prefill_attn_mode(AttnPrefillMode.classic)
+            var prompt <- encode(m, "Once upon a time in a small village near the mountains there lived a very curious little robot who loved counting stars", true, false)
+            let np = int64(length(prompt))
+            t |> success(np > 17l, "prompt spans multiple pages at P=16 ({np} tokens)")
+            var none : array<int64>
+            let greedy = SamplingParams()
+            var sch <- create_scheduler(m, 1l, 4l, 64l, 16l)   // paged, P=16, unbounded prefix cache
+            var events : array<SchedEvent>
+            t |> success(submit(m, sch, make_req(1l, prompt, greedy, 8l, none)), "cold stream queued")
+            drain(m, sch, events)
+            var cold <- toks_of(events, 1l)
+            t |> equal(finished_of(events, 1l).n_cached, 0l)
+            t |> success(prefix_held_groups(sch.prefix) > 0l, "the finished stream donated its pages")
+            t |> equal(sch.cached_tokens, 0l)
+            events |> clear()
+            t |> success(submit(m, sch, make_req(2l, prompt, greedy, 8l, none)), "warm stream queued")
+            drain(m, sch, events)
+            var warm <- toks_of(events, 2l)
+            let fin2 = finished_of(events, 2l)
+            t |> equal(fin2.n_cached, (np - 1l) / 16l * 16l)   // whole pages, capped below np
+            t |> success(same(warm, cold), "warm stream identical to cold")
+            t |> equal(sch.cached_tokens, fin2.n_cached)
+            // idle scheduler: the only live page holds are the cache's
+            t |> equal(int64(length(sch.pool.free_groups)),
+                       sch.pool.capacity_groups - prefix_held_groups(sch.prefix))
+            set_prefill_attn_mode(saved_mode)
+            delete cold
+            delete warm
+            delete events
+            unsafe {
+                delete sch
+            }
+            delete prompt
+            delete m
+        }
+    }
+}
+
 // ===== active eviction mid-run + the context-exhaustion length pre-check =====
 
 [test]

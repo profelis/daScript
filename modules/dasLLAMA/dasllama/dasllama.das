@@ -16,6 +16,7 @@ options gen2
 module dasllama shared public
 
 require dasllama/dasllama_transformer public   // the engine + arch registry; every arch [init] fires
+require dasllama/dasllama_prefix public        // page-granular prefix cache over the paged pool
 require dasllama/dasllama_chat public          // layer 2: chat sessions over the same engine
 require dasllama/dasllama_audio public         // audio tower (mel frontend + whisper encoder + projectors)
 require dasllama/dasllama_asr public           // uniform ASR surface (whisper today; parakeet/qwen3-asr land behind the same sniff)
@@ -79,6 +80,44 @@ def release_kv_pages(var session : Session) {
     //! release + ``delete``; a released session stays alive but loses its cached context — to reuse
     //! it, also reset ``session.n_past`` to 0.
     release_kv_pages_(session)
+}
+
+def create_prefix_cache(max_groups : int64 = 0l) : PrefixCache {
+    //! Create a prefix cache for the paged sessions of one ``create_kv_pool`` pool: finished
+    //! streams donate their KV pages (``prefix_insert``) and later requests with the same prompt
+    //! prefix attach them (``prefix_attach``) instead of re-prefilling — the serving win for
+    //! shared system prompts and multi-turn chats. ``max_groups`` caps how many page groups the
+    //! cache retains (LRU-dropped past it); 0 = unbounded. Page hashes route, stored token ids
+    //! verify — a hit attaches only after its tokens compare equal.
+    return <- create_prefix_cache_(max_groups)
+}
+
+def prefix_attach(var cache : PrefixCache; var pool : KVPool; var session : Session; prompt : array<int64>) : int64 {
+    //! Attach the longest cached prefix of ``prompt`` to a FRESH paged ``session`` of ``pool``:
+    //! matched whole pages join the session's block table (shared, refcounted) and ``n_past``
+    //! advances past them, so the caller prefills only the tail. Returns the matched token count
+    //! — a multiple of the pool's ``page_rows``, capped one token short of the prompt so the tail
+    //! eval always produces the sampling logits.
+    return prefix_attach_(cache, pool, session, prompt)
+}
+
+def prefix_insert(var cache : PrefixCache; var pool : KVPool; session : Session; tokens : array<int64>) {
+    //! Donate a finished session's KV pages to the cache. ``tokens`` is the session's full EVALED
+    //! history (prompt + reply + any closing tokens; only the first ``n_past`` count — those rows
+    //! exist); every full page of it not already cached is registered and survives the session's
+    //! ``release_kv_pages``. Call right before releasing.
+    prefix_insert_(cache, pool, session, tokens)
+}
+
+def prefix_release(var cache : PrefixCache; var pool : KVPool) {
+    //! Release every cached page back to ``pool`` and clear the cache (pages still used by live
+    //! sessions stay alive until those sessions release them). Call before deleting the pool.
+    prefix_release_(cache, pool)
+}
+
+def prefix_held_groups(cache : PrefixCache) : int64 {
+    //! Pages the cache currently holds (== pool groups retained for reuse).
+    return prefix_held_groups_(cache)
 }
 
 def encode(model : Model; text : string; add_special = true; parse_special = false) : array<int64> {

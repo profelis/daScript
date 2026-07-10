@@ -284,5 +284,55 @@ def test_openai_server_stream(t : T?) {
                 t |> equal(int(resp.status_code), int(http_status.OK))
             }
         }
+        t |> run("prefix cache: the same request twice returns the identical completion, warm run cached") @(t : T?) {
+            // The rendered prompt must span at least one full page (server default P = 64 = the
+            // prefill chunk, so warm chunk boundaries align with cold's and flash prefill repeats
+            // the exact same evals — greedy output is bit-identical, not just similar).
+            let user = ("Tell me about a little robot who lives in a small village near the mountains" +
+                " and spends every evening counting the birds that cross the sky above the old bakery" +
+                " while dreaming about the day it will finally learn to fly like them." +
+                " The robot keeps a careful notebook of every sparrow, swallow and crow it has ever" +
+                " counted, and the baker sometimes leaves a warm roll on the windowsill for it." +
+                " In winter the birds are fewer, so the robot recounts the old pages and wonders" +
+                " whether the mountains are lonely too. Please tell the story slowly and gently.")
+            let body = "\{\"messages\":[\{\"role\":\"user\",\"content\":\"{user}\"}],\"max_tokens\":24}"
+            var replies : array<string>
+            for (_round in range(2)) {
+                POST("{base_url}/v1/chat/completions", body) $(resp) {
+                    t |> equal(int(resp.status_code), int(http_status.OK))
+                    var perr = ""
+                    var js = read_json(string(resp.body), perr)
+                    if (js != null) {
+                        let cr = from_JV(js, type<ChatResp>)
+                        if (length(cr.choices) == 1) {
+                            replies |> push("{cr.choices[0].message.content}\t{cr.choices[0].finish_reason}")
+                        }
+                        unsafe {
+                            delete js
+                        }
+                    }
+                }
+            }
+            t |> equal(2, length(replies))
+            if (length(replies) == 2) {
+                t |> success(!empty(replies[0]), "cold reply non-empty")
+                t |> equal(replies[0], replies[1])
+            }
+            GET("{base_url}/v1/stats") $(resp) {
+                var perr = ""
+                var js = read_json(string(resp.body), perr)
+                t |> success(js != null, "stats parses")
+                if (js != null) {
+                    let cached = int64(js?["cached_tokens"] ?? 0l)
+                    let pages = int64(js?["prefix_pages"] ?? 0l)
+                    t |> success(cached >= 64l, "the warm run attached at least one full page ({cached} tokens)")
+                    t |> success(pages > 0l, "the prefix cache retains pages ({pages})")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            delete replies
+        }
     }
 }

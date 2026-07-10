@@ -46,11 +46,20 @@ struct ServerArgs {
     ctx : int
 
     @clarg_short = "s"
-    @clarg_doc = "Max concurrent generation streams — each holds a full KV cache (default 4)"
+    @clarg_doc = "Max concurrent generation streams (default 4)"
     streams : int
 
     @clarg_doc = "Prefill chunk in tokens: decode stalls at most this many per tick (default 64)"
     chunk : int
+
+    @clarg_doc = "KV page size in positions for paged serving (default 64)"
+    page_rows : int
+
+    @clarg_doc = "Prefix-cache retention cap in pages (default: one full context per stream; -1 = unbounded)"
+    prefix : int
+
+    @clarg_doc = "Flat preallocated KV sessions — disables paged serving and the prefix cache"
+    flat : bool
 
     @clarg_doc = "Re-tune this box's dasLLAMA kernels, then relaunch (handled before arg parsing)"
     tune : bool
@@ -98,6 +107,8 @@ def main : int {
     let ctx = cfg.ctx > 0 ? int64(cfg.ctx) : 4096l   // guard: a negative ctx would make seq_len < 0
     let streams = cfg.streams > 0 ? int64(cfg.streams) : 4l
     let chunk = cfg.chunk > 0 ? int64(cfg.chunk) : 64l
+    let page_rows = cfg.flat ? 0l : (cfg.page_rows > 0 ? int64(cfg.page_rows) : 64l)
+    let prefix = int64(cfg.prefix)   // 0 = auto (run_server sizes it), < 0 = unbounded
 
     log_tune_status("dasllama-server")
     print("loading {cfg.model} ...\n")
@@ -111,6 +122,6 @@ def main : int {
         set_asr(a)
     }
 
-    run_server(port, streams, chunk_tokens = chunk)
+    run_server(port, streams, chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix)
     return 0
 }

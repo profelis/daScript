@@ -82,12 +82,18 @@ struct Scheduler {
     max_streams : int64 = 4l
     max_queue : int64 = 32l
     chunk_tokens : int64 = 64l              // prefill quantum K: decode stalls at most this many tokens
+    // paged serving (page_rows > 0 at create): sessions page KV out of the pool, and finished
+    // streams donate their pages to the prefix cache so repeat prefixes skip their prefill
+    paged : bool
+    pool : KVPool
+    prefix : PrefixCache
     // per-step gather scratch. @do_not_delete is load-bearing: delete of a plain array<T?>
     // CASCADES to the pointees — these are borrowed rows into streams[i].session
     @do_not_delete batch_rows : array<Session?>
     batch_toks : array<int64>
     batch_idx : array<int64>                // batch row -> streams index
     chunk : array<int64>                    // the current prefill chunk
+    donate_toks : array<int64>              // reap-time scratch: tail eval + the insert token list
     // counters (/v1/stats and server_bench read these)
     n_admitted : int64
     n_finished : int64                      // reaped streams (any finish, evictions included)
@@ -96,16 +102,26 @@ struct Scheduler {
     gen_tokens : int64
     sum_batch : int64                       // Σ decode batch size (avg batch = sum_batch / decode_steps)
     peak_active : int64
-    cached_tokens : int64                   // prefix-cache hits (0 this rung)
+    cached_tokens : int64                   // prefix-cache hits (tokens attached instead of prefilled)
 }
 
-//! Create a scheduler over `model`: `max_streams` concurrent sessions (each a full KV cache — cap
-//! model.config.seq_len BEFORE this to bound memory), `max_queue` waiting requests, `chunk_tokens`
-//! the prefill quantum. Free with `unsafe(delete sch)` — live sessions and the workspace go with it.
+//! Create a scheduler over `model`: `max_streams` concurrent sessions, `max_queue` waiting
+//! requests, `chunk_tokens` the prefill quantum. `page_rows` > 0 switches to PAGED serving — KV
+//! pages allocate on demand (memory tracks actual context, not seq_len × streams) and a prefix
+//! cache reuses completed streams' pages across requests (`prefix_groups` caps its retention;
+//! 0 = unbounded); 0 keeps today's flat preallocated sessions. Free with `unsafe(delete sch)` —
+//! live sessions, the pool, and the workspace go with it.
 def create_scheduler(model : Model; max_streams : int64 = 4l; max_queue : int64 = 32l;
-                     chunk_tokens : int64 = 64l) : Scheduler {
-    return <- Scheduler(ws <- create_batch_workspace(model), max_streams = max(1l, max_streams),
-                        max_queue = max(1l, max_queue), chunk_tokens = max(1l, chunk_tokens))
+                     chunk_tokens : int64 = 64l; page_rows : int64 = 0l;
+                     prefix_groups : int64 = 0l) : Scheduler {
+    var sch <- Scheduler(ws <- create_batch_workspace(model), max_streams = max(1l, max_streams),
+                         max_queue = max(1l, max_queue), chunk_tokens = max(1l, chunk_tokens))
+    if (page_rows > 0l) {
+        sch.paged = true
+        sch.pool <- create_kv_pool(model, page_rows)
+        sch.prefix <- create_prefix_cache(prefix_groups)
+    }
+    return <- sch
 }
 
 //! Active stream count (prefilling + decoding).
@@ -199,12 +215,22 @@ def evict(var sch : Scheduler; id : int64; var events : array<SchedEvent>) : boo
 //! logits sample the first token inline), then reap finished streams. Events append to `events`
 //! (the caller drains it). Returns true while any stream or queued request remains.
 def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent>) : bool {
-    // (1) admit FIFO while under the cap — sessions (KV memory) exist only from this point on
+    // (1) admit FIFO while under the cap — sessions (KV memory) exist only from this point on.
+    // Paged mode also attaches the longest prefix-cache hit: those positions never prefill.
     while (!empty(sch.queue) && int64(length(sch.streams)) < sch.max_streams) {
-        var st <- Stream(id = sch.queue[0].id, session <- create_session(m),
+        var st <- Stream(id = sch.queue[0].id,
                          params = sch.queue[0].params, prompt <- sch.queue[0].prompt,
                          close_toks <- sch.queue[0].close_toks, stop_ids <- sch.queue[0].stop_ids,
                          max_new = sch.queue[0].max_new, t_admit = ref_time_ticks())
+        if (sch.paged) {
+            st.session <- create_session(m, sch.pool)
+            let matched = prefix_attach(sch.prefix, sch.pool, st.session, st.prompt)
+            st.n_prefilled = matched
+            st.n_cached = matched
+            sch.cached_tokens += matched
+        } else {
+            st.session <- create_session(m)
+        }
         if (sch.queue[0].seed != 0) {
             set_seed(st.session, sch.queue[0].seed)
         }
@@ -262,10 +288,15 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         }
         break
     }
-    // (4) reap done streams (their finished events were emitted at the state flip)
+    // (4) reap done streams (their finished events were emitted at the state flip); paged streams
+    // donate their pages to the prefix cache on the way out
     var i = 0
     while (i < length(sch.streams)) {
         if (sch.streams[i].state == StreamState.done) {
+            if (sch.paged) {
+                donate_stream(m, sch, sch.streams[i])
+                release_kv_pages(sch.streams[i].session)
+            }
             delete sch.streams[i]   // erase is a raw memmove — finalize the owned session first
             sch.streams |> erase(i)
             sch.n_finished ++
@@ -274,4 +305,26 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         }
     }
     return !empty(sch.streams) || !empty(sch.queue)
+}
+
+// Donate a finished stream's KV pages. A completed stream first evals its pending token (the last
+// emitted one — sampled but never fed back) plus the close tokens, so the NEXT turn of the same
+// conversation (prompt + reply + close + new user turn) extends the cached prefix; an evicted or
+// context-full stream donates only what it evaled. prefix_insert trims to n_past.
+def private donate_stream(m : Model; var sch : Scheduler; var st : Stream) {
+    let close_n = int64(length(st.close_toks))
+    if (st.finish != "evicted" && st.cur_tok >= 0l
+            && st.session.n_past + 1l + close_n <= m.config.seq_len) {
+        sch.donate_toks |> clear()
+        sch.donate_toks |> push(st.cur_tok)
+        sch.donate_toks |> push_from(st.close_toks)
+        eval(m, st.session, sch.donate_toks)
+    }
+    sch.donate_toks |> clear()
+    sch.donate_toks |> reserve(int(st.n_prefilled) + length(st.session.recent) + length(st.close_toks))
+    for (k in range64(st.n_prefilled)) {
+        sch.donate_toks |> push(st.prompt[k])
+    }
+    sch.donate_toks |> push_from(st.session.recent, st.close_toks)
+    prefix_insert(sch.prefix, sch.pool, st.session, sch.donate_toks)
 }

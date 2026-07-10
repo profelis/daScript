@@ -516,6 +516,7 @@ struct private OaiStatsResponse {
     gen_tokens : int64
     avg_batch : float
     cached_tokens : int64
+    prefix_pages : int64
     max_streams : int64
     chunk_tokens : int64
 }
@@ -526,7 +527,7 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         admitted = g_sched.n_admitted, finished = g_sched.n_finished, evicted = g_sched.n_evicted,
         decode_steps = g_sched.decode_steps, gen_tokens = g_sched.gen_tokens,
         avg_batch = float(g_sched.sum_batch) / float(max(g_sched.decode_steps, 1l)),
-        cached_tokens = g_sched.cached_tokens,
+        cached_tokens = g_sched.cached_tokens, prefix_pages = prefix_held_groups(g_sched.prefix),
         max_streams = g_sched.max_streams, chunk_tokens = g_sched.chunk_tokens)
     return resp |> JSON(sprint_json(out, false), http_status.OK)
 }
@@ -619,21 +620,35 @@ class OpenAiServer : HvWebServer {
 //! job queue, then drives the serve loop: pump HTTP (handlers parse + render + submit), evict
 //! streams whose client disconnected, one scheduler step (continuous batching over every live
 //! stream), flush events to the writers.
-//! ``max_streams`` concurrent generation streams (each holds a full KV cache — cap the context with
-//! ``--ctx`` to bound memory), ``max_queue`` waiting requests (503 beyond), ``chunk_tokens`` the
-//! prefill quantum (decode stalls at most this many tokens per tick). Call after ``set_model``.
-def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l) {
+//! ``max_streams`` concurrent generation streams, ``max_queue`` waiting requests (503 beyond),
+//! ``chunk_tokens`` the prefill quantum (decode stalls at most this many tokens per tick).
+//! ``page_rows`` > 0 (the default) serves PAGED: KV memory tracks actual context and a prefix
+//! cache reuses completed streams' pages, so repeated prompts (system prompts, multi-turn chats)
+//! skip their prefill; ``prefix_groups`` caps the cache (0 = auto: one full context per stream
+//! slot, < 0 = unbounded). ``page_rows`` = 0 restores flat preallocated sessions (each the full
+//! ``--ctx`` slab). Call after ``set_model``.
+def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
+               page_rows : int64 = 64l; prefix_groups : int64 = 0l) {
     g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once
     with_job_que() {
         setup_dasllama_jobque()
-        g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens)
+        var pfx = prefix_groups
+        if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
+            pfx = max_streams * ((g_model.config.seq_len + page_rows - 1l) / page_rows)
+        }
+        if (pfx < 0l) {
+            pfx = 0l   // explicit unbounded
+        }
+        g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx)
         var server = new OpenAiServer()
         server->init(port)
         let rc = server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
         if (rc != 0) {
             to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
         } else {
-            to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens})\n")
+            let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
+            let kv_mode = page_rows > 0l ? "paged P={page_rows}, prefix cache {pfx_desc} pages" : "flat"
+            to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode})\n")
             while (!g_should_stop) {
                 server->tick()   // drains queued handlers: requests parse + render + submit here
                 reap_disconnected(server.server)
