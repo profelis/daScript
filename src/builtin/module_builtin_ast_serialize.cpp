@@ -724,11 +724,20 @@ namespace das {
                     ser << anno->module->nameHash;
                 }
             } else {
-                // If the macro is from current module, do nothing
-                // it will probably take care of itself during compilation
-                SERIALIZER_VERIFYF( anno->module->macroContext,
-                    "expected to see macro module '%s'", anno->module->name.c_str()
-                );
+                // das-declared distinct-type entities round-trip with the module itself
+                // (Module::serialize registers them before anything that references them
+                // deserializes), so an own-module reference resolves by name
+                bool isDistinct = anno->rtti_isDistinctTypeAnnotation();
+                ser << isDistinct;
+                if ( isDistinct ) {
+                    ser << anno->name;
+                } else {
+                    // If the macro is from current module, do nothing
+                    // it will probably take care of itself during compilation
+                    SERIALIZER_VERIFYF( anno->module->macroContext,
+                        "expected to see macro module '%s'", anno->module->name.c_str()
+                    );
+                }
             }
         } else {
             bool inThisModule = false;
@@ -747,6 +756,16 @@ namespace das {
                     SERIALIZER_VERIFYF(mod!=nullptr, "module '%llu' is not found", moduleNameHash);
                     anno = mod->findAnnotation(name);
                     SERIALIZER_VERIFYF(anno!=nullptr, "annotation '%s' is not found", name.c_str());
+                }
+            } else {
+                bool isDistinct = false;
+                ser << isDistinct;
+                if ( isDistinct ) {
+                    string name;
+                    ser << name;
+                    anno = ser.thisModule->findAnnotation(name);
+                    SERIALIZER_VERIFYF(anno!=nullptr && anno->rtti_isDistinctTypeAnnotation(),
+                        "distinct type '%s' is not found in module '%s'", name.c_str(), ser.thisModule->name.c_str());
                 }
             }
         }

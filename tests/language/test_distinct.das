@@ -3,6 +3,7 @@ require dastest/testing_boost public
 require _distinct_fixture
 
 distinct Id = int
+distinct OtherId = int
 distinct Name = string
 distinct Handle = void ?
 distinct Pos = float3
@@ -82,6 +83,11 @@ def test_distinct_operators_and_overloads(t : T?) {
     t |> run("overloads on distinct vs underlying coexist") @(t : T?) {
         t |> equal(describe(5), "int 5")
         t |> equal(describe(Id(5)), "id 5")
+    }
+    t |> run("two distincts over the same underlying are unrelated") @(t : T?) {
+        // Id and OtherId are both int underneath; describe(Id) must not accept OtherId
+        t |> equal(typeinfo typename(default<Id>), "Id")
+        t |> equal(typeinfo typename(default<OtherId>), "OtherId")
     }
 }
 

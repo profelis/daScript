@@ -1,9 +1,10 @@
 options gen2
 
-expect 30341 : 4
+expect 30341 : 6
 expect 30344
 
 distinct Id = int
+distinct OtherId = int
 
 def take_int(i : int) : int => i + 1
 
@@ -17,4 +18,7 @@ def main {
     var b : Id = 5      // 30344: no implicit init from the underlying
     let eq = a == 5     // 30341: Id == int does not borrow
     let sum = a + a     // 30341: no borrowed arithmetic
+    var o = OtherId(5)
+    take_id(o)          // 30341: two distincts over the same underlying are unrelated
+    let eq2 = a == o    // 30341: == does not borrow across distinct types
 }
