@@ -1025,6 +1025,20 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 |---|---|---|
 | test_template.das | `[template]` annotation — `type<T>` and `decltype` as template arguments | |
 
+## type_lattice/
+
+> GENERATED per-type conformance harness (do not hand-edit) — regen via `daslang utils/dasgen/gen_type_conformance.das`. Each file exercises one basic type through sizeof/alignof, zero-init, `default<>`, ctor+equality, copy, pass/return by value, `v[i]`, swizzles, struct field layout, array element, archive round-trip, print, and (where operators exist) arithmetic. Runs in all CI tiers (interp/jit/AOT) to pin cross-tier parity for the 16/8-bit type-lattice arc.
+
+| File | Description | Expects errors |
+|---|---|---|
+| test_float2.das | float2 conformance (control) | |
+| test_float3.das | float3 conformance (control — odd-size 12B layout) | |
+| test_float4.das | float4 conformance (control) | |
+| test_int2.das | int2 conformance (control) | |
+| test_uint4.das | uint4 conformance (control) | |
+| test_int8.das | int8 scalar conformance (control — storage-only precedent) | |
+| test_uint16.das | uint16 scalar conformance (control — storage-only precedent) | |
+
 ## type_traits/
 
 | File | Description | Expects errors |
