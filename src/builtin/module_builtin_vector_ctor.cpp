@@ -520,6 +520,16 @@ ADD_SVEC_SPLAT(VTYPE,ETYPE,uint32_t) ADD_SVEC_CTOR_##N(VTYPE,ETYPE,uint32_t)
         ADD_SVEC_CVT(ubyte4, uint8_t, uint4, uint32_t);    ADD_SVEC_CVT_SAT(ubyte4, uint8_t, uint4, uint32_t);
         ADD_SVEC_CVT(byte8, int8_t, short8, int16_t);      ADD_SVEC_CVT_SAT(byte8, int8_t, short8, int16_t);
         ADD_SVEC_CVT(ubyte8, uint8_t, ushort8, uint16_t);  ADD_SVEC_CVT_SAT(ubyte8, uint8_t, ushort8, uint16_t);
+        // fp16 <-> float per arity (narrowing rounds RNE per lane), + half8 <-> 2x float4
+        ADD_SVEC_CVT(half2, float16_t, float2, float);
+        ADD_SVEC_CVT(half3, float16_t, float3, float);
+        ADD_SVEC_CVT(half4, float16_t, float4, float);
+        ADD_SVEC_CVT(float2, float, half2, float16_t);
+        ADD_SVEC_CVT(float3, float, half3, float16_t);
+        ADD_SVEC_CVT(float4, float, half4, float16_t);
+        addExtern<DAS_BIND_FUN(das_half8_pack)>(*this, lib, "half8", SideEffects::none, "das_half8_pack");
+        addExtern<DAS_BIND_FUN(das_half8_lo)>(*this, lib, "half8_lo", SideEffects::none, "das_half8_lo");
+        addExtern<DAS_BIND_FUN(das_half8_hi)>(*this, lib, "half8_hi", SideEffects::none, "das_half8_hi");
 #undef ADD_SVEC_CVT
 #undef ADD_SVEC_CVT_SAT
     }

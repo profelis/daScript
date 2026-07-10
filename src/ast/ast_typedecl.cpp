@@ -3128,6 +3128,7 @@ namespace das
 
     bool TypeDecl::isNumericComparable() const {
         switch (baseType) {
+        case Type::tFloat16:
         case Type::tInt:
         case Type::tUInt:
         case Type::tBitfield:

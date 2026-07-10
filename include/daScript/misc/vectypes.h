@@ -385,6 +385,22 @@ namespace das
         return r;
     }
 
+    // half8 <-> 2x float4 pack/unpack (the fp16 SIMD register shape)
+    __forceinline half8 das_half8_pack ( float4 lo, float4 hi ) {
+        half8 r;
+        const float * s = &lo.x;
+        for ( int i = 0; i != 4; ++i ) r.s[i] = float16_t(s[i]);
+        s = &hi.x;
+        for ( int i = 0; i != 4; ++i ) r.s[i + 4] = float16_t(s[i]);
+        return r;
+    }
+    __forceinline float4 das_half8_lo ( half8 v ) {
+        return float4(v.s[0].toFloat(), v.s[1].toFloat(), v.s[2].toFloat(), v.s[3].toFloat());
+    }
+    __forceinline float4 das_half8_hi ( half8 v ) {
+        return float4(v.s[4].toFloat(), v.s[5].toFloat(), v.s[6].toFloat(), v.s[7].toFloat());
+    }
+
     template <typename TO, typename TOE, typename FROM, typename FE>
     __forceinline TO das_sv_cvt_sat ( FROM v ) {
         TO r;
