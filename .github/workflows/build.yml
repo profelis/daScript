@@ -461,6 +461,7 @@ jobs:
             # tracked separately, real fix is in the binding).
             printf 'leak:format_error\nleak:uriParseSingleUriA\nleak:uriMakeOwner\n' > suppressions.txt
             export LSAN_OPTIONS="suppressions=$(pwd)/suppressions.txt"
+            export TSAN_OPTIONS="suppressions=$(pwd)/.github/tsan_suppressions.txt"
             # Sanitizer matrix: only run language tests under JIT (full test
             # suite under asan/tsan/ubsan adds ~10m wall-clock without proportionate
             # coverage value). Non-sanitizer keeps the full sweep.
@@ -533,6 +534,7 @@ jobs:
             # need them here too.
             printf 'leak:format_error\nleak:uriParseSingleUriA\nleak:uriMakeOwner\n' > suppressions.txt
             export LSAN_OPTIONS="suppressions=$(pwd)/suppressions.txt"
+            export TSAN_OPTIONS="suppressions=$(pwd)/.github/tsan_suppressions.txt"
             cmake --build ./build --config ${{ matrix.cmake_preset }} --target run_tests_aot
             ;;
         esac

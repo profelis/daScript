@@ -667,7 +667,9 @@ static void post_writer_op ( Handle<hv::WebSocketServer> h, hv::HttpResponseWrit
     if ( !adapter || !w ) return;
     auto sp = adapter->find_writer(w);
     if ( !sp ) return;
-    auto loop = adapter->loop();
+    // loop(0), not loop(): the default idx=-1 resolves via currentThreadEventLoop — always null on
+    // the tick thread, so the fallback ran every write there, racing the loop thread (glibc gmtime).
+    auto loop = adapter->loop(0);
     if ( loop ) {
         loop->runInLoop([ssp,sp,fn](){ fn(sp.get()); });
     } else {

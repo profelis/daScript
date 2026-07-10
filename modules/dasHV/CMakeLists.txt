@@ -135,14 +135,21 @@ IF ((NOT DAS_HV_INCLUDED) AND ((NOT ${DAS_HV_DISABLED}) OR (NOT DEFINED DAS_HV_D
 	IF(MSVC)
 		SET(_HV_CXX_FLAGS "${_HV_CXX_FLAGS} /EHsc")
 	ENDIF()
+	SET(_HV_SAN_FLAG "")
 	IF(DAS_USE_SANITIZER STREQUAL "address" OR DAS_USE_SANITIZER STREQUAL "asan")
 		IF(MSVC)
-			SET(_HV_ASAN_FLAG "/fsanitize=address")
+			SET(_HV_SAN_FLAG "/fsanitize=address")
 		ELSE()
-			SET(_HV_ASAN_FLAG "-fsanitize=address")
+			SET(_HV_SAN_FLAG "-fsanitize=address")
 		ENDIF()
-		SET(_HV_C_FLAGS "${_HV_C_FLAGS} ${_HV_ASAN_FLAG}")
-		SET(_HV_CXX_FLAGS "${_HV_CXX_FLAGS} ${_HV_ASAN_FLAG}")
+	ELSEIF((DAS_USE_SANITIZER STREQUAL "thread" OR DAS_USE_SANITIZER STREQUAL "tsan") AND NOT MSVC)
+		# An uninstrumented libhv hides its atomics from tsan — proper shared_ptr teardown
+		# then reads as a false "data race in operator delete" (partially-instrumented code).
+		SET(_HV_SAN_FLAG "-fsanitize=thread")
+	ENDIF()
+	IF(_HV_SAN_FLAG)
+		SET(_HV_C_FLAGS "${_HV_C_FLAGS} ${_HV_SAN_FLAG}")
+		SET(_HV_CXX_FLAGS "${_HV_CXX_FLAGS} ${_HV_SAN_FLAG}")
 	ENDIF()
 	LIST(APPEND HV_CMAKE_FLAGS
 		"-DCMAKE_C_FLAGS:STRING=${_HV_C_FLAGS}"
