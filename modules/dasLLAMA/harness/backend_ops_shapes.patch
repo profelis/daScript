@@ -8,8 +8,8 @@ index c21675e..1757b0f 100644
  #else
 -#   define N_THREADS std::thread::hardware_concurrency()
 +// GGML_BENCH_THREADS pins the backend thread count (dasLLAMA pure-GEMM ladder: thread parity
-+// with the das side's DAS_JOBQUE_THREADS); default = all hardware threads as before
-+#   define N_THREADS (getenv("GGML_BENCH_THREADS") ? (size_t) atoi(getenv("GGML_BENCH_THREADS")) : std::thread::hardware_concurrency())
++// with the das side's DAS_JOBQUE_THREADS); unset/zero/garbage = all hardware threads as before
++#   define N_THREADS (getenv("GGML_BENCH_THREADS") && atoi(getenv("GGML_BENCH_THREADS")) > 0 ? (size_t) atoi(getenv("GGML_BENCH_THREADS")) : std::thread::hardware_concurrency())
  #endif
  
  static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {

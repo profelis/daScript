@@ -46,7 +46,8 @@ for LENG in lcpp lcpp-amx; do
     if [ "$LENG" = lcpp-amx ]; then
         GGML_PERF_WEIGHT_BUFT=AMX GGML_BENCH_THREADS=$T "$TBO" perf -o MUL_MAT -b CPU -p "type_a=q8_0,type_b=f32" 2>/dev/null
     else
-        GGML_BENCH_THREADS=$T "$TBO" perf -o MUL_MAT -b CPU -p "type_a=q8_0,type_b=f32" 2>/dev/null
+        # env -u, not =": an exported GGML_PERF_WEIGHT_BUFT would silently poison the plain rung
+        env -u GGML_PERF_WEIGHT_BUFT GGML_BENCH_THREADS=$T "$TBO" perf -o MUL_MAT -b CPU -p "type_a=q8_0,type_b=f32" 2>/dev/null
     fi |
 awk -v nt=$NTOK -v t=$T -v ENG=$LENG '
     BEGIN {
