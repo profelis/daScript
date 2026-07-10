@@ -1202,6 +1202,29 @@ namespace das {
             case tFloat4:
             case tDouble:
             case tString:
+            case tFloat16:
+            case tHalf2:
+            case tHalf3:
+            case tHalf4:
+            case tHalf8:
+            case tShort2:
+            case tShort3:
+            case tShort4:
+            case tShort8:
+            case tUShort2:
+            case tUShort3:
+            case tUShort4:
+            case tUShort8:
+            case tByte2:
+            case tByte3:
+            case tByte4:
+            case tByte8:
+            case tByte16:
+            case tUByte2:
+            case tUByte3:
+            case tUByte4:
+            case tUByte8:
+            case tUByte16:
                 ser << alias;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
