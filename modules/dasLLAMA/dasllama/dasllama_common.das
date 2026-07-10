@@ -2513,13 +2513,33 @@ def private flash_decode_check_g(qp : float const?; qq : int8 const?; qsp : floa
             if (sinksp != null) {
                 m2 = max(m2, sinksp[hh])
             }
+            // exp4 fold in place: sref becomes the exp weights (one pass, not one exp per (i, j))
             var l2 = 0.0
-            for (j in range64(cnt)) {
-                l2 += exp(sref[j] - m2)
+            {
+                let m24 = float4(m2, m2, m2, m2)
+                var s4 = float4(0.0)
+                var j = 0l
+                while (j + 4l <= cnt) {
+                    let e = exp4(max(float4(sref[j], sref[j + 1l], sref[j + 2l], sref[j + 3l]) - m24, EXP4_LO))
+                    sref[j] = e.x
+                    sref[j + 1l] = e.y
+                    sref[j + 2l] = e.z
+                    sref[j + 3l] = e.w
+                    s4 += e
+                    j += 4l
+                }
+                l2 = s4.x + s4.y + s4.z + s4.w
+                while (j < cnt) {
+                    let e = exp(max(sref[j] - m2, -80.0))
+                    sref[j] = e
+                    l2 += e
+                    j++
+                }
             }
             if (sinksp != null) {
-                l2 += exp(sinksp[hh] - m2)
+                l2 += exp(max(sinksp[hh] - m2, -80.0))
             }
+            let invl2 = 1.0 / l2
             var worstd = 0.0
             for (i in range64(head_size)) {
                 var acc = 0.0
@@ -2529,7 +2549,7 @@ def private flash_decode_check_g(qp : float const?; qq : int8 const?; qsp : floa
                     let rowbase = runs[r].row0 - runs[r].j0
                     for (aj in range64(rj0, rj1)) {
                         let voff = (rowbase + aj) * vdim + vhoff   // vcp is layer-base (codec seam)
-                        acc += exp(sref[aj - kstart] - m2) / l2 * kv_load(vcp, voff, i)
+                        acc += sref[aj - kstart] * invl2 * kv_load(vcp, voff, i)
                     }
                 }
                 worstd = max(worstd, abs(acc - xbv[qoff + i]))
@@ -3288,13 +3308,29 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             xbp[qoff + i] = 0.0
                         }
                         var lg = 0.0
-                        for (sl in range64(int64(nsl))) {
-                            let f = exp(flmp[fbase + sl] - mg)
-                            lg += fllp[fbase + sl] * f
-                            axpy(xbp + qoff, flop + (fbase + sl) * head_size, f, head_size)
+                        {
+                            // exp4 over the slice scale factors (nsl <= 16), flash-fold clamp convention
+                            let mg4 = float4(mg, mg, mg, mg)
+                            var sl = 0l
+                            while (sl + 4l <= int64(nsl)) {
+                                let f = exp4(max(float4(flmp[fbase + sl], flmp[fbase + sl + 1l], flmp[fbase + sl + 2l], flmp[fbase + sl + 3l]) - mg4, EXP4_LO))
+                                lg += (fllp[fbase + sl] * f.x + fllp[fbase + sl + 1l] * f.y
+                                    + fllp[fbase + sl + 2l] * f.z + fllp[fbase + sl + 3l] * f.w)
+                                axpy(xbp + qoff, flop + (fbase + sl) * head_size, f.x, head_size)
+                                axpy(xbp + qoff, flop + (fbase + sl + 1l) * head_size, f.y, head_size)
+                                axpy(xbp + qoff, flop + (fbase + sl + 2l) * head_size, f.z, head_size)
+                                axpy(xbp + qoff, flop + (fbase + sl + 3l) * head_size, f.w, head_size)
+                                sl += 4l
+                            }
+                            while (sl < int64(nsl)) {
+                                let f = exp(max(flmp[fbase + sl] - mg, -80.0))
+                                lg += fllp[fbase + sl] * f
+                                axpy(xbp + qoff, flop + (fbase + sl) * head_size, f, head_size)
+                                sl++
+                            }
                         }
                         if (sinksp != null) {
-                            lg += exp(sinksp[hh] - mg)
+                            lg += exp(max(sinksp[hh] - mg, -80.0))
                         }
                         let inv = 1.0 / lg
                         for (i in range64(head_size)) {
@@ -3683,22 +3719,45 @@ def private moe_select(c : Config; var lg : array<float> | #; var idx : array<in
     // probs — softmax_weight routes on the RAW biased logits and softmaxes only the selected
     // top-k afterwards (gpt-oss)
     if (c.moe_gate == MoeGate.sigmoid) {
-        for (i in range64(ne)) {
-            lg[i] = 1.0 / (1.0 + exp(-lg[i]))
+        var i = 0l
+        while (i + 4l <= ne) {
+            let e = exp4(clamp(-float4(lg[i], lg[i + 1l], lg[i + 2l], lg[i + 3l]), EXP4_LO, EXP4_HI))
+            lg[i] = 1.0 / (1.0 + e.x)
+            lg[i + 1l] = 1.0 / (1.0 + e.y)
+            lg[i + 2l] = 1.0 / (1.0 + e.z)
+            lg[i + 3l] = 1.0 / (1.0 + e.w)
+            i += 4l
+        }
+        while (i < ne) {
+            lg[i] = 1.0 / (1.0 + exp(clamp(-lg[i], -80.0, 80.0)))
+            i++
         }
     } elif (c.moe_gate == MoeGate.softmax) {
         var mx = lg[0]
         for (i in range64(ne)) {
             mx = max(mx, lg[i])
         }
-        var sum = 0.0
-        for (i in range64(ne)) {
-            let e = exp(lg[i] - mx)
+        let m4 = float4(mx, mx, mx, mx)
+        var sum4 = float4(0.0)
+        var i = 0l
+        while (i + 4l <= ne) {
+            let e = exp4(max(float4(lg[i], lg[i + 1l], lg[i + 2l], lg[i + 3l]) - m4, EXP4_LO))
+            lg[i] = e.x
+            lg[i + 1l] = e.y
+            lg[i + 2l] = e.z
+            lg[i + 3l] = e.w
+            sum4 += e
+            i += 4l
+        }
+        var sum = sum4.x + sum4.y + sum4.z + sum4.w
+        while (i < ne) {
+            let e = exp(max(lg[i] - mx, -80.0))
             lg[i] = e
             sum += e
+            i++
         }
-        for (i in range64(ne)) {
-            lg[i] /= sum
+        for (j in range64(ne)) {
+            lg[j] /= sum
         }
     }
     // top-k by selection score — the winner is knocked out with -FLT_MAX (softmax_weight selects on

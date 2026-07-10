@@ -1538,15 +1538,29 @@ def template softmax_template(var x : float ?; size : int64) : void {
     if (size <= 0) return   // seeds the reduction with x[0]; size<=0 must be a no-op (same contract as the array overload)
     unsafe {
         let maxv = hmax(x, size)   // hand-vectorized max reduction (see hmax)
-        var sum = 0.0
-        for [tune = 1] (i in range64(size)) {
-            let e = exp(x[i] - maxv)
+        // exp4 fold (like the flash softmax folds): clamp underflow to -80 (exp -> ~0, negligible)
+        let m4 = float4(maxv, maxv, maxv, maxv)
+        var sum4 = float4(0.0)
+        var i = 0l
+        while (i + 4l <= size) {
+            let e = exp4(max(float4(x[i], x[i + 1l], x[i + 2l], x[i + 3l]) - m4, EXP4_LO))
+            x[i] = e.x
+            x[i + 1l] = e.y
+            x[i + 2l] = e.z
+            x[i + 3l] = e.w
+            sum4 += e
+            i += 4l
+        }
+        var sum = sum4.x + sum4.y + sum4.z + sum4.w
+        while (i < size) {
+            let e = exp(max(x[i] - maxv, -80.0))
             x[i] = e
             sum += e
+            i++
         }
         let inv_sum = 1.0 / sum   // scale by the reciprocal (matches ggml_vec_scale_f32), not a per-element /=
-        for [tune = 1] (i in range64(size)) {
-            x[i] *= inv_sum
+        for [tune = 1] (j in range64(size)) {
+            x[j] *= inv_sum
         }
     }
 }
@@ -1565,16 +1579,30 @@ def template softmax_sink_template(var x : float ?; size : int64; sink : float) 
     if (size <= 0) return
     unsafe {
         let maxv = max(hmax(x, size), sink)
-        var sum = 0.0
-        for [tune = 1] (i in range64(size)) {
-            let e = exp(x[i] - maxv)
+        // exp4 fold — same shape (and clamp convention) as softmax_template
+        let m4 = float4(maxv, maxv, maxv, maxv)
+        var sum4 = float4(0.0)
+        var i = 0l
+        while (i + 4l <= size) {
+            let e = exp4(max(float4(x[i], x[i + 1l], x[i + 2l], x[i + 3l]) - m4, EXP4_LO))
+            x[i] = e.x
+            x[i + 1l] = e.y
+            x[i + 2l] = e.z
+            x[i + 3l] = e.w
+            sum4 += e
+            i += 4l
+        }
+        var sum = sum4.x + sum4.y + sum4.z + sum4.w
+        while (i < size) {
+            let e = exp(max(x[i] - maxv, -80.0))
             x[i] = e
             sum += e
+            i++
         }
-        sum += exp(sink - maxv)
+        sum += exp(max(sink - maxv, -80.0))
         let inv_sum = 1.0 / sum
-        for [tune = 1] (i in range64(size)) {
-            x[i] *= inv_sum
+        for [tune = 1] (j in range64(size)) {
+            x[j] *= inv_sum
         }
     }
 }
