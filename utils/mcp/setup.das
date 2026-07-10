@@ -64,8 +64,9 @@ def shell_unsafe(s : string) : bool {
         find(s, "%") >= 0 || find(s, "\n") >= 0 || find(s, "\r") >= 0)
 }
 
-// Build the daslang target (required) plus tree_sitter_daslang (best-effort —
-// it powers the ast-grep tools). Configures build/ first if needed. A non-empty
+// Build the daslang target (required; the tree-sitter grammar is ensure_grammar's
+// job — it must happen even when this build is skipped). Configures build/ first if
+// needed. A non-empty
 // `openssl_dir` is passed as -DOPENSSL_ROOT_DIR so dasHV reuses one OpenSSL build
 // across worktrees instead of rebuilding it per build dir (~15 min each). The
 // flag only takes effect on the INITIAL configure — a build/ that already has a
@@ -91,14 +92,42 @@ def build_worktree(root, openssl_dir : string) : bool {
         print("ERROR: building daslang failed (exit {rc})\n")
         return false
     }
-    // Grammar shared lib for ast-grep (grep_usage/outline/cpp_*). Optional —
-    // the compiler-backed tools work without it.
-    print("Building tree-sitter grammar ...\n")
-    let grc = run_visible("cmake --build \"{build_dir}\" --target tree_sitter_daslang --config Release")
-    if (grc != 0) {
-        print("WARNING: tree_sitter_daslang build failed (exit {grc}); ast-grep tools may be unavailable\n")
-    }
     return true
+}
+
+// The tree-sitter grammar shared lib powers the ast-grep tools (grep_usage/outline);
+// without it they silently match NOTHING. Runs unconditionally — the build step above is
+// skipped whenever a daslang binary already exists (or --no-build), which used to leave
+// worktrees grammar-less. Build the target when a configured build dir is present (two C
+// files, seconds); else stage the lib from the tree running this setup, best-effort.
+def ensure_grammar(root : string) {
+    let plat = get_platform_name()
+    let lib_name = plat == "windows" ? "daslang.dll" : (plat == "darwin" ? "daslang.dylib" : "daslang.so")
+    let rel = path_join("tree-sitter-daslang", lib_name)
+    let dst = path_join(root, rel)
+    if (fexist(dst)) {
+        return
+    }
+    let build_dir = path_join(root, "build")
+    if (fexist(path_join(build_dir, "CMakeCache.txt"))) {
+        print("Building tree-sitter grammar ...\n")
+        let rc = run_visible("cmake --build \"{build_dir}\" --target tree_sitter_daslang --config Release")
+        if (rc == 0 && fexist(dst)) {
+            return
+        }
+        print("WARNING: grammar build did not produce {rel} (exit {rc}); staging from the source tree instead\n")
+    }
+    let src = path_join(get_das_root(), rel)
+    if (!fexist(src) || get_full_file_name(src) == get_full_file_name(dst)) {
+        print("WARNING: no grammar lib to stage ({rel}); ast-grep tools (grep_usage/outline) will return nothing\n")
+        return
+    }
+    let cr = copy_file_result(src, dst, false)
+    if (cr is error) {
+        print("WARNING: failed to stage grammar lib: {cr as error}\n")
+    } else {
+        print("Staged tree-sitter grammar from {get_das_root()} — a grammar-changing branch should rebuild its own (cmake --build build --target tree_sitter_daslang)\n")
+    }
 }
 
 // Copy the platform sgconfig.yml template if no sgconfig.yml exists yet.
@@ -243,6 +272,7 @@ def main() : int {
     }
 
     ensure_sgconfig(root)
+    ensure_grammar(root)
     stage_jit_backend(root)
     if (!emit_mcp_config(root)) {
         return 1
