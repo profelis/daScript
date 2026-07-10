@@ -2657,6 +2657,18 @@ namespace das {
     // Used in eden
     void AstSerializer::serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept {
         auto & ser = *this;
+        // version gate — the module-cache path (trySerializeProgramModule) checks only
+        // mtime+filename before this; a cache written by a different serializer version must
+        // fail cleanly here (the caller falls back to a full parse on ser.failed), not misparse
+        // every field after the first layout difference
+        uint32_t version = getVersion();
+        ser << version;
+        if ( !ser.writing && version != getVersion() ) {
+            LOG(LogLevel::warning) << "das: deserialize: module cache version " << version
+                << " does not match serializer version " << getVersion() << "\n";
+            ser.failed = true;
+            return;
+        }
         // Bump epoch so reused pointer addresses across program boundaries
         // get distinct SerializeNodeIds on this persistent serializer.
         ser.epoch++;
