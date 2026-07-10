@@ -157,6 +157,18 @@ namespace das {
                 }
                 verifyType(elemType, false, false, allowTemplate);
             }
+        } else if (decl->baseType == Type::tDistinct) {
+            auto underlying = decl->firstType;
+            if (!underlying) {
+                error("distinct type is missing its underlying type: '" + describeType(decl) + "'", "", "",
+                      decl->at, CompilationError::invalid_distinct_type);
+            } else if (underlying->baseType == Type::tDistinct) {
+                error("distinct type can't be defined in terms of another distinct type: '" + describeType(decl) + "'", "", "",
+                      decl->at, CompilationError::invalid_distinct_type);
+            } else if (!underlying->isAutoOrAlias() && !underlying->isWorkhorseType()) {
+                error("distinct type underlying type must be a workhorse type: '" + describeType(decl) + "'", "", "",
+                      decl->at, CompilationError::invalid_distinct_type);
+            }
         } else if (decl->baseType == Type::tArray) {
             if (auto arrayType = decl->firstType) {
                 if (arrayType->isAutoOrAlias()) {
@@ -187,7 +199,10 @@ namespace das {
                     error("table key can't be declared as a reference: '" + describeType(keyType) + "'", "", "",
                           keyType->at, CompilationError::invalid_table);
                 }
-                if (!(keyType->isWorkhorseType() || (keyType->baseType == Type::tHandle && !keyType->annotation->isRefType()))) {
+                if (keyType->baseType == Type::tDistinct) {
+                    error("distinct type can't be a table key: '" + describeType(keyType) + "'", "", "",
+                          keyType->at, CompilationError::invalid_table_type);
+                } else if (!(keyType->isWorkhorseType() || (keyType->baseType == Type::tHandle && !keyType->annotation->isRefType()))) {
                     error("table key has to be declared as a basic 'hashable' type: '" + describeType(keyType) + "'", "", "",
                           keyType->at, CompilationError::invalid_table_type);
                 }

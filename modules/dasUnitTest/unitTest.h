@@ -372,6 +372,38 @@ __forceinline int32_t eidToInt(EntityId id) {
     return id.value;
 }
 
+// C++-registered distinct type (`distinct NativeId = int` declared from C++ via
+// DistinctTypeAnnotation) - ABI-identical to int32_t, nominal on the das side
+struct NativeId {
+    int32_t value = 0;
+    NativeId() : value(0) {}
+    NativeId( const NativeId & t ) : value(t.value) {}
+    NativeId & operator = ( const NativeId & t ) { value = t.value; return * this; }
+    operator int32_t () const { return value; }
+};
+
+struct NativeId_WrapArg : NativeId {
+    NativeId_WrapArg ( int32_t t ) { value = t; }
+};
+
+__forceinline NativeId make_NativeId(int32_t value) {
+    NativeId t; t.value = value; return t;
+}
+
+namespace das {
+    template <>
+    struct cast<NativeId> {
+        static __forceinline NativeId to ( vec4f x )            { return make_NativeId(v_extract_xi(v_cast_vec4i(x))); }
+        static __forceinline vec4f from ( NativeId x )          { return v_cast_vec4f(v_seti_x(x.value)); }
+    };
+    template <> struct WrapType<NativeId> { enum { value = true }; typedef int32_t type; typedef int32_t rettype; };
+    template <> struct WrapArgType<NativeId> { typedef NativeId_WrapArg type; };
+}
+
+__forceinline NativeId nativeIdNext(NativeId id) {
+    return make_NativeId(id.value + 1);
+}
+
 struct SceneNodeId
 {
   typedef uint32_t handle_type_t;

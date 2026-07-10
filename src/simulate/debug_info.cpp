@@ -61,6 +61,7 @@ namespace das
         {   Type::tTuple,       "tuple"},
         {   Type::tVariant,     "variant"},
         {   Type::tFixedArray,  "fixed array"},
+        {   Type::tDistinct,    "distinct"},
         {   Type::fakeContext,  "__context"},
         {   Type::fakeLineInfo,  "__lineInfo"},
     };

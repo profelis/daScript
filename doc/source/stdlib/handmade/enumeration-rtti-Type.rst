@@ -54,3 +54,4 @@ Block type.
 Tuple type.
 Variant type.
 Fixed size array type (e.g. int[10]); element type in firstType, size in fixedDim.
+Distinct nominal type (distinct Foo = int); AST-only, underlying type in firstType, entity in annotation.

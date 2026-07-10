@@ -1228,7 +1228,9 @@ namespace das
 
     ExpressionPtr SimulateVisitor::visit(ExprPtr2Ref * expr) {
         const auto &at = expr->at;
-        if ( expr->unsafeDeref ) {
+        if ( expr->subexpr->type && expr->subexpr->type->isDistinct() ) {
+            setE(expr, getE(expr->subexpr));    // distinct deref is a compile-time relabel
+        } else if ( expr->unsafeDeref ) {
             setE(expr, getE(expr->subexpr));
         } else {
             auto errorMessage = context.code->allocateName(", "+expr->subexpr->describe()+" is null");

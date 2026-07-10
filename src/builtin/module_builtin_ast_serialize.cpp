@@ -724,11 +724,20 @@ namespace das {
                     ser << anno->module->nameHash;
                 }
             } else {
-                // If the macro is from current module, do nothing
-                // it will probably take care of itself during compilation
-                SERIALIZER_VERIFYF( anno->module->macroContext,
-                    "expected to see macro module '%s'", anno->module->name.c_str()
-                );
+                // das-declared distinct-type entities round-trip with the module itself
+                // (Module::serialize registers them before anything that references them
+                // deserializes), so an own-module reference resolves by name
+                bool isDistinct = anno->rtti_isDistinctTypeAnnotation();
+                ser << isDistinct;
+                if ( isDistinct ) {
+                    ser << anno->name;
+                } else {
+                    // If the macro is from current module, do nothing
+                    // it will probably take care of itself during compilation
+                    SERIALIZER_VERIFYF( anno->module->macroContext,
+                        "expected to see macro module '%s'", anno->module->name.c_str()
+                    );
+                }
             }
         } else {
             bool inThisModule = false;
@@ -747,6 +756,16 @@ namespace das {
                     SERIALIZER_VERIFYF(mod!=nullptr, "module '%llu' is not found", moduleNameHash);
                     anno = mod->findAnnotation(name);
                     SERIALIZER_VERIFYF(anno!=nullptr, "annotation '%s' is not found", name.c_str());
+                }
+            } else {
+                bool isDistinct = false;
+                ser << isDistinct;
+                if ( isDistinct ) {
+                    string name;
+                    ser << name;
+                    anno = ser.thisModule->findAnnotation(name);
+                    SERIALIZER_VERIFYF(anno!=nullptr && anno->rtti_isDistinctTypeAnnotation(),
+                        "distinct type '%s' is not found in module '%s'", name.c_str(), ser.thisModule->name.c_str());
                 }
             }
         }
@@ -1203,6 +1222,11 @@ namespace das {
             case tHandle:
                 ser << alias << annotation;
                 DAS_VERIFYF_MULTI(!!annotation, !structType, !enumType, !firstType, !secondType,
+                                argTypes.empty(), argNames.empty());
+                break;
+            case tDistinct:
+                ser << alias << annotation << firstType;
+                DAS_VERIFYF_MULTI(!!annotation, !structType, !enumType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
             case tEnumeration:
@@ -2378,6 +2402,38 @@ namespace das {
         ser.tag(HASH_TAG("Module"));
         ser << name << nameHash << moduleFlags;
         ser << annotationData << requireModule;
+        // das-declared distinct types round-trip with the module (C++-module annotations
+        // re-register on load, parser-created ones don't). they stream BEFORE aliasTypes and
+        // enumerations - any TypeDecl deserialized below resolves tDistinct annotation
+        // pointers via findAnnotation, so the entities must exist first
+        if ( ser.writing ) {
+            uint64_t dtSize = 0;
+            for ( auto & [key, ann] : handleTypes ) {
+                (void) key;
+                if ( ann->rtti_isDistinctTypeAnnotation() ) dtSize ++;
+            }
+            ser << dtSize;
+            for ( auto & [key, ann] : handleTypes ) {
+                (void) key;
+                if ( !ann->rtti_isDistinctTypeAnnotation() ) continue;
+                auto dann = static_cast<DistinctTypeAnnotation *>(ann);
+                ser << dann->name << dann->cppName << dann->at << dann->isPrivate << dann->underlyingType;
+            }
+        } else {
+            uint64_t dtSize = 0;
+            ser << dtSize;
+            for ( uint64_t i=0; i<dtSize; ++i ) {
+                string dname, dcppName;
+                LineInfo dat;
+                bool dpriv = false;
+                TypeDeclPtr dunder = nullptr;
+                ser << dname << dcppName << dat << dpriv << dunder;
+                auto dann = new DistinctTypeAnnotation(dname, dunder, dcppName);
+                dann->at = dat;
+                dann->isPrivate = dpriv;
+                addAnnotation(dann, true);
+            }
+        }
         ser << aliasTypes     << enumerations;
         /*
         // serialize handleTypes (annotation lookup table)

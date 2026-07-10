@@ -51,6 +51,10 @@ namespace das
         return library.makeHandleType(typeName);
     }
 
+    TypeDeclPtr makeDistinctType(const ModuleLibrary & library, const char * typeName) {
+        return library.makeDistinctType(typeName);
+    }
+
     Annotation * TypeDecl::isPointerToAnnotation() const {
         if ( baseType!=Type::tPointer || !firstType || firstType->baseType!=Type::tHandle ) {
             return nullptr;
@@ -101,6 +105,9 @@ namespace das
             auto valueType = annotation->makeValueType();
             DAS_ASSERTF(valueType, "internal integration error. handle type %s has no value type", annotation->name.c_str());
             return valueType->baseType;
+        } else if ( baseType==Type::tDistinct ) {
+            DAS_ASSERTF(firstType, "internal error. distinct type %s has no underlying type", annotation ? annotation->name.c_str() : "?");
+            return firstType->getR2VType();
         } else {
             return baseType;
         }
@@ -710,6 +717,15 @@ namespace das
             } else {
                 stream << "unspecified annotation";
             }
+        } else if ( baseType==Type::tDistinct ) {
+            if ( annotation ) {
+                if (dmodule == DescribeModule::yes && annotation->module && !annotation->module->name.empty()) {
+                    stream << annotation->module->name << "::";
+                }
+                stream << annotation->name;
+            } else {
+                stream << "unspecified distinct";
+            }
         } else if ( baseType==Type::tArray ) {
             if ( firstType ) {
                 stream << "array<" << firstType->describe(extra, contracts, dmodule, aliasDefs) << ">";
@@ -1166,7 +1182,7 @@ namespace das
     }
 
     bool TypeDecl::canMove() const {
-        if (baseType == Type::tFixedArray) {
+        if (baseType == Type::tFixedArray || baseType == Type::tDistinct) {
             return firstType ? firstType->canMove() : true;
         } else if (baseType == Type::tHandle) {
             return annotation->canMove();
@@ -1185,7 +1201,7 @@ namespace das
     }
 
     bool TypeDecl::canCloneFromConst() const {
-        if (baseType == Type::tFixedArray) {
+        if (baseType == Type::tFixedArray || baseType == Type::tDistinct) {
             return firstType ? firstType->canCloneFromConst() : true;
         } else if (baseType == Type::tHandle) {
             return annotation->canClone();
@@ -1214,7 +1230,7 @@ namespace das
     }
 
     bool TypeDecl::canClone() const {
-        if (baseType == Type::tFixedArray) {
+        if (baseType == Type::tFixedArray || baseType == Type::tDistinct) {
             return firstType ? firstType->canClone() : true;
         } else if (baseType == Type::tHandle) {
             return annotation->canClone();
@@ -1239,7 +1255,7 @@ namespace das
     }
 
     bool TypeDecl::canCopy(bool tempMatters) const {
-        if ( baseType == Type::tFixedArray ) {
+        if ( baseType == Type::tFixedArray || baseType == Type::tDistinct ) {
             return firstType ? firstType->canCopy(tempMatters) : true;
         } else if ( baseType == Type::tHandle ) {
             return annotation->canCopy();
@@ -1264,7 +1280,7 @@ namespace das
     }
 
         bool TypeDecl::isNoHeapType() const {
-            if ( baseType==Type::tFixedArray )
+            if ( baseType==Type::tFixedArray || baseType==Type::tDistinct )
                 return firstType ? firstType->isNoHeapType() : true;
             if ( baseType==Type::tArray || baseType==Type::tTable
                     || baseType==Type::tBlock || baseType==Type::tLambda )
@@ -1285,7 +1301,7 @@ namespace das
         }
 
     bool TypeDecl::isPod() const {
-        if ( baseType==Type::tFixedArray )
+        if ( baseType==Type::tFixedArray || baseType==Type::tDistinct )
             return firstType ? firstType->isPod() : true;
         if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tString
                 || baseType==Type::tBlock || baseType==Type::tLambda )
@@ -1307,7 +1323,7 @@ namespace das
     }
 
     bool TypeDecl::isRawPod() const {
-        if ( baseType==Type::tFixedArray )
+        if ( baseType==Type::tFixedArray || baseType==Type::tDistinct )
             return firstType ? firstType->isRawPod() : true;
         if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tString
             || baseType==Type::tBlock || baseType==Type::tLambda || baseType==Type::tFunction )
@@ -1353,7 +1369,7 @@ namespace das
                 }
             }
             return false;
-        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             if ( firstType && firstType->hasStringData(dep) ) return true;
             if ( secondType && secondType->hasStringData(dep) ) return true;
         } else if ( baseType==Type::tPointer) {
@@ -1413,7 +1429,7 @@ namespace das
                 }
             }
             return false;
-        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             if ( firstType && firstType->needInScope(dep) ) return true;
             if ( secondType && secondType->needInScope(dep) ) return true;
         } else if ( baseType==Type::tPointer) {
@@ -1445,7 +1461,7 @@ namespace das
             return true;
         } else if ( baseType==Type::tBlock ) {
             return false;
-        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             if ( firstType && !firstType->canBePlacedInContainer(dep) ) return false;
             if ( secondType && !secondType->canBePlacedInContainer(dep) ) return false;
         }
@@ -1458,7 +1474,7 @@ namespace das
     }
 
     bool TypeDecl::hasNonTrivialCtor(das_set<Structure *> & dep) const {
-        if ( baseType==Type::tFixedArray ) {
+        if ( baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             // unlike tArray (excluded below — an empty array<T> stays uninitialized), a
             // fixed array's elements are live at init, so the element's ctor-ness counts
             return firstType ? firstType->hasNonTrivialCtor(dep) : false;
@@ -1506,7 +1522,7 @@ namespace das
                     return true;
                 }
             }
-        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             if ( firstType && firstType->hasNonTrivialDtor(dep) ) return true;
             if ( secondType && secondType->hasNonTrivialDtor(dep) ) return true;
         }
@@ -1533,7 +1549,7 @@ namespace das
                     return true;
                 }
             }
-        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             if ( firstType && firstType->hasNonTrivialCopy(dep) ) return true;
             if ( secondType && secondType->hasNonTrivialCopy(dep) ) return true;
         }
@@ -1590,7 +1606,7 @@ namespace das
             gcf |= gcFlag_heap;
             if ( firstType ) gcf |= firstType->gcFlags(dep,depA);
             if ( secondType ) gcf |= secondType->gcFlags(dep,depA);
-        } else if ( baseType==Type::tFixedArray ) {
+        } else if ( baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             // inline storage — element flags only, no gcFlag_heap (matches the old
             // dim-vector behavior where dims never added heap-ness)
             if ( firstType ) gcf |= firstType->gcFlags(dep,depA);
@@ -1675,7 +1691,7 @@ namespace das
             return true;
         } else if ( baseType==Type::tBlock ) {
             return false;
-        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray ) {
+        } else if ( baseType==Type::tArray || baseType==Type::tTable || baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             if ( firstType && !firstType->isLocal(dep) ) return false;
             if ( secondType && !secondType->isLocal(dep) ) return false;
         }
@@ -1766,6 +1782,12 @@ namespace das
                         return true;
                     }
                 }
+                return false;
+            }
+            break;
+        case Type::tDistinct:
+            // nominal: same entity or nothing — no substitution, no structural match
+            if ( annotation!=decl.annotation ) {
                 return false;
             }
             break;
@@ -2496,7 +2518,9 @@ namespace das
     }
 
     bool TypeDecl::isTableKeyType() const {
-        if ( isWorkhorseType() ) {
+        if ( baseType==Type::tDistinct ) {  // nominal opacity: never hashable, by design
+            return false;
+        } else if ( isWorkhorseType() ) {
             return true;
         } else if ( baseType==Type::tHandle && annotation->isRefType()==false ) {
             return true;
@@ -2543,6 +2567,8 @@ namespace das
                 return true;
             case Type::tPointer:
                 return !smartPtr;
+            case Type::tDistinct:
+                return firstType ? firstType->isWorkhorseType() : false;
             default:
                 return false;
         }
@@ -3108,7 +3134,7 @@ namespace das
     }
 
     uint64_t TypeDecl::getBaseSizeOf64() const {
-        if ( baseType==Type::tFixedArray ) {
+        if ( baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             // size of the chain-end element, dims excluded — the dim-vector meaning
             return firstType ? firstType->getBaseSizeOf64() : 0;
         }
@@ -3128,7 +3154,7 @@ namespace das
     }
 
     uint64_t TypeDecl::getBaseSizeOf64(bool & failed) const {
-        if ( baseType==Type::tFixedArray ) {
+        if ( baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             if ( !firstType ) {
                 failed = true;
                 return 0;
@@ -3155,7 +3181,7 @@ namespace das
     }
 
     int TypeDecl::getAlignOf() const {
-        if ( baseType==Type::tFixedArray ) {
+        if ( baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             return firstType ? firstType->getAlignOf() : 1;
         }
         if ( baseType==Type::tHandle ) {
@@ -3174,7 +3200,7 @@ namespace das
     }
 
     int TypeDecl::getAlignOfFailed(bool &failed) const {
-        if ( baseType==Type::tFixedArray ) {
+        if ( baseType==Type::tFixedArray || baseType==Type::tDistinct ) {
             if ( !firstType ) {
                 failed = true;
                 return 1;
@@ -3383,6 +3409,12 @@ namespace das
                 ss << annotation->module->name << "::";
              }
              ss << annotation->name << ">";
+        } else if ( baseType==Type::tDistinct ) {
+            ss << "Q<";
+            if ( annotation->module && !annotation->module->name.empty() ) {
+                ss << annotation->module->name << "::";
+            }
+            ss << annotation->name << ">";
         } else if ( baseType==Type::tStructure ) {
             ss << "S<";
             if ( structType->module && !structType->module->name.empty() ) {
@@ -3809,6 +3841,16 @@ namespace das
             } else {
                 stream << type->annotation->cppName;
             }
+        } else if ( baseType==Type::tDistinct ) {
+            // ABI-identical to the underlying type; a C++-registered distinct may carry its own cppName
+            if ( type->annotation && !type->annotation->cppName.empty() ) {
+                stream << "DAS_COMMENT(distinct " << type->annotation->name << ") " << type->annotation->cppName;
+            } else if ( type->firstType ) {
+                stream << "DAS_COMMENT(distinct " << (type->annotation ? type->annotation->name : "?") << ") "
+                    << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::yes,CpptRedundantConst::yes, chooseSmartPtr);
+            } else {
+                stream << "DAS_COMMENT(unspecified distinct)";
+            }
         } else if ( baseType==Type::tArray ) {
             if ( type->firstType ) {
                 stream << "TArray<" << describeCppTypeEx(type->firstType,CpptSubstitureRef::no,CpptSkipRef::no,CpptSkipConst::no,CpptRedundantConst::yes, chooseSmartPtr) << ">";
@@ -4039,6 +4081,32 @@ namespace das
                 if ( ann.size()!=1 ) error("unresolved annotation '" + annName + "'", ch);
                 pt->annotation = (TypeAnnotation *) ann.back();
                 if ( !pt->annotation->rtti_isHandledTypeAnnotation() ) error("'" + annName + "' is not a handled type", ch);
+                return pt;
+            };
+            case 'Q': {
+                ch ++;
+                auto pt = new TypeDecl(Type::tDistinct);
+                auto annName = parseAnyNameInBrackets(ch,true);
+                auto ann = library.findAnnotation(annName,thisModule);
+                if ( thisModule && ann.size()==0 ) {
+                    if ( auto tann = thisModule->findAnnotation(annName) ) {
+                        ann.push_back(tann);
+                    }
+                }
+                if ( ann.size()==0 ) {
+                    string modName, shortName;
+                    splitTypeName(annName, modName, shortName);
+                    if ( !modName.empty() ) {
+                        if ( auto mod = Module::require(modName) ) {
+                            if ( auto tann = mod->findAnnotation(shortName) ) {
+                                ann.push_back(tann);
+                            }
+                        }
+                    }
+                }
+                if ( ann.size()!=1 ) error("unresolved distinct type '" + annName + "'", ch);
+                pt->annotation = (TypeAnnotation *) ann.back();
+                if ( !pt->annotation->rtti_isDistinctTypeAnnotation() ) error("'" + annName + "' is not a distinct type", ch);
                 return pt;
             };
             case 'S': {

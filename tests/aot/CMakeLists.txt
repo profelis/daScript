@@ -549,6 +549,7 @@ list(FILTER AOT_LANGUAGE_TEST_FILES EXCLUDE REGEX "/_")
 
 # Language test module files (libraries required by tests)
 SET(AOT_LANGUAGE_MODULE_FILES
+    tests/language/_distinct_fixture.das
     tests/language/_glob.das
     tests/language/_helper_foo.das
     tests/language/_inline_unsafe_helper.das

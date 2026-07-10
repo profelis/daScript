@@ -124,6 +124,7 @@ namespace das
         virtual ~Annotation() {}
         virtual void seal( Module * m ) { module = m; }
         virtual bool rtti_isHandledTypeAnnotation() const { return false; }
+        virtual bool rtti_isDistinctTypeAnnotation() const { return false; }
         virtual bool rtti_isStructureAnnotation() const { return false; }
         virtual bool rtti_isStructureTypeAnnotation() const { return false; }
         virtual bool rtti_isEnumerationAnnotation() const { return false; }
@@ -1376,6 +1377,7 @@ namespace das
         Module * findModuleByMangledNameHash ( uint64_t hash ) const;
         TypeDeclPtr makeStructureType ( const string & name ) const;
         TypeDeclPtr makeHandleType ( const string & name ) const;
+        TypeDeclPtr makeDistinctType ( const string & name ) const;
         TypeDeclPtr makeEnumType ( const string & name ) const;
         Module* front() const { return modules.front(); }
         Module* back() const { return modules.back(); }

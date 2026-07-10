@@ -1140,6 +1140,43 @@ namespace das {
                 return ews;
             }
         } else if (expr->type->isWorkhorseType()) {
+            if (expr->type->isDistinct()) {
+                // no fields to initialize - Foo(a=...) is invalid (preVisit reported); don't fold,
+                // or the astChanged rerun would discard the error
+                if (expr->structs.size()) {
+                    return Visitor::visit(expr);
+                }
+                // default<Foo> - zero constant of the underlying, relabeled (the raw const node
+                // would re-infer as the underlying type on the next pass, losing the distinct).
+                // string and pointer underlyings route the same way the non-distinct default<>
+                // paths above do - Program::makeConst does not cover them
+                auto underT = expr->type->firstType;
+                ExpressionPtr ews;
+                if (underT->isString()) {
+                    ews = new ExprConstString(expr->at);
+                } else if (underT->isPointer()) {
+                    auto ewp = new ExprConstPtr(expr->at);
+                    ewp->isSmartPtr = underT->smartPtr;
+                    if (underT->firstType) {
+                        ewp->ptrType = new TypeDecl(*underT->firstType);
+                    }
+                    ews = ewp;
+                } else {
+                    ews = Program::makeConst(expr->at, underT, v_zero());
+                }
+                if (!ews) {
+                    error("can't zero-initialize distinct type " + describeType(expr->type) + "; construct it explicitly from a " + describeType(underT) + " value", "", "",
+                          expr->at, CompilationError::mismatching_distinct_type);
+                    return Visitor::visit(expr);
+                }
+                expr->type->ref = false;
+                reportAstChanged();
+                ews->type = new TypeDecl(*underT);
+                auto ecast = new ExprCast(expr->at, ews, new TypeDecl(*expr->type));
+                ecast->reinterpret = true;
+                ecast->alwaysSafe = true;
+                return ecast;
+            }
             expr->type->ref = false;
             reportAstChanged();
             auto ews = Program::makeConst(expr->at, expr->type, v_zero());

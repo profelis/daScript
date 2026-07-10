@@ -1174,6 +1174,20 @@ namespace das {
     ExpressionPtr InferTypes::visit(ExprPtr2Ref *expr) {
         if (!expr->subexpr->type)
             return Visitor::visit(expr);
+        // deref of a distinct type peels one level - underlying type, in place, no runtime op.
+        // ref-ness and const flow from the handle (the const model), so `*a = 5` writes iff `a` is a mutable ref
+        if (expr->subexpr->type->isDistinct()) {
+            if (!expr->subexpr->type->firstType) {
+                error("distinct type is missing its underlying type", "", "",
+                      expr->at, CompilationError::invalid_distinct_type);
+                return Visitor::visit(expr);
+            }
+            TypeDecl::clone(expr->type, expr->subexpr->type->firstType);
+            expr->type->ref = expr->subexpr->type->ref;
+            expr->type->constant |= expr->subexpr->type->constant;
+            propagateTempType(expr->subexpr->type, expr->type);
+            return Visitor::visit(expr);
+        }
         // safe deref of non-pointer is it
         if (expr->alwaysSafe && !expr->subexpr->type->isPointer() && !(expr->subexpr->type->baseType == Type::autoinfer || expr->subexpr->type->baseType == Type::alias)) {
             reportAstChanged();
@@ -2400,6 +2414,9 @@ namespace das {
             } else if (expr->trait == "is_handle") {
                 reportAstChanged();
                 return new ExprConstBool(expr->at, expr->typeexpr->isHandle());
+            } else if (expr->trait == "is_distinct") {
+                reportAstChanged();
+                return new ExprConstBool(expr->at, expr->typeexpr->isDistinct());
             } else if (expr->trait == "is_ref") {
                 reportAstChanged();
                 return new ExprConstBool(expr->at, expr->typeexpr->isRef());
@@ -5888,6 +5905,29 @@ namespace das {
                         mks->makeType = new TypeDecl(*aliasT);
                         return mks;
                     }
+                } else if (aliasT->isDistinct()) {
+                    // Foo(expr) - the only way IN to a distinct type: exactly one argument of
+                    // exactly the underlying type, relabeled in place (reinterpret, zero cost)
+                    if (expr->arguments.size() != 1) {
+                        error("distinct type " + describeType(aliasT) + " is constructed from exactly one argument of its underlying type", "", "",
+                              expr->at, CompilationError::mismatching_distinct_type);
+                        return Visitor::visit(expr);
+                    }
+                    auto argT = expr->arguments[0]->type;
+                    if (!argT || argT->isAliasOrExpr()) {
+                        return Visitor::visit(expr);        // not inferred yet
+                    }
+                    if (!aliasT->firstType || !argT->isSameType(*aliasT->firstType, RefMatters::no, ConstMatters::no, TemporaryMatters::no)) {
+                        error("can't construct " + describeType(aliasT) + " from " + describeType(argT),
+                              "distinct type is constructed from exactly its underlying type " + (aliasT->firstType ? describeType(aliasT->firstType) : ""), "",
+                              expr->at, CompilationError::mismatching_distinct_type);
+                        return Visitor::visit(expr);
+                    }
+                    reportAstChanged();
+                    auto ecast = new ExprCast(expr->at, expr->arguments[0]->clone(), new TypeDecl(*aliasT));
+                    ecast->reinterpret = true;
+                    ecast->alwaysSafe = true;
+                    return ecast;
                 } else if (expr->arguments.empty()) {
                     // this is Blah() - so we promote to default<Blah>
                     reportAstChanged();

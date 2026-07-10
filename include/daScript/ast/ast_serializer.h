@@ -221,7 +221,7 @@ namespace das {
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
         static constexpr uint32_t getVersion () {
-            return 98;   // 98: CodeOfPolicies disable_auto_inline / disable_run / fusion added
+            return 99;   // 99: distinct types (Type::tDistinct + DistinctTypeAnnotation)
         }
 
         void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;

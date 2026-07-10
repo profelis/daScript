@@ -2986,6 +2986,23 @@ single_alias
 
 alias_declaration
     :   DAS_TYPEDEF single_alias SEMICOLON
+    |   DAS_TYPEDEF distinct_alias SEMICOLON
+    ;
+
+// `typedef [private|public] distinct Foo = int` - nominal newtype over a workhorse type.
+// `distinct` is NOT a keyword; the NAME is validated in the action, so the identifier
+// stays free everywhere else (daslib/linq's distinct() etc.)
+distinct_alias
+    :   optional_public_or_private_alias[pubA] NAME[kw] NAME[name] '=' type_declaration[tdecl] {
+        if ( *$kw != "distinct" ) {
+            das2_yyerror(scanner,"expected 'distinct', got '"+*$kw+"'",tokAt(scanner,@kw),
+                CompilationError::invalid_distinct_type);
+        } else {
+            ast_distinctDeclaration(scanner,$name,tokAt(scanner,@name),!$pubA,$tdecl);
+        }
+        delete $kw;
+        delete $name;
+    }
     ;
 
 optional_public_or_private_enum
