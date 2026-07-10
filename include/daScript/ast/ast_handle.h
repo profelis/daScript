@@ -869,7 +869,7 @@ namespace das
         }
         virtual uint64_t getOwnSemanticHash ( HashBuilder & hb, das_set<Structure *> & dep, das_set<Annotation *> & adep ) const override {
             hb.updateString(getMangledName());
-            underlyingType->getOwnSemanticHash(hb, dep, adep);
+            if ( underlyingType ) underlyingType->getOwnSemanticHash(hb, dep, adep);
             return hb.getHash();
         }
         virtual void gc_collect ( gc_root * target, gc_root * from ) override {

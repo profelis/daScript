@@ -2,7 +2,7 @@ options gen2
 
 expect 30254
 
-distinct Id = int
+typedef distinct Id = int
 
 [export]
 def main {

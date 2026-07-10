@@ -2,12 +2,12 @@ options gen2
 require dastest/testing_boost public
 require _distinct_fixture
 
-distinct Id = int
-distinct OtherId = int
-distinct Name = string
-distinct Handle = void ?
-distinct Pos = float3
-distinct Meters = float
+typedef distinct Id = int
+typedef distinct OtherId = int
+typedef distinct Name = string
+typedef distinct Handle = void?
+typedef distinct Pos = float3
+typedef distinct Meters = float
 
 def operator +(a, b : Meters) : Meters => Meters(*a + *b)
 
@@ -43,6 +43,11 @@ def test_distinct_construct_and_deref(t : T?) {
         let z : Id
         t |> success(z == Id(0))
         t |> success(default<Id> == Id(0))
+    }
+    t |> run("default over string, pointer, vector underlyings") @(t : T?) {
+        t |> success(default<Name> == Name(""))
+        t |> success(default<Handle> == Handle(null))
+        t |> equal((*default<Pos>).y, 0.0)
     }
 }
 

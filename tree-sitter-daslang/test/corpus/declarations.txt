@@ -266,6 +266,23 @@ typedef MyInt = int;
     type: (basic_type)))
 
 ================================================================================
+Typedef distinct (nominal newtype)
+================================================================================
+
+typedef distinct Id = int
+typedef private distinct Secret = float
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (typedef_declaration
+    name: (identifier)
+    type: (basic_type))
+  (typedef_declaration
+    name: (identifier)
+    type: (basic_type)))
+
+================================================================================
 Function with type-witness parameter (basic)
 ================================================================================
 

@@ -3,8 +3,8 @@ options gen2
 expect 30341 : 6
 expect 30344
 
-distinct Id = int
-distinct OtherId = int
+typedef distinct Id = int
+typedef distinct OtherId = int
 
 def take_int(i : int) : int => i + 1
 

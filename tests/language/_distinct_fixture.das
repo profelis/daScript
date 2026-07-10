@@ -2,8 +2,8 @@ options gen2
 
 module _distinct_fixture shared public
 
-distinct PubId = int
-distinct private Secret = int
+typedef distinct PubId = int
+typedef private distinct Secret = int
 
 def make_pub_id(v : int) : PubId => PubId(v)
 

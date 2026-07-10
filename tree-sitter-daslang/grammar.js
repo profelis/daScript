@@ -484,6 +484,17 @@ module.exports = grammar({
         field('type', $._type),
         $._semicolon,
       ),
+      // typedef distinct Name = Type (nominal newtype; 'distinct' is contextual, not a keyword)
+      seq(
+        optional($.annotation_list),
+        'typedef',
+        optional(choice('public', 'private')),
+        'distinct',
+        field('name', $.identifier),
+        '=',
+        field('type', $._type),
+        $._semicolon,
+      ),
     ),
 
     tuple_alias_declaration: $ => seq(

@@ -17,14 +17,17 @@ handles, IDs, and unit-like values type-safe at zero runtime cost.
 
 .. code-block:: das
 
-    distinct EntityId = int
-    distinct Meters = float
-    distinct FileHandle = void?
+    typedef distinct EntityId = int
+    typedef distinct Meters = float
+    typedef distinct FileHandle = void?
 
-Distinct types are declared at module scope. The underlying type must be a workhorse type
-(a value type that passes by value — ``int``/``uint`` and friends, ``float``, ``double``,
-``bool``, ``string``, pointers, vector types like ``float3``, ranges). A distinct type
-cannot be defined in terms of another distinct type.
+Distinct types are declared at module scope with ``typedef distinct`` — the ``typedef``
+family form that creates a *nominal* type instead of a transparent alias (``distinct``
+itself is not a keyword, so identifiers named ``distinct`` — like the linq function —
+keep working). The underlying type must be a workhorse type (a value type that passes
+by value — ``int``/``uint`` and friends, ``float``, ``double``, ``bool``, ``string``,
+pointers, vector types like ``float3``, ranges). A distinct type cannot be defined in
+terms of another distinct type.
 
 ----------------------
 Construction and Deref
@@ -92,7 +95,7 @@ Modules and Privacy
 --------------------
 
 Distinct types are module-nominal: same-named distinct types in two modules are different
-types. ``distinct private Foo = int`` limits visibility to the declaring module, like
+types. ``typedef private distinct Foo = int`` limits visibility to the declaring module, like
 ``enum private``.
 
 ---------------
