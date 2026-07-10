@@ -498,6 +498,8 @@ def private flush_events(srv : WebSocketServer) {
             respond(srv, w.writer, int(http_status.OK), "application/json", sprint_json(out, false))
             delete out
         }
+        let tps = e.gen_us > 0l ? int64(double(e.n_gen) * 1.0e6lf / double(e.gen_us)) : 0l
+        to_log(LOG_INFO, "stream {w.id}: finish={e.finish} prompt={e.n_prompt} cached={e.n_cached} gen={e.n_gen} ttft={e.ttft_us / 1000l}ms tps={tps}\n")
         delete g_wires[e.stream]   // finalize the wire in place (erase is a raw remove)
         g_wires |> erase(e.stream)
     }
