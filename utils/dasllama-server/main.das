@@ -45,6 +45,13 @@ struct ServerArgs {
     @clarg_doc = "Context-length cap in tokens (default 4096)"
     ctx : int
 
+    @clarg_short = "s"
+    @clarg_doc = "Max concurrent generation streams — each holds a full KV cache (default 4)"
+    streams : int
+
+    @clarg_doc = "Prefill chunk in tokens: decode stalls at most this many per tick (default 64)"
+    chunk : int
+
     @clarg_doc = "Re-tune this box's dasLLAMA kernels, then relaunch (handled before arg parsing)"
     tune : bool
 
@@ -89,6 +96,8 @@ def main : int {
 
     let port = cfg.port > 0 ? cfg.port : 8080     // non-positive (incl. a stray negative) -> default
     let ctx = cfg.ctx > 0 ? int64(cfg.ctx) : 4096l   // guard: a negative ctx would make seq_len < 0
+    let streams = cfg.streams > 0 ? int64(cfg.streams) : 4l
+    let chunk = cfg.chunk > 0 ? int64(cfg.chunk) : 64l
 
     log_tune_status("dasllama-server")
     print("loading {cfg.model} ...\n")
@@ -102,6 +111,6 @@ def main : int {
         set_asr(a)
     }
 
-    run_server(port)
+    run_server(port, streams, chunk_tokens = chunk)
     return 0
 }

@@ -692,13 +692,22 @@ int das_writer_respond ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter *
     return 0;
 }
 
-// One SSE event: SSEvent(data, NULL) auto-sends the text/event-stream headers on first call and emits
-// exactly `data: <data>\n\n` (no event: line) — the OpenAI streaming wire format.
+// One SSE event, chunk-framed: `data: <data>\n\n` (an `event:` line only when named) — the OpenAI
+// streaming wire format. The first event sends text/event-stream + Transfer-Encoding: chunked
+// headers; chunked framing is what makes close_writer's End() a VISIBLE terminator (the 0-chunk).
+// libhv's raw SSEvent() writes unframed bytes whose only end-of-stream is a connection close that
+// keep-alive never sends — buffered clients would wait out their whole timeout on every stream.
 int das_writer_sse_event ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w, const char * data, const char * event ) {
     std::string d = data ? data : "";
     std::string e = event ? event : "";
     post_writer_op(h, w, [d,e](hv::HttpResponseWriter* wr){
-        wr->SSEvent(d, e.empty() ? nullptr : e.c_str());
+        if ( wr->state == hv::HttpResponseWriter::SEND_BEGIN ) {
+            wr->WriteHeader("Content-Type", "text/event-stream");
+        }
+        std::string msg;
+        if ( !e.empty() ) { msg = "event: "; msg += e; msg += "\n"; }
+        msg += "data: "; msg += d; msg += "\n\n";
+        wr->WriteChunked(msg);   // first call emits the headers via EndHeaders("Transfer-Encoding", "chunked")
     });
     return 0;
 }
