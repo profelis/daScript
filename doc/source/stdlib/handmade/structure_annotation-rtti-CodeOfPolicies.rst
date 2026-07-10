@@ -4,6 +4,7 @@ AOT library mode.
 Whether standalone context AOT compilation is enabled.
 Specifies to AOT if we are compiling a module, or a final program.
 Enables AOT of macro code (like 'qmacro_block' etc).
+Never apply per-box [tune] stamps to this compile (cross-box artifacts: AOT generation, AST serialization).
 Whether paranoid validation is enabled (extra checks, no optimizations).
 Whether to validate the AST after compilation (uniqueness checks, etc.). Off by default (slow).
 Whether cross-platform AOT is enabled (if not, we generate code for the current platform).

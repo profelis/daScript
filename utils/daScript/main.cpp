@@ -62,6 +62,7 @@ static CodeOfPolicies getPolicies() {
     CodeOfPolicies policies;
     policies.aot = false;
     policies.aot_module = true;
+    policies.tune_frozen = true;    // -aot output is a cross-box artifact — no per-box [tune] stamps
     if (aotMacros) {
         policies.aot_macros = true;
         policies.export_all = true; // need it for aot to export macros
@@ -84,6 +85,7 @@ bool aot_compile ( vector<pair<string, string>> &aot_files, bool dryRun, bool cr
     CodeOfPolicies stubPolicies;
     stubPolicies.version_2_syntax = true;
     stubPolicies.aot_module = true;
+    stubPolicies.tune_frozen = true;
     string aotCppPath = getDasRoot() + "/daslib/aot_cpp.das";
     auto program = compileDaScript(aotCppPath, access, tout, dummyGroup, stubPolicies);
     if ( !program || program->failed() ) {

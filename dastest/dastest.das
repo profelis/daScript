@@ -372,7 +372,8 @@ def serialize_path(ctx : SuiteCtx, files : array<string>, out_file : string) {
             continue if (base |> starts_with("cant_") || base |> starts_with("failed_") || base |> starts_with("invalid_"))
             using() $(var mg : ModuleGroup) {
                 using() $(var cop : CodeOfPolicies) {
-                    cop.aot_module = ctx.use_aot   // match test_file — see the note there
+                    cop.aot_module = true
+                    cop.tune_frozen = true   // a serialized AST is a cross-box artifact — no per-box [tune] stamps
                     cop.aot = ctx.use_aot
                     cop.fail_on_no_aot = ctx.use_aot
                     cop.threadlock_context = true

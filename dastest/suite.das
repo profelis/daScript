@@ -165,10 +165,7 @@ def test_file(file_name : string; var ctx : SuiteCtx; var file_ctx : FileCtx) : 
     using() $(var mg : ModuleGroup) {
         using() $(var cop : CodeOfPolicies) {
             ctx.queued_benchmarks |> clear
-            // aot_module only on real AOT runs: it feeds tune_aot_gate(), and setting it on plain
-            // interp/jit runs made every [tune] kernel compile its reference body — tests then
-            // never exercised the tuned tier that production runs
-            cop.aot_module = ctx.use_aot
+            cop.aot_module = true
             cop.aot = ctx.use_aot
             cop.fail_on_no_aot = ctx.use_aot
             cop.aot_macros = ctx.aot_macros

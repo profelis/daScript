@@ -2567,6 +2567,7 @@ namespace das {
         *this << value.aot
               << value.aot_module
               << value.aot_macros
+              << value.tune_frozen
               << value.completion
               << value.export_all
               << value.serialize_main_module

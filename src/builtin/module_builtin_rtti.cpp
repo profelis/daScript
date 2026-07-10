@@ -929,6 +929,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(standalone_context)>("standalone_context");
             addField<DAS_BIND_MANAGED_FIELD(aot_module)>("aot_module");
             addField<DAS_BIND_MANAGED_FIELD(aot_macros)>("aot_macros");
+            addField<DAS_BIND_MANAGED_FIELD(tune_frozen)>("tune_frozen");
             addField<DAS_BIND_MANAGED_FIELD(aot_result)>("aot_result");
             addField<DAS_BIND_MANAGED_FIELD(completion)>("completion");
             addField<DAS_BIND_MANAGED_FIELD(lint_check)>("lint_check");

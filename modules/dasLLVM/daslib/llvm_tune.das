@@ -46,14 +46,17 @@ def tune_mode() : string {
     return empty(m) ? "normal" : m
 }
 
-//! True when this compile is AOT — C++ generation (`policies.aot_module`) or an AOT-consuming
-//! run (`policies.aot`). Under AOT every tune annotation is fully inert: no manifest/scope
-//! reads, no stamps (`fallback=` included), no policy, no injected checks — only the
-//! reference-row `<name>_variants()` registries are emitted so harness code still compiles.
-//! AOT soundness depends on the gate covering BOTH the generating and the consuming compile:
-//! per-box stamps would desync their AOT hashes.
+//! True when this compile must stay stamp-free. Two triggers: `policies.tune_frozen` — the
+//! dedicated "cross-box artifact" mark (set by the `-aot` C++ generator and by dastest's AST
+//! serializer; per-box stamps must never leak into an artifact another box consumes) — and an
+//! AOT-consuming run (`policies.aot`) WITHOUT the JIT (a stamp changes the semantic hash, so a
+//! stamped function would fail the AOT link; under `-jit` the JIT supersedes AOT bodies and
+//! tuned stamps are wanted). When the gate fires every tune annotation is fully inert: no
+//! manifest/scope reads, no stamps (`fallback=` included), no policy, no injected checks —
+//! only the reference-row `<name>_variants()` registries are emitted so harness code compiles.
 def tune_aot_gate() : bool {
-    return compiling_program().policies.aot || compiling_program().policies.aot_module
+    return (compiling_program().policies.tune_frozen
+        || (compiling_program().policies.aot && !compiling_program().policies.jit_enabled))
 }
 
 //! True when this compile produces a standalone exe (`llvm-jit -exe`). Stamping still runs:

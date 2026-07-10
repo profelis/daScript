@@ -180,10 +180,14 @@ Standalone builds
 
 A frozen artifact must not demand or run tuning:
 
-* **AOT** (``policies.aot`` / ``policies.aot_module``) is fully tune-free —
-  every tune annotation is inert, only the reference-row registries are
-  emitted. Per-box stamps would otherwise desync the generating and consuming
-  box's AOT hashes.
+* **Cross-box artifacts** (``policies.tune_frozen`` — set by the ``-aot`` C++
+  generator and by dastest's AST serializer) are fully tune-free — every tune
+  annotation is inert, only the reference-row registries are emitted. Per-box
+  stamps would otherwise desync the artifact against the box that consumes it.
+* **AOT-consuming runs** (``policies.aot``) are tune-free only when the JIT is
+  off: a stamp changes the function's semantic hash, so a stamped function
+  would fail the AOT link. Under ``-jit`` the JIT supersedes AOT bodies and
+  tuned stamps stay live.
 * **Standalone exe** (``llvm-jit -exe``) still *stamps* — an exe built on a box
   with a manifest ships those winners (a local-use artifact by definition), and
   one built without ships the generic ``fallback=`` stamps — but the policy
