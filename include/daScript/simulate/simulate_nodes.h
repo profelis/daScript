@@ -1257,6 +1257,7 @@ SIM_NODE_AT_VECTOR(Float, float)
             int32_t idx = index->evalInt(context);
             if (idx<0 || uint32_t(idx) >= range) {
                 context.throw_error_at(debugInfo,"vector index out of range, %d of %u%s", idx, range, errorMessage);
+                return v_zero();
             }
             TT * pv = (TT *) &vec;
             return cast<TT>::from(pv[idx]);
