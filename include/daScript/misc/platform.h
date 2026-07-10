@@ -478,7 +478,9 @@ inline void *das_aligned_alloc16(size_t size) {
     }
 #if defined(__linux__)
     if (size >= 2*1024*1024) {
-        madvise(p, size, MADV_HUGEPAGE);
+        // interior only (size rounded DOWN to 2MB): hinting the partial tail page would back
+        // it with a full 2MB of RSS (a 2.05MB block ballooning to 4MB); the tail stays 4K
+        madvise(p, size & ~size_t(2*1024*1024 - 1), MADV_HUGEPAGE);
     }
 #endif
 #endif
