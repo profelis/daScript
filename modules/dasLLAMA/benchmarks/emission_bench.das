@@ -59,15 +59,7 @@ def private build_prompt(n : int64; seed : int64) : array<int64> {
 }
 
 def private greedy_top(s : Session; vocab : int64) : int64 {
-    var best = 0l
-    var bestv = s.logits[0]
-    for (i in range64(vocab)) {
-        if (s.logits[i] > bestv) {
-            bestv = s.logits[i]
-            best = i
-        }
-    }
-    return best
+    return parallel_argmax(s.logits, vocab)   // team-scanned; bit-identical to the serial loop
 }
 
 [export]

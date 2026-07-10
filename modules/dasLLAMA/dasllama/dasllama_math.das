@@ -1643,6 +1643,71 @@ def exp4(x : float4) : float4 {
     }
 }
 
+//! Index of the max element, first-index-wins on ties — the greedy-decode argmax. Chunked team
+//! scan (per-lane trace: the serial 151-262k-vocab scan idled every lane for 210-284us per token,
+//! the only all-lanes-blank band left in a decode token); the combine folds candidates in index
+//! order with strict >, so the result is bit-identical to the serial loop for ANY split.
+def public parallel_argmax(x : float const?; n : int64) : int64 {
+    if (n <= 1l) {
+        return 0l
+    }
+    let nch = int(min(int64(get_dispatch_lanes()) * 2l, n / 4096l))
+    unsafe {
+        if (nch <= 1) {
+            var best = 0l
+            for (i in range64(1l, n)) {
+                if (x[i] > x[best]) {
+                    best = i
+                }
+            }
+            return best
+        }
+        var cm : array<float>
+        var ci : array<int64>
+        cm |> resize(nch)
+        ci |> resize(nch)
+        var cmp = addr(cm[0])
+        var cip = addr(ci[0])
+        let nn = n
+        let nc = int64(nch)
+        maybe_parallel_for(0, nch, nch) $(cb, ce) {
+            unsafe {
+                for (c in range(cb, ce)) {
+                    let r0 = int64(c) * nn / nc
+                    let r1 = (int64(c) + 1l) * nn / nc
+                    var b = r0
+                    for (i in range64(r0 + 1l, r1)) {
+                        if (x[i] > x[b]) {
+                            b = i
+                        }
+                    }
+                    cmp[c] = x[b]
+                    cip[c] = b
+                }
+            }
+        }
+        var best = ci[0]
+        var bm = cm[0]
+        for (c in range(1, nch)) {
+            if (cm[c] > bm) {
+                bm = cm[c]
+                best = ci[c]
+            }
+        }
+        delete cm
+        delete ci
+        return best
+    }
+}
+
+//! Array overload — forwards to the pointer core.
+def public parallel_argmax(x : array<float> | #; n : int64) : int64 {
+    if (n <= 0l) {
+        return 0l
+    }
+    return parallel_argmax(unsafe(addr(x[0])), n)
+}
+
 //! SiLU (a.k.a. swish) activation: silu(x) = x * sigmoid(x) = x / (1 + exp(-x)).
 //! In place over the first `size` elements. The nonlinearity in the SwiGLU FFN gate;
 //! smooth, ~identity for large x, dips slightly negative just below zero.

@@ -6425,15 +6425,9 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
 
 //! Greedy argmax over the current logits; returns the winning token id.
 def private argmax(s : Session; vocab : int64) : int64 {
-    var best = 0l
-    var bestv = s.logits[0]
-    for (i in range64(vocab)) {
-        if (s.logits[i] > bestv) {
-            bestv = s.logits[i]
-            best = i
-        }
-    }
-    return best
+    // team-scanned argmax (bit-identical to the serial first-wins loop) — a 151-262k vocab scan
+    // was 210-284us of every-lane-idle per decoded token
+    return parallel_argmax(s.logits, vocab)
 }
 
 //! Greedy decode. `prompt_tokens` is the encoded prompt (at least [BOS]); while still
