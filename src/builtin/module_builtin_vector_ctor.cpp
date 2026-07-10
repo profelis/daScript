@@ -475,6 +475,53 @@ ADD_SVEC_SPLAT(VTYPE,ETYPE,uint32_t) ADD_SVEC_CTOR_##N(VTYPE,ETYPE,uint32_t)
         ADD_SVEC_FAMILY(ubyte4,  uint8_t,  4);
         ADD_SVEC_FAMILY(ubyte8,  uint8_t,  8);
         ADD_SVEC_FAMILY(ubyte16, uint8_t,  16);
+        // lane-wise converts: widen = ctor-name overload on the wider type; narrow =
+        // ctor-name overload (C-truncation, mirrors the int8(x) scalar cast) plus a
+        // `_sat` variant that clamps to the target range (the Q8-quant shape; the native
+        // sqxtn/PACK lowering is a later JIT wave)
+#define ADD_SVEC_CVT(TO,TOE,FROM,FE) \
+    addExtern<DAS_BIND_FUN((das_sv_cvt<TO,TOE,FROM,FE>))>(*this, lib, #TO, SideEffects::none, "das_sv_cvt<" #TO "," #TOE "," #FROM "," #FE ">");
+#define ADD_SVEC_CVT_SAT(TO,TOE,FROM,FE) \
+    addExtern<DAS_BIND_FUN((das_sv_cvt_sat<TO,TOE,FROM,FE>))>(*this, lib, #TO "_sat", SideEffects::none, "das_sv_cvt_sat<" #TO "," #TOE "," #FROM "," #FE ">");
+        // widen to 32-bit families
+        ADD_SVEC_CVT(int2, int32_t, short2, int16_t);
+        ADD_SVEC_CVT(int3, int32_t, short3, int16_t);
+        ADD_SVEC_CVT(int4, int32_t, short4, int16_t);
+        ADD_SVEC_CVT(int2, int32_t, byte2, int8_t);
+        ADD_SVEC_CVT(int3, int32_t, byte3, int8_t);
+        ADD_SVEC_CVT(int4, int32_t, byte4, int8_t);
+        ADD_SVEC_CVT(uint2, uint32_t, ushort2, uint16_t);
+        ADD_SVEC_CVT(uint3, uint32_t, ushort3, uint16_t);
+        ADD_SVEC_CVT(uint4, uint32_t, ushort4, uint16_t);
+        ADD_SVEC_CVT(uint2, uint32_t, ubyte2, uint8_t);
+        ADD_SVEC_CVT(uint3, uint32_t, ubyte3, uint8_t);
+        ADD_SVEC_CVT(uint4, uint32_t, ubyte4, uint8_t);
+        // widen within the lattice (8-lane included — the Q8 dot shape)
+        ADD_SVEC_CVT(short2, int16_t, byte2, int8_t);
+        ADD_SVEC_CVT(short3, int16_t, byte3, int8_t);
+        ADD_SVEC_CVT(short4, int16_t, byte4, int8_t);
+        ADD_SVEC_CVT(short8, int16_t, byte8, int8_t);
+        ADD_SVEC_CVT(ushort2, uint16_t, ubyte2, uint8_t);
+        ADD_SVEC_CVT(ushort3, uint16_t, ubyte3, uint8_t);
+        ADD_SVEC_CVT(ushort4, uint16_t, ubyte4, uint8_t);
+        ADD_SVEC_CVT(ushort8, uint16_t, ubyte8, uint8_t);
+        // narrow, truncating + saturating
+        ADD_SVEC_CVT(short2, int16_t, int2, int32_t);      ADD_SVEC_CVT_SAT(short2, int16_t, int2, int32_t);
+        ADD_SVEC_CVT(short3, int16_t, int3, int32_t);      ADD_SVEC_CVT_SAT(short3, int16_t, int3, int32_t);
+        ADD_SVEC_CVT(short4, int16_t, int4, int32_t);      ADD_SVEC_CVT_SAT(short4, int16_t, int4, int32_t);
+        ADD_SVEC_CVT(byte2, int8_t, int2, int32_t);        ADD_SVEC_CVT_SAT(byte2, int8_t, int2, int32_t);
+        ADD_SVEC_CVT(byte3, int8_t, int3, int32_t);        ADD_SVEC_CVT_SAT(byte3, int8_t, int3, int32_t);
+        ADD_SVEC_CVT(byte4, int8_t, int4, int32_t);        ADD_SVEC_CVT_SAT(byte4, int8_t, int4, int32_t);
+        ADD_SVEC_CVT(ushort2, uint16_t, uint2, uint32_t);  ADD_SVEC_CVT_SAT(ushort2, uint16_t, uint2, uint32_t);
+        ADD_SVEC_CVT(ushort3, uint16_t, uint3, uint32_t);  ADD_SVEC_CVT_SAT(ushort3, uint16_t, uint3, uint32_t);
+        ADD_SVEC_CVT(ushort4, uint16_t, uint4, uint32_t);  ADD_SVEC_CVT_SAT(ushort4, uint16_t, uint4, uint32_t);
+        ADD_SVEC_CVT(ubyte2, uint8_t, uint2, uint32_t);    ADD_SVEC_CVT_SAT(ubyte2, uint8_t, uint2, uint32_t);
+        ADD_SVEC_CVT(ubyte3, uint8_t, uint3, uint32_t);    ADD_SVEC_CVT_SAT(ubyte3, uint8_t, uint3, uint32_t);
+        ADD_SVEC_CVT(ubyte4, uint8_t, uint4, uint32_t);    ADD_SVEC_CVT_SAT(ubyte4, uint8_t, uint4, uint32_t);
+        ADD_SVEC_CVT(byte8, int8_t, short8, int16_t);      ADD_SVEC_CVT_SAT(byte8, int8_t, short8, int16_t);
+        ADD_SVEC_CVT(ubyte8, uint8_t, ushort8, uint16_t);  ADD_SVEC_CVT_SAT(ubyte8, uint8_t, ushort8, uint16_t);
+#undef ADD_SVEC_CVT
+#undef ADD_SVEC_CVT_SAT
     }
 }
 

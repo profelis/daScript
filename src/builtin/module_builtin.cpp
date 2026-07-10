@@ -242,6 +242,31 @@ namespace das
         addEquNeqVal<uint8_t>(*this,lib);
         addEquNeqVal<int16_t>(*this,lib);
         addEquNeqVal<uint16_t>(*this,lib);
+        // 16/8-bit lattice: equality is elementwise all-lanes via the C++ operators
+        // (fp16 lanes promote-compare, so -0 == +0 and NaN != NaN hold per lane)
+        addEquNeqVal<float16_t>(*this,lib);
+        addEquNeqVal<half2>(*this,lib);
+        addEquNeqVal<half3>(*this,lib);
+        addEquNeqVal<half4>(*this,lib);
+        addEquNeqVal<half8>(*this,lib);
+        addEquNeqVal<short2>(*this,lib);
+        addEquNeqVal<short3>(*this,lib);
+        addEquNeqVal<short4>(*this,lib);
+        addEquNeqVal<short8>(*this,lib);
+        addEquNeqVal<ushort2>(*this,lib);
+        addEquNeqVal<ushort3>(*this,lib);
+        addEquNeqVal<ushort4>(*this,lib);
+        addEquNeqVal<ushort8>(*this,lib);
+        addEquNeqVal<byte2>(*this,lib);
+        addEquNeqVal<byte3>(*this,lib);
+        addEquNeqVal<byte4>(*this,lib);
+        addEquNeqVal<byte8>(*this,lib);
+        addEquNeqVal<byte16>(*this,lib);
+        addEquNeqVal<ubyte2>(*this,lib);
+        addEquNeqVal<ubyte3>(*this,lib);
+        addEquNeqVal<ubyte4>(*this,lib);
+        addEquNeqVal<ubyte8>(*this,lib);
+        addEquNeqVal<ubyte16>(*this,lib);
         // misc types
         addMiscTypes(lib);
         // `half` spells float16 without reserving the identifier (audit: `half` is a common

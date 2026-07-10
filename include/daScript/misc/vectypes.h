@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include "daScript/misc/string_writer.h"
 
 namespace das
@@ -368,5 +370,36 @@ namespace das
 
     static_assert(sizeof(half3) == 6 && sizeof(half8) == 16 && sizeof(byte3) == 3 && sizeof(byte16) == 16,
         "small-element vectors must be tightly packed");
+
+    // lane-wise conversions between lattice vectors and the 32-bit families (and between
+    // lattice families). The names carry the template args so AOT can emit them verbatim.
+    template <typename TO, typename TOE, typename FROM, typename FE>
+    __forceinline TO das_sv_cvt ( FROM v ) {
+        TO r;
+        memset(&r, 0, sizeof(TO));
+        constexpr int n = int(sizeof(FROM) / sizeof(FE));
+        static_assert(n * sizeof(TOE) == sizeof(TO), "lane count mismatch");
+        const FE * s = (const FE *) &v;
+        TOE * d = (TOE *) &r;
+        for ( int i = 0; i != n; ++i ) d[i] = TOE(s[i]);
+        return r;
+    }
+
+    template <typename TO, typename TOE, typename FROM, typename FE>
+    __forceinline TO das_sv_cvt_sat ( FROM v ) {
+        TO r;
+        memset(&r, 0, sizeof(TO));
+        constexpr int n = int(sizeof(FROM) / sizeof(FE));
+        static_assert(n * sizeof(TOE) == sizeof(TO), "lane count mismatch");
+        constexpr int64_t lo = int64_t(std::numeric_limits<TOE>::min());
+        constexpr int64_t hi = int64_t(std::numeric_limits<TOE>::max());
+        const FE * s = (const FE *) &v;
+        TOE * d = (TOE *) &r;
+        for ( int i = 0; i != n; ++i ) {
+            int64_t x = int64_t(s[i]);
+            d[i] = TOE(x < lo ? lo : (x > hi ? hi : x));
+        }
+        return r;
+    }
 }
 
