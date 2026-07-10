@@ -2626,29 +2626,10 @@ namespace das
             case Type::tURange:
             case Type::tRange64:
             case Type::tURange64:
+            // 16/8-bit lattice: only the scalar float16 is foldable — it has a const node
+            // (ExprConstFloat16). The lattice VECTORS deliberately have none, and foldable
+            // means exactly "representable as a constant node" (Program::makeConst).
             case Type::tFloat16:
-            case Type::tHalf2:
-            case Type::tHalf3:
-            case Type::tHalf4:
-            case Type::tHalf8:
-            case Type::tShort2:
-            case Type::tShort3:
-            case Type::tShort4:
-            case Type::tShort8:
-            case Type::tUShort2:
-            case Type::tUShort3:
-            case Type::tUShort4:
-            case Type::tUShort8:
-            case Type::tByte2:
-            case Type::tByte3:
-            case Type::tByte4:
-            case Type::tByte8:
-            case Type::tByte16:
-            case Type::tUByte2:
-            case Type::tUByte3:
-            case Type::tUByte4:
-            case Type::tUByte8:
-            case Type::tUByte16:
                 return true;
             default:
                 return false;

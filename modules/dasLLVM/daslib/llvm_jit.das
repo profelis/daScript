@@ -1341,6 +1341,7 @@ class public LlvmJitVisitor : AstVisitor {
 
     def need_z_or_s_ext(_type : TypeDeclPtr) {
         if (!_type.isRef && !_type.isVoid && _type.sizeOf < 4 &&
+            !is_lattice_small_type(_type.baseType) && // ext attributes are integer-only: not for half or packed lattice vectors
             _type.baseType != Type.fakeContext && // incorrect size for fakeContext & fakeLineInfo
             _type.baseType != Type.fakeLineInfo) {
             if (_type.isSignedInteger) {
@@ -7914,11 +7915,33 @@ class public DisableJitVisitor : AstVisitor {
                 disable = true
             }
         }
+        if (!disable && expr.func.flags.builtIn) {
+            // lattice values cross the extern ABI as LLVM half / packed vectors, but the
+            // C++ side expects the das slot conventions — fall back until the marshal wave
+            var lattice = is_lattice_small_type(expr._type.baseType)
+            if (!lattice) {
+                for (arg in expr.arguments) {
+                    if (is_lattice_small_type(arg._type.baseType)) {
+                        lattice = true
+                        break
+                    }
+                }
+            }
+            if (lattice) {
+                to_log(LOG_WARNING, "LLVM JIT: 16/8-bit lattice type crosses `{expr.func._module.name}::{expr.func.name}` at {expr.at}, falling back to interpreter.\n")
+                disable = true
+            }
+        }
     }
 
     def override preVisitExprOp1(expr : ExprOp1?) : void {
         if (isExprOp1_Func(expr)) {
             disable_builtin_call(expr)
+            if (expr.func.flags.builtIn) {
+                // ExprOp1/2 carry operands in subexpr/left/right — the arguments list
+                // disable_builtin_call scans is empty for operators
+                lattice_fallback(expr.subexpr._type, expr.at)
+            }
         }
     }
 
@@ -7926,6 +7949,10 @@ class public DisableJitVisitor : AstVisitor {
     def override preVisitExprOp2(expr : ExprOp2?) : void {
         if (isExprOp2_Func(expr)) {
             disable_builtin_call(expr)
+            if (expr.func.flags.builtIn) {
+                lattice_fallback(expr.left._type, expr.at)
+                lattice_fallback(expr.right._type, expr.at)
+            }
         }
     }
 

@@ -59,6 +59,13 @@ def test_int2_conformance(t : T?) {
         t |> equal(a.x, 7)
         t |> equal(a.y, 8)
     }
+    t |> run("s-namespace swizzle") @(t : T?) {
+        var a = int2(1, 2)
+        t |> equal(a.s1, 2)
+        t |> success(a.s10 == int2(2, 1), "pair reorder")
+        a.s0 = 9
+        t |> equal(a.s0, 9)
+    }
     t |> run("struct field and layout") @(t : T?) {
         var w = Wrap_int2(pad = uint8(1), v = int2(1, 2))
         t |> success(w.v == int2(1, 2), "field read")

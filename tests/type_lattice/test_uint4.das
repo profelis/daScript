@@ -62,6 +62,13 @@ def test_uint4_conformance(t : T?) {
         t |> equal(a.x, 7u)
         t |> equal(a.y, 8u)
     }
+    t |> run("s-namespace swizzle") @(t : T?) {
+        var a = uint4(1u, 2u, 3u, 4u)
+        t |> equal(a.s3, 4u)
+        t |> success(a.s30 == uint2(4u, 1u), "pair reorder")
+        a.s0 = 9u
+        t |> equal(a.s0, 9u)
+    }
     t |> run("struct field and layout") @(t : T?) {
         var w = Wrap_uint4(pad = uint8(1), v = uint4(1u, 2u, 3u, 4u))
         t |> success(w.v == uint4(1u, 2u, 3u, 4u), "field read")

@@ -380,6 +380,9 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
                 if (fun.flags.used && (jit_all_functions || rqj)) {
                     if (!fun.moreFlags.requestNoJit) {
                         disableJitVisitor.disable = false
+                        // the signature gate must run explicitly — `visit(fun)` does not
+                        // dispatch preVisitFunction through the adapter
+                        disableJitVisitor->preVisitFunction(fun)
                         fun |> visit(disableJitVisitorAdapter)
                         if (!disableJitVisitor.disable) {
                             fun.moreFlags.requestJit = true

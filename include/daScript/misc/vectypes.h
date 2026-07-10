@@ -1,6 +1,7 @@
 #pragma once
 
 #include <limits>
+#include <type_traits>
 
 #include "daScript/misc/string_writer.h"
 
@@ -250,6 +251,10 @@ namespace das
         __forceinline svec2(vec4f t) { memcpy(this, &t, sizeof(*this)); }
         __forceinline svec2(TT X, TT Y) : x(X), y(Y) {}
         __forceinline svec2(TT t) : x(t), y(t) {}
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec2(QQ X, QQ Y) : x(TT(X)), y(TT(Y)) {}
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec2(QQ t) : x(TT(t)), y(TT(t)) {}
         __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
     };
 
@@ -269,6 +274,10 @@ namespace das
         __forceinline svec3(vec4f t) { memcpy(this, &t, sizeof(*this)); }
         __forceinline svec3(TT X, TT Y, TT Z) : x(X), y(Y), z(Z) {}
         __forceinline svec3(TT t) : x(t), y(t), z(t) {}
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec3(QQ X, QQ Y, QQ Z) : x(TT(X)), y(TT(Y)), z(TT(Z)) {}
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec3(QQ t) : x(TT(t)), y(TT(t)), z(TT(t)) {}
         __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
     };
 
@@ -288,6 +297,10 @@ namespace das
         __forceinline svec4(vec4f t) { memcpy(this, &t, sizeof(*this)); }
         __forceinline svec4(TT X, TT Y, TT Z, TT W) : x(X), y(Y), z(Z), w(W) {}
         __forceinline svec4(TT t) : x(t), y(t), z(t), w(t) {}
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec4(QQ X, QQ Y, QQ Z, QQ W) : x(TT(X)), y(TT(Y)), z(TT(Z)), w(TT(W)) {}
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec4(QQ t) : x(TT(t)), y(TT(t)), z(TT(t)), w(TT(t)) {}
         __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
     };
 
@@ -312,6 +325,11 @@ namespace das
         __forceinline svec8(vec4f t) { memcpy(this, &t, sizeof(*this)); }
         __forceinline svec8(TT s0, TT s1, TT s2, TT s3, TT s4, TT s5, TT s6, TT s7) : s{s0, s1, s2, s3, s4, s5, s6, s7} {}
         __forceinline svec8(TT t) { for ( int i = 0; i != 8; ++i ) s[i] = t; }
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec8(QQ s0, QQ s1, QQ s2, QQ s3, QQ s4, QQ s5, QQ s6, QQ s7)
+            : s{TT(s0), TT(s1), TT(s2), TT(s3), TT(s4), TT(s5), TT(s6), TT(s7)} {}
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec8(QQ t) { for ( int i = 0; i != 8; ++i ) s[i] = TT(t); }
         __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
     };
 
@@ -338,6 +356,13 @@ namespace das
                              TT s8, TT s9, TT sa, TT sb, TT sc, TT sd, TT se, TT sf)
             : s{s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, sa, sb, sc, sd, se, sf} {}
         __forceinline svec16(TT t) { for ( int i = 0; i != 16; ++i ) s[i] = t; }
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec16(QQ s0, QQ s1, QQ s2, QQ s3, QQ s4, QQ s5, QQ s6, QQ s7,
+                             QQ s8, QQ s9, QQ sa, QQ sb, QQ sc, QQ sd, QQ se, QQ sf)
+            : s{TT(s0), TT(s1), TT(s2), TT(s3), TT(s4), TT(s5), TT(s6), TT(s7),
+                TT(s8), TT(s9), TT(sa), TT(sb), TT(sc), TT(sd), TT(se), TT(sf)} {}
+        template <typename QQ, typename = typename std::enable_if<std::is_arithmetic<QQ>::value>::type>
+        __forceinline svec16(QQ t) { for ( int i = 0; i != 16; ++i ) s[i] = TT(t); }
         __forceinline operator vec4f() const { vec4f r = v_zero(); memcpy(&r, this, sizeof(*this)); return r; }
     };
 
@@ -382,6 +407,15 @@ namespace das
         const FE * s = (const FE *) &v;
         TOE * d = (TOE *) &r;
         for ( int i = 0; i != n; ++i ) d[i] = TOE(s[i]);
+        return r;
+    }
+
+    // typed zero for AOT emission — the interp zero ctor is SimNode_Zero (a raw vec4f),
+    // but emitted C++ needs the value typed or template deduction around it breaks
+    template <typename VT>
+    __forceinline VT das_svec_zero () {
+        VT r;
+        memset(&r, 0, sizeof(r));
         return r;
     }
 

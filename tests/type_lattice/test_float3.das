@@ -61,6 +61,13 @@ def test_float3_conformance(t : T?) {
         t |> equal(a.x, 7.)
         t |> equal(a.y, 8.)
     }
+    t |> run("s-namespace swizzle") @(t : T?) {
+        var a = float3(1., 2., 3.)
+        t |> equal(a.s2, 3.)
+        t |> success(a.s20 == float2(3., 1.), "pair reorder")
+        a.s0 = 9.
+        t |> equal(a.s0, 9.)
+    }
     t |> run("struct field and layout") @(t : T?) {
         var w = Wrap_float3(pad = uint8(1), v = float3(1., 2., 3.))
         t |> success(w.v == float3(1., 2., 3.), "field read")

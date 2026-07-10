@@ -346,7 +346,7 @@ addFunction ( (new BuiltInFn<SimNode_SVecCtor<VTYPE,ETYPE,ATYPE,16>,const VTYPE,
 // zero + pass-through + {float,double,int,uint} x {splat, N-arg} — mirrors the arg-type
 // coverage the 32-bit vector families get from ADD_VEC_CTOR_*
 #define ADD_SVEC_FAMILY(VTYPE,ETYPE,N) \
-addFunction ( (new BuiltInFn<SimNode_Zero,const VTYPE>(#VTYPE,lib,"v_zero",false)) ); \
+addFunction ( (new BuiltInFn<SimNode_Zero,const VTYPE>(#VTYPE,lib,"das_svec_zero<" #VTYPE ">",false)) ); \
 addFunction ( (new BuiltInFn<SimNode_VecPassThrough, VTYPE, VTYPE>(#VTYPE,lib,#VTYPE,false)) ); \
 ADD_SVEC_SPLAT(VTYPE,ETYPE,float)    ADD_SVEC_CTOR_##N(VTYPE,ETYPE,float) \
 ADD_SVEC_SPLAT(VTYPE,ETYPE,double)   ADD_SVEC_CTOR_##N(VTYPE,ETYPE,double) \
@@ -457,6 +457,11 @@ ADD_SVEC_SPLAT(VTYPE,ETYPE,uint32_t) ADD_SVEC_CTOR_##N(VTYPE,ETYPE,uint32_t)
         ADD_SVEC_FAMILY(half3,  float16_t, 3);
         ADD_SVEC_FAMILY(half4,  float16_t, 4);
         ADD_SVEC_FAMILY(half8,  float16_t, 8);
+        // fp16-scalar-argument ctors: half2(1.h, 2.h) and splats from a float16 value
+        ADD_SVEC_SPLAT(half2, float16_t, float16_t) ADD_SVEC_CTOR_2(half2, float16_t, float16_t)
+        ADD_SVEC_SPLAT(half3, float16_t, float16_t) ADD_SVEC_CTOR_3(half3, float16_t, float16_t)
+        ADD_SVEC_SPLAT(half4, float16_t, float16_t) ADD_SVEC_CTOR_4(half4, float16_t, float16_t)
+        ADD_SVEC_SPLAT(half8, float16_t, float16_t) ADD_SVEC_CTOR_8(half8, float16_t, float16_t)
         ADD_SVEC_FAMILY(short2, int16_t,   2);
         ADD_SVEC_FAMILY(short3, int16_t,   3);
         ADD_SVEC_FAMILY(short4, int16_t,   4);

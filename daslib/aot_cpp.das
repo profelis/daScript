@@ -1822,7 +1822,10 @@ class public CppAot : AstVisitor {
         if (variable.init != null) {
             write(*ss, cvname);
         } elif (variable._type.canInitWithZero) {
-            let init_val = isLocalVec(variable._type) ? "v_zero()" : "0";
+            var init_val = isLocalVec(variable._type) ? "v_zero()" : "0";
+            if (variable._type.baseType == Type.tFloat16) {
+                init_val = "float16_t(0.f)";   // no implicit int conversion on the fp16 carrier
+            }
             write(*ss, "{cvname} = {init_val}");
         } else {
             if (!collector.isMoved(variable)) {
@@ -2710,6 +2713,12 @@ class public CppAot : AstVisitor {
         writeOutFloat(c.getValue);
         return c;
     }
+    def override visitExprConstFloat16(var c : ExprConstFloat16?) : ExpressionPtr {
+        write(*ss, "float16_t(");
+        writeOutFloat(float(c.value));
+        write(*ss, ")");
+        return c;
+    }
     def override visitExprConstString(var c : ExprConstString?) : ExpressionPtr {
         if (c.value.empty()) {
             write(*ss, "nullptr");
@@ -2897,7 +2906,27 @@ class public CppAot : AstVisitor {
         return ifte;
     }
 // swizzle
+    def is_lattice_elem(t : Type) : bool {
+        return t == Type.tFloat16 || t == Type.tInt16 || t == Type.tUInt16 || t == Type.tInt8 || t == Type.tUInt8
+    }
     def override preVisitExprSwizzle(expr : ExprSwizzle?) {
+        assume srcT = expr.value._type
+        if (srcT.isVectorType && is_lattice_elem(srcT.vectorBaseType)) {
+            // 16/8-bit lattice — element-typed helpers (up to 16 lanes; the generic
+            // das_swizzle caps at 4 fields and v_extract is 32-bit-lane only)
+            let et = das_to_cppString(srcT.vectorBaseType)
+            let type_str = describeCppType(expr._type, DescribeConfig(skip_ref = true, cross_platform = cross_platform))
+            if (expr._type.flags.ref) {
+                write(*ss, "das_swizzle_ref_small<{type_str},{et},{int(expr.fields[0])}>::swizzle(")
+            } else {
+                let field_str = (each(expr.fields)
+                    ._select("{_:d}")
+                    .to_array()
+                    ._fold()) |> join(",")
+                write(*ss, "das_swizzle_small<{type_str},{et},{field_str}>::swizzle(")
+            }
+            return
+        }
         if (expr._type.flags.ref) {
             let type_str = describeCppType(expr._type, DescribeConfig(skip_ref = true, cross_platform = cross_platform));
             let value_str = describeCppType(expr.value._type, DescribeConfig(skip_ref = true, cross_platform = cross_platform));
@@ -2936,6 +2965,11 @@ class public CppAot : AstVisitor {
     def override visitExprSwizzle(var expr : ExprSwizzle?) : ExpressionPtr {
         if (expr.value._type.flags.aotAlias) {
             write(*ss, ")");
+        }
+        assume srcT = expr.value._type
+        if (srcT.isVectorType && is_lattice_elem(srcT.vectorBaseType)) {
+            write(*ss, ")");
+            return expr;
         }
         if (expr._type.flags.ref) {
             write(*ss, ")");
@@ -3712,6 +3746,9 @@ class public CppAot : AstVisitor {
     }
     def policyResultNeedCast(polType : TypeDeclPtr; resType : TypeDeclPtr) {
         if (resType.isVoid || !resType.isPolicyType) return false;
+        // lattice vector policy results must come back typed: they flow into template
+        // deduction contexts (the das_equ_val equality externs), where raw vec4f deduces wrong
+        if (resType.isVectorType && is_lattice_elem(resType.vectorBaseType)) return true;
         return policyArgNeedCast(polType, resType);
     }
     def isPolicyBasedCall(call : ExprCall?) {

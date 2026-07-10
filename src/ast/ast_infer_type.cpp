@@ -1047,6 +1047,10 @@ namespace das {
                 auto ewsType = new TypeDecl(*(expr->subexpr->type));
                 ewsType->ref = false;
                 auto ews = Program::makeConst(expr->at, ewsType, v_zero());
+                if (!ews) {
+                    // 16/8-bit lattice vectors have no const nodes — lower to the zero ctor call
+                    return new ExprCall(expr->at, das_to_string(ewsType->baseType));
+                }
                 ews->type = ewsType;
                 return ews;
             } else {

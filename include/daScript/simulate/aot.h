@@ -833,9 +833,85 @@ namespace das {
         }
     };
 
+    // 16/8-bit lattice: svec8/svec16 carry lanes in s[] (no .x member), so their index
+    // goes through an element-pointer variant; svec2/3/4 have x/y/z/w and use the generic
+    template <typename TT, typename VecT, uint32_t size>
+    struct das_vec_index_small {
+        static __forceinline TT & at ( VecT & value, int32_t index, Context * __context__ ) {
+            if ( index<0 || uint32_t(index)>=size ) __context__->throw_error_ex("vector index out of range, %d of %u", index, size);
+            return ((TT *)&value)[index];
+        }
+        static __forceinline const TT & at ( const VecT & value, int32_t index, Context * __context__ ) {
+            if ( index<0 || uint32_t(index)>=size ) __context__->throw_error_ex("vector index out of range, %d of %u", index, size);
+            return ((const TT *)&value)[index];
+        }
+        static __forceinline TT & at ( VecT & value, uint32_t idx, Context * __context__ ) {
+            if ( idx>=size ) __context__->throw_error_ex("vector index out of range, %u of %u", idx, size);
+            return ((TT *)&value)[idx];
+        }
+        static __forceinline const TT & at ( const VecT & value, uint32_t idx, Context * __context__ ) {
+            if ( idx>=size ) __context__->throw_error_ex("vector index out of range, %u of %u", idx, size);
+            return ((const TT *)&value)[idx];
+        }
+        static __forceinline TT * safe_at ( VecT * value, int32_t index, Context * ) {
+            if (!value) return nullptr;
+            if ( index<0 || uint32_t(index)>=size ) return nullptr;
+            return ((TT *)value) + index;
+        }
+        static __forceinline const TT * safe_at ( const VecT * value, int32_t index, Context * ) {
+            if (!value) return nullptr;
+            if ( index<0 || uint32_t(index)>=size ) return nullptr;
+            return ((const TT *)value) + index;
+        }
+        static __forceinline TT * safe_at ( VecT * value, uint32_t idx, Context * ) {
+            if (!value) return nullptr;
+            if ( idx>=size ) return nullptr;
+            return ((TT *)value) + idx;
+        }
+        static __forceinline const TT * safe_at ( const VecT * value, uint32_t idx, Context * ) {
+            if (!value) return nullptr;
+            if ( idx>=size ) return nullptr;
+            return ((const TT *)value) + idx;
+        }
+    };
+
+    // lattice swizzles — element-typed, up to 16 lanes; a scalar ResT lands in the low bytes
+    template <typename ResT, typename ET, int... f>
+    struct das_swizzle_small {
+        template <typename VT>
+        static __forceinline ResT swizzle ( const VT & val ) {
+            ResT res;
+            memset(&res, 0, sizeof(res));
+            const ET * s = (const ET *) &val;
+            ET * d = (ET *) &res;
+            constexpr int idx[] = { f... };
+            for ( size_t i = 0; i != sizeof...(f); ++i ) d[i] = s[idx[i]];
+            return res;
+        }
+    };
+    template <typename ResT, typename ET, int index>
+    struct das_swizzle_ref_small {
+        template <typename VT>
+        static __forceinline ResT & swizzle ( VT & val ) {
+            return *(ResT *)((ET *)&val + index);
+        }
+    };
+
     template <typename TT> struct das_index<vec2<TT>> : das_vec_index<TT, vec2<TT>, 2> {};
     template <typename TT> struct das_index<vec3<TT>> : das_vec_index<TT, vec3<TT>, 3> {};
     template <typename TT> struct das_index<vec4<TT>> : das_vec_index<TT, vec4<TT>, 4> {};
+
+    template <typename TT> struct das_index<svec2<TT>> : das_vec_index<TT, svec2<TT>, 2> {};
+    template <typename TT> struct das_index<svec3<TT>> : das_vec_index<TT, svec3<TT>, 3> {};
+    template <typename TT> struct das_index<svec4<TT>> : das_vec_index<TT, svec4<TT>, 4> {};
+    template <typename TT> struct das_index<svec8<TT>> : das_vec_index_small<TT, svec8<TT>, 8> {};
+    template <typename TT> struct das_index<svec16<TT>> : das_vec_index_small<TT, svec16<TT>, 16> {};
+
+    template <typename TT> struct das_index<const svec2<TT>> : das_vec_index<TT, svec2<TT>, 2> {};
+    template <typename TT> struct das_index<const svec3<TT>> : das_vec_index<TT, svec3<TT>, 3> {};
+    template <typename TT> struct das_index<const svec4<TT>> : das_vec_index<TT, svec4<TT>, 4> {};
+    template <typename TT> struct das_index<const svec8<TT>> : das_vec_index_small<TT, svec8<TT>, 8> {};
+    template <typename TT> struct das_index<const svec16<TT>> : das_vec_index_small<TT, svec16<TT>, 16> {};
 
     template <typename TT> struct das_index<const vec2<TT>> : das_vec_index<TT, vec2<TT>, 2> {};
     template <typename TT> struct das_index<const vec3<TT>> : das_vec_index<TT, vec3<TT>, 3> {};
