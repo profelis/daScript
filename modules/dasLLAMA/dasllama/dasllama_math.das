@@ -635,6 +635,24 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
     }
 }
 
+//! Blob+offset form: the weight is rows [d x n] at element offset `woff` inside `w` — no
+//! array_view (the view's block invoke is an LLVM optimization boundary; the kernel only ever
+//! wanted the base pointer).
+def matmul(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d : int64) {
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<float const?>(addr(w[woff]))
+        let xp = addr(x[0])
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    yp[i] = dot(wp + int64(i) * n, xp, n)
+                }
+            }
+        }
+    }
+}
+
 //! Batched fp32 GEMM for prefill: Y [ntok x d] = X [ntok x n] · Wᵀ, W row-major [d x n].
 //! X is token-major (token t at X[t*n..]); Y is token-major (token t at Y[t*d..]). Weight-
 //! stationary nest (rows outer) — each weight row streams from DRAM once and is reused across
@@ -643,6 +661,25 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
     unsafe {
         var yp = addr(y[0])
         let wp = reinterpret<float const?>(addr(w[0]))
+        let xp = reinterpret<float const?>(addr(x[0]))
+        maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let wrow = wp + int64(i) * n
+                    for (tk in range64(ntok)) {
+                        yp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! Blob+offset form of matmul_batch (see the matmul woff overload).
+def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<float const?>(addr(w[woff]))
         let xp = reinterpret<float const?>(addr(x[0]))
         maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
             unsafe {
@@ -805,6 +842,24 @@ def dot_q8(wq : int8 const?; ws : float const?; x : float const?; n : int64) : f
 //! Q8_0 matmul: y = W·x with W stored as int8 quants `wq` [d x n] + per-block scales
 //! `ws` [d x n/32]. Same auto-dispatch as the fp32 matmul; large matmuls thread the output
 //! rows (2x the worker count — Q8 is compute-bound and threads better than fp32). n % 32 == 0.
+//! Blob+offset form: weight region at element offset `woff` (scales at woff/32) — no array_view.
+def matmul_q8(var y : array<float>; wq : array<int8>; ws : array<float>; woff : int64; x : array<float>; n, d : int64) {
+    let nb = n / 32l
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<int8 const?>(addr(wq[woff]))
+        let sp = reinterpret<float const?>(addr(ws[woff / 32l]))
+        let xp = addr(x[0])
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q8_chunks_per_job, n * d)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    yp[i] = dot_q8(wp + int64(i) * n, sp + int64(i) * nb, xp, n)
+                }
+            }
+        }
+    }
+}
+
 def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; x : array<float>; n, d : int64) {
     let nb = n / 32l
     unsafe {
@@ -1280,6 +1335,16 @@ def matmul_q8q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | 
     }
 }
 
+//! Blob+offset form: the weight region at element offset `woff` in the whole quantized blob
+//! (scales at woff/32) — no array_view (see the matmul woff overload).
+def matmul_q8q8(var y : array<float>; wq : array<int8>; ws : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<float const?>(addr(ws[woff / 32l])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
 //! Batched Q8·Q8 GEMM for prefill: same weight-stationary nest as matmul_batch over the SDOT kernel.
 //! Activations PRE-quantized per token into (xq [ntok x n], xs [ntok x n/32]). Y token-major
 //! [ntok x d]. Bit-for-bit ntok× matmul_q8q8. Dispatches to the active backend. n % 32 == 0.
@@ -1287,6 +1352,15 @@ def matmul_q8q8_batch(var y : array<float>; wq : array<int8> | #; ws : array<flo
     unsafe {
         invoke(g_mm_q8q8_batch, addr(y[0]),
             reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+    }
+}
+
+//! Blob+offset form (weights at woff, scales at woff/32) — no array_view.
+def matmul_q8q8_batch(var y : array<float>; wq : array<int8>; ws : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_batch, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<float const?>(addr(ws[woff / 32l])),
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
     }
 }
@@ -1345,6 +1419,16 @@ def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> 
     }
 }
 
+//! Blob+offset form: weight region at ELEMENT offset `woff` in the whole nibble/exponent planes
+//! (nibbles at woff/2, E8M0 at woff/32) — no array_view.
+def matmul_mx4q8(var y : array<float>; wn : array<uint8>; we : array<uint8>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[woff / 2l])), reinterpret<uint8 const?>(addr(we[woff / 32l])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
 //! Batched MXFP4·Q8 GEMM for prefill — the batch analog of matmul_mx4q8 (Y token-major [ntok x d],
 //! activations PRE-quantized per token into xq [ntok x n] / xs [ntok x n/32]). Dispatches to the
 //! active backend (g_mm_mx4q8_batch); only backends flagged mx4_native_batch provide one (the stub
@@ -1353,6 +1437,15 @@ def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8> | #; we : array<u
     unsafe {
         invoke(g_mm_mx4q8_batch, addr(y[0]),
             reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+    }
+}
+
+//! Blob+offset form (nibbles at woff/2, E8M0 at woff/32) — no array_view.
+def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8>; we : array<uint8>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_mx4q8_batch, addr(y[0]),
+            reinterpret<uint8 const?>(addr(wn[woff / 2l])), reinterpret<uint8 const?>(addr(we[woff / 32l])),
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
     }
 }
@@ -1463,6 +1556,26 @@ def dot_q4(wq : uint8 const?; ws : float const?; x : float const?; n : int64) : 
 //! Q4_0 matmul: y = W·x with W as 4-bit quants `wq` [d x n/2 bytes] + per-block scales `ws`
 //! [d x n/32]. Large matmuls thread the output rows at 4 chunks per hw job (4N — the heavy nibble
 //! unpack is compute-bound, so finer splitting balances better); small ones stay single. n % 32 == 0.
+//! Blob+offset form: weight region at ELEMENT offset `woff` (bytes at woff/2, scales at woff/32)
+//! — no array_view.
+def matmul_q4(var y : array<float>; wq : array<uint8>; ws : array<float>; woff : int64; x : array<float>; n, d : int64) {
+    let nb = n / 32l
+    let nh = n / 2l
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<uint8 const?>(addr(wq[woff / 2l]))
+        let sp = reinterpret<float const?>(addr(ws[woff / 32l]))
+        let xp = addr(x[0])
+        maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job, n * d)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    yp[i] = dot_q4(wp + int64(i) * nh, sp + int64(i) * nb, xp, n)
+                }
+            }
+        }
+    }
+}
+
 def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #; x : array<float>; n, d : int64) {
     let nb = n / 32l
     let nh = n / 2l

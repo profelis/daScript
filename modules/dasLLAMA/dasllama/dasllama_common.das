@@ -1819,32 +1819,37 @@ def bos_id(m : Model) : int64 {
     return bos_id(m.tok)
 }
 
-// fp32 matmul with the weight as a zero-copy view into the big-weight blob at `woff` (len n*d).
+// fp32 matmul with the weight at element offset `woff` in the big-weight blob (blob+offset kernel
+// form — array_view's block invoke is an LLVM optimization boundary, and the kernel only ever
+// wanted the base pointer; same for every mm_* wrapper below).
 def private mm_at(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d : int64) {
-    array_view(t.wblob, woff, n * d) $(w : array<float>#) {
-        matmul(y, w, x, n, d)
-    }
+    matmul(y, t.wblob, woff, x, n, d)
 }
 
-// fp32 matmul with the weight viewed into the fp32 aux blob (used for the tied classifier = embedding).
+// fp32 matmul against the fp32 aux blob (used for the tied classifier = embedding).
 def private mm_fblob(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d : int64) {
-    array_view(t.fblob, woff, n * d) $(w : array<float>#) {
-        matmul(y, w, x, n, d)
-    }
+    matmul(y, t.fblob, woff, x, n, d)
 }
 
 // Batched fp32 matmul against the aux blob: Y [npos x d] token-major from X [npos x n] — the grouped
 // MoE prefill's router. matmul_batch is bit-for-bit npos x matmul, so routing matches decode exactly.
 def private mm_fblob_b(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d, npos : int64) {
-    array_view(t.fblob, woff, n * d) $(w : array<float>#) {
-        matmul_batch(y, w, x, n, d, npos)
+    matmul_batch(y, t.fblob, woff, x, n, d, npos)
+}
+
+// rmsnorm with the weight at `woff` in the fp32 aux blob — straight to the tuned pointer core.
+def private rms_at(var o : array<float> | #; t : Model; woff : int64; x : array<float> | #; size : int64) {
+    unsafe {
+        rmsnorm(reinterpret<float?>(addr(o[0])), reinterpret<float const?>(addr(x[0])),
+            reinterpret<float const?>(addr(t.fblob[woff])), size, t.config.norm_eps)
     }
 }
 
-// rmsnorm with the weight as a zero-copy view into the fp32 aux blob at `woff` (len size).
-def private rms_at(var o : array<float> | #; t : Model; woff : int64; x : array<float> | #; size : int64) {
-    array_view(t.fblob, woff, size) $(w : array<float>#) {
-        rmsnorm(o, x, w, size, t.config.norm_eps)
+// Same, with the source at element offset `xoff` (per-position rows of a batched activation).
+def private rms_at(var o : array<float> | #; t : Model; woff : int64; x : array<float>; xoff : int64; size : int64) {
+    unsafe {
+        rmsnorm(reinterpret<float?>(addr(o[0])), reinterpret<float const?>(addr(x[xoff])),
+            reinterpret<float const?>(addr(t.fblob[woff])), size, t.config.norm_eps)
     }
 }
 
@@ -2693,24 +2698,14 @@ def private add_bias(var y : array<float>; yoff : int64; b : array<float>; boff,
 // rows), then run the int8·int8 SDOT kernel against the int8 weights. woff is the weight-element
 // offset; scales start at woff/32 (woff is block-aligned for every 2D tensor).
 def private mm_at_q8(var y : array<float>; t : Model; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; n, d : int64) {
-    let total = n * d
     quantize_q8_0_into(x, n, xq, xs, 0l, 0l)
-    array_view(t.qblob, woff, total) $(wq : array<int8>#) {
-        array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
-            matmul_q8q8(y, wq, ws, xq, xs, n, d)
-        }
-    }
+    matmul_q8q8(y, t.qblob, t.qscales, woff, xq, xs, n, d)
 }
 
-// Q4 matmul with the weight viewed into the quantized blob (4-bit, two per byte) + its per-block
-// scales. Bytes start at woff/2 (woff is even), scales at woff/32.
+// Q4 matmul with the weight in the quantized blob (4-bit, two per byte) + its per-block scales.
+// Bytes at woff/2 (woff is even), scales at woff/32 — the kernel's woff form does the math.
 def private mm_at_q4(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d : int64) {
-    let total = n * d
-    array_view(t.q4blob, woff / 2l, total / 2l) $(wq : array<uint8>#) {
-        array_view(t.q4scales, woff / 32l, total / 32l) $(ws : array<float>#) {
-            matmul_q4(y, wq, ws, x, n, d)
-        }
-    }
+    matmul_q4(y, t.q4blob, t.q4scales, woff, x, n, d)
 }
 
 // Fuse the attention Q/K/V projections (all three read s.xb) into one parallel dispatch when the
@@ -2751,23 +2746,13 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
 // quantizes the shared rmsnormed activation once per layer and reuses it across every expert's
 // gate/up matmul instead of re-quantizing per call.
 def private mm_at_q8_pre(var y : array<float>; t : Model; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    let total = n * d
-    array_view(t.qblob, woff, total) $(wq : array<int8>#) {
-        array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
-            matmul_q8q8(y, wq, ws, xq, xs, n, d)
-        }
-    }
+    matmul_q8q8(y, t.qblob, t.qscales, woff, xq, xs, n, d)
 }
 
-// Native-MXFP4 GEMV against a PRE-quantized activation: the weight region [d x n] is viewed into the
+// Native-MXFP4 GEMV against a PRE-quantized activation: the weight region [d x n] lives in the
 // nibble + E8M0 planes (woff is the weight-element offset, like mm_at_q8_pre). Expert stacks only.
 def private mm_at_mx4_pre(var y : array<float>; t : Model; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    let total = n * d
-    array_view(t.mxq, woff / 2l, total / 2l) $(wn : array<uint8>#) {
-        array_view(t.mxs, woff / 32l, total / 32l) $(we : array<uint8>#) {
-            matmul_mx4q8(y, wn, we, xq, xs, n, d)
-        }
-    }
+    matmul_mx4q8(y, t.mxq, t.mxs, woff, xq, xs, n, d)
 }
 
 // Region-list GEMVs (the MoE decode dispatch fuse): all k routed experts' same-shape projections in
@@ -2831,13 +2816,8 @@ def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<i
 // mm_at_mx4_pre): grouped MoE prefill dispatches here — no Q8 expansion — when the active backend
 // carries a native mx4 batch kernel (g_active_mx4_native_batch).
 def private mm_b_mx4_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
-    let total = n * d
     let ts_gemm = ref_time_ticks()
-    array_view(t.mxq, woff / 2l, total / 2l) $(wn : array<uint8>#) {
-        array_view(t.mxs, woff / 32l, total / 32l) $(we : array<uint8>#) {
-            matmul_mx4q8_batch(y, wn, we, xqb, xsb, n, d, npos)
-        }
-    }
+    matmul_mx4q8_batch(y, t.mxq, t.mxs, woff, xqb, xsb, n, d, npos)
     prof_add("mm_gemm", ts_gemm)
 }
 
@@ -2845,13 +2825,8 @@ def private mm_b_mx4_pre(var y : array<float>; t : Model; woff : int64; xqb : ar
 // the grouped MoE prefill runs many GEMMs off one requant (the whole-batch image or a gathered
 // expert bucket).
 def private mm_b_q8_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
-    let total = n * d
     let ts_gemm = ref_time_ticks()
-    array_view(t.qblob, woff, total) $(wq : array<int8>#) {
-        array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
-            matmul_q8q8_batch(y, wq, ws, xqb, xsb, n, d, npos)
-        }
-    }
+    matmul_q8q8_batch(y, t.qblob, t.qscales, woff, xqb, xsb, n, d, npos)
     prof_add("mm_gemm", ts_gemm)
 }
 
@@ -2863,9 +2838,7 @@ def private mm_b(var y : array<float>; t : Model; woff : int64; x : array<float>
         requant_rows_q8(x, n, npos, xqb, xsb)
         mm_b_q8_pre(y, t, woff, xqb, xsb, n, d, npos)
     } else {
-        array_view(t.wblob, woff, n * d) $(w : array<float>#) {
-            matmul_batch(y, w, x, n, d, npos)
-        }
+        matmul_batch(y, t.wblob, woff, x, n, d, npos)
     }
 }
 
@@ -3714,9 +3687,10 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
 // Gate transform + top-k selection + weight post-processing on one router-logit row, IN PLACE (the
 // top-k knockout consumes the row). The selected ids/weights land at idx[off..]/w[off..] — off is 0
 // for decode, p*k for the grouped prefill router. One body for both, so routing is bit-identical.
-def private moe_select(c : Config; var lg : array<float> | #; var idx : array<int64>; var w : array<float>; off : int64) {
+def private moe_select(c : Config; var lg : float?; var idx : array<int64>; var w : array<float>; off : int64) {
     let ne = c.n_expert
     let k = c.n_expert_used
+    unsafe {   // the whole body indexes the logit-row pointer (in-place gate + top-k knockout)
     // probs — softmax_weight routes on the RAW biased logits and softmaxes only the selected
     // top-k afterwards (gpt-oss)
     if (c.moe_gate == MoeGate.sigmoid) {
@@ -3793,18 +3767,17 @@ def private moe_select(c : Config; var lg : array<float> | #; var idx : array<in
             w[off + j] *= c.expert_weights_scale
         }
     }
+    }
 }
 
 // The shared expert's scalar sigmoid gate: σ(gate_vec_l · x). One body for decode and prefill.
-// Tuned dot, not an array_view loop — the block invoke + bounds-checked indexing was an
-// optimization boundary around a plain dot (reassociates the sum: tolerance, not bit, change).
-def private moe_shexp_gate(t : Model; l : int64; x : array<float> | #) : float {
+// Tuned dot on raw pointers, not an array_view loop — the block invoke + bounds-checked indexing
+// was an optimization boundary around a plain dot (reassociates the sum: tolerance-level change).
+def private moe_shexp_gate(t : Model; l : int64; xp : float const?) : float {
     let dim = t.config.dim
-    var gl = 0.0
     unsafe {
-        gl = dot(addr(t.fblob[t.shexp_gate_off + l * dim]), reinterpret<float const?>(addr(x[0])), dim)
+        return 1.0 / (1.0 + exp(-dot(addr(t.fblob[t.shexp_gate_off + l * dim]), xp, dim)))
     }
-    return 1.0 / (1.0 + exp(-gl))
 }
 
 // Routed experts, given the pre-normed input in s.xb and the top-k selection already in s.moe_idx /
@@ -3943,14 +3916,14 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     if (c.moe_router_bias) {
         add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
     }
-    moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
+    moe_select(c, unsafe(addr(s.moe_logits[0])), s.moe_idx, s.moe_w, 0l)
     prof_add("moe_route", ts_route)
     moe_experts_apply(t, s, l)
     // shared expert, gated by a sigmoid scalar from its per-layer gate vector
     if (c.n_ff_shexp > 0l) {
         let pre_q8 = t.quant == QuantMode.q8
         let ts_sh = ref_time_ticks()
-        let g = moe_shexp_gate(t, l, s.xb)
+        let g = moe_shexp_gate(t, l, unsafe(addr(s.xb[0])))
         let nsh = c.n_ff_shexp
         let she = dim * nsh
         if (pre_q8) {
@@ -4070,9 +4043,13 @@ def private gemma4_router_tmp(t : Model; var s : Session; l : int64) {
     }
     let scale = 1.0 / sqrt(float(ss / double(dim)) + t.config.norm_eps)
     let inv_d = 1.0 / sqrt(float(dim))
-    array_view(t.fblob, t.moe_router_scale_off + l * dim, dim) $(sc : array<float>#) {
+    unsafe {
+        let scp = reinterpret<float const?>(addr(t.fblob[t.moe_router_scale_off + l * dim]))
+        var op = addr(s.xb2[0])
+        let ip = reinterpret<float const?>(addr(s.moe_ao[0]))
+        let si = scale * inv_d
         for (i in range64(dim)) {
-            s.xb2[i] = s.moe_ao[i] * scale * inv_d * sc[i]
+            op[i] = ip[i] * si * scp[i]
         }
     }
 }
@@ -4092,7 +4069,7 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     let ts_route = ref_time_ticks()
     gemma4_router_tmp(t, s, l)
     mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb2, dim, ne)
-    moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
+    moe_select(c, unsafe(addr(s.moe_logits[0])), s.moe_idx, s.moe_w, 0l)
     for (j in range64(k)) {   // ggml scales each expert's down output by ffn_down_exps_s — fold it into w_j
         s.moe_w[j] *= t.fblob[t.moe_down_scale_off + l * ne + s.moe_idx[j]]
     }
@@ -5395,13 +5372,9 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         if (c.moe_router_bias) {
             add_bias(s.moe_rlog, p * ne, t.fblob, t.router_b_off + l * ne, ne)
         }
-        array_view(s.moe_rlog, p * ne, ne) $(var lg : array<float>#) {
-            moe_select(c, lg, s.moe_idx_b, s.moe_w_b, p * k)
-        }
+        moe_select(c, unsafe(addr(s.moe_rlog[p * ne])), s.moe_idx_b, s.moe_w_b, p * k)
         if (nsh > 0l) {
-            array_view(s.xb_b, p * dim, dim) $(var xv : array<float>#) {
-                s.moe_gl_b[p] = moe_shexp_gate(t, l, xv)
-            }
+            s.moe_gl_b[p] = moe_shexp_gate(t, l, unsafe(addr(s.xb_b[p * dim])))
         }
     }
     // bucket the (position, slot) pairs by expert — CSR with the in-place cursor trick: counts
@@ -5707,9 +5680,7 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
     gemma4_router_batch(t, s.xb2_b, s.x_b, l, dim, npos)
     mm_fblob_b(s.moe_rlog, t, t.router_off + l * ne * dim, s.xb2_b, dim, ne, npos)
     for (p in range64(npos)) {
-        array_view(s.moe_rlog, p * ne, ne) $(var lg : array<float>#) {
-            moe_select(c, lg, s.moe_idx_b, s.moe_w_b, p * k)
-        }
+        moe_select(c, unsafe(addr(s.moe_rlog[p * ne])), s.moe_idx_b, s.moe_w_b, p * k)
         for (j in range64(k)) {
             s.moe_w_b[p * k + j] *= t.fblob[t.moe_down_scale_off + l * ne + s.moe_idx_b[p * k + j]]
         }
@@ -5955,12 +5926,8 @@ def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int6
         // the last position, so re-apply the final RMSNorm to EVERY position and accumulate.
         forward_prefill(t, s, tokens, npos, 0l)
         for (p in range64(npos)) {
-            array_view(s.x_b, p * dim, dim) $(var xv : array<float>#) {
-                rms_at(s.xb, t, t.rms_final_off, xv, dim)
-            }
-            for (i in range64(dim)) {
-                out[i] += s.xb[i]
-            }
+            rms_at(s.xb, t, t.rms_final_off, s.x_b, p * dim, dim)
+            add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
         }
     } else {
         // q4 (no batched prefill) or a single token: per-token forward leaves s.xb = post-final-norm hidden.
@@ -6077,9 +6044,7 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     // final rmsnorm + classifier on the LAST position only (that's what we sample next)
     let ts_final = ref_time_ticks()
     let last = npos - 1l
-    array_view(s.x_b, last * dim, dim) $(var xv : array<float>#) {
-        rms_at(s.xb, t, t.rms_final_off, xv, dim)
-    }
+    rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
     if (c.shared_weights && !t.cls_q8) {
         mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
     } else {

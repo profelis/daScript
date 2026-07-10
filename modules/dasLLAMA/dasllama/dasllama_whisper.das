@@ -172,11 +172,7 @@ def whisper_dec_quantize(var w : WhisperModel) {
 def private wm_mm(w : WhisperModel; var y : array<float>; woff : int64; x : array<float>;
                   xq : array<int8>; xs : array<float>; n, d, npos : int64) {
     if (w.dq8 && n % 32l == 0l) {
-        array_view(w.dqblob, woff, n * d) $(wq : array<int8>#) {
-            array_view(w.dqscales, woff / 32l, n * d / 32l) $(ws : array<float>#) {
-                matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, npos)
-            }
-        }
+        matmul_q8q8_batch(y, w.dqblob, w.dqscales, woff, xq, xs, n, d, npos)
     } else {
         mm_blob_b(y, w.dblob, woff, x, n, d, npos)
     }

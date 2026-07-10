@@ -4,7 +4,6 @@ module dasllama_audio shared public
 
 require math
 require daslib/fio
-require daslib/array_boost
 require dasllama/dasllama_math
 require dasllama/dasllama_par
 require dasllama/dasllama_gguf
@@ -807,11 +806,10 @@ def add_inplace_rows(var x : array<float>; r : array<float>; n : int64) {
     }
 }
 
-//! fp32 matmul against a blob region: Y [npos×d] = W[d×n]·X[npos×n] (threaded matmul_batch)
+//! fp32 matmul against a blob region: Y [npos×d] = W[d×n]·X[npos×n] (threaded matmul_batch,
+//! blob+offset form — no array_view).
 def mm_blob_b(var y : array<float>; blob : array<float>; woff : int64; x : array<float>; n, d, npos : int64) {
-    array_view(blob, woff, n * d) $(w : array<float>#) {
-        matmul_batch(y, w, x, n, d, npos)
-    }
+    matmul_batch(y, blob, woff, x, n, d, npos)
 }
 
 // ===== tower Q8 rail (parakeet's v1 recipe: whole-blob Q8_0 image + per-GEMM-region repack) =====
@@ -873,11 +871,7 @@ def tower_quantize(var t : AudioTower) {
 def private tw_mm(t : AudioTower; var y : array<float>; woff : int64; x : array<float>;
                   xq : array<int8>; xs : array<float>; n, d, npos : int64) {
     if (t.q8 && n % 32l == 0l) {
-        array_view(t.qblob, woff, n * d) $(wq : array<int8>#) {
-            array_view(t.qscales, woff / 32l, n * d / 32l) $(ws : array<float>#) {
-                matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, npos)
-            }
-        }
+        matmul_q8q8_batch(y, t.qblob, t.qscales, woff, xq, xs, n, d, npos)
     } else {
         mm_blob_b(y, t.fblob, woff, x, n, d, npos)
     }
