@@ -363,6 +363,74 @@ def test_scheduler_prefix_cache(t : T?) {
             // idle scheduler: the only live page holds are the cache's
             t |> equal(int64(length(sch.pool.free_groups)),
                        sch.pool.capacity_groups - prefix_held_groups(sch.prefix))
+
+            // ===== stop-finished streams donate an ALIGNED history: continuation attach == cold.
+            // A "stop" finish must donate rows matching prompt + emitted + close exactly — the stop
+            // was sampled from the last emitted token's eval, so only the CLOSE tokens are pending.
+            // Re-evaling the last token would shift every row past the reply boundary against the
+            // page's token list, poisoning multi-turn continuation attaches.
+            var prompt3 <- encode(m, "The little robot climbed the old bakery roof to count the evening birds", true, false)
+            var ref3 <- ref_generate(m, prompt3, greedy, 8l, none)
+            var kstop = -1
+            for (k in range(1, length(ref3.toks))) {   // first token unique so far — a safe stop id
+                var seen = false
+                for (j in range(k)) {
+                    seen ||= ref3.toks[j] == ref3.toks[k]
+                }
+                if (!seen) {
+                    kstop = k
+                    break
+                }
+            }
+            if (kstop >= 1) {
+                var stops <- [ref3.toks[kstop]]
+                var close <- [100l, 200l]   // any valid ids: the donated history must include them
+                var sch2 <- create_scheduler(m, 1l, 4l, 64l, 16l)
+                events |> clear()
+                var req <- make_req(50l, prompt3, greedy, 8l, stops)
+                req.close_toks := close
+                t |> success(submit(m, sch2, req), "stop stream queued")
+                drain(m, sch2, events)
+                t |> equal(finished_of(events, 50l).finish, "stop")
+                var emitted <- toks_of(events, 50l)
+                t |> equal(length(emitted), kstop)
+                // continuation: the next turn's prompt replays prompt + reply + close, then diverges
+                var prompt4 : array<int64>
+                prompt4 |> push_from(prompt3, emitted, close)
+                for (i in range64(16l)) {
+                    prompt4 |> push(500l + i)
+                }
+                events |> clear()
+                t |> success(submit(m, sch2, make_req(51l, prompt4, greedy, 6l, none)), "warm continuation queued")
+                drain(m, sch2, events)
+                var warm4 <- toks_of(events, 51l)
+                let fin4 = finished_of(events, 51l)
+                t |> success(fin4.n_cached > int64(length(prompt3)),
+                    "continuation attached past the reply boundary (cached {fin4.n_cached})")
+                // cold reference: the same continuation with no cache
+                var sch3 <- create_scheduler(m, 1l, 4l, 64l, 16l)
+                events |> clear()
+                t |> success(submit(m, sch3, make_req(52l, prompt4, greedy, 6l, none)), "cold continuation queued")
+                drain(m, sch3, events)
+                var cold4 <- toks_of(events, 52l)
+                t |> success(same(warm4, cold4), "continuation attach bit-exact vs cold — donated rows aligned")
+                delete cold4
+                unsafe {
+                    delete sch3
+                }
+                delete warm4
+                delete prompt4
+                delete emitted
+                unsafe {
+                    delete sch2
+                }
+                delete close
+                delete stops
+            } else {
+                t |> success(true, "no unique stop candidate in 8 greedy tokens — continuation arm skipped")
+            }
+            delete ref3
+            delete prompt3
             set_prefill_attn_mode(saved_mode)
             delete cold
             delete warm

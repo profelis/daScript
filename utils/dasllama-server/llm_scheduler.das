@@ -307,18 +307,24 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
     return !empty(sch.streams) || !empty(sch.queue)
 }
 
-// Donate a finished stream's KV pages. A completed stream first evals its pending token (the last
-// emitted one — sampled but never fed back) plus the close tokens, so the NEXT turn of the same
-// conversation (prompt + reply + close + new user turn) extends the cached prefix; an evicted or
-// context-full stream donates only what it evaled. prefix_insert trims to n_past.
+// Donate a finished stream's KV pages, first evaling what the cache still lacks. A "length"
+// finish leaves the last emitted token pending (sampled, never fed back); a "stop" finish already
+// evaled every emitted token — the stop was sampled from the last one's eval — so only the close
+// tokens are pending (re-evaling the last token would shift every row past the reply boundary
+// against the page's token list). Either way the close tokens follow, so the NEXT turn of this
+// conversation (prompt + reply + close + new user turn) extends the cached prefix. The tail is
+// skipped when it cannot fit; evicted streams donate only what ran. prefix_insert trims to n_past.
 def private donate_stream(m : Model; var sch : Scheduler; var st : Stream) {
-    let close_n = int64(length(st.close_toks))
-    if (st.finish != "evicted" && st.cur_tok >= 0l
-            && st.session.n_past + 1l + close_n <= m.config.seq_len) {
+    if (st.finish != "evicted") {
         sch.donate_toks |> clear()
-        sch.donate_toks |> push(st.cur_tok)
+        if (st.finish == "length" && st.cur_tok >= 0l) {
+            sch.donate_toks |> push(st.cur_tok)
+        }
         sch.donate_toks |> push_from(st.close_toks)
-        eval(m, st.session, sch.donate_toks)
+        if (!empty(sch.donate_toks)
+                && st.session.n_past + int64(length(sch.donate_toks)) <= m.config.seq_len) {
+            eval(m, st.session, sch.donate_toks)
+        }
     }
     sch.donate_toks |> clear()
     sch.donate_toks |> reserve(int(st.n_prefilled) + length(st.session.recent) + length(st.close_toks))
