@@ -34,7 +34,7 @@ struct SchedEvent {
     finish : string = ""                    // finished: "stop" | "length" | "evicted"
     n_prompt : int64 = 0l                   // finished: prompt tokens prefilled
     n_gen : int64 = 0l                      // finished: tokens generated
-    n_cached : int64 = 0l                   // finished: prefix-cache hit length (0 until the prefix cache lands)
+    n_cached : int64 = 0l                   // finished: prefix-cache hit length (tokens attached at admit)
     ttft_us : int64 = 0l                    // finished: admit -> first sampled token (microseconds)
     gen_us : int64 = 0l                     // finished: first sampled token -> finish (microseconds)
 }
@@ -45,7 +45,7 @@ struct SchedEvent {
 struct PendingReq {
     id : int64
     prompt : array<int64>                   // the full rendered prompt
-    close_toks : array<int64>               // the turn-terminating tokens (render_close; evaled once the prefix cache lands)
+    close_toks : array<int64>               // the turn-terminating tokens (render_close; evaled at donation so the next turn extends the cached prefix)
     stop_ids : array<int64>                 // sampling one of these finishes "stop" (the token is not emitted)
     params : SamplingParams = SamplingParams()
     max_new : int64 = 256l                  // reply token budget (>= 1)
@@ -67,7 +67,7 @@ struct Stream {
     cur_tok : int64 = -1l                   // sampled but not yet evaled — the next decode step's input
     state : StreamState = StreamState.prefilling
     finish : string = ""
-    n_cached : int64                        // prefix-cache hit length (0 this rung)
+    n_cached : int64                        // prefix-cache hit length (set at admit; 0 in flat mode)
     t_admit : int64                         // ref_time_ticks at admit
     t_first : int64                         // ref_time_ticks at the first sampled token (0 until then)
     ttft_us : int64

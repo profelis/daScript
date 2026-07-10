@@ -8,7 +8,7 @@ options fast_math = true  // ggml-parity FP laxity — a serving benchmark, not 
 //   2. chunk interference: a decoding stream's inter-token p95 while a long prompt prefills,
 //      per chunk size K — the data that tunes --chunk
 //   3. warm vs cold TTFT for an identical prompt — the prefix-cache collapse
-//   bin/daslang -jit utils/dasllama-server/server_bench.das -- -m <model.gguf> [-b 8] [-n 64] [--long 512]
+//   bin/daslang -jit utils/dasllama-server/server_bench.das -- -m <model.gguf> [-b 8] [-n 64] [--long-prompt 512]
 
 require llm_scheduler           // the scheduler under bench (sibling — bare require, hyphenated dir)
 require dasllama/dasllama       // facade: load_model / setup_dasllama_jobque
