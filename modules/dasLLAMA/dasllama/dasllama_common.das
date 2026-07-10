@@ -3697,11 +3697,12 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm before the residual add
         rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
     }
-    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
     // gemma4: scale the whole layer output (after the residual). The E-series applies it AFTER its PLE
     // block (in ffn_gemma4_decode), so skip it here when PLE is on.
     if (c.layer_out_scale && !has_ple(c)) {
-        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
+        add_scale_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), t.fblob[t.out_scale_off + l], dim)
+    } else {
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
     }
     prof_add("act_resid", ts_resid1)
 }
@@ -3795,13 +3796,13 @@ def private moe_select(c : Config; var lg : array<float> | #; var idx : array<in
 }
 
 // The shared expert's scalar sigmoid gate: σ(gate_vec_l · x). One body for decode and prefill.
+// Tuned dot, not an array_view loop — the block invoke + bounds-checked indexing was an
+// optimization boundary around a plain dot (reassociates the sum: tolerance, not bit, change).
 def private moe_shexp_gate(t : Model; l : int64; x : array<float> | #) : float {
     let dim = t.config.dim
     var gl = 0.0
-    array_view(t.fblob, t.shexp_gate_off + l * dim, dim) $(gv : array<float>#) {
-        for (i in range64(dim)) {
-            gl += gv[i] * x[i]
-        }
+    unsafe {
+        gl = dot(addr(t.fblob[t.shexp_gate_off + l * dim]), reinterpret<float const?>(addr(x[0])), dim)
     }
     return 1.0 / (1.0 + exp(-gl))
 }
@@ -3898,10 +3899,7 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         prof_add("mm_moe", ts_down)
         let ts_red = ref_time_ticks()
         for (j in range64(k)) {   // slot order preserved — the sum is bit-identical
-            let w = s.moe_w[j]
-            for (i in range64(dim)) {
-                s.moe_acc[i] += w * s.moe_dn[j * dim + i]
-            }
+            axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[j * dim])), s.moe_w[j], dim)
         }
         prof_add("moe_reduce", ts_red)
     } else {
@@ -3927,10 +3925,7 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
             prof_add("mm_moe", ts_down)
             let ts_red = ref_time_ticks()
-            let w = s.moe_w[j]
-            for (i in range64(dim)) {
-                s.moe_acc[i] += w * s.xb2[i]
-            }
+            axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb2[0])), s.moe_w[j], dim)
             prof_add("moe_reduce", ts_red)
         }
     }
@@ -3976,9 +3971,7 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
             gate_batch(s.hb, s.hb2, c.ffn_act, nsh, 1l)
             mm(s.xb2, t, t.wsh2_off + l * she, s.hb, s.xq, s.xs, nsh, dim)
         }
-        for (i in range64(dim)) {
-            s.moe_acc[i] += g * s.xb2[i]
-        }
+        axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb2[0])), g, dim)
         prof_add("mm_shexp", ts_sh)
     }
 }
@@ -4113,9 +4106,7 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     rms_at(s.xb, t, t.rms_post_ffn1_off + l * dim, s.xb, dim)
     prof_add("mm_shexp", ts_sh)
     // combine then the shared post_ffw_norm on the sum
-    for (i in range64(dim)) {
-        s.moe_acc[i] += s.xb[i]
-    }
+    add_inplace(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb[0])), dim)
     rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
 }
 
@@ -4138,9 +4129,10 @@ def private ffn_gemma4_decode(t : Model; var s : Session; l : int64) {
     copy_floats(s.x, 0l, s.moe_ao, 0l, dim)
     gemma4_moe_ffn(t, s, l)
     let ts_resid = ref_time_ticks()
-    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     if (c.layer_out_scale) {
-        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
+        add_scale_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), t.fblob[t.out_scale_off + l], dim)
+    } else {
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     }
     prof_add("act_resid", ts_resid)
 }
@@ -4168,9 +4160,7 @@ def private ffn_gemma4_prefill(t : Model; var s : Session; l : int64; npos : int
         for (p in range64(npos)) {
             copy_floats(s.x_b, p * dim, s.moe_ao, 0l, dim)
             gemma4_moe_ffn(t, s, l)
-            for (i in range64(dim)) {
-                s.x_b[p * dim + i] += s.moe_acc[i]
-            }
+            add_inplace(unsafe(addr(s.x_b[p * dim])), unsafe(addr(s.moe_acc[0])), dim)
         }
     }
     if (c.layer_out_scale) {
@@ -4191,9 +4181,10 @@ def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
     if (c.pre_post_norm) {
         rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
     }
-    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     if (c.layer_out_scale) {
-        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
+        add_scale_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), t.fblob[t.out_scale_off + l], dim)
+    } else {
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     }
     prof_add("act_resid", ts_resid)
 }
@@ -5850,9 +5841,7 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
             if (c.pre_post_norm) {
                 rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
             }
-            for (i in range64(dim)) {   // residual add into this position's x_b row
-                s.x_b[p * dim + i] += s.moe_acc[i]
-            }
+            add_inplace(unsafe(addr(s.x_b[p * dim])), unsafe(addr(s.moe_acc[0])), dim)   // residual add into this position's x_b row
         }
     }
     if (c.layer_out_scale) {

@@ -249,6 +249,20 @@ def template add_inplace_template(var d : float ?; s : float const ?; n : int64)
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def add_inplace(var d : float?; s : float const?; n : int64) {}
 
+//! d[j] = (d[j] + s[j]) * scale in ONE pass — the residual add fused with the per-layer output
+//! scale (gemma4 layer_out_scale, the PLE 1/sqrt(2) fold). Bit-identical to add_inplace followed
+//! by scale_inplace (same two fp ops per element, same order) at one RMW walk instead of two.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template add_scale_inplace_template(var d : float ?; s : float const ?; scale : float; n : int64) : void {
+    for [tune = 1] (j in range64(n)) {
+        unsafe {
+            d[j] = (d[j] + s[j]) * scale
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def add_scale_inplace(var d : float?; s : float const?; scale : float; n : int64) {}
+
 //! d[j] *= s[j], width-8 vectorized — the SwiGLU/GeGLU gate multiply (act(W1·x) * (W3·x)).
 [hint(unsafe_range_check, noalias = d, noalias = s)]
 def template mul_inplace_template(var d : float ?; s : float const ?; n : int64) : void {
