@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 15b5020..138a8e2 100644
+index c21675e..1757b0f 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -48,7 +48,9 @@
@@ -13,7 +13,51 @@ index 15b5020..138a8e2 100644
  #endif
  
  static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
-@@ -9432,6 +9434,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -1510,6 +1512,43 @@ struct test_case {
+             return true;
+         }
+ 
++        // dasLLAMA pure-GEMM ladder: GGML_PERF_WEIGHT_BUFT=<name-substr> (e.g. "AMX") places
++        // quantized leaf tensors into the matching CPU extra buffer type so extra-buft GEMM
++        // paths (AMX mmq / repack) engage in perf mode — the default CPU buffer never does.
++        std::vector<ggml_backend_buffer_ptr> weight_bufs;
++        if (const char * want = getenv("GGML_PERF_WEIGHT_BUFT")) {
++            ggml_backend_buffer_type_t wbuft = nullptr;
++            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++            auto get_extra_fn = reg ? (ggml_backend_dev_get_extra_bufts_t)
++                ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
++            if (get_extra_fn != nullptr) {
++                for (ggml_backend_buffer_type_t * b = get_extra_fn(dev); b && *b; ++b) {
++                    if (strstr(ggml_backend_buft_name(*b), want) != nullptr) { wbuft = *b; break; }
++                }
++            }
++            for (ggml_tensor * t = wbuft ? ggml_get_first_tensor(ctx.get()) : nullptr;
++                 t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->op != GGML_OP_NONE || t->view_src != nullptr || !ggml_is_quantized(t->type)) {
++                    continue;
++                }
++                ggml_backend_buffer_t wb = ggml_backend_buft_alloc_buffer(wbuft, ggml_backend_buft_get_alloc_size(wbuft, t));
++                if (wb == NULL) {
++                    continue;
++                }
++                ggml_backend_tensor_alloc(wb, t, ggml_backend_buffer_get_base(wb));
++                if (!ggml_backend_dev_supports_op(dev, out)) {
++                    // shape fails the extra buft's gates — roll back to the default buffer
++                    t->buffer = NULL;
++                    t->data   = NULL;
++                    t->extra  = NULL;
++                    ggml_backend_buffer_free(wb);
++                    continue;
++                }
++                weight_bufs.emplace_back(wb);
++                fprintf(stderr, "  %s: weights in %s\n", current_op_name.c_str(), ggml_backend_buft_name(wbuft));
++            }
++        }
+         // allocate
+         ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend)); // smart ptr
+ 
+@@ -9440,6 +9479,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          }
      }
  
