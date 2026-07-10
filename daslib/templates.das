@@ -75,7 +75,7 @@ class TemplateMacro : AstFunctionAnnotation {
         if (taidx == -1) return expr
         var ffunc = expr.func
         // new call
-        var newcall = unsafe(reinterpret<ExprCallFunc?> clone_expression(expr))
+        var newcall = unsafe(reinterpret<ExprCallFunc?>(clone_expression(expr)))
         // new func
         var fclone = clone_function(ffunc)
         fclone.fromGeneric = ffunc

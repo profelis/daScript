@@ -38,7 +38,7 @@ def public matches(var parser; tmpl : string; strlen : int) : bool {
     return false if (parser.input |> length < mark + strlen)
 
     unsafe {
-        if (memcmp(addr(parser.input[mark]), reinterpret<uint8?> tmpl, strlen) == 0) {
+        if (memcmp(addr(parser.input[mark]), reinterpret<uint8?>(tmpl), strlen) == 0) {
             parser |> move(strlen)
             return true
         }

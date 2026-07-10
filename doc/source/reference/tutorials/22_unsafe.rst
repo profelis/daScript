@@ -71,7 +71,7 @@ reinterpret
 ``reinterpret`` performs a raw bit cast between types of the same size::
 
   let f = 1.0
-  let bits = unsafe(reinterpret<int> f)
+  let bits = unsafe(reinterpret<int>(f))
   print("{bits:x}\n")  // 3f800000
 
 .. warning::

@@ -2096,6 +2096,19 @@ install(FILES ${DAS_GLTF_VIEWER_EXAMPLE}
     DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/mesh_viewer_opengl
 )
 
+# dasGLTF Vulkan ImGui mesh viewer (vulkan_gltf sibling of the above). The dasVulkan + dasImgui deps
+# are daspkg-installed into modules/ (gitignored) from the .das_package; run with
+# -project_root examples/gltf/mesh_viewer_vulkan. Ships source + manifest only.
+file(GLOB DAS_GLTF_VIEWER_VULKAN_EXAMPLE
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_vulkan/*.das
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_vulkan/.das_package
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_vulkan/.gitignore
+    ${PROJECT_SOURCE_DIR}/examples/gltf/mesh_viewer_vulkan/README.md
+)
+install(FILES ${DAS_GLTF_VIEWER_VULKAN_EXAMPLE}
+    DESTINATION ${DAS_INSTALL_EXAMPLESDIR}/gltf/mesh_viewer_vulkan
+)
+
 add_subdirectory(tutorials)
 
 # Test-runner targets (run_tests_interpreter / _jit / _aot).

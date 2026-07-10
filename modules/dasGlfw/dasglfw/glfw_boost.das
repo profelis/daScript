@@ -7,7 +7,6 @@ module glfw_boost shared
 
 require glfw public
 require daslib/safe_addr
-require math
 require daslib/rtti
 
 def glfwInitOpenGL(major : int = 3; minor : int = 3; dctx : bool = false; compat : bool = false) {
@@ -31,19 +30,19 @@ def glfwGetFramebufferSize(window : GLFWwindow?; var display_w, display_h : int&
 
 def gl_array_ptr(foo : array<auto>) : void? {
     unsafe {
-        return reinterpret<void?> addr(foo[0])
+        return reinterpret<void?>(addr(foo[0]))
     }
 }
 
 def gl_array_ptr(foo : auto[]) : void? {
     unsafe {
-        return reinterpret<void?> addr(foo[0])
+        return reinterpret<void?>(addr(foo[0]))
     }
 }
 
 def gl_array_ptr(foo : auto[][]) : void? {
     unsafe {
-        return reinterpret<void?> addr(foo[0][0])
+        return reinterpret<void?>(addr(foo[0][0]))
     }
 }
 

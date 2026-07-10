@@ -904,7 +904,7 @@ def command_processor {
             } else {
                 decoder = new AudioSourceDecoder()
             }
-            decoder->initFromDecoder(unsafe(reinterpret<ma_decoder?> dcmd.decoder), dcmd.rate, dcmd.channels)
+            decoder->initFromDecoder(unsafe(reinterpret<ma_decoder?>(dcmd.decoder)), dcmd.rate, dcmd.channels)
             add_channel(dcmd.sid) <| new AudioChannel(decoder)
         } elif (cmd is add_decoder_3d) {
             assume dcmd = cmd as add_decoder_3d
@@ -914,7 +914,7 @@ def command_processor {
             } else {
                 decoder = new AudioSourceDecoder()
             }
-            decoder->initFromDecoder(unsafe(reinterpret<ma_decoder?> dcmd.decoder), dcmd.rate, dcmd.channels)
+            decoder->initFromDecoder(unsafe(reinterpret<ma_decoder?>(dcmd.decoder)), dcmd.rate, dcmd.channels)
             add_channel_3d(dcmd.sid, dcmd.position, dcmd.attenuation) <| new AudioChannel(decoder)
         } elif (cmd is add_pcm_stream) {
             assume pcmd = cmd as add_pcm_stream
@@ -1585,7 +1585,7 @@ enum public ReverbPreset {
 
 def public set_reverb_preset(sid : SID; preset : ReverbPreset) {
     //! set reverb from preset for sound
-    return set_reverb(sid, get_preset(unsafe(reinterpret<I3DL2Preset> preset)))
+    return set_reverb(sid, get_preset(unsafe(reinterpret<I3DL2Preset>(preset))))
 }
 
 def public set_chorus(sid : SID; config : ma_chorus_config) {
@@ -1630,7 +1630,7 @@ def public get_audio_command_stream : void ? {
 
 [unsafe_operation]
 def public set_audio_thread_command_stream(ch : void?) {
-    var s = unsafe(reinterpret<Stream?> ch)
+    var s = unsafe(reinterpret<Stream?>(ch))
     if (s == g_command_stream) return
     if (g_command_stream != null) {
         g_command_stream |> release
@@ -1646,7 +1646,7 @@ def public get_sound_sid : void ? {
 }
 
 def public set_sound_sid(next_sid : void?) {
-    var sid = unsafe(reinterpret<Atomic64?> next_sid)
+    var sid = unsafe(reinterpret<Atomic64?>(next_sid))
     if (sid == g_sound_sid) return
     g_sound_sid = sid
 }

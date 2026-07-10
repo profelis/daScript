@@ -184,8 +184,8 @@ Must ``reinterpret`` back to a typed pointer before use::
   unsafe {
       var x = 123
       var px = addr(x)
-      var vp : void? = reinterpret<void?> px   // erase type
-      var px2 = reinterpret<int?> vp           // restore type
+      var vp : void? = reinterpret<void?>(px)   // erase type
+      var px2 = reinterpret<int?>(vp)           // restore type
       print("{*px2}\n")                        // 123
   }
 
@@ -209,8 +209,8 @@ Requires ``unsafe``::
 
   unsafe {
       let f = 1.0
-      let bits = reinterpret<int> f    // IEEE 754: 0x3f800000
-      let back = reinterpret<float> bits
+      let bits = reinterpret<int>(f)    // IEEE 754: 0x3f800000
+      let back = reinterpret<float>(bits)
       print("{back}\n")                // 1
   }
 

@@ -107,7 +107,7 @@ When you discover something new about daslang syntax, semantics, or conventions 
 
 ## daslang Language — Gen2 Syntax (REQUIRED)
 
-All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key rules:
+**gen2 is the DEFAULT parser** — every `.das` file parses as gen2 unless it explicitly opts out with `options gen2 = false` (the only gen1 discriminator; the `options gen2` markers around the tree are historical no-ops — NEVER infer gen1 from their absence). All code MUST use gen2 syntax; house style still adds `options gen2` at the top of new files. Key rules:
 
 - **Parentheses** on control flow: `if (x > 0)`, `for (i in range(10))`, `while (running)`
 - **Braces** on all blocks: `def foo() { ... }`, `if (x) { ... }`
@@ -126,6 +126,7 @@ All code MUST use gen2 syntax (add `options gen2` at the top of every file). Key
 - **`typeinfo`:** `typeinfo trait_name(type<T>)` — trait name outside parens
 - **`static_if`:** `static_if (condition) { ... }` — parentheses required
 - **Type function call:** `take(type<int>, 1, 2)` — NOT `take < int > (1, 2)`
+- **Casts require call-style parens:** `cast<T>(x)` / `upcast<T>(x)` / `reinterpret<T>(x)` — the parenthesized operand is mandatory and self-delimiting, so `reinterpret<uint8?>(p) + 1` means `(reinterpret<uint8?>(p)) + 1`, like the call it looks like. The old juxtaposition form `cast<T> x` is a syntax error (it swallowed trailing `<< >> + - * / % ??` into the operand, silently running the arithmetic on `x`'s original type — stride 0 for `void?`, i.e. dropping the add). Related: pointer arithmetic on `void?` is a compile error (30950); do byte math via `intptr` and reinterpret once
 - **Newlines inside `(...)`, `[...]`, `{...}` are free** — long pipe chains, multi-arg calls, array/table literals can wrap freely. Statement-level (no surrounding bracket) still requires one statement per line, so wrap the RHS in `(...)` if a `let x = a |> b |> c` needs to break across lines. **DANGER — silent, no error:** without the parens, a continuation line starting with a *unary-capable* operator (`+`, `-`) parses as a separate statement — `+ b` is unary plus, pure, so the optimizer **silently deletes it**. `let x = a` ⏎ `+ b` ⏎ `+ c` becomes just `let x = a` (the `+ b`/`+ c` lines vanish) — wrong result, no diagnostic (verified: `x` is `a`, not `a+b+c`). A non-unary operator like `|> f()` can't begin a statement, so it errors loudly instead — it's `+`/`-` that bite silently. Always wrap a multi-line arithmetic RHS in `(...)`
 - **Inline literals over temp-var-and-push** — for short arrays consumed in one expression, write `stack([a, b, c])` rather than `var xs : array<T>; xs |> emplace(a); xs |> emplace(b); stack(xs)`. Faster in interpreted mode and easier to read; same applies to table literals and other bracketed constructors. Threshold: while it stays readable
 
@@ -302,7 +303,7 @@ A generic that should accept `array<T>`, `array<array<T>>`, … (any nesting) �
 | 6 qmacro arms differing only in the call target (`if isTry { qmacro(_::try_run_select(…)) } elif … { … }`) | `let fname = (isTry ? "try_run_select" : "run_select") + suffix; qmacro($c(fname)(…))` | `$c(stringVar)` splices a function name; resolution at splice site uses user's `require` chain. Note: `_::$c(…)` is a parse error — drop `_::` |
 | `if (true) { ... }` | `{ ... }` | bare blocks create lexical scope in gen2 |
 | `var inscope r <- expr; return <- r` | `return <- expr` | direct return avoids intermediate |
-| `unsafe { (reinterpret<ExprBlock?> blk).list }` / `unsafe(reinterpret<T?> x)` | make param `var` + plain `x.list` | `var` param gives non-const field access without reinterpret |
+| `unsafe { (reinterpret<ExprBlock?>(blk)).list }` / `unsafe(reinterpret<T?>(x))` | make param `var` + plain `x.list` | `var` param gives non-const field access without reinterpret |
 | `if (cond) { return X }` (or `{ break }` / `{ continue }`) | `if (cond) return X` or postfix `return X if (cond)` | STYLE005: braces around a single-statement early-exit are noise |
 | `for (i in range(length(arr))) { ... arr[i] ... }` where `i` is used only as `arr[i]` | `for (c in arr) { ... c ... }` | PERF018: direct iteration drops the index variable |
 | `from_JV(v, type<int>, 13)` | `v ?? 13` | STYLE020: json_boost provides `operator ??` for every scalar `from_JV` overload |

@@ -187,7 +187,7 @@ def with_http_request(blk : block<(var req : HttpRequest?#) : void>) {
     //! Use this to configure and send outbound HTTP requests.
     var req = new HttpRequest
     unsafe {
-        invoke(blk, reinterpret<HttpRequest?#> req)
+        invoke(blk, reinterpret<HttpRequest?#>(req))
         delete req
     }
 }
@@ -200,7 +200,7 @@ def get_body_bytes(resp : HttpResponse?) : array<uint8> {
     bytes |> resize(resp.content_length)
     peek(resp.body) $(bodybytes) {
         unsafe {
-            memcpy(addr(bytes[0]), reinterpret<void?> bodybytes, resp.content_length)
+            memcpy(addr(bytes[0]), reinterpret<void?>(bodybytes), resp.content_length)
         }
     }
     return <- bytes

@@ -50,7 +50,7 @@ def check_recursive(at : LineInfo; var fun : Function?) {
 def collect_call_tree(fun : Function?; var visited : table<Function?>) {
     if (fun.flags.builtIn || visited |> key_exists(fun)) return
     visited |> insert(fun)
-    unsafe(reinterpret<FunctionPtr> fun) |> get_use_functions() $(f) {
+    unsafe(reinterpret<FunctionPtr>(fun)) |> get_use_functions() $(f) {
         collect_call_tree(f, visited)
     }
 }

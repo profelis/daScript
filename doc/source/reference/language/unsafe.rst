@@ -62,7 +62,7 @@ Upcast and reinterpret cast require an unsafe section:
 .. code-block:: das
 
     unsafe {
-        return reinterpret<void?> 13            // reinterpret can create unsafe pointers
+        return reinterpret<void?>(13)            // reinterpret can create unsafe pointers
     }
 
 Indexing into a pointer is unsafe:

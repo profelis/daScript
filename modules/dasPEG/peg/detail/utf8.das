@@ -6,7 +6,6 @@ options no_aot = true
 options strict_smart_pointers = true
 
 require daslib/utf8_utils
-require daslib/strings
 
 module utf8 shared
 
@@ -27,7 +26,7 @@ def public get_next_character(utf8_string : array<uint8>; var index : int&) : in
 
         state = s_utf8d[256u + state + type_]
 
-        if (state == UTF8_ACCEPT) return unsafe(reinterpret<int> codepoint)
+        if (state == UTF8_ACCEPT) return unsafe(reinterpret<int>(codepoint))
         if (state == 1u) return -1   // UTF8_REJECT
     }
 

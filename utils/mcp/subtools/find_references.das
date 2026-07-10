@@ -44,7 +44,7 @@ struct RefTarget {
 }
 
 def to_void(p) : void? {
-    return unsafe(reinterpret<void?> p)
+    return unsafe(reinterpret<void?>(p))
 }
 
 // Build a RefTarget from a cursor hit

@@ -299,7 +299,7 @@ Here an example:
 
     struct Foo3D: Foo {
         z: int = 3
-        override set = cast<auto> @@Foo3D_setXY
+        override set = cast<auto>(@@Foo3D_setXY)
     }
 
     def Foo3D_setXY(var thisFoo: Foo3D; x, y: int) {
@@ -313,7 +313,7 @@ It is safe to use the ``cast`` keyword to cast a derived structure instance into
 .. code-block:: das
 
     var f3d: Foo3D = Foo3D()
-    (cast<Foo> f3d).y = 5
+    (cast<Foo>(f3d)).y = 5
 
 It is unsafe to cast a base struct to its derived child type:
 
@@ -321,7 +321,7 @@ It is unsafe to cast a base struct to its derived child type:
 
     var f3d: Foo3D = Foo3D()
     def foo(var foo: Foo) {
-        (cast<Foo3D> foo).z = 5  // error, won't compile
+        (cast<Foo3D>(foo)).z = 5  // error, won't compile
     }
 
 If needed, the upcast can be used with the ``unsafe`` keyword:
@@ -338,7 +338,7 @@ If needed, the upcast can be used with the ``unsafe`` keyword:
 
     def setY(var foo: Foo; y: int) {  // Warning! Can cause problems if foo is not actually Foo2
         unsafe {
-            (upcast<Foo2> foo).y = y
+            (upcast<Foo2>(foo)).y = y
         }
     }
 
@@ -359,7 +359,7 @@ As the example above is very dangerous, and in order to make it safer, you can m
     def setY(var foo: Foo; y: int) {  // this won't do anything really bad, but will panic on wrong reference
         unsafe {
             if ( foo.typeTag == hash("Foo2") ) {
-                (upcast<Foo2> foo).y = y
+                (upcast<Foo2>(foo)).y = y
                 print("Foo2 type references was passed\n")
             } else {
                 assert(false, "Not Foo2 type references was passed\n")

@@ -266,7 +266,7 @@ def private get_or_create_table_fn(llvm_module : LLVMOpaqueModule?; var types : 
 }
 
 def public get_table_at(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaqueModule?; t : Type; var types : PrimitiveTypes?) {
-    assume fn_ptr = get_jit_table_at(unsafe(reinterpret<int> t))
+    assume fn_ptr = get_jit_table_at(unsafe(reinterpret<int>(t)))
     // int32_t jit_table_at ( Table * tab, KeyType key, int32_t valueTypeSize, Context * context )
     assume at_type = LLVMFunctionType(types.t_int32,   // int32_t result
         fixed_array<LLVMTypeRef>(types.LLVMVoidPtrType(), // table ptr
@@ -283,7 +283,7 @@ def public get_table_at(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaque
 }
 
 def public get_table_find(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaqueModule?; t : Type; var types : PrimitiveTypes?) {
-    assume fn_ptr = get_jit_table_find(unsafe(reinterpret<int> t))
+    assume fn_ptr = get_jit_table_find(unsafe(reinterpret<int>(t)))
     // int32_t jit_table_find ( Table * tab, KeyType key, int32_t valueTypeSize, Context * context )
     let find_type = LLVMFunctionType(types.t_int32,   // int32_t result
             fixed_array<LLVMTypeRef>(types.LLVMVoidPtrType(),   // table ptr
@@ -353,7 +353,7 @@ def public table_header_llvm_type(var types : PrimitiveTypes?) : LLVMOpaqueType?
 
 def public get_table_erase(g_builder : LLVMOpaqueBuilder?; llvm_module : LLVMOpaqueModule?; t : Type; var types : PrimitiveTypes?) {
     let fn_name = DllName(FN_JIT_TABLE_ERASE(t))
-    assume fn_ptr = get_jit_table_erase(unsafe(reinterpret<int> t))
+    assume fn_ptr = get_jit_table_erase(unsafe(reinterpret<int>(t)))
     // bool jit_table_erase ( Table * tab, KeyType key, int32_t valueTypeSize, Context * context, LineInfoArg * at )
     let erase_type = LLVMFunctionType(types.t_int1,                        // bool result
             fixed_array<LLVMTypeRef>(types.LLVMVoidPtrType(),   // table ptr

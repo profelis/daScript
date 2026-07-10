@@ -12,7 +12,6 @@ options stack = 1000000000
 require dastest/testing_boost
 
 require daslib/strings_boost
-require daslib/utf8_utils
 require daslib/defer
 require daslib/json
 require daslib/fio
@@ -29,8 +28,8 @@ def main {
     let input = file |> fread
 
     profile(10, "PEG json") {
-        get_parser_with(input) $(res_json; err) {
-            print("{intptr(unsafe(reinterpret<JsonValue?> addr(res_json)))}")
+        get_parser_with(input) $(res_json; _err) {
+            print("{intptr(unsafe(reinterpret<JsonValue?>(addr(res_json))))}")
         }
     }
 

@@ -961,7 +961,7 @@ def private re_match2_char(var regex : Regex; var node : ReNode?; str : uint8 co
     }
     if (*str == 0u8) return null
     unsafe {
-        if (memcmp(reinterpret<uint8?> node.text, str, node.textLen) != 0) return null
+        if (memcmp(reinterpret<uint8?>(node.text), str, node.textLen) != 0) return null
         var tail = str + node.textLen
         node.tail = tail
         var node2 = node.next
@@ -1642,7 +1642,7 @@ def regex_match(var regex : Regex; str : string; offset : int = 0) : int {
         print("matching with `{str}` at {offset}\n")
     }
     unsafe {
-        regex.match = reinterpret<uint8?> str
+        regex.match = reinterpret<uint8?>(str)
         let mptr = invoke(regex.root.fun2, regex, regex.root, regex.match + offset)
         if (mptr == null) return -1
         return int(mptr - regex.match)
@@ -1660,9 +1660,9 @@ def regex_foreach(var regex : Regex; str : string; blk : block<(at : range) : bo
     //! Iterates through all matches for the given regular expression in `str`.
     if (empty(str)) return
     unsafe {
-        regex.match = reinterpret<uint8 const?> str
+        regex.match = reinterpret<uint8 const?>(str)
         var root = regex.root
-        var pstr = reinterpret<uint8 const?> str
+        var pstr = reinterpret<uint8 const?>(str)
         var cstr = pstr
         if (regex.canEarlyOut) {
             // lets try if it helps
@@ -1709,9 +1709,9 @@ def regex_replace(var regex : Regex; str : string; blk : block<(at : string) : s
     if (empty(str)) return ""
     unsafe {
         return build_string() $(writer) {
-            regex.match = reinterpret<uint8 const?> str
+            regex.match = reinterpret<uint8 const?>(str)
             var root = regex.root
-            var pstr = reinterpret<uint8 const?> str
+            var pstr = reinterpret<uint8 const?>(str)
             var cstr = pstr
             if (regex.canEarlyOut) {
                 // lets try if it helps
@@ -1838,9 +1838,9 @@ def regex_replace(var regex : Regex; str : string; replacement : string) : strin
     if (empty(str)) return ""
     unsafe {
         return build_string() $(writer) {
-            regex.match = reinterpret<uint8 const?> str
+            regex.match = reinterpret<uint8 const?>(str)
             var root = regex.root
-            var pstr = reinterpret<uint8 const?> str
+            var pstr = reinterpret<uint8 const?>(str)
             var cstr = pstr
             if (regex.canEarlyOut) {
                 while (true) {
@@ -1899,9 +1899,9 @@ def regex_search(var regex : Regex; str : string; offset : int = 0) : int2 {
     //! Unlike `regex_match` which only matches at the given offset, this scans the entire string.
     if (empty(str)) return int2(-1, -1)
     unsafe {
-        regex.match = reinterpret<uint8 const?> str
+        regex.match = reinterpret<uint8 const?>(str)
         var root = regex.root
-        var pstr = reinterpret<uint8 const?> str
+        var pstr = reinterpret<uint8 const?>(str)
         var cstr = pstr + offset
         if (regex.canEarlyOut) {
             while (true) {

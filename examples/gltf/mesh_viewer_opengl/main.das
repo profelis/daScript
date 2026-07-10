@@ -52,6 +52,8 @@ var g_light_dir       = float3(0.3, 0.7, 0.5)
 var g_light_color     = float3(1.0, 1.0, 1.0)
 var g_light_intensity = 3.0f
 var g_light_ambient   = float3(0.15, 0.15, 0.18)
+var g_env_amount      = 1.0f
+var g_env_tex         = 0u
 
 var g_model_name = ""
 var g_load_error = ""
@@ -121,6 +123,7 @@ def reset_lighting {
     g_light_color = d.color
     g_light_intensity = d.intensity
     g_light_ambient = d.ambient
+    g_env_amount = d.environment
 }
 
 // T(centre) * R * S * T(-centre): rotate/scale about the model centre so the framed model stays framed.
@@ -185,6 +188,7 @@ def build_ui {
             edit_slider_float(safe_addr(g_light_intensity), (id = "LINT", text = "Intensity", v_min = 0.0f, v_max = 10.0f))
             edit_color_edit3(safe_addr(g_light_color), (id = "LCOL", text = "Color"))
             edit_color_edit3(safe_addr(g_light_ambient), (id = "LAMB", text = "Ambient"))
+            edit_slider_float(safe_addr(g_env_amount), (id = "ENV", text = "Environment", v_min = 0.0f, v_max = 2.0f))
             separator(SEP_LIGHT)
             if (button(RESET_LIGHT_BTN, (text = "Reset"))) {
                 reset_lighting()
@@ -237,7 +241,7 @@ def draw_scene {
     let view = look_at_rh(eye, g_center, float3(0.0, 1.0, 0.0))
     let proj = perspective_rh_minus1_to_1(45.0f * PI / 180.0f, aspect, g_radius * 0.05f, g_radius * 60.0f)
     let light = GltfPbrLight(direction = g_light_dir, color = g_light_color,
-        intensity = g_light_intensity, ambient = g_light_ambient)
+        intensity = g_light_intensity, ambient = g_light_ambient, environment = g_env_amount)
 
     gltf_pbr_render(g_renderer, g_model, g_scene, model_root_transform(), view, proj, eye, light)
 
@@ -255,6 +259,10 @@ def init {
     io.ConfigFlags |= ImGuiConfigFlags.DockingEnable
 
     g_renderer <- gltf_pbr_create()
+    // equirect HDR environment for image-based ambient (metals reflect it); CC0, shared with tutorial 12
+    let env = gltf_gl_load_hdr_env("{get_das_root()}/tutorials/_assets/hdri/cannon_2k.hdr")
+    g_env_tex = env._0
+    gltf_pbr_set_environment(g_renderer, env._0, env._1)
     load_model(path)
 }
 
@@ -281,6 +289,9 @@ def update {
 
 [export]
 def shutdown {
+    if (g_env_tex != 0u) {
+        glDeleteTextures(1, safe_addr(g_env_tex))
+    }
     delete g_renderer
     delete g_model
     delete g_scene

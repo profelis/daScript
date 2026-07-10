@@ -1299,7 +1299,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
         var as_cast_f = new ExprAsVariant(at = at, value = as_val_f, name := rtti)
         body |> push <| qmacro_expr(${ var $i(cast_var) = $e(as_cast_f); })
         // Run annotation reflection for fields
-        var ann = unsafe(reinterpret<BasicStructureAnnotation?> get_expression_annotation(pattern))
+        var ann = unsafe(reinterpret<BasicStructureAnnotation?>(get_expression_annotation(pattern)))
         if (ann != null) {
             for_each_field(*ann) $(name, _cppName, xtype, offset) {
                 return if (offset == 0xFFFFFFFFu
@@ -1310,12 +1310,12 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                         || xtype.baseType == Type.tFixedArray)
                 var p8 : int8?
                 unsafe {
-                    p8 = (reinterpret<int8?> pattern) + int(offset)
+                    p8 = (reinterpret<int8?>(pattern)) + int(offset)
                 }
                 let bt = xtype.baseType
                 // Reuse the same field matching logic from the generic handler
                 if (bt == Type.tHandle && xtype.annotation.name == "dasvector`das_string") {
-                    let pv = unsafe(reinterpret<dasvector`das_string?> p8)
+                    let pv = unsafe(reinterpret<dasvector`das_string?>(p8))
                     let pat_len = length(*pv)
                     if (pat_len > 0) {
                         var cond_s = qmacro(length($i(cast_var).$f(name)) != $v(pat_len))
@@ -1341,7 +1341,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                         // skip TypeDecl fields
                         pass
                     } else {
-                        let pv = unsafe(reinterpret<Expression ??> p8)
+                        let pv = unsafe(reinterpret<Expression ??>(p8))
                         if (*pv != null) {
                             let child_pattern = *pv
                             let child_var = next_var(index)
@@ -1355,7 +1355,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                         }
                     }
                 } elif (bt == Type.tHandle && xtype.annotation.name == "dasvector`ptr`Expression") {
-                    let pv = unsafe(reinterpret<dasvector`ptr`Expression?> p8)
+                    let pv = unsafe(reinterpret<dasvector`ptr`Expression?>(p8))
                     let pat_len = length(*pv)
                     if (pat_len > 0) {
                         var cond_e = qmacro(length($i(cast_var).$f(name)) != $v(pat_len))
@@ -1577,7 +1577,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
     body |> push <| qmacro_expr(${ var $i(cast_var) = $e(as_cast2); }) // nolint:LINT004
 
     // Iterate fields via annotation reflection
-    var ann = unsafe(reinterpret<BasicStructureAnnotation?> get_expression_annotation(pattern))
+    var ann = unsafe(reinterpret<BasicStructureAnnotation?>(get_expression_annotation(pattern)))
     if (ann == null) return
 
     // Field-by-field matching via annotation reflection
@@ -1588,7 +1588,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
         }
         var p8 : int8?
         unsafe {
-            p8 = (reinterpret<int8?> pattern) + int(offset)
+            p8 = (reinterpret<int8?>(pattern)) + int(offset)
         }
         let bt = xtype.baseType
 
@@ -1596,7 +1596,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
         if (inner_ann_name == "TypeDecl" || inner_ann_name == "Expression") {
             if (inner_ann_name == "TypeDecl") {
                 // TypeDecl? field — use generate_type_match
-                let pv = unsafe(reinterpret<TypeDeclPtr?> p8)
+                let pv = unsafe(reinterpret<TypeDeclPtr?>(p8))
                 if (*pv != null) {
                     let child_td = *pv
                     let child_var = next_var(index)
@@ -1610,7 +1610,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                 // If pattern's TypeDecl field is null, skip (don't require actual's to be null)
             } else {
                 // Expression? child — recurse or check null
-                let pv = unsafe(reinterpret<Expression ??> p8)
+                let pv = unsafe(reinterpret<Expression ??>(p8))
                 if (*pv != null) {
                     let child_pattern = *pv
                     let child_var = next_var(index)
@@ -1630,7 +1630,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
             }
         } elif (bt == Type.tHandle && xtype.annotation.name == "das_string") {
             // das_string field
-            let pv = unsafe(reinterpret<das_string?> p8)
+            let pv = unsafe(reinterpret<das_string?>(p8))
             if (!empty(*pv)) {
                 var cond = qmacro($i(cast_var).$f(name) != $v(string(*pv)))
                 var fail = qmacro(qm_fail_field($i(actual_var)))
@@ -1638,7 +1638,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
             }
         } elif (bt == Type.tHandle && xtype.annotation.name == "dasvector`ptr`Expression") {
             // Expression vector field (block.list, call.arguments)
-            let pv = unsafe(reinterpret<dasvector`ptr`Expression?> p8)
+            let pv = unsafe(reinterpret<dasvector`ptr`Expression?>(p8))
             let pat_len = length(*pv)
             if (pat_len > 0) {
                 var cond = qmacro(length($i(cast_var).$f(name)) != $v(pat_len))
@@ -1655,7 +1655,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
             }
         } elif (bt == Type.tHandle && xtype.annotation.name == "dasvector`ptr`Variable") {
             // Variable vector (ExprLet.variables) — match name, type, init
-            var pv = unsafe(reinterpret<dasvector`ptr`Variable?> p8)
+            var pv = unsafe(reinterpret<dasvector`ptr`Variable?>(p8))
             let pat_len = length(*pv)
             if (pat_len > 0) {
                 var cond = qmacro(length($i(cast_var).$f(name)) != $v(pat_len))
@@ -1699,7 +1699,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
             }
         } elif (bt == Type.tHandle && xtype.annotation.name == "dasvector`das_string") {
             // String vector (ExprFor.iterators) — match name strings
-            let pv = unsafe(reinterpret<dasvector`das_string?> p8)
+            let pv = unsafe(reinterpret<dasvector`das_string?>(p8))
             let pat_len = length(*pv)
             if (pat_len > 0) {
                 var cond = qmacro(length($i(cast_var).$f(name)) != $v(pat_len))
@@ -1716,7 +1716,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                 }
             }
         } elif (bt == Type.tInt) {
-            let pv = unsafe(reinterpret<int?> p8)
+            let pv = unsafe(reinterpret<int?>(p8))
             if (*pv != 0) {
                 let fval = *pv
                 var cond = qmacro($i(cast_var).$f(name) != $v(fval))
@@ -1724,7 +1724,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                 body |> push <| qm_guard(at, cond, fail)
             }
         } elif (bt == Type.tUInt) {
-            let pv = unsafe(reinterpret<uint?> p8)
+            let pv = unsafe(reinterpret<uint?>(p8))
             if (*pv != 0u) {
                 let fval = *pv
                 var cond = qmacro($i(cast_var).$f(name) != $v(fval))
@@ -1732,7 +1732,7 @@ def private generate_match(pattern : Expression?; actual_var : string; var body 
                 body |> push <| qm_guard(at, cond, fail)
             }
         } elif (bt == Type.tBool) {
-            let pv = unsafe(reinterpret<bool?> p8)
+            let pv = unsafe(reinterpret<bool?>(p8))
             if (*pv) {
                 var cond = qmacro($i(cast_var).$f(name) == false)
                 var fail = qmacro(qm_fail_field($i(actual_var)))

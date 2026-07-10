@@ -1,4 +1,4 @@
-Any cast expression (`cast<int> a`, `upcast<Foo> b` or `reinterpret<Bar?> c`)
+Any cast expression (`cast<int>(a)`, `upcast<Foo>(b)` or `reinterpret<Bar?>(c)`)
 Location of the expression in source code
 Type of the expression
 Runtime type information of the class of the expression (i.e "ExprConstant", "ExprCall", etc)

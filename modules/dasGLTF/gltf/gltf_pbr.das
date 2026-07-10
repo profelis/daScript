@@ -7,6 +7,7 @@ module gltf_pbr shared
 
 require gltf/gltf_types
 require gltf/gltf_scene
+require gltf/gltf_pbr_common public
 require gltf/gltf_gl public
 require opengl/opengl_boost public
 require glsl/glsl_opengl public
@@ -50,30 +51,19 @@ def gltf_pbr_vs {
     var wnormal = float3(0.0, 0.0, 0.0)
     var wtangent = float3(0.0, 0.0, 0.0)
     if (u_skinned > 0.5) {
-        // Linear-blend skinning in VECTOR space: daslang shader math has mat*vec, vec*scalar and vec+vec,
-        // but no mat+mat / scalar*mat, so we blend the transformed vectors rather than the matrices. The
-        // palette already maps into world space (joint.world * inverseBind), so u_model is not applied.
-        let p = float4(a_position, 1.0)
-        let nn = float4(a_normal, 0.0)
-        let tg = float4(a_tangent.xyz, 0.0)
-        // clamp to the palette size: a skin with > GLTF_MAX_JOINTS joints (or malformed JOINTS_0)
-        // would otherwise index u_joints out of range -> undefined shader behavior.
+        // The palette already maps into world space (joint.world * inverseBind), so u_model is not
+        // applied. clamp to the palette size: a skin with > GLTF_MAX_JOINTS joints (or malformed
+        // JOINTS_0) would otherwise index u_joints out of range -> undefined shader behavior.
         let jx = clamp(int(a_joints0.x), 0, GLTF_MAX_JOINTS - 1)
         let jy = clamp(int(a_joints0.y), 0, GLTF_MAX_JOINTS - 1)
         let jz = clamp(int(a_joints0.z), 0, GLTF_MAX_JOINTS - 1)
         let jw = clamp(int(a_joints0.w), 0, GLTF_MAX_JOINTS - 1)
-        world = ((u_joints[jx] * p) * a_weights0.x
-               + (u_joints[jy] * p) * a_weights0.y
-               + (u_joints[jz] * p) * a_weights0.z
-               + (u_joints[jw] * p) * a_weights0.w)
-        wnormal = ((u_joints[jx] * nn).xyz * a_weights0.x
-                 + (u_joints[jy] * nn).xyz * a_weights0.y
-                 + (u_joints[jz] * nn).xyz * a_weights0.z
-                 + (u_joints[jw] * nn).xyz * a_weights0.w)
-        wtangent = ((u_joints[jx] * tg).xyz * a_weights0.x
-                  + (u_joints[jy] * tg).xyz * a_weights0.y
-                  + (u_joints[jz] * tg).xyz * a_weights0.z
-                  + (u_joints[jw] * tg).xyz * a_weights0.w)
+        world = gltf_skin_point(u_joints[jx], u_joints[jy], u_joints[jz], u_joints[jw],
+            a_weights0, float4(a_position, 1.0))
+        wnormal = gltf_skin_point(u_joints[jx], u_joints[jy], u_joints[jz], u_joints[jw],
+            a_weights0, float4(a_normal, 0.0)).xyz
+        wtangent = gltf_skin_point(u_joints[jx], u_joints[jy], u_joints[jz], u_joints[jw],
+            a_weights0, float4(a_tangent.xyz, 0.0)).xyz
     } else {
         world = u_model * float4(a_position, 1.0)
         // u_normal_matrix is inverse-transpose(u_model 3x3), so normals stay correct under
@@ -110,50 +100,18 @@ var @uniform @stage = 1 u_metal_rough_tex : sampler2D
 var @uniform @stage = 2 u_normal_tex      : sampler2D
 var @uniform @stage = 3 u_occlusion_tex   : sampler2D
 var @uniform @stage = 4 u_emissive_tex    : sampler2D
+// equirect HDR environment (linear radiance, mipmapped); u_env_amount = 0 -> flat ambient
+var @uniform @stage = 5 u_env_tex         : sampler2D
+var @uniform u_env_amount  : float
+var @uniform u_env_max_lod : float
 
 var @out o_color : float4
 
-// Trowbridge-Reitz GGX normal distribution.
-def private distribution_ggx(n, h : float3; roughness : float) : float {
-    let a = roughness * roughness
-    let a2 = a * a
-    let ndoth = max(dot(n, h), 0.0)
-    let d = ndoth * ndoth * (a2 - 1.0) + 1.0
-    return a2 / max(3.14159265 * d * d, 0.0000001)
-}
-
-// Smith geometry term with Schlick-GGX, direct-lighting k = (r+1)^2 / 8.
-def private geometry_smith(n, v, l : float3; roughness : float) : float {
-    let r = roughness + 1.0
-    let k = r * r * 0.125
-    let ndotv = max(dot(n, v), 0.0)
-    let ndotl = max(dot(n, l), 0.0)
-    let gv = ndotv / (ndotv * (1.0 - k) + k)
-    let gl = ndotl / (ndotl * (1.0 - k) + k)
-    return gv * gl
-}
-
-def private fresnel_schlick(cos_theta : float; f0 : float3) : float3 {
-    let m = clamp(1.0 - cos_theta, 0.0, 1.0)
-    let m5 = m * m * m * m * m
-    return f0 + (float3(1.0, 1.0, 1.0) - f0) * m5
-}
-
-// Perturb the geometric normal by the tangent-space normal map when a tangent frame exists; fall back
-// to the geometric normal otherwise (the flat-normal default texture also yields no perturbation).
+// The BRDF / normal-perturbation / skinning math lives in gltf/gltf_pbr_common — shared with the
+// dasVulkan renderer; this module only samples textures and feeds the values in.
 def private shade_normal(uv : float2) : float3 {
-    let n_geom = normalize(v_world_normal)
-    let tlen = length(v_world_tangent)
-    var n = n_geom
-    if (tlen > 0.0001) {
-        let t = v_world_tangent * (1.0 / tlen)
-        let b = cross(n_geom, t) * v_tangent_w
-        let s = texture(u_normal_tex, uv).xyz * 2.0 - float3(1.0, 1.0, 1.0)
-        let sx = s.x * u_normal_scale
-        let sy = s.y * u_normal_scale
-        n = normalize(t * sx + b * sy + n_geom * s.z)
-    }
-    return n
+    return gltf_perturb_normal(normalize(v_world_normal), v_world_tangent, v_tangent_w,
+        texture(u_normal_tex, uv).xyz, u_normal_scale)
 }
 
 [fragment_program]
@@ -174,29 +132,21 @@ def gltf_pbr_fs {
     let n = shade_normal(uv)
     let v = normalize(u_cam_pos - v_world_pos)
     let l = normalize(u_light_dir)
-    let h = normalize(v + l)
-    let ndotl = max(dot(n, l), 0.0)
-    let ndotv = max(dot(n, v), 0.0)
-
-    let f0 = lerp(float3(0.04, 0.04, 0.04), albedo, float3(metallic, metallic, metallic))
-    let d = distribution_ggx(n, h, roughness)
-    let g = geometry_smith(n, v, l, roughness)
-    let f = fresnel_schlick(max(dot(h, v), 0.0), f0)
-    let spec_denom = 4.0 * ndotv * ndotl + 0.0001
-    let specular = f * (d * g * (1.0 / spec_denom))
-
-    let kd = (float3(1.0, 1.0, 1.0) - f) * (1.0 - metallic)
-    let diffuse = kd * albedo * (1.0 / 3.14159265)
-    let direct = (diffuse + specular) * u_light_color * ndotl
-
-    // occlusion darkens indirect (ambient) only, per the glTF strength blend
-    let ao = 1.0 + u_occlusion_strength * (occ - 1.0)
-    let ambient = u_ambient * albedo * ao
+    let direct = gltf_pbr_direct(albedo, metallic, roughness, n, v, l, u_light_color)
+    var ambient = gltf_pbr_ambient(albedo, u_ambient, occ, u_occlusion_strength)
+    if (u_env_amount > 0.0) {
+        // image-based ambient: irradiance from a deep mip along n, reflection from a
+        // roughness-scaled mip along the mirror direction (mips as prefiltered environment);
+        // clamp so a tiny environment (max lod < 2) can't produce a negative LOD
+        let irr = textureLod(u_env_tex, gltf_equirect_uv(n), max(u_env_max_lod - 2.0, 0.0)).xyz
+        let refl = textureLod(u_env_tex, gltf_equirect_uv(gltf_reflect_dir(n, v)), roughness * u_env_max_lod).xyz
+        ambient = gltf_env_ambient(albedo, metallic, roughness, n, v, irr, refl,
+            gltf_occlusion_factor(occ, u_occlusion_strength)) * u_env_amount
+    }
 
     let linear = ambient + direct + emissive
     // no sRGB default framebuffer -> encode linear -> sRGB (approximate 2.2 gamma)
-    let g22 = 1.0 / 2.2
-    let out_rgb = pow(linear, float3(g22, g22, g22))
+    let out_rgb = gltf_srgb_encode(linear)
     let out_a = u_alpha_mode > 1.5 ? base.w : 1.0
     o_color = float4(out_rgb, out_a)
 }
@@ -204,15 +154,17 @@ def gltf_pbr_fs {
 // ===== host renderer =====
 
 struct GltfPbrRenderer {
-    program : uint
+    program   : uint
+    envTex    : uint     // mipmapped equirect HDR environment, 0 = none (flat ambient)
+    envMaxLod : float
 }
 
-//! A single directional light plus a flat ambient term. `direction` points TOWARD the light.
-struct GltfPbrLight {
-    direction : float3 = float3(0.3, 0.7, 0.5)
-    color     : float3 = float3(1.0, 1.0, 1.0)
-    intensity : float  = 3.0
-    ambient   : float3 = float3(0.15, 0.15, 0.18)
+//! Attach a mipmapped equirect HDR environment (see gltf_gl_load_hdr_env); pass 0 to remove it.
+//! The renderer does not take ownership of the texture. `GltfPbrLight.environment` scales its
+//! contribution per frame.
+def gltf_pbr_set_environment(var r : GltfPbrRenderer; tex : uint; max_lod : float) {
+    r.envTex = tex
+    r.envMaxLod = max_lod
 }
 
 //! Compile + link the PBR program. Call with a current GL context; `delete` the renderer to release it.
@@ -293,6 +245,9 @@ def gltf_pbr_render(r : GltfPbrRenderer; model : GltfGlModel; scene : GltfScene;
     u_light_dir = normalize(light.direction)
     u_light_color = light.color * light.intensity
     u_ambient = light.ambient
+    u_env_tex := (r.envTex != 0u ? r.envTex : model.whiteTex)
+    u_env_amount = r.envTex != 0u ? light.environment : 0.0
+    u_env_max_lod = r.envMaxLod
     for (node in scene.nodes) {
         if (node.mesh < 0 || node.mesh >= length(model.meshes)) {
             continue

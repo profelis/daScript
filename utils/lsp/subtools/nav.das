@@ -505,7 +505,7 @@ struct RefTarget {
 // instantiation — same-name instances differing only in pointee const trip the
 // mangler ICE 50609 (see CLAUDE.md "Generic-mangling pitfall")
 def private to_void(p : auto(TT) const?) : void? {
-    return unsafe(reinterpret<void?> p)
+    return unsafe(reinterpret<void?>(p))
 }
 
 def private identify_target(hit : CursorHit) : RefTarget {

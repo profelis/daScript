@@ -247,7 +247,7 @@ Step 3 — Get the body as ExprBlock
 .. code-block:: das
 
    unsafe {
-       var blk = reinterpret<ExprBlock?> fn.body
+       var blk = reinterpret<ExprBlock?>(fn.body)
 
 The function body is an ``ExpressionPtr`` internally — we know it
 is an ``ExprBlock`` because we built it that way in ``apply()``.

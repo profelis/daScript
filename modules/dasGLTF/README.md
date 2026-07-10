@@ -22,10 +22,15 @@ Neutral core — `require gltf/gltf_boost` (never pulls in OpenGL):
 OpenGL adapter — `require gltf/gltf_gl` + `gltf/gltf_pbr` (require `dasOpenGL` / `dasGlsl`):
 
 - `gltf/gltf_gl.das` — `GltfScene` → per-primitive VAO/VBO/EBO + textures (`GltfGlModel`); sRGB/linear
-  texture pipeline, mipmaps, sampler wrap/filter, white + flat-normal defaults
+  texture pipeline, mipmaps, sampler wrap/filter, white + flat-normal defaults, equirect HDR
+  environment loader (`gltf_gl_load_hdr_env`)
 - `gltf/gltf_pbr.das` — portable Cook-Torrance GGX metal-rough shader (native DSL, `[vertex_program]`/
-  `[fragment_program]`): tangent-space normals, occlusion, emissive, directional light + ambient, sRGB
-  output, alpha OPAQUE/MASK/BLEND, doubleSided cull, GPU skinning (64-joint palette)
+  `[fragment_program]`): tangent-space normals, occlusion, emissive, directional light + ambient or
+  image-based ambient from an equirect HDR environment (`gltf_pbr_set_environment`, roughness-mip
+  reflections), sRGB output, alpha OPAQUE/MASK/BLEND, doubleSided cull, GPU skinning (64-joint palette)
+- `gltf/gltf_pbr_common.das` — backend-neutral PBR shader math (GGX BRDF, normal perturbation, vector-space
+  skin blend, sRGB encode): pure scalar/vector/matrix functions both shader emitters lower as user
+  functions, shared with the dasVulkan renderer
 
 ## Neutral core
 
@@ -88,3 +93,8 @@ mesh optimization, `KHR_draco_mesh_compression`, and the strip/fan/loop primitiv
 (`LINE_LOOP`/`LINE_STRIP`/`TRIANGLE_STRIP`/`TRIANGLE_FAN`) are out of scope — geometry is expected as
 indexed `TRIANGLES`, which is what glTF exporters emit almost universally. The neutral scene format is
 designed to feed a separate mesh optimizer. A Vulkan backend (`gltf_vk`) is a planned parallel to `gltf_gl`.
+
+glTF extensions are not implemented. An asset whose `extensionsRequired` names any extension **fails
+closed** (empty scene + error log, per spec) instead of decoding to degenerate geometry — e.g. Draco-compressed
+assets; recompress with `gltf-transform` / `gltfpack` to plain glTF. Optional `extensionsUsed`-only
+extensions load with a warning and their features are ignored.

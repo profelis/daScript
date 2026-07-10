@@ -89,10 +89,10 @@ def main {
     print("reinterpret:\n")
     unsafe {
         let float_val = 1.0
-        let int_bits = reinterpret<int> float_val
+        let int_bits = reinterpret<int>(float_val)
         print("  1.0 as int bits: 0x{int_bits:08x}\n")   // IEEE 754: 0x3f800000
 
-        let back = reinterpret<float> int_bits
+        let back = reinterpret<float>(int_bits)
         print("  back to float: {back}\n")
     }
 

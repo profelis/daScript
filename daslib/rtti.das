@@ -200,7 +200,7 @@ def public class_info(cl) : StructInfo const? {
         }
     } static_elif (typeinfo is_lambda(cl)) {
         unsafe {
-            var l = reinterpret<int8 ??> addr(cl)
+            var l = reinterpret<int8 ??>(addr(cl))
             if (l == null) return null
             var pti = reinterpret<TypeInfo const ??>(l[0] - 16)
             return (*pti).structType
@@ -228,7 +228,7 @@ def public type_info(cl) : TypeInfo const? {
         }
     } static_elif (typeinfo is_lambda(cl)) {
         unsafe {
-            var l = reinterpret<int8 ??> addr(cl)
+            var l = reinterpret<int8 ??>(addr(cl))
             if (l == null) return null
             return reinterpret<TypeInfo const ??>(l[0] - 16)
         }
