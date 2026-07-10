@@ -361,6 +361,7 @@
 %token<ui64>    UNSIGNED_LONG_INTEGER   "unsigned long integer constant"
 %token<ui>      UNSIGNED_INT8           "unsigned int8 constant"
 %token<fd>      DAS_FLOAT               "floating point constant"
+%token<fd>      DAS_FLOAT16_CONST       "float16 constant"
 %token<d>       DOUBLE                  "double constant"
 %token<s>       NAME                    "name"
 %token<s>       KEYWORD                 "keyword"
@@ -2099,6 +2100,7 @@ expr_numeric_const
     |   UNSIGNED_LONG_INTEGER[const]          { $$ = new ExprConstUInt64(tokAt(scanner,@const),(uint64_t)$const); }
     |   UNSIGNED_INT8[const]                  { $$ = new ExprConstUInt8(tokAt(scanner,@const),(uint8_t)$const); }
     |   DAS_FLOAT[const]                      { $$ = new ExprConstFloat(tokAt(scanner,@const),(float)$const); }
+    |   DAS_FLOAT16_CONST[const]              { $$ = new ExprConstFloat16(tokAt(scanner,@const),(float)$const); }
     |   DOUBLE[const]                         { $$ = new ExprConstDouble(tokAt(scanner,@const),(double)$const); }
     ;
 
