@@ -7,7 +7,8 @@
     "llama_cpp":"fdb1db877",
     "date":"2026-07-09",
     "box_profile":"box_profile.json",
-    "parsec_off":true
+    "parsec_off":true,
+    "tune":"q8q8_tile_gen=dot_maddubs_width256_mr8_kstep2 (fallback)"
   },
   "tests":[
     {
