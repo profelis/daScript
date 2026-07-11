@@ -194,15 +194,17 @@ def stage_jit_backend(root : string) {
 
 // Point .mcp.json at the stdio supervisor (mcp_supervisor.py). The supervisor
 // owns the .mcp.json merge (preserving other servers like github), so setup
-// just invokes it. Probes `python` then `python3` — stock macOS ships only the
-// latter — and the supervisor emits whichever launcher resolves into .mcp.json.
+// just invokes it. Probes `python3` first (a bare `python` can be Python 2 on
+// legacy boxes, and the supervisor is Python 3), then `python` (python.org
+// Windows installs ship no python3 alias); the supervisor emits whichever
+// launcher resolves into .mcp.json.
 def emit_mcp_config(root : string) : bool {
     let script = path_join(root, "utils/mcp/mcp_supervisor.py")
     if (!fexist(script)) {
         print("ERROR: {script} not found\n")
         return false
     }
-    for (py in ["python", "python3"]) {
+    for (py in ["python3", "python"]) {
         continue if (run_visible("{py} --version") != 0)
         let rc = run_visible("{py} \"{script}\" --emit-config --repo-root \"{root}\"")
         if (rc != 0) {
@@ -211,7 +213,7 @@ def emit_mcp_config(root : string) : bool {
         }
         return true
     }
-    print("ERROR: neither python nor python3 found on PATH\n")
+    print("ERROR: neither python3 nor python found on PATH\n")
     return false
 }
 

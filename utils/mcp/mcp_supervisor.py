@@ -18,8 +18,8 @@ own supervisor, which spawns that worktree's own daslang. No ports, no config.
 
 .mcp.json (written by --emit-config / setup.das):
     "daslang": { "command": "python", "args": ["utils/mcp/mcp_supervisor.py"] }
-(the command is whichever of python/python3 resolves on PATH — stock macOS
-ships only python3 — falling back to the absolute interpreter path)
+(the command is whichever of python3/python resolves on PATH — python3 first,
+since a bare python can be Python 2 — falling back to the absolute interpreter path)
 
 Pre-build guard: kill the daslang child (a `daslang.exe` running mcp\\main.das)
 to release its DLL locks; build; the next tool call respawns the fresh binary.
@@ -239,10 +239,11 @@ def _default_launcher() -> list[str]:
 
 
 def _python_launcher() -> str:
-    """The launcher Claude Code should spawn the supervisor with: the first of
-    python/python3 that resolves on PATH (stock macOS ships only python3), else
+    """The launcher Claude Code should spawn the supervisor with: python3 first
+    (a bare `python` can be Python 2 on legacy boxes, and this script is Python
+    3), then python (python.org Windows installs ship no python3 alias), else
     the absolute path of the interpreter running this emit."""
-    for name in ("python", "python3"):
+    for name in ("python3", "python"):
         if shutil.which(name):
             return name
     return sys.executable
