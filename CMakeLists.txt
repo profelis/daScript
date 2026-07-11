@@ -34,6 +34,7 @@ option(DAS_GLFW_DISABLED "Disable dasGLFW (GLFW window for graphics apps)" OFF)
 option(DAS_AUDIO_DISABLED "Disable dasAudio (Miniaudio sound library)" OFF)
 option(DAS_STDDLG_DISABLED "Disable dasStdDlg (File new,open,save etc dialogs)" OFF)
 option(DAS_STBIMAGE_DISABLED "Disable dasStbImage (StbImage bindings, image loading and saving)" OFF)
+option(DAS_METAL_DISABLED "Disable dasMetal (native Metal compute binding, Apple only)" OFF)
 
 option(DAS_PUGIXML_DISABLED "Disable dasPUGIXML (xml parsing library)" OFF)
 option(DAS_SQLITE_DISABLED "Disable dasSQLITE (sqlite3 library)" ON)

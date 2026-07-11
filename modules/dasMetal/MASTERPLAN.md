@@ -270,8 +270,34 @@ prerequisite.
 
 # Implementation log
 
-*(Phase 0 not started — 2026-07-11: masterplan authored; revised same day per review:
-class-based authoring (kernels = methods, resources = `@ssbo` members — no module-scope
-resource globals), `fastmath` a `[metal_kernel]` property defaulting ON, CPU-reference
-oracle promoted to the primary correctness gate, cross-backend GPU parity demoted to a
-deferred nice-to-have.)*
+**2026-07-11 — masterplan.** Authored; revised same day per review: class-based authoring
+(kernels = methods, resources = `@ssbo` members — no module-scope resource globals),
+`fastmath` a `[metal_kernel]` property defaulting ON, CPU-reference oracle promoted to the
+primary correctness gate, cross-backend GPU parity demoted to a deferred nice-to-have.
+
+**2026-07-11 — Phase 0 landed: binding bring-up + probes.** `src/dasMetal.mm`
+(`Module("das_metal")`, class `Module_DasMetal`, ARC-compiled, 8 `DummyTypeAnnotation`
+opaque handles, the full PoC extern surface incl. 8 `metal_release` overloads +
+`metal_live_object_count`) + `src/dasMetal.h` (pure-C++ decls for `aotRequire`);
+`CMakeLists.txt` APPLE-gated (`ADD_MODULE_CPP(DasMetal)` + `ADD_MODULE_LIB`, `-fobjc-arc`
+on the `.mm`, Metal+Foundation frameworks); `.das_module` descriptor (silent 2-arg
+`register_dynamic_module` — skips cleanly on non-Apple); root `DAS_METAL_DISABLED` option
+(default OFF). Scaffold `_handrolled_mul.das` green on M1 Max (macOS 26.4, arm64):
+- **Readback exact** — a*b over 256 floats via BOTH `metal_dispatch_threadgroups` and
+  `metal_dispatch_threads` (exact-grid fast path confirmed working on Apple-family GPU —
+  risk 7 half-resolved; paravirtual still unknown).
+- **Bad-MSL probe** — `undeclared_identifier` fixture surfaces the real Metal compiler
+  log (with source line + caret) as a clean das error string; no crash, no nil deref.
+- **Leak probe** — live-object counter round-trips to 0 after releasing all 12 handles.
+- **Fail-closed probe** (beyond plan) — null handle into any extern throws a clean,
+  `recover`-able das error via `throw_error_at` (every extern null-guards its handles).
+Implementation notes: `char *&` error out-params follow the fio pattern
+(`SideEffects::modifyArgumentAndExternal`); handles cross as `__bridge_retained void*`,
+`metal_release` = `__bridge_transfer`, counted by a shim-side atomic;
+`MTLCompileOptions.mathMode` (macOS 15+ SDK) with `fastMathEnabled` fallback. das-side
+gotcha for the Phase-1 emitter: `label` and `expect` are reserved words; literal `{`/`}`
+in MSL strings must be escaped `\{`/`\}` (string interpolation).
+**Probe (a) — macOS CI paravirtual execute — PENDING:** `build.yml` runs on
+PR/master-push/dispatch only and the branch is local; the macOS lanes are `macos-15` /
+`macos-26` Apple-Silicon (M2) runners with the Apple Paravirtual device. Resolve when the
+arc branch first goes to CI; until then CI posture = compile gate, behavioral = M-boxes.
