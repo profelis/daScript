@@ -6,16 +6,15 @@ options indenting = 4
 require dastest/testing_boost public
 require _glsl_common
 require glsl/glsl_opengl
-require strings
 
 var @inout conf_uint8_uv : float2
 var @out conf_uint8_color : float4
 
 [fragment_program(name="conf_uint8_glsl")]
 def conf_uint8_fragment {
-    var v = uint8(1u)
+    let v = uint8(1u)
     let s = uint8(uint(conf_uint8_uv.x))
-    let r = v
+    let r = uint(v) + uint(s)
     conf_uint8_color = float4(float(r), 0., 0., 1.)
 }
 
@@ -23,6 +22,8 @@ def conf_uint8_fragment {
 def test_conf_uint8_glsl(t : T?) {
     t |> run("conformance uint8: emits and validates") <| @(t : T?) {
         t |> success(has(conf_uint8_glsl, "uint8_t"), "spells uint8_t")
+        t |> success(has(conf_uint8_glsl, "#if defined(GL_NV_gpu_shader5)"), "guarded NV chain")
+        t |> success(has(conf_uint8_glsl, "GL_EXT_shader_explicit_arithmetic_types_int8"), "EXT line in the #else branch")
         let r = validate_glsl(conf_uint8_glsl, "frag")
         if (r.ran) {
             t |> success(r.ok, "glslang: {r.msg}")

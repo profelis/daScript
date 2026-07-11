@@ -14,10 +14,10 @@ var @ssbo @binding = 0 conf_uint8_data : array<uint>
 [compute_shader(local_size_x=64, name="conf_uint8_spv"), marker(no_coverage)]
 def conf_uint8_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = uint8(1u)
+    let v = uint8(1u)
     let s = uint8(conf_uint8_data[gi])
-    let r = v
-    conf_uint8_data[gi] = uint(r)
+    let r = uint(v) + uint(s)
+    conf_uint8_data[gi] = r
 }
 
 [test]

@@ -14,10 +14,10 @@ var @ssbo @binding = 0 conf_byte4_data : array<int>
 [compute_shader(local_size_x=64, name="conf_byte4_spv"), marker(no_coverage)]
 def conf_byte4_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = byte4(1, 2, 3, 4)
+    let v = byte4(1, 2, 3, 4)
     let s = byte4(conf_byte4_data[gi])
-    let r = v.x
-    conf_byte4_data[gi] = int(r)
+    let r = int(v.x) + int(s.x)
+    conf_byte4_data[gi] = r
 }
 
 [test]

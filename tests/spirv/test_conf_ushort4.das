@@ -14,10 +14,10 @@ var @ssbo @binding = 0 conf_ushort4_data : array<uint>
 [compute_shader(local_size_x=64, name="conf_ushort4_spv"), marker(no_coverage)]
 def conf_ushort4_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = ushort4(1u, 2u, 3u, 4u)
+    let v = ushort4(1u, 2u, 3u, 4u)
     let s = ushort4(conf_ushort4_data[gi])
-    let r = v.x
-    conf_ushort4_data[gi] = uint(r)
+    let r = uint(v.x) + uint(s.x)
+    conf_ushort4_data[gi] = r
 }
 
 [test]

@@ -44,6 +44,10 @@ def ctor_gen(spec : ShaderTypeSpec; lane : block<(i : int) : int>) : string {
         return lit(spec.kind, invoke(lane, 0))      // bare literal: no float16(float16) ctor exists
     }
     if (spec.arity == 1) {
+        // 32-bit scalars: the literal already IS the type — a same-type ctor is PERF020 noise
+        if (spec.name == "float" || spec.name == "int" || spec.name == "uint") {
+            return lit(spec.kind, invoke(lane, 0))
+        }
         return "{spec.name}({lit(spec.kind, invoke(lane, 0))})"
     }
     return build_string() $(var writer) {
@@ -66,10 +70,12 @@ def ctor(spec : ShaderTypeSpec; base : int) : string {
 // the shader body shared by both rails: local ctor + splat + (arith) + swizzle read,
 // reduced to one scalar so the value flows into the output (nothing dead-code-elided)
 def emit_body(var writer; spec : ShaderTypeSpec; seed : string) {
+    // storage rows never mutate v (no closed arithmetic) — declare with let
+    let vkw = spec.has_arith ? "var" : "let"
     if (spec.arity == 1 && spec.kind == "half") {
-        writer |> write("    var v = 1.5h\n")   // scalar float16 has no float16(float16) ctor
+        writer |> write("    {vkw} v = 1.5h\n")   // scalar float16 has no float16(float16) ctor
     } else {
-        writer |> write("    var v = {ctor(spec, 1)}\n")
+        writer |> write("    {vkw} v = {ctor(spec, 1)}\n")
     }
     if (spec.arity > 1) {
         writer |> write("    let s = {spec.name}({seed})\n")
@@ -82,17 +88,28 @@ def emit_body(var writer; spec : ShaderTypeSpec; seed : string) {
         writer |> write("    v = v + s\n")
         writer |> write("    v = v * {ctor_gen(spec) $(_i) => 2}\n")
         writer |> write("    v = v - s\n")
-    }
-    if (spec.arity > 1) {
-        let last = LANE_LETTERS[spec.arity - 1]
-        if (spec.has_arith) {
+        if (spec.arity > 1) {
+            let last = LANE_LETTERS[spec.arity - 1]
             writer |> write("    let r = v.x + v.{last}\n")
         } else {
-            writer |> write("    let r = v.x\n")
+            writer |> write("    let r = v\n")
         }
     } else {
-        writer |> write("    let r = v\n")
+        // storage rows: consume BOTH the literal ctor and the runtime-convert seed — s is the
+        // convert-coverage half; widen the elements first (storage scalars have no operators)
+        let wide = spec.kind == "uint" ? "uint" : "int"
+        if (spec.arity > 1) {
+            writer |> write("    let r = {wide}(v.x) + {wide}(s.x)\n")
+        } else {
+            writer |> write("    let r = {wide}(v) + {wide}(s)\n")
+        }
     }
+}
+
+// only fp16 rows need the sink widened (float16 r -> float elem); storage rows pre-widen to
+// int/uint and 32-bit arith rows already produce the element type (PERF020: same-type cast)
+def ssbo_sink(spec : ShaderTypeSpec) : string {
+    return spec.kind == "half" ? "{ssbo_elem(spec)}(r)" : "r"
 }
 
 def ssbo_elem(spec : ShaderTypeSpec) : string {
@@ -125,7 +142,7 @@ def emit_spirv_test(spec : ShaderTypeSpec) {
             writer |> write("def conf_{spec.name}_kernel \{\n")
             writer |> write("    let gi = gl_GlobalInvocationID.x\n")
             emit_body(writer, spec, "conf_{spec.name}_data[gi]")
-            writer |> write("    conf_{spec.name}_data[gi] = {ssbo_elem(spec)}(r)\n")
+            writer |> write("    conf_{spec.name}_data[gi] = {ssbo_sink(spec)}\n")
             writer |> write("\}\n")
             writer |> write("\n")
             writer |> write("[test]\n")
@@ -166,6 +183,22 @@ def out_expr(spec : ShaderTypeSpec) : string {
     return spec.kind == "float" ? "r" : "float(r)"
 }
 
+// the GL_EXT_* line expected in the guarded extension chain's #else branch ("" = 32-bit row).
+// real desktop drivers take the GL_NV_gpu_shader5 / AMD branch instead — same type spellings
+def glsl_ext_needle(spec : ShaderTypeSpec) : string {
+    let g = spec.glsl_name
+    if (g == "float16_t" || starts_with(g, "f16vec")) {
+        return "GL_EXT_shader_explicit_arithmetic_types_float16"
+    }
+    if (g == "int16_t" || g == "uint16_t" || starts_with(g, "i16vec") || starts_with(g, "u16vec")) {
+        return "GL_EXT_shader_explicit_arithmetic_types_int16"
+    }
+    if (g == "int8_t" || g == "uint8_t" || starts_with(g, "i8vec") || starts_with(g, "u8vec")) {
+        return "GL_EXT_shader_explicit_arithmetic_types_int8"
+    }
+    return ""
+}
+
 def emit_glsl_test(spec : ShaderTypeSpec) {
     let path = get_das_root() + "/tests/glsl/test_conf_{spec.name}.das"
     let t0 = ref_time_ticks()
@@ -180,7 +213,6 @@ def emit_glsl_test(spec : ShaderTypeSpec) {
             writer |> write("require dastest/testing_boost public\n")
             writer |> write("require _glsl_common\n")
             writer |> write("require glsl/glsl_opengl\n")
-            writer |> write("require strings\n")
             writer |> write("\n")
             writer |> write("var @inout conf_{spec.name}_uv : float2\n")
             writer |> write("var @out conf_{spec.name}_color : float4\n")
@@ -195,6 +227,11 @@ def emit_glsl_test(spec : ShaderTypeSpec) {
             writer |> write("def test_conf_{spec.name}_glsl(t : T?) \{\n")
             writer |> write("    t |> run(\"conformance {spec.name}: emits and validates\") <| @(t : T?) \{\n")
             writer |> write("        t |> success(has(conf_{spec.name}_glsl, \"{spec.glsl_name}\"), \"spells {spec.glsl_name}\")\n")
+            let extn = glsl_ext_needle(spec)
+            if (extn != "") {
+                writer |> write("        t |> success(has(conf_{spec.name}_glsl, \"#if defined(GL_NV_gpu_shader5)\"), \"guarded NV chain\")\n")
+                writer |> write("        t |> success(has(conf_{spec.name}_glsl, \"{extn}\"), \"EXT line in the #else branch\")\n")
+            }
             writer |> write("        let r = validate_glsl(conf_{spec.name}_glsl, \"frag\")\n")
             writer |> write("        if (r.ran) \{\n")
             writer |> write("            t |> success(r.ok, \"glslang: \{r.msg\}\")\n")

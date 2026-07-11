@@ -14,13 +14,13 @@ var @ssbo @binding = 0 conf_float_data : array<float>
 [compute_shader(local_size_x=64, name="conf_float_spv"), marker(no_coverage)]
 def conf_float_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = float(1.)
+    var v = 1.
     let s = conf_float_data[gi]
     v = v + s
-    v = v * float(2.)
+    v = v * 2.
     v = v - s
     let r = v
-    conf_float_data[gi] = float(r)
+    conf_float_data[gi] = r
 }
 
 [test]

@@ -6,16 +6,15 @@ options indenting = 4
 require dastest/testing_boost public
 require _glsl_common
 require glsl/glsl_opengl
-require strings
 
 var @inout conf_short4_uv : float2
 var @out conf_short4_color : float4
 
 [fragment_program(name="conf_short4_glsl")]
 def conf_short4_fragment {
-    var v = short4(1, 2, 3, 4)
+    let v = short4(1, 2, 3, 4)
     let s = short4(int(conf_short4_uv.x))
-    let r = v.x
+    let r = int(v.x) + int(s.x)
     conf_short4_color = float4(float(r), 0., 0., 1.)
 }
 
@@ -23,6 +22,8 @@ def conf_short4_fragment {
 def test_conf_short4_glsl(t : T?) {
     t |> run("conformance short4: emits and validates") <| @(t : T?) {
         t |> success(has(conf_short4_glsl, "i16vec4"), "spells i16vec4")
+        t |> success(has(conf_short4_glsl, "#if defined(GL_NV_gpu_shader5)"), "guarded NV chain")
+        t |> success(has(conf_short4_glsl, "GL_EXT_shader_explicit_arithmetic_types_int16"), "EXT line in the #else branch")
         let r = validate_glsl(conf_short4_glsl, "frag")
         if (r.ran) {
             t |> success(r.ok, "glslang: {r.msg}")

@@ -6,7 +6,6 @@ options indenting = 4
 require dastest/testing_boost public
 require _glsl_common
 require glsl/glsl_opengl
-require strings
 
 var @inout conf_uint4_uv : float2
 var @out conf_uint4_color : float4

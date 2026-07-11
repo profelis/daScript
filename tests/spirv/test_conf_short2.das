@@ -14,10 +14,10 @@ var @ssbo @binding = 0 conf_short2_data : array<int>
 [compute_shader(local_size_x=64, name="conf_short2_spv"), marker(no_coverage)]
 def conf_short2_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = short2(1, 2)
+    let v = short2(1, 2)
     let s = short2(conf_short2_data[gi])
-    let r = v.x
-    conf_short2_data[gi] = int(r)
+    let r = int(v.x) + int(s.x)
+    conf_short2_data[gi] = r
 }
 
 [test]

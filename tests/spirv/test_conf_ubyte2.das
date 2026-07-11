@@ -14,10 +14,10 @@ var @ssbo @binding = 0 conf_ubyte2_data : array<uint>
 [compute_shader(local_size_x=64, name="conf_ubyte2_spv"), marker(no_coverage)]
 def conf_ubyte2_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = ubyte2(1u, 2u)
+    let v = ubyte2(1u, 2u)
     let s = ubyte2(conf_ubyte2_data[gi])
-    let r = v.x
-    conf_ubyte2_data[gi] = uint(r)
+    let r = uint(v.x) + uint(s.x)
+    conf_ubyte2_data[gi] = r
 }
 
 [test]

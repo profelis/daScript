@@ -6,16 +6,15 @@ options indenting = 4
 require dastest/testing_boost public
 require _glsl_common
 require glsl/glsl_opengl
-require strings
 
 var @inout conf_uint16_uv : float2
 var @out conf_uint16_color : float4
 
 [fragment_program(name="conf_uint16_glsl")]
 def conf_uint16_fragment {
-    var v = uint16(1u)
+    let v = uint16(1u)
     let s = uint16(uint(conf_uint16_uv.x))
-    let r = v
+    let r = uint(v) + uint(s)
     conf_uint16_color = float4(float(r), 0., 0., 1.)
 }
 
@@ -23,6 +22,8 @@ def conf_uint16_fragment {
 def test_conf_uint16_glsl(t : T?) {
     t |> run("conformance uint16: emits and validates") <| @(t : T?) {
         t |> success(has(conf_uint16_glsl, "uint16_t"), "spells uint16_t")
+        t |> success(has(conf_uint16_glsl, "#if defined(GL_NV_gpu_shader5)"), "guarded NV chain")
+        t |> success(has(conf_uint16_glsl, "GL_EXT_shader_explicit_arithmetic_types_int16"), "EXT line in the #else branch")
         let r = validate_glsl(conf_uint16_glsl, "frag")
         if (r.ran) {
             t |> success(r.ok, "glslang: {r.msg}")

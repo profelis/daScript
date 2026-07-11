@@ -6,17 +6,16 @@ options indenting = 4
 require dastest/testing_boost public
 require _glsl_common
 require glsl/glsl_opengl
-require strings
 
 var @inout conf_float_uv : float2
 var @out conf_float_color : float4
 
 [fragment_program(name="conf_float_glsl")]
 def conf_float_fragment {
-    var v = float(1.)
+    var v = 1.
     let s = conf_float_uv.x
     v = v + s
-    v = v * float(2.)
+    v = v * 2.
     v = v - s
     let r = v
     conf_float_color = float4(r, 0., 0., 1.)

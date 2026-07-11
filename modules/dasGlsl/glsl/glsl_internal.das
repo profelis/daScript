@@ -2190,14 +2190,25 @@ def generate_glsl(fnMain : FunctionPtr; var errors : array<string>; shaderType :
     // needs_* flags at every lattice touchpoint, so non-lattice shaders stay byte-identical
     if (needs_f16 || needs_i16 || needs_i8 || needs_arb_packing) {
         var ext = ""
-        if (needs_f16) {
-            ext += "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n"
-        }
-        if (needs_i16) {
-            ext += "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n"
-        }
-        if (needs_i8) {
-            ext += "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n"
+        if (needs_f16 || needs_i16 || needs_i8) {
+            // real desktop GL drivers speak GL_NV_gpu_shader5 / AMD_gpu_shader_half_float, NOT the EXT
+            // family (NVIDIA GL rejects it; zen2-verified) — same spellings, so guard per consumer
+            ext += "#if defined(GL_NV_gpu_shader5)\n#extension GL_NV_gpu_shader5 : require\n"
+            if (needs_f16 && !needs_i16 && !needs_i8) {
+                // the AMD alternative is fp16-only — no small-int types there
+                ext += "#elif defined(GL_AMD_gpu_shader_half_float)\n#extension GL_AMD_gpu_shader_half_float : require\n"
+            }
+            ext += "#else\n"
+            if (needs_f16) {
+                ext += "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n"
+            }
+            if (needs_i16) {
+                ext += "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n"
+            }
+            if (needs_i8) {
+                ext += "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n"
+            }
+            ext += "#endif\n"
         }
         if (needs_arb_packing) {
             ext += "#extension GL_ARB_shading_language_packing : require\n"

@@ -6,16 +6,15 @@ options indenting = 4
 require dastest/testing_boost public
 require _glsl_common
 require glsl/glsl_opengl
-require strings
 
 var @inout conf_ubyte4_uv : float2
 var @out conf_ubyte4_color : float4
 
 [fragment_program(name="conf_ubyte4_glsl")]
 def conf_ubyte4_fragment {
-    var v = ubyte4(1u, 2u, 3u, 4u)
+    let v = ubyte4(1u, 2u, 3u, 4u)
     let s = ubyte4(uint(conf_ubyte4_uv.x))
-    let r = v.x
+    let r = uint(v.x) + uint(s.x)
     conf_ubyte4_color = float4(float(r), 0., 0., 1.)
 }
 
@@ -23,6 +22,8 @@ def conf_ubyte4_fragment {
 def test_conf_ubyte4_glsl(t : T?) {
     t |> run("conformance ubyte4: emits and validates") <| @(t : T?) {
         t |> success(has(conf_ubyte4_glsl, "u8vec4"), "spells u8vec4")
+        t |> success(has(conf_ubyte4_glsl, "#if defined(GL_NV_gpu_shader5)"), "guarded NV chain")
+        t |> success(has(conf_ubyte4_glsl, "GL_EXT_shader_explicit_arithmetic_types_int8"), "EXT line in the #else branch")
         let r = validate_glsl(conf_ubyte4_glsl, "frag")
         if (r.ran) {
             t |> success(r.ok, "glslang: {r.msg}")
