@@ -3042,7 +3042,7 @@ def has_dual_rope(c : Config) : bool => (c.sliding_window > 0l
 // ctx 512. Slice length tuning = ledger.
 let FLASH_DECODE_SLICE = 256l       // single-pass threshold: cnt <= this never slices
 let FLASH_DECODE_SLICE_LEN = 32l    // slice granularity once slicing engages
-let FLASH_DECODE_MAX_SLICES = 16l
+let FLASH_DECODE_MAX_SLICES = 32l   // 4 chunks/lane at 16L: Qwen2.5-1.5B d4k attn wall 393->333us/layer vs cap 16
 
 // attn-norm → QKV(+bias) → RoPE → KV-store → GQA multi-head attention → out-proj(+post-norm) → residual.
 // Can layer l's attention run as the fused 3-stage chain? Std shape only: Q8 weights, group3
