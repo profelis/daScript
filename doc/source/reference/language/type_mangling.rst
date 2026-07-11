@@ -53,6 +53,12 @@ daslang       Mangled   Notes
 ``urange``    ``z``
 ``range64``   ``r64``
 ``urange64``  ``z64``
+``float16``   ``h``     IEEE-754 binary16 scalar
+``half2``     ``h2``    packed fp16 vectors (h3/h4/h8 likewise)
+``short2``    ``w2``    packed int16 vectors (w3/w4/w8)
+``ushort2``   ``x2``    packed uint16 vectors (x3/x4/x8)
+``byte2``     ``c2``    packed int8 vectors (c3/c4/c8/c16)
+``ubyte2``    ``q2``    packed uint8 vectors (q3/q4/q8/q16)
 ============  ========  ============================
 
 

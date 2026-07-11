@@ -792,6 +792,75 @@ namespace  das {
 
     // generic SimPolicy<X>
 
+    // 16/8-bit lattice fp16 family. Reference semantics: promote each fp16 lane to
+    // float32, compute, round back (RNE) — correctly rounded per op, so this emulation
+    // and native fp16 hardware agree bit-exactly. The scalar float16 is the lanes=1
+    // case (its widened-lane-0 value convention shares the low 2 bytes with the packed
+    // layout). Division by zero follows IEEE (±inf/NaN), like float — no throw.
+#define DAS_FP16_OP1(OPNAME, EXPR)                                                          \
+        static __forceinline vec4f OPNAME ( vec4f x, Context &, LineInfo * ) {              \
+            vec4f r = v_zero();                                                             \
+            const float16_t * px = (const float16_t *)&x;                                   \
+            float16_t * pr = (float16_t *)&r;                                               \
+            for ( int i = 0; i != lanes; ++i ) { float xa = px[i].toFloat(); pr[i] = float16_t(EXPR); } \
+            return r;                                                                       \
+        }
+#define DAS_FP16_OP2(OPNAME, OP)                                                            \
+        static __forceinline vec4f OPNAME ( vec4f a, vec4f b, Context &, LineInfo * ) {     \
+            vec4f r = v_zero();                                                             \
+            const float16_t * pa = (const float16_t *)&a;                                   \
+            const float16_t * pb = (const float16_t *)&b;                                   \
+            float16_t * pr = (float16_t *)&r;                                               \
+            for ( int i = 0; i != lanes; ++i ) pr[i] = float16_t(OP);                       \
+            return r;                                                                       \
+        }
+#define DAS_FP16_SET_OP2(OPNAME, OP)                                                        \
+        static __forceinline void OPNAME ( char * a, vec4f b, Context &, LineInfo * ) {     \
+            float16_t * pa = (float16_t *)a;                                                \
+            const float16_t * pb = (const float16_t *)&b;                                   \
+            for ( int i = 0; i != lanes; ++i ) pa[i] = float16_t(OP);                       \
+        }
+#define DAS_FP16_BOOL_OP2(OPNAME, OP)                                                       \
+        static __forceinline bool OPNAME ( vec4f a, vec4f b, Context &, LineInfo * ) {      \
+            const float16_t * pa = (const float16_t *)&a;                                   \
+            const float16_t * pb = (const float16_t *)&b;                                   \
+            for ( int i = 0; i != lanes; ++i ) if ( !(pa[i].toFloat() OP pb[i].toFloat()) ) return false; \
+            return true;                                                                    \
+        }
+
+    template <int lanes>
+    struct SimPolicy_HalfVec {
+        DAS_FP16_OP1(Unp,  xa)
+        DAS_FP16_OP1(Unm, -xa)
+        DAS_FP16_OP2(Add, pa[i].toFloat() + pb[i].toFloat())
+        DAS_FP16_OP2(Sub, pa[i].toFloat() - pb[i].toFloat())
+        DAS_FP16_OP2(Mul, pa[i].toFloat() * pb[i].toFloat())
+        DAS_FP16_OP2(Div, pa[i].toFloat() / pb[i].toFloat())
+        DAS_FP16_OP2(Mod, fmodf(pa[i].toFloat(), pb[i].toFloat()))
+        DAS_FP16_SET_OP2(SetAdd, pa[i].toFloat() + pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetSub, pa[i].toFloat() - pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetMul, pa[i].toFloat() * pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetDiv, pa[i].toFloat() / pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetMod, fmodf(pa[i].toFloat(), pb[i].toFloat()))
+        // scalar x vector — the fp16 scalar operand rides widened in lane 0
+        DAS_FP16_OP2(MulVecScal, pa[i].toFloat() * pb[0].toFloat())
+        DAS_FP16_OP2(DivVecScal, pa[i].toFloat() / pb[0].toFloat())
+        DAS_FP16_OP2(MulScalVec, pa[0].toFloat() * pb[i].toFloat())
+        DAS_FP16_OP2(DivScalVec, pa[0].toFloat() / pb[i].toFloat())
+        DAS_FP16_SET_OP2(SetMulScal, pa[i].toFloat() * pb[0].toFloat())
+        DAS_FP16_SET_OP2(SetDivScal, pa[i].toFloat() / pb[0].toFloat())
+        // ordered comparisons — registered for the scalar (lanes=1); all-lanes for vectors
+        DAS_FP16_BOOL_OP2(Less, <)
+        DAS_FP16_BOOL_OP2(LessEqu, <=)
+        DAS_FP16_BOOL_OP2(Gt, >)
+        DAS_FP16_BOOL_OP2(GtEqu, >=)
+    };
+
+#undef DAS_FP16_OP1
+#undef DAS_FP16_OP2
+#undef DAS_FP16_SET_OP2
+#undef DAS_FP16_BOOL_OP2
+
     template <typename TT>
     struct SimPolicy;
 
@@ -816,6 +885,11 @@ namespace  das {
     template <> struct SimPolicy<urange> : SimPolicy_URange {};
     template <> struct SimPolicy<range64> : SimPolicy_Range64 {};
     template <> struct SimPolicy<urange64> : SimPolicy_URange64 {};
+    template <> struct SimPolicy<float16_t> : SimPolicy_HalfVec<1> {};
+    template <> struct SimPolicy<half2> : SimPolicy_HalfVec<2> {};
+    template <> struct SimPolicy<half3> : SimPolicy_HalfVec<3> {};
+    template <> struct SimPolicy<half4> : SimPolicy_HalfVec<4> {};
+    template <> struct SimPolicy<half8> : SimPolicy_HalfVec<8> {};
     template <> struct SimPolicy<char *> : SimPolicy_String {};
 
 }

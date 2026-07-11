@@ -161,6 +161,7 @@ def public has_sideeffects(expr : Expression?) : bool {
             || expr is ExprConstInt || expr is ExprConstInt8 || expr is ExprConstInt16
             || expr is ExprConstInt64 || expr is ExprConstUInt || expr is ExprConstUInt8
             || expr is ExprConstUInt16 || expr is ExprConstUInt64 || expr is ExprConstFloat
+            || expr is ExprConstFloat16
             || expr is ExprConstDouble || expr is ExprConstBool || expr is ExprConstString
             || expr is ExprConstPtr || expr is ExprConstRange || expr is ExprConstURange
             || expr is ExprConstRange64 || expr is ExprConstURange64

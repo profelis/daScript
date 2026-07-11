@@ -1229,6 +1229,12 @@ namespace das {
             case Type::tPointer:    case Type::tStructure:  case Type::tHandle:
             case Type::tArray:      case Type::tTable:      case Type::tTuple:  case Type::tVariant:
             case Type::tFunction:   case Type::tLambda:     case Type::tBlock:  case Type::tIterator:
+            case Type::tFloat16:
+            case Type::tHalf2:      case Type::tHalf3:      case Type::tHalf4:      case Type::tHalf8:
+            case Type::tShort2:     case Type::tShort3:     case Type::tShort4:     case Type::tShort8:
+            case Type::tUShort2:    case Type::tUShort3:    case Type::tUShort4:    case Type::tUShort8:
+            case Type::tByte2:      case Type::tByte3:      case Type::tByte4:      case Type::tByte8:      case Type::tByte16:
+            case Type::tUByte2:     case Type::tUByte3:     case Type::tUByte4:     case Type::tUByte8:     case Type::tUByte16:
                 def.index = RttiAny;
                 break;
             default:

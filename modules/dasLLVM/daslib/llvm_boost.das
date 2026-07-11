@@ -19,6 +19,7 @@ class PrimitiveTypes {
     private ctx : LLVMContextRef
     t_float : LLVMOpaqueType?
     t_double : LLVMOpaqueType?
+    t_half : LLVMOpaqueType?
     t_int1 : LLVMOpaqueType?
     t_int8 : LLVMOpaqueType?
     t_int16 : LLVMOpaqueType?
@@ -31,6 +32,7 @@ class PrimitiveTypes {
         ctx = ctx_
         t_float = LLVMFloatTypeInContext(ctx)
         t_double = LLVMDoubleTypeInContext(ctx)
+        t_half = LLVMHalfTypeInContext(ctx)
         t_int1 = LLVMInt1TypeInContext(ctx)
         t_int8 = LLVMInt8TypeInContext(ctx)
         t_int16 = LLVMInt16TypeInContext(ctx)
@@ -76,6 +78,19 @@ class PrimitiveTypes {
         return LLVMVectorType(t_int64, 2u)
     }
 
+    // 16/8-bit lattice — byte-packed lane vectors match the das value layout exactly
+    def const LLVMHalfVecType(lanes : uint) {
+        return LLVMVectorType(t_half, lanes)
+    }
+
+    def const LLVMShortVecType(lanes : uint) {
+        return LLVMVectorType(t_int16, lanes)
+    }
+
+    def const LLVMByteVecType(lanes : uint) {
+        return LLVMVectorType(t_int8, lanes)
+    }
+
     def const get_type_string : LLVMOpaqueType ? {
         return LLVMPointerType(t_int8, 0u)
     }
@@ -118,6 +133,10 @@ class PrimitiveTypes {
 
     def const ConstReal(value : double) {
         return LLVMConstReal(t_float, value)
+    }
+
+    def const ConstHalf(value : double) {
+        return LLVMConstReal(t_half, value)
     }
 
     def const ConstDouble(value : double) {
@@ -453,13 +472,28 @@ def describe(blk : LLVMOpaqueBasicBlock?) {
     return st
 }
 
+// 16/8-bit lattice types (contiguous appended block in the Type enum). Ops on these route
+// through the function path — visitExprOp2_NonMonade only lowers float/int/uint vector
+// bases natively, and an unrouted lattice op would hard-fail JIT emission via g_errors.
+// Until the fp16 operators carry builtin addresses, the function path cleanly drops the
+// enclosing function to the interpreter (DisableJitVisitor).
+def public is_lattice_small_type(t : Type) {
+    return int(t) >= int(Type.tFloat16) && int(t) <= int(Type.tUByte16)
+}
+
 def isExprOp2_Func(expr : ExprOp2?) {
-    if (!expr.func.flags.builtIn) return true
+    if (is_lattice_small_type(expr.left._type.baseType)
+            || is_lattice_small_type(expr.right._type.baseType)
+            || !expr.func.flags.builtIn) {
+        return true
+    }
     return expr.left._type.isHandle || expr.right._type.isHandle
 }
 
 def isExprOp1_Func(expr : ExprOp1?) {
-    if (!expr.func.flags.builtIn) return true
+    if (is_lattice_small_type(expr.subexpr._type.baseType) || !expr.func.flags.builtIn) {
+        return true
+    }
     return expr.subexpr._type.isHandle
 }
 

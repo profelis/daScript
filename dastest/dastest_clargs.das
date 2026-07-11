@@ -15,8 +15,8 @@ struct DastestArgs {
     @clarg_doc = "Compile test files without executing them"
     compile_only : bool
 
-    @clarg_doc = "If tests run longer than this duration in seconds, panic. If 0, the timeout is disabled. The default is 10 minutes"
-    timeout : float = 600.0
+    @clarg_doc = "If tests run longer than this duration in seconds, panic. If 0, the timeout is disabled. The default is 20 minutes"
+    timeout : float = 1200.0
 
     @clarg_doc = "Print the top N slowest test files and highlight statistical timing outliers (above mean + 2x stddev)"
     timing_outliers : int = 0

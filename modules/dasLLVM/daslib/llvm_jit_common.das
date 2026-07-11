@@ -1349,6 +1349,21 @@ def public base_type_to_llvm_type(t : Type) {
     return g_prim_t.LLVMFloat4Type() if (t == Type.tFloat4)
     return g_prim_t.get_type_string() if (t == Type.tString)
     return g_prim_t.LLVMVoidPtrType() if (t == Type.tPointer)
+    // 16/8-bit lattice — packed-lane vectors mirror the das value layout
+    return g_prim_t.t_half if (t == Type.tFloat16)
+    return g_prim_t.LLVMHalfVecType(2u) if (t == Type.tHalf2)
+    return g_prim_t.LLVMHalfVecType(3u) if (t == Type.tHalf3)
+    return g_prim_t.LLVMHalfVecType(4u) if (t == Type.tHalf4)
+    return g_prim_t.LLVMHalfVecType(8u) if (t == Type.tHalf8)
+    return g_prim_t.LLVMShortVecType(2u) if (t == Type.tShort2 || t == Type.tUShort2)
+    return g_prim_t.LLVMShortVecType(3u) if (t == Type.tShort3 || t == Type.tUShort3)
+    return g_prim_t.LLVMShortVecType(4u) if (t == Type.tShort4 || t == Type.tUShort4)
+    return g_prim_t.LLVMShortVecType(8u) if (t == Type.tShort8 || t == Type.tUShort8)
+    return g_prim_t.LLVMByteVecType(2u) if (t == Type.tByte2 || t == Type.tUByte2)
+    return g_prim_t.LLVMByteVecType(3u) if (t == Type.tByte3 || t == Type.tUByte3)
+    return g_prim_t.LLVMByteVecType(4u) if (t == Type.tByte4 || t == Type.tUByte4)
+    return g_prim_t.LLVMByteVecType(8u) if (t == Type.tByte8 || t == Type.tUByte8)
+    return g_prim_t.LLVMByteVecType(16u) if (t == Type.tByte16 || t == Type.tUByte16)
     failed("base_type_to_llvm_type: unsupported type {t}")
     return g_prim_t.t_int32
 }

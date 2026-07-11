@@ -415,6 +415,7 @@ namespace das {
                 expr->type->ref = false;
                 auto sim = Program::makeConst(expr->at, expr->type, value);
                 expr->type->ref = wasRef;
+                if ( !sim ) return expr;    // no const node for this type (lattice vectors) — don't fold
                 sim->type = new TypeDecl(*expr->type);
                 sim->constexpression = true;
                 ((ExprConst *)sim)->foldedNonConst = !expr->type->constant;

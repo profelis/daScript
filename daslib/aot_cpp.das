@@ -83,6 +83,29 @@ def das_to_cppString(t : Type) {
         if (Type.tFloat2) { return "float2"; }
         if (Type.tFloat3) { return "float3"; }
         if (Type.tFloat4) { return "float4"; }
+        if (Type.tFloat16) { return "float16_t"; }
+        if (Type.tHalf2) { return "half2"; }
+        if (Type.tHalf3) { return "half3"; }
+        if (Type.tHalf4) { return "half4"; }
+        if (Type.tHalf8) { return "half8"; }
+        if (Type.tShort2) { return "short2"; }
+        if (Type.tShort3) { return "short3"; }
+        if (Type.tShort4) { return "short4"; }
+        if (Type.tShort8) { return "short8"; }
+        if (Type.tUShort2) { return "ushort2"; }
+        if (Type.tUShort3) { return "ushort3"; }
+        if (Type.tUShort4) { return "ushort4"; }
+        if (Type.tUShort8) { return "ushort8"; }
+        if (Type.tByte2) { return "byte2"; }
+        if (Type.tByte3) { return "byte3"; }
+        if (Type.tByte4) { return "byte4"; }
+        if (Type.tByte8) { return "byte8"; }
+        if (Type.tByte16) { return "byte16"; }
+        if (Type.tUByte2) { return "ubyte2"; }
+        if (Type.tUByte3) { return "ubyte3"; }
+        if (Type.tUByte4) { return "ubyte4"; }
+        if (Type.tUByte8) { return "ubyte8"; }
+        if (Type.tUByte16) { return "ubyte16"; }
         if (Type.tDouble) { return "double"; }
         if (Type.tRange) { return "range"; }
         if (Type.tURange) { return "urange"; }
@@ -138,6 +161,29 @@ def das_to_cppCTypeString(t : Type) {
         if (Type.tFloat2) { return "tFloat2"; }
         if (Type.tFloat3) { return "tFloat3"; }
         if (Type.tFloat4) { return "tFloat4"; }
+        if (Type.tFloat16) { return "tFloat16"; }
+        if (Type.tHalf2) { return "tHalf2"; }
+        if (Type.tHalf3) { return "tHalf3"; }
+        if (Type.tHalf4) { return "tHalf4"; }
+        if (Type.tHalf8) { return "tHalf8"; }
+        if (Type.tShort2) { return "tShort2"; }
+        if (Type.tShort3) { return "tShort3"; }
+        if (Type.tShort4) { return "tShort4"; }
+        if (Type.tShort8) { return "tShort8"; }
+        if (Type.tUShort2) { return "tUShort2"; }
+        if (Type.tUShort3) { return "tUShort3"; }
+        if (Type.tUShort4) { return "tUShort4"; }
+        if (Type.tUShort8) { return "tUShort8"; }
+        if (Type.tByte2) { return "tByte2"; }
+        if (Type.tByte3) { return "tByte3"; }
+        if (Type.tByte4) { return "tByte4"; }
+        if (Type.tByte8) { return "tByte8"; }
+        if (Type.tByte16) { return "tByte16"; }
+        if (Type.tUByte2) { return "tUByte2"; }
+        if (Type.tUByte3) { return "tUByte3"; }
+        if (Type.tUByte4) { return "tUByte4"; }
+        if (Type.tUByte8) { return "tUByte8"; }
+        if (Type.tUByte16) { return "tUByte16"; }
         if (Type.tDouble) { return "tDouble"; }
         if (Type.tRange) { return "tRange"; }
         if (Type.tURange) { return "tURange"; }
@@ -1776,7 +1822,10 @@ class public CppAot : AstVisitor {
         if (variable.init != null) {
             write(*ss, cvname);
         } elif (variable._type.canInitWithZero) {
-            let init_val = isLocalVec(variable._type) ? "v_zero()" : "0";
+            var init_val = isLocalVec(variable._type) ? "v_zero()" : "0";
+            if (variable._type.baseType == Type.tFloat16) {
+                init_val = "float16_t(0.f)";   // no implicit int conversion on the fp16 carrier
+            }
             write(*ss, "{cvname} = {init_val}");
         } else {
             if (!collector.isMoved(variable)) {
@@ -2664,6 +2713,12 @@ class public CppAot : AstVisitor {
         writeOutFloat(c.getValue);
         return c;
     }
+    def override visitExprConstFloat16(var c : ExprConstFloat16?) : ExpressionPtr {
+        write(*ss, "float16_t(");
+        writeOutFloat(float(c.value));
+        write(*ss, ")");
+        return c;
+    }
     def override visitExprConstString(var c : ExprConstString?) : ExpressionPtr {
         if (c.value.empty()) {
             write(*ss, "nullptr");
@@ -2851,7 +2906,27 @@ class public CppAot : AstVisitor {
         return ifte;
     }
 // swizzle
+    def is_lattice_elem(t : Type) : bool {
+        return t == Type.tFloat16 || t == Type.tInt16 || t == Type.tUInt16 || t == Type.tInt8 || t == Type.tUInt8
+    }
     def override preVisitExprSwizzle(expr : ExprSwizzle?) {
+        assume srcT = expr.value._type
+        if (srcT.isVectorType && is_lattice_elem(srcT.vectorBaseType)) {
+            // 16/8-bit lattice — element-typed helpers (up to 16 lanes; the generic
+            // das_swizzle caps at 4 fields and v_extract is 32-bit-lane only)
+            let et = das_to_cppString(srcT.vectorBaseType)
+            let type_str = describeCppType(expr._type, DescribeConfig(skip_ref = true, cross_platform = cross_platform))
+            if (expr._type.flags.ref) {
+                write(*ss, "das_swizzle_ref_small<{type_str},{et},{int(expr.fields[0])}>::swizzle(")
+            } else {
+                let field_str = (each(expr.fields)
+                    ._select("{_:d}")
+                    .to_array()
+                    ._fold()) |> join(",")
+                write(*ss, "das_swizzle_small<{type_str},{et},{field_str}>::swizzle(")
+            }
+            return
+        }
         if (expr._type.flags.ref) {
             let type_str = describeCppType(expr._type, DescribeConfig(skip_ref = true, cross_platform = cross_platform));
             let value_str = describeCppType(expr.value._type, DescribeConfig(skip_ref = true, cross_platform = cross_platform));
@@ -2890,6 +2965,11 @@ class public CppAot : AstVisitor {
     def override visitExprSwizzle(var expr : ExprSwizzle?) : ExpressionPtr {
         if (expr.value._type.flags.aotAlias) {
             write(*ss, ")");
+        }
+        assume srcT = expr.value._type
+        if (srcT.isVectorType && is_lattice_elem(srcT.vectorBaseType)) {
+            write(*ss, ")");
+            return expr;
         }
         if (expr._type.flags.ref) {
             write(*ss, ")");
@@ -3666,6 +3746,9 @@ class public CppAot : AstVisitor {
     }
     def policyResultNeedCast(polType : TypeDeclPtr; resType : TypeDeclPtr) {
         if (resType.isVoid || !resType.isPolicyType) return false;
+        // lattice vector policy results must come back typed: they flow into template
+        // deduction contexts (the das_equ_val equality externs), where raw vec4f deduces wrong
+        if (resType.isVectorType && is_lattice_elem(resType.vectorBaseType)) return true;
         return policyArgNeedCast(polType, resType);
     }
     def isPolicyBasedCall(call : ExprCall?) {

@@ -858,6 +858,18 @@ namespace das
         auto getValue() const { return ExprConstT::getValue(); };
     };
 
+    struct DAS_API ExprConstFloat16 : ExprConstT<float16_t,ExprConstFloat16> {
+        ExprConstFloat16(float16_t i = float16_t())
+            : ExprConstT(i,Type::tFloat16) { __rtti = "ExprConstFloat16"; }
+        ExprConstFloat16(float i)
+            : ExprConstT(float16_t(i),Type::tFloat16) { __rtti = "ExprConstFloat16"; }
+        ExprConstFloat16(const LineInfo & a, float16_t i)
+            : ExprConstT(a,i,Type::tFloat16) { __rtti = "ExprConstFloat16"; }
+        ExprConstFloat16(const LineInfo & a, float i)
+            : ExprConstT(a,float16_t(i),Type::tFloat16) { __rtti = "ExprConstFloat16"; }
+        auto getValue() const { return ExprConstT::getValue(); };
+    };
+
     struct DAS_API ExprConstFloat2 : ExprConstT<float2,ExprConstFloat2> {
         ExprConstFloat2(float2 i = float2())
             : ExprConstT(i,Type::tFloat2) { __rtti = "ExprConstFloat2"; }

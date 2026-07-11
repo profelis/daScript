@@ -798,6 +798,29 @@ static_assert(DAS_TYPE_TABLE == (int)Type::tTable, "DAS_TYPE_TABLE mismatch");
 static_assert(DAS_TYPE_BLOCK == (int)Type::tBlock, "DAS_TYPE_BLOCK mismatch");
 static_assert(DAS_TYPE_TUPLE == (int)Type::tTuple, "DAS_TYPE_TUPLE mismatch");
 static_assert(DAS_TYPE_VARIANT == (int)Type::tVariant, "DAS_TYPE_VARIANT mismatch");
+static_assert(DAS_TYPE_FLOAT16 == (int)Type::tFloat16, "DAS_TYPE_FLOAT16 mismatch");
+static_assert(DAS_TYPE_HALF2 == (int)Type::tHalf2, "DAS_TYPE_HALF2 mismatch");
+static_assert(DAS_TYPE_HALF3 == (int)Type::tHalf3, "DAS_TYPE_HALF3 mismatch");
+static_assert(DAS_TYPE_HALF4 == (int)Type::tHalf4, "DAS_TYPE_HALF4 mismatch");
+static_assert(DAS_TYPE_HALF8 == (int)Type::tHalf8, "DAS_TYPE_HALF8 mismatch");
+static_assert(DAS_TYPE_SHORT2 == (int)Type::tShort2, "DAS_TYPE_SHORT2 mismatch");
+static_assert(DAS_TYPE_SHORT3 == (int)Type::tShort3, "DAS_TYPE_SHORT3 mismatch");
+static_assert(DAS_TYPE_SHORT4 == (int)Type::tShort4, "DAS_TYPE_SHORT4 mismatch");
+static_assert(DAS_TYPE_SHORT8 == (int)Type::tShort8, "DAS_TYPE_SHORT8 mismatch");
+static_assert(DAS_TYPE_USHORT2 == (int)Type::tUShort2, "DAS_TYPE_USHORT2 mismatch");
+static_assert(DAS_TYPE_USHORT3 == (int)Type::tUShort3, "DAS_TYPE_USHORT3 mismatch");
+static_assert(DAS_TYPE_USHORT4 == (int)Type::tUShort4, "DAS_TYPE_USHORT4 mismatch");
+static_assert(DAS_TYPE_USHORT8 == (int)Type::tUShort8, "DAS_TYPE_USHORT8 mismatch");
+static_assert(DAS_TYPE_BYTE2 == (int)Type::tByte2, "DAS_TYPE_BYTE2 mismatch");
+static_assert(DAS_TYPE_BYTE3 == (int)Type::tByte3, "DAS_TYPE_BYTE3 mismatch");
+static_assert(DAS_TYPE_BYTE4 == (int)Type::tByte4, "DAS_TYPE_BYTE4 mismatch");
+static_assert(DAS_TYPE_BYTE8 == (int)Type::tByte8, "DAS_TYPE_BYTE8 mismatch");
+static_assert(DAS_TYPE_BYTE16 == (int)Type::tByte16, "DAS_TYPE_BYTE16 mismatch");
+static_assert(DAS_TYPE_UBYTE2 == (int)Type::tUByte2, "DAS_TYPE_UBYTE2 mismatch");
+static_assert(DAS_TYPE_UBYTE3 == (int)Type::tUByte3, "DAS_TYPE_UBYTE3 mismatch");
+static_assert(DAS_TYPE_UBYTE4 == (int)Type::tUByte4, "DAS_TYPE_UBYTE4 mismatch");
+static_assert(DAS_TYPE_UBYTE8 == (int)Type::tUByte8, "DAS_TYPE_UBYTE8 mismatch");
+static_assert(DAS_TYPE_UBYTE16 == (int)Type::tUByte16, "DAS_TYPE_UBYTE16 mismatch");
 
 // --- Type introspection: entry points ---
 

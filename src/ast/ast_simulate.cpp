@@ -231,6 +231,7 @@ namespace das
         SV_CONST_VISIT(ExprConstURange64)
         SV_CONST_VISIT(ExprConstBool)
         SV_CONST_VISIT(ExprConstFloat)
+        SV_CONST_VISIT(ExprConstFloat16)
         SV_CONST_VISIT(ExprConstFloat2)
         SV_CONST_VISIT(ExprConstFloat3)
         SV_CONST_VISIT(ExprConstFloat4)
@@ -1487,7 +1488,7 @@ namespace das
                 valueType = valueT->baseType;
                 val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
             }
-            setE(expr, context.code->makeValueNode<SimNode_TableErase>(valueType, at, cont, val, valueTypeSize));
+            setE(expr, context.code->makeTableKeyValueNode<SimNode_TableErase>(valueType, at, cont, val, valueTypeSize));
         } else {
             DAS_ASSERTF(0, "we should not even be here. erase can only accept tables. infer type should have failed.");
             context.thisProgram->error("internal compilation error, generating erase for non-table type", "", "", at, CompilationError::internal_table);
@@ -1510,7 +1511,7 @@ namespace das
                 valueType = valueT->baseType;
                 val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
             }
-            setE(expr, context.code->makeValueNode<SimNode_TableSetInsert>(valueType, at, cont, val));
+            setE(expr, context.code->makeTableKeyValueNode<SimNode_TableSetInsert>(valueType, at, cont, val));
         } else {
             DAS_ASSERTF(0, "we should not even be here. erase can only accept tables. infer type should have failed.");
             context.thisProgram->error("internal compilation error, generating set insert for non-table type", "", "", at, CompilationError::internal_table);
@@ -1538,7 +1539,7 @@ namespace das
                     valueType = valueT->baseType;
                     val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
                 }
-                setE(expr, context.code->makeValueNode<SimNode_TableFind>(valueType, at, cont, val, valueTypeSize));
+                setE(expr, context.code->makeTableKeyValueNode<SimNode_TableFind>(valueType, at, cont, val, valueTypeSize));
             }
         } else {
             DAS_ASSERTF(0, "we should not even be here. find can only accept tables. infer type should have failed.");
@@ -1567,7 +1568,7 @@ namespace das
                     valueType = valueT->baseType;
                     val = context.code->makeNode<SimNode_CastToWorkhorse>(at, val);
                 }
-                setE(expr, context.code->makeValueNode<SimNode_KeyExists>(valueType, at, cont, val, valueTypeSize));
+                setE(expr, context.code->makeTableKeyValueNode<SimNode_KeyExists>(valueType, at, cont, val, valueTypeSize));
             }
         } else {
             DAS_ASSERTF(0, "we should not even be here. find can only accept tables. infer type should have failed.");
@@ -1950,6 +1951,11 @@ namespace das
                     case tBitfield64:
                                     setE(expr, (SimNode *) context.code->makeNode<SimNode_AtVectorU<uint64_t>>(at, prv, pidx, range)); break;
                     case tFloat:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtVectorU<float>>(at, prv, pidx, range)); break;
+                    case tFloat16:  setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<float16_t>>(at, prv, pidx, range)); break;
+                    case tInt16:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<int16_t>>(at, prv, pidx, range)); break;
+                    case tUInt16:   setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<uint16_t>>(at, prv, pidx, range)); break;
+                    case tInt8:     setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<int8_t>>(at, prv, pidx, range)); break;
+                    case tUInt8:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVecU<uint8_t>>(at, prv, pidx, range)); break;
                     default:
                         DAS_ASSERTF(0, "we should not even be here. infer type should have failed on unsupported_vector[blah]");
                         context.thisProgram->error("internal compilation error, generating vector at for unsupported vector type.", "", "", at, CompilationError::internal_expression);
@@ -1966,6 +1972,11 @@ namespace das
                     case tBitfield64:
                                     setE(expr, (SimNode *) context.code->makeNode<SimNode_AtVector<uint64_t>>(at, prv, pidx, range, errorMessage)); break;
                     case tFloat:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtVector<float>>(at, prv, pidx, range, errorMessage)); break;
+                    case tFloat16:  setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<float16_t>>(at, prv, pidx, range, errorMessage)); break;
+                    case tInt16:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<int16_t>>(at, prv, pidx, range, errorMessage)); break;
+                    case tUInt16:   setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<uint16_t>>(at, prv, pidx, range, errorMessage)); break;
+                    case tInt8:     setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<int8_t>>(at, prv, pidx, range, errorMessage)); break;
+                    case tUInt8:    setE(expr, (SimNode *) context.code->makeNode<SimNode_AtSVec<uint8_t>>(at, prv, pidx, range, errorMessage)); break;
                     default:
                         DAS_ASSERTF(0, "we should not even be here. infer type should have failed on unsupported_vector[blah]");
                         context.thisProgram->error("internal compilation error, generating vector at for unsupported vector type.", "", "", at, CompilationError::internal_expression);
@@ -1990,7 +2001,7 @@ namespace das
                     keyType = keyValueType->baseType;
                     pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
                 }
-                res = context.code->makeValueNode<SimNode_TableIndex>(keyType, at, prv, pidx, valueTypeSize, 0);
+                res = context.code->makeTableKeyValueNode<SimNode_TableIndex>(keyType, at, prv, pidx, valueTypeSize, 0);
             }
             if ( expr->r2v ) {
                 setE(expr, GetR2V(context, at, expr->type, res));
@@ -2037,7 +2048,7 @@ namespace das
                         valueType = valueT->baseType;
                         pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
                     }
-                    setE(expr, context.code->makeValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
+                    setE(expr, context.code->makeTableKeyValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
                 }
             } else if ( seT->baseType==Type::tFixedArray ) {
                 uint32_t range = uint32_t(seT->fixedDim);
@@ -2097,7 +2108,7 @@ namespace das
                         valueType = valueT->baseType;
                         pidx = context.code->makeNode<SimNode_CastToWorkhorse>(at, pidx);
                     }
-                    setE(expr, context.code->makeValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
+                    setE(expr, context.code->makeTableKeyValueNode<SimNode_SafeTableIndex>(valueType, at, prv, pidx, valueTypeSize, 0));
                 }
             } else if ( seT->baseType==Type::tFixedArray ) {
                 uint32_t range = uint32_t(seT->fixedDim);
@@ -2298,18 +2309,29 @@ namespace das
             if (seq && expr->value->type->ref) {
                 setE(expr, sv_trySimulate(expr, 0, expr->type));
             } else {
-                auto fsz = expr->fields.size();
-                uint8_t fs[4];
-                fs[0] = expr->fields[0];
-                fs[1] = fsz >= 2 ? expr->fields[1] : expr->fields[0];
-                fs[2] = fsz >= 3 ? expr->fields[2] : expr->fields[0];
-                fs[3] = fsz >= 4 ? expr->fields[3] : expr->fields[0];
-                auto simV = getE(expr->value);
-                if ( expr->type->baseType==Type::tInt64 || expr->type->baseType==Type::tUInt64
-                    || expr->type->baseType==Type::tRange64 || expr->type->baseType==Type::tURange64 ) {
-                    setE(expr, context.code->makeNode<SimNode_Swizzle64>(at, simV, fs));
+                auto srcBT = expr->value->type->getVectorBaseType();
+                if ( srcBT==Type::tFloat16 || srcBT==Type::tInt16 || srcBT==Type::tUInt16 ) {
+                    auto simV = getE(expr->value);
+                    setE(expr, context.code->makeNode<SimNode_SwizzleSmall<uint16_t,8>>(at, simV,
+                        expr->fields.data(), uint8_t(expr->fields.size())));
+                } else if ( srcBT==Type::tInt8 || srcBT==Type::tUInt8 ) {
+                    auto simV = getE(expr->value);
+                    setE(expr, context.code->makeNode<SimNode_SwizzleSmall<uint8_t,16>>(at, simV,
+                        expr->fields.data(), uint8_t(expr->fields.size())));
                 } else {
-                    setE(expr, context.code->makeNode<SimNode_Swizzle>(at, simV, fs));
+                    auto fsz = expr->fields.size();
+                    uint8_t fs[4];
+                    fs[0] = expr->fields[0];
+                    fs[1] = fsz >= 2 ? expr->fields[1] : expr->fields[0];
+                    fs[2] = fsz >= 3 ? expr->fields[2] : expr->fields[0];
+                    fs[3] = fsz >= 4 ? expr->fields[3] : expr->fields[0];
+                    auto simV = getE(expr->value);
+                    if ( expr->type->baseType==Type::tInt64 || expr->type->baseType==Type::tUInt64
+                        || expr->type->baseType==Type::tRange64 || expr->type->baseType==Type::tURange64 ) {
+                        setE(expr, context.code->makeNode<SimNode_Swizzle64>(at, simV, fs));
+                    } else {
+                        setE(expr, context.code->makeNode<SimNode_Swizzle>(at, simV, fs));
+                    }
                 }
             }
         } else {
