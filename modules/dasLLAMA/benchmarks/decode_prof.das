@@ -87,10 +87,11 @@ def private greedy_top(s : Session; vocab : int64) : int64 {
     return parallel_argmax(s.logits, vocab)   // team-scanned; bit-identical to the serial loop
 }
 
-// Bytes read per weight for a quant mode (quants + fp32 block scales at 1 per 32).
-def private wbytes(q : QuantMode) : double {
+// Bytes read per weight for a quant mode (quants + block scales at 1 per 32 — f32, or raw
+// binary16 on a wscale_f16 model's q8 plane).
+def private wbytes(q : QuantMode; wscale16 : bool = false) : double {
     if (q == QuantMode.q8) {
-        return 1.0lf + 4.0lf / 32.0lf
+        return 1.0lf + (wscale16 ? 2.0lf : 4.0lf) / 32.0lf
     }
     if (q == QuantMode.q4) {
         return 0.5lf + 4.0lf / 32.0lf
@@ -104,7 +105,7 @@ def private mb(v : double) : double => v / (1024.0lf * 1024.0lf)
 // depth `pos` (attention KV traffic grows with position; everything else is position-free).
 def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     let c = t.config
-    let wb = wbytes(t.quant)
+    let wb = wbytes(t.quant, t.wscale_f16)
     let dim = c.dim
     var attn = 0.0lf
     var kv_read = 0.0lf
@@ -133,7 +134,7 @@ def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     }
     let cls_fp32 = c.shared_weights && !t.cls_q8
     let cls = double(dim * c.vocab_size) * (cls_fp32 ? 4.0lf : wb)
-    let embed = double(dim) * (t.cls_q8 ? wbytes(QuantMode.q8) : 4.0lf)
+    let embed = double(dim) * (t.cls_q8 ? wbytes(QuantMode.q8, t.wscale_f16) : 4.0lf)
     let total = attn + kv_read + ffn + moe + router + shexp + cls + embed
     print("--- per-token traffic at ctx depth {pos} (config-derived, MB read/token) ---\n")
     print("  attn weights: {mb(attn)} ({100.0lf * attn / total}%)\n")

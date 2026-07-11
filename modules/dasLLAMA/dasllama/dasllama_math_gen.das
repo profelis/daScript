@@ -4,6 +4,8 @@ module dasllama_math_gen shared public
 
 require dasllama/dasllama_math
 require dasllama/dasllama_math_aarch64_neon
+require dasllama/dasllama_math_default  // dot_q8q8_f16s — the row-major tails of the s16 twins
+require llvm/daslib/f16_cvt             // f16_to_f32 — the s16 reference bodies' in-loop widen
 require llvm/daslib/llvm_tune  // [tune]/[tune_perm]/[tune_companion] + the [llvm_code] annotation it re-exports
 require dasllama/dasllama_gemm_schema
 require daslib/jobque_boost public
@@ -19,8 +21,10 @@ require math
 // bytes are baked (bias128), the kgroup companion how the plane groups its k-bytes (kg8 on
 // smmla stamps), the tokstep companion how many tokens one tile call covers (16·nrsplit on
 // amx stamps — the batch wrapper walks its space off it), the witness answers "did the family
-// actually emit", and all eight generators share one decline predicate, so kernels, repacks,
-// walk shape and availability cannot desync on any tier. Normal runs stamp exactly one winner (manifest > the per-ISA fallback chain:
+// actually emit", the q8q8_tile_s16_gen/q8q8_gemv_s16_gen twins serve the wscale_f16 rail
+// (same perm, only the scale-fold load widens binary16), and ALL the generators share one
+// decline predicate, so kernels, repacks, walk shape and availability cannot desync on any
+// tier. Normal runs stamp exactly one winner (manifest > the per-ISA fallback chain:
 // biased busd512 on AVX512-VNNI boxes / biased busd256 on VEX-VNNI / maddubs on plain AVX2 /
 // kstep2 elsewhere — each ISA's measured tune winner as the manifest-less default);
 // DAS_TUNE_MODE=tune/test stamps the grid + the *_variants() registries for the harness
@@ -136,6 +140,36 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
     }
 }
 
+//! The f16-scale GEMV companion (the wscale_f16 rail): q8q8_gemv_gen's twin over the raw
+//! binary16 group-scale plane (Model.qscales16 — the repacked f32 plane, converted in place,
+//! element order preserved). Same rows-range contract; the generated body differs only in the
+//! scale fold's widen (fcvtl/vcvtph2ps). Reference body = the scalar grp4 walk — correct on
+//! every tier; the hand laneq f16s twin is the neon backend's stage. Not `private`: it IS the
+//! mm_rows_s16 slot and is called from inside lifted parallel_for worker lambdas.
+[hint(unsafe_range_check, noalias = wp, noalias = sp, noalias = xqp, noalias = xsp)]
+def q8q8_gemv_s16_gen(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) : void {
+    let nb = n / 32l
+    unsafe {
+        for (g in range64(rb / 4l, re / 4l)) {
+            q8q8_token_grp_generic(yp, wp + g * 4l * n, sp + g * 4l * nb, xqp, xsp, n, 0l, g * 4l, 0l, 4l)
+        }
+    }
+}
+
+//! The f16-scale tile companion: q8q8_tile_gen's twin over the binary16 group-scale plane —
+//! same 4-token contract, stamped with the SAME perm (bias128/amx/smmla included; only the
+//! scale-fold load differs). Reference body = 4 scalar grp4 token walks, same per-block fold
+//! order. Not `private`: called from inside the lifted parallel_for worker lambdas.
+[unused_argument(xbsp), hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def q8q8_tile_s16_gen(var yp : float?; wg : int8 const?; sg : uint16 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
+    let nb = n / 32l
+    unsafe {
+        for (t in range64(4l)) {
+            q8q8_token_grp_generic(yp, wg, sg, xqp + (t0 + t) * n, xsp + (t0 + t) * nb, n, d, g * 4l, t0 + t, 4l)
+        }
+    }
+}
+
 //! The generated tile: mr interleaved rows x 4 tokens (the q8q8_repack_type(mr) layout — see
 //! dasllama_gemm_schema; the stamped mr is what q8q8_layout_gen reports). The reference body —
 //! 4 single-token laneq4 dots with the same per-block fold order as the tile — runs on interp,
@@ -185,6 +219,8 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
  tune_companion(fn = "q8q8_tokstep_gen", gen = "dasllama_gemm_gen::q8q8_tokstep"),
  tune_companion(fn = "q8q8_amx_cfg_gen", gen = "dasllama_gemm_gen::q8q8_amx_cfg"),
  tune_companion(fn = "q8q8_gemv_gen", gen = "dasllama_gemm_gen::q8q8_gemv"),
+ tune_companion(fn = "q8q8_tile_s16_gen", gen = "dasllama_gemm_gen::q8q8_tile_s16"),
+ tune_companion(fn = "q8q8_gemv_s16_gen", gen = "dasllama_gemm_gen::q8q8_gemv_s16"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
  tune(gen = "dasllama_gemm_gen::q8q8_tile",
@@ -355,6 +391,41 @@ def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?;
                     acc += int(int8(int(wg[wo + 3l]) + wb0)) * int(xq[xo + 3l])
                 }
                 f[int(r)] += float(acc) * sg[bi * mr + r] * xsb
+            }
+        }
+        for (r in range64(mr)) {
+            yp[trow * d + col + r] = f[int(r)]
+        }
+    }
+}
+
+//! The wscale_f16 overload of q8q8_token_grp_generic: the same walk with the per-block weight
+//! scale widened in-loop from the raw binary16 plane. The s16 stubs' reference bodies.
+def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : uint16 const?; xq : int8 const?; xs : float const?; n, d, col, trow, mr : int64; wbias : int64 = 0l; kgroup : int64 = 4l) {
+    let nb = n / 32l
+    let wb0 = int(wbias)
+    var f : float[32]   // scratch cap = the grid's max stampable mr (busd512 mr32 row)
+    for (r in range(int(mr))) {
+        f[r] = 0.0
+    }
+    unsafe {
+        for (bi in range64(nb)) {
+            let wb = bi * mr * 32l
+            let xb = bi * 32l
+            let xsb = xs[bi]
+            for (r in range64(mr)) {
+                var acc = 0
+                for (kg in range64(8l)) {
+                    let wo = (kgroup == 8l
+                        ? wb + (kg / 2l) * 8l * mr + r * 8l + (kg % 2l) * 4l
+                        : wb + kg * 4l * mr + r * 4l)
+                    let xo = xb + kg * 4l
+                    acc += int(int8(int(wg[wo + 0l]) + wb0)) * int(xq[xo + 0l])
+                    acc += int(int8(int(wg[wo + 1l]) + wb0)) * int(xq[xo + 1l])
+                    acc += int(int8(int(wg[wo + 2l]) + wb0)) * int(xq[xo + 2l])
+                    acc += int(int8(int(wg[wo + 3l]) + wb0)) * int(xq[xo + 3l])
+                }
+                f[int(r)] += float(acc) * f16_to_f32(uint(sg[bi * mr + r])) * xsb
             }
         }
         for (r in range64(mr)) {
@@ -735,6 +806,258 @@ def private mx4q8_groupn_gen(var yp : float?; wn : uint8 const?; we : uint8 cons
     }
 }
 
+// ===== f16-scale twins (the wscale_f16 rail): the same slot traversals over the binary16
+// group-scale plane — generated cores via the s16 companions, row-major tails via
+// dot_q8q8_f16s, token tails via the s16 rows core (no laneq fork needed: the generated
+// core covers every stamped layout) =====
+
+def private q8q8_batch_cell_s16_gen(var myp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, nb, mr, TB : int64; ub, ue : int; tb0, te : int64) {
+    unsafe {
+        var tb = tb0
+        while (tb < te) {
+            let tbe = min(tb + TB, te)
+            let tb4 = tb + ((tbe - tb) / 4l) * 4l
+            for (gi in range(ub, ue)) {
+                let g = int64(gi)
+                let wgp = wp + g * mr * n
+                let sgp = sp + g * mr * nb
+                var tk = tb
+                while (tk < tb4) {
+                    q8q8_tile_s16_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, g, tk)
+                    tk += 4l
+                }
+                while (tk < tbe) {
+                    q8q8_gemv_s16_gen(myp + tk * d, wp, sp, xqp + tk * n, xsp + tk * nb, n, g * mr, (g + 1l) * mr)
+                    tk++
+                }
+            }
+            tb += TB
+        }
+    }
+}
+
+def private q8q8_batch_amx_cell_s16_gen(var myp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, nb, mr, TBa, ts, gs : int64; ub, ue : int; tb0, te : int64) {
+    unsafe {
+        var tb = tb0
+        while (tb < te) {
+            let tbe = min(tb + TBa, te)
+            let tbS = tb + ((tbe - tb) / ts) * ts
+            for (ui in range(ub, ue)) {
+                let gg = int64(ui) * gs
+                let wgp = wp + gg * mr * n
+                let sgp = sp + gg * mr * nb
+                var tk = tb
+                while (tk < tbS) {
+                    q8q8_tile_s16_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, gg, tk)
+                    tk += ts
+                }
+                if (tk < tbe) {
+                    if (tbe - ts >= tb0) {
+                        q8q8_tile_s16_gen(myp, wgp, sgp, xqp, xsp, xbsp, n, d, gg, tbe - ts)
+                    } else {
+                        while (tk < tbe) {
+                            q8q8_gemv_s16_gen(myp + tk * d, wp, sp, xqp + tk * n, xsp + tk * nb, n, gg * mr, (gg + gs) * mr)
+                            tk++
+                        }
+                    }
+                }
+            }
+            tb += TBa
+        }
+    }
+}
+
+def private q8q8_batch_kernel_s16_gen(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    let nb = n / 32l
+    let mr = int64(q8q8_layout_gen())
+    let wbias = int64(q8q8_wbias_gen())
+    let ng = d / mr
+    var myp = yp
+    let TB = effective_token_block(g_q8_token_block, n)
+    var bs : array<int>
+    if (wbias != 0l) {
+        bs |> resize(int(ntok * nb))
+        unsafe {
+            var bsp = addr(bs[0])
+            for (t in range64(ntok)) {
+                let xrow = xqp + t * n
+                for (bi in range64(nb)) {
+                    var s = 0
+                    let xb = bi * 32l
+                    for (j in range64(32l)) {
+                        s += int(xrow[xb + j])
+                    }
+                    bsp[t * nb + bi] = -128 * s
+                }
+            }
+        }
+    }
+    let xbsp : int const? = wbias != 0l ? unsafe(addr(bs[0])) : null
+    let ts = int64(q8q8_tokstep_gen())   // tokens per tile call (4; 16/32 on amx stamps)
+    if (ts != 4l) {
+        let gs = ts / 16l                // row-groups per call — amx macros are square in tile units
+        let ngu = ng / gs
+        let TBa = max(TB, ts)
+        let grid = matmul_grid(int(ngu), gs * mr, get_q8_batch_chunks_per_job(), n * d * ntok, ntok, int(ts))
+        if (grid.y <= 1) {
+            maybe_parallel_for(0, int(ngu), grid.x) $(ub, ue) {
+                q8q8_amx_cfg_gen()      // latch stamps: load the TMUL palette on this worker
+                q8q8_batch_amx_cell_s16_gen(myp, wp, sp, xqp, xsp, xbsp, n, d, nb, mr, TBa, ts, gs, ub, ue, 0l, ntok)
+            }
+        } else {
+            let ntile = ntok / ts
+            let cells = grid.x * grid.y
+            maybe_parallel_for(0, cells, cells) $(cb, ce) {
+                q8q8_amx_cfg_gen()      // latch stamps: load the TMUL palette on this worker
+                for (ci in range(cb, ce)) {
+                    let ri = ci % grid.x
+                    let ti = ci / grid.x
+                    let ub = int(int64(ri) * ngu / int64(grid.x))
+                    let ue = int(int64(ri + 1) * ngu / int64(grid.x))
+                    let ctb = int64(ti) * ntile / int64(grid.y) * ts
+                    let cte = ti == grid.y - 1 ? ntok : int64(ti + 1) * ntile / int64(grid.y) * ts
+                    q8q8_batch_amx_cell_s16_gen(myp, wp, sp, xqp, xsp, xbsp, n, d, nb, mr, TBa, ts, gs, ub, ue, ctb, cte)
+                }
+            }
+        }
+        if (ngu * gs < ng) {
+            unsafe {
+                for (tk in range64(ntok)) {
+                    q8q8_gemv_s16_gen(myp + tk * d, wp, sp, xqp + tk * n, xsp + tk * nb, n, ngu * gs * mr, ng * mr)
+                }
+            }
+        }
+    } else {
+        let grid = matmul_grid(int(ng), mr, get_q8_batch_chunks_per_job(), n * d * ntok, ntok, 4)
+        if (grid.y <= 1) {
+            maybe_parallel_for(0, int(ng), grid.x) $(rb, re) {
+                q8q8_batch_cell_s16_gen(myp, wp, sp, xqp, xsp, xbsp, n, d, nb, mr, TB, rb, re, 0l, ntok)
+            }
+        } else {
+            let ntile = ntok / 4l
+            let cells = grid.x * grid.y
+            maybe_parallel_for(0, cells, cells) $(cb, ce) {
+                for (ci in range(cb, ce)) {
+                    let ri = ci % grid.x
+                    let ti = ci / grid.x
+                    let ub = int(int64(ri) * ng / int64(grid.x))
+                    let ue = int(int64(ri + 1) * ng / int64(grid.x))
+                    let ctb = int64(ti) * ntile / int64(grid.y) * 4l
+                    let cte = ti == grid.y - 1 ? ntok : int64(ti + 1) * ntile / int64(grid.y) * 4l
+                    q8q8_batch_cell_s16_gen(myp, wp, sp, xqp, xsp, xbsp, n, d, nb, mr, TB, ub, ue, ctb, cte)
+                }
+            }
+        }
+    }
+    unsafe {
+        for (i in range64(ng * mr, d)) {   // row tails (d % mr) stay row-major in the repack
+            let wrow = wp + i * n
+            let srow = sp + i * nb
+            for (tk in range64(ntok)) {
+                myp[tk * d + i] = dot_q8q8_f16s(wrow, srow, xqp + tk * n, xsp + tk * nb, n)
+            }
+        }
+    }
+    delete bs
+}
+
+def private q8q8_kernel_s16_gen(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+    var myp = yp
+    maybe_parallel_for(0, int(ng), matmul_chunks_gemv(int(ng * mr), get_q8_batch_chunks_per_job(), n * d)) $(rb, re) {
+        q8q8_gemv_s16_gen(myp, wp, sp, xqp, xsp, n, int64(rb) * mr, int64(re) * mr)
+    }
+    unsafe {
+        for (i in range64(ng * mr, d)) {
+            myp[i] = dot_q8q8_f16s(wp + i * n, sp + i * nb, xqp, xsp, n)
+        }
+    }
+}
+
+def private q8q8_group3_s16_gen(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : uint16 const?;
+                                woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) {
+    let nb = n / 32l
+    let mr = int64(q8q8_layout_gen())
+    let ng0 = d0 / mr
+    let ng1 = d1 / mr
+    let ng2 = d2 / mr
+    let ngtot = ng0 + ng1 + ng2
+    var w0 = y0p
+    var w1 = y1p
+    var w2 = y2p
+    maybe_parallel_for(0, int(ngtot), matmul_chunks_gemv(int(ngtot * mr), get_jobque_team_mode() ? get_q8_batch_chunks_per_job() : 1, n * (d0 + d1 + d2))) $(rb, re) {
+        unsafe {
+            let b0 = int64(rb)
+            let e0 = min(int64(re), ng0)
+            if (b0 < e0) {
+                q8q8_gemv_s16_gen(w0, wp + woff0, sp + woff0 / 32l, xqp, xsp, n, b0 * mr, e0 * mr)
+            }
+            let b1 = max(int64(rb) - ng0, 0l)
+            let e1 = min(int64(re) - ng0, ng1)
+            if (b1 < e1) {
+                q8q8_gemv_s16_gen(w1, wp + woff1, sp + woff1 / 32l, xqp, xsp, n, b1 * mr, e1 * mr)
+            }
+            let b2 = max(int64(rb) - ng0 - ng1, 0l)
+            let e2 = min(int64(re) - ng0 - ng1, ng2)
+            if (b2 < e2) {
+                q8q8_gemv_s16_gen(w2, wp + woff2, sp + woff2 / 32l, xqp, xsp, n, b2 * mr, e2 * mr)
+            }
+        }
+    }
+    unsafe {
+        for (i in range64(ng0 * mr, d0)) {
+            w0[i] = dot_q8q8_f16s(wp + woff0 + i * n, sp + woff0 / 32l + i * nb, xqp, xsp, n)
+        }
+        for (i in range64(ng1 * mr, d1)) {
+            w1[i] = dot_q8q8_f16s(wp + woff1 + i * n, sp + woff1 / 32l + i * nb, xqp, xsp, n)
+        }
+        for (i in range64(ng2 * mr, d2)) {
+            w2[i] = dot_q8q8_f16s(wp + woff2 + i * n, sp + woff2 / 32l + i * nb, xqp, xsp, n)
+        }
+    }
+}
+
+def private q8q8_groupn_s16_gen(var yp : float?; wp : int8 const?; sp : uint16 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nb = n / 32l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+    var myp = yp
+    maybe_parallel_for(0, int(nregions * ng), matmul_chunks_gemv(int(nregions * ng * mr), get_q8_batch_chunks_per_job(), n * d * nregions)) $(gb, ge) {
+        unsafe {
+            var gg = int64(gb)
+            while (gg < int64(ge)) {
+                let r = gg / ng
+                let gLocal = gg % ng
+                let gEnd = min(int64(ge) - r * ng, ng)
+                let woff = offs[r * 2l]
+                let xoff = offs[r * 2l + 1l]
+                q8q8_gemv_s16_gen(myp + r * d, wp + woff, sp + woff / 32l, xqp + xoff, xsp + xoff / 32l, n, gLocal * mr, gEnd * mr)
+                if (bp != null) {
+                    for (i in range64(gLocal * mr, gEnd * mr)) {
+                        myp[r * d + i] += bp[boffs[r] + i]
+                    }
+                }
+                gg = r * ng + gEnd
+            }
+        }
+    }
+    unsafe {
+        for (r in range64(nregions)) {   // row tails (d % mr): row-major per region
+            let woff = offs[r * 2l]
+            let xoff = offs[r * 2l + 1l]
+            for (i in range64(ng * mr, d)) {
+                var v = dot_q8q8_f16s(wp + woff + i * n, sp + woff / 32l + i * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + i]
+                }
+                myp[r * d + i] = v
+            }
+        }
+    }
+}
+
 [init]
 def dasllama_math_gen_register() {
     // Same gate as the laneq backend it superseded; needs_repack keeps it out of auto-select
@@ -744,7 +1067,8 @@ def dasllama_math_gen_register() {
     // expand's positional map reads; it is evaluated at selection time, never at [init]
     // ([init]s run before the JIT installs generated code — the slice C mr8 bug). arm64
     // needs no availability predicate: a declined stamp still leaves the fast grp4
-    // reference pair there.
+    // reference pair there (the s16 slots' references are scalar until the neon laneq
+    // f16s twins land — wscale_f16 stays a per-box opt-in meanwhile).
     if (get_architecture_name() == "arm64" && jit_enabled()) {
         register_kernel_backend(KernelBackend(name = "arm64-gen", mm = @@q8q8_kernel_gen,
             batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_gen,
@@ -752,6 +1076,9 @@ def dasllama_math_gen_register() {
             mm_mx4 = @@mx4q8_kernel_gen, repack_mx4 = @@repack_mx4_gen,
             groupn = @@q8q8_groupn_gen, groupn_mx4 = @@mx4q8_groupn_gen,
             mm_rows = @@q8q8_gemv_gen,
+            mm_s16 = @@q8q8_kernel_s16_gen, batch_s16 = @@q8q8_batch_kernel_s16_gen,
+            group3_s16 = @@q8q8_group3_s16_gen, groupn_s16 = @@q8q8_groupn_s16_gen,
+            mm_rows_s16 = @@q8q8_gemv_s16_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
             q8_kgroup = @@q8q8_kgroup_gen))
@@ -769,6 +1096,9 @@ def dasllama_math_gen_register() {
             mm_mx4 = @@mx4q8_kernel_gen, repack_mx4 = @@repack_mx4_gen,
             groupn = @@q8q8_groupn_gen, groupn_mx4 = @@mx4q8_groupn_gen,
             mm_rows = @@q8q8_gemv_gen,
+            mm_s16 = @@q8q8_kernel_s16_gen, batch_s16 = @@q8q8_batch_kernel_s16_gen,
+            group3_s16 = @@q8q8_group3_s16_gen, groupn_s16 = @@q8q8_groupn_s16_gen,
+            mm_rows_s16 = @@q8q8_gemv_s16_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
             q8_kgroup = @@q8q8_kgroup_gen,
