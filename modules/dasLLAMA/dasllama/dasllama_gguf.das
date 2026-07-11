@@ -578,7 +578,7 @@ def private rd_pair(ks : array<uint8> | #; o : int64) : float2 {
 
 //! Reference dequant of one k4-plane superblock (the exact math the k4 kernels must reproduce):
 //! w = s*q - o with the plane's f16-rounded (s, o) pairs.
-def dequant_k4_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float>; doff : int64) {
+def dequant_k4_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
     var dsto = doff
     for (js in range64(4l)) {
         let p0 = rd_pair(ks, kso + 2l * js * 4l)
@@ -593,7 +593,7 @@ def dequant_k4_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<u
 }
 
 //! Reference dequant of one k5-plane superblock: w = s*q - o, q = nibble | (high bit << 4).
-def dequant_k5_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float>; doff : int64) {
+def dequant_k5_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
     var dsto = doff
     for (js in range64(4l)) {
         let p0 = rd_pair(ks, kso + 2l * js * 4l)
@@ -612,7 +612,7 @@ def dequant_k5_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<u
 
 //! Reference dequant of one k6-plane superblock: w = (d*sc16)*(q - 32) — bit-identical to the
 //! disk dequant (the k6 planes are verbatim).
-def dequant_k6_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float>; doff : int64) {
+def dequant_k6_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
     let d = f16_to_f32(rd_u16(ks, kso + 16l))
     var qlo = kqo
     var qho = kqo + 128l

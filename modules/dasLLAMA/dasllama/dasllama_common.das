@@ -3011,18 +3011,28 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
     let qoff = t.wq_offs[l]
     let koff = t.wk_offs[l]
     let voff = t.wv_offs[l]
+    let fq = fmt_at(t.wq_fmt, l)
+    let fk = fmt_at(t.wk_fmt, l)
+    let fv = fmt_at(t.wv_fmt, l)
     if (voff < 0l) {
         // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection. With v_norm the
         // copy fuses into the norm — rmsnorm reads all of k before writing v, and k stays intact for
         // its own qk_norm + rope — one pass instead of copy-then-norm; the block's v_norm step skips
         // these layers. Bit-identical arithmetic to copy + in-place norm.
-        mm(s.q, t, qoff, s.xb, s.xq, s.xs, dim, qd)
-        mm(s.k, t, koff, s.xb, s.xq, s.xs, dim, kv)
+        mm_f(s.q, t, fq, qoff, s.xb, s.xq, s.xs, s.xbs, dim, qd)
+        mm_f(s.k, t, fk, koff, s.xb, s.xq, s.xs, s.xbs, dim, kv)
         if (c.v_norm) {
             rms_batch(s.v, s.k, t, t.rms_ones_off, layer_head_size(c, l), layer_n_kv_heads(c, l))
         } else {
             copy_floats(s.k, 0l, s.v, 0l, kv)
         }
+    } elif (fq != KqFmt.q8 || fk != KqFmt.q8 || fv != KqFmt.q8) {
+        // K-quant projections (formats can MIX per layer — Q4_K_M keeps attn_v at Q6_K):
+        // one bs-quantize, then a per-format plane GEMV each
+        quantize_q8_0_bs_into(s.xb, dim, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
+        mm_pre_f(s.q, t, fq, qoff, s.xq, s.xs, s.xbs, dim, qd)
+        mm_pre_f(s.k, t, fk, koff, s.xq, s.xs, s.xbs, dim, kv)
+        mm_pre_f(s.v, t, fv, voff, s.xq, s.xs, s.xbs, dim, kv)
     } elif (t.quant == QuantMode.q8 && lanes_for_work(dim * (qd + 2l * kv), g_gemv_lane_cap) > 1) {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
         if (t.wscale_f16) {
@@ -3080,6 +3090,67 @@ def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs : array<int64
 
 def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs, boffs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
     matmul_mx4q8_groupn(y, t.mxq, t.mxs, offs, nregions, xq, xs, t.fblob, boffs, n, d)
+}
+
+// ===== native K-quant dispatch (kquant_native; fmt != q8 tags) =====
+
+// K-quant GEMV against a PRE-quantized activation (xq/xs/xbs already filled by the bs quantizer).
+def private mm_at_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; n, d : int64; yoff : int64 = 0l) {
+    if (fmt == KqFmt.k4) {
+        matmul_kq(4, y, t.k4q, t.k4s, woff, xq, xs, xbs, n, d, yoff)
+    } elif (fmt == KqFmt.k5) {
+        matmul_kq(5, y, t.k5q, t.k5s, woff, xq, xs, xbs, n, d, yoff)
+    } else {
+        matmul_kq(6, y, t.k6q, t.k6s, woff, xq, xs, xbs, n, d, yoff)
+    }
+}
+
+// K-quant matmul: bs-quantize the activation (quants + scales + the per-16 sums the offset term
+// needs), then the format's plane GEMV. The kq sibling of mm/mm_at_q8.
+def private mm_kq(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; var xbs : array<int>; n, d : int64) {
+    quantize_q8_0_bs_into(x, n, xq, xs, xbs, 0l, 0l, 0l)
+    mm_at_kq_pre(y, t, fmt, woff, xq, xs, xbs, n, d)
+}
+
+// Batched K-quant matmul: positions run serially, each bs-quantized into the shared decode
+// scratch then a full row GEMV (which parallelizes over d). Exact — the mx4 expand-to-q8 trick
+// is lossy for asymmetric K-quants, so prefill pays a slower path until a native tile lands.
+def private mm_b_kq(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; var xbs : array<int>; n, d, npos : int64) {
+    unsafe {
+        for (p in range64(npos)) {
+            quantize_q8_0_bs_into_ptr(addr(x[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), 0l, 0l, 0l)
+            mm_at_kq_pre(y, t, fmt, woff, xq, xs, xbs, n, d, p * d)
+        }
+    }
+}
+
+// Format router: q8-tagged weights take the classic mm; kq tags take the plane GEMV.
+def private mm_f(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; var xbs : array<int>; n, d : int64) {
+    if (fmt == KqFmt.q8) {
+        mm(y, t, woff, x, xq, xs, n, d)
+    } else {
+        mm_kq(y, t, fmt, woff, x, xq, xs, xbs, n, d)
+    }
+}
+
+// Pre-quantized format router (the activation was bs-quantized once — its quants/scales are
+// byte-identical to the plain quantizer's, so q8-tagged weights consume them unchanged).
+def private mm_pre_f(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; n, d : int64) {
+    if (fmt == KqFmt.q8) {
+        mm_at_q8_pre(y, t, woff, xq, xs, n, d)
+    } else {
+        mm_at_kq_pre(y, t, fmt, woff, xq, xs, xbs, n, d)
+    }
+}
+
+// Batched format router: q8 weights ride the batch tile; kq weights take the serial-per-position
+// plane GEMVs through the DECODE scratch (xq/xs/xbs — sized max(dim, hidden), not the batch planes).
+def private mm_b_f(var s : Session; var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; n, d, npos : int64) {
+    if (fmt == KqFmt.q8) {
+        mm_b(y, t, woff, x, s.xqb, s.xsb, n, d, npos)
+    } else {
+        mm_b_kq(y, t, fmt, woff, x, s.xq, s.xs, s.xbs, n, d, npos)
+    }
 }
 
 // Route a big-weight matmul through the Q8, Q4, or fp32 kernel depending on the model's quant mode.
@@ -3273,6 +3344,8 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
     // needs whole 32-quant groups per head (real targets are 64/128/256; stories15M's 48 falls back)
     return (g_fused_decode && t.quant == QuantMode.q8 && g_use_rope_table
         && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
+        && fmt_at(t.wq_fmt, l) == KqFmt.q8 && fmt_at(t.wk_fmt, l) == KqFmt.q8
+        && fmt_at(t.wv_fmt, l) == KqFmt.q8 && fmt_at(t.wo_fmt, l) == KqFmt.q8   // kq layers: per-op path (chain rows cores are Q8-only for now)
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && (!t.wscale_f16 || kernel_backend_has_rows16())
         && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
@@ -3696,6 +3769,8 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
 def private fused_ffn_ok(t : Model; l : int64) : bool {
     let c = t.config
     return (g_fused_decode && t.quant == QuantMode.q8
+        && fmt_at(t.w1_fmt, l) == KqFmt.q8 && fmt_at(t.w2_fmt, l) == KqFmt.q8
+        && fmt_at(t.w3_fmt, l) == KqFmt.q8   // kq layers: per-op path (chain rows cores are Q8-only for now)
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && (!t.wscale_f16 || kernel_backend_has_rows16())
         && lanes_for_work(c.dim * layer_hidden(t, l), g_gemv_lane_cap) > 1)
@@ -3863,7 +3938,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     // q, k, v projections (independent — share s.xb; fused into one parallel dispatch when Q8)
     let ts_qkv = ref_time_ticks()
     if (kv_shared) {
-        mm(s.q, t, t.wq_offs[l], s.xb, s.xq, s.xs, dim, qd)   // Q only
+        mm_f(s.q, t, fmt_at(t.wq_fmt, l), t.wq_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, qd)   // Q only
     } else {
         mm_qkv(s, t, l)
     }
@@ -3972,7 +4047,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     prof_add("attn", ts_attn)
     // output projection (qd -> dim), optional bias + post-attention norm, residual
     let ts_wo = ref_time_ticks()
-    mm(s.xb2, t, t.wo_offs[l], s.xb, s.xq, s.xs, qd, dim)
+    mm_f(s.xb2, t, fmt_at(t.wo_fmt, l), t.wo_offs[l], s.xb, s.xq, s.xs, s.xbs, qd, dim)
     if (c.attn_out_bias) {  // gpt-oss: + bias on the projected attention output
         add_bias(s.xb2, 0l, t.bo, l * dim, dim)
     }
@@ -3994,7 +4069,25 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
     let dim = c.dim
     let hidden = layer_hidden(t, l)   // gemma-4 E2B varies FFN width per layer
     let ts_ffn = ref_time_ticks()
-    if (t.quant == QuantMode.q8) {
+    let f1 = fmt_at(t.w1_fmt, l)
+    let f2 = fmt_at(t.w2_fmt, l)
+    let f3 = fmt_at(t.w3_fmt, l)
+    if (f1 != KqFmt.q8 || f2 != KqFmt.q8 || f3 != KqFmt.q8) {
+        // K-quant FFN (Q4_K_M keeps ffn_down at Q6_K on some layers — formats mix): one
+        // bs-quantize serves every format, gate/up as separate plane GEMVs, then the gated
+        // half requants (with sums) for the down projection
+        quantize_q8_0_bs_into(s.xb, dim, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
+        mm_pre_f(s.hb, t, f1, t.w1_offs[l], s.xq, s.xs, s.xbs, dim, hidden)
+        mm_pre_f(s.hb2, t, f3, t.w3_offs[l], s.xq, s.xs, s.xbs, dim, hidden)
+        prof_add("mm_ffn", ts_ffn)
+        let ts_act = ref_time_ticks()
+        gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)
+        prof_add("act", ts_act)
+        let ts_down = ref_time_ticks()
+        quantize_q8_0_bs_into(s.hb, hidden, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
+        mm_pre_f(s.xb, t, f2, t.w2_offs[l], s.xq, s.xs, s.xbs, hidden, dim)
+        prof_add("mm_ffn", ts_down)
+    } elif (t.quant == QuantMode.q8) {
         // gate+up share the activation: ONE quantize + ONE region-list dispatch into ffn_gu's
         // halves (bit-identical — same quants, same per-row dots, only the scheduling changes)
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
@@ -4580,11 +4673,27 @@ def private dequant_q8_row(t : Model; off, n : int64; var dst : float?) {
 }
 
 // Copy token `token`'s embedding row into dst — from the fp32 fblob table, or (cls_q8 loads, which
-// carry no fp32 table) dequanted on demand from the linear Q8 copy at emb_q8_off.
+// carry no fp32 table) dequanted on demand from the linear Q8 copy at emb_q8_off, or (cls_kq loads)
+// from the K-quant plane at wcls_off — rows are whole superblocks (dim % 256 == 0, a ggml K-quant
+// invariant the layout relies on).
 def private embed_row(t : Model; token : int64; var dst : float?) {
     let dim = t.config.dim
     if (t.cls_q8) {
         dequant_q8_row(t, t.emb_q8_off + token * dim, dim, dst)
+    } elif (cls_kq(t)) {
+        unsafe {
+            var row = temp_array(dst, dim, type<float>)
+            let sb0 = (t.wcls_off + token * dim) / 256l
+            for (s in range64(dim / 256l)) {
+                if (t.emb_fmt == KqFmt.k4) {
+                    dequant_k4_plane_superblock(t.k4q, (sb0 + s) * K4_QSB, t.k4s, (sb0 + s) * K4_SSB, row, s * 256l)
+                } elif (t.emb_fmt == KqFmt.k5) {
+                    dequant_k5_plane_superblock(t.k5q, (sb0 + s) * K5_QSB, t.k5s, (sb0 + s) * K5_SSB, row, s * 256l)
+                } else {
+                    dequant_k6_plane_superblock(t.k6q, (sb0 + s) * K6_QSB, t.k6s, (sb0 + s) * K6_SSB, row, s * 256l)
+                }
+            }
+        }
     } else {
         copy_floats(dst, unsafe(addr(t.fblob[t.tok_emb_off + token * dim])), dim)
     }
@@ -4687,14 +4796,18 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     let ts_final = ref_time_ticks()
     trace_tag(TRACE_TAG_CLS)
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
-    let tied_f32 = c.shared_weights && !t.cls_q8
-    if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
+    if (c.final_logit_softcap > 0.0 && !tied_f32 && cls_fmt == KqFmt.q8 && fused_cls_ok(t)) {
         // Gemma2/E-series: soft-cap fused into the classifier chunks
         cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
         if (tied_f32) {
             // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
             mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+        } elif (cls_fmt != KqFmt.q8) {
+            // K-quant classifier (tied plane copy or untied kq output.weight)
+            mm_kq(s.logits, t, cls_fmt, t.wcls_off, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
         } else {
             // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
             mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
@@ -5470,13 +5583,13 @@ def private attn_qkv_rope_prefix(t : Model; var s : Session; l : int64; npos : i
     prof_add("norm", ts_norm0)
     // batched q/k/v projections (each re-quantizes xb_b — cheap vs the matmul)
     let ts_qkv = ref_time_ticks()
-    mm_b(s.q_b, t, t.wq_offs[l], s.xb_b, s.xqb, s.xsb, dim, qd, npos)
+    mm_b_f(s, s.q_b, t, fmt_at(t.wq_fmt, l), t.wq_offs[l], s.xb_b, dim, qd, npos)
     if (kv_shared) {
         // E-series shared-KV layer: no K/V of its own — the source layer already filled the cache
     } else {
-        mm_b(s.k_b, t, t.wk_offs[l], s.xb_b, s.xqb, s.xsb, dim, kv_dim, npos)
+        mm_b_f(s, s.k_b, t, fmt_at(t.wk_fmt, l), t.wk_offs[l], s.xb_b, dim, kv_dim, npos)
         if (t.wv_offs[l] >= 0l) {
-            mm_b(s.v_b, t, t.wv_offs[l], s.xb_b, s.xqb, s.xsb, dim, kv_dim, npos)
+            mm_b_f(s, s.v_b, t, fmt_at(t.wv_fmt, l), t.wv_offs[l], s.xb_b, dim, kv_dim, npos)
         } elif (c.v_norm) {
             // no attn_v tensor (gemma4 global layers): V = the pre-norm K projection, with the copy
             // fused into the weightless V-norm (k_b read fully before v_b is written; k_b stays intact
@@ -5541,7 +5654,7 @@ def private attn_out_suffix(t : Model; var s : Session; l : int64; npos : int64)
     let qd = c.n_heads * layer_head_size(c, l)
     // output projection (batched, qd -> dim) + optional bias + post-attn norm + residual
     let ts_wo = ref_time_ticks()
-    mm_b(s.xb2_b, t, t.wo_offs[l], s.xb_b, s.xqb, s.xsb, qd, dim, npos)
+    mm_b_f(s, s.xb2_b, t, fmt_at(t.wo_fmt, l), t.wo_offs[l], s.xb_b, qd, dim, npos)
     if (c.attn_out_bias) {  // gpt-oss: + bias per position on the projected attention output
         for (p in range64(npos)) {
             add_bias(s.xb2_b, p * dim, t.bo, l * dim, dim)
@@ -5607,15 +5720,15 @@ def private ffn_dense_prefill(t : Model; var s : Session; l : int64; npos : int6
     prof_add("norm", ts_norm1)
     // gated FFN (batched): hb = act(W1·xb) * (W3·xb) — act/mul elementwise, so batch-flat
     let ts_ffn = ref_time_ticks()
-    mm_b(s.hb_b, t, t.w1_offs[l], s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
-    mm_b(s.hb2_b, t, t.w3_offs[l], s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
+    mm_b_f(s, s.hb_b, t, fmt_at(t.w1_fmt, l), t.w1_offs[l], s.xb_b, dim, hidden, npos)
+    mm_b_f(s, s.hb2_b, t, fmt_at(t.w3_fmt, l), t.w3_offs[l], s.xb_b, dim, hidden, npos)
     prof_add("mm_ffn", ts_ffn)
     let ts_act = ref_time_ticks()
     gate_batch(s.hb_b, s.hb2_b, c.ffn_act, hidden, npos)   // fused act*gate (exp4 unless act_vec off)
     prof_add("act", ts_act)
     // down projection (batched) + optional post-FFN norm + residual
     let ts_ffn2 = ref_time_ticks()
-    mm_b(s.xb_b, t, t.w2_offs[l], s.hb_b, s.xqb, s.xsb, hidden, dim, npos)
+    mm_b_f(s, s.xb_b, t, fmt_at(t.w2_fmt, l), t.w2_offs[l], s.hb_b, hidden, dim, npos)
     prof_add("mm_ffn", ts_ffn2)
     let ts_resid1 = ref_time_ticks()
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm per position before residual
@@ -6228,10 +6341,10 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
     // 5. dense parallel shared expert over ALL positions: rms_ffn -> GeGLU -> post_ffw_norm_1 into gout
     let ts_sh = ref_time_ticks()
     rms_batch(s.xb_b, s.x_b, t, t.rms_ffn_off + l * dim, dim, npos)
-    mm_b(s.hb_b, t, t.w1_offs[l], s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
-    mm_b(s.hb2_b, t, t.w3_offs[l], s.xb_b, s.xqb, s.xsb, dim, hidden, npos)
+    mm_b_f(s, s.hb_b, t, fmt_at(t.w1_fmt, l), t.w1_offs[l], s.xb_b, dim, hidden, npos)
+    mm_b_f(s, s.hb2_b, t, fmt_at(t.w3_fmt, l), t.w3_offs[l], s.xb_b, dim, hidden, npos)
     gate_batch(s.hb_b, s.hb2_b, c.ffn_act, hidden, npos)
-    mm_b(s.moe_gout, t, t.w2_offs[l], s.hb_b, s.xqb, s.xsb, hidden, dim, npos)
+    mm_b_f(s, s.moe_gout, t, fmt_at(t.w2_fmt, l), t.w2_offs[l], s.hb_b, hidden, dim, npos)
     rms_batch(s.moe_gout, s.moe_gout, t, t.rms_post_ffn1_off + l * dim, dim, npos)
     prof_add("mm_shexp", ts_sh)
 
@@ -6501,12 +6614,15 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     let ts_final = ref_time_ticks()
     let last = npos - 1l
     rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
-    let tied_f32 = c.shared_weights && !t.cls_q8
-    if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
+    if (c.final_logit_softcap > 0.0 && !tied_f32 && cls_fmt == KqFmt.q8 && fused_cls_ok(t)) {
         cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
         if (tied_f32) {
             mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+        } elif (cls_fmt != KqFmt.q8) {
+            mm_kq(s.logits, t, cls_fmt, t.wcls_off, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
         } else {
             mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
         }
@@ -6813,9 +6929,12 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
     let vocab = c.vocab_size
     rms_batch(ws.scr.xb_b, ws.scr.x_b, t, t.rms_final_off, dim, nrows)
     ws.logits_b |> resize(nrows * vocab)
-    if (c.shared_weights && !t.cls_q8) {
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    if (c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) {
         // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
         mm_fblob_b(ws.logits_b, t, t.tok_emb_off, ws.scr.xb_b, dim, vocab, nrows)
+    } elif (cls_fmt != KqFmt.q8) {
+        mm_b_kq(ws.logits_b, t, cls_fmt, t.wcls_off, ws.scr.xb_b, ws.scr.xq, ws.scr.xs, ws.scr.xbs, dim, vocab, nrows)
     } else {
         mm_b(ws.logits_b, t, t.wcls_off, ws.scr.xb_b, ws.scr.xqb, ws.scr.xsb, dim, vocab, nrows)
     }

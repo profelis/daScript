@@ -6,6 +6,7 @@ require dastest/testing_boost public
 require _model_tier
 require dasllama/dasllama_gguf
 require dasllama/dasllama_quant
+require dasllama/dasllama_math_default   // dot_k4q8/k5/k6 — the kernel arms gate them vs the plane dequant
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration for load_gguf
 require math
 
@@ -185,6 +186,104 @@ def test_kq_transcode_planes(t : T?) {
         for (k in range(256)) {
             t |> success(dst[k] == want[k], "k6 plane element must equal the file dequant bit-exactly")
         }
+    }
+}
+
+// XOR the quant payload of a synthetic superblock with an LCG byte stream — every quant bit
+// pattern is valid, so the second superblock of a kernel test carries different data (an
+// inter-superblock offset bug can't cancel).
+def private perturb_quants(var blkb : array<uint8>; qoff, qlen : int) {
+    var st = 0x12345u
+    for (i in range(qlen)) {
+        st = st * 1664525u + 1013904223u
+        blkb[qoff + i] = uint8(uint(blkb[qoff + i]) ^ (st >> 16u))
+    }
+}
+
+// Kernel-vs-reference gate core: transcode two distinct superblocks of `fmt`, quantize a smooth
+// activation with the bs quantizer, and compare the integer-domain kernel dot against the fp64
+// elementwise dot over the plane dequant (the kernels' declared oracle).
+def private kq_dot_gate(t : T?; fmt : int) {
+    let n = 512l
+    let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
+    var blk2 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
+    if (fmt == 4) {
+        perturb_quants(blk2, 16, 128)
+    } elif (fmt == 5) {
+        perturb_quants(blk2, 16, 160)   // qh + qs
+    } else {
+        perturb_quants(blk2, 0, 192)    // ql + qh
+    }
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    var kq : array<uint8>
+    var ks : array<uint8>
+    kq |> resize(2l * qsb)
+    ks |> resize(2l * ssb)
+    if (fmt == 4) {
+        transcode_q4k_superblock(blk1, 0l, kq, 0l, ks, 0l)
+        transcode_q4k_superblock(blk2, 0l, kq, qsb, ks, ssb)
+    } elif (fmt == 5) {
+        transcode_q5k_superblock(blk1, 0l, kq, 0l, ks, 0l)
+        transcode_q5k_superblock(blk2, 0l, kq, qsb, ks, ssb)
+    } else {
+        transcode_q6k_superblock(blk1, 0l, kq, 0l, ks, 0l)
+        transcode_q6k_superblock(blk2, 0l, kq, qsb, ks, ssb)
+    }
+    // plane dequant = the reference weights
+    var w : array<float>
+    w |> resize(n)
+    for (s in range64(2l)) {
+        if (fmt == 4) {
+            dequant_k4_plane_superblock(kq, s * qsb, ks, s * ssb, w, s * 256l)
+        } elif (fmt == 5) {
+            dequant_k5_plane_superblock(kq, s * qsb, ks, s * ssb, w, s * 256l)
+        } else {
+            dequant_k6_plane_superblock(kq, s * qsb, ks, s * ssb, w, s * 256l)
+        }
+    }
+    // activation: smooth signal -> bs quantizer (quants + scales + per-16 sums)
+    var src : array<float>
+    src |> resize(n)
+    for (i in range64(n)) {
+        src[i] = 1.7 * sin(float(i) * 0.23) + 0.3 * cos(float(i) * 0.071)
+    }
+    var xq : array<int8>
+    var xs : array<float>
+    var xbs : array<int>
+    xq |> resize(n)
+    xs |> resize(n / 32l)
+    xbs |> resize(n / 16l)
+    quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    // fp64 elementwise reference over the SAME quantized activation
+    var ref = 0.0lf
+    for (i in range64(n)) {
+        ref += double(w[i]) * double(xq[i]) * double(xs[i / 32l])
+    }
+    var got = 0.0
+    unsafe {
+        if (fmt == 4) {
+            got = dot_k4q8(addr(kq[0]), addr(ks[0]), addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+        } elif (fmt == 5) {
+            got = dot_k5q8(addr(kq[0]), addr(ks[0]), addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+        } else {
+            got = dot_k6q8(addr(kq[0]), addr(ks[0]), addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+        }
+    }
+    let denom = max(abs(float(ref)), 1.0e-6)
+    t |> success(abs(got - float(ref)) / denom < 1.0e-4, "kernel dot must match the fp64 plane-dequant reference")
+}
+
+[test]
+def test_kq_dots(t : T?) {
+    t |> run("dot_k4q8 matches the fp64 plane-dequant reference") @(t : T?) {
+        kq_dot_gate(t, 4)
+    }
+    t |> run("dot_k5q8 matches the fp64 plane-dequant reference") @(t : T?) {
+        kq_dot_gate(t, 5)
+    }
+    t |> run("dot_k6q8 matches the fp64 plane-dequant reference") @(t : T?) {
+        kq_dot_gate(t, 6)
     }
 }
 
