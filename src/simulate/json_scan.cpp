@@ -840,6 +840,9 @@ namespace das {
             skipWS();
             T * vals = (T*)dst;
             if (peek() == '{') {
+                // object form names lanes x/y/z/w only — >4-lane vectors are
+                // array-only (matches the printer; anything else parses lossy)
+                if (count > 4) return false;
                 // object form: zero-init then fill by field name
                 cur++;
                 for (int i = 0; i < count; i++) vals[i] = T(0);
@@ -871,6 +874,7 @@ namespace das {
             skipWS();
             float * vals = (float*)dst;
             if (peek() == '{') {
+                if (count > 4) return false;
                 cur++;
                 for (int i = 0; i < count; i++) vals[i] = 0.f;
                 if (expect('}')) return true;
@@ -901,6 +905,7 @@ namespace das {
             skipWS();
             float16_t * vals = (float16_t*)dst;
             if (peek() == '{') {
+                if (count > 4) return false;
                 cur++;
                 for (int i = 0; i < count; i++) vals[i].bits = 0;
                 if (expect('}')) return true;
