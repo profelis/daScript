@@ -4,6 +4,9 @@ from collections import defaultdict
 path = sys.argv[1]
 ev = json.load(open(path))["traceEvents"]
 ev = [e for e in ev if e.get("ph") == "X"]
+if not ev:
+    print("no span events in trace")
+    sys.exit(0)
 caller_tid = max(e["tid"] for e in ev)
 
 chains = defaultdict(lambda: {"pub": None, "chunks": defaultdict(list), "cwaits": {}, "nstages": 0, "total": 0})
@@ -66,7 +69,7 @@ for ns in sorted(classes, reverse=True):
                 interstage[s].append(s0 - prev_end)
             prev_end = s1
     print(f"\n== {name.get(ns, ns)}  n={len(rows)}  chunks/chain={rows[0][1]['total']}")
-    print(f"  wall/chain us: p50={st.median(walls):.1f} p95={p(walls, 95):.1f}   publish: p50={st.median(pubs):.1f}   first-worker-claim after pub: p50={st.median(reacts):.1f} p95={p(reacts, 95):.1f}")
+    print(f"  wall/chain us: p50={st.median(walls):.1f} p95={p(walls, 95):.1f}   publish: p50={st.median(pubs):.1f}   first-worker-claim after pub: p50={st.median(reacts) if reacts else 0:.1f} p95={p(reacts, 95):.1f}")
     for s in sorted(stage_span):
         print(f"  stage {s}: span p50={st.median(stage_span[s]):7.1f}  busy-sum p50={st.median(stage_busy[s]):7.1f}  eff-par p50={st.median(stage_par[s]):5.2f}  lanes p50={st.median(stage_lanes[s]):4.1f}  last-chunk p50={st.median(stage_tail[s]):5.1f}"
               + (f"  gap-from-prev p50={st.median(interstage[s]):5.1f}" if s in interstage else ""))
