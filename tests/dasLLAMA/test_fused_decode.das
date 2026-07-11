@@ -300,7 +300,7 @@ def test_fused_decode_pre_post_norm(t : T?) {
             setup_dasllama_jobque_()
             set_target_chunk_work(1l)
             pin_kernel_backend("portable")   // the rows core every host shares (see the attn-chain twin)
-            for (name in ["gemma-3-1b-it-Q8_0.gguf", "gemma-2-2b-it-Q8_0.gguf"]) {
+            for (name in ["gemma-3-1b-it-Q8_0.gguf", "gemma-2-2b-it-Q8_0.gguf", "gemma-4-E2B-it-Q8_0.gguf"]) {
                 let path = path_join(models_dir(), name)
                 if (!stat(path).is_valid) {
                     t |> success(true, "skipped: {path} not present")

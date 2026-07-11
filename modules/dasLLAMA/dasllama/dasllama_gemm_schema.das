@@ -12,7 +12,9 @@ module dasllama_gemm_schema shared public
 struct Q8RepackType {
     //! rows interleaved per dword group (= the tile's mr)
     interleave : int
-    //! scales pre-converted to f32 at repack time and interleaved per group
+    //! scales pre-converted to f32 at repack time and interleaved per group (the wscale_f16
+    //! rail converts the BUILT plane to raw binary16 in place afterwards, order-preserving —
+    //! the *_s16 kernel twins read that halfword view of this same layout)
     f32_scales : bool
     //! additive bias baked into every GROUP-row weight byte (`w ^ 0x80` when 128 — the
     //! vpdpbusd bias128 perms; 0 = plain s8). Row-major tail rows always stay unbiased.

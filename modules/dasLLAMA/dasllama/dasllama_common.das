@@ -220,6 +220,11 @@ struct Model {
     wblob : array<float>
     qblob : array<int8>
     qscales : array<float>
+    // wscale_f16 rail: the Q8 weight-scale plane as raw binary16 halfwords — llama.cpp byte
+    // parity (34 vs 36 B per 32 weights). Built by wscale_convert_f16 post-repack (qscales is
+    // then freed); exactly one of qscales/qscales16 is populated for a q8 model.
+    qscales16 : array<uint16>
+    wscale_f16 : bool = false
     q4blob : array<uint8>
     q4scales : array<float>
     // Native-MXFP4 expert stacks (valid when experts_mx4): the routed we1/we2/we3 stacks live here
@@ -232,6 +237,11 @@ struct Model {
     mxq : array<uint8>
     mxs : array<uint8>
     experts_mx4 : bool = false
+    // gemma-4 E-series: per_layer_model_proj kept in its native BF16 halfwords — half the
+    // per-token read; dot_bf16 widens by the exact bit shift, so the math matches the fp32
+    // expand bit-for-bit. ple_model_off indexes bf16blob when set, fblob otherwise.
+    bf16blob : array<uint16>
+    ple_model_bf16 : bool = false
     // Attention projections use PER-LAYER offsets — tensor shapes differ per layer class on gemma4
     // (SWA 16Q/8KV heads of 256 vs global 16Q/1KV of 512); uniform arches fill the flat strides.
     // wv_offs[l] = -1 marks a layer with no attn_v tensor (V reuses the pre-norm K projection).
@@ -355,6 +365,7 @@ struct private LayoutSizes {
     fblob_n : int64   // element count of the fp32 aux region
     wblob_n : int64   // element count of the big-weight region
     mx_n : int64      // element count of the native-MXFP4 expert planes (0 unless experts_mx4)
+    bf16_n : int64    // halfword count of the native-BF16 region (0 unless ple_model_bf16)
 }
 
 // Fill the dense FFN offset tables (w1/w2/w3), each a contiguous per-layer region, from `wo` — the
@@ -381,6 +392,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     let hidden = c.hidden_dim
     let layers = c.n_layers
     var fo = 0l
+    var bf16 = 0l
     if (t.cls_q8) {
         t.tok_emb_off = -1l   // no fp32 embedding table — rows dequant from emb_q8_off
     } else {
@@ -463,8 +475,13 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         fo += c.n_embd_per_layer
         t.ple_post_off = fo
         fo += layers * dim
-        t.ple_model_off = fo
-        fo += dim * c.n_embd_per_layer * layers
+        if (t.ple_model_bf16) {
+            t.ple_model_off = 0l
+            bf16 = dim * c.n_embd_per_layer * layers
+        } else {
+            t.ple_model_off = fo
+            fo += dim * c.n_embd_per_layer * layers
+        }
     }
     // Per-layer KV source + cache-row prefix. A shared layer (E-series) contributes NO width and
     // aliases its source layer's slot, so kv_cache_off returns the source base and its own K/V are
@@ -580,7 +597,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         t.wcls_off = wo
         wo += c.vocab_size * dim
     }
-    return LayoutSizes(fblob_n = fo, wblob_n = wo, mx_n = mx)
+    return LayoutSizes(fblob_n = fo, wblob_n = wo, mx_n = mx, bf16_n = bf16)
 }
 
 // Reserve exact capacity then size — avoids the array allocator's power-of-2 rounding on big arrays.
@@ -752,6 +769,36 @@ def private resolve_arch(var t : Model; arch : string) {
     t.arch = arch
     g_arch_registry[arch].configure(t.config)
     t.blocks = g_arch_registry[arch].blocks
+}
+
+// The wscale_f16 rail's load-time switch (see Model.qscales16): default off; box-profile
+// runtime knob `wscale_f16` / benches flip it before load_gguf.
+var g_wscale_f16 = false
+def public set_wscale_f16(on : bool) {
+    g_wscale_f16 = on
+}
+def public get_wscale_f16() : bool {
+    return g_wscale_f16
+}
+
+// Convert the (already repacked/permuted) f32 scale plane to raw binary16 halfwords and free the
+// f32 plane. f16->f32->f16 round-trips exactly, so for gguf-Q8 tensors the halfword plane equals
+// the disk scales bit-for-bit and every dot is bit-identical to the f32 plane; runtime-quantized
+// tensors (f32/bf16-source weights on a q8 load) take one f16 rounding on their scales. Gated on
+// the active backend carrying the f16-scale kernel twins.
+def private wscale_convert_f16(var t : Model) {
+    if (!kernel_backend_has_wscale16()) {
+        to_log(LOG_WARNING, "dasLLAMA: wscale_f16 requested but backend '{active_kernel_backend()}' has no f16-scale kernels — keeping the f32 scale plane\n")
+        return
+    }
+    let n = long_length(t.qscales)
+    t.qscales16 |> resize(int(n))
+    unsafe {
+        cvt_f32_to_f16(addr(t.qscales16[0]), addr(t.qscales[0]), n)
+    }
+    delete t.qscales
+    t.wscale_f16 = true
+    to_log(LOG_INFO, "dasLLAMA: weight-scale plane converted to f16 ({n} scales, -{n * 2l} bytes)\n")
 }
 
 //! Load a llama-architecture GGUF into the split layout at the requested precision. The big weights
@@ -1140,11 +1187,19 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             && gguf_tensor_type(m, "blk.0.ffn_gate_exps.weight") == GGML_TYPE_MXFP4
             && gguf_tensor_type(m, "blk.0.ffn_down_exps.weight") == GGML_TYPE_MXFP4
             && gguf_tensor_type(m, "blk.0.ffn_up_exps.weight") == GGML_TYPE_MXFP4)
+        // gemma-4 E-series: keep per_layer_model_proj in its native BF16 — half the per-token
+        // read; dot_bf16's widen is the exact bit shift, so the values match the fp32 expand
+        t.ple_model_bf16 = (has_ple(t.config)
+            && gguf_tensor_type(m, "per_layer_model_proj.weight") == GGML_TYPE_BF16)
         let kv = t.config.kv_dim
         let qd = t.config.n_heads * t.config.head_size   // query width (== dim except Gemma2)
         let sz = layout_offsets(t)
         // fp32 aux (embedding + norms) is always present; the big-weight storage matches `mode`
         reserve_resize(t.fblob, sz.fblob_n)
+        if (sz.bf16_n > 0l) {
+            t.bf16blob |> reserve(sz.bf16_n)
+            t.bf16blob |> resize(sz.bf16_n)
+        }
         if (sz.mx_n > 0l) {
             t.mxq |> reserve(sz.mx_n / 2l)
             t.mxq |> resize(sz.mx_n / 2l)
@@ -1209,9 +1264,13 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
         }
         gguf_read_tensor_f32(m, bytes, "output_norm.weight", t.fblob, t.rms_final_off, dim)
-        if (has_ple(t.config)) {  // gemma-4 E-series PLE globals: fp32 model-proj + proj-norm (both fblob)
+        if (has_ple(t.config)) {  // gemma-4 E-series PLE globals: model-proj (native bf16 when on disk) + proj-norm
             let ple = t.config.n_embd_per_layer
-            gguf_read_tensor_f32(m, bytes, "per_layer_model_proj.weight", t.fblob, t.ple_model_off, dim * ple * layers)
+            if (t.ple_model_bf16) {
+                gguf_transcode_bf16(m, bytes, "per_layer_model_proj.weight", t.bf16blob, t.ple_model_off, dim * ple * layers)
+            } else {
+                gguf_read_tensor_f32(m, bytes, "per_layer_model_proj.weight", t.fblob, t.ple_model_off, dim * ple * layers)
+            }
             gguf_read_tensor_f32(m, bytes, "per_layer_proj_norm.weight", t.fblob, t.ple_pnorm_off, ple)
         }
         // big 2D weights -> active precision. ggml stores them row-major [out x in] = our convention.
@@ -1341,6 +1400,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 repack_mx4_stacks(t)
             }
         }
+        if (mode == QuantMode.q8 && g_wscale_f16) {
+            wscale_convert_f16(t)
+        }
     }
     fclose(f)
     return <- t
@@ -1358,6 +1420,9 @@ def quantize_weights(var t : Model) {
     // same backend-for-load select + in-place repack as the load_gguf Q8 path (no-op off-ARM)
     if (select_matmul_backend_for_load()) {
         repack_q8_weights(t)
+    }
+    if (g_wscale_f16) {
+        wscale_convert_f16(t)
     }
 }
 
@@ -1392,7 +1457,7 @@ def footprint(t : Model) : MemFootprint {
     let aux = long_length(t.fblob) * 4l
     let wf = long_length(t.wblob) * 4l
     let q8 = long_length(t.qblob)                 // int8 -> 1 byte each
-    let q8s = long_length(t.qscales) * 4l
+    let q8s = long_length(t.qscales) * 4l + long_length(t.qscales16) * 2l
     let q4 = long_length(t.q4blob)                // uint8 (two nibbles) -> 1 byte each
     let q4s = long_length(t.q4scales) * 4l
     let mx4 = long_length(t.mxq)                  // uint8 (two nibbles) -> 1 byte each
@@ -1752,6 +1817,8 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "q8_batch_chunks_per_job") $(v) { set_q8_batch_chunks_per_job(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "matmul_min_chunk_rows") $(v) { set_matmul_min_chunk_rows(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "matmul_min_chunk_rows_gemv") $(v) { set_matmul_min_chunk_rows_gemv(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "gemv_chunks_per_lane") $(v) { set_gemv_chunks_per_lane(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "wscale_f16") $(v) { set_wscale_f16(v != 0l) }
     apply_i64_knob(rt, "gemv_lane_cap") $(v) { set_gemv_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_lane_cap") $(v) { set_batch_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_grid_2d") $(v) { set_batch_grid_2d(int(min(v, 2l))) }
@@ -1819,32 +1886,37 @@ def bos_id(m : Model) : int64 {
     return bos_id(m.tok)
 }
 
-// fp32 matmul with the weight as a zero-copy view into the big-weight blob at `woff` (len n*d).
+// fp32 matmul with the weight at element offset `woff` in the big-weight blob (blob+offset kernel
+// form — array_view's block invoke is an LLVM optimization boundary, and the kernel only ever
+// wanted the base pointer; same for every mm_* wrapper below).
 def private mm_at(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d : int64) {
-    array_view(t.wblob, woff, n * d) $(w : array<float>#) {
-        matmul(y, w, x, n, d)
-    }
+    matmul(y, t.wblob, woff, x, n, d)
 }
 
-// fp32 matmul with the weight viewed into the fp32 aux blob (used for the tied classifier = embedding).
+// fp32 matmul against the fp32 aux blob (used for the tied classifier = embedding).
 def private mm_fblob(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d : int64) {
-    array_view(t.fblob, woff, n * d) $(w : array<float>#) {
-        matmul(y, w, x, n, d)
-    }
+    matmul(y, t.fblob, woff, x, n, d)
 }
 
 // Batched fp32 matmul against the aux blob: Y [npos x d] token-major from X [npos x n] — the grouped
 // MoE prefill's router. matmul_batch is bit-for-bit npos x matmul, so routing matches decode exactly.
 def private mm_fblob_b(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d, npos : int64) {
-    array_view(t.fblob, woff, n * d) $(w : array<float>#) {
-        matmul_batch(y, w, x, n, d, npos)
+    matmul_batch(y, t.fblob, woff, x, n, d, npos)
+}
+
+// rmsnorm with the weight at `woff` in the fp32 aux blob — straight to the tuned pointer core.
+def private rms_at(var o : array<float> | #; t : Model; woff : int64; x : array<float> | #; size : int64) {
+    unsafe {
+        rmsnorm(reinterpret<float?>(addr(o[0])), reinterpret<float const?>(addr(x[0])),
+            reinterpret<float const?>(addr(t.fblob[woff])), size, t.config.norm_eps)
     }
 }
 
-// rmsnorm with the weight as a zero-copy view into the fp32 aux blob at `woff` (len size).
-def private rms_at(var o : array<float> | #; t : Model; woff : int64; x : array<float> | #; size : int64) {
-    array_view(t.fblob, woff, size) $(w : array<float>#) {
-        rmsnorm(o, x, w, size, t.config.norm_eps)
+// Same, with the source at element offset `xoff` (per-position rows of a batched activation).
+def private rms_at(var o : array<float> | #; t : Model; woff : int64; x : array<float>; xoff : int64; size : int64) {
+    unsafe {
+        rmsnorm(reinterpret<float?>(addr(o[0])), reinterpret<float const?>(addr(x[xoff])),
+            reinterpret<float const?>(addr(t.fblob[woff])), size, t.config.norm_eps)
     }
 }
 
@@ -2319,8 +2391,8 @@ def private attn_head_decode(var arow : float?; var xbp : float?; qp : float con
                 arow[j - kstart] = kv_score(qp, qq, qsp, kcp, (rowbase + j) * kdim + khoff, qoff, head_size) * scale
             }
         }
-        if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-            softcap(arow, cnt, attn_softcap)
+        if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax (softcap4 = the flash-prefill form)
+            softcap4(arow, cnt, attn_softcap)
         }
         if (sinksp != null) {  // gpt-oss: this head's sink logit joins the softmax denominator
             softmax_sink(arow, cnt, sinksp[hh])
@@ -2513,13 +2585,33 @@ def private flash_decode_check_g(qp : float const?; qq : int8 const?; qsp : floa
             if (sinksp != null) {
                 m2 = max(m2, sinksp[hh])
             }
+            // exp4 fold in place: sref becomes the exp weights (one pass, not one exp per (i, j))
             var l2 = 0.0
-            for (j in range64(cnt)) {
-                l2 += exp(sref[j] - m2)
+            {
+                let m24 = float4(m2, m2, m2, m2)
+                var s4 = float4(0.0)
+                var j = 0l
+                while (j + 4l <= cnt) {
+                    let e = exp4(max(float4(sref[j], sref[j + 1l], sref[j + 2l], sref[j + 3l]) - m24, EXP4_LO))
+                    sref[j] = e.x
+                    sref[j + 1l] = e.y
+                    sref[j + 2l] = e.z
+                    sref[j + 3l] = e.w
+                    s4 += e
+                    j += 4l
+                }
+                l2 = s4.x + s4.y + s4.z + s4.w
+                while (j < cnt) {
+                    let e = exp(max(sref[j] - m2, -80.0))
+                    sref[j] = e
+                    l2 += e
+                    j++
+                }
             }
             if (sinksp != null) {
-                l2 += exp(sinksp[hh] - m2)
+                l2 += exp(max(sinksp[hh] - m2, -80.0))
             }
+            let invl2 = 1.0 / l2
             var worstd = 0.0
             for (i in range64(head_size)) {
                 var acc = 0.0
@@ -2529,7 +2621,7 @@ def private flash_decode_check_g(qp : float const?; qq : int8 const?; qsp : floa
                     let rowbase = runs[r].row0 - runs[r].j0
                     for (aj in range64(rj0, rj1)) {
                         let voff = (rowbase + aj) * vdim + vhoff   // vcp is layer-base (codec seam)
-                        acc += exp(sref[aj - kstart] - m2) / l2 * kv_load(vcp, voff, i)
+                        acc += sref[aj - kstart] * invl2 * kv_load(vcp, voff, i)
                     }
                 }
                 worstd = max(worstd, abs(acc - xbv[qoff + i]))
@@ -2673,24 +2765,18 @@ def private add_bias(var y : array<float>; yoff : int64; b : array<float>; boff,
 // rows), then run the int8·int8 SDOT kernel against the int8 weights. woff is the weight-element
 // offset; scales start at woff/32 (woff is block-aligned for every 2D tensor).
 def private mm_at_q8(var y : array<float>; t : Model; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; n, d : int64) {
-    let total = n * d
     quantize_q8_0_into(x, n, xq, xs, 0l, 0l)
-    array_view(t.qblob, woff, total) $(wq : array<int8>#) {
-        array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
-            matmul_q8q8(y, wq, ws, xq, xs, n, d)
-        }
+    if (t.wscale_f16) {
+        matmul_q8q8(y, t.qblob, t.qscales16, woff, xq, xs, n, d)
+    } else {
+        matmul_q8q8(y, t.qblob, t.qscales, woff, xq, xs, n, d)
     }
 }
 
-// Q4 matmul with the weight viewed into the quantized blob (4-bit, two per byte) + its per-block
-// scales. Bytes start at woff/2 (woff is even), scales at woff/32.
+// Q4 matmul with the weight in the quantized blob (4-bit, two per byte) + its per-block scales.
+// Bytes at woff/2 (woff is even), scales at woff/32 — the kernel's woff form does the math.
 def private mm_at_q4(var y : array<float>; t : Model; woff : int64; x : array<float>; n, d : int64) {
-    let total = n * d
-    array_view(t.q4blob, woff / 2l, total / 2l) $(wq : array<uint8>#) {
-        array_view(t.q4scales, woff / 32l, total / 32l) $(ws : array<float>#) {
-            matmul_q4(y, wq, ws, x, n, d)
-        }
-    }
+    matmul_q4(y, t.q4blob, t.q4scales, woff, x, n, d)
 }
 
 // Fuse the attention Q/K/V projections (all three read s.xb) into one parallel dispatch when the
@@ -2719,7 +2805,11 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
         }
     } elif (t.quant == QuantMode.q8 && lanes_for_work(dim * (qd + 2l * kv), g_gemv_lane_cap) > 1) {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
-        matmul_q8q8_group3(s.q, s.k, s.v, t.qblob, t.qscales, qoff, koff, voff, s.xq, s.xs, dim, qd, kv, kv)
+        if (t.wscale_f16) {
+            matmul_q8q8_group3(s.q, s.k, s.v, t.qblob, t.qscales16, qoff, koff, voff, s.xq, s.xs, dim, qd, kv, kv)
+        } else {
+            matmul_q8q8_group3(s.q, s.k, s.v, t.qblob, t.qscales, qoff, koff, voff, s.xq, s.xs, dim, qd, kv, kv)
+        }
     } else {
         mm(s.q, t, qoff, s.xb, s.xq, s.xs, dim, qd)
         mm(s.k, t, koff, s.xb, s.xq, s.xs, dim, kv)
@@ -2731,23 +2821,17 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
 // quantizes the shared rmsnormed activation once per layer and reuses it across every expert's
 // gate/up matmul instead of re-quantizing per call.
 def private mm_at_q8_pre(var y : array<float>; t : Model; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    let total = n * d
-    array_view(t.qblob, woff, total) $(wq : array<int8>#) {
-        array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
-            matmul_q8q8(y, wq, ws, xq, xs, n, d)
-        }
+    if (t.wscale_f16) {
+        matmul_q8q8(y, t.qblob, t.qscales16, woff, xq, xs, n, d)
+    } else {
+        matmul_q8q8(y, t.qblob, t.qscales, woff, xq, xs, n, d)
     }
 }
 
-// Native-MXFP4 GEMV against a PRE-quantized activation: the weight region [d x n] is viewed into the
+// Native-MXFP4 GEMV against a PRE-quantized activation: the weight region [d x n] lives in the
 // nibble + E8M0 planes (woff is the weight-element offset, like mm_at_q8_pre). Expert stacks only.
 def private mm_at_mx4_pre(var y : array<float>; t : Model; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    let total = n * d
-    array_view(t.mxq, woff / 2l, total / 2l) $(wn : array<uint8>#) {
-        array_view(t.mxs, woff / 32l, total / 32l) $(we : array<uint8>#) {
-            matmul_mx4q8(y, wn, we, xq, xs, n, d)
-        }
-    }
+    matmul_mx4q8(y, t.mxq, t.mxs, woff, xq, xs, n, d)
 }
 
 // Region-list GEMVs (the MoE decode dispatch fuse): all k routed experts' same-shape projections in
@@ -2755,11 +2839,19 @@ def private mm_at_mx4_pre(var y : array<float>; t : Model; woff : int64; xq : ar
 // The boffs forms fold each region's fblob bias vector into the workers' stores (gpt-oss expert
 // biases) — bit-identical to a post-pass add_bias, minus its serial caller-side cost.
 def private mm_at_q8_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, n, d)
+    if (t.wscale_f16) {
+        matmul_q8q8_groupn(y, t.qblob, t.qscales16, offs, nregions, xq, xs, n, d)
+    } else {
+        matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, n, d)
+    }
 }
 
 def private mm_at_q8_groupn(var y : array<float>; t : Model; offs, boffs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, t.fblob, boffs, n, d)
+    if (t.wscale_f16) {
+        matmul_q8q8_groupn(y, t.qblob, t.qscales16, offs, nregions, xq, xs, t.fblob, boffs, n, d)
+    } else {
+        matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, t.fblob, boffs, n, d)
+    }
 }
 
 def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
@@ -2811,13 +2903,8 @@ def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<i
 // mm_at_mx4_pre): grouped MoE prefill dispatches here — no Q8 expansion — when the active backend
 // carries a native mx4 batch kernel (g_active_mx4_native_batch).
 def private mm_b_mx4_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
-    let total = n * d
     let ts_gemm = ref_time_ticks()
-    array_view(t.mxq, woff / 2l, total / 2l) $(wn : array<uint8>#) {
-        array_view(t.mxs, woff / 32l, total / 32l) $(we : array<uint8>#) {
-            matmul_mx4q8_batch(y, wn, we, xqb, xsb, n, d, npos)
-        }
-    }
+    matmul_mx4q8_batch(y, t.mxq, t.mxs, woff, xqb, xsb, n, d, npos)
     prof_add("mm_gemm", ts_gemm)
 }
 
@@ -2825,12 +2912,11 @@ def private mm_b_mx4_pre(var y : array<float>; t : Model; woff : int64; xqb : ar
 // the grouped MoE prefill runs many GEMMs off one requant (the whole-batch image or a gathered
 // expert bucket).
 def private mm_b_q8_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
-    let total = n * d
     let ts_gemm = ref_time_ticks()
-    array_view(t.qblob, woff, total) $(wq : array<int8>#) {
-        array_view(t.qscales, woff / 32l, total / 32l) $(ws : array<float>#) {
-            matmul_q8q8_batch(y, wq, ws, xqb, xsb, n, d, npos)
-        }
+    if (t.wscale_f16) {
+        matmul_q8q8_batch(y, t.qblob, t.qscales16, woff, xqb, xsb, n, d, npos)
+    } else {
+        matmul_q8q8_batch(y, t.qblob, t.qscales, woff, xqb, xsb, n, d, npos)
     }
     prof_add("mm_gemm", ts_gemm)
 }
@@ -2843,9 +2929,7 @@ def private mm_b(var y : array<float>; t : Model; woff : int64; x : array<float>
         requant_rows_q8(x, n, npos, xqb, xsb)
         mm_b_q8_pre(y, t, woff, xqb, xsb, n, d, npos)
     } else {
-        array_view(t.wblob, woff, n * d) $(w : array<float>#) {
-            matmul_batch(y, w, x, n, d, npos)
-        }
+        matmul_batch(y, t.wblob, woff, x, n, d, npos)
     }
 }
 
@@ -2944,14 +3028,18 @@ def has_dual_rope(c : Config) : bool => (c.sliding_window > 0l
 // here without touching forward(). Bit-identical to the inlined form.
 
 // Flash-decode slicing (fused attention chain): a decode context deeper than FLASH_DECODE_SLICE
-// positions splits each head's KV pass into ceil(cnt/slice) slices (capped) with a per-head
+// positions splits each head's KV pass into ceil(cnt/SLICE_LEN) slices (capped) with a per-head
 // combine stage — the KV stream stops being limited to n_heads lanes (Qwen3-0.6B zen2: T>16 bought
 // nothing, attn_chain 68% of token time at ctx 2048). Slice count derives from CONTEXT ONLY —
 // never lane count — so generation stays deterministic and box/T-independent; ctx <= 256 keeps
 // the exact single-pass body (bit-identical to the un-fused path). The sliced path reassociates
 // the softmax/AV sums (flash-decode partials), so deep-ctx fused output is tolerance-equal, not
-// bit-equal, to the un-fused path (test_fused_flash_deep_ctx). Slice length tuning = ledger.
-let FLASH_DECODE_SLICE = 256l
+// bit-equal, to the un-fused path (test_fused_flash_deep_ctx). SLICE_LEN < SLICE keeps the
+// bit-exact region while giving a 1-kv-head arch (Gemma) enough slice units to feed the lanes —
+// per-lane trace 3990X: 256-len slices left 14 of 16 lanes idle through the longest stage at
+// ctx 512. Slice length tuning = ledger.
+let FLASH_DECODE_SLICE = 256l       // single-pass threshold: cnt <= this never slices
+let FLASH_DECODE_SLICE_LEN = 32l    // slice granularity once slicing engages
 let FLASH_DECODE_MAX_SLICES = 16l
 
 // attn-norm → QKV(+bias) → RoPE → KV-store → GQA multi-head attention → out-proj(+post-norm) → residual.
@@ -2966,21 +3054,24 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
     return (g_fused_decode && t.quant == QuantMode.q8 && g_use_rope_table
         && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
         && get_jobque_team_mode() && kernel_backend_has_rows()
+        && (!t.wscale_f16 || kernel_backend_has_rows16())
         && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
 }
 
-// Fused attention block: ONE team rendezvous runs [qkv rows + bias/qk-norm/rope/kv-store] →
-// [attn heads + per-head wo-input requant] → [wo rows + bias + residual add] as three stages
-// (team_parallel_stages). At ctx <= FLASH_DECODE_SLICE this is bit-identical to
-// attention_std_decode — the same backend row dots, the same per-head norm/rope/store/softmax
-// order, the same adds — only the scheduling changes: the per-op fork/joins collapse into
-// worker-side stage barriers, and every piece of serial glue between the old dispatches becomes
-// a chunk-local epilogue. Deeper contexts switch to the 4-stage flash shape (see
-// FLASH_DECODE_SLICE above): stage 1 becomes (head x kv-slice) partials and a per-head combine
-// stage rescales + requants — tolerance-equal, not bit-equal, to the un-fused path. Stage
-// geometry: stage 0 splits over HEAD slots (q heads, then k heads, then v heads — each
-// head_size rows, so rope/norm/store are chunk-local), stage 1 over query heads (or
-// head x slice units), then [combine +] 32-row output groups.
+// Fused attention block: ONE team rendezvous runs [qkv rows + bias] → [per-head-slot
+// qk-norm/rope/kv-store] → [attn heads + per-head wo-input requant] → [wo rows + bias +
+// residual add] as four stages (team_parallel_stages). At ctx <= FLASH_DECODE_SLICE this is
+// bit-identical to attention_std_decode — the same backend row dots, the same per-head
+// norm/rope/store/softmax order, the same adds — only the scheduling changes: the per-op
+// fork/joins collapse into worker-side stage barriers, and every piece of serial glue between
+// the old dispatches becomes a chunk-local epilogue. Deeper contexts switch to the 5-stage
+// flash shape (see FLASH_DECODE_SLICE above): the attn stage becomes (kv-head x kv-slice)
+// partials and a per-head combine stage rescales + requants — tolerance-equal, not bit-equal,
+// to the un-fused path. Stage geometry: stage 0 splits the qkv rows over 32-row groups (row
+// dots + bias are row-local, so ALL lanes serve — one chunk per whole head left 10 of 16 lanes
+// idle on a 4-head model); stage 1 runs the head-local epilogue over HEAD slots (q heads, then
+// k heads, then v heads — norm/rope/store need the whole head); stage 2 over query heads (or
+// kv-head x slice units), then [combine +] 32-row output groups.
 def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : int64) {
     let c = t.config
     let dim = c.dim
@@ -3002,17 +3093,19 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
     prof_add("norm", ts_norm0)
     let ts_chain = ref_time_ticks()
+    trace_tag(TRACE_TAG_ATTN_CHAIN)
     // stage geometry (same grain math as the per-op dispatches; the C++ side clamps chunks <= range)
     let nslots = int(n_heads + 2l * n_kv_heads)
-    let n0 = matmul_chunks_gemv(int(qd + 2l * kv_dim), 1, dim * (qd + 2l * kv_dim))
+    let ngq = int((qd + 2l * kv_dim) / 32l)   // stage-0 domain: 32-row groups (head_size % 32 == 0 by the fuse gate)
+    let n0 = chain_stage_chunks(ngq, int(qd + 2l * kv_dim), dim * (qd + 2l * kv_dim))
     let n1 = get_dispatch_lanes()
     let ngrp = int(dim / 32l)
-    let n2 = matmul_chunks_gemv(int(dim), 1, qd * dim)
-    // flash-decode slicing: nsl slices per head past FLASH_DECODE_SLICE positions (ctx-derived
-    // ONLY — deterministic, box/T-independent); nsl == 1 keeps the exact single-pass body and
-    // today's 3-stage shape. Sliced shape inserts a per-head combine stage: [qkv][partials]
-    // [combine+requant][wo].
-    let nsl = int(min(FLASH_DECODE_MAX_SLICES, 1l + (cnt - 1l) / FLASH_DECODE_SLICE))
+    let n2 = chain_stage_chunks(ngrp, int(dim), qd * dim)
+    // flash-decode slicing: FLASH_DECODE_SLICE_LEN-position slices once cnt crosses
+    // FLASH_DECODE_SLICE (ctx-derived ONLY — deterministic, box/T-independent); nsl == 1 keeps
+    // the exact single-pass body and the 4-stage shape. Sliced shape inserts a per-head combine
+    // stage: [qkv rows][head epilogue][partials][combine+requant][wo].
+    let nsl = cnt <= FLASH_DECODE_SLICE ? 1 : int(min(FLASH_DECODE_MAX_SLICES, (cnt + FLASH_DECODE_SLICE_LEN - 1l) / FLASH_DECODE_SLICE_LEN))
     let slice_len = (cnt + int64(nsl) - 1l) / int64(nsl)
     if (nsl > 1) {
         let need = int(n_heads) * nsl
@@ -3024,18 +3117,20 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         if (length(s.fl_o) < needo) {
             s.fl_o |> resize(needo)
         }
-        s.chain_stages |> resize(4)
-        s.chain_stages[0] = int3(0, nslots, n0)
-        s.chain_stages[1] = int3(0, int(n_kv_heads) * nsl, int(n_kv_heads) * nsl)
-        s.chain_stages[2] = int3(0, int(n_heads), int(n_heads))
-        s.chain_stages[3] = int3(0, ngrp, n2)
-        count_parallel_dispatch(min(n0, nslots) + int(n_kv_heads) * nsl + int(n_heads) + min(n2, ngrp))
+        s.chain_stages |> resize(5)
+        s.chain_stages[0] = int3(0, ngq, n0)
+        s.chain_stages[1] = int3(0, nslots, nslots)
+        s.chain_stages[2] = int3(0, int(n_kv_heads) * nsl, int(n_kv_heads) * nsl)
+        s.chain_stages[3] = int3(0, int(n_heads), int(n_heads))
+        s.chain_stages[4] = int3(0, ngrp, n2)
+        count_parallel_dispatch(min(n0, ngq) + nslots + int(n_kv_heads) * nsl + int(n_heads) + min(n2, ngrp))
     } else {
-        s.chain_stages |> resize(3)
-        s.chain_stages[0] = int3(0, nslots, n0)
-        s.chain_stages[1] = int3(0, int(n_heads), n1)
-        s.chain_stages[2] = int3(0, ngrp, n2)
-        count_parallel_dispatch(min(n0, nslots) + min(n1, int(n_heads)) + min(n2, ngrp))
+        s.chain_stages |> resize(4)
+        s.chain_stages[0] = int3(0, ngq, n0)
+        s.chain_stages[1] = int3(0, nslots, nslots)
+        s.chain_stages[2] = int3(0, int(n_heads), n1)
+        s.chain_stages[3] = int3(0, ngrp, n2)
+        count_parallel_dispatch(min(n0, ngq) + nslots + min(n1, int(n_heads)) + min(n2, ngrp))
     }
     let mmrows = mm_q8q8_rows_fn()
     let neox = c.rope_neox
@@ -3067,17 +3162,37 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         var kcl = kv_layer_kbase(s, l, c.seq_len)  // layer-base byte pointers (stores + the _d read dispatch)
         var vcl = kv_layer_vbase(s, l, c.seq_len)
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))   // this layer's physical runs (fork-safe hoist)
-        // weight region bases (element offsets into the Q8 blob, scales at /32)
+        // weight region bases (element offsets into the Q8 blob, scales at /32); wscale_f16
+        // models carry the binary16 plane instead (qscales is freed) — each plane's pointers
+        // are formed only in its own branch, so no offset is ever taken off a null base
+        let f16w = t.wscale_f16
+        let mmrows16 = mm_q8q8_rows16_fn()
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
-        let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        var wsq : float const? = null
+        var wsk : float const? = null
+        var wsv : float const? = null
+        var wso : float const? = null
+        var wsq16 : uint16 const? = null
+        var wsk16 : uint16 const? = null
+        var wsv16 : uint16 const? = null
+        var wso16 : uint16 const? = null
+        if (f16w) {
+            let wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+            wsq16 = wsb16 + t.wq_offs[l] / 32l
+            wsk16 = wsb16 + t.wk_offs[l] / 32l
+            wsv16 = wsb16 + t.wv_offs[l] / 32l
+            wso16 = wsb16 + t.wo_offs[l] / 32l
+        } else {
+            let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+            wsq = wsb + t.wq_offs[l] / 32l
+            wsk = wsb + t.wk_offs[l] / 32l
+            wsv = wsb + t.wv_offs[l] / 32l
+            wso = wsb + t.wo_offs[l] / 32l
+        }
         let wpq = wqb + t.wq_offs[l]
-        let wsq = wsb + t.wq_offs[l] / 32l
         let wpk = wqb + t.wk_offs[l]
-        let wsk = wsb + t.wk_offs[l] / 32l
         let wpv = wqb + t.wv_offs[l]
-        let wsv = wsb + t.wv_offs[l] / 32l
         let wpo = wqb + t.wo_offs[l]
-        let wso = wsb + t.wo_offs[l] / 32l
         // this position's rope table row (dual-rope arches: the sliding class's row)
         let swa_row = is_sliding && has_dual_rope(c)
         let crow = swa_row ? reinterpret<float const?>(addr(s.rope_cos_swa[0])) : reinterpret<float const?>(addr(s.rope_cos[0]))
@@ -3101,18 +3216,60 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         var flop = nsl > 1 ? addr(s.fl_o[0]) : null
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             if (stage == 0) {
-                // qkv rows by head slot; per-slot epilogue = bias → norm → rope → cache store
+                // qkv rows in 32-row groups — dots + bias are row-local, so every lane serves;
+                // the head-local epilogue (norm/rope/store/quant) is stage 1's head slots. A
+                // group never straddles a q/k/v region boundary (all regions are head_size
+                // multiples and head_size % 32 == 0 by the fuse gate).
+                unsafe {
+                    var r = int64(jb) * 32l
+                    let rend = int64(je) * 32l
+                    while (r < rend) {
+                        if (r < qd) {
+                            let r1 = min(rend, qd)
+                            if (f16w) {
+                                invoke(mmrows16, qp, wpq, wsq16, xqp, xsp, dim, r, r1)
+                            } else {
+                                invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r, r1)
+                            }
+                            if (bqp != null) {
+                                add_inplace(qp + r, bqp + bqoff + r, r1 - r)
+                            }
+                            r = r1
+                        } elif (r < qd + kv_dim) {
+                            let r0 = r - qd
+                            let r1 = min(rend, qd + kv_dim) - qd
+                            if (f16w) {
+                                invoke(mmrows16, kp, wpk, wsk16, xqp, xsp, dim, r0, r1)
+                            } else {
+                                invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r1)
+                            }
+                            if (bkp != null) {
+                                add_inplace(kp + r0, bkp + bkvoff + r0, r1 - r0)
+                            }
+                            r = r1 + qd
+                        } else {
+                            let r0 = r - qd - kv_dim
+                            let r1 = min(rend, qd + 2l * kv_dim) - qd - kv_dim
+                            if (f16w) {
+                                invoke(mmrows16, vp, wpv, wsv16, xqp, xsp, dim, r0, r1)
+                            } else {
+                                invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r1)
+                            }
+                            if (bvp != null) {
+                                add_inplace(vp + r0, bvp + bkvoff + r0, r1 - r0)
+                            }
+                            r = r1 + qd + kv_dim
+                        }
+                    }
+                }
+            } elif (stage == 1) {
+                // head-local epilogue by head slot: norm → rope → cache store (k/v), roped-query
+                // quantize (q, q8 K) — whole-head reductions, so the split floor is the slot
                 unsafe {
                     for (slot in range(jb, je)) {
                         let sl = int64(slot)
                         if (sl < n_heads) {
                             let r0 = sl * head_size
-                            invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r0, r0 + head_size)
-                            if (bqp != null) {
-                                for (i in range64(r0, r0 + head_size)) {
-                                    qp[i] += bqp[bqoff + i]
-                                }
-                            }
                             if (rqp != null) {
                                 rmsnorm(qp + r0, qp + r0, rqp, head_size, eps)
                             }
@@ -3126,12 +3283,6 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             }
                         } elif (sl < n_heads + n_kv_heads) {
                             let r0 = (sl - n_heads) * head_size
-                            invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r0 + head_size)
-                            if (bkp != null) {
-                                for (i in range64(r0, r0 + head_size)) {
-                                    kp[i] += bkp[bkvoff + i]
-                                }
-                            }
                             if (rkp != null) {
                                 rmsnorm(kp + r0, kp + r0, rkp, head_size, eps)
                             }
@@ -3143,12 +3294,6 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             kv_store_row(kcl, kdt, kv_dim, prow, r0, head_size, kp + r0)
                         } else {
                             let r0 = (sl - n_heads - n_kv_heads) * head_size
-                            invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r0 + head_size)
-                            if (bvp != null) {
-                                for (i in range64(r0, r0 + head_size)) {
-                                    vp[i] += bvp[bkvoff + i]
-                                }
-                            }
                             if (rvp != null) {
                                 rmsnorm(vp + r0, vp + r0, rvp, head_size, eps)
                             }
@@ -3156,7 +3301,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         }
                     }
                 }
-            } elif (stage == 1 && nsl == 1) {
+            } elif (stage == 2 && nsl == 1) {
                 // multi-head attention (the attention_std_decode worker body) + per-head requant of
                 // the wo input — each head's xb slice is final here, and head_size % 32 == 0, so the
                 // quant groups are chunk-local. Overwrites xq/xs; stage 0 (the only reader of the
@@ -3171,7 +3316,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
                     }
                 }
-            } elif (stage == 1) {
+            } elif (stage == 2) {
                 // flash-decode partials: unit = (KV-head, slice) — the slice's K/V rows stream
                 // ONCE and serve all kv_mul q-heads of the group (a GQA logical-read halving;
                 // deep-ctx decode attention is DRAM-bound on many-lane boxes, so the per-q-head
@@ -3193,12 +3338,11 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             let hh = qh0 + g
                             var arow = attp + hh * seq_len
                             if (attn_softcap > 0.0) {
-                                softcap(arow + j0, j1 - j0, attn_softcap)
+                                softcap4(arow + j0, j1 - j0, attn_softcap)
                             }
-                            var m = arow[j0]   // slices are non-empty by construction
-                            for (j in range64(j0 + 1l, j1)) {
-                                m = max(m, arow[j])
-                            }
+                            // hand-vectorized max reduction — order-independent, so bit-identical
+                            // to the scalar scan (slices are non-empty by construction)
+                            let m = hmax(unsafe(arow + j0), j1 - j0)
                             // exponentials in place over the slice — exp4 fast path, clamped to
                             // -80 like the prefill flash fold (underflow -> ~0, negligible);
                             // element-constructed float4: slice offsets carry no 16B alignment
@@ -3236,18 +3380,15 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             qh0, kv_mul, seq_len, int64(nsl), sl)
                     }
                 }
-            } elif (stage == 2 && nsl > 1) {
+            } elif (stage == 3 && nsl > 1) {
                 // per-head combine (flash rescale; sink joins max + denominator, softmax_sink
-                // contract) + the wo-input requant that the single-pass body does in stage 1
+                // contract) + the wo-input requant that the single-pass body does in stage 2
                 unsafe {
                     for (h in range(jb, je)) {
                         let hh = int64(h)
                         let qoff = hh * head_size
                         let fbase = hh * int64(nsl)
-                        var mg = flmp[fbase]
-                        for (sl in range64(1l, int64(nsl))) {
-                            mg = max(mg, flmp[fbase + sl])
-                        }
+                        var mg = hmax(unsafe(flmp + fbase), int64(nsl))
                         if (sinksp != null) {
                             mg = max(mg, sinksp[hh])
                         }
@@ -3255,13 +3396,29 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             xbp[qoff + i] = 0.0
                         }
                         var lg = 0.0
-                        for (sl in range64(int64(nsl))) {
-                            let f = exp(flmp[fbase + sl] - mg)
-                            lg += fllp[fbase + sl] * f
-                            axpy(xbp + qoff, flop + (fbase + sl) * head_size, f, head_size)
+                        {
+                            // exp4 over the slice scale factors (nsl <= 16), flash-fold clamp convention
+                            let mg4 = float4(mg, mg, mg, mg)
+                            var sl = 0l
+                            while (sl + 4l <= int64(nsl)) {
+                                let f = exp4(max(float4(flmp[fbase + sl], flmp[fbase + sl + 1l], flmp[fbase + sl + 2l], flmp[fbase + sl + 3l]) - mg4, EXP4_LO))
+                                lg += (fllp[fbase + sl] * f.x + fllp[fbase + sl + 1l] * f.y
+                                    + fllp[fbase + sl + 2l] * f.z + fllp[fbase + sl + 3l] * f.w)
+                                axpy(xbp + qoff, flop + (fbase + sl) * head_size, f.x, head_size)
+                                axpy(xbp + qoff, flop + (fbase + sl + 1l) * head_size, f.y, head_size)
+                                axpy(xbp + qoff, flop + (fbase + sl + 2l) * head_size, f.z, head_size)
+                                axpy(xbp + qoff, flop + (fbase + sl + 3l) * head_size, f.w, head_size)
+                                sl += 4l
+                            }
+                            while (sl < int64(nsl)) {
+                                let f = exp(max(flmp[fbase + sl] - mg, -80.0))
+                                lg += fllp[fbase + sl] * f
+                                axpy(xbp + qoff, flop + (fbase + sl) * head_size, f, head_size)
+                                sl++
+                            }
                         }
                         if (sinksp != null) {
-                            lg += exp(sinksp[hh] - mg)
+                            lg += exp(max(sinksp[hh] - mg, -80.0))
                         }
                         let inv = 1.0 / lg
                         for (i in range64(head_size)) {
@@ -3276,11 +3433,13 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                 unsafe {
                     let r0 = int64(jb) * 32l
                     let r1 = int64(je) * 32l
-                    invoke(mmrows, xb2p, wpo, wso, xqp, xsp, qd, r0, r1)
+                    if (f16w) {
+                        invoke(mmrows16, xb2p, wpo, wso16, xqp, xsp, qd, r0, r1)
+                    } else {
+                        invoke(mmrows, xb2p, wpo, wso, xqp, xsp, qd, r0, r1)
+                    }
                     if (bop != null) {
-                        for (i in range64(r0, r1)) {
-                            xb2p[i] += bop[booff + i]
-                        }
+                        add_inplace(xb2p + r0, bop + booff + r0, r1 - r0)
                     }
                     if (!post_norm) {
                         add_inplace(xp + r0, xb2p + r0, r1 - r0)
@@ -3310,14 +3469,16 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     }
 }
 
-// Can the dense FFN run as the fused 2-stage chain? Q8, no post-block scale, team mode + a
-// backend row core, and the size threshold. pre_post_norm (Gemma2/3) is handled: the chain
-// defers the residual add and the caller runs the serial post-norm + add after the rendezvous.
-def private fused_ffn_ok(t : Model) : bool {
+// Can layer l's dense FFN run as the fused 2-stage chain? Q8, team mode + a backend row core,
+// and the size threshold (per-layer width — gemma-4 E2B varies it). pre_post_norm (Gemma2/3)
+// and layer_out_scale (gemma4) are handled: the chain defers the residual add and the caller's
+// serial tail runs post-norm and/or the fused add+scale after the rendezvous.
+def private fused_ffn_ok(t : Model; l : int64) : bool {
     let c = t.config
-    return (g_fused_decode && t.quant == QuantMode.q8 && !c.layer_out_scale
+    return (g_fused_decode && t.quant == QuantMode.q8
         && get_jobque_team_mode() && kernel_backend_has_rows()
-        && lanes_for_work(c.dim * c.hidden_dim, g_gemv_lane_cap) > 1)
+        && (!t.wscale_f16 || kernel_backend_has_rows16())
+        && lanes_for_work(c.dim * layer_hidden(t, l), g_gemv_lane_cap) > 1)
 }
 
 // Fused dense FFN block: ONE team rendezvous runs [w1+w3 rows + act + requant] → [w2 rows +
@@ -3329,23 +3490,28 @@ def private fused_ffn_ok(t : Model) : bool {
 def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
     let c = t.config
     let dim = c.dim
-    let hidden = c.hidden_dim
+    let hidden = layer_hidden(t, l)   // gemma-4 E2B varies FFN width per layer
     let ts_norm1 = ref_time_ticks()
     rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
     quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
     prof_add("norm", ts_norm1)
     let ts_chain = ref_time_ticks()
+    trace_tag(TRACE_TAG_FFN_CHAIN)
     let mmrows = mm_q8q8_rows_fn()
     let is_gelu = c.ffn_act == FfnAct.gelu
     let is_oai = c.ffn_act == FfnAct.swiglu_oai
     let vec = g_act_vec
     // Gemma2/3: the post-FFN norm is a whole-vector reduction over the down-proj output, so the
-    // chain can't fold the residual add into stage 1 — it lands serially after the rendezvous
+    // chain can't fold the residual add into stage 1 — it lands serially after the rendezvous.
+    // gemma4's layer_out_scale (applied after the residual, unless PLE owns it later) defers the
+    // add the same way; the tail finishes with the fused add+scale.
     let post_norm = c.pre_post_norm
+    let out_scale_here = c.layer_out_scale && !has_ple(c)
+    let defer_add = post_norm || out_scale_here
     let ngrp0 = int(hidden / 32l)
     let ngrp1 = int(dim / 32l)
-    let n0 = matmul_chunks_gemv(int(hidden), 1, 2l * dim * hidden)
-    let n1 = matmul_chunks_gemv(int(dim), 1, hidden * dim)
+    let n0 = chain_stage_chunks(ngrp0, int(hidden), 2l * dim * hidden)
+    let n1 = chain_stage_chunks(ngrp1, int(dim), hidden * dim)
     s.chain_stages |> resize(2)
     s.chain_stages[0] = int3(0, ngrp0, n0)
     s.chain_stages[1] = int3(0, ngrp1, n1)
@@ -3358,25 +3524,45 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         var xsp = addr(s.xs[0])
         var xq2p = addr(s.xq2[0])
         var xs2p = addr(s.xs2[0])
+        let f16w = t.wscale_f16
+        let mmrows16 = mm_q8q8_rows16_fn()
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
-        let wsb = reinterpret<float const?>(addr(t.qscales[0]))
-        let w1o = t.w1_offs[l]   // fused chain runs only for uniform-width arches (layer_out_scale gates it off)
+        let w1o = t.w1_offs[l]
         let w3o = t.w3_offs[l]
         let w2o = t.w2_offs[l]
+        var ws1 : float const? = null
+        var ws3 : float const? = null
+        var ws2 : float const? = null
+        var ws116 : uint16 const? = null
+        var ws316 : uint16 const? = null
+        var ws216 : uint16 const? = null
+        if (f16w) {
+            let wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+            ws116 = wsb16 + w1o / 32l
+            ws316 = wsb16 + w3o / 32l
+            ws216 = wsb16 + w2o / 32l
+        } else {
+            let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+            ws1 = wsb + w1o / 32l
+            ws3 = wsb + w3o / 32l
+            ws2 = wsb + w2o / 32l
+        }
         let wp1 = wqb + w1o
-        let ws1 = wsb + w1o / 32l
         let wp3 = wqb + w3o
-        let ws3 = wsb + w3o / 32l
         let wp2 = wqb + w2o
-        let ws2 = wsb + w2o / 32l
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             unsafe {
                 let r0 = int64(jb) * 32l
                 let r1 = int64(je) * 32l
                 if (stage == 0) {
                     // paired gate/up rows, then act + requant on exactly these rows
-                    invoke(mmrows, gup, wp1, ws1, xqp, xsp, dim, r0, r1)
-                    invoke(mmrows, gup + hidden, wp3, ws3, xqp, xsp, dim, r0, r1)
+                    if (f16w) {
+                        invoke(mmrows16, gup, wp1, ws116, xqp, xsp, dim, r0, r1)
+                        invoke(mmrows16, gup + hidden, wp3, ws316, xqp, xsp, dim, r0, r1)
+                    } else {
+                        invoke(mmrows, gup, wp1, ws1, xqp, xsp, dim, r0, r1)
+                        invoke(mmrows, gup + hidden, wp3, ws3, xqp, xsp, dim, r0, r1)
+                    }
                     if (vec) {
                         if (is_gelu) {
                             geglu4(gup + r0, gup + hidden + r0, r1 - r0)
@@ -3396,10 +3582,14 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
                     }
                     quantize_q8_0_into_ptr(gup + r0, r1 - r0, xq2p, xs2p, r0, r0 / 32l)
                 } else {
-                    // down-projection rows + residual add (post-norm arches defer the add —
-                    // the caller's serial tail owns it)
-                    invoke(mmrows, xbp, wp2, ws2, xq2p, xs2p, hidden, r0, r1)
-                    if (!post_norm) {
+                    // down-projection rows + residual add (post-norm / layer_out_scale arches
+                    // defer the add — the caller's serial tail owns it)
+                    if (f16w) {
+                        invoke(mmrows16, xbp, wp2, ws216, xq2p, xs2p, hidden, r0, r1)
+                    } else {
+                        invoke(mmrows, xbp, wp2, ws2, xq2p, xs2p, hidden, r0, r1)
+                    }
+                    if (!defer_add) {
                         add_inplace(xp + r0, xbp + r0, r1 - r0)
                     }
                 }
@@ -3407,11 +3597,16 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         }
     }
     prof_add("ffn_chain", ts_chain)
-    if (post_norm) {  // Gemma2/3: post-FFN RMSNorm before the residual add — same serial tail
-        // as the un-fused path (dim-sized, microseconds), bit-identical order
+    if (defer_add) {  // same serial tail as the un-fused path (dim-sized, microseconds), bit-identical order
         let ts_resid = ref_time_ticks()
-        rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
-        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
+        if (post_norm) {  // Gemma2/3/4: post-FFN RMSNorm before the residual add
+            rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
+        }
+        if (out_scale_here) {  // gemma4 12B/31B: residual + per-layer output scale, one pass
+            add_scale_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), t.fblob[t.out_scale_off + l], dim)
+        } else {
+            add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
+        }
         prof_add("act_resid", ts_resid)
     }
 }
@@ -3421,6 +3616,7 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         attention_chain_decode(t, s, l, pos)
         return
     }
+    trace_tag(TRACE_TAG_ATTN_STD)
     let c = t.config
     let dim = c.dim
     let kv_dim = layer_kv_dim(c, l)
@@ -3612,10 +3808,11 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
 }
 
 def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
-    if (fused_ffn_ok(t)) {
+    if (fused_ffn_ok(t, l)) {
         ffn_chain_decode(t, s, l)
         return
     }
+    trace_tag(TRACE_TAG_FFN_STD)
     let c = t.config
     let dim = c.dim
     // ffn rmsnorm
@@ -3628,11 +3825,12 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
     if (c.pre_post_norm) {  // Gemma2: post-FFN RMSNorm before the residual add
         rms_at(s.xb, t, t.rms_post_ffn_off + l * dim, s.xb, dim)
     }
-    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
     // gemma4: scale the whole layer output (after the residual). The E-series applies it AFTER its PLE
     // block (in ffn_gemma4_decode), so skip it here when PLE is on.
     if (c.layer_out_scale && !has_ple(c)) {
-        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
+        add_scale_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), t.fblob[t.out_scale_off + l], dim)
+    } else {
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb[0])), dim)
     }
     prof_add("act_resid", ts_resid1)
 }
@@ -3644,28 +3842,52 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
 // Gate transform + top-k selection + weight post-processing on one router-logit row, IN PLACE (the
 // top-k knockout consumes the row). The selected ids/weights land at idx[off..]/w[off..] — off is 0
 // for decode, p*k for the grouped prefill router. One body for both, so routing is bit-identical.
-def private moe_select(c : Config; var lg : array<float> | #; var idx : array<int64>; var w : array<float>; off : int64) {
+def private moe_select(c : Config; var lg : float?; var idx : array<int64>; var w : array<float>; off : int64) {
     let ne = c.n_expert
     let k = c.n_expert_used
+    unsafe {   // the whole body indexes the logit-row pointer (in-place gate + top-k knockout)
     // probs — softmax_weight routes on the RAW biased logits and softmaxes only the selected
     // top-k afterwards (gpt-oss)
     if (c.moe_gate == MoeGate.sigmoid) {
-        for (i in range64(ne)) {
-            lg[i] = 1.0 / (1.0 + exp(-lg[i]))
+        var i = 0l
+        while (i + 4l <= ne) {
+            let e = exp4(clamp(-float4(lg[i], lg[i + 1l], lg[i + 2l], lg[i + 3l]), EXP4_LO, EXP4_HI))
+            lg[i] = 1.0 / (1.0 + e.x)
+            lg[i + 1l] = 1.0 / (1.0 + e.y)
+            lg[i + 2l] = 1.0 / (1.0 + e.z)
+            lg[i + 3l] = 1.0 / (1.0 + e.w)
+            i += 4l
+        }
+        while (i < ne) {
+            lg[i] = 1.0 / (1.0 + exp(clamp(-lg[i], -80.0, 80.0)))
+            i++
         }
     } elif (c.moe_gate == MoeGate.softmax) {
         var mx = lg[0]
         for (i in range64(ne)) {
             mx = max(mx, lg[i])
         }
-        var sum = 0.0
-        for (i in range64(ne)) {
-            let e = exp(lg[i] - mx)
+        let m4 = float4(mx, mx, mx, mx)
+        var sum4 = float4(0.0)
+        var i = 0l
+        while (i + 4l <= ne) {
+            let e = exp4(max(float4(lg[i], lg[i + 1l], lg[i + 2l], lg[i + 3l]) - m4, EXP4_LO))
+            lg[i] = e.x
+            lg[i + 1l] = e.y
+            lg[i + 2l] = e.z
+            lg[i + 3l] = e.w
+            sum4 += e
+            i += 4l
+        }
+        var sum = sum4.x + sum4.y + sum4.z + sum4.w
+        while (i < ne) {
+            let e = exp(max(lg[i] - mx, -80.0))
             lg[i] = e
             sum += e
+            i++
         }
-        for (i in range64(ne)) {
-            lg[i] /= sum
+        for (j in range64(ne)) {
+            lg[j] /= sum
         }
     }
     // top-k by selection score — the winner is knocked out with -FLT_MAX (softmax_weight selects on
@@ -3700,18 +3922,17 @@ def private moe_select(c : Config; var lg : array<float> | #; var idx : array<in
             w[off + j] *= c.expert_weights_scale
         }
     }
+    }
 }
 
 // The shared expert's scalar sigmoid gate: σ(gate_vec_l · x). One body for decode and prefill.
-def private moe_shexp_gate(t : Model; l : int64; x : array<float> | #) : float {
+// Tuned dot on raw pointers, not an array_view loop — the block invoke + bounds-checked indexing
+// was an optimization boundary around a plain dot (reassociates the sum: tolerance-level change).
+def private moe_shexp_gate(t : Model; l : int64; xp : float const?) : float {
     let dim = t.config.dim
-    var gl = 0.0
-    array_view(t.fblob, t.shexp_gate_off + l * dim, dim) $(gv : array<float>#) {
-        for (i in range64(dim)) {
-            gl += gv[i] * x[i]
-        }
+    unsafe {
+        return 1.0 / (1.0 + exp(-dot(addr(t.fblob[t.shexp_gate_off + l * dim]), xp, dim)))
     }
-    return 1.0 / (1.0 + exp(-gl))
 }
 
 // Routed experts, given the pre-normed input in s.xb and the top-k selection already in s.moe_idx /
@@ -3719,6 +3940,7 @@ def private moe_shexp_gate(t : Model; l : int64; x : array<float> | #) : float {
 // qwen2moe / gpt-oss (via moe_ffn_core) and gemma4 (which folds its per-expert down scale into
 // s.moe_w before the call). The router + select + any shared-expert steps live in the callers.
 def private moe_experts_apply(t : Model; var s : Session; l : int64) {
+    trace_tag(TRACE_TAG_MOE)
     let c = t.config
     let dim = c.dim
     let ne = c.n_expert
@@ -3806,10 +4028,7 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         prof_add("mm_moe", ts_down)
         let ts_red = ref_time_ticks()
         for (j in range64(k)) {   // slot order preserved — the sum is bit-identical
-            let w = s.moe_w[j]
-            for (i in range64(dim)) {
-                s.moe_acc[i] += w * s.moe_dn[j * dim + i]
-            }
+            axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.moe_dn[j * dim])), s.moe_w[j], dim)
         }
         prof_add("moe_reduce", ts_red)
     } else {
@@ -3835,10 +4054,7 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             }
             prof_add("mm_moe", ts_down)
             let ts_red = ref_time_ticks()
-            let w = s.moe_w[j]
-            for (i in range64(dim)) {
-                s.moe_acc[i] += w * s.xb2[i]
-            }
+            axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb2[0])), s.moe_w[j], dim)
             prof_add("moe_reduce", ts_red)
         }
     }
@@ -3856,14 +4072,15 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     if (c.moe_router_bias) {
         add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
     }
-    moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
+    moe_select(c, unsafe(addr(s.moe_logits[0])), s.moe_idx, s.moe_w, 0l)
     prof_add("moe_route", ts_route)
     moe_experts_apply(t, s, l)
     // shared expert, gated by a sigmoid scalar from its per-layer gate vector
     if (c.n_ff_shexp > 0l) {
         let pre_q8 = t.quant == QuantMode.q8
         let ts_sh = ref_time_ticks()
-        let g = moe_shexp_gate(t, l, s.xb)
+        trace_tag(TRACE_TAG_SHEXP)
+        let g = moe_shexp_gate(t, l, unsafe(addr(s.xb[0])))
         let nsh = c.n_ff_shexp
         let she = dim * nsh
         if (pre_q8) {
@@ -3884,9 +4101,7 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
             gate_batch(s.hb, s.hb2, c.ffn_act, nsh, 1l)
             mm(s.xb2, t, t.wsh2_off + l * she, s.hb, s.xq, s.xs, nsh, dim)
         }
-        for (i in range64(dim)) {
-            s.moe_acc[i] += g * s.xb2[i]
-        }
+        axpy(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb2[0])), g, dim)
         prof_add("mm_shexp", ts_sh)
     }
 }
@@ -3900,12 +4115,18 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
 // in s.ple_inp[0..npos*all), add the projected embedding branch. proj = rmsnorm((1/√dim)·(model_proj·
 // embd)); ple_inp = (gathered + proj)/√2. embd_scaled is the sqrt(dim)-scaled residual (s.x / s.x_b).
 def private ple_pre_finish(t : Model; var s : Session; embd_scaled : array<float>; npos : int64) {
+    trace_tag(TRACE_TAG_PLE)   // decode: runs between cls and layer 0, would inherit the stale cls tag
     let c = t.config
     let ple = c.n_embd_per_layer
     let all = c.n_layers * ple
     scale_inplace(unsafe(addr(s.ple_inp[0])), sqrt(float(ple)), npos * all)
-    // model_proj · embedding (batched over positions), then × 1/√dim
-    mm_fblob_b(s.ple_proj, t, t.ple_model_off, embd_scaled, c.dim, all, npos)
+    // model_proj · embedding (batched over positions), then × 1/√dim — native-BF16 rows when
+    // the load kept them (dot_bf16 = exact widen, bit-identical), else the fp32 expand
+    if (t.ple_model_bf16) {
+        matmul_bf16_batch(s.ple_proj, t.bf16blob, t.ple_model_off, embd_scaled, c.dim, all, npos)
+    } else {
+        mm_fblob_b(s.ple_proj, t, t.ple_model_off, embd_scaled, c.dim, all, npos)
+    }
     scale_inplace(unsafe(addr(s.ple_proj[0])), 1.0 / sqrt(float(c.dim)), npos * all)
     // RMSNorm each (position, layer) ple-slice with the single proj-norm vector
     rms_batch(s.ple_proj, s.ple_proj, t, t.ple_pnorm_off, ple, npos * c.n_layers)
@@ -3941,6 +4162,7 @@ def private ple_pre_prefill_pad(t : Model; var s : Session; npos : int64) {
 
 // Per-layer block (decode): cur += post_norm(proj · (gelu(inp_gate·cur) ⊙ ple_inp[l])). In place on s.x.
 def private ple_block_decode(t : Model; var s : Session; l : int64) {
+    trace_tag(TRACE_TAG_PLE)
     let c = t.config
     let dim = c.dim
     let ple = c.n_embd_per_layer
@@ -3985,9 +4207,13 @@ def private gemma4_router_tmp(t : Model; var s : Session; l : int64) {
     }
     let scale = 1.0 / sqrt(float(ss / double(dim)) + t.config.norm_eps)
     let inv_d = 1.0 / sqrt(float(dim))
-    array_view(t.fblob, t.moe_router_scale_off + l * dim, dim) $(sc : array<float>#) {
+    unsafe {
+        let scp = reinterpret<float const?>(addr(t.fblob[t.moe_router_scale_off + l * dim]))
+        var op = addr(s.xb2[0])
+        let ip = reinterpret<float const?>(addr(s.moe_ao[0]))
+        let si = scale * inv_d
         for (i in range64(dim)) {
-            s.xb2[i] = s.moe_ao[i] * scale * inv_d * sc[i]
+            op[i] = ip[i] * si * scp[i]
         }
     }
 }
@@ -4007,7 +4233,7 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     let ts_route = ref_time_ticks()
     gemma4_router_tmp(t, s, l)
     mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb2, dim, ne)
-    moe_select(c, s.moe_logits, s.moe_idx, s.moe_w, 0l)
+    moe_select(c, unsafe(addr(s.moe_logits[0])), s.moe_idx, s.moe_w, 0l)
     for (j in range64(k)) {   // ggml scales each expert's down output by ffn_down_exps_s — fold it into w_j
         s.moe_w[j] *= t.fblob[t.moe_down_scale_off + l * ne + s.moe_idx[j]]
     }
@@ -4016,14 +4242,13 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     rms_at(s.moe_acc, t, t.rms_post_ffn2_off + l * dim, s.moe_acc, dim)
     // dense parallel shared expert (its own pre/post norms), into s.xb
     let ts_sh = ref_time_ticks()
+    trace_tag(TRACE_TAG_SHEXP)
     rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.moe_ao, dim)
     dense_ffn_inplace(t, s, l)
     rms_at(s.xb, t, t.rms_post_ffn1_off + l * dim, s.xb, dim)
     prof_add("mm_shexp", ts_sh)
     // combine then the shared post_ffw_norm on the sum
-    for (i in range64(dim)) {
-        s.moe_acc[i] += s.xb[i]
-    }
+    add_inplace(unsafe(addr(s.moe_acc[0])), unsafe(addr(s.xb[0])), dim)
     rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
 }
 
@@ -4046,9 +4271,10 @@ def private ffn_gemma4_decode(t : Model; var s : Session; l : int64) {
     copy_floats(s.x, 0l, s.moe_ao, 0l, dim)
     gemma4_moe_ffn(t, s, l)
     let ts_resid = ref_time_ticks()
-    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     if (c.layer_out_scale) {
-        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
+        add_scale_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), t.fblob[t.out_scale_off + l], dim)
+    } else {
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     }
     prof_add("act_resid", ts_resid)
 }
@@ -4076,9 +4302,7 @@ def private ffn_gemma4_prefill(t : Model; var s : Session; l : int64; npos : int
         for (p in range64(npos)) {
             copy_floats(s.x_b, p * dim, s.moe_ao, 0l, dim)
             gemma4_moe_ffn(t, s, l)
-            for (i in range64(dim)) {
-                s.x_b[p * dim + i] += s.moe_acc[i]
-            }
+            add_inplace(unsafe(addr(s.x_b[p * dim])), unsafe(addr(s.moe_acc[0])), dim)
         }
     }
     if (c.layer_out_scale) {
@@ -4099,9 +4323,10 @@ def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
     if (c.pre_post_norm) {
         rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
     }
-    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     if (c.layer_out_scale) {
-        scale_inplace(unsafe(addr(s.x[0])), t.fblob[t.out_scale_off + l], dim)
+        add_scale_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), t.fblob[t.out_scale_off + l], dim)
+    } else {
+        add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.moe_acc[0])), dim)
     }
     prof_add("act_resid", ts_resid)
 }
@@ -4112,12 +4337,23 @@ def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
 def private dequant_q8_row(t : Model; off, n : int64; var dst : float?) {
     unsafe {
         let qp = addr(t.qblob[off])
-        let sp = addr(t.qscales[off / 32l])
-        for (b in range64(n / 32l)) {
-            let sc = sp[b]
-            let base = b * 32l
-            for (k in range64(32l)) {
-                dst[base + k] = float(qp[base + k]) * sc
+        if (t.wscale_f16) {
+            let sp = addr(t.qscales16[off / 32l])
+            for (b in range64(n / 32l)) {
+                let sc = f16_to_f32(uint(sp[b]))
+                let base = b * 32l
+                for (k in range64(32l)) {
+                    dst[base + k] = float(qp[base + k]) * sc
+                }
+            }
+        } else {
+            let sp = addr(t.qscales[off / 32l])
+            for (b in range64(n / 32l)) {
+                let sc = sp[b]
+                let base = b * 32l
+                for (k in range64(32l)) {
+                    dst[base + k] = float(qp[base + k]) * sc
+                }
             }
         }
     }
@@ -4131,6 +4367,61 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
         dequant_q8_row(t, t.emb_q8_off + token * dim, dim, dst)
     } else {
         copy_floats(dst, unsafe(addr(t.fblob[t.tok_emb_off + token * dim])), dim)
+    }
+}
+
+// Can the classifier run as the fused matmul+softcap team chain? Q8 wcls (the tied-f32 load takes
+// mm_fblob and can't), team mode + a backend row core, 32-aligned vocab, and worth threading.
+def private fused_cls_ok(t : Model) : bool {
+    let c = t.config
+    return (g_fused_decode && t.quant == QuantMode.q8
+        && get_jobque_team_mode() && kernel_backend_has_rows()
+        && (!t.wscale_f16 || kernel_backend_has_rows16())
+        && c.vocab_size % 32l == 0l
+        && lanes_for_work(c.dim * c.vocab_size, g_gemv_lane_cap) > 1)
+}
+
+// Fused classifier + final-logit softcap: one team chain over 32-row vocab groups, each chunk
+// soft-capping the rows it just produced (cache-hot) — a serial softcap over a 256k vocab was
+// 2-4ms of every-lane-idle per token. Same row dots and same softcap4 element order as the
+// unfused mm + softcap4 pair, so bit-identical to it.
+def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
+    let c = t.config
+    let dim = c.dim
+    let vocab = c.vocab_size
+    quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+    let mmrows = mm_q8q8_rows_fn()
+    let ngrp = int(vocab / 32l)
+    let n0 = chain_stage_chunks(ngrp, int(vocab), dim * vocab)
+    s.chain_stages |> resize(1)
+    s.chain_stages[0] = int3(0, ngrp, n0)
+    count_parallel_dispatch(min(n0, ngrp))
+    unsafe {
+        var lp = addr(s.logits[0])
+        var xqp = addr(s.xq[0])
+        var xsp = addr(s.xs[0])
+        let f16w = t.wscale_f16
+        let mmrows16 = mm_q8q8_rows16_fn()
+        let wp = reinterpret<int8 const?>(addr(t.qblob[0])) + t.wcls_off
+        var ws : float const? = null
+        var ws16 : uint16 const? = null
+        if (f16w) {
+            ws16 = reinterpret<uint16 const?>(addr(t.qscales16[0])) + t.wcls_off / 32l
+        } else {
+            ws = reinterpret<float const?>(addr(t.qscales[0])) + t.wcls_off / 32l
+        }
+        team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
+            unsafe {
+                let r0 = int64(jb) * 32l
+                let r1 = int64(je) * 32l
+                if (f16w) {
+                    invoke(mmrows16, lp, wp, ws16, xqp, xsp, dim, r0, r1)
+                } else {
+                    invoke(mmrows, lp, wp, ws, xqp, xsp, dim, r0, r1)
+                }
+                softcap4(lp + r0, r1 - r0, cap)
+            }
+        }
     }
 }
 
@@ -4174,16 +4465,23 @@ def forward(t : Model; var s : Session; token, pos : int64) {
 
     // final rmsnorm (into xb to avoid aliasing x as both in/out), then classifier
     let ts_final = ref_time_ticks()
+    trace_tag(TRACE_TAG_CLS)
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
-    if (c.shared_weights && !t.cls_q8) {
-        // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
-        mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+    let tied_f32 = c.shared_weights && !t.cls_q8
+    if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
+        // Gemma2/E-series: soft-cap fused into the classifier chunks
+        cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
-        // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
-        mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
-    }
-    if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
-        softcap(s.logits, c.vocab_size, c.final_logit_softcap)
+        if (tied_f32) {
+            // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
+            mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+        } else {
+            // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
+            mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
+        }
+        if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
+            softcap4(s.logits, c.vocab_size, c.final_logit_softcap)
+        }
     }
     for (id in t.suppress) {  // gemma4: pin the checkpoint's suppressed token ids to -inf
         s.logits[id] = -1.0e30
@@ -4584,7 +4882,7 @@ def private attn_head_blocked(var attp_h : float?; var xbp : float?; qp : float 
                 let cnt = ap + 1l - kstart_p
                 let rbase = bi * maxctx
                 if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                    softcap(attp_h + rbase, cnt, attn_softcap)
+                    softcap4(attp_h + rbase, cnt, attn_softcap)
                 }
                 if (sinksp != null) {  // gpt-oss: sink joins the denominator
                     softmax_sink(attp_h + rbase, cnt, sinksp[hh])
@@ -4646,7 +4944,7 @@ def private attn_head_classic(var attp_h : float?; var xbp : float?; qp : float 
                 }
             }
             if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                softcap(attp_h, cnt, attn_softcap)
+                softcap4(attp_h, cnt, attn_softcap)
             }
             if (sinksp != null) {  // gpt-oss: sink joins the denominator
                 softmax_sink(attp_h, cnt, sinksp[hh])
@@ -5312,13 +5610,9 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         if (c.moe_router_bias) {
             add_bias(s.moe_rlog, p * ne, t.fblob, t.router_b_off + l * ne, ne)
         }
-        array_view(s.moe_rlog, p * ne, ne) $(var lg : array<float>#) {
-            moe_select(c, lg, s.moe_idx_b, s.moe_w_b, p * k)
-        }
+        moe_select(c, unsafe(addr(s.moe_rlog[p * ne])), s.moe_idx_b, s.moe_w_b, p * k)
         if (nsh > 0l) {
-            array_view(s.xb_b, p * dim, dim) $(var xv : array<float>#) {
-                s.moe_gl_b[p] = moe_shexp_gate(t, l, xv)
-            }
+            s.moe_gl_b[p] = moe_shexp_gate(t, l, unsafe(addr(s.xb_b[p * dim])))
         }
     }
     // bucket the (position, slot) pairs by expert — CSR with the in-place cursor trick: counts
@@ -5624,9 +5918,7 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
     gemma4_router_batch(t, s.xb2_b, s.x_b, l, dim, npos)
     mm_fblob_b(s.moe_rlog, t, t.router_off + l * ne * dim, s.xb2_b, dim, ne, npos)
     for (p in range64(npos)) {
-        array_view(s.moe_rlog, p * ne, ne) $(var lg : array<float>#) {
-            moe_select(c, lg, s.moe_idx_b, s.moe_w_b, p * k)
-        }
+        moe_select(c, unsafe(addr(s.moe_rlog[p * ne])), s.moe_idx_b, s.moe_w_b, p * k)
         for (j in range64(k)) {
             s.moe_w_b[p * k + j] *= t.fblob[t.moe_down_scale_off + l * ne + s.moe_idx_b[p * k + j]]
         }
@@ -5758,9 +6050,7 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
             if (c.pre_post_norm) {
                 rms_at(s.moe_acc, t, t.rms_post_ffn_off + l * dim, s.moe_acc, dim)
             }
-            for (i in range64(dim)) {   // residual add into this position's x_b row
-                s.x_b[p * dim + i] += s.moe_acc[i]
-            }
+            add_inplace(unsafe(addr(s.x_b[p * dim])), unsafe(addr(s.moe_acc[0])), dim)   // residual add into this position's x_b row
         }
     }
     if (c.layer_out_scale) {
@@ -5874,20 +6164,14 @@ def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int6
         // the last position, so re-apply the final RMSNorm to EVERY position and accumulate.
         forward_prefill(t, s, tokens, npos, 0l)
         for (p in range64(npos)) {
-            array_view(s.x_b, p * dim, dim) $(var xv : array<float>#) {
-                rms_at(s.xb, t, t.rms_final_off, xv, dim)
-            }
-            for (i in range64(dim)) {
-                out[i] += s.xb[i]
-            }
+            rms_at(s.xb, t, t.rms_final_off, s.x_b, p * dim, dim)
+            add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
         }
     } else {
         // q4 (no batched prefill) or a single token: per-token forward leaves s.xb = post-final-norm hidden.
         for (p in range64(npos)) {
             forward(t, s, tokens[p], p)
-            for (i in range64(dim)) {
-                out[i] += s.xb[i]
-            }
+            add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
         }
     }
     s.n_past = npos   // KV now holds npos positions (start_pos was 0) — keep the session cursor consistent
@@ -5996,16 +6280,19 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     // final rmsnorm + classifier on the LAST position only (that's what we sample next)
     let ts_final = ref_time_ticks()
     let last = npos - 1l
-    array_view(s.x_b, last * dim, dim) $(var xv : array<float>#) {
-        rms_at(s.xb, t, t.rms_final_off, xv, dim)
-    }
-    if (c.shared_weights && !t.cls_q8) {
-        mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+    rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
+    let tied_f32 = c.shared_weights && !t.cls_q8
+    if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
+        cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
-        mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
-    }
-    if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
-        softcap(s.logits, c.vocab_size, c.final_logit_softcap)
+        if (tied_f32) {
+            mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+        } else {
+            mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
+        }
+        if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
+            softcap4(s.logits, c.vocab_size, c.final_logit_softcap)
+        }
     }
     for (id in t.suppress) {  // gemma4: pin the checkpoint's suppressed token ids to -inf
         s.logits[id] = -1.0e30
@@ -6316,7 +6603,7 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         unsafe {
             var lbp = addr(ws.logits_b[0])
             for (i in range64(nrows)) {
-                softcap(lbp + i * vocab, vocab, c.final_logit_softcap)
+                softcap4(lbp + i * vocab, vocab, c.final_logit_softcap)
             }
         }
     }
@@ -6333,15 +6620,9 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
 
 //! Greedy argmax over the current logits; returns the winning token id.
 def private argmax(s : Session; vocab : int64) : int64 {
-    var best = 0l
-    var bestv = s.logits[0]
-    for (i in range64(vocab)) {
-        if (s.logits[i] > bestv) {
-            bestv = s.logits[i]
-            best = i
-        }
-    }
-    return best
+    // team-scanned argmax (bit-identical to the serial first-wins loop) — a 151-262k vocab scan
+    // was 210-284us of every-lane-idle per decoded token
+    return parallel_argmax(s.logits, vocab)
 }
 
 //! Greedy decode. `prompt_tokens` is the encoded prompt (at least [BOS]); while still

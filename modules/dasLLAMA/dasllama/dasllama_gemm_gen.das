@@ -43,8 +43,9 @@ require dasllama/dasllama_gemm_schema
 // perm_declines), so repacks and kernels fall back to the grp4 reference family together.
 // Runs in the llvm-jit context; wired via llvm_user_modules.das. The stubs it generates for
 // are dasllama/dasllama_math_gen.das::q8q8_tile_gen, ::q8q8_layout_gen, ::q8q8_wbias_gen,
-// ::q8q8_kgroup_gen, ::q8q8_tokstep_gen, ::q8q8_gemv_gen, ::mx4q8_gemv_gen and
-// ::q8q8_family_live (the witness).
+// ::q8q8_kgroup_gen, ::q8q8_tokstep_gen, ::q8q8_gemv_gen, ::mx4q8_gemv_gen,
+// ::q8q8_family_live (the witness), and the wscale_f16 twins ::q8q8_tile_s16_gen /
+// ::q8q8_gemv_s16_gen (same perm, same fold order — only the scale-fold load widens f16).
 
 // dot-primitive kinds (TilePerm.dotPrim, parsed once into TileEmit.dotKind)
 let DOT_SDOT = 0
@@ -300,6 +301,10 @@ struct private TileEmit {
     pshuf_ty : LLVMOpaqueType?
     lut : LLVMOpaqueValue?               // the doubled-e2m1 LUT: v16i8 on NEON; broadcast per
                                          // 16-byte lane to vwi8 on x64 (pshufb is per-lane)
+    sgF16 : bool                         // the wscale_f16 rail: the group-scale plane is raw
+                                         // binary16 halfwords — scale loads widen via fpext
+    vni16 : LLVMOpaqueType?              // <rv x i16> — the halfword scale-load type (sgF16)
+    vnf16 : LLVMOpaqueType?              // <rv x half> — its bitcast view, the fpext source
 }
 
 // one indexed sdot: acc += w · (dword-group `lane` of x, splatted). The bitcast-to-v4i32 lane
@@ -531,6 +536,21 @@ def private fold_fma(var te : TileEmit; var a, b, c : LLVMOpaqueValue?; name : s
     return LLVMBuildFAdd(bld, LLVMBuildFMul(bld, a, b, ""), c, name)
 }
 
+// one vnf32 group-scale vector at element index `idx` off `base` — the f32-plane load, or
+// (sgF16) the raw-binary16 plane widened via bitcast-to-half + fpext (fcvtl / vcvtph2ps: the
+// scalar f16_to_f32 JIT lowering, vectorized). Every weight-scale load in the family goes
+// through here, so the two planes differ ONLY in this load and the fold order is shared.
+def private load_scale_vec(var te : TileEmit; var base, idx : LLVMOpaqueValue?; name : string) : LLVMOpaqueValue? {
+    let b = te.builder
+    if (!te.sgF16) {
+        var sgp = LLVMBuildGEP2(b, te.types.t_float, base, idx, name)
+        return LLVMBuildLoad2Aligned(b, te.vnf32, sgp, 4u, name)
+    }
+    var sgp = LLVMBuildGEP2(b, te.types.t_int16, base, idx, name)
+    var hv = LLVMBuildLoad2Aligned(b, te.vni16, sgp, 2u, name)
+    return LLVMBuildFPExt(b, LLVMBuildBitCast(b, hv, te.vnf16, ""), te.vnf32, name)
+}
+
 // the per-block Q8 scale fold shared by the sdot/x64 lattice and the smmla MMA form: f[acc] +=
 // float(a[acc]) * s[qd] * splat(q[i]) — the exact op order of the hand template
 // dot_q8q8_laneq4x4_template, so every emitter's fast-math contraction sees the same input and
@@ -542,8 +562,7 @@ def private emit_scale_fold(var te : TileEmit; var bi : LLVMOpaqueValue?; a : LL
     var sgIdx0 = LLVMBuildMul(b, bi, te.types->ConstI64(uint64(te.interleave)), "")
     for (qd in range(rq)) {
         var idx = qd == 0 ? sgIdx0 : LLVMBuildAdd(b, sgIdx0, te.types->ConstI64(uint64(qd * te.rv)), "")
-        var sgp = LLVMBuildGEP2(b, te.types.t_float, te.sg, idx, qd == 0 ? "sgp" : "sgp{qd}")
-        s4[qd] = LLVMBuildLoad2Aligned(b, te.vnf32, sgp, 4u, qd == 0 ? "s4" : "s4{qd}")
+        s4[qd] = load_scale_vec(te, te.sg, idx, qd == 0 ? "s4" : "s4{qd}")
     }
     for (i in range(tokCount)) {
         let tk = tokBase + i
@@ -918,6 +937,8 @@ def private setup_tile_emit(var te : TileEmit; var gc : LlvmCodeCtx; p : TilePer
     te.vwi8 = LLVMVectorType(te.types.t_int8, uint(te.width / 8))
     te.vni32 = LLVMVectorType(te.types.t_int32, uint(te.rv))
     te.vnf32 = LLVMVectorType(te.types.t_float, uint(te.rv))
+    te.vni16 = LLVMVectorType(te.types.t_int16, uint(te.rv))
+    te.vnf16 = LLVMVectorType(LLVMHalfTypeInContext(gc.jit.ctx), uint(te.rv))
     let mod = LLVMGetGlobalParent(gc.impl)
     if (te.dotKind == DOT_SDOT || te.dotKind == DOT_SMMLA) {
         let id = LLVMLookupIntrinsicID("llvm.aarch64.neon.sdot")
@@ -1034,6 +1055,8 @@ def private setup_amx_emit(var te : TileEmit; var gc : LlvmCodeCtx; p : TilePerm
     te.bias = p.bias
     te.vni32 = LLVMVectorType(te.types.t_int32, 16u)
     te.vnf32 = LLVMVectorType(te.types.t_float, 16u)
+    te.vni16 = LLVMVectorType(te.types.t_int16, 16u)
+    te.vnf16 = LLVMVectorType(LLVMHalfTypeInContext(gc.jit.ctx), 16u)
     let mod = LLVMGetGlobalParent(gc.impl)
     var noTypes : array<LLVMOpaqueType?>
     var ptrTy = te.types->LLVMVoidPtrType()
@@ -1146,8 +1169,8 @@ def private amx_store(var te : TileEmit; nt, r, ts : int; var cd, reg : LLVMOpaq
 // 32×32 f32 across blocks): the tile zero-inits its own y region first, which also makes the
 // wrapper's overlapped token-tail recompute idempotent. kstep is pinned 1 — Q8's per-block
 // scale boundary (i32 cannot accumulate across blocks).
-def private emit_amx_tile(var gc : LlvmCodeCtx; p : TilePerm) : bool {
-    var te = TileEmit()
+def private emit_amx_tile(var gc : LlvmCodeCtx; p : TilePerm; f16s : bool) : bool {
+    var te = TileEmit(sgF16 = f16s)
     if (!setup_amx_emit(te, gc, p)) return false
     let b = gc.jit.builder
     let nt = p.nrsplit
@@ -1230,10 +1253,9 @@ def private emit_amx_tile(var gc : LlvmCodeCtx; p : TilePerm) : bool {
     }
     var bi16 = LLVMBuildMul(b, biPhi, te.types->ConstI64(16ul), "bi16")
     for (r in range(nt)) {
-        // ws_vec: the block's 16 f32 group scales, mr-contiguous in the grp plane — one zmm
+        // ws_vec: the block's 16 group scales, mr-contiguous in the grp plane — one zmm
         var sidx = r == 0 ? bi16 : LLVMBuildAdd(b, bi16, sgoff[r], "")
-        var swp = LLVMBuildGEP2(b, te.types.t_float, sg, sidx, "sw{r}")
-        var ws = LLVMBuildLoad2Aligned(b, te.vnf32, swp, 4u, "ws{r}")
+        var ws = load_scale_vec(te, sg, sidx, "ws{r}")
         for (ts in range(nt)) {
             var cd = amx_dot(te, nt, r, ts, As[ts], Bs[r])
             amx_store(te, nt, r, ts, cd, scratch)
@@ -1304,8 +1326,8 @@ def private amx_fold_tile(var te : TileEmit; var region, bi, ws : LLVMOpaqueValu
 // crunches instead of the whole chain stalling behind every tilestored. Structure: peel
 // block 0 (compute-only into buf0), steady-state loop folds bi−1 between bi's tile ops
 // (buffer swap via phis), exit block folds the final spill (post-swap, cPre holds it).
-def private emit_amx_tile_pipelined(var gc : LlvmCodeCtx; p : TilePerm) : bool {
-    var te = TileEmit()
+def private emit_amx_tile_pipelined(var gc : LlvmCodeCtx; p : TilePerm; f16s : bool) : bool {
+    var te = TileEmit(sgF16 = f16s)
     if (!setup_amx_emit(te, gc, p)) return false
     let b = gc.jit.builder
     let nt = p.nrsplit
@@ -1414,8 +1436,7 @@ def private emit_amx_tile_pipelined(var gc : LlvmCodeCtx; p : TilePerm) : bool {
     for (r in range(nt)) {
         // block bi−1's ws vector — the deferred fold's group scales (one zmm per r plane)
         var sidx = r == 0 ? ii16 : LLVMBuildAdd(b, ii16, sgoff[r], "")
-        var swp = LLVMBuildGEP2(b, te.types.t_float, sg, sidx, "sw{r}")
-        var ws = LLVMBuildLoad2Aligned(b, te.vnf32, swp, 4u, "ws{r}")
+        var ws = load_scale_vec(te, sg, sidx, "ws{r}")
         for (ts in range(nt)) {
             let idx = r * nt + ts
             // the deferral: fold tile (r, ts) of block bi−1 from C[pre] before this chain's
@@ -1444,8 +1465,7 @@ def private emit_amx_tile_pipelined(var gc : LlvmCodeCtx; p : TilePerm) : bool {
     var iiF16 = LLVMBuildMul(b, iiF, te.types->ConstI64(16ul), "iif16")
     for (r in range(nt)) {
         var sidx = r == 0 ? iiF16 : LLVMBuildAdd(b, iiF16, sgoff[r], "")
-        var swp = LLVMBuildGEP2(b, te.types.t_float, sg, sidx, "swf{r}")
-        var ws = LLVMBuildLoad2Aligned(b, te.vnf32, swp, 4u, "wsf{r}")
+        var ws = load_scale_vec(te, sg, sidx, "wsf{r}")
         for (ts in range(nt)) {
             let idx = r * nt + ts
             var preReg = idx == 0 ? cPrePhi : LLVMBuildGEP2(b, te.types.t_int8, cPrePhi, te.types->ConstI64(uint64(idx * 1024)), "")
@@ -1456,17 +1476,19 @@ def private emit_amx_tile_pipelined(var gc : LlvmCodeCtx; p : TilePerm) : bool {
     return true
 }
 
-def private tile_gen(var gc : LlvmCodeCtx) : bool {
+// the tile emitter shared by the f32 and f16-scale entries: f16s swaps ONLY the scale-fold
+// load (load_scale_vec) — same lattice, same fold order, same shared decline rails
+def private tile_gen_impl(var gc : LlvmCodeCtx; f16s : bool) : bool {
     // decline on a foreign signature, and on every shared rail (perm_declines — the layout
     // companion declines in lockstep): the reference body compiles instead
     if (!is_tile_signature(gc.fn)) return false
     let p = parse_perm(gc)
     if (perm_declines(gc, p)) return false
     if (dot_kind(p.dotPrim) == DOT_AMX) {
-        return p.pipe != 0 ? emit_amx_tile_pipelined(gc, p) : emit_amx_tile(gc, p)
+        return p.pipe != 0 ? emit_amx_tile_pipelined(gc, p, f16s) : emit_amx_tile(gc, p, f16s)
     }
 
-    var te = TileEmit()
+    var te = TileEmit(sgF16 = f16s)
     if (!setup_tile_emit(te, gc, p, false)) return false
 
     let b = gc.jit.builder
@@ -1508,6 +1530,12 @@ def private tile_gen(var gc : LlvmCodeCtx) : bool {
     LLVMBuildRetVoid(b)
     return true
 }
+
+def private tile_gen(var gc : LlvmCodeCtx) : bool => tile_gen_impl(gc, false)
+
+// the wscale_f16 tile twin (stamped as a companion with the SAME perm): the binary16 group-
+// scale plane, widened in the fold load — bit-identical over the plane the halfwords widen to
+def private tile_s16_gen(var gc : LlvmCodeCtx) : bool => tile_gen_impl(gc, true)
 
 def private is_layout_signature(fn : Function const?) : bool {
     return empty(fn.arguments) && fn.result.baseType == Type.tInt
@@ -1679,13 +1707,13 @@ def private is_gemv_signature(fn : Function const?) : bool {
 // accumulators per block are the independent dot chains a serial single-token laneq chain
 // lacks. Declines via the SAME perm_declines as the tile — the reference body (the grp4
 // laneq rows walk) falls back in lockstep with the grp4 reference pair.
-def private gemv_gen(var gc : LlvmCodeCtx) : bool {
+def private gemv_gen_impl(var gc : LlvmCodeCtx; f16s : bool) : bool {
     if (!is_gemv_signature(gc.fn)) return false
     let p0 = parse_perm(gc)
     if (perm_declines(gc, p0)) return false
     let p = companion_perm(p0)
 
-    var te = TileEmit()
+    var te = TileEmit(sgF16 = f16s)
     if (!setup_tile_emit(te, gc, p, false)) return false
 
     let b = gc.jit.builder
@@ -1724,7 +1752,7 @@ def private gemv_gen(var gc : LlvmCodeCtx) : bool {
     sa.g = gPhi
     var gRow = LLVMBuildMul(b, gPhi, mrC, "grow")
     te.wg = LLVMBuildGEP2(b, te.types.t_int8, wp, LLVMBuildMul(b, gRow, n, ""), "wg")
-    te.sg = LLVMBuildGEP2(b, te.types.t_float, sp, LLVMBuildMul(b, gRow, sa.nb, ""), "sg")
+    te.sg = LLVMBuildGEP2(b, f16s ? te.types.t_int16 : te.types.t_float, sp, LLVMBuildMul(b, gRow, sa.nb, ""), "sg")
 
     var after = emit_slice(te, sa, ghead, 0, 1, "")
     LLVMPositionBuilderAtEnd(b, after)
@@ -1739,6 +1767,11 @@ def private gemv_gen(var gc : LlvmCodeCtx) : bool {
     LLVMBuildRetVoid(b)
     return true
 }
+
+def private gemv_gen(var gc : LlvmCodeCtx) : bool => gemv_gen_impl(gc, false)
+
+// the wscale_f16 rows-core twin (stamped as a companion with the SAME perm) — see tile_s16_gen
+def private gemv_s16_gen(var gc : LlvmCodeCtx) : bool => gemv_gen_impl(gc, true)
 
 // The MXFP4 quarter of the stamp: the same rows-range GEMV as gemv_gen over the
 // grp<mr>-interleaved nibble/exponent planes — emit_block_mx4 swaps the weight-load stage for
@@ -1814,6 +1847,8 @@ def public register_dasllama_gemm_generators {
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_tokstep", @@tokstep_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_amx_cfg", @@cfg_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_gemv", @@gemv_gen)
+    register_llvm_code_generator("dasllama_gemm_gen::q8q8_tile_s16", @@tile_s16_gen)
+    register_llvm_code_generator("dasllama_gemm_gen::q8q8_gemv_s16", @@gemv_s16_gen)
     register_llvm_code_generator("dasllama_gemm_gen::mx4_gemv", @@mx4_gemv_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_witness", @@witness_gen)
 }

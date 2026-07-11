@@ -804,6 +804,30 @@ namespace das {
                       s.lastN ? float(s.lastT) / float(s.lastN) : 0.0f};
     }
 
+    // per-lane event tracer (JobQue::traceStart/traceStop/traceSave): every lane records
+    // publish/chunk/stage-wait/wake/fifo-job events on one global clock; save writes
+    // chrome://tracing JSON for Perfetto — one row per lane, the gaps read directly off the
+    // timeline.
+    void jobque_trace_start ( int32_t eventsPerLane, Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->traceStart(eventsPerLane);
+    }
+
+    void jobque_trace_stop ( Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->traceStop();
+    }
+
+    bool jobque_trace_save ( const char * path, Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        return g_jobQue->traceSave(path ? path : "");
+    }
+
+    void jobque_trace_tag ( int32_t tag, Context *, LineInfoArg * ) {
+        // op tag for subsequent trace publishes (viewer color channel); no-op without a que
+        if ( g_jobQue ) g_jobQue->traceSetTag(tag);
+    }
+
     void team_parallel_for_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo ) {
         if ( !g_jobQue ) context->throw_error_at(lineinfo, "need to be in a 'with_job_que' block, or call create_job_que() first");
         int total = rangeEnd - rangeBegin;
@@ -1452,6 +1476,18 @@ namespace das {
             addExtern<DAS_BIND_FUN(get_jobque_team_prof_react)>(*this, lib,  "get_jobque_team_prof_react",
                 SideEffects::accessExternal, "get_jobque_team_prof_react")
                     ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(jobque_trace_start)>(*this, lib,  "jobque_trace_start",
+                SideEffects::modifyExternal, "jobque_trace_start")
+                    ->args({"events_per_lane","context","line"});
+            addExtern<DAS_BIND_FUN(jobque_trace_stop)>(*this, lib,  "jobque_trace_stop",
+                SideEffects::modifyExternal, "jobque_trace_stop")
+                    ->args({"context","line"});
+            addExtern<DAS_BIND_FUN(jobque_trace_save)>(*this, lib,  "jobque_trace_save",
+                SideEffects::modifyExternal, "jobque_trace_save")
+                    ->args({"path","context","line"});
+            addExtern<DAS_BIND_FUN(jobque_trace_tag)>(*this, lib,  "jobque_trace_tag",
+                SideEffects::modifyExternal, "jobque_trace_tag")
+                    ->args({"tag","context","line"});
             addExtern<DAS_BIND_FUN(team_parallel_for_invoke)>(*this, lib,  "team_parallel_for_invoke",
                 SideEffects::modifyExternal, "team_parallel_for_invoke")
                     ->args({"range_begin","range_end","num_chunks","lambda","function","lambdaSize","context","line"});

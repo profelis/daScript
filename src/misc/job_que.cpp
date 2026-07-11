@@ -168,6 +168,8 @@ namespace das {
         mLimitOrderSpread = limitOrderEnv != nullptr && strcmp(limitOrderEnv, "spread") == 0;
         const char * rankGateEnv = getenv("DAS_JOBQUE_TEAM_RANK_GATE");   // =1: per-op worker participation gate (see setTeamRankGate)
         mTeamRankGate = (rankGateEnv != nullptr && atoi(rankGateEnv) != 0) ? 1 : 0;
+        const char * eagerExitEnv = getenv("DAS_JOBQUE_TEAM_EAGER_EXIT");   // =0 re-enables the final-barrier spin (see setTeamEagerExit)
+        mTeamEagerExit = (eagerExitEnv != nullptr) ? ((atoi(eagerExitEnv) != 0) ? 1 : 0) : 1;
         SetCurrentThreadPriority(JobPriority::High);
         for (int j = 0, js = mThreadCount; j < js; j++) {
             mThreads.emplace_back(make_unique<thread>([this, j]() {
@@ -207,6 +209,49 @@ namespace das {
         s.publishT = mTPpub; s.serveT = mTPserve; s.tailT = mTPtail; s.totalT = mTPtotal;
         s.reactT = mTPreact; s.reactN = mTPreactN; s.lastT = mTPlastRel; s.lastN = mTPlastN;
         return s;
+    }
+
+    void JobQue::traceStart ( int eventsPerLane ) {
+        int lanes = mThreadCount.load() + 1;    // workers + the dispatching caller
+        mTrace.clear();
+        mTrace.resize(size_t(lanes));
+        for ( auto & L : mTrace ) {
+            L.ev.resize(size_t(das::max(eventsPerLane, 1024)));
+            L.n = 0;
+        }
+        mTraceT0 = uint64_t(ref_time_ticks());  // wake spans clamp their park-t0 to the session start
+        mTraceOn.store(1, std::memory_order_seq_cst);
+    }
+
+    bool JobQue::traceSave ( const char * path ) {
+        if ( mTraceOn.load(std::memory_order_relaxed) ) return false;   // stop before saving
+        uint64_t tmin = ~0ull;
+        for ( auto & L : mTrace ) {
+            for ( uint32_t i = 0; i != L.n; ++i ) tmin = das::min(tmin, L.ev[i].t0);
+        }
+        if ( tmin == ~0ull ) return false;
+        FILE * f = fopen(path, "wb");
+        if ( !f ) return false;
+        static const char * tagName[] = { "publish", "chunk", "stage_wait", "wake", "fifo_job" };
+        fprintf(f, "{\"traceEvents\":[");
+        bool first = true;
+        for ( size_t lane = 0; lane != mTrace.size(); ++lane ) {
+            auto & L = mTrace[lane];
+            const bool caller = lane + 1 == mTrace.size();
+            fprintf(f, "%s\n{\"ph\":\"M\",\"pid\":0,\"tid\":%d,\"name\":\"thread_name\",\"args\":{\"name\":\"%s%d\"}}",
+                first ? "" : ",", int(lane), caller ? "caller " : "worker ", int(lane));
+            first = false;
+            for ( uint32_t i = 0; i != L.n; ++i ) {
+                const auto & e = L.ev[i];
+                fprintf(f, ",\n{\"ph\":\"X\",\"pid\":0,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,\"name\":\"%s\","
+                    "\"args\":{\"stage\":%u,\"arg\":%u,\"chain\":%u}}",
+                    int(lane), double(e.t0 - tmin) / 1000.0, double(e.t1 - e.t0) / 1000.0,
+                    tagName[e.tag < 5 ? e.tag : 4], e.stage, e.arg, e.chain);
+            }
+        }
+        fprintf(f, "\n]}\n");
+        fclose(f);
+        return true;
     }
 
     void JobQue::EvalOnMainThread(Job && expr) {
@@ -441,12 +486,18 @@ namespace das {
                 // A team publish notifies only when it sees us parked (the seq_cst parked++ /
                 // seq-check pair below vs the publisher's seq-bump / parked-check closes the
                 // sleep/wake race), hence the team clause in the predicate + the empty-fifo continue.
+                uint64_t p0 = mTraceOn.load(std::memory_order_relaxed) ? uint64_t(ref_time_ticks()) : 0;
                 mParkedWorkers.fetch_add(1, std::memory_order_seq_cst);
                 mCond.wait(lock, [&]() {
                     return mFifo.size() != 0 || mShutdown.load()
                         || mTeamSeq.load(std::memory_order_seq_cst) != teamSeqSeen;
                 });
                 mParkedWorkers.fetch_sub(1, std::memory_order_relaxed);
+                if ( p0 && mTraceOn.load(std::memory_order_relaxed) ) {
+                    // re-check: tracing may have stopped while we were parked; a wake into a NEWER
+                    // session clamps its park-t0 to that session's start (no pre-session spans)
+                    traceEvent(threadIndex, TraceTag::Wake, das::max(p0, mTraceT0), uint64_t(ref_time_ticks()), 0, 1, 0);
+                }
                 if ( mShutdown ) break;
                 if ( mFifo.empty() ) continue;      // team wake, no fifo work → back to the spin/team poll
                 job = das::move(mFifo.front().function);
@@ -473,7 +524,13 @@ namespace das {
                 SetCurrentThreadPriority(mThreads[threadIndex].currentPriority);
                 mThreads[threadIndex].appliedPriority = mThreads[threadIndex].currentPriority;
             }
-            job();
+            if ( mTraceOn.load(std::memory_order_relaxed) ) {
+                uint64_t j0 = uint64_t(ref_time_ticks());
+                job();
+                traceEvent(threadIndex, TraceTag::FifoJob, j0, uint64_t(ref_time_ticks()), 0, 0, 0);
+            } else {
+                job();
+            }
             {
                 unique_lock<mutex> lock(mFifoMutex);
                 mThreads[threadIndex].currentPriority = JobPriority::Inactive;
@@ -540,6 +597,7 @@ namespace das {
         }
         seqSeen = seq;
         int nStages = mTeamStageCount;
+        const bool tracing = mTraceOn.load(std::memory_order_relaxed) != 0;
         for ( int s = 0; s != nStages; ++s ) {
             for (;;) {
                 // one fetch_add returns {numChunks, index} as a unit, so overflow (c >= K)
@@ -555,15 +613,27 @@ namespace das {
                     mTeamFirstClaimT.compare_exchange_strong(z, t, std::memory_order_relaxed);
                     mTeamLastClaimT.store(t, std::memory_order_relaxed);
                 }
-                (*mTeamWorkS[s])(int(c), threadIndex);
+                if ( tracing ) {
+                    uint64_t c0 = uint64_t(ref_time_ticks());
+                    (*mTeamWorkS[s])(int(c), threadIndex);
+                    traceEvent(threadIndex, TraceTag::Chunk, c0, uint64_t(ref_time_ticks()), uint32_t(s), c, seq);
+                } else {
+                    (*mTeamWorkS[s])(int(c), threadIndex);
+                }
                 mTeamRemainingS[s].fetch_sub(1, std::memory_order_release);
             }
+            // eager exit: the FINAL join belongs to the caller (its remaining==0 spin), and we
+            // hold no claim after the overflow — spinning here only widens the in-flight window
+            // the next publish must drain, so a preemption in this spin becomes a fat publish.
+            if ( s == nStages - 1 && mTeamEagerExit.load(std::memory_order_relaxed) ) break;
             // stage barrier: stage s+1 reads what stage s wrote, so wait for ALL of stage s —
             // the acquire pairs with every serving lane's release decrement.
+            uint64_t w0 = tracing ? uint64_t(ref_time_ticks()) : 0;
             while ( mTeamRemainingS[s].load(std::memory_order_acquire) != 0 ) {
                 if ( mShutdown.load(std::memory_order_relaxed) ) { s = nStages - 1; break; }
                 jobque_spin_relax();
             }
+            if ( tracing ) traceEvent(threadIndex, TraceTag::StageWait, w0, uint64_t(ref_time_ticks()), uint32_t(s), 0, seq);
         }
         mTeamInFlight.fetch_sub(1, std::memory_order_release);
         // true = seqSeen advanced (we saw this op, whether or not we won any chunks) — the
@@ -590,6 +660,8 @@ namespace das {
         uint64_t t0 = 0, tp = 0, tc = 0;
         int callerChunks = 0;
         int totalChunks = 0;
+        const bool tracing = mTraceOn.load(std::memory_order_relaxed) != 0;
+        uint64_t tt0 = tracing ? uint64_t(ref_time_ticks()) : 0;
         if ( mTeamProf ) {
             t0 = uint64_t(ref_time_ticks());
             mTeamFirstClaimT.store(0, std::memory_order_relaxed);
@@ -617,26 +689,37 @@ namespace das {
         // publish, phase 2: even seq = "published". seq_cst bump + parked check: the Dekker pair
         // with the worker's parked++ / seq-check — either the parking worker sees this chain, or
         // we see it parked and pay the wake. No mutex touched while everyone spins.
-        mTeamSeq.fetch_add(1, std::memory_order_seq_cst);
+        uint32_t chainSeq = mTeamSeq.fetch_add(1, std::memory_order_seq_cst) + 1;
         if ( mParkedWorkers.load(std::memory_order_seq_cst) > 0 ) {
             lock_guard<mutex> lock(mFifoMutex);
             mCond.notify_all();
         }
         if ( mTeamProf ) tp = uint64_t(ref_time_ticks());
+        if ( tracing ) traceEvent(nW, TraceTag::ChainPublish, tt0, uint64_t(ref_time_ticks()),
+            uint32_t(numStages) | (uint32_t(mTraceTag.load(std::memory_order_relaxed)) << 8),
+            uint32_t(totalChunks), chainSeq);
         // caller serves every stage and participates in every barrier (slot nW)
         for ( int s = 0; s != numStages; ++s ) {
             for (;;) {
                 uint64_t claim = mTeamOpS[s].fetch_add(1, std::memory_order_acq_rel);
                 uint32_t c = uint32_t(claim);
                 if ( c >= uint32_t(claim >> 32) ) break;
-                (*stages[s].work)(int(c), nW);
+                if ( tracing ) {
+                    uint64_t c0 = uint64_t(ref_time_ticks());
+                    (*stages[s].work)(int(c), nW);
+                    traceEvent(nW, TraceTag::Chunk, c0, uint64_t(ref_time_ticks()), uint32_t(s), c, chainSeq);
+                } else {
+                    (*stages[s].work)(int(c), nW);
+                }
                 mTeamRemainingS[s].fetch_sub(1, std::memory_order_release);
                 ++callerChunks;
             }
             if ( mTeamProf && s == numStages - 1 ) tc = uint64_t(ref_time_ticks());
             // stage barrier / final join: acquire pairs with the workers' release decrements, so
             // their chunk writes are visible. Unbounded spin — the tail is at most one chunk per lane.
+            uint64_t w0 = tracing ? uint64_t(ref_time_ticks()) : 0;
             while ( mTeamRemainingS[s].load(std::memory_order_acquire) != 0 ) jobque_spin_relax();
+            if ( tracing ) traceEvent(nW, TraceTag::StageWait, w0, uint64_t(ref_time_ticks()), uint32_t(s), 0, chainSeq);
         }
         if ( mTeamProf ) {
             uint64_t tj = uint64_t(ref_time_ticks());

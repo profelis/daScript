@@ -1,0 +1,1 @@
+Arms the per-lane JobQue event tracer: every lane (each worker plus the dispatching caller) records publish, chunk, stage-wait, wake and fifo-job events into a preallocated buffer of max(events_per_lane, 1024) entries; a lane stops recording when its buffer fills. Start (and stop) the trace only while no dispatch is in flight — arming reallocates the lane buffers.

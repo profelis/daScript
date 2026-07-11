@@ -47,7 +47,7 @@ struct Args {
     @clarg_doc = "Positions per page when --paged (default: 64)"
     page_rows : int = 64
 
-    @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; 1 = thread everything, -1 = keep default)"
+    @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; default 1 = thread everything; 1000000 = the old coarse threshold; -1 = keep default)"
     target_work : int = -1
 
     @clarg_doc = "Override the GEMV lane cap (0 = uncapped, -1 = keep default)"
@@ -62,6 +62,15 @@ struct Args {
     @clarg_doc = "Team dispatch: workers self-serve chunks off one published atomic instead of per-chunk fifo jobs"
     team : bool
 
+    @clarg_doc = "Save a per-lane jobque event trace of the FIRST decode window to this path (Perfetto/chrome-tracing JSON)"
+    trace : string
+
+    @clarg_doc = "GEMV chunks per lane (fine-grain self-serve tail; default 8; 1 = the old equal split; -1 = keep default)"
+    fine : int = -1
+
+    @clarg_doc = "Weight-scale plane A/B: 1 = convert to f16 at load (llama.cpp byte parity), 0 = keep f32, -1 = keep default"
+    wscale_f16 : int = -1
+
     @clarg_doc = "A/B: size chunk counts to workers only (the pre-fix split), not workers + caller lane"
     legacy_lanes : bool
 
@@ -75,21 +84,14 @@ def private build_prompt(n : int64) : array<int64> {
 }
 
 def private greedy_top(s : Session; vocab : int64) : int64 {
-    var best = 0l
-    var bestv = s.logits[0]
-    for (i in range64(vocab)) {
-        if (s.logits[i] > bestv) {
-            bestv = s.logits[i]
-            best = i
-        }
-    }
-    return best
+    return parallel_argmax(s.logits, vocab)   // team-scanned; bit-identical to the serial loop
 }
 
-// Bytes read per weight for a quant mode (quants + fp32 block scales at 1 per 32).
-def private wbytes(q : QuantMode) : double {
+// Bytes read per weight for a quant mode (quants + block scales at 1 per 32 — f32, or raw
+// binary16 on a wscale_f16 model's q8 plane).
+def private wbytes(q : QuantMode; wscale16 : bool = false) : double {
     if (q == QuantMode.q8) {
-        return 1.0lf + 4.0lf / 32.0lf
+        return 1.0lf + (wscale16 ? 2.0lf : 4.0lf) / 32.0lf
     }
     if (q == QuantMode.q4) {
         return 0.5lf + 4.0lf / 32.0lf
@@ -103,7 +105,7 @@ def private mb(v : double) : double => v / (1024.0lf * 1024.0lf)
 // depth `pos` (attention KV traffic grows with position; everything else is position-free).
 def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     let c = t.config
-    let wb = wbytes(t.quant)
+    let wb = wbytes(t.quant, t.wscale_f16)
     let dim = c.dim
     var attn = 0.0lf
     var kv_read = 0.0lf
@@ -132,7 +134,7 @@ def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     }
     let cls_fp32 = c.shared_weights && !t.cls_q8
     let cls = double(dim * c.vocab_size) * (cls_fp32 ? 4.0lf : wb)
-    let embed = double(dim) * (t.cls_q8 ? wbytes(QuantMode.q8) : 4.0lf)
+    let embed = double(dim) * (t.cls_q8 ? wbytes(QuantMode.q8, t.wscale_f16) : 4.0lf)
     let total = attn + kv_read + ffn + moe + router + shexp + cls + embed
     print("--- per-token traffic at ctx depth {pos} (config-derived, MB read/token) ---\n")
     print("  attn weights: {mb(attn)} ({100.0lf * attn / total}%)\n")
@@ -169,7 +171,7 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     return tok
 }
 
-def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype; paged : bool; page_rows : int64) {
+def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVDtype; paged : bool; page_rows : int64; trace : string) {
     let c = t.config
     var pool <- create_kv_pool_(c, page_rows, kvdt, kvdt)   // empty (no groups) unless --paged
     var s : Session
@@ -195,7 +197,20 @@ def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVD
         let prompt <- build_prompt(p)
         forward_prefill(t, s, prompt, p, 0l)
         var tok = greedy_top(s, c.vocab_size)
+        if (!empty(trace)) {
+            jobque_trace_start(1 << 17)
+            set_trace_tags(true)
+        }
         tok = profile_window(t, s, p, n, tok)
+        if (!empty(trace)) {
+            set_trace_tags(false)
+            jobque_trace_stop()
+            if (jobque_trace_save(trace)) {
+                print("jobque trace saved: {trace}\n")
+            } else {
+                print("jobque trace: nothing recorded\n")
+            }
+        }
         if (p2 > p + n) {   // second window, deeper into the context, off the same load
             let fill = p2 - (p + n)
             let more <- build_prompt(fill)
@@ -232,6 +247,11 @@ def main() {
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
         pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
     }
+    // the wscale rail is a LOAD-TIME convert — the flag must land before load_gguf
+    if (cfg.wscale_f16 >= 0) {
+        set_wscale_f16(cfg.wscale_f16 != 0)
+        print("wscale_f16 override: {cfg.wscale_f16 != 0}\n")
+    }
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)
     let ctx_cap = max(2048l, max(p, p2) + n + 8l)
@@ -259,6 +279,10 @@ def main() {
         set_dispatch_caller_lane(false)
         print("dispatch lanes: workers only (legacy)\n")
     }
+    if (cfg.fine >= 1) {
+        set_gemv_chunks_per_lane(cfg.fine)
+        print("gemv_chunks_per_lane override: {cfg.fine}\n")
+    }
     // A/B the fused per-block decode chains (default on; 0 = per-op dispatches) — same rail
     // as emission_bench
     if (has_env_variable("DASLLAMA_FUSED_DECODE")) {
@@ -268,5 +292,5 @@ def main() {
     if (cfg.kv != KVDtype.f32) {
         print("kv cache dtype: {cfg.kv}\n")
     }
-    run_profile(t, p, n, p2, cfg.team, cfg.kv, cfg.paged, int64(cfg.page_rows))
+    run_profile(t, p, n, p2, cfg.team, cfg.kv, cfg.paged, int64(cfg.page_rows), cfg.trace)
 }

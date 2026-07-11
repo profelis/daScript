@@ -299,11 +299,7 @@ def private pk_ensure(var a : array<int8>; n : int64) {
 def private pk_mm(m : ParakeetModel; var y : array<float>; woff : int64; x : array<float>;
                   xq : array<int8>; xs : array<float>; n, d, npos : int64) {
     if (m.q8) {
-        array_view(m.qblob, woff, n * d) $(wq : array<int8>#) {
-            array_view(m.qscales, woff / 32l, n * d / 32l) $(ws : array<float>#) {
-                matmul_q8q8_batch(y, wq, ws, xq, xs, n, d, npos)
-            }
-        }
+        matmul_q8q8_batch(y, m.qblob, m.qscales, woff, xq, xs, n, d, npos)
     } else {
         mm_blob_b(y, m.blob, woff, x, n, d, npos)
     }
@@ -1314,12 +1310,8 @@ def private pk_predict(m : ParakeetModel; var s : ParakeetPredState; token : int
         for (j in range64(pd)) {
             s.hbuf[j] = s.h[l * pd + j]
         }
-        array_view(m.blob, m.lstm_ih[l], 4l * pd * pd) $(wih : array<float>#) {
-            matmul(s.gates, wih, s.xin, pd, 4l * pd)
-        }
-        array_view(m.blob, m.lstm_hh[l], 4l * pd * pd) $(whh : array<float>#) {
-            matmul(s.gates2, whh, s.hbuf, pd, 4l * pd)
-        }
+        matmul(s.gates, m.blob, m.lstm_ih[l], s.xin, pd, 4l * pd)
+        matmul(s.gates2, m.blob, m.lstm_hh[l], s.hbuf, pd, 4l * pd)
         // gates via float4 exp4: σ = 1/(1+exp4(-a)), tanh(a) = 1 − 2/(1+exp4(2a)) (geglu4 identity)
         unsafe {
             let gp = reinterpret<float const?>(addr(s.gates[0]))
@@ -1362,9 +1354,7 @@ def private pk_predict(m : ParakeetModel; var s : ParakeetPredState; token : int
         }
     }
     // joint.pred projection of the top hidden (already in s.xin after the last layer)
-    array_view(m.blob, m.joint_pred_w, m.n_pred_dim * m.n_pred_dim) $(w : array<float>#) {
-        matmul(s.pred, w, s.xin, pd, pd)
-    }
+    matmul(s.pred, m.blob, m.joint_pred_w, s.xin, pd, pd)
     for (j in range64(pd)) {
         s.pred[j] += m.blob[m.joint_pred_b + j]
     }
