@@ -92,4 +92,12 @@ def test_ubyte8_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = ubyte8(1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u)
+        let w = ushort8(a)
+        t |> success(w == ushort8(1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u), "widen")
+        t |> success(ubyte8(w) == a, "narrow round trip")
+        let s = ubyte8_sat(ushort8(30000u, 1u, 2u, 3u, 4u, 5u, 6u, 7u))
+        t |> success(s == ubyte8(255u, 1u, 2u, 3u, 4u, 5u, 6u, 7u), "sat clamp")
+    }
 }

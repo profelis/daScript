@@ -92,4 +92,7 @@ def test_short8_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        t |> success(short8(byte8(1, 2, 3, 4, 5, 6, 7, 8)) == short8(1, 2, 3, 4, 5, 6, 7, 8), "widen from 8-bit")
+    }
 }

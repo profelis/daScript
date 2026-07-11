@@ -95,4 +95,12 @@ def test_byte2_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = byte2(1, 2)
+        let w = int2(a)
+        t |> success(w == int2(1, 2), "widen")
+        t |> success(byte2(w) == a, "narrow round trip")
+        let s = byte2_sat(int2(100000, -100000))
+        t |> success(s == byte2(127, -128), "sat clamp")
+    }
 }

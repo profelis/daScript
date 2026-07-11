@@ -95,4 +95,12 @@ def test_short2_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = short2(1, 2)
+        let w = int2(a)
+        t |> success(w == int2(1, 2), "widen")
+        t |> success(short2(w) == a, "narrow round trip")
+        let s = short2_sat(int2(100000, -100000))
+        t |> success(s == short2(32767, -32768), "sat clamp")
+    }
 }

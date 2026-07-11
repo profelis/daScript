@@ -101,5 +101,16 @@ def test_int2_conformance(t : T?) {
         t |> success(a + b == int2(3, 6), "add")
         t |> success(b - a == int2(1, 2), "sub")
         t |> success(a * b == int2(2, 8), "mul")
+        var c = a
+        c += b
+        t |> success(c == a + b, "add assign")
+        c -= b
+        t |> success(c == a, "sub assign")
+        t |> success(-a == int2(-1, -2), "unary minus")
+        t |> success(a * 2 == a + a, "vec mul scalar")
+        t |> success(2 * a == a + a, "scalar mul vec")
+        c = a
+        c *= 2
+        t |> success(c == a + a, "mul assign scalar")
     }
 }

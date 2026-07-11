@@ -98,4 +98,12 @@ def test_short4_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = short4(1, 2, 3, 4)
+        let w = int4(a)
+        t |> success(w == int4(1, 2, 3, 4), "widen")
+        t |> success(short4(w) == a, "narrow round trip")
+        let s = short4_sat(int4(100000, -100000, 2, 3))
+        t |> success(s == short4(32767, -32768, 2, 3), "sat clamp")
+    }
 }

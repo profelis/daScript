@@ -2013,6 +2013,11 @@ class public CppAot : AstVisitor {
         if (is_alpha(first_character(that.op))) return true;
         return that.subexpr._type.isPolicyType;
     }
+    // fp16 unary policies (Unp/Unm) are vec4f-ABI like the whole SimPolicy_HalfVec family —
+    // unlike the typed generic scalar policies (int64 ++ etc.), so only they get the casts
+    def isF16Op1(that : ExprOp1?) {
+        return that._type.baseType == Type.tFloat16 || (that._type.isVectorType && that._type.vectorBaseType == Type.tFloat16);
+    }
     def override preVisitExprOp1(var that : ExprOp1?) {
         if (!that.func.flags.builtIn || that.func.flags.callBased) {
             that.arguments |> clear();
@@ -2021,8 +2026,15 @@ class public CppAot : AstVisitor {
             CallFunc_preVisit(that);
             CallFunc_preVisitCallArg(that, that.subexpr, true);
         } elif (isOpPolicy1(that)) {
+            if (isF16Op1(that)) {
+                let cfg = DescribeConfig(skip_ref = true, skip_const = true, cross_platform = cross_platform)
+                write(*ss, "cast<{describeCppType(that._type, cfg)}>::to(");
+            }
             outPolicy(that.subexpr._type);
             write(*ss, "::{opPolicyName(that)}(");
+            if (that.subexpr._type.baseType == Type.tFloat16) {
+                write(*ss, "cast<float16_t>::from(");
+            }
         } else {
             if (that.op != "+++" && that.op != "---") {
                 write(*ss, that.op);
@@ -2037,8 +2049,14 @@ class public CppAot : AstVisitor {
             CallFunc_visitCallArg(that, that.subexpr, true);
             CallFunc_visit(that);
             that.arguments.clear();
-        } elif (isOpPolicy1(that)){
+        } elif (isOpPolicy1(that)) {
+            if (that.subexpr._type.baseType == Type.tFloat16) {
+                write(*ss, ")");
+            }
             write(*ss, ",*__context__,nullptr)");
+            if (isF16Op1(that)) {
+                write(*ss, ")");
+            }
         } else {
             if (that.op == "+++" || that.op == "---") {
                 peek(that.op) $(op) {
@@ -2109,7 +2127,8 @@ class public CppAot : AstVisitor {
             }
             outPolicy(pt);
             write(*ss, "::{opPolicyName(that)}(");
-            if (isRefPolicyOp(that) && (pt.isVectorType || pt.isString)) {
+            // scalar float16 set-ops share the vector policies' (char *, vec4f) signature
+            if (isRefPolicyOp(that) && (pt.isVectorType || pt.isString || pt.baseType == Type.tFloat16)) {
                 write(*ss, "(char *)&(");
             } elif (policyArgNeedCast(pt, that.left._type)) {
                 let cfg = DescribeConfig(skip_ref = true, skip_const = true, cross_platform = cross_platform)
@@ -2136,7 +2155,7 @@ class public CppAot : AstVisitor {
             CallFunc_preVisitCallArg(that, that.right, true);
         } elif (isOpPolicy2(that)) {
             assume pt = opPolicyBase(that);
-            if (isRefPolicyOp(that) && (pt.isVectorType || pt.isString)) {
+            if (isRefPolicyOp(that) && (pt.isVectorType || pt.isString || pt.baseType == Type.tFloat16)) {
                 write(*ss, ")");
             } elif (policyArgNeedCast(pt, that.left._type)) {
                 if (that.left._type.isRefType) {
@@ -3740,7 +3759,9 @@ class public CppAot : AstVisitor {
     def policyArgNeedCast(polType : TypeDeclPtr; argType : TypeDeclPtr) {
         if (argType.isVectorType) return false;
         if (!polType.isHandle) {
-            if (polType.isVecPolicyType && argType.isVecPolicyType) return false;
+            // scalar float16 rides the vec4f policy ABI (SimPolicy_HalfVec<1>) but the C++
+            // float16_t has no implicit vec4f conversion — it always casts across
+            if (polType.isVecPolicyType && argType.isVecPolicyType && argType.baseType != Type.tFloat16) return false;
         }
         return polType.isPolicyType;
     }

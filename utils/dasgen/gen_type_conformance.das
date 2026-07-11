@@ -134,6 +134,8 @@ def emit_s_swizzle_section(var writer; spec : TypeSpec) {
 }
 
 def emit_arith_section(var writer; spec : TypeSpec) {
+    // lane values stay small integers so every op below is EXACT in fp16 — the checks
+    // pin semantics across interp/jit/aot without rounding sensitivity
     writer |> write("    t |> run(\"arithmetic\") @(t : T?) \{\n")
     writer |> write("        let a = {ctor(spec, 1)}\n")
     writer |> write("        let b = {ctor_gen(spec) $(i) => (1 + i) * 2}\n")
@@ -142,6 +144,103 @@ def emit_arith_section(var writer; spec : TypeSpec) {
     writer |> write("        t |> success(a * b == {ctor_gen(spec) $(i) => (1 + i) * (1 + i) * 2}, \"mul\")\n")
     if (spec.kind == "float") {
         writer |> write("        t |> success(b / a == {ctor_gen(spec) $(_i) => 2}, \"div\")\n")
+    }
+    writer |> write("        var c = a\n")
+    writer |> write("        c += b\n")
+    writer |> write("        t |> success(c == a + b, \"add assign\")\n")
+    writer |> write("        c -= b\n")
+    writer |> write("        t |> success(c == a, \"sub assign\")\n")
+    if (spec.kind != "uint") {
+        writer |> write("        t |> success(-a == {ctor_gen(spec) $(i) => -(1 + i)}, \"unary minus\")\n")
+    }
+    if (spec.arity > 1) {
+        let s = lit(spec.ekind, 2)
+        writer |> write("        t |> success(a * {s} == a + a, \"vec mul scalar\")\n")
+        writer |> write("        t |> success({s} * a == a + a, \"scalar mul vec\")\n")
+        if (spec.kind == "float") {
+            writer |> write("        t |> success((a + a) / {s} == a, \"vec div scalar\")\n")
+        }
+        writer |> write("        c = a\n")
+        writer |> write("        c *= {s}\n")
+        writer |> write("        t |> success(c == a + a, \"mul assign scalar\")\n")
+    }
+    writer |> write("    \}\n")
+}
+
+// lane-matched converts + saturating narrows — mirrors the das_sv_cvt/das_sv_cvt_sat
+// registration matrix (module_builtin_vector_ctor.cpp)
+def emit_convert_section(var writer; spec : TypeSpec) {
+    let n = spec.arity
+    assume fam = spec.family
+    let isIntNarrow = (fam == "short" || fam == "byte" || fam == "ushort" || fam == "ubyte") && n <= 4
+    let isByte8 = (fam == "byte" || fam == "ubyte") && n == 8
+    let isShort8 = (fam == "short" || fam == "ushort") && n == 8
+    let isHalfVec = fam == "half" && n <= 4
+    if (!(isIntNarrow || isByte8 || isShort8 || isHalfVec || fam == "half" && n == 8 || spec.name == "float16")) {
+        return
+    }
+    writer |> write("    t |> run(\"converts\") @(t : T?) \{\n")
+    if (spec.name == "float16") {
+        writer |> write("        let a = 1.5h\n")
+        writer |> write("        t |> equal(float(a), 1.5)\n")
+        writer |> write("        t |> success(float16(1.5) == a, \"narrow round trip\")\n")
+    } elif (isHalfVec) {
+        writer |> write("        let a = {ctor(spec, 1)}\n")
+        var fspec = spec
+        fspec.name = "float{n}"
+        fspec.kind = "float"
+        writer |> write("        let f = float{n}(a)\n")
+        writer |> write("        t |> success(f == {ctor(fspec, 1)}, \"widen to float\")\n")
+        writer |> write("        t |> success({spec.name}(f) == a, \"narrow round trip\")\n")
+    } elif (fam == "half") {   // half8 <-> 2x float4 pack/unpack
+        writer |> write("        let lo = float4(1., 2., 3., 4.)\n")
+        writer |> write("        let hi = float4(5., 6., 7., 8.)\n")
+        writer |> write("        let p = half8(lo, hi)\n")
+        writer |> write("        t |> success(p == {ctor(spec, 1)}, \"pack\")\n")
+        writer |> write("        t |> success(half8_lo(p) == lo, \"unpack lo\")\n")
+        writer |> write("        t |> success(half8_hi(p) == hi, \"unpack hi\")\n")
+    } else {
+        let signed_ = fam == "short" || fam == "byte"
+        var src = spec
+        src.kind = signed_ ? "int" : "uint"
+        var big = 100000
+        if (isByte8) {
+            src.name = signed_ ? "short8" : "ushort8"   // byte8/ubyte8 narrow from the 16-bit 8-lane form
+            big = 30000
+        } elif (isShort8) {
+            src.name = signed_ ? "byte8" : "ubyte8"     // short8/ushort8 only WIDEN (from the 8-bit form)
+        } else {
+            src.name = (signed_ ? "int" : "uint") + "{n}"
+        }
+        if (isShort8) {
+            writer |> write("        t |> success({spec.name}({ctor(src, 1)}) == {ctor(spec, 1)}, \"widen from 8-bit\")\n")
+        } else {
+            // widen round trip: lattice -> 32/16-bit -> back (values in range, C-truncation exact)
+            writer |> write("        let a = {ctor(spec, 1)}\n")
+            writer |> write("        let w = {src.name}(a)\n")
+            writer |> write("        t |> success(w == {ctor(src, 1)}, \"widen\")\n")
+            writer |> write("        t |> success({spec.name}(w) == a, \"narrow round trip\")\n")
+            // saturating narrow: lane 0 clamps high, lane 1 clamps low (signed), tail lanes pass through
+            var lim = 0
+            if (fam == "short") {
+                lim = 32767
+            } elif (fam == "byte") {
+                lim = 127
+            } elif (fam == "ushort") {
+                lim = 65535
+            } else {
+                lim = 255
+            }
+            let limv = lim
+            let bigv = big
+            if (signed_) {
+                writer |> write("        let s = {spec.name}_sat({ctor_gen(src) $(i) => i == 0 ? bigv : (i == 1 ? -bigv : i)})\n")
+                writer |> write("        t |> success(s == {ctor_gen(spec) $(i) => i == 0 ? limv : (i == 1 ? -limv - 1 : i)}, \"sat clamp\")\n")
+            } else {
+                writer |> write("        let s = {spec.name}_sat({ctor_gen(src) $(i) => i == 0 ? bigv : i})\n")
+                writer |> write("        t |> success(s == {ctor_gen(spec) $(i) => i == 0 ? limv : i}, \"sat clamp\")\n")
+            }
+        }
     }
     writer |> write("    \}\n")
 }
@@ -243,6 +342,7 @@ def emit_test_file(spec : TypeSpec) {
             if (spec.has_arith) {
                 emit_arith_section(writer, spec)
             }
+            emit_convert_section(writer, spec)
             writer |> write("\}\n")
         }
         f |> fwrite(body)

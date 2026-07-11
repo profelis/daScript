@@ -97,4 +97,12 @@ def test_short3_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = short3(1, 2, 3)
+        let w = int3(a)
+        t |> success(w == int3(1, 2, 3), "widen")
+        t |> success(short3(w) == a, "narrow round trip")
+        let s = short3_sat(int3(100000, -100000, 2))
+        t |> success(s == short3(32767, -32768, 2), "sat clamp")
+    }
 }
