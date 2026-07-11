@@ -796,6 +796,8 @@ def private walk_and_convert_basic(data : uint8 const?; info : TypeDeclPtr; at :
             return new ExprConstInt8(at = at, value = *reinterpret<int8?>(data))
         } elif (info.baseType == Type.tInt16) {
             return new ExprConstInt16(at = at, value = *reinterpret<int16?>(data))
+        } elif (info.baseType == Type.tFloat16) {
+            return new ExprConstFloat16(at = at, value = *reinterpret<float16?>(data))
         } elif (info.baseType == Type.tInt) {
             return new ExprConstInt(at = at, value = *reinterpret<int?>(data))
         } elif (info.baseType == Type.tInt64) {

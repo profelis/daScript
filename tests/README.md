@@ -1025,6 +1025,43 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 |---|---|---|
 | test_template.das | `[template]` annotation — `type<T>` and `decltype` as template arguments | |
 
+## type_lattice/
+
+> GENERATED per-type conformance harness (do not hand-edit) — regen via `daslang utils/dasgen/gen_type_conformance.das`. Each file exercises one basic type through sizeof/alignof, zero-init, `default<>`, ctor+equality, copy, pass/return by value, `v[i]`, swizzles, struct field layout, array element, archive round-trip, print, and (where operators exist) arithmetic. Runs in all CI tiers (interp/jit/AOT) to pin cross-tier parity for the 16/8-bit type-lattice arc.
+
+| File | Description | Expects errors |
+|---|---|---|
+| test_float2.das | float2 conformance (control) | |
+| test_float3.das | float3 conformance (control — odd-size 12B layout) | |
+| test_float4.das | float4 conformance (control) | |
+| test_int2.das | int2 conformance (control) | |
+| test_uint4.das | uint4 conformance (control) | |
+| test_int8.das | int8 scalar conformance (control — storage-only precedent) | |
+| test_uint16.das | uint16 scalar conformance (control — storage-only precedent) | |
+| test_float16.das | float16 scalar conformance (fp16 lattice — closed arithmetic, ordered compares) | |
+| test_half2.das | half2 conformance (fp16 lattice) | |
+| test_half3.das | half3 conformance (fp16 lattice — 6B odd size) | |
+| test_half4.das | half4 conformance (fp16 lattice) | |
+| test_half8.das | half8 conformance (fp16 lattice — full 128-bit slot) | |
+| test_short2.das | short2 conformance (int16 storage family) | |
+| test_short3.das | short3 conformance | |
+| test_short4.das | short4 conformance | |
+| test_short8.das | short8 conformance | |
+| test_ushort2.das | ushort2 conformance (uint16 storage family) | |
+| test_ushort3.das | ushort3 conformance | |
+| test_ushort4.das | ushort4 conformance | |
+| test_ushort8.das | ushort8 conformance | |
+| test_byte2.das | byte2 conformance (int8 storage family) | |
+| test_byte3.das | byte3 conformance (3B odd size) | |
+| test_byte4.das | byte4 conformance | |
+| test_byte8.das | byte8 conformance | |
+| test_byte16.das | byte16 conformance (16-lane) | |
+| test_ubyte2.das | ubyte2 conformance (uint8 storage family) | |
+| test_ubyte3.das | ubyte3 conformance | |
+| test_ubyte4.das | ubyte4 conformance | |
+| test_ubyte8.das | ubyte8 conformance | |
+| test_ubyte16.das | ubyte16 conformance (16-lane) | |
+
 ## type_traits/
 
 | File | Description | Expects errors |

@@ -55,3 +55,26 @@ Tuple type.
 Variant type.
 Fixed size array type (e.g. int[10]); element type in firstType, size in fixedDim.
 Distinct nominal type (distinct Foo = int); AST-only, underlying type in firstType, entity in annotation.
+IEEE-754 binary16 (fp16) scalar; the das name is float16, half is a builtin alias.
+Packed fp16 vector of 2 lanes.
+Packed fp16 vector of 3 lanes.
+Packed fp16 vector of 4 lanes.
+Packed fp16 vector of 8 lanes.
+Packed int16 vector of 2 lanes (storage + converts, no closed arithmetic).
+Packed int16 vector of 3 lanes (storage + converts, no closed arithmetic).
+Packed int16 vector of 4 lanes (storage + converts, no closed arithmetic).
+Packed int16 vector of 8 lanes (storage + converts, no closed arithmetic).
+Packed uint16 vector of 2 lanes (storage + converts).
+Packed uint16 vector of 3 lanes (storage + converts).
+Packed uint16 vector of 4 lanes (storage + converts).
+Packed uint16 vector of 8 lanes (storage + converts).
+Packed int8 vector of 2 lanes (byte is signed; storage + converts).
+Packed int8 vector of 3 lanes (byte is signed; storage + converts).
+Packed int8 vector of 4 lanes (byte is signed; storage + converts).
+Packed int8 vector of 8 lanes (byte is signed; storage + converts).
+Packed int8 vector of 16 lanes (byte is signed; storage + converts).
+Packed uint8 vector of 2 lanes (storage + converts).
+Packed uint8 vector of 3 lanes (storage + converts).
+Packed uint8 vector of 4 lanes (storage + converts).
+Packed uint8 vector of 8 lanes (storage + converts).
+Packed uint8 vector of 16 lanes (storage + converts).

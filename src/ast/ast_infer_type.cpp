@@ -1047,6 +1047,10 @@ namespace das {
                 auto ewsType = new TypeDecl(*(expr->subexpr->type));
                 ewsType->ref = false;
                 auto ews = Program::makeConst(expr->at, ewsType, v_zero());
+                if (!ews) {
+                    // 16/8-bit lattice vectors have no const nodes — lower to the zero ctor call
+                    return new ExprCall(expr->at, das_to_string(ewsType->baseType));
+                }
                 ews->type = ewsType;
                 return ews;
             } else {
@@ -3743,6 +3747,12 @@ namespace das {
         int dim = valT->getVectorDim();
         if (!TypeDecl::buildSwizzleMask(expr->mask, dim, expr->fields)) {
             error("invalid swizzle mask " + expr->mask, "", "",
+                  expr->at, CompilationError::invalid_swizzle_mask);
+        } else if (int rdim = int(expr->fields.size());
+                   valT->isRange() ? (rdim > 2) : !TypeDecl::hasVectorType(valT->getVectorBaseType(), rdim)) {
+            // e.g. .s01230123 on a float4 — 8 lanes, but the float family has no 8-wide vector
+            error("swizzle ." + expr->mask + " yields " + to_string(rdim)
+                    + " lane(s) — no such vector of '" + das_to_string(valT->getVectorBaseType()) + "'", "", "",
                   expr->at, CompilationError::invalid_swizzle_mask);
         } else {
             auto bt = valT->getVectorBaseType();

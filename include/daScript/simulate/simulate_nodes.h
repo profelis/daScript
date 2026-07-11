@@ -657,6 +657,35 @@ namespace das {
         DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override;
     };
 
+    // 16/8-bit lattice lane shuffle — up to maxLanes indices over byte-packed lanes.
+    // A 1-lane result lands in the low bytes, which is exactly the widened-lane-0 scalar
+    // convention little-endian consumers truncate from.
+    template <typename TT, int maxLanes>
+    struct SimNode_SwizzleSmall : SimNode {
+        SimNode_SwizzleSmall ( const LineInfo & at, SimNode * rv, const uint8_t * fi, uint8_t cnt )
+            : SimNode(at), value(rv), count(cnt) {
+            for ( int i = 0; i != maxLanes; ++i ) fields[i] = i < cnt ? fi[i] : 0;
+        }
+        virtual SimNode * visit ( SimVisitor & vis ) override {
+            V_BEGIN();
+            V_OP_TT(SwizzleSmall);
+            V_SUB(value);
+            V_END();
+        }
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+            DAS_PROFILE_NODE
+            auto vec = value->eval(context);
+            vec4f r = v_zero();
+            const TT * s = (const TT *) &vec;
+            TT * d = (TT *) &r;
+            for ( int i = 0; i != count; ++i ) d[i] = s[fields[i]];
+            return r;
+        }
+        SimNode *   value;
+        uint8_t     fields[maxLanes];
+        uint8_t     count;
+    };
+
     // FIELD .
     struct SimNode_FieldDeref : SimNode {
         DAS_PTR_NODE;
@@ -1206,6 +1235,58 @@ SIM_NODE_AT_VECTOR(UInt,  uint32_t)
 SIM_NODE_AT_VECTOR(Int64, int64_t)
 SIM_NODE_AT_VECTOR(UInt64,uint64_t)
 SIM_NODE_AT_VECTOR(Float, float)
+
+    // rvalue v[i] for the 16/8-bit lattice vectors. The typed-eval ABI (DAS_NODE) has no
+    // slots for the small element types, so these return the element through the generic
+    // vec4f eval using the widened-lane-0 scalar convention (cast<TT>::from).
+    template <typename TT>
+    struct SimNode_AtSVec : SimNode_WithErrorMessage {
+        SimNode_AtSVec ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t rng, const char * msg )
+            : SimNode_WithErrorMessage(at,msg), value(rv), index(idx), range(rng) {}
+        virtual SimNode * visit ( SimVisitor & vis ) override {
+            V_BEGIN();
+            V_OP_TT(AtSVec);
+            V_SUB(value);
+            V_SUB(index);
+            V_ARG(range);
+            V_END();
+        }
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+            DAS_PROFILE_NODE
+            auto vec = value->eval(context);
+            int32_t idx = index->evalInt(context);
+            if (idx<0 || uint32_t(idx) >= range) {
+                context.throw_error_at(debugInfo,"vector index out of range, %d of %u%s", idx, range, errorMessage);
+                return v_zero();
+            }
+            TT * pv = (TT *) &vec;
+            return cast<TT>::from(pv[idx]);
+        }
+        SimNode * value, * index;
+        uint32_t  range;
+    };
+    template <typename TT>
+    struct SimNode_AtSVecU : SimNode {
+        SimNode_AtSVecU ( const LineInfo & at, SimNode * rv, SimNode * idx, uint32_t rng )
+            : SimNode(at), value(rv), index(idx), range(rng) {}
+        virtual SimNode * visit ( SimVisitor & vis ) override {
+            V_BEGIN();
+            V_OP_TT(AtSVecU);
+            V_SUB(value);
+            V_SUB(index);
+            V_ARG(range);
+            V_END();
+        }
+        DAS_EVAL_ABI virtual vec4f eval ( Context & context ) override {
+            DAS_PROFILE_NODE
+            auto vec = value->eval(context);
+            uint32_t idx = uint32_t(index->evalInt(context));
+            TT * pv = (TT *) &vec;
+            return cast<TT>::from(pv[idx]);
+        }
+        SimNode * value, * index;
+        uint32_t  range;
+    };
 
     template <int nElem>
     struct EvalBlock { static __forceinline void eval(Context & context, SimNode ** arguments, vec4f * argValues) {

@@ -894,11 +894,13 @@ namespace das {
                                 exprV->type->constant = true;
                                 return exprV;
                             } else {
-                                reportFolding();
                                 auto exprV = Program::makeConst(expr->at, expr->type, v_zero());
-                                exprV->type = new TypeDecl(*expr->type);
-                                exprV->type->constant = true;
-                                return exprV;
+                                if ( exprV ) {   // null for lattice vectors (not foldable; unreachable belt-and-suspenders)
+                                    reportFolding();
+                                    exprV->type = new TypeDecl(*expr->type);
+                                    exprV->type->constant = true;
+                                    return exprV;
+                                }
                             }
                         }
                     }

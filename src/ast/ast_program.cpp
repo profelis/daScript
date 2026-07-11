@@ -379,6 +379,7 @@ namespace das {
             case Type::tUInt3:          return new ExprConstUInt3(at, cast<uint3>::to(value));
             case Type::tUInt4:          return new ExprConstUInt4(at, cast<uint4>::to(value));
             case Type::tFloat:          return new ExprConstFloat(at, cast<float>::to(value));
+            case Type::tFloat16:        return new ExprConstFloat16(at, cast<float16_t>::to(value));
             case Type::tFloat2:         return new ExprConstFloat2(at, cast<float2>::to(value));
             case Type::tFloat3:         return new ExprConstFloat3(at, cast<float3>::to(value));
             case Type::tFloat4:         return new ExprConstFloat4(at, cast<float4>::to(value));
@@ -387,6 +388,30 @@ namespace das {
             case Type::tURange:         return new ExprConstURange(at, cast<urange>::to(value));
             case Type::tRange64:        return new ExprConstRange64(at, cast<range64>::to(value));
             case Type::tURange64:       return new ExprConstURange64(at, cast<urange64>::to(value));
+            // 16/8-bit lattice vectors have no ExprConst nodes (by design) — a constant
+            // expression of these types simply doesn't fold; callers must handle nullptr
+            case Type::tHalf2:
+            case Type::tHalf3:
+            case Type::tHalf4:
+            case Type::tHalf8:
+            case Type::tShort2:
+            case Type::tShort3:
+            case Type::tShort4:
+            case Type::tShort8:
+            case Type::tUShort2:
+            case Type::tUShort3:
+            case Type::tUShort4:
+            case Type::tUShort8:
+            case Type::tByte2:
+            case Type::tByte3:
+            case Type::tByte4:
+            case Type::tByte8:
+            case Type::tByte16:
+            case Type::tUByte2:
+            case Type::tUByte3:
+            case Type::tUByte4:
+            case Type::tUByte8:
+            case Type::tUByte16:        return nullptr;
             default:                    DAS_ASSERTF(0, "we should not even be here"); return nullptr;
         }
     }

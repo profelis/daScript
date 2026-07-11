@@ -1341,6 +1341,7 @@ class public LlvmJitVisitor : AstVisitor {
 
     def need_z_or_s_ext(_type : TypeDeclPtr) {
         if (!_type.isRef && !_type.isVoid && _type.sizeOf < 4 &&
+            !is_lattice_small_type(_type.baseType) && // ext attributes are integer-only: not for half or packed lattice vectors
             _type.baseType != Type.fakeContext && // incorrect size for fakeContext & fakeLineInfo
             _type.baseType != Type.fakeLineInfo) {
             if (_type.isSignedInteger) {
@@ -6626,6 +6627,12 @@ class public LlvmJitVisitor : AstVisitor {
         return expr
     }
 
+// ExprConstFloat16
+    def override visitExprConstFloat16(expr : ExprConstFloat16?) : ExpressionPtr {
+        setE(expr, types.ConstHalf(float(expr.value) |> double()))
+        return expr
+    }
+
 // ExprConstFloat2
     def override visitExprConstFloat2(expr : ExprConstFloat2?) : ExpressionPtr {
         var x = types.ConstReal(expr.value.x |> double())
@@ -7810,6 +7817,32 @@ class public DisableJitVisitor : AstVisitor {
     def TypeInfoVisitor {
         disable = false
     }
+    // 16/8-bit lattice floor: plain loads/stores/moves of lattice values lower natively
+    // (the types are mapped), and lattice calls/ops fall back via the builtin-address gates
+    // below. What has no lowering yet is indexing and locals-with-init — gate those two
+    // RARE node kinds only (a generic preVisitExpression gate costs an adapter call per
+    // expression and blows the per-file JIT budget on daslib-sized programs).
+    def lattice_fallback(t : TypeDeclPtr; at : LineInfo) {
+        if (!disable && t != null && is_lattice_small_type(t.baseType)) {
+            to_log(LOG_WARNING, "LLVM JIT: 16/8-bit lattice type `{describe(t)}` at {at}, falling back to interpreter.\n")
+            disable = true
+        }
+    }
+    def override preVisitExprLetVariable(expr : ExprLet?; arg : VariablePtr; lastArg : bool) : void {
+        lattice_fallback(arg._type, arg.at)
+    }
+    def override preVisitExprSwizzle(expr : ExprSwizzle?) : void {
+        lattice_fallback(expr.value._type, expr.at)
+    }
+    def override preVisitFunction(fun : FunctionPtr) : void {
+        // signature-level gate: the interp<->jit wrappers marshal args/results through
+        // vec4f slots, and that marshaling is not lattice-aware yet (a vec4f <-> <4 x half>
+        // bitcast is invalid IR — one bad function fails the whole module)
+        lattice_fallback(fun.result, fun.at)
+        for (arg in fun.arguments) {
+            lattice_fallback(arg._type, arg.at)
+        }
+    }
     def override preVisitExprTypeInfo(expr : ExprTypeInfo?) : void {
         if (expr.trait == "ast_typedecl" || expr.trait == "rtti_classinfo" || expr.trait == "rtti_typeinfo") {
             pass
@@ -7862,6 +7895,7 @@ class public DisableJitVisitor : AstVisitor {
                 "type {type_str} to be used in JIT, keeping interpreter mode.\n")
             disable = true
         }
+        lattice_fallback(expr.subexpr._type, expr.at)
     }
 
     def override preVisitExprForSource(var expr : ExprFor?, var source : ExpressionPtr, last : bool) {
@@ -7881,11 +7915,33 @@ class public DisableJitVisitor : AstVisitor {
                 disable = true
             }
         }
+        if (!disable && expr.func.flags.builtIn) {
+            // lattice values cross the extern ABI as LLVM half / packed vectors, but the
+            // C++ side expects the das slot conventions — fall back until the marshal wave
+            var lattice = is_lattice_small_type(expr._type.baseType)
+            if (!lattice) {
+                for (arg in expr.arguments) {
+                    if (is_lattice_small_type(arg._type.baseType)) {
+                        lattice = true
+                        break
+                    }
+                }
+            }
+            if (lattice) {
+                to_log(LOG_WARNING, "LLVM JIT: 16/8-bit lattice type crosses `{expr.func._module.name}::{expr.func.name}` at {expr.at}, falling back to interpreter.\n")
+                disable = true
+            }
+        }
     }
 
     def override preVisitExprOp1(expr : ExprOp1?) : void {
         if (isExprOp1_Func(expr)) {
             disable_builtin_call(expr)
+            if (expr.func.flags.builtIn) {
+                // ExprOp1/2 carry operands in subexpr/left/right — the arguments list
+                // disable_builtin_call scans is empty for operators
+                lattice_fallback(expr.subexpr._type, expr.at)
+            }
         }
     }
 
@@ -7893,6 +7949,10 @@ class public DisableJitVisitor : AstVisitor {
     def override preVisitExprOp2(expr : ExprOp2?) : void {
         if (isExprOp2_Func(expr)) {
             disable_builtin_call(expr)
+            if (expr.func.flags.builtIn) {
+                lattice_fallback(expr.left._type, expr.at)
+                lattice_fallback(expr.right._type, expr.at)
+            }
         }
     }
 

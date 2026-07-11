@@ -915,6 +915,11 @@ class PrintVisitor : AstVisitor {
         //! Prints an int16 constant value.
         write(*writer, "{expr.value}");
     }
+// const float 16
+    def override preVisitExprConstFloat16(expr : ExprConstFloat16?) : void {
+        //! Prints a float16 constant value with its literal suffix.
+        write(*writer, "{expr.value}h");
+    }
 // const int 64
     def override preVisitExprConstInt64(expr : ExprConstInt64?) : void {
         //! Prints an int64 constant value.

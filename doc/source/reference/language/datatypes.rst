@@ -23,6 +23,35 @@ Daslang's storage types are:
 
 They have no arithmetic of their own, but can be used as a storage type within structs, classes, etc.
 
+Daslang's 16/8-bit vector lattice extends the storage tier with packed small-element vectors:
+
+.. code-block:: das
+
+    float16                                       - IEEE-754 binary16 scalar (`half` is an alias)
+    half2, half3, half4, half8                    - packed float16 vectors
+    short2, short3, short4, short8                - packed int16 vectors
+    ushort2, ushort3, ushort4, ushort8            - packed uint16 vectors
+    byte2, byte3, byte4, byte8, byte16            - packed int8 vectors (byte is SIGNED)
+    ubyte2, ubyte3, ubyte4, ubyte8, ubyte16       - packed uint8 vectors
+
+Lattice values are tightly packed (``half3`` is 6 bytes, ``byte3`` is 3 bytes; alignment equals
+the element size) and pass by value like other PODs. The fp16 family has closed arithmetic:
+``a * b + c`` on ``half4`` yields ``half4``, computed by promoting each lane to ``float``,
+computing, and rounding back — correctly rounded per operation, bit-identical to native fp16
+hardware. Division follows IEEE (``1h / 0h`` is ``inf``; ``NaN != NaN``). ``float16`` literals
+use the ``h`` suffix: ``1.5h``. The integer families are storage + converts only (``byte4 +
+byte4`` is a compile error): widen with the wider ctor (``int4(b4)`` sign-extends,
+``short8(b8)``), narrow with the ctor (C truncation, ``short4(i4)``) or the saturating ``_sat``
+forms (``short4_sat(i4)``, ``byte8_sat(s8)``, clamping to the target range). The fp16 family
+converts to and from float per arity (``half4(f4)`` rounds each lane, ``float4(h4)`` is exact)
+plus ``half8(lo, hi)`` / ``half8_lo`` / ``half8_hi`` packing against two ``float4``.
+
+Beyond ``xyzw`` (which stays capped at 4 lanes), all vectors support OpenCL-style ``.s``
+swizzles — ``s`` followed by one hex lane digit per output lane, repeats allowed: ``v.s0``,
+``v.s3210``, ``b16.sf``, ``h8.s0246``. The 8/16-lane forms add ``.lo`` / ``.hi`` for their
+half-vectors. Sequential swizzles are writable (``v.xy = half2(1h, 2h)``; ``v.s0 = 9h``); the
+two namespaces never mix in one mask.
+
 Daslang's other types are:
 
 .. code-block:: das

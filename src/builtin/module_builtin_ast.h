@@ -103,6 +103,7 @@ MAKE_EXTERNAL_TYPE_FACTORY(ExprConstEnumeration,das::ExprConstEnumeration);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstBitfield,das::ExprConstBitfield);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt8,das::ExprConstInt8);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt16,das::ExprConstInt16);
+MAKE_EXTERNAL_TYPE_FACTORY(ExprConstFloat16,das::ExprConstFloat16);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt64,das::ExprConstInt64);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt,das::ExprConstInt);
 MAKE_EXTERNAL_TYPE_FACTORY(ExprConstInt2,das::ExprConstInt2);
