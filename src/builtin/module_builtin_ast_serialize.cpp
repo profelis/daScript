@@ -2678,7 +2678,20 @@ namespace das {
     }
 
     // Used in eden
-    void AstSerializer::serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept {
+    // if an early return (bad hash, missing module, throw) leaves the thread-active
+    // root pointing at a scope-local gc_root, repoint it to the permanent thread root
+    // before the local dies
+    struct ActiveRootGuard {
+        gc_root * scopeRoot;
+        ~ActiveRootGuard() {
+            auto & active = gc_root::gc_get_active_root();
+            if ( active == scopeRoot ) active = &gc_root::gc_get_thread_root();
+        }
+    };
+
+    // NOT noexcept: the header reads above the module loop can throw on a truncated
+    // stream — both callers (trySerializeProgramModule, the rtti wrapper) catch
+    void AstSerializer::serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) {
         auto & ser = *this;
         // version gate — the module-cache path (trySerializeProgramModule) checks only
         // mtime+filename before this; a cache written by a different serializer version must
@@ -2705,6 +2718,7 @@ namespace das {
         ser << program->options << program->policies;
 
         if ( writing ) {
+            moduleLibrary = &program->library;  // Module::serialize binds *moduleLibrary (finalizeModule)
             TopSort ts(program->library.getModules());
             auto modules = ts.getDependecyOrdered(program->thisModule.get());
 
@@ -2729,6 +2743,18 @@ namespace das {
             }
         } else {
             uint64_t size = 0; ser << size;
+
+            // parseDaScript runs with the placeholder thisModule's gc root as the
+            // thread-active root; library.reset() below deletes that module (and its
+            // root) — repoint the active root as we go, or every node deserialized
+            // after this line gc_links through a dangling pointer into freed memory
+            auto & activeRoot = gc_root::gc_get_active_root();
+            const bool activeWasThisModule = program->thisModule && activeRoot == program->thisModule->module_gc_root.get();
+            // throwaway already-exists reads park nodes here — they may be referenced
+            // through the patch maps until all modules are read, then sweep with scope
+            gc_root throwaway_root;
+            ActiveRootGuard throwaway_guard { &throwaway_root };
+            if ( activeWasThisModule ) activeRoot = &throwaway_root;
 
             program->library.reset();
             program->thisModule.release();
@@ -2774,14 +2800,19 @@ namespace das {
                     deser->setModuleName(name);
                     if ( existing ) {
                         program->library.addModule(existing);
+                        // throwaway read into a temp module — keep nodes off its root
+                        // (they may be referenced through the patch maps past `delete deser`)
                         ser.serializeModule(*deser, /*already_exists*/true);
                         deser->builtIn = false; // suppress dtor unlink assert
                         delete deser;
                         continue;
                     }
                     program->library.addModule(deser);
+                    if ( activeWasThisModule ) activeRoot = deser->module_gc_root.get();
                     ser << *deser;
+                    if ( activeWasThisModule ) activeRoot = &throwaway_root;
                 } catch ( const dasException & r ) {
+                    if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
                     delete deser;
                     LOG(LogLevel::warning) << "das: serialize: " << r.what();
                     program->failToCompile = true;
@@ -2790,6 +2821,9 @@ namespace das {
             }
 
             program->thisModule.reset(program->library.getModules().back());
+            // the deserialized module is the program's module now — new nodes and the
+            // ModuleGcFinalize collect belong on its root
+            if ( activeWasThisModule ) activeRoot = program->thisModule->module_gc_root.get();
         }
 
         // drop ref_counts
@@ -2884,6 +2918,17 @@ namespace das {
             return;
         }
 
+        // parseDaScript runs with the placeholder thisModule's gc root as the
+        // thread-active root; library.reset() below deletes that module (and its
+        // root) — without repointing, every node deserialized after this line would
+        // gc_link through a dangling root pointer into freed memory
+        auto & activeRoot = gc_root::gc_get_active_root();
+        const bool activeWasThisModule = thisModule && activeRoot == thisModule->module_gc_root.get();
+        // throwaway already-exists reads park nodes here — they may be referenced
+        // through the patch maps until all modules are read, then sweep with scope
+        gc_root throwaway_root;
+        ActiveRootGuard throwaway_guard { &throwaway_root };
+        if ( activeWasThisModule ) activeRoot = &throwaway_root;
         library.reset();
         thisModule.release();
         ser.moduleLibrary = &library;
@@ -2911,12 +2956,16 @@ namespace das {
                     mod->fileName = fileName;
                     if ( prev ) {
                         library.addModule(prev);
+                        // throwaway read into a temp module — keep nodes off its root
+                        // (they may be referenced through the patch maps past `delete mod`)
                         ser.serializeModule(*mod, /*already_exists*/true);
                         mod->builtIn = false; // suppress assert
                         delete mod;
                     } else {
                         library.addModule(mod);
+                        if ( activeWasThisModule ) activeRoot = mod->module_gc_root.get();
                         ser.serializeModule(*mod, /*already_exists*/false);
+                        if ( activeWasThisModule ) activeRoot = &throwaway_root;
                         mod->builtIn = false; // suppress assert
                         mod->promoteToBuiltin(nullptr, promotedRequire);
                     }
@@ -2929,11 +2978,16 @@ namespace das {
                 mod->setModuleName(name);
                 mod->fileName = fileName;
                 library.addModule(mod);
+                if ( activeWasThisModule ) activeRoot = mod->module_gc_root.get();
                 ser << *mod;
+                if ( activeWasThisModule ) activeRoot = &throwaway_root;
             }
         }
 
         thisModule.reset(library.modules.back());
+        // the deserialized module is the program's module now — new nodes (allocateStack
+        // init script, etc.) and the ModuleGcFinalize collect belong on its root
+        if ( activeWasThisModule ) activeRoot = thisModule->module_gc_root.get();
 
         ser << allRequireDecl;
 

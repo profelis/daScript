@@ -19,7 +19,7 @@ namespace das {
         template<typename T>
         __forceinline bool read ( T & data ) {
             if ( bufferPos + sizeof(T) < buffer.size() ) {
-                data = *(T*)(buffer.data() + bufferPos);
+                memcpy((void*)&data, buffer.data() + bufferPos, sizeof(T));  // buffer offsets are arbitrary — no aligned punning
                 bufferPos += sizeof(T);
                 return true;
             }
@@ -224,7 +224,7 @@ namespace das {
             return 101;   // 101: 16/8-bit type lattice tags (100: tune_frozen, 99: distinct types)
         }
 
-        void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;
+        void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup );
         bool serializeScript ( ProgramPtr program ) noexcept;
 
         template <uint64_t n>

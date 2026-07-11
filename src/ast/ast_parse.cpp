@@ -9,6 +9,7 @@
 #include "daScript/ast/ast_cfg.h"
 #include "daScript/ast/ast_bound_check_elision.h"
 #include "daScript/misc/das_common.h"
+#include "daScript/simulate/simulate.h"
 #include "daScript/simulate/aot_builtin_string.h"
 #include "daScript/simulate/aot_builtin_uriparser.h"
 #include "daScript/simulate/fs_file_info.h"
@@ -546,6 +547,15 @@ namespace das {
     static DAS_THREAD_LOCAL(int64_t) totOpt;
     static DAS_THREAD_LOCAL(int64_t) totM;
 
+    // deserialization may have left the active gc root pointing at (or the old program
+    // owning) a module root that dies with the old program — repoint around the swap so
+    // fallback parsing doesn't allocate through a stale root
+    static void replaceProgramKeepGcRootValid ( ProgramPtr & program ) {
+        gc_root::gc_get_active_root() = &gc_root::gc_get_thread_root();
+        program = make_smart<Program>();
+        gc_root::gc_get_active_root() = program->thisModule->module_gc_root.get();
+    }
+
     bool trySerializeProgramModule (
             ProgramPtr          & program,
             const FileAccessPtr & access,
@@ -560,28 +570,38 @@ namespace das {
         }
 
         int64_t file_mtime = access->getFileMtime(fileName.c_str());
-        int64_t saved_mtime = 0; *serializer_read << saved_mtime;
-        string saved_filename{}; *serializer_read << saved_filename;
+        // a truncated or corrupt cache stream throws dasException from the stream
+        // readers — contain it here and fall back to parsing, don't crash the embedder
+        try {
+            int64_t saved_mtime = 0; *serializer_read << saved_mtime;
+            string saved_filename{}; *serializer_read << saved_filename;
 
-        if ( saved_filename != fileName || file_mtime != saved_mtime ) {
+            if ( saved_filename != fileName || file_mtime != saved_mtime ) {
+                serializer_read->seenNewModule = true;
+                if (saved_filename != fileName) {
+                    logs << "ser: file name mismatch. Expected '" << saved_filename << "', got '" << fileName << "'\n";
+                }
+                if (file_mtime != saved_mtime) {
+                    logs << "ser: file mtime mismatch. Expected " << saved_mtime << ", got " << file_mtime << "\n";
+                }
+                serializer_read->failed = true;
+                return false;
+            }
+
+            serializer_read->thisModuleGroup = &libGroup;
+            serializer_read->serializeProgram(program, libGroup);
+        } catch ( const dasException & ex ) {
             serializer_read->seenNewModule = true;
-            if (saved_filename != fileName) {
-                logs << "ser: file name mismatch. Expected '" << saved_filename << "', got '" << fileName << "'\n";
-            }
-            if (file_mtime != saved_mtime) {
-                logs << "ser: file mtime mismatch. Expected " << saved_mtime << ", got " << file_mtime << "\n";
-            }
             serializer_read->failed = true;
+            replaceProgramKeepGcRootValid(program);
+            logs << "ser: read failed '" << fileName << "': " << ex.what() << "\n";
             return false;
         }
-
-        serializer_read->thisModuleGroup = &libGroup;
-        serializer_read->serializeProgram(program, libGroup);
 
         if ( program->failed()) {
             serializer_read->seenNewModule = true;
             serializer_read->failed = true;
-            program = make_smart<Program>();
+            replaceProgramKeepGcRootValid(program);
             logs << "ser: program failed '" << fileName << "'\n";
             return false;
         }
@@ -590,7 +610,7 @@ namespace das {
 
         if ( serializer_read->failed ) {
             serializer_read->seenNewModule = true;
-            program = make_smart<Program>();
+            replaceProgramKeepGcRootValid(program);
             logs << "ser: serialization failed. Internal issue.\n";
             return false;
         }
@@ -1347,12 +1367,23 @@ namespace das {
     }
 
     void disableSerializationOnDebugger ( vector<ModuleInfo> & req ) {
-        if ( daScriptEnvironment::getBound()->serializer_read == nullptr )
+        auto & serializer_read = daScriptEnvironment::getBound()->serializer_read;
+        auto & serializer_write = daScriptEnvironment::getBound()->serializer_write;
+        if ( serializer_read == nullptr && serializer_write == nullptr )
             return;
+        // the debugger installs into the environment: once daslib/debug is promoted
+        // (first debugger compile), later programs don't list it in req — every compile
+        // in this environment is under the debugger, so keep serialization off
+        if ( auto dbg = Module::requireEx("debug", true) ) {
+            if ( dbg->fileName.find("daslib/debug.das") != string::npos ) {
+                LOG(LogLevel::warning) << "das: serialize: disabled, the debugger is installed in this environment ('" << dbg->fileName << "')\n";
+                serializer_read = serializer_write = nullptr;
+                return;
+            }
+        }
         for ( auto & mod : req ) {
-            if ( mod.fileName.find("daslib/debug") != string::npos ) {
-                auto & serializer_read = daScriptEnvironment::getBound()->serializer_read;
-                auto & serializer_write = daScriptEnvironment::getBound()->serializer_read;
+            if ( mod.fileName.find("daslib/debug.das") != string::npos ) {
+                LOG(LogLevel::warning) << "das: serialize: disabled, program requires the debugger ('" << mod.fileName << "')\n";
                 serializer_read = serializer_write = nullptr;
                 break;
             }

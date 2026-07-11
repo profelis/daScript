@@ -32,6 +32,7 @@
 int main(int argc, char** argv) {
     NEED_ALL_DEFAULT_MODULES;     // statement-form macro — must be inside a function body
     NEED_MODULE(Module_JobQue);   // ensure the JobQue module is linked in even if no test pulls it
+    NEED_MODULE(Module_UriParser); // daslib/debug require chain (test_env_serializer) reaches uriparser
 
     das::Module::Initialize();
 
