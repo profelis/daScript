@@ -3141,9 +3141,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             let r1 = min(rend, qd)
                             invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r, r1)
                             if (bqp != null) {
-                                for (i in range64(r, r1)) {
-                                    qp[i] += bqp[bqoff + i]
-                                }
+                                add_inplace(qp + r, bqp + bqoff + r, r1 - r)
                             }
                             r = r1
                         } elif (r < qd + kv_dim) {
@@ -3151,9 +3149,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             let r1 = min(rend, qd + kv_dim) - qd
                             invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r1)
                             if (bkp != null) {
-                                for (i in range64(r0, r1)) {
-                                    kp[i] += bkp[bkvoff + i]
-                                }
+                                add_inplace(kp + r0, bkp + bkvoff + r0, r1 - r0)
                             }
                             r = r1 + qd
                         } else {
@@ -3161,9 +3157,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             let r1 = min(rend, qd + 2l * kv_dim) - qd - kv_dim
                             invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r1)
                             if (bvp != null) {
-                                for (i in range64(r0, r1)) {
-                                    vp[i] += bvp[bkvoff + i]
-                                }
+                                add_inplace(vp + r0, bvp + bkvoff + r0, r1 - r0)
                             }
                             r = r1 + qd + kv_dim
                         }
@@ -3342,9 +3336,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                     let r1 = int64(je) * 32l
                     invoke(mmrows, xb2p, wpo, wso, xqp, xsp, qd, r0, r1)
                     if (bop != null) {
-                        for (i in range64(r0, r1)) {
-                            xb2p[i] += bop[booff + i]
-                        }
+                        add_inplace(xb2p + r0, bop + booff + r0, r1 - r0)
                     }
                     if (!post_norm) {
                         add_inplace(xp + r0, xb2p + r0, r1 - r0)
@@ -6027,9 +6019,7 @@ def embed_forward(t : Model; var s : Session; tokens : array<int64>; npos : int6
         // q4 (no batched prefill) or a single token: per-token forward leaves s.xb = post-final-norm hidden.
         for (p in range64(npos)) {
             forward(t, s, tokens[p], p)
-            for (i in range64(dim)) {
-                out[i] += s.xb[i]
-            }
+            add_inplace(unsafe(addr(out[0])), unsafe(addr(s.xb[0])), dim)
         }
     }
     s.n_past = npos   // KV now holds npos positions (start_pos was 0) — keep the session cursor consistent
