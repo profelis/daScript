@@ -47,7 +47,7 @@ struct Args {
     @clarg_doc = "Positions per page when --paged (default: 64)"
     page_rows : int = 64
 
-    @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; 1 = thread everything, -1 = keep default)"
+    @clarg_doc = "Override target_chunk_work (MACs per dispatch chunk; default 1 = thread everything; 1000000 = the old coarse threshold; -1 = keep default)"
     target_work : int = -1
 
     @clarg_doc = "Override the GEMV lane cap (0 = uncapped, -1 = keep default)"
@@ -65,8 +65,8 @@ struct Args {
     @clarg_doc = "Save a per-lane jobque event trace of the FIRST decode window to this path (Perfetto/chrome-tracing JSON)"
     trace : string
 
-    @clarg_doc = "GEMV chunks per lane (>1 = fine-grain self-serve tail A/B; default 1 = equal split)"
-    fine : int = 1
+    @clarg_doc = "GEMV chunks per lane (fine-grain self-serve tail; default 8; 1 = the old equal split; -1 = keep default)"
+    fine : int = -1
 
     @clarg_doc = "A/B: size chunk counts to workers only (the pre-fix split), not workers + caller lane"
     legacy_lanes : bool
@@ -270,7 +270,7 @@ def main() {
         set_dispatch_caller_lane(false)
         print("dispatch lanes: workers only (legacy)\n")
     }
-    if (cfg.fine > 1) {
+    if (cfg.fine >= 1) {
         set_gemv_chunks_per_lane(cfg.fine)
         print("gemv_chunks_per_lane override: {cfg.fine}\n")
     }

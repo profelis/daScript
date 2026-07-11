@@ -472,11 +472,11 @@ def private assert_wave_aligned(chunks, lanes : int) {
 // ===== work-proportional dispatch (lanes sized to the matmul, not the box) =====
 
 // MACs of work that justify one dispatch chunk: lanes_for_work invites one lane per this much
-// work, so a tiny matmul stays inline (1 lane ⇔ work < 2×target — at the 1M default this is
-// exactly the old 2M binary par-threshold boundary) and a mid-size one invites only the lanes
-// it can feed. Runtime knob: tracks the box's per-chunk dispatch overhead (team_probe measures
-// it), not the kernel.
-var g_target_chunk_work = 1_000_000l
+// work; the chunk shapers' grain floors keep genuinely tiny matmuls inline regardless. Default 1
+// = dispatch everything the grains admit — the old 1M default left every per-layer attn matmul
+// of a ≤4B model single-lane (5-model curve A/B 2026-07-10: −5..−17% tok/s). Per-box runtime
+// knob for boxes where per-chunk dispatch overhead bites (team_probe suggests a value).
+var g_target_chunk_work = 1l
 def public set_target_chunk_work(v : int64) { g_target_chunk_work = max(v, 1l) }
 def public get_target_chunk_work() : int64 { return g_target_chunk_work }
 
@@ -594,8 +594,9 @@ def public get_matmul_min_chunk_rows_gemv() : int { return g_matmul_min_chunk_ro
 // GEMV tail A/B (per-lane trace, 3990X 2026-07-10): the one-chunk-per-lane equal split leaves
 // the join waiting out the SLOWEST lane's whole chunk — the median lane idles the last 14-24%
 // of every GEMV stage. >1 publishes up to this many wave-aligned chunks per lane (grain-floored)
-// so finished lanes keep serving and the tail shrinks to one small chunk. 1 = historical split.
-var g_gemv_chunks_per_lane = 1
+// so finished lanes keep serving and the tail shrinks to one small chunk. Default 8 (5-model
+// curve A/B 2026-07-10); 1 = the historical equal split.
+var g_gemv_chunks_per_lane = 8
 def public set_gemv_chunks_per_lane(v : int) { g_gemv_chunks_per_lane = max(v, 1) }
 def public get_gemv_chunks_per_lane() : int { return g_gemv_chunks_per_lane }
 
