@@ -302,11 +302,11 @@ def private greedy_ids(tr : Model; var s : Session; var ids : array<int64>; var 
 def test_kv_f16_decode(t : T?) {
     t |> run("f16 KV: greedy trajectory matches f32, fused==std bit-exact under f16 (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)
@@ -379,11 +379,11 @@ def test_kv_f16_decode(t : T?) {
 def test_kv_f16_prefill_vs_decode(t : T?) {
     t |> run("f16 KV: prefill == per-token decode, logits bit-exact (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)
@@ -448,11 +448,11 @@ let GGUF_PATH = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
 
 def private gguf_missing(t : T?) : bool {
     if (!jit_enabled()) {
-        t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+        t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
         return true
     }
     if (!stat(GGUF_PATH).is_valid) {
-        t |> success(true, "skipped: {GGUF_PATH} not present")
+        t |> skip("{GGUF_PATH} not present")
         return true
     }
     return false

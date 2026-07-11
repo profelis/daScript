@@ -293,11 +293,11 @@ def private cache_rows_equal(var sf : Session; var sp : Session; c : Config; npo
 def test_kv_paged_decode(t : T?) {
     t |> run("interleaved paged sessions == flat, bit-exact under fragmentation (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)
@@ -351,7 +351,7 @@ def test_kv_paged_decode(t : T?) {
 def test_kv_paged_q8(t : T?) {
     t |> run("paged q8_0 sessions == flat q8_0, bit-exact under fragmentation (needs SmolLM2-135M)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         // q8_0 needs a head_size-64 carrier (stories15M's 48 is rejected by the 32-block check)
@@ -359,7 +359,7 @@ def test_kv_paged_q8(t : T?) {
         let mdir = empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
         let path = path_join(mdir, "SmolLM2-135M-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var tr <- load_gguf(path, QuantMode.q8)
@@ -412,11 +412,11 @@ def test_kv_paged_q8(t : T?) {
 def test_kv_paged_prefill(t : T?) {
     t |> run("paged prefill == flat prefill: logits and cache rows bit-exact (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)
@@ -465,11 +465,11 @@ def test_kv_paged_prefill(t : T?) {
 def test_kv_paged_eval_batch(t : T?) {
     t |> run("paged eval_batch == flat eval_batch, ragged depths on one pool (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)

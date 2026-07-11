@@ -50,7 +50,7 @@ def test_facade_spm(t : T?) {
     t |> run("SPM facade auto-dispatch matches raw SentencePiece") @(t : T?) {
         let path = path_join(models_dir(), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var v <- load_tokenizer_auto(path)
@@ -70,7 +70,7 @@ def test_facade_bpe(t : T?) {
     t |> run("BPE facade auto-dispatch matches raw byte-level BPE") @(t : T?) {
         let path = path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var v <- load_tokenizer_auto(path)
@@ -99,7 +99,7 @@ def test_facade_model(t : T?) {
     t |> run("load_model owns the tokenizer; model facade delegates") @(t : T?) {
         let path = path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_model(path, QuantMode.q8)

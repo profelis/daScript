@@ -70,7 +70,7 @@ def test_chat_tinyllama_zephyr(t : T?) {
     t |> run("TinyLlama (arch=llama + SPM) renders the Zephyr prefill") @(t : T?) {
         let path = path_join(models_dir(), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_capped(path)
@@ -94,7 +94,7 @@ def test_chat_gemma(t : T?) {
     t |> run("Gemma-2 (SPM, no system role) folds system into the first user turn") @(t : T?) {
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_capped(path)
@@ -119,7 +119,7 @@ def test_chat_phi(t : T?) {
     t |> run("Phi-3.5 (SPM) renders the Phi-3 prefill") @(t : T?) {
         let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_capped(path)
@@ -147,7 +147,7 @@ def test_chat_qwen(t : T?) {
     t |> run("Qwen2.5 (BPE) renders the ChatML prefill") @(t : T?) {
         let path = path_join(models_dir(), "Qwen2.5-1.5B-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_capped(path)
@@ -177,7 +177,7 @@ def test_chat_llama3(t : T?) {
     t |> run("Llama-3 (arch=llama + BPE) renders the Llama-3 header prefill") @(t : T?) {
         let path = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_capped(path)
@@ -206,12 +206,12 @@ def test_chat_llama3(t : T?) {
 def test_chat_end_to_end(t : T?) {
     t |> run("respond() streams a reply, stops on a stop token, records stats + transcript") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_model(path, QuantMode.q8)
@@ -327,7 +327,7 @@ def test_chat_pending_cleared_on_consume(t : T?) {
     t |> run("respond()/add_assistant() clear the consumed user text (needs SmolLM2-135M)") @(t : T?) {
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         with_job_que() {
@@ -355,12 +355,12 @@ def test_chat_pending_cleared_on_consume(t : T?) {
 def test_chat_render_seam(t : T?) {
     t |> run("render_assistant ≡ add_assistant evals; renderer chat holds no KV (needs SmolLM2-135M)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         with_job_que() {

@@ -5,7 +5,6 @@ module dasllama_math_gen shared public
 require dasllama/dasllama_math
 require dasllama/dasllama_math_aarch64_neon
 require dasllama/dasllama_math_default  // dot_q8q8_f16s — the row-major tails of the s16 twins
-require llvm/daslib/f16_cvt             // f16_to_f32 — the s16 reference bodies' in-loop widen
 require llvm/daslib/llvm_tune  // [tune]/[tune_perm]/[tune_companion] + the [llvm_code] annotation it re-exports
 require dasllama/dasllama_gemm_schema
 require daslib/jobque_boost public
@@ -143,29 +142,39 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
 //! The f16-scale GEMV companion (the wscale_f16 rail): q8q8_gemv_gen's twin over the raw
 //! binary16 group-scale plane (Model.qscales16 — the repacked f32 plane, converted in place,
 //! element order preserved). Same rows-range contract; the generated body differs only in the
-//! scale fold's widen (fcvtl/vcvtph2ps). Reference body = the scalar grp4 walk — correct on
-//! every tier; the hand laneq f16s twin is the neon backend's stage. Not `private`: it IS the
-//! mm_rows_s16 slot and is called from inside lifted parallel_for worker lambdas.
+//! scale fold's widen (fcvtl/vcvtph2ps). Reference body = the hand laneq f16s rows walk over
+//! the grp4 reference layout, declining in lockstep via the shared predicate. Not `private`:
+//! it IS the mm_rows_s16 slot and is called from inside lifted parallel_for worker lambdas.
 [hint(unsafe_range_check, noalias = wp, noalias = sp, noalias = xqp, noalias = xsp)]
 def q8q8_gemv_s16_gen(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) : void {
     let nb = n / 32l
     unsafe {
         for (g in range64(rb / 4l, re / 4l)) {
-            q8q8_token_grp_generic(yp, wp + g * 4l * n, sp + g * 4l * nb, xqp, xsp, n, 0l, g * 4l, 0l, 4l)
+            let f = dot_q8q8_laneq4_f16s(wp + g * 4l * n, sp + g * 4l * nb, xqp, xsp, n)
+            yp[g * 4l + 0l] = f.x
+            yp[g * 4l + 1l] = f.y
+            yp[g * 4l + 2l] = f.z
+            yp[g * 4l + 3l] = f.w
         }
     }
 }
 
 //! The f16-scale tile companion: q8q8_tile_gen's twin over the binary16 group-scale plane —
 //! same 4-token contract, stamped with the SAME perm (bias128/amx/smmla included; only the
-//! scale-fold load differs). Reference body = 4 scalar grp4 token walks, same per-block fold
-//! order. Not `private`: called from inside the lifted parallel_for worker lambdas.
+//! scale-fold load differs). Reference body = 4 single-token laneq f16s dots with the tile's
+//! per-block fold order. Not `private`: called from inside the lifted parallel_for worker
+//! lambdas.
 [unused_argument(xbsp), hint(unsafe_range_check, noalias = wg, noalias = sg, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def q8q8_tile_s16_gen(var yp : float?; wg : int8 const?; sg : uint16 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
     let nb = n / 32l
     unsafe {
         for (t in range64(4l)) {
-            q8q8_token_grp_generic(yp, wg, sg, xqp + (t0 + t) * n, xsp + (t0 + t) * nb, n, d, g * 4l, t0 + t, 4l)
+            let f = dot_q8q8_laneq4_f16s(wg, sg, xqp + (t0 + t) * n, xsp + (t0 + t) * nb, n)
+            let r = g * 4l
+            yp[(t0 + t) * d + r + 0l] = f.x
+            yp[(t0 + t) * d + r + 1l] = f.y
+            yp[(t0 + t) * d + r + 2l] = f.z
+            yp[(t0 + t) * d + r + 3l] = f.w
         }
     }
 }
@@ -391,41 +400,6 @@ def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : float const?;
                     acc += int(int8(int(wg[wo + 3l]) + wb0)) * int(xq[xo + 3l])
                 }
                 f[int(r)] += float(acc) * sg[bi * mr + r] * xsb
-            }
-        }
-        for (r in range64(mr)) {
-            yp[trow * d + col + r] = f[int(r)]
-        }
-    }
-}
-
-//! The wscale_f16 overload of q8q8_token_grp_generic: the same walk with the per-block weight
-//! scale widened in-loop from the raw binary16 plane. The s16 stubs' reference bodies.
-def q8q8_token_grp_generic(var yp : float?; wg : int8 const?; sg : uint16 const?; xq : int8 const?; xs : float const?; n, d, col, trow, mr : int64; wbias : int64 = 0l; kgroup : int64 = 4l) {
-    let nb = n / 32l
-    let wb0 = int(wbias)
-    var f : float[32]   // scratch cap = the grid's max stampable mr (busd512 mr32 row)
-    for (r in range(int(mr))) {
-        f[r] = 0.0
-    }
-    unsafe {
-        for (bi in range64(nb)) {
-            let wb = bi * mr * 32l
-            let xb = bi * 32l
-            let xsb = xs[bi]
-            for (r in range64(mr)) {
-                var acc = 0
-                for (kg in range64(8l)) {
-                    let wo = (kgroup == 8l
-                        ? wb + (kg / 2l) * 8l * mr + r * 8l + (kg % 2l) * 4l
-                        : wb + kg * 4l * mr + r * 4l)
-                    let xo = xb + kg * 4l
-                    acc += int(int8(int(wg[wo + 0l]) + wb0)) * int(xq[xo + 0l])
-                    acc += int(int8(int(wg[wo + 1l]) + wb0)) * int(xq[xo + 1l])
-                    acc += int(int8(int(wg[wo + 2l]) + wb0)) * int(xq[xo + 2l])
-                    acc += int(int8(int(wg[wo + 3l]) + wb0)) * int(xq[xo + 3l])
-                }
-                f[int(r)] += float(acc) * f16_to_f32(uint(sg[bi * mr + r])) * xsb
             }
         }
         for (r in range64(mr)) {

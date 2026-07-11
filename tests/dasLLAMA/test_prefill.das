@@ -98,11 +98,11 @@ def check_continuation(t : T?; tr : Model; prompt : array<int64>; split : int64;
 def test_prefill_fp32(t : T?) {
     t |> run("prefill == N× forward, fp32 (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid || !stat(TOKENIZER_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)
@@ -123,11 +123,11 @@ def test_prefill_fp32(t : T?) {
 def test_prefill_q8(t : T?) {
     t |> run("prefill == N× forward, Q8 (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid || !stat(TOKENIZER_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         // bit-exactness across forward_batch (batch tile) and forward (GEMV) needs same-dot

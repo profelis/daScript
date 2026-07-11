@@ -55,11 +55,11 @@ def private greedy_ids(tr : Model; var s : Session; var ids : array<int64>; var 
 def test_fused_decode_bit_exact(t : T?) {
     t |> run("fused stage chains == per-op dispatches, ids + logits bit-exact (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)
@@ -157,12 +157,12 @@ def private fused_vs_std_bit_exact(t : T?; tr : Model) {
 def test_fused_flash_deep_ctx(t : T?) {
     t |> run("flash-sliced fused chain: per-layer witness + structural logit bound (needs SmolLM2-135M)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         let prev_backend = active_kernel_backend()
@@ -224,12 +224,12 @@ def test_fused_flash_deep_ctx(t : T?) {
 def test_fused_flash_deep_ctx_q8(t : T?) {
     t |> run("flash-sliced fused chain under q8_0 KV: per-layer witness + structural logit bound (needs SmolLM2-135M)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         let prev_backend = active_kernel_backend()
@@ -291,7 +291,7 @@ def test_fused_flash_deep_ctx_q8(t : T?) {
 def test_fused_decode_pre_post_norm(t : T?) {
     t |> run("fused chains bit-exact on pre/post-norm arches (needs the gemma ggufs)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let prev_backend = active_kernel_backend()
@@ -303,6 +303,8 @@ def test_fused_decode_pre_post_norm(t : T?) {
             for (name in ["gemma-3-1b-it-Q8_0.gguf", "gemma-2-2b-it-Q8_0.gguf", "gemma-4-E2B-it-Q8_0.gguf"]) {
                 let path = path_join(models_dir(), name)
                 if (!stat(path).is_valid) {
+                    // deliberately NOT `t |> skip` — it would mark the WHOLE arm skipped even
+                    // when the loop goes on to exercise the models that ARE present
                     t |> success(true, "skipped: {path} not present")
                     continue
                 }
@@ -321,12 +323,12 @@ def test_fused_decode_pre_post_norm(t : T?) {
 def test_fused_decode_attn_chain(t : T?) {
     t |> run("fused attention chain bit-exact on SmolLM2-135M (needs the gguf)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         let prev_backend = active_kernel_backend()

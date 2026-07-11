@@ -30,16 +30,18 @@ def parity_full_mode() : bool {
 }
 
 // Presence + tier gate for a model-loading test. Returns true if the caller should proceed to
-// load `path`; otherwise registers a passing skip on `t` (model absent, or large-tier without
-// DASLLAMA_PARITY_FULL) and returns false. Collapses the per-test presence-check boilerplate.
+// load `path`; otherwise registers a LOUD skip on `t` (model absent, or large-tier without
+// DASLLAMA_PARITY_FULL) and returns false — the arm lands in the suite's skipped count instead
+// of masquerading as a pass (two real x64 failures hid behind the passing form for months).
+// `skip` does NOT unwind: the caller's `if (!model_available(t, path)) return` exits the arm.
 def model_available(t : T?; path : string) : bool {
     let st = stat(path)
     if (!st.is_valid) {
-        t |> success(true, "skipped: {base_name(path)} not present")
+        t |> skip("{base_name(path)} not present")
         return false
     }
     if (!parity_full_mode() && st.size > LARGE_TIER_BYTES) {
-        t |> success(true, "skipped: {base_name(path)} is large-tier ({st.size / (1024ul * 1024ul * 1024ul)} GB) — set DASLLAMA_PARITY_FULL=1 to run")
+        t |> skip("{base_name(path)} is large-tier ({st.size / (1024ul * 1024ul * 1024ul)} GB) — set DASLLAMA_PARITY_FULL=1 to run")
         return false
     }
     return true

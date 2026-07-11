@@ -164,11 +164,11 @@ def private logits_match(s : Session; all : array<float>; snap, vocab : int64) :
 def test_prefix_warm_equals_cold(t : T?) {
     t |> run("attached pages + tail eval == cold prefill, bit-exact (needs stories15M.bin)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!stat(MODEL_PATH).is_valid) {
-            t |> success(true, "skipped: stories15M.bin not present")
+            t |> skip("stories15M.bin not present")
             return
         }
         var tr <- load_checkpoint(MODEL_PATH)

@@ -497,6 +497,15 @@ def private test_any(name : string; func; args_num : int; var context : FileCtx;
             dt = get_time_usec(t0)
         }
     } recover {
+        if (!deliberateRecover && context.context != null && context.context.exception |> starts_with("test skipped")) {
+            // a DIRECT T.skipNow unwound through this level (its panic tears down every
+            // test-context frame, outer [test] body included; the exception text carries a
+            // trailing newline — hence prefix match). The pipe-form `t |> skip(...)` does not
+            // unwind and never lands here. Propagate as a skip, not an error.
+            deliberateRecover = true
+            skipped = true
+            dt = get_time_usec(t0)
+        }
         if (!deliberateRecover) {
             dt = get_time_usec(t0)
             failed = true

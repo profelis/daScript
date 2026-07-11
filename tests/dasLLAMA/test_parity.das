@@ -3,6 +3,7 @@ options persistent_heap   // + explicit deletes below: each test frees its model
 
 require dastest/testing_boost public
 require dasllama/dasllama   // the public facade — public-path tests exercise the API through it (engine + arch registrations + chat)
+require llvm/daslib/f16_cvt   // f16_to_f32 — the tied-cls arm reads the live scale plane
 require daslib/jobque_boost
 require daslib/fio
 require strings
@@ -82,7 +83,7 @@ def private parity_ok(path : string; quant : QuantMode; prompt, want : array<int
 def test_parity_tied_cls_q8_rows(t : T?) {
     t |> run("tied Q8 load: cls_q8 embedding rows bit-match the fp32 table") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "SmolLM2-135M-Instruct-Q8_0.gguf")
@@ -97,7 +98,10 @@ def test_parity_tied_cls_q8_rows(t : T?) {
             for (i in range64(dim)) {
                 let el = t8.emb_q8_off + token * dim + i
                 let want = t32.fblob[t32.tok_emb_off + token * dim + i]
-                if (float(t8.qblob[el]) * t8.qscales[el / 32l] != want) {
+                // read whichever scale plane is live (wscale_f16 frees the f32 one; the widen
+                // is the exact disk value, so the bit-match claim is unchanged)
+                let sc = t8.wscale_f16 ? f16_to_f32(uint(t8.qscales16[el / 32l])) : t8.qscales[el / 32l]
+                if (float(t8.qblob[el]) * sc != want) {
                     bad++
                 }
             }
@@ -125,7 +129,7 @@ let GEMMA2_GEN <- [235248l, 235321l, 235269l, 235248l, 235315l, 235269l, 235248l
 def test_parity_gemma2(t : T?) {
     t |> run("gemma2 forward (gemma-2-2b-it Q8)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
@@ -146,7 +150,7 @@ let TINYLLAMA_V03_GEN <- [29892l, 727l, 471l, 263l, 4123l, 7826l, 4257l, 365l, 2
 def test_parity_tinyllama_v03(t : T?) {
     t |> run("llama forward (TinyLlama-1.1B-v0.3 F16 -> fp32)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "tinyllama-1.1b-v0.3-f16.gguf")
@@ -167,7 +171,7 @@ let LLAMA32_1B_GEN <- [11l, 304l, 264l, 2678l, 14458l, 89777l, 304l, 279l, 20700
 def test_parity_llama3_2_1b(t : T?) {
     t |> run("llama forward (Llama-3.2-1B-Instruct Q8, θ=500000)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "Llama-3.2-1B-Instruct-Q8_0.gguf")
@@ -190,7 +194,7 @@ let QWEN25_15B_GEN <- [220l, 23l, 11l, 220l, 24l, 11l, 220l, 16l, 15l, 11l,
 def test_parity_qwen25_15b(t : T?) {
     t |> run("qwen2 forward (Qwen2.5-1.5B-Instruct Q8)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "Qwen2.5-1.5B-Instruct-Q8_0.gguf")
@@ -212,7 +216,7 @@ let PHI35_GEN <- [29871l, 29947l, 29892l, 29871l, 29929l, 29892l, 29871l, 29896l
 def test_parity_phi35(t : T?) {
     t |> run("phi3 forward (Phi-3.5-mini-instruct Q8, fused QKV + LongRoPE)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q8_0.gguf")
@@ -232,7 +236,7 @@ let SMOLLM2_GEN <- [28l, 281l, 253l, 1165l, 6560l, 32047l, 826l, 827l, 1109l, 87
 def test_parity_smollm2(t : T?) {
     t |> run("llama forward (SmolLM2-1.7B-Instruct Q8)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "SmolLM2-1.7B-Instruct-Q8_0.gguf")
@@ -252,7 +256,7 @@ let MISTRAL7B_GEN <- [29493l, 1504l, 1171l, 1032l, 3286l, 1444l, 5928l, 5067l, 2
 def test_parity_mistral7b(t : T?) {
     t |> run("llama forward (Mistral-7B-Instruct-v0.3 Q8)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "Mistral-7B-Instruct-v0.3-Q8_0.gguf")
@@ -275,7 +279,7 @@ let QWEN3_GEN <- [220l, 23l, 11l, 220l, 24l, 11l, 220l, 16l, 15l, 11l,
 def test_parity_qwen3_06b(t : T?) {
     t |> run("qwen3 forward (Qwen3-0.6B Q8, QK-norm)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "Qwen3-0.6B-Q8_0.gguf")
@@ -288,7 +292,7 @@ def test_parity_qwen3_06b(t : T?) {
 def test_parity_qwen3_4b(t : T?) {
     t |> run("qwen3 forward (Qwen3-4B-Instruct-2507 Q8, QK-norm)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "Qwen3-4B-Instruct-2507-Q8_0.gguf")
@@ -307,7 +311,7 @@ def test_parity_qwen3_4b(t : T?) {
 def test_parity_qwen2moe(t : T?) {
     t |> run("qwen2moe forward (Qwen1.5-MoE-A2.7B-Chat Q8, routed experts + shared expert)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "Qwen1.5-MoE-A2.7B-Chat.Q8_0.gguf")
@@ -341,7 +345,7 @@ def test_parity_qwen2moe(t : T?) {
 def test_parity_qwen3moe_30b(t : T?) {
     t |> run("qwen3moe forward (Qwen3-30B-A3B Q8: QK-norm attn, softmax top-8-of-128 renormalized, no shared expert)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "Qwen3-30B-A3B-Q8_0.gguf")
@@ -391,7 +395,7 @@ let GEMMA3_4B_GEN <- [236743l, 236828l, 236764l, 236743l, 236819l, 236764l, 2367
 def test_parity_gemma3_1b(t : T?) {
     t |> run("gemma3 forward (gemma-3-1b-it Q8, SWA pattern + dual rope)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-3-1b-it-Q8_0.gguf")
@@ -404,7 +408,7 @@ def test_parity_gemma3_1b(t : T?) {
 def test_parity_gemma3_4b(t : T?) {
     t |> run("gemma3 forward (gemma-3-4b-it Q8, SWA pattern + dual rope + linear scale)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-3-4b-it-Q8_0.gguf")
@@ -454,7 +458,7 @@ def private parity_text_ok(path : string; quant : QuantMode; text : string; want
 def test_parity_gemma4_12b(t : T?) {
     t |> run("gemma4 forward (gemma-4-12B-it Q8, heterogeneous SWA/global geometry, window engaged)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-4-12B-it-Q8_0.gguf")
@@ -473,7 +477,7 @@ def test_parity_gemma4_12b(t : T?) {
 def test_parity_gemma4_31b(t : T?) {
     t |> run("gemma4 forward (gemma-4-31B-it Q8, same arch as 12B scaled: 60L/5376d)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-4-31B-it-Q8_0.gguf")
@@ -505,7 +509,7 @@ let GEMMA4_26B_GEN <- [236743l, 236800l, 236778l, 236770l, 236764l, 236743l, 236
 def test_parity_gemma4_26b(t : T?) {
     t |> run("gemma4 MoE forward (gemma-4-26B-A4B-it Q8: dense shared expert + routed top-8-of-128)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-4-26B-A4B-it-Q8_0.gguf")
@@ -531,7 +535,7 @@ def test_parity_gemma4_26b(t : T?) {
 def test_parity_gemma4_e4b(t : T?) {
     t |> run("gemma4 forward (gemma-4-E4B-it Q8: per-layer embeddings + cross-layer KV sharing)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-4-E4B-it-Q8_0.gguf")
@@ -550,7 +554,7 @@ def test_parity_gemma4_e4b(t : T?) {
 def test_parity_gemma4_e2b(t : T?) {
     t |> run("gemma4 forward (gemma-4-E2B-it Q8: PLE + KV sharing + per-layer FFN width)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-4-E2B-it-Q8_0.gguf")
@@ -595,7 +599,7 @@ def private gptoss_counting_prompt() : string {
 def test_parity_gptoss_20b(t : T?) {
     t |> run("gpt-oss forward (gpt-oss-20b native-MXFP4 experts, sinks + YaRN + MoE biases; short + window-engaged)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gpt-oss-20b-mxfp4.gguf")
