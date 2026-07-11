@@ -7870,22 +7870,15 @@ class public DisableJitVisitor : AstVisitor {
     def TypeInfoVisitor {
         disable = false
     }
-    // 16/8-bit lattice floor: plain loads/stores/moves of lattice values lower natively
-    // (the types are mapped), and lattice calls/ops fall back via the builtin-address gates
-    // below. What has no lowering yet is indexing and locals-with-init — gate those two
-    // RARE node kinds only (a generic preVisitExpression gate costs an adapter call per
-    // expression and blows the per-file JIT budget on daslib-sized programs).
+    // 16/8-bit lattice floor: data movement (loads/stores/moves/locals/indexing/swizzles)
+    // and the vec4f wrapper ABI lower natively; what still falls back is lattice values
+    // crossing a BUILTIN CALL boundary (ctors/converts/operators) — the builtin-address
+    // gates below catch those until the per-op emission wave completes.
     def lattice_fallback(t : TypeDeclPtr; at : LineInfo) {
         if (!disable && t != null && is_lattice_small_type(t.baseType)) {
             to_log(LOG_WARNING, "LLVM JIT: 16/8-bit lattice type `{describe(t)}` at {at}, falling back to interpreter.\n")
             disable = true
         }
-    }
-    def override preVisitExprLetVariable(expr : ExprLet?; arg : VariablePtr; lastArg : bool) : void {
-        lattice_fallback(arg._type, arg.at)
-    }
-    def override preVisitExprSwizzle(expr : ExprSwizzle?) : void {
-        lattice_fallback(expr.value._type, expr.at)
     }
     def override preVisitExprTypeInfo(expr : ExprTypeInfo?) : void {
         if (expr.trait == "ast_typedecl" || expr.trait == "rtti_classinfo" || expr.trait == "rtti_typeinfo") {
@@ -7939,7 +7932,6 @@ class public DisableJitVisitor : AstVisitor {
                 "type {type_str} to be used in JIT, keeping interpreter mode.\n")
             disable = true
         }
-        lattice_fallback(expr.subexpr._type, expr.at)
     }
 
     def override preVisitExprForSource(var expr : ExprFor?, var source : ExpressionPtr, last : bool) {
