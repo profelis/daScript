@@ -490,9 +490,10 @@ def test_kq_load_layout(t : T?) {
         // this arm is the stage-2 CURSOR-PLACEMENT oracle over disk-order planes — pin the
         // portable backend so a kq-capable gen backend can't repack them at load (stage 4)
         pin_kernel_backend("portable")
+        let prev_kq = get_kquant_native()
         set_kquant_native(true)
         var tr <- load_gguf(path, QuantMode.q8)
-        set_kquant_native(false)
+        set_kquant_native(prev_kq)
         clear_kernel_backend_pin()
         t |> success(!tr.kq_repacked, "portable-pinned load keeps the kq planes disk-order")
         t |> success(tr.kquant_native, "load detected native K-quant tensors")

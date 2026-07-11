@@ -873,11 +873,12 @@ def public get_wscale_f16() : bool {
 }
 
 // Native K-quant weight planes: Q4_K/Q5_K/Q6_K tensors stay packed in per-format planes (see
-// Model.k4q..k6s) instead of requantizing to Q8. Default OFF until the kernel tier lands — OFF
-// loads them through the q8-requant fallback exactly as before. Load-time switch (like wscale_f16).
-var private g_kquant_native = false
+// Model.k4q..k6s) instead of requantizing to Q8. Default ON since the kernel tier landed
+// (kq stage 5, gated on all-6-file parity); OFF loads them through the q8-requant fallback
+// exactly as before — the A/B opt-out. Load-time switch (like wscale_f16).
+var private g_kquant_native = true
 
-//! Enable/disable native K-quant weight planes for subsequent loads (A/B rail; default off).
+//! Enable/disable native K-quant weight planes for subsequent loads (A/B rail; default ON).
 def public set_kquant_native(on : bool) {
     g_kquant_native = on
 }
