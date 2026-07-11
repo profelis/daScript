@@ -94,7 +94,7 @@ def test_vad_segments_jfk(t : T?) {
         let wav = "{samples_dir()}/jfk.wav"
         let samples <- read_wav_pcm16_mono(wav)
         if (empty(samples)) {
-            t |> success(true, "skipped: jfk.wav not present in DASLLAMA_MODELS_DIR")
+            t |> skip("jfk.wav not present in DASLLAMA_MODELS_DIR")
             return
         }
         // silero get_speech_timestamps defaults, sample indices (harness/silero_segment_oracle.py)

@@ -176,11 +176,11 @@ def private batch_vs_ref(t : T?; tr : Model; kdt : KVDtype; nsteps : int64; tol 
 
 def private model_missing(t : T?) : bool {
     if (!jit_enabled()) {
-        t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+        t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
         return true
     }
     if (!stat(MODEL_PATH).is_valid) {
-        t |> success(true, "skipped: stories15M.bin not present")
+        t |> skip("stories15M.bin not present")
         return true
     }
     return false
@@ -250,7 +250,7 @@ def test_batch_decode_f16_kv(t : T?) {
 def test_batch_decode_q8_kv(t : T?) {
     t |> run("batched decode == sequential under the q8_0 KV codec (needs SmolLM2-135M)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         // stories15M's head_size 48 is rejected by the q8_0 32-block check (by design) — this arm
@@ -259,7 +259,7 @@ def test_batch_decode_q8_kv(t : T?) {
         let mdir = empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
         let path = path_join(mdir, "SmolLM2-135M-Instruct-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var tr <- load_gguf(path, QuantMode.q8)

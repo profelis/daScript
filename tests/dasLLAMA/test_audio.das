@@ -226,7 +226,7 @@ def test_omni_tower(t : T?) {
 def test_encoder_oracle(t : T?) {
     t |> run("all-ones mel through the tower matches mtmd (needs qwen2audio mmproj)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "qwen2audio-mmproj-f32.gguf")

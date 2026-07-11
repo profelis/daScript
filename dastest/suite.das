@@ -497,6 +497,14 @@ def private test_any(name : string; func; args_num : int; var context : FileCtx;
             dt = get_time_usec(t0)
         }
     } recover {
+        if (!deliberateRecover && context.context.exception |> starts_with("test skipped")) {
+            // a nested arm's skip (T.skipNow) unwound through this level (the panic tears down
+            // every test-context frame, outer [test] body included, and the exception text
+            // carries a trailing newline — hence prefix match). The arm's own test_any already
+            // counted the skip; this level propagates as a skip, not an error.
+            deliberateRecover = true
+            skipped = true
+        }
         if (!deliberateRecover) {
             dt = get_time_usec(t0)
             failed = true

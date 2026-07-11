@@ -43,12 +43,12 @@ def private same(a, b : array<int64>) : bool {
 def test_sampling_greedy_matches_oracle(t : T?) {
     t |> run("greedy sampling generate reproduces the gemma2 oracle") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_model(path, QuantMode.q8)
@@ -79,12 +79,12 @@ def test_sampling_greedy_matches_oracle(t : T?) {
 def test_sampling_deterministic(t : T?) {
     t |> run("same seed => identical sampled output") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(models_dir(), "gemma-2-2b-it-Q8_0.gguf")
         if (!stat(path).is_valid) {
-            t |> success(true, "skipped: {path} not present")
+            t |> skip("{path} not present")
             return
         }
         var m <- load_model(path, QuantMode.q8)

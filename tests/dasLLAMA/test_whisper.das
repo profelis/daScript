@@ -288,14 +288,14 @@ def test_asr_surface(t : T?) {
 def test_qwen3a_tower(t : T?) {
     t |> run("qwen3a tower: conv2d frontend + windowed encode matches mtmd on jfk") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(samples_dir(), "mmproj-Qwen3-ASR-0.6B-bf16.gguf")
         if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
-            t |> success(true, "skipped: jfk.wav not present")
+            t |> skip("jfk.wav not present")
             return
         }
         var tw <- load_qwen3a_tower(path)
@@ -330,14 +330,14 @@ def test_qwen3a_tower(t : T?) {
 def test_parakeet_oracle(t : T?) {
     t |> run("parakeet-TDT greedy on jfk.wav is token-for-token with parakeet-cli") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v2-f32.bin")
         if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
-            t |> success(true, "skipped: jfk.wav not present")
+            t |> skip("jfk.wav not present")
             return
         }
         // through the uniform ASR surface: the sniff routes a small-vocab ggml bin to parakeet
@@ -393,14 +393,14 @@ def test_parakeet_oracle(t : T?) {
 def test_parakeet_v3_oracle(t : T?) {
     t |> run("parakeet-TDT v3 (25-lang) greedy on jfk.wav is token-for-token with parakeet-cli") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let path = path_join(whisper_models_dir(), "ggml-parakeet-tdt-0.6b-v3-f32.bin")
         if (!model_available(t, path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
-            t |> success(true, "skipped: jfk.wav not present")
+            t |> skip("jfk.wav not present")
             return
         }
         // the 8192-piece SPM vocab routes to parakeet AND flips the multilingual caps
@@ -436,14 +436,14 @@ def test_parakeet_v3_oracle(t : T?) {
 def test_whisper_transcribe_oracle(t : T?) {
     t |> run("tiny greedy on jfk.wav is token-for-token with whisper-cli") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
         if (!model_available(t, model_path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
-            t |> success(true, "skipped: jfk.wav not present")
+            t |> skip("jfk.wav not present")
             return
         }
         var w <- load_whisper_model(model_path)
@@ -512,14 +512,14 @@ def test_whisper_transcribe_oracle(t : T?) {
 def test_whisper_q8_gate(t : T?) {
     t |> run("tiny q8 tower (the load_asr_model default) stays token-identical to fp32 on jfk") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let model_path = path_join(whisper_models_dir(), "ggml-tiny.bin")
         if (!model_available(t, model_path)) return
         let samples <- read_wav_pcm16_mono(path_join(samples_dir(), "jfk.wav"))
         if (length(samples) == 0) {
-            t |> success(true, "skipped: jfk.wav not present")
+            t |> skip("jfk.wav not present")
             return
         }
         var m <- load_asr_model(model_path)     // the asr-surface default: q8 tower
@@ -567,7 +567,7 @@ def test_whisper_q8_gate(t : T?) {
 def private check_canary_clip(t : T?; m : AsrModel; wav : string; expected : array<int>) {
     let samples <- read_wav_pcm16_mono(wav)
     if (empty(samples)) {
-        t |> success(true, "skipped: {base_name(wav)} not present")
+        t |> skip("{base_name(wav)} not present")
         return
     }
     var s <- create_session(m, "en")
@@ -587,11 +587,11 @@ def private check_canary_clip(t : T?; m : AsrModel; wav : string; expected : arr
 def test_canary_qwen_oracle(t : T?) {
     t |> run("Canary-Qwen 2.5B greedy is token-for-token with the NeMo SALM oracle") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!parity_full_mode()) {   // ~6.7 GB two-file (decoder GGUF + f32 encoder bin) — large-tier
-            t |> success(true, "skipped: canary-qwen is large-tier — set DASLLAMA_PARITY_FULL=1 to run")
+            t |> skip("canary-qwen is large-tier — set DASLLAMA_PARITY_FULL=1 to run")
             return
         }
         let dec = path_join(samples_dir(), "canary-qwen-2.5b-decoder-f16.gguf")
@@ -633,7 +633,7 @@ def test_canary_qwen_oracle(t : T?) {
 def test_gemma4a_audio_oracle(t : T?) {
     t |> run("Gemma-4 E2B audio greedy is token-for-token with llama-mtmd-cli (confident prefix)") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         let dec = path_join(samples_dir(), "gemma-4-E2B-it-Q8_0.gguf")
@@ -649,9 +649,9 @@ def test_gemma4a_audio_oracle(t : T?) {
         let wav = path_join(corpus_dir(), "gemma4a_test2.wav")
         let samples <- read_wav_pcm16_mono(wav)
         if (empty(samples)) {
-            t |> success(true, "skipped: gemma4a_test2.wav not present")
-            delete m.dec.wblob
+            delete m.dec.wblob   // free the weights BEFORE the skip — skip unwinds the arm
             delete m.g4a.blob
+            t |> skip("gemma4a_test2.wav not present")
             return
         }
         with_job_que() {
@@ -690,7 +690,7 @@ def test_gemma4a_audio_oracle(t : T?) {
 def private check_q3omni_clip(t : T?; m : AsrModel; wav : string; expected : array<int>) {
     let samples <- read_wav_pcm16_mono(wav)
     if (empty(samples)) {
-        t |> success(true, "skipped: {base_name(wav)} not present")
+        t |> skip("{base_name(wav)} not present")
         return
     }
     var s <- create_session(m, "auto")
@@ -715,11 +715,11 @@ def private check_q3omni_clip(t : T?; m : AsrModel; wav : string; expected : arr
 def test_qwen3omni_audio_oracle(t : T?) {
     t |> run("Qwen3-Omni-30B greedy audio transcription is token-for-token with llama-mtmd-cli") @(t : T?) {
         if (!jit_enabled()) {
-            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
             return
         }
         if (!parity_full_mode()) {   // ~34 GB (Q8 thinker + bf16 mmproj) — large-tier
-            t |> success(true, "skipped: Qwen3-Omni-30B is large-tier — set DASLLAMA_PARITY_FULL=1 to run")
+            t |> skip("Qwen3-Omni-30B is large-tier — set DASLLAMA_PARITY_FULL=1 to run")
             return
         }
         let dec = path_join(samples_dir(), "Qwen3-Omni-30B-A3B-Instruct-Q8_0.gguf")
