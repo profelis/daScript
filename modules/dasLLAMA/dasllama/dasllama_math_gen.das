@@ -5,6 +5,7 @@ module dasllama_math_gen shared public
 require dasllama/dasllama_math
 require dasllama/dasllama_math_aarch64_neon
 require dasllama/dasllama_math_default  // dot_q8q8_f16s — the row-major tails of the s16 twins
+require llvm/daslib/f16_cvt  // the kq reference bodies widen the f16 (s, o) scale pairs
 require llvm/daslib/llvm_tune  // [tune]/[tune_perm]/[tune_companion] + the [llvm_code] annotation it re-exports
 require dasllama/dasllama_gemm_schema
 require daslib/jobque_boost public
@@ -139,6 +140,106 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
     }
 }
 
+//! One row's dot off the grp<mr> K-quant planes, scalar — the kq stubs' reference body (runs
+//! only when the stamp declined; production loads never see it) and the tests' repack oracle.
+//! kqg/ksg = the row's GROUP plane bases; r = the row within the group. Block contributions
+//! are computed and summed in the SAME order as the portable disk dots, so it is bit-exact
+//! against them (the integer sub-sums are exact; only the plane layout differs).
+def kq_grp_row_dot(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, mr : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64) : float {
+    var acc = 0.0
+    let nsb = n / 256l
+    let qsb = fmt == 4l ? 128l : (fmt == 5l ? 160l : 192l)
+    let ssb = fmt == 6l ? 18l : 32l
+    unsafe {
+        for (sbi in range64(nsb)) {
+            let qb = sbi * qsb * mr
+            let sb = sbi * ssb * mr
+            let dk6 = fmt == 6l ? f16_to_f32(uint(ksg[sb + 16l * mr + 2l * r]) | (uint(ksg[sb + 16l * mr + 2l * r + 1l]) << 8u)) : 0.0
+            for (blk in range64(8l)) {
+                let b = sbi * 8l + blk
+                var ilo = 0
+                var ihi = 0
+                for (j in range64(4l)) {
+                    let hb = fmt == 5l ? int(kqg[qb + 128l * mr + (blk * 4l + j) * mr + r]) : 0
+                    let g2 = uint((blk % 4l) * 2l)
+                    for (t in range64(4l)) {
+                        let nib = uint(kqg[qb + ((blk * 4l + j) * mr + r) * 4l + t])
+                        var qlo = int(nib & 15u)
+                        var qhi = int(nib >> 4u)
+                        if (fmt == 5l) {
+                            qlo |= ((hb >> int(t)) & 1) << 4
+                            qhi |= ((hb >> int(4l + t)) & 1) << 4
+                        } elif (fmt == 6l) {
+                            let hbase = qb + 128l * mr + (blk / 4l) * 32l * mr
+                            let h0 = uint(kqg[hbase + (j * mr + r) * 4l + t])
+                            let h1 = uint(kqg[hbase + ((j + 4l) * mr + r) * 4l + t])
+                            qlo |= int(((h0 >> g2) & 3u) << 4u)
+                            qhi |= int(((h1 >> g2) & 3u) << 4u)
+                        }
+                        ilo += qlo * int(xqp[b * 32l + j * 4l + t])
+                        ihi += qhi * int(xqp[b * 32l + 16l + j * 4l + t])
+                    }
+                }
+                if (fmt == 6l) {
+                    let s0 = dk6 * float(int(int8(ksg[sb + 2l * blk * mr + r])))
+                    let s1 = dk6 * float(int(int8(ksg[sb + (2l * blk + 1l) * mr + r])))
+                    let a0 = float(xbsp[b * 2l])
+                    let a1 = float(xbsp[b * 2l + 1l])
+                    acc += xsp[b] * (s0 * (float(ilo) - 32.0 * a0) + s1 * (float(ihi) - 32.0 * a1))
+                } else {
+                    let s4 = sb + blk * 4l * mr
+                    let s = f16_to_f32(uint(ksg[s4 + 2l * r]) | (uint(ksg[s4 + 2l * r + 1l]) << 8u))
+                    let o = f16_to_f32(uint(ksg[s4 + 2l * mr + 2l * r]) | (uint(ksg[s4 + 2l * mr + 2l * r + 1l]) << 8u))
+                    let a32 = float(xbsp[b * 2l] + xbsp[b * 2l + 1l])
+                    acc += xsp[b] * (s * float(ilo + ihi) - o * a32)
+                }
+            }
+        }
+    }
+    return acc
+}
+
+//! The K-quant GEMV companions (kq stage 4, the sixth family slice): rows [rb, re) of one
+//! plane-region pair off the grp<mr> kq planes (repack_k4/k5/k6_grp — the SAME mr as the Q8
+//! layout). The generators emit the unsigned-quant superblock loop (dasllama_gemm_gen::k*_gemv);
+//! reference bodies = the scalar grp walk above, declining in lockstep via the shared predicate.
+//! Not `private`: they ARE the kq_rows_* slots and are called from inside lifted worker lambdas.
+[hint(unsafe_range_check, noalias = kqp, noalias = ksp, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def k4q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) : void {
+    let mr = int64(q8q8_layout_gen())
+    let nsb = n / 256l
+    unsafe {
+        for (i in range64(rb, re)) {
+            let g = i / mr
+            yp[i] = kq_grp_row_dot(4l, kqp + g * mr * nsb * 128l, ksp + g * mr * nsb * 32l, i % mr, mr, xqp, xsp, xbsp, n)
+        }
+    }
+}
+
+[hint(unsafe_range_check, noalias = kqp, noalias = ksp, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def k5q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) : void {
+    let mr = int64(q8q8_layout_gen())
+    let nsb = n / 256l
+    unsafe {
+        for (i in range64(rb, re)) {
+            let g = i / mr
+            yp[i] = kq_grp_row_dot(5l, kqp + g * mr * nsb * 160l, ksp + g * mr * nsb * 32l, i % mr, mr, xqp, xsp, xbsp, n)
+        }
+    }
+}
+
+[hint(unsafe_range_check, noalias = kqp, noalias = ksp, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def k6q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) : void {
+    let mr = int64(q8q8_layout_gen())
+    let nsb = n / 256l
+    unsafe {
+        for (i in range64(rb, re)) {
+            let g = i / mr
+            yp[i] = kq_grp_row_dot(6l, kqp + g * mr * nsb * 192l, ksp + g * mr * nsb * 18l, i % mr, mr, xqp, xsp, xbsp, n)
+        }
+    }
+}
+
 //! The f16-scale GEMV companion (the wscale_f16 rail): q8q8_gemv_gen's twin over the raw
 //! binary16 group-scale plane (Model.qscales16 — the repacked f32 plane, converted in place,
 //! element order preserved). Same rows-range contract; the generated body differs only in the
@@ -231,6 +332,9 @@ def q8q8_tile_s16_gen(var yp : float?; wg : int8 const?; sg : uint16 const?; xqp
  tune_companion(fn = "q8q8_tile_s16_gen", gen = "dasllama_gemm_gen::q8q8_tile_s16"),
  tune_companion(fn = "q8q8_gemv_s16_gen", gen = "dasllama_gemm_gen::q8q8_gemv_s16"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
+ tune_companion(fn = "k4q8_gemv_gen", gen = "dasllama_gemm_gen::k4_gemv"),
+ tune_companion(fn = "k5q8_gemv_gen", gen = "dasllama_gemm_gen::k5_gemv"),
+ tune_companion(fn = "k6q8_gemv_gen", gen = "dasllama_gemm_gen::k6_gemv"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
  tune(gen = "dasllama_gemm_gen::q8q8_tile",
       fallback = "dot_vpdpbusd_width512_mr16_kstep2_gkstep2_bias128;dot_vpdpbusd_width256_mr8_kstep2_gkstep2_bias128;dot_maddubs_width256_mr8_kstep2;kstep2"), unused_argument(xbsp),
@@ -366,6 +470,208 @@ def repack_mx4_grp(var np : uint8?; var ep : uint8?; n, d, mr : int64) {
 // interleave at the ONE stamped mr
 def private repack_mx4_gen(var np : uint8?; var ep : uint8?; n, d : int64) {
     repack_mx4_grp(np, ep, n, d, int64(q8q8_layout_gen()))
+}
+
+// ===== K-quant grp<mr> repacks (kq stage 4) =====
+// The layouts the stamped k4/k5/k6 rows cores read, per superblock per mr-row group (tail rows
+// d % mr stay disk-order at their original offsets — the portable dots serve them):
+//   quants  [blk 0..7][j 0..3][row][4B] — byte t of (blk,j) pairs k = blk*32+j*4+t (LOW nibble)
+//           with k+16 (HIGH), the mx4 pairing (disk pairs sub-blocks 2js/2js+1 instead)
+//   k5 high [blk][j][row] 1B — bit t = weight j*4+t's 5th bit, bit 4+t = the k+16 weight's
+//   k6 high [half][jj 0..7][row][4B] — the disk qh bytes verbatim (bits for all 4 blocks of the
+//           half at uniform shift 2g), only row-interleaved by 4-byte columns
+//   scales  k4/k5 [blk][mr f16 s][mr f16 o]; k6 [idx 0..15][mr int8 sc][mr f16 d]
+
+// low 4 bits of weight k off a disk-order k4/k5 nibble row (128 bytes per superblock)
+def private k45_nib(rowq : uint8 const?; k : int64) : uint {
+    let js = k / 64l
+    let rem = k % 64l
+    let b = uint(unsafe(rowq[js * 32l + rem % 32l]))
+    return rem < 32l ? b & 15u : b >> 4u
+}
+
+// the 5th bit of weight k off a disk-order k5 qh row (32 bytes per superblock)
+def private k5_hbit(rowh : uint8 const?; k : int64) : uint {
+    let js = k / 64l
+    let rem = k % 64l
+    return (uint(unsafe(rowh[rem % 32l])) >> uint(2l * js + (rem < 32l ? 0l : 1l))) & 1u
+}
+
+// low 4 bits of weight k off a disk-order k6 ql row (128 bytes per superblock)
+def private k6_nib(rowq : uint8 const?; k : int64) : uint {
+    let h = k / 128l
+    let g = (k % 128l) / 32l
+    let b = uint(unsafe(rowq[h * 64l + (g % 2l) * 32l + k % 32l]))
+    return g < 2l ? b & 15u : b >> 4u
+}
+
+//! mr-generalized K-quant plane repack, one function per format (grp layouts above). Runs once
+//! per kq weight tensor at load, on the main context. Public: probes/tests repack per-variant
+//! copies with an explicit mr.
+def repack_k4_grp(var kq : uint8?; var ks : uint8?; n, d, mr : int64) {
+    let nsb = n / 256l
+    let qrow = nsb * 128l
+    let srow = nsb * 32l
+    let ng = d / mr
+    var tq : array<uint8>
+    var ts : array<uint8>
+    tq |> resize(int(d * qrow))
+    ts |> resize(int(d * srow))
+    unsafe {
+        var tqp = addr(tq[0])
+        var tsp = addr(ts[0])
+        for (i in range64(d * qrow)) {
+            tqp[i] = kq[i]
+        }
+        for (i in range64(d * srow)) {
+            tsp[i] = ks[i]
+        }
+        for (g in range64(ng)) {
+            for (sbi in range64(nsb)) {
+                let dq = g * mr * qrow + sbi * 128l * mr
+                let ds = g * mr * srow + sbi * 32l * mr
+                for (r in range64(mr)) {
+                    let sq = (g * mr + r) * qrow + sbi * 128l
+                    let ss = (g * mr + r) * srow + sbi * 32l
+                    for (blk in range64(8l)) {
+                        for (j in range64(4l)) {
+                            for (t in range64(4l)) {
+                                let k = blk * 32l + j * 4l + t
+                                let lo = k45_nib(tqp + sq, k)
+                                let hi = k45_nib(tqp + sq, k + 16l)
+                                kq[dq + ((blk * 4l + j) * mr + r) * 4l + t] = uint8(lo | (hi << 4u))
+                            }
+                        }
+                        let sb4 = ds + blk * 4l * mr
+                        ks[sb4 + 2l * r] = tsp[ss + blk * 4l]
+                        ks[sb4 + 2l * r + 1l] = tsp[ss + blk * 4l + 1l]
+                        ks[sb4 + 2l * mr + 2l * r] = tsp[ss + blk * 4l + 2l]
+                        ks[sb4 + 2l * mr + 2l * r + 1l] = tsp[ss + blk * 4l + 3l]
+                    }
+                }
+            }
+        }
+    }
+    delete tq
+    delete ts
+}
+
+def repack_k5_grp(var kq : uint8?; var ks : uint8?; n, d, mr : int64) {
+    let nsb = n / 256l
+    let qrow = nsb * 160l
+    let srow = nsb * 32l
+    let ng = d / mr
+    var tq : array<uint8>
+    var ts : array<uint8>
+    tq |> resize(int(d * qrow))
+    ts |> resize(int(d * srow))
+    unsafe {
+        var tqp = addr(tq[0])
+        var tsp = addr(ts[0])
+        for (i in range64(d * qrow)) {
+            tqp[i] = kq[i]
+        }
+        for (i in range64(d * srow)) {
+            tsp[i] = ks[i]
+        }
+        for (g in range64(ng)) {
+            for (sbi in range64(nsb)) {
+                let dq = g * mr * qrow + sbi * 160l * mr
+                let ds = g * mr * srow + sbi * 32l * mr
+                for (r in range64(mr)) {
+                    let sq = (g * mr + r) * qrow + sbi * 160l
+                    let ss = (g * mr + r) * srow + sbi * 32l
+                    for (blk in range64(8l)) {
+                        for (j in range64(4l)) {
+                            var hb = 0u
+                            for (t in range64(4l)) {
+                                let k = blk * 32l + j * 4l + t
+                                let lo = k45_nib(tqp + sq, k)
+                                let hi = k45_nib(tqp + sq, k + 16l)
+                                kq[dq + ((blk * 4l + j) * mr + r) * 4l + t] = uint8(lo | (hi << 4u))
+                                hb |= k5_hbit(tqp + sq + 128l, k) << uint(t)
+                                hb |= k5_hbit(tqp + sq + 128l, k + 16l) << uint(4l + t)
+                            }
+                            kq[dq + 128l * mr + (blk * 4l + j) * mr + r] = uint8(hb)
+                        }
+                        let sb4 = ds + blk * 4l * mr
+                        ks[sb4 + 2l * r] = tsp[ss + blk * 4l]
+                        ks[sb4 + 2l * r + 1l] = tsp[ss + blk * 4l + 1l]
+                        ks[sb4 + 2l * mr + 2l * r] = tsp[ss + blk * 4l + 2l]
+                        ks[sb4 + 2l * mr + 2l * r + 1l] = tsp[ss + blk * 4l + 3l]
+                    }
+                }
+            }
+        }
+    }
+    delete tq
+    delete ts
+}
+
+def repack_k6_grp(var kq : uint8?; var ks : uint8?; n, d, mr : int64) {
+    let nsb = n / 256l
+    let qrow = nsb * 192l
+    let srow = nsb * 18l
+    let ng = d / mr
+    var tq : array<uint8>
+    var ts : array<uint8>
+    tq |> resize(int(d * qrow))
+    ts |> resize(int(d * srow))
+    unsafe {
+        var tqp = addr(tq[0])
+        var tsp = addr(ts[0])
+        for (i in range64(d * qrow)) {
+            tqp[i] = kq[i]
+        }
+        for (i in range64(d * srow)) {
+            tsp[i] = ks[i]
+        }
+        for (g in range64(ng)) {
+            for (sbi in range64(nsb)) {
+                let dq = g * mr * qrow + sbi * 192l * mr
+                let ds = g * mr * srow + sbi * 18l * mr
+                for (r in range64(mr)) {
+                    let sq = (g * mr + r) * qrow + sbi * 192l
+                    let ss = (g * mr + r) * srow + sbi * 18l
+                    for (blk in range64(8l)) {
+                        for (j in range64(4l)) {
+                            for (t in range64(4l)) {
+                                let k = blk * 32l + j * 4l + t
+                                let lo = k6_nib(tqp + sq, k)
+                                let hi = k6_nib(tqp + sq, k + 16l)
+                                kq[dq + ((blk * 4l + j) * mr + r) * 4l + t] = uint8(lo | (hi << 4u))
+                            }
+                        }
+                    }
+                    for (h in range64(2l)) {   // qh bytes verbatim, row-interleaved by 4-byte columns
+                        for (jj in range64(8l)) {
+                            for (t in range64(4l)) {
+                                kq[dq + 128l * mr + ((h * 8l + jj) * mr + r) * 4l + t] = tqp[sq + 128l + h * 32l + jj * 4l + t]
+                            }
+                        }
+                    }
+                    for (idx in range64(16l)) {
+                        ks[ds + idx * mr + r] = tsp[ss + idx]
+                    }
+                    ks[ds + 16l * mr + 2l * r] = tsp[ss + 16l]
+                    ks[ds + 16l * mr + 2l * r + 1l] = tsp[ss + 17l]
+                }
+            }
+        }
+    }
+    delete tq
+    delete ts
+}
+
+// the backend kq repack slot: same layout companion as the Q8/mx4 repacks — one stamped mr
+def private repack_kq_gen(fmt : int; var kq : uint8?; var ks : uint8?; n, d : int64) {
+    if (fmt == 4) {
+        repack_k4_grp(kq, ks, n, d, int64(q8q8_layout_gen()))
+    } elif (fmt == 5) {
+        repack_k5_grp(kq, ks, n, d, int64(q8q8_layout_gen()))
+    } else {
+        repack_k6_grp(kq, ks, n, d, int64(q8q8_layout_gen()))
+    }
 }
 
 //! Generic grp<mr> single-token dot for the mr != 4 slots and tails: scalar, correct
@@ -780,6 +1086,36 @@ def private mx4q8_groupn_gen(var yp : float?; wn : uint8 const?; we : uint8 cons
     }
 }
 
+// mm_kq slot: the K-quant twin of q8q8_kernel_gen/mx4q8_kernel_gen — group chunks handed to
+// the stamped kq rows core for the format, row tail (d % mr) row-major via the portable dots
+// (tail rows stay disk-order in the repack)
+def private kq_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
+    let nsb = n / 256l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+    var myp = yp
+    maybe_parallel_for(0, int(ng), matmul_chunks_gemv(int(ng * mr), get_q8_batch_chunks_per_job(), n * d)) $(rb, re) {
+        if (fmt == 4) {
+            k4q8_gemv_gen(myp, kqp, ksp, xqp, xsp, xbsp, n, int64(rb) * mr, int64(re) * mr)
+        } elif (fmt == 5) {
+            k5q8_gemv_gen(myp, kqp, ksp, xqp, xsp, xbsp, n, int64(rb) * mr, int64(re) * mr)
+        } else {
+            k6q8_gemv_gen(myp, kqp, ksp, xqp, xsp, xbsp, n, int64(rb) * mr, int64(re) * mr)
+        }
+    }
+    unsafe {
+        for (i in range64(ng * mr, d)) {
+            if (fmt == 4) {
+                myp[i] = dot_k4q8(kqp + i * nsb * 128l, ksp + i * nsb * 32l, xqp, xsp, xbsp, n)
+            } elif (fmt == 5) {
+                myp[i] = dot_k5q8(kqp + i * nsb * 160l, ksp + i * nsb * 32l, xqp, xsp, xbsp, n)
+            } else {
+                myp[i] = dot_k6q8(kqp + i * nsb * 192l, ksp + i * nsb * 18l, xqp, xsp, xbsp, n)
+            }
+        }
+    }
+}
+
 // ===== f16-scale twins (the wscale_f16 rail): the same slot traversals over the binary16
 // group-scale plane — generated cores via the s16 companions, row-major tails via
 // dot_q8q8_f16s, token tails via the s16 rows core (no laneq fork needed: the generated
@@ -1073,6 +1409,9 @@ def dasllama_math_gen_register() {
             mm_s16 = @@q8q8_kernel_s16_gen, batch_s16 = @@q8q8_batch_kernel_s16_gen,
             group3_s16 = @@q8q8_group3_s16_gen, groupn_s16 = @@q8q8_groupn_s16_gen,
             mm_rows_s16 = @@q8q8_gemv_s16_gen,
+            mm_kq = @@kq_kernel_gen, repack_kq = @@repack_kq_gen,
+            kq_rows_k4 = @@k4q8_gemv_gen, kq_rows_k5 = @@k5q8_gemv_gen,
+            kq_rows_k6 = @@k6q8_gemv_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
             q8_kgroup = @@q8q8_kgroup_gen,

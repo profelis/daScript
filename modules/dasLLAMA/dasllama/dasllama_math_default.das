@@ -451,6 +451,64 @@ def private kq_gemv_kernel(fmt : int; var yp : float?; kqp : uint8 const?; ksp :
     }
 }
 
+//! Dequant one row off the grp<mr>-REPACKED K-quant planes (kq stage 4 — the layout
+//! repack_k4/k5/k6_grp writes; see dasllama_math_gen). kqg/ksg = the row's GROUP plane bases
+//! (group g = row/mr at g*mr*(n/256)*{qsb,ssb}); r = row % mr. embed_row's kq_repacked path —
+//! per-token, so scalar is fine.
+def dequant_kq_row_grp(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, mr, n : int64; var dst : float?) {
+    let nsb = n / 256l
+    let qsb = fmt == 4l ? 128l : (fmt == 5l ? 160l : 192l)
+    let ssb = fmt == 6l ? 18l : 32l
+    unsafe {
+        for (sbi in range64(nsb)) {
+            let qb = sbi * qsb * mr
+            let sb = sbi * ssb * mr
+            let dk6 = fmt == 6l ? f16_to_f32(uint(ksg[sb + 16l * mr + 2l * r]) | (uint(ksg[sb + 16l * mr + 2l * r + 1l]) << 8u)) : 0.0
+            for (blk in range64(8l)) {
+                let kb = sbi * 256l + blk * 32l
+                var s0 = 0.0
+                var s1 = 0.0
+                var o = 0.0
+                if (fmt == 6l) {
+                    s0 = dk6 * float(int(int8(ksg[sb + 2l * blk * mr + r])))
+                    s1 = dk6 * float(int(int8(ksg[sb + (2l * blk + 1l) * mr + r])))
+                } else {
+                    let s4 = sb + blk * 4l * mr
+                    s0 = f16_to_f32(uint(ksg[s4 + 2l * r]) | (uint(ksg[s4 + 2l * r + 1l]) << 8u))
+                    s1 = s0
+                    o = f16_to_f32(uint(ksg[s4 + 2l * mr + 2l * r]) | (uint(ksg[s4 + 2l * mr + 2l * r + 1l]) << 8u))
+                }
+                for (j in range64(4l)) {
+                    let hb = fmt == 5l ? int(kqg[qb + 128l * mr + (blk * 4l + j) * mr + r]) : 0
+                    let g2 = uint((blk % 4l) * 2l)
+                    for (t in range64(4l)) {
+                        let nib = uint(kqg[qb + ((blk * 4l + j) * mr + r) * 4l + t])
+                        var qlo = int(nib & 15u)
+                        var qhi = int(nib >> 4u)
+                        if (fmt == 5l) {
+                            qlo |= ((hb >> int(t)) & 1) << 4
+                            qhi |= ((hb >> int(4l + t)) & 1) << 4
+                        } elif (fmt == 6l) {
+                            let hbase = qb + 128l * mr + (blk / 4l) * 32l * mr
+                            let h0 = uint(kqg[hbase + (j * mr + r) * 4l + t])
+                            let h1 = uint(kqg[hbase + ((j + 4l) * mr + r) * 4l + t])
+                            qlo |= int(((h0 >> g2) & 3u) << 4u)
+                            qhi |= int(((h1 >> g2) & 3u) << 4u)
+                        }
+                        if (fmt == 6l) {
+                            dst[kb + j * 4l + t] = s0 * (float(qlo) - 32.0)
+                            dst[kb + 16l + j * 4l + t] = s1 * (float(qhi) - 32.0)
+                        } else {
+                            dst[kb + j * 4l + t] = s0 * float(qlo) - o
+                            dst[kb + 16l + j * 4l + t] = s1 * float(qhi) - o
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 //! K-quant GEMV over a plane pair at plane-local element offset `woff` (blob+offset form, the
 //! dispatch shape every call site uses). fmt: 4/5/6 selects the sub-format; rows land at
 //! y[yoff .. yoff+d) (batched callers pass the token row base).

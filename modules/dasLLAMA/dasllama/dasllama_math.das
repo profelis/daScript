@@ -1064,6 +1064,15 @@ typedef BackendAvailableFn = function<() : bool>
 // into every store of region r (per-expert bias vectors). Bit-exact vs a per-region loop of the
 // same backend's mx4 batch kernel — the same per-row dots, one fork instead of nregions.
 typedef MatmulMx4Q8BatchGroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// Native K-quant rows-range GEMV core (kq stage 4): rows [rb, re) of one plane-region pair
+// (kqp/ksp = the format's quant/scale plane bases at the tensor's superblock), activation as
+// (xq, xs, xbs — the per-16 sums the offset term consumes). One typedef per the three formats;
+// a backend's cores read ITS repacked kq layout (repack_kq), so mixing backends across a load
+// is as illegal as for the Q8 plane. rb/re multiples of the backend's mr.
+typedef MatmulKqRowsFn = function<(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; rb : int64; re : int64) : void>
+// The fmt-branched full K-quant GEMV (fmt 4/5/6; internal fork over d rows) and plane repack.
+typedef MatmulKqFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64) : void>
+typedef RepackKqFn = function<(fmt : int; var kq : uint8?; var ks : uint8?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
 //! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
@@ -1097,6 +1106,15 @@ struct KernelBackend {
     group3_s16 : MatmulQ8Q8Group3FnS16 = @@q8q8_unset_group3_s16
     groupn_s16 : MatmulQ8Q8GroupNFnS16 = @@q8q8_unset_groupn_s16
     mm_rows_s16 : MatmulQ8Q8RowsFnS16 = @@q8q8_unset_rows_s16
+    // Optional native K-quant slots (kq stage 4). All-or-nothing per backend, keyed off mm_kq
+    // (kernel_backend_has_kq): the loader repacks the kq planes through repack_kq iff the
+    // gate is up, and from then on EVERY kq matmul must run these cores — the portable
+    // disk-order kernels would read garbage off the interleaved planes.
+    mm_kq : MatmulKqFn = @@kq_unset_kernel
+    kq_rows_k4 : MatmulKqRowsFn = @@kq_unset_rows
+    kq_rows_k5 : MatmulKqRowsFn = @@kq_unset_rows
+    kq_rows_k6 : MatmulKqRowsFn = @@kq_unset_rows
+    repack_kq : RepackKqFn = @@repack_kq_identity
     needs_repack : bool
     // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the interleaved
     // byte-for-byte expand map (expand_mx4_region_q8's direct-interleave branch): nibble byte
@@ -1147,8 +1165,14 @@ var g_mm_q8q8_groupn_s16 = @@q8q8_unset_groupn_s16
 var g_mm_q8q8_rows_s16 = @@q8q8_unset_rows_s16
 var g_active_has_wscale16 = false   // does the active backend carry the f16-scale twins?
 var g_active_has_rows16 = false     // ... including the f16-scale row-range GEMV core?
+var g_mm_kq = @@kq_unset_kernel
+var g_kq_rows_k4 = @@kq_unset_rows
+var g_kq_rows_k5 = @@kq_unset_rows
+var g_kq_rows_k6 = @@kq_unset_rows
+var g_active_has_kq = false         // does the active backend carry the native K-quant slots?
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
+var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend is selected
 
 var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
@@ -1170,6 +1194,10 @@ def repack_q8q8_identity(var wp : int8?; var sp : float?; n, d : int64) {}
 //! Default MXFP4 repack: no-op — the planes stay row-major for the portable / row-major kernels.
 [unused_argument(np, ep, n, d)]
 def repack_mx4_identity(var np : uint8?; var ep : uint8?; n, d : int64) {}
+
+//! Default K-quant repack: no-op — the kq planes stay disk-order for the portable kernels.
+[unused_argument(fmt, kq, ks, n, d)]
+def repack_kq_identity(fmt : int; var kq : uint8?; var ks : uint8?; n, d : int64) {}
 
 def private no_backend() {
     panic("dasLLAMA: no Q8·Q8 kernel backend registered — require dasllama/dasllama_math_default")
@@ -1241,6 +1269,16 @@ def private q8q8_unset_groupn_s16(var yp : float?; wp : int8 const?; sp : uint16
 def private q8q8_unset_rows_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
     panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no f16-scale row-range GEMV core (mm_rows_s16)")
 }
+// The kq stubs are reachable with a registered backend (the slots are optional) — dispatch
+// gates on kernel_backend_has_kq(); when it is down the disk-order portable kernels serve.
+[unused_argument(fmt, yp, kqp, ksp, xqp, xsp, xbsp, n, d)]
+def private kq_unset_kernel(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no native K-quant kernels (mm_kq)")
+}
+[unused_argument(yp, kqp, ksp, xqp, xsp, xbsp, n, rb, re)]
+def private kq_unset_rows(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant row-range GEMV cores (kq_rows_*)")
+}
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
@@ -1260,8 +1298,14 @@ def private activate(be : KernelBackend) {
     g_mm_q8q8_rows_s16 = be.mm_rows_s16
     g_active_has_wscale16 = !(be.mm_s16 == @@q8q8_unset_kernel_s16)
     g_active_has_rows16 = !(be.mm_rows_s16 == @@q8q8_unset_rows_s16)
+    g_mm_kq = be.mm_kq
+    g_kq_rows_k4 = be.kq_rows_k4
+    g_kq_rows_k5 = be.kq_rows_k5
+    g_kq_rows_k6 = be.kq_rows_k6
+    g_active_has_kq = !(be.mm_kq == @@kq_unset_kernel)
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
+    g_repack_kq = be.repack_kq
     g_active_backend = be.name
     g_active_needs_repack = be.needs_repack
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
@@ -1417,6 +1461,48 @@ def mm_q8q8_rows16_fn() : MatmulQ8Q8RowsFnS16 {
 //! kernel_backend_has_rows — a wscale_f16 model's fused chains gate on it.
 def kernel_backend_has_rows16() : bool {
     return g_active_has_rows16
+}
+
+//! Does the active backend carry the native K-quant slots (mm_kq + kq_rows_* + repack_kq)?
+//! Decides at LOAD whether the kq planes get repacked; a Model records the answer
+//! (kq_repacked) and every later dispatch routes off that record, not this live query.
+def kernel_backend_has_kq() : bool {
+    return g_active_has_kq
+}
+
+//! The active backend's K-quant rows core for `fmt` (4/5/6) — the chains' kq twin of
+//! mm_q8q8_rows_fn. Same read-into-a-local-then-capture rule.
+def kq_rows_fn(fmt : int) : MatmulKqRowsFn {
+    if (fmt == 4) return g_kq_rows_k4
+    if (fmt == 5) return g_kq_rows_k5
+    return g_kq_rows_k6
+}
+
+//! Native K-quant GEMV over a REPACKED plane pair at plane-local element offset `woff`
+//! (blob+offset form — the repacked twin of dasllama_math_default's matmul_kq). Dispatches
+//! to the active backend's mm_kq; callers guard with the model's kq_repacked record.
+def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
+    let sb = woff / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    unsafe {
+        invoke(g_mm_kq, fmt, addr(y[yoff]),
+            reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<int const?>(addr(xbs[0])), n, d)
+    }
+}
+
+//! Repack one K-quant weight tensor (region at element offset woff in the fmt's planes, shape
+//! [d rows x n cols]) into the active backend's kq layout, IN PLACE. No-op unless a kq-capable
+//! backend is active. n % 256 == 0 (the ggml K-quant row invariant).
+def repack_kq_weight(fmt : int; var kq : array<uint8>; var ks : array<uint8>; woff, n, d : int64) {
+    let sb = woff / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    unsafe {
+        invoke(g_repack_kq, fmt, addr(kq[sb * qsb]), addr(ks[sb * ssb]), n, d)
+    }
 }
 
 //! Registered backend names (diagnostics / tests).

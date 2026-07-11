@@ -6,7 +6,9 @@ require dastest/testing_boost public
 require _model_tier
 require dasllama/dasllama_gguf
 require dasllama/dasllama_quant
+require dasllama/dasllama_math   // pin_kernel_backend — the layout arm needs disk-order planes
 require dasllama/dasllama_math_default   // dot_k4q8/k5/k6 — the kernel arms gate them vs the plane dequant
+require dasllama/dasllama_math_gen   // repack_k4/k5/k6_grp + kq_grp_row_dot — the stage-4 repack oracle
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration for load_gguf
 require math
 
@@ -287,6 +289,128 @@ def test_kq_dots(t : T?) {
     }
 }
 
+// Stage-4 repack oracle core: build a d-row disk plane of `fmt` (transcoded synthetic
+// superblocks, per-row LCG-perturbed quant payloads — every quant bit pattern is valid),
+// capture the portable disk dots + row dequants, repack in place at `mr`, and require the
+// grp<mr> scalar reference (kq_grp_row_dot — the stamped cores' decline body) and the grp row
+// dequant to reproduce them BIT-EXACTLY (same block order, exact integer sub-sums — only the
+// plane layout moved).
+def private kq_repack_gate(t : T?; fmt : int; mr : int64) {
+    let n = 512l
+    let d = 32l
+    let nsb = n / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
+    var kq : array<uint8>
+    var ks : array<uint8>
+    kq |> resize(int(d * nsb * qsb))
+    ks |> resize(int(d * nsb * ssb))
+    for (r in range64(d)) {
+        for (s in range64(nsb)) {
+            if (fmt == 4) {
+                transcode_q4k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } elif (fmt == 5) {
+                transcode_q5k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } else {
+                transcode_q6k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            }
+        }
+        // per-row LCG over the quant payload only (scale planes stay valid f16/int8)
+        var st = 0x9E3779Bu + uint(r) * 0x85EBCA6Bu
+        for (i in range64(nsb * qsb)) {
+            st = st * 1664525u + 1013904223u
+            kq[r * nsb * qsb + i] = uint8(uint(kq[r * nsb * qsb + i]) ^ (st >> 16u))
+        }
+    }
+    var src : array<float>
+    src |> resize(n)
+    for (i in range64(n)) {
+        src[i] = 1.3 * sin(float(i) * 0.19) - 0.4 * cos(float(i) * 0.057)
+    }
+    var xq : array<int8>
+    var xs : array<float>
+    var xbs : array<int>
+    xq |> resize(n)
+    xs |> resize(n / 32l)
+    xbs |> resize(n / 16l)
+    quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    var want : array<float>
+    var wrow : array<float>
+    want |> resize(int(d))
+    wrow |> resize(int(d * n))
+    unsafe {
+        for (r in range64(d)) {
+            let kqr = addr(kq[r * nsb * qsb])
+            let ksr = addr(ks[r * nsb * ssb])
+            if (fmt == 4) {
+                want[r] = dot_k4q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+            } elif (fmt == 5) {
+                want[r] = dot_k5q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+            } else {
+                want[r] = dot_k6q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+            }
+            for (s in range64(nsb)) {
+                if (fmt == 4) {
+                    dequant_k4_plane_superblock(kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb, wrow, r * n + s * 256l)
+                } elif (fmt == 5) {
+                    dequant_k5_plane_superblock(kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb, wrow, r * n + s * 256l)
+                } else {
+                    dequant_k6_plane_superblock(kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb, wrow, r * n + s * 256l)
+                }
+            }
+        }
+        if (fmt == 4) {
+            repack_k4_grp(addr(kq[0]), addr(ks[0]), n, d, mr)
+        } elif (fmt == 5) {
+            repack_k5_grp(addr(kq[0]), addr(ks[0]), n, d, mr)
+        } else {
+            repack_k6_grp(addr(kq[0]), addr(ks[0]), n, d, mr)
+        }
+        var dotbad = 0
+        var deqbad = 0
+        var row : array<float>
+        row |> resize(n)
+        for (r in range64(d)) {
+            let g = r / mr
+            let kqg = addr(kq[g * mr * nsb * qsb])
+            let ksg = addr(ks[g * mr * nsb * ssb])
+            let got = kq_grp_row_dot(int64(fmt), kqg, ksg, r % mr, mr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+            if (got != want[r]) {
+                dotbad++
+            }
+            dequant_kq_row_grp(int64(fmt), kqg, ksg, r % mr, mr, n, addr(row[0]))
+            for (i in range64(n)) {
+                if (row[i] != wrow[r * n + i]) {
+                    deqbad++
+                }
+            }
+        }
+        t |> success(dotbad == 0, "grp<mr> row dots bit-match the disk dots after repack")
+        t |> success(deqbad == 0, "grp<mr> row dequant bit-matches the disk row dequant after repack")
+        delete row
+    }
+    delete kq
+    delete ks
+    delete want
+    delete wrow
+    delete src
+    delete xq
+    delete xs
+    delete xbs
+}
+
+[test]
+def test_kq_repack_grp(t : T?) {
+    for (fmt in [4, 5, 6]) {
+        for (mr in [4l, 8l, 16l]) {
+            t |> run("repack_k{fmt}_grp mr={mr} preserves dots and row dequants") @(t : T?) {
+                kq_repack_gate(t, fmt, mr)
+            }
+        }
+    }
+}
+
 [test]
 def test_quantize_bs(t : T?) {
     t |> run("bs quantizer matches quantize_q8_0 byte-for-byte plus exact per-16 sums") @(t : T?) {
@@ -363,9 +487,14 @@ def test_kq_load_layout(t : T?) {
         if (!model_available(t, path)) {
             return
         }
+        // this arm is the stage-2 CURSOR-PLACEMENT oracle over disk-order planes — pin the
+        // portable backend so a kq-capable gen backend can't repack them at load (stage 4)
+        pin_kernel_backend("portable")
         set_kquant_native(true)
         var tr <- load_gguf(path, QuantMode.q8)
         set_kquant_native(false)
+        clear_kernel_backend_pin()
+        t |> success(!tr.kq_repacked, "portable-pinned load keeps the kq planes disk-order")
         t |> success(tr.kquant_native, "load detected native K-quant tensors")
         t |> success(cls_kq(tr), "tied Q6_K classifier takes the kq plane path")
         t |> success(tr.wq_fmt[0] == KqFmt.k4, "blk.0.attn_q tagged k4")
