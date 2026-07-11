@@ -37,6 +37,7 @@ let GGML_TYPE_F16 = 1
 let GGML_TYPE_Q4_0 = 2
 let GGML_TYPE_Q8_0 = 8
 let GGML_TYPE_Q4_K = 12
+let GGML_TYPE_Q5_K = 13
 let GGML_TYPE_Q6_K = 14
 let GGML_TYPE_BF16 = 30
 let GGML_TYPE_MXFP4 = 39
@@ -449,6 +450,38 @@ def dequant_q4k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array
     }
 }
 
+//! Dequantize one Q5_K superblock (176 bytes at `bo`: fp16 d, fp16 dmin, 12 bytes of 6-bit
+//! sub-scales/mins, 32 high-bit bytes qh, 128 nibble bytes qs) into dst[doff .. doff+256).
+//! w = (d*sc)*q - (dmin*m) with q = nibble | (high bit << 4) in 0..31; the high bit for chunk
+//! js lives in bit 2js (low nibbles) / 2js+1 (high nibbles) of qh[l], qh base fixed per
+//! superblock. Matches llama.cpp dequantize_row_q5_K op-for-op.
+def dequant_q5k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array<float>; doff : int64) {
+    let d = f16_to_f32(rd_u16(bytes, bo))
+    let dmin = f16_to_f32(rd_u16(bytes, bo + 2l))
+    let so = bo + 4l     // 12 scale/min bytes
+    let qho = bo + 16l   // 32 high-bit bytes (fixed base for the whole superblock)
+    var qo = bo + 48l    // 128 nibble bytes
+    var dsto = doff
+    for (js in range64(4l)) {
+        let s0 = q4k_scale_min(bytes, so, 2l * js)
+        let s1 = q4k_scale_min(bytes, so, 2l * js + 1l)
+        let d1 = d * float(s0.x)
+        let m1 = dmin * float(s0.y)
+        let d2 = d * float(s1.x)
+        let m2 = dmin * float(s1.y)
+        let u1 = 1 << (int(js) * 2)
+        let u2 = 2 << (int(js) * 2)
+        for (l in range64(32l)) {
+            let b = int(bytes[qo + l])
+            let h = int(bytes[qho + l])
+            dst[dsto + l] = d1 * float((b & 15) + ((h & u1) != 0 ? 16 : 0)) - m1
+            dst[dsto + 32l + l] = d2 * float((b >> 4) + ((h & u2) != 0 ? 16 : 0)) - m2
+        }
+        qo += 32l
+        dsto += 64l
+    }
+}
+
 //! Dequantize one Q6_K superblock (210 bytes at `bo`: 128 low-nibble bytes ql, 64 high-2-bit
 //! bytes qh, 16 int8 sub-scales for 16 sub-blocks of 16, fp16 d) into dst[doff .. doff+256).
 //! w = (d*sc)*q with q = (ql | qh<<4) - 32. Matches llama.cpp dequantize_row_q6_K op-for-op.
@@ -555,6 +588,16 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             dequant_q4k_superblock(bytes, bo, dst, dst_off + blk * 256l)
             bo += 144l
         }
+    } elif (gtype == GGML_TYPE_Q5_K) {
+        if (src_off % 256l != 0l || expect_n % 256l != 0l) {
+            panic("gguf: tensor '{name}' Q5_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
+        }
+        let nb = expect_n / 256l
+        var bo = base + (src_off / 256l) * 176l
+        for (blk in range64(nb)) {
+            dequant_q5k_superblock(bytes, bo, dst, dst_off + blk * 256l)
+            bo += 176l
+        }
     } elif (gtype == GGML_TYPE_Q6_K) {
         if (src_off % 256l != 0l || expect_n % 256l != 0l) {
             panic("gguf: tensor '{name}' Q6_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
@@ -581,7 +624,7 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             bo += 16l
         }
     } else {
-        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q6_K/MXFP4)")
+        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K/MXFP4)")
     }
 }
 

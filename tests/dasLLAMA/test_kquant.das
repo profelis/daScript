@@ -4,6 +4,7 @@ options stack = 65536   // dasLLAMA program-root convention (options stack does 
 require dastest/testing_boost public
 require _model_tier
 require dasllama/dasllama_gguf
+require dasllama/dasllama_quant
 require math
 
 // K-quant (Q4_K / Q6_K) superblock dequant gates. The synthetic arms hand-pack one superblock
@@ -12,8 +13,9 @@ require math
 // proven bit-exact against gguf-py's dequantize (harness/q4k_dequant_probe.das); the real-file
 // arm cross-checks against the Q8_0 twin of the same weights at known quantization-error levels.
 
-// synthetic quant patterns: every nibble/6-bit value, position-dependent so swaps can't cancel
+// synthetic quant patterns: every nibble/5-bit/6-bit value, position-dependent so swaps can't cancel
 def private q4_pat(k : int) : int => (k * 7 + 3) % 16
+def private q5_pat(k : int) : int => (k * 3 + 7) % 32
 def private q6_pat(k : int) : int => (k * 5 + 11) % 64
 
 [test]
@@ -52,6 +54,44 @@ def test_q4k_synthetic(t : T?) {
             t |> success(dst[k] == expected, "Q4_K element must match hand-packed value exactly")
         }
     }
+    t |> run("Q5_K superblock unpacks the split high-bit plane") @(t : T?) {
+        // reuse the Q4_K scale/min values (same 12-byte packing) — the new surface is qh
+        let sc <- [63, 21, 37, 5, 48, 17, 60, 33]
+        let mn <- [1, 62, 19, 44, 7, 58, 25, 36]
+        let d = 0.5
+        let dmin = 0.25
+        var blkb : array<uint8>
+        blkb |> resize(176)
+        let dbits = f32_to_f16(d)
+        let mbits = f32_to_f16(dmin)
+        blkb[0] = uint8(dbits & 0xFF)
+        blkb[1] = uint8(dbits >> 8u)
+        blkb[2] = uint8(mbits & 0xFF)
+        blkb[3] = uint8(mbits >> 8u)
+        for (j in range(4)) {
+            blkb[4 + j] = uint8((sc[j] & 63) | (((sc[j + 4] >> 4) & 3) << 6))
+            blkb[8 + j] = uint8((mn[j] & 63) | (((mn[j + 4] >> 4) & 3) << 6))
+            blkb[12 + j] = uint8((sc[j + 4] & 15) | ((mn[j + 4] & 15) << 4))
+        }
+        // qh[l] bit 2js = high bit of weight 64js+l, bit 2js+1 = high bit of weight 64js+32+l
+        for (js in range(4)) {
+            for (l in range(32)) {
+                blkb[48 + 32 * js + l] = uint8((q5_pat(64 * js + l) & 15) | ((q5_pat(64 * js + 32 + l) & 15) << 4))
+                var h = int(blkb[16 + l])
+                h |= (q5_pat(64 * js + l) >> 4) << (2 * js)
+                h |= (q5_pat(64 * js + 32 + l) >> 4) << (2 * js + 1)
+                blkb[16 + l] = uint8(h)
+            }
+        }
+        var dst : array<float>
+        dst |> resize(256)
+        dequant_q5k_superblock(blkb, 0l, dst, 0l)
+        for (k in range(256)) {
+            let sub = k / 32
+            let expected = d * float(sc[sub]) * float(q5_pat(k)) - dmin * float(mn[sub])
+            t |> success(dst[k] == expected, "Q5_K element must match hand-packed value exactly")
+        }
+    }
     t |> run("Q6_K superblock unpacks the ql/qh split and signed sub-scales") @(t : T?) {
         let scq <- [3, -5, 60, -60, 17, 127, -128, 1, 0, 33, -77, 90, -2, 45, -101, 7]
         let d = 0.25
@@ -79,6 +119,51 @@ def test_q4k_synthetic(t : T?) {
             let expected = d * float(scq[k / 16]) * float(q6_pat(k) - 32)
             t |> success(dst[k] == expected, "Q6_K element must match hand-packed value exactly")
         }
+    }
+}
+
+[test]
+def test_quantize_bs(t : T?) {
+    t |> run("bs quantizer matches quantize_q8_0 byte-for-byte plus exact per-16 sums") @(t : T?) {
+        let n = 4096l
+        var src : array<float>
+        src |> resize(n)
+        for (i in range64(n)) {
+            src[i] = 2.0 * sin(float(i) * 0.37) - 0.11 * float(i % 13l)
+        }
+        let want <- quantize_q8_0(src, n)
+        var qdst : array<int8>
+        var sdst : array<float>
+        var bdst : array<int>
+        qdst |> resize(n)
+        sdst |> resize(n / 32l)
+        bdst |> resize(n / 16l)
+        quantize_q8_0_bs_into(src, n, qdst, sdst, bdst, 0l, 0l, 0l)
+        var qbad = 0
+        var sbad = 0
+        var bbad = 0
+        for (j in range64(n)) {
+            if (qdst[j] != want.q[j]) {
+                qbad++
+            }
+        }
+        for (b in range64(n / 32l)) {
+            if (sdst[b] != want.scales[b]) {
+                sbad++
+            }
+        }
+        for (h in range64(n / 16l)) {
+            var bs = 0
+            for (i in range64(16l)) {
+                bs += int(want.q[h * 16l + i])
+            }
+            if (bdst[h] != bs) {
+                bbad++
+            }
+        }
+        t |> success(qbad == 0, "quants byte-identical to quantize_q8_0")
+        t |> success(sbad == 0, "scales bit-identical to quantize_q8_0")
+        t |> success(bbad == 0, "per-16 sums exact")
     }
 }
 

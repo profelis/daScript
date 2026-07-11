@@ -1527,6 +1527,11 @@ struct Session {
     // requant needs its own buffers; chain_stages is the reused stage-def array (no per-layer alloc)
     xq2 : array<int8>         // activated-hidden requant quants (ffn width)
     xs2 : array<float>        // ... and their scales (ffn width / 32)
+    // K-quant activation block sums: sum of each 16 quants of xq / xq2 (the K-quant dot's offset
+    // term is o * Σq_a per weight sub-block). Filled by quantize_q8_0_bs_into alongside xq/xs
+    // on the kq-native paths; sized always (~KB)
+    xbs : array<int>          // per-16 sums of xq (sized max(dim, hidden_dim) / 16)
+    xbs2 : array<int>         // per-16 sums of xq2 (ffn width / 16)
     chain_stages : array<int3>  // stage defs, int3(range_begin, range_end, num_chunks)
     // flash-decode attention partials (fused chain, ctx > FLASH_DECODE_SLICE): per (head, slice)
     // running max / exp-sum / unnormalized AV accumulator, combined per head in the chain's
@@ -1696,6 +1701,8 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
     s.xs |> resize(maxn / 32l)
     s.xq2 |> resize(ffw)        // fused-FFN chain requant (see the Session field comment)
     s.xs2 |> resize(ffw / 32l)
+    s.xbs |> resize(maxn / 16l)   // K-quant per-16 activation sums (~KB — sized regardless of format)
+    s.xbs2 |> resize(ffw / 16l)
     if (kdt == KVDtype.q8_0) {  // q8_0 K: the roped query quantizes ONCE per token (ggml lesson)
         s.attq |> resize(qd)
         s.atts |> resize(qd / 32l)
