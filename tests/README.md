@@ -583,6 +583,8 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | _glob.das | *(helper)* Shared module defining `AAA = 10` | |
 | _helper_foo.das | *(helper)* Module providing `TestObjectFoo` struct and `testFoo` function | |
 | _helper_macro_uninferred.das | *(helper)* `[bad_emitter]` structure_macro that adds an un-inferred function during patch | |
+| _fixup_init_macro.das | *(helper)* `[fixup_init_capture]` function_macro whose fixup installs a call-shaped global init (to_array_move) | |
+| test_fixup_global_init.das | Pipeline contract — a call-shaped global init installed by an annotation's fixup() resolves via the post-fixup dirty re-infer and evaluates | |
 | _lambda_vis_inner.das | *(helper)* Non-public leaf module for lambda_in_generic_module_vis — provides `inner_dot` | |
 | _lambda_vis_mid.das | *(helper)* Mid module hosting generics whose outlined lambdas/generators/local fns must resolve `inner_dot` | |
 | _module_a.das | *(helper)* Module for module_vis_fail — globals, types, functions | |

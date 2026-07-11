@@ -340,3 +340,21 @@ test fixture `_msl_common.das`, not the emitter (the emitter modules are macro-o
 never AOT'd — a runtime `declared_msl_census()` there would 50101 under `test_aot`).
 das gotcha for kernel authors: emitter-facing das reserved words `label`/`expect` (now in
 CLAUDE.md gotchas). CI paravirtual probe still pending first push.
+
+**2026-07-11 — pipeline: fixup-set global inits now infer; dasSpirv blob fill patch→fixup**
+(rides this branch — surfaced reviewing dasMetal's apply/fixup model). Boris called dasSpirv's
+patch+astChanged blob fill a workaround for a compiler gap; confirmed and fixed. Diagnosis
+(both repro'd): `fixupAnnotations()` ran post-optimize and nothing inferred what fixup created —
+a call-shaped init (`to_array_move` from the `array<uint>` literal) died with 50607; and a naive
+re-infer at that old position re-tripped already-folded unsafe (31013 in daslib generics) because
+`foldUnsafe` strips the wrappers — the exact ordering constraint the scope_free comment documents.
+Fix (ast_parse.cpp): `fixupAnnotations()` moved to right after infer converges — BEFORE
+lint/foldUnsafe/optimize — followed by a dirty re-infer gated on any global init left uninferred;
+fixup output now flows through the whole back half like ordinary code. dasSpirv's blob+reflection
+fill moved patch→fixup, astChanged dance deleted (also deletes one full-program re-infer restart
+per shader-bearing module — those restarts marked EVERY function notInferred). The dasVulkan
+backend body-fill hooks stay in patch (function bodies genuinely need the in-loop re-infer).
+Consequence for annotation authors: fixup now sees PRE-optimize AST (dasMetal's emitter already
+handles both shapes; dasGlsl goldens unchanged — 98/98). Regression test independent of dasSpirv:
+`tests/language/test_fixup_global_init.das` + `_fixup_init_macro.das`. Green: tests/spirv 238/238
+(generation in fixup), glsl, msl, metal, language — dynamic + static binaries.
