@@ -24,13 +24,51 @@ def public matrix_info(t : TypeDecl?) : tuple<ok : bool; width : int; cols : int
     return (ok = false, width = 0, cols = 0)
 }
 
-// Type -> scalar class: 0 signed int, 1 unsigned int, 2 float (scalars and their 2/3/4 vectors);
-// -1 for anything else. The supported interface-block leaf set is exactly these 32-bit numerics.
+// The whole 16/8-bit type set of the shader arc: the lattice proper (contiguous appended
+// block in the Type enum) PLUS the pre-lattice small scalars, which live in the enum's old
+// region (near tInt) and are NOT covered by the range check.
+def public lattice_small_type(bt : Type) : bool {
+    return ((int(bt) >= int(Type.tFloat16) && int(bt) <= int(Type.tUByte16))
+        || bt == Type.tInt8 || bt == Type.tUInt8 || bt == Type.tInt16 || bt == Type.tUInt16)
+}
+
+// The 8/16-lane lattice forms (half8, short8/ushort8, byte8/16, ubyte8/16) are CPU-only by
+// design: shader vectors cap at 4 lanes on every target (SPIR-V OpTypeVector, GLSL vecN).
+// Both shader emitters key their dedicated fail-closed diagnostic on this predicate.
+def public cpu_only_lattice_width(bt : Type) : bool {
+    return (bt == Type.tHalf8
+        || bt == Type.tShort8 || bt == Type.tUShort8
+        || bt == Type.tByte8 || bt == Type.tByte16
+        || bt == Type.tUByte8 || bt == Type.tUByte16)
+}
+
+// Type -> scalar class: 0 signed int, 1 unsigned int, 2 float — scalars and their shader-legal
+// vectors, INCLUDING the 16/8-bit lattice (scalar float16/int8/uint8/int16/uint16 + 2/3/4-lane
+// half/short/ushort/byte/ubyte vectors); -1 for anything else (8/16-lane forms stay -1: CPU-only).
+// NOTE: scalar_class >= 0 no longer implies 32-bit — width-sensitive consumers must ALSO check
+// scalar_width(bt) == 32 until their lattice feature wave lands.
 def public scalar_class(bt : Type) : int {
-    if (bt == Type.tInt || bt == Type.tInt2 || bt == Type.tInt3 || bt == Type.tInt4) return 0
-    if (bt == Type.tUInt || bt == Type.tUInt2 || bt == Type.tUInt3 || bt == Type.tUInt4) return 1
-    if (bt == Type.tFloat || bt == Type.tFloat2 || bt == Type.tFloat3 || bt == Type.tFloat4) return 2
+    if (bt == Type.tInt || bt == Type.tInt2 || bt == Type.tInt3 || bt == Type.tInt4
+            || bt == Type.tInt16 || bt == Type.tShort2 || bt == Type.tShort3 || bt == Type.tShort4
+            || bt == Type.tInt8 || bt == Type.tByte2 || bt == Type.tByte3 || bt == Type.tByte4) return 0
+    if (bt == Type.tUInt || bt == Type.tUInt2 || bt == Type.tUInt3 || bt == Type.tUInt4
+            || bt == Type.tUInt16 || bt == Type.tUShort2 || bt == Type.tUShort3 || bt == Type.tUShort4
+            || bt == Type.tUInt8 || bt == Type.tUByte2 || bt == Type.tUByte3 || bt == Type.tUByte4) return 1
+    if (bt == Type.tFloat || bt == Type.tFloat2 || bt == Type.tFloat3 || bt == Type.tFloat4
+            || bt == Type.tFloat16 || bt == Type.tHalf2 || bt == Type.tHalf3 || bt == Type.tHalf4) return 2
     return -1
+}
+
+// Scalar bit width of a classified type: 32/16/8; 0 for unclassified types. The third axis
+// next to scalar_class/component_count — emitters key op/type/layout decisions on it.
+def public scalar_width(bt : Type) : int {
+    if (bt == Type.tFloat16 || bt == Type.tHalf2 || bt == Type.tHalf3 || bt == Type.tHalf4
+            || bt == Type.tInt16 || bt == Type.tShort2 || bt == Type.tShort3 || bt == Type.tShort4
+            || bt == Type.tUInt16 || bt == Type.tUShort2 || bt == Type.tUShort3 || bt == Type.tUShort4) return 16
+    if (bt == Type.tInt8 || bt == Type.tByte2 || bt == Type.tByte3 || bt == Type.tByte4
+            || bt == Type.tUInt8 || bt == Type.tUByte2 || bt == Type.tUByte3 || bt == Type.tUByte4) return 8
+    if (scalar_class(bt) >= 0 || bt == Type.tBool) return 32
+    return 0
 }
 
 // Lane count of a scalar/vector Type: 1/2/3/4; 0 for non-scalar/vector types.
@@ -39,12 +77,18 @@ def public component_count(bt : Type) : int {
     if (bt == Type.tInt2 || bt == Type.tUInt2 || bt == Type.tFloat2) return 2
     if (bt == Type.tInt3 || bt == Type.tUInt3 || bt == Type.tFloat3) return 3
     if (bt == Type.tInt4 || bt == Type.tUInt4 || bt == Type.tFloat4) return 4
+    if (bt == Type.tFloat16 || bt == Type.tInt8 || bt == Type.tUInt8 || bt == Type.tInt16 || bt == Type.tUInt16) return 1
+    if (bt == Type.tHalf2 || bt == Type.tShort2 || bt == Type.tUShort2 || bt == Type.tByte2 || bt == Type.tUByte2) return 2
+    if (bt == Type.tHalf3 || bt == Type.tShort3 || bt == Type.tUShort3 || bt == Type.tByte3 || bt == Type.tUByte3) return 3
+    if (bt == Type.tHalf4 || bt == Type.tShort4 || bt == Type.tUShort4 || bt == Type.tByte4 || bt == Type.tUByte4) return 4
     return 0
 }
 
 // ===== std140 layout for a UBO interface block =====
 // std140 base alignment: scalar -> 4, vec2 -> 8, vec3/vec4 -> 16. The base *size* of a vec3 is 12
 // (only its alignment is 16), so a scalar can pack into the trailing 4 bytes after a vec3.
+// 32-BIT ONLY by contract: std140 has no 16/8-bit story — compute_block_layout rejects lattice
+// members before these are consulted (the scalar_width gate below).
 def public std140_align(bt : Type) : int {
     let cc = component_count(bt)
     if (cc == 1) return 4
@@ -165,7 +209,7 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
             // scalar / vector element
             if (et.baseType != Type.tStructure && et.baseType != Type.tFixedArray && !matrix_info(et).ok) {
                 let ebt = et.baseType
-                if (scalar_class(ebt) < 0) {
+                if (scalar_class(ebt) < 0 || scalar_width(ebt) != 32) {
                     errors |> push("interface block '{sname}' field '{fld.name}': array element type {ebt} is not supported (only 32-bit int/uint/float scalars, their vectors, or nested structs of those)")
                     fields |> clear
                     return (ok = false, size = 0, align = 0)
@@ -208,7 +252,7 @@ def public compute_block_layout(sname : string; st : Structure?; var fields : ar
         }
         // terminal scalar / vector field
         let fbt = fld._type.baseType
-        if (scalar_class(fbt) < 0) {
+        if (scalar_class(fbt) < 0 || scalar_width(fbt) != 32) {
             errors |> push("interface block '{sname}' field '{fld.name}': type {fbt} is not supported (only 32-bit int/uint/float scalars, their vectors, matrices, fixed-arrays of those, and nested structs of those; bool has no physical interface-block layout in Vulkan)")
             fields |> clear
             return (ok = false, size = 0, align = 0)

@@ -205,6 +205,15 @@ def private generate_bind_uniform(fnMain : FunctionPtr; var fn : FunctionPtr; pa
             let isUniform = ((vv.annotation |> find_arg("uniform") is tBool) ||
                 (vv.annotation |> find_arg("push_constant") is tBool))
             if (isUniform) {
+                // 16/8-bit lattice uniforms fail closed HERE, before the generated bind code
+                // trips the typer on glUniformAny (no f16 setters exist); member_reaches_lattice
+                // peels array dims and recurses nested structs, so half4[4] / array<half4> /
+                // Inner[4]-with-lattice shapes all get the designed diagnostic
+                if (member_reaches_lattice(vv._type)) {
+                    macro_error(compiling_program(), vv.at,
+                        "uniform '{vv.name}': 16/8-bit lattice types are not supported in shader interfaces (in/out/uniform/ssbo) yet")
+                    continue
+                }
                 if (is_glsl_structure(vv, "sampler2D")) {
                     // bind_sampler_2d(binding, varName.texture2D)
                     let binding = vv.annotation |> find_arg("stage") ?as tInt ?? 0

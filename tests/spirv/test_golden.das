@@ -196,5 +196,6 @@ def test_golden_disassembly(t : T?) {
         // check() pins the plain-struct member ids + the payload access-chain order.
         check(t, "task_payload", task_payload_words())
         check(t, "mesh_payload", mesh_payload_words())
+        check(t, "lattice", lattice_words())
     }
 }

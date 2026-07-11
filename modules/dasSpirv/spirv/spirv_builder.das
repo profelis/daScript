@@ -144,10 +144,31 @@ def public type_bool(var m : SpirvModule) : uint {
     return id
 }
 
+// Sub-32-bit numeric types require their OpCapability (Float16/Int16/Int8 — all core in
+// SPIR-V 1.3, no OpExtension; spirv-val verified). Emitting it HERE, in the type factory,
+// makes the cap impossible to forget: any path that creates the type pulls it. Deduped
+// through the type pool alongside the type itself.
+def private ensure_width_cap(var m : SpirvModule; is_float : bool; width : uint) {
+    if (width == 32u) {
+        return
+    }
+    let key = is_float ? "cap_f{width}" : "cap_i{width}"
+    return if ((m.type_pool?[key] ?? 0u) != 0u)
+    if (is_float && width == 16u) {
+        emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Float16))
+    } elif (!is_float && width == 16u) {
+        emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Int16))
+    } elif (!is_float && width == 8u) {
+        emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.Int8))
+    }
+    m.type_pool |> insert(key, 1u)
+}
+
 def public type_int(var m : SpirvModule; width, signedness : uint) : uint {
     let key = "i{width}_{signedness}"
     let ex = m.type_pool?[key] ?? 0u
     return ex if (ex != 0u)
+    ensure_width_cap(m, false, width)
     let id = alloc_id(m)
     emit(m, SEC_TYPES, SpvOp.TypeInt, id, width, signedness)
     m.type_pool |> insert(key, id)
@@ -162,6 +183,7 @@ def public type_float(var m : SpirvModule; width : uint) : uint {
     let key = "f{width}"
     let ex = m.type_pool?[key] ?? 0u
     return ex if (ex != 0u)
+    ensure_width_cap(m, true, width)
     let id = alloc_id(m)
     emit(m, SEC_TYPES, SpvOp.TypeFloat, id, width)
     m.type_pool |> insert(key, id)
@@ -470,6 +492,100 @@ def public const_float(var m : SpirvModule; v : float) : uint {
 
 // Boolean OpConstant: OpConstantTrue / OpConstantFalse carry NO literal word (the opcode IS the
 // value), so this is type + result-id only. Keyed separately so it never collides with const_int 0/1.
+// f32 -> f16 bits, round-to-nearest-even — the das CPU reference semantics exactly (its
+// float16 converts are RNE too, so a folded CPU constant and this routine agree bit-for-bit).
+// Pure das because the f16_cvt daslib lives in dasLLVM (not requireable from here).
+def public float_to_half_bits(v : float) : uint {
+    let bits = unsafe(reinterpret<uint>(v))
+    let s = (bits >> 16u) & 0x8000
+    let ebits = int((bits >> 23u) & 0xff)
+    var mant = bits & 0x7fffff
+    if (ebits == 0xff) {    // inf / nan (keep a nan payload bit so nan stays nan)
+        return s | 0x7c00 | (mant != 0u ? (0x200 | (mant >> 13u)) : 0u)
+    }
+    let e = ebits - 127 + 15
+    if (e >= 0x1f) {
+        return s | 0x7c00  // overflow -> signed infinity
+    }
+    if (e <= 0) {           // subnormal half (or underflow to signed zero)
+        if (e < -10) {
+            return s
+        }
+        mant |= 0x800000
+        let shift = uint(14 - e)
+        var r = mant >> shift
+        let rem = mant & ((1u << shift) - 1u)
+        let halfway = 1u << (shift - 1u)
+        if (rem > halfway || (rem == halfway && (r & 1u) != 0u)) {
+            r ++
+        }
+        return s | r
+    }
+    var r = (uint(e) << 10u) | (mant >> 13u)
+    let rem = mant & 0x1fff
+    if (rem > 0x1000 || (rem == 0x1000 && (r & 1u) != 0u)) {
+        r ++                // RNE; a mantissa carry rolls into the exponent correctly (may hit inf)
+    }
+    return s | r
+}
+
+// Sub-32-bit OpConstant literals pack into ONE word: floats zero-extend, signed ints
+// sign-extend, unsigned ints zero-extend (SPIR-V 2.2.1 literal rules).
+def public const_float16(var m : SpirvModule; bits16 : uint) : uint {
+    let key = "ch_{bits16}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let ft = type_float(m, 16u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.Constant, ft, id, bits16 & 0xffff)
+    m.const_pool |> insert(key, id)
+    return id
+}
+
+def public const_int16(var m : SpirvModule; v : int) : uint {
+    let key = "ci16_{v}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let it = type_int(m, 16u, 1u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.Constant, it, id, uint(v))     // sign-extended word
+    m.const_pool |> insert(key, id)
+    return id
+}
+
+def public const_uint16(var m : SpirvModule; v : uint) : uint {
+    let key = "cu16_{v}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let it = type_int(m, 16u, 0u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.Constant, it, id, v & 0xffff)
+    m.const_pool |> insert(key, id)
+    return id
+}
+
+def public const_int8(var m : SpirvModule; v : int) : uint {
+    let key = "ci8_{v}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let it = type_int(m, 8u, 1u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.Constant, it, id, uint(v))     // sign-extended word
+    m.const_pool |> insert(key, id)
+    return id
+}
+
+def public const_uint8(var m : SpirvModule; v : uint) : uint {
+    let key = "cu8_{v}"
+    let ex = m.const_pool?[key] ?? 0u
+    return ex if (ex != 0u)
+    let it = type_int(m, 8u, 0u)
+    let id = alloc_id(m)
+    emit(m, SEC_TYPES, SpvOp.Constant, it, id, v & 0xff)
+    m.const_pool |> insert(key, id)
+    return id
+}
+
 def public const_bool(var m : SpirvModule; v : bool) : uint {
     let key = "cb_{v}"
     let ex = m.const_pool?[key] ?? 0u

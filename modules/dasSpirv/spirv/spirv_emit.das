@@ -96,6 +96,7 @@ struct EmitCtx {
     stage         : ShaderStage                 // the shader stage (texture() implicit-LOD sampling is fragment-only)
     uses_frag_depth : bool                      // gl_FragDepth referenced (Output-only, so = written) -> emit DepthReplacing
     image_query_cap : bool                      // OpCapability ImageQuery already emitted (textureSize)
+    sio16_cap : bool                            // OpCapability StorageInputOutput16 already emitted (16-bit varyings)
     input_attachment_cap : bool                 // OpCapability InputAttachment already emitted (subpassLoad)
     draw_parameters_cap : bool                  // OpCapability DrawParameters already emitted (gl_DrawID)
     descriptor_indexing_cap : bool              // OpCapability ShaderNonUniform + OpExtension "SPV_EXT_descriptor_indexing" already emitted (nonuniformEXT, descriptor arrays)
@@ -333,8 +334,9 @@ def private ssbo_element_layout(var m : SpirvModule; sname : string; et : TypeDe
         if (!bs.ok) return (ok = false, elem_type = 0u, stride = 0)
         return (ok = true, elem_type = bs.type_id, stride = round_up(bs.size, bs.align))
     }
-    // 32-bit scalar or its 2/3/4 vector (scalar_class rejects bool and non-numeric base types)
-    if (component_count(bt) >= 1 && scalar_class(bt) >= 0) {
+    // 32-bit scalar or its 2/3/4 vector (scalar_class rejects bool and non-numeric base types;
+    // the width gate keeps 16/8-bit lattice elements out until the storage-caps wave)
+    if (component_count(bt) >= 1 && scalar_class(bt) >= 0 && scalar_width(bt) == 32) {
         return (ok = true, elem_type = emit_type(m, et), stride = round_up(std140_size(bt), std140_align(bt)))
     }
     errors |> push("ssbo '{sname}' element type {bt} is not supported (a 32-bit scalar, a vector of those, or a struct of those)")
@@ -407,6 +409,8 @@ def private is_emittable_value_type(t : TypeDecl?) : bool {
     if (matrix_info(t).ok) return true
     let bt = t.baseType
     if (bt == Type.tFixedArray && t.firstType != null) return is_emittable_value_type(t.firstType)
+    // every classified width emits: 32-bit natively, 16/8-bit through the width-generic type
+    // factories (which pull Float16/Int16/Int8 caps). 8/16-lane forms stay unclassified (-1).
     return scalar_class(bt) >= 0 || bt == Type.tBool
 }
 
@@ -640,6 +644,21 @@ def private classify_global(var m : SpirvModule; var ctx : EmitCtx; v : Variable
             ctx.globals |> insert(intptr(v), GlobalInfo(var_id = avid, storage = SpvStorageClass.Output, value_type = arr, elem_type = elem_t, is_mesh_output = true))
             ctx.interface_ids |> push(avid)
             return
+        }
+        // varying type validation (emit_type would panic on e.g. a double varying); 16-bit
+        // varyings pull StorageInputOutput16; 8-bit varyings do not exist in Vulkan
+        // (SPV_KHR_8bit_storage has no Input/Output storage class)
+        if (!is_emittable_value_type(v._type)) {
+            errors |> push("stage variable '{vname}': type {v._type.baseType} is not a supported varying type")
+            return
+        }
+        let vw = scalar_width(v._type.baseType)
+        if (vw == 8) {
+            errors |> push("stage variable '{vname}': 8-bit varyings do not exist in Vulkan (SPV_KHR_8bit_storage has no Input/Output class)")
+            return
+        }
+        if (vw == 16) {
+            ensure_storage_input_output_16(m, ctx)
         }
         let vt = emit_type(m, v._type)
         let pt = type_pointer(m, storage, vt)
@@ -1118,29 +1137,43 @@ def private atomic_info(name : string; cls : int) : tuple<ok : bool; op : SpvOp;
 
 // ===== arithmetic opcode selection =====
 
-// A scalar type-name used as a conversion call (float(x)/int(x)/uint(x)). Returns the destination
-// scalar class (0 signed / 1 unsigned / 2 float) or -1 if `name` is not a scalar type name. The
-// vecN constructor names (float2, ...) are handled separately by vector_ctor — they return -1 here.
-def private scalar_type_name_class(name : string) : int {
-    if (name == "int") return 0
-    if (name == "uint") return 1
-    if (name == "float") return 2
-    return -1
+// A scalar type-name used as a conversion call (float(x)/int8(x)/float16(x)/...). Returns the
+// destination scalar class (0 signed / 1 unsigned / 2 float) + bit width, or cls=-1 if `name`
+// is not a scalar type name. The vecN constructor names are handled by vector_ctor.
+def private scalar_type_name_class(name : string) : tuple<cls : int; width : int> {
+    if (name == "int") return (cls = 0, width = 32)
+    if (name == "uint") return (cls = 1, width = 32)
+    if (name == "float") return (cls = 2, width = 32)
+    if (name == "float16") return (cls = 2, width = 16)
+    if (name == "int16") return (cls = 0, width = 16)
+    if (name == "uint16") return (cls = 1, width = 16)
+    if (name == "int8") return (cls = 0, width = 8)
+    if (name == "uint8") return (cls = 1, width = 8)
+    return (cls = -1, width = 0)
 }
 
-// SPIR-V opcode for a scalar conversion from src class to dst class (caller handles same-class no-op).
-// int<->uint is a same-width bit reinterpret (OpBitcast — daslang two's-complement cast semantics);
-// float<->int/uint are value conversions.
-def private convert_op(src_cls, dst_cls : int) : tuple<ok : bool; code : SpvOp> {
+// SPIR-V opcode for a conversion between (class, width) pairs — scalar or lane-matched vector
+// (callers handle the same-class-same-width no-op). int<->uint at the SAME width is a bit
+// reinterpret (OpBitcast — daslang two's-complement cast semantics); same-class width changes
+// are FConvert (f16<->f32) / SConvert / UConvert (SPIR-V narrowing keeps low bits = the das
+// C-truncation); class changes are value conversions (width-agnostic opcodes). Cross-sign
+// cross-width int casts stay unsupported (not in the das shader convert surface).
+def private convert_op(src_cls, src_w, dst_cls, dst_w : int) : tuple<ok : bool; code : SpvOp> {
+    if (src_cls == dst_cls) {
+        if (src_w == dst_w) return (ok = false, code = SpvOp.Nop)   // no-op — caller's case
+        if (src_cls == 2) return (ok = true, code = SpvOp.FConvert)
+        if (src_cls == 0) return (ok = true, code = SpvOp.SConvert)
+        if (src_cls == 1) return (ok = true, code = SpvOp.UConvert)
+    }
     if (dst_cls == 2) {                                             // -> float
         if (src_cls == 0) return (ok = true, code = SpvOp.ConvertSToF)
         if (src_cls == 1) return (ok = true, code = SpvOp.ConvertUToF)
     } elif (dst_cls == 0) {                                         // -> signed int
         if (src_cls == 2) return (ok = true, code = SpvOp.ConvertFToS)
-        if (src_cls == 1) return (ok = true, code = SpvOp.Bitcast)
+        if (src_cls == 1 && src_w == dst_w) return (ok = true, code = SpvOp.Bitcast)
     } elif (dst_cls == 1) {                                         // -> unsigned int
         if (src_cls == 2) return (ok = true, code = SpvOp.ConvertFToU)
-        if (src_cls == 0) return (ok = true, code = SpvOp.Bitcast)
+        if (src_cls == 0 && src_w == dst_w) return (ok = true, code = SpvOp.Bitcast)
     }
     return (ok = false, code = SpvOp.Nop)
 }
@@ -1221,20 +1254,35 @@ def private cmp_code(op : string; cls : int) : tuple<ok : bool; code : SpvOp> {
     return (ok = false, code = SpvOp.Nop)
 }
 
-// vector constructor name (float2/3/4, int2/3/4, uint2/3/4) -> lane count + component class
-// (0 signed, 1 unsigned, 2 float), else ok=false. The class lets the constructor reject
-// component-kind conversions (e.g. int4(float4(...))), which need conversion ops we don't emit yet.
-def private vector_ctor(name : string) : tuple<ok : bool; n : int; cls : int> {
-    if (name == "float2") return (ok = true, n = 2, cls = 2)
-    if (name == "float3") return (ok = true, n = 3, cls = 2)
-    if (name == "float4") return (ok = true, n = 4, cls = 2)
-    if (name == "int2") return (ok = true, n = 2, cls = 0)
-    if (name == "int3") return (ok = true, n = 3, cls = 0)
-    if (name == "int4") return (ok = true, n = 4, cls = 0)
-    if (name == "uint2") return (ok = true, n = 2, cls = 1)
-    if (name == "uint3") return (ok = true, n = 3, cls = 1)
-    if (name == "uint4") return (ok = true, n = 4, cls = 1)
-    return (ok = false, n = 0, cls = -1)
+// vector constructor name -> lane count + component class (0 signed, 1 unsigned, 2 float) +
+// component width, else ok=false. The (class, width) pair routes 1-arg component-kind
+// conversions through convert_op (the das_sv_cvt lane-matched convert surface).
+def private vector_ctor(name : string) : tuple<ok : bool; n : int; cls : int; width : int> {
+    if (name == "float2") return (ok = true, n = 2, cls = 2, width = 32)
+    if (name == "float3") return (ok = true, n = 3, cls = 2, width = 32)
+    if (name == "float4") return (ok = true, n = 4, cls = 2, width = 32)
+    if (name == "int2") return (ok = true, n = 2, cls = 0, width = 32)
+    if (name == "int3") return (ok = true, n = 3, cls = 0, width = 32)
+    if (name == "int4") return (ok = true, n = 4, cls = 0, width = 32)
+    if (name == "uint2") return (ok = true, n = 2, cls = 1, width = 32)
+    if (name == "uint3") return (ok = true, n = 3, cls = 1, width = 32)
+    if (name == "uint4") return (ok = true, n = 4, cls = 1, width = 32)
+    if (name == "half2") return (ok = true, n = 2, cls = 2, width = 16)
+    if (name == "half3") return (ok = true, n = 3, cls = 2, width = 16)
+    if (name == "half4") return (ok = true, n = 4, cls = 2, width = 16)
+    if (name == "short2") return (ok = true, n = 2, cls = 0, width = 16)
+    if (name == "short3") return (ok = true, n = 3, cls = 0, width = 16)
+    if (name == "short4") return (ok = true, n = 4, cls = 0, width = 16)
+    if (name == "ushort2") return (ok = true, n = 2, cls = 1, width = 16)
+    if (name == "ushort3") return (ok = true, n = 3, cls = 1, width = 16)
+    if (name == "ushort4") return (ok = true, n = 4, cls = 1, width = 16)
+    if (name == "byte2") return (ok = true, n = 2, cls = 0, width = 8)
+    if (name == "byte3") return (ok = true, n = 3, cls = 0, width = 8)
+    if (name == "byte4") return (ok = true, n = 4, cls = 0, width = 8)
+    if (name == "ubyte2") return (ok = true, n = 2, cls = 1, width = 8)
+    if (name == "ubyte3") return (ok = true, n = 3, cls = 1, width = 8)
+    if (name == "ubyte4") return (ok = true, n = 4, cls = 1, width = 8)
+    return (ok = false, n = 0, cls = -1, width = 0)
 }
 
 // OpExtInstImport "GLSL.std.450" once per module; returns the cached set id.
@@ -1257,6 +1305,14 @@ def private ensure_image_query(var m : SpirvModule; var ctx : EmitCtx) {
     if (ctx.image_query_cap) return
     emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.ImageQuery))
     ctx.image_query_cap = true
+}
+
+// 16-bit stage I/O (a half/short/ushort varying) requires StorageInputOutput16 — core in
+// SPIR-V 1.3, cap only (SPV_KHR_16bit_storage needs no OpExtension at our baseline).
+def private ensure_storage_input_output_16(var m : SpirvModule; var ctx : EmitCtx) {
+    if (ctx.sio16_cap) return
+    emit(m, SEC_CAPS, SpvOp.Capability, uint(SpvCapability.StorageInputOutput16))
+    ctx.sio16_cap = true
 }
 
 // Subpass-input attachments (OpTypeImage Dim=SubpassData) require the InputAttachment capability.
@@ -1340,6 +1396,12 @@ def private ensure_ray_tracing(var m : SpirvModule; var ctx : EmitCtx) {
 // Only dependency-free builtin `math` functions appear here (no dead branches). Excluded on purpose:
 // daslang has no mix.
 def private glsl_ext_op(name : string; cls : int) : tuple<ok : bool; op : GLSLstd450> {
+    if (name == "packHalf2x16") {
+        return (ok = true, op = GLSLstd450.PackHalf2x16)     // float2 -> uint (RNE per lane)
+    }
+    if (name == "unpackHalf2x16") {
+        return (ok = true, op = GLSLstd450.UnpackHalf2x16)   // uint -> float2 (exact)
+    }
     if (name == "abs") {
         if (cls == 2) return (ok = true, op = GLSLstd450.FAbs)
         if (cls == 0) return (ok = true, op = GLSLstd450.SAbs)
@@ -1437,6 +1499,18 @@ def private emit_const(var m : SpirvModule; e : ExpressionPtr; var errors : arra
     if (cf != null) return (ok = true, id = const_float(m, cf.value))
     let cb = e ?as ExprConstBool
     if (cb != null) return (ok = true, id = const_bool(m, cb.value))
+    // 16/8-bit scalar constants (lattice VECTOR constants don't exist as nodes — they arrive
+    // as all-constant ctor calls and fold through the composite path below)
+    let ch = e ?as ExprConstFloat16
+    if (ch != null) return (ok = true, id = const_float16(m, float_to_half_bits(float(ch.value))))
+    let ci16 = e ?as ExprConstInt16
+    if (ci16 != null) return (ok = true, id = const_int16(m, int(ci16.value)))
+    let cu16 = e ?as ExprConstUInt16
+    if (cu16 != null) return (ok = true, id = const_uint16(m, uint(cu16.value)))
+    let ci8 = e ?as ExprConstInt8
+    if (ci8 != null) return (ok = true, id = const_int8(m, int(ci8.value)))
+    let cu8 = e ?as ExprConstUInt8
+    if (cu8 != null) return (ok = true, id = const_uint8(m, uint(cu8.value)))
     // unary minus on a constant: depending on fold state `-0.6` can arrive as ExprOp1("-", const)
     // rather than a folded negative literal. Fold it here so both shapes produce the same constant.
     let neg = e ?as ExprOp1
@@ -1506,12 +1580,53 @@ def private emit_const(var m : SpirvModule; e : ExpressionPtr; var errors : arra
         parts |> reserve(length(call.arguments))
         for (a in call.arguments) {
             let cc = component_count(a._type.baseType)
-            if (cc == 0 || scalar_class(a._type.baseType) != vc.cls) {
+            let a_cls = scalar_class(a._type.baseType)
+            let a_w = scalar_width(a._type.baseType)
+            if (cc == 0 || a_cls != vc.cls) {
                 errors |> push("{call.name}: constant constructor constituent of type {a._type.baseType} has the wrong component kind")
                 delete parts
                 return (ok = false, id = 0u)
             }
             total += cc
+            if (a_w != vc.width && cc == 1) {
+                // narrow the constant LANE at compile time (das per-lane ctors take int32/float
+                // args and C-truncate / RNE-round — mirror that exactly on the constant)
+                var narrowed = 0u
+                var got = false
+                let nci = a ?as ExprConstInt
+                if (nci != null && vc.width == 16) {
+                    narrowed = const_int16(m, int(int16(nci.value)))
+                    got = true
+                } elif (nci != null && vc.width == 8) {
+                    narrowed = const_int8(m, int(int8(nci.value)))
+                    got = true
+                }
+                let ncu = a ?as ExprConstUInt
+                if (ncu != null && vc.width == 16) {
+                    narrowed = const_uint16(m, uint(uint16(ncu.value)))
+                    got = true
+                } elif (ncu != null && vc.width == 8) {
+                    narrowed = const_uint8(m, uint(uint8(ncu.value)))
+                    got = true
+                }
+                let ncf = a ?as ExprConstFloat
+                if (ncf != null && vc.width == 16) {
+                    narrowed = const_float16(m, float_to_half_bits(ncf.value))
+                    got = true
+                }
+                if (!got) {
+                    errors |> push("{call.name}: constant constituent of type {a._type.baseType} cannot narrow to the component width")
+                    delete parts
+                    return (ok = false, id = 0u)
+                }
+                parts |> push(narrowed)
+                continue
+            }
+            if (a_w != vc.width) {
+                errors |> push("{call.name}: constant constructor constituent of type {a._type.baseType} has the wrong component width")
+                delete parts
+                return (ok = false, id = 0u)
+            }
             let pr = emit_const(m, a, errors)
             if (!pr.ok) {
                 errors |> push("{call.name}: constructor argument is not a compile-time constant")
@@ -1622,7 +1737,11 @@ def private declare_local_var(var m : SpirvModule; var ctx : EmitCtx; v : Variab
     let bt = v._type.baseType
     if (scalar_class(bt) < 0 && bt != Type.tBool && bt != Type.tFixedArray) {
         // emit_type would panic on an unsupported base type; reject with a clean error instead.
-        errors |> push("local '{v.name}': type {bt} is not supported yet (only 32-bit int/uint/float scalars+vectors, bool, and fixed arrays)")
+        if (cpu_only_lattice_width(bt)) {
+            errors |> push("local '{v.name}': type {bt} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)")
+        } else {
+            errors |> push("local '{v.name}': type {bt} is not supported yet (only int/uint/float scalars+vectors, bool, and fixed arrays)")
+        }
         return
     }
     let vt = emit_type(m, v._type)
@@ -1837,6 +1956,31 @@ class SpirvEmit : AstVisitor {
     def override visitExprConstBool(var expr : ExprConstBool?) : ExpressionPtr {
         var bm & = unsafe(*m)
         e2id[intptr(expr)] = const_bool(bm, expr.value)
+        return expr
+    }
+    def override visitExprConstFloat16(var expr : ExprConstFloat16?) : ExpressionPtr {
+        var bm & = unsafe(*m)
+        e2id[intptr(expr)] = const_float16(bm, float_to_half_bits(float(expr.value)))
+        return expr
+    }
+    def override visitExprConstInt16(var expr : ExprConstInt16?) : ExpressionPtr {
+        var bm & = unsafe(*m)
+        e2id[intptr(expr)] = const_int16(bm, int(expr.value))
+        return expr
+    }
+    def override visitExprConstUInt16(var expr : ExprConstUInt16?) : ExpressionPtr {
+        var bm & = unsafe(*m)
+        e2id[intptr(expr)] = const_uint16(bm, uint(expr.value))
+        return expr
+    }
+    def override visitExprConstInt8(var expr : ExprConstInt8?) : ExpressionPtr {
+        var bm & = unsafe(*m)
+        e2id[intptr(expr)] = const_int8(bm, int(expr.value))
+        return expr
+    }
+    def override visitExprConstUInt8(var expr : ExprConstUInt8?) : ExpressionPtr {
+        var bm & = unsafe(*m)
+        e2id[intptr(expr)] = const_uint8(bm, uint(expr.value))
         return expr
     }
 
@@ -3025,10 +3169,11 @@ class SpirvEmit : AstVisitor {
             e2id[k] = res
             return expr
         }
-        // scalar numeric conversion: float(int/uint), int(float/uint), uint(float/int). Same-class is a
-        // no-op passthrough; cross-class emits OpConvert* / OpBitcast. Scalar only (vector casts rejected).
-        let dst_cls = scalar_type_name_class(name)
-        if (dst_cls >= 0 && length(expr.arguments) == 1) {
+        // scalar numeric conversion: float(int/uint), float16(float), int8(float), ... Same class
+        // AND width is a no-op passthrough; anything else emits OpConvert*/OpF/S/UConvert/OpBitcast
+        // per convert_op. Scalar only (lane-matched vector converts ride the ctor path below).
+        let dst = scalar_type_name_class(name)
+        if (dst.cls >= 0 && length(expr.arguments) == 1) {
             let a0 = expr.arguments[0]
             if (component_count(a0._type.baseType) != 1) {
                 errs |> push("{name}: vector conversion is not supported (scalar only)")
@@ -3037,11 +3182,12 @@ class SpirvEmit : AstVisitor {
             let aid = value_of(a0)
             if (aid == 0u) return expr
             let src_cls = scalar_class(a0._type.baseType)
-            if (src_cls == dst_cls) {            // same-class no-op cast, e.g. float(someFloat)
+            let src_w = scalar_width(a0._type.baseType)
+            if (src_cls == dst.cls && src_w == dst.width) {  // same class+width no-op, e.g. float(someFloat)
                 e2id[k] = aid
                 return expr
             }
-            let cc = convert_op(src_cls, dst_cls)
+            let cc = convert_op(src_cls, src_w, dst.cls, dst.width)
             if (!cc.ok) {
                 errs |> push("{name}: conversion from {a0._type.baseType} is not supported")
                 return expr
@@ -3059,17 +3205,41 @@ class SpirvEmit : AstVisitor {
             if (length(expr.arguments) == 1) {
                 let a0 = expr.arguments[0]
                 let cc = component_count(a0._type.baseType)
-                if (scalar_class(a0._type.baseType) != vc.cls) {
-                    // same-width component-kind conversion: float2(uint2) -> OpConvertUToF,
-                    // int2(uint2) -> OpBitcast, ... (OpConvert*/OpBitcast are vector-valid)
-                    let src_cls = scalar_class(a0._type.baseType)
+                let src_cls = scalar_class(a0._type.baseType)
+                let src_w = scalar_width(a0._type.baseType)
+                if (src_cls != vc.cls || src_w != vc.width) {
+                    // lane-matched component conversion: float2(uint2) -> OpConvertUToF,
+                    // half4(float4) -> OpFConvert, short4(int4) -> OpSConvert, ...
+                    // (OpConvert*/OpF/S/UConvert/OpBitcast are all vector-valid)
                     if (cc == vc.n && src_cls >= 0) {
-                        let cv = convert_op(src_cls, vc.cls)
+                        let cv = convert_op(src_cls, src_w, vc.cls, vc.width)
                         if (cv.ok) {
                             let aid = value_of(a0)
                             if (aid == 0u) return expr
                             let res = alloc_id(bm)
                             emit(bm, SEC_FUNCS, cv.code, rt, res, aid)
+                            e2id[k] = res
+                            return expr
+                        }
+                    }
+                    // splat-with-same-class-convert: half4(floatScalar) — convert the scalar
+                    // (single rounding, matches the CPU float16_t(float) RNE), then splat
+                    if (cc == 1 && src_cls == vc.cls) {
+                        let cv = convert_op(src_cls, src_w, vc.cls, vc.width)
+                        if (cv.ok) {
+                            let aid = value_of(a0)
+                            if (aid == 0u) return expr
+                            let et = emit_component_type(bm, expr._type)
+                            let conv = alloc_id(bm)
+                            emit(bm, SEC_FUNCS, cv.code, et, conv, aid)
+                            let res = alloc_id(bm)
+                            var cons <- [rt, res]
+                            cons |> reserve(2 + vc.n)
+                            for (_l in range(vc.n)) {
+                                cons |> push(conv)
+                            }
+                            emit_n(bm, SEC_FUNCS, SpvOp.CompositeConstruct, cons)
+                            delete cons
                             e2id[k] = res
                             return expr
                         }
@@ -3109,16 +3279,32 @@ class SpirvEmit : AstVisitor {
                     delete cons
                     return expr
                 }
-                if (scalar_class(a._type.baseType) != vc.cls) {
+                let a_cls = scalar_class(a._type.baseType)
+                let a_w = scalar_width(a._type.baseType)
+                if (a_cls != vc.cls || (a_w != vc.width && !(cc == 1 && a_cls == vc.cls))) {
                     errs |> push("{name}: constituent of type {a._type.baseType} has a different component kind (conversion not supported yet)")
                     delete cons
                     return expr
                 }
                 total += cc
-                let aid = value_of(a)
+                var aid = value_of(a)
                 if (aid == 0u) {
                     delete cons
                     return expr
+                }
+                if (a_w != vc.width) {
+                    // per-lane scalar constituent of a narrower/wider ctor (the CPU per-lane
+                    // registrations take int32/float args): same-class convert, one scalar op
+                    let cv = convert_op(a_cls, a_w, vc.cls, vc.width)
+                    if (!cv.ok) {
+                        errs |> push("{name}: constituent of type {a._type.baseType} cannot convert to the component type")
+                        delete cons
+                        return expr
+                    }
+                    let et = emit_component_type(bm, expr._type)
+                    let conv = alloc_id(bm)
+                    emit(bm, SEC_FUNCS, cv.code, et, conv, aid)
+                    aid = conv
                 }
                 cons |> push(aid)
             }

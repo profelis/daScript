@@ -168,3 +168,17 @@ def public discard() : void {}
 [unused_argument(p), sideeffects] def public fwidth(p : float2) : float2 { return p }
 [unused_argument(p), sideeffects] def public fwidth(p : float3) : float3 { return p }
 [unused_argument(p), sideeffects] def public fwidth(p : float4) : float4 { return p }
+
+// ===== fp16 packing =====
+// packHalf2x16/unpackHalf2x16: the portable fp16 STORAGE bridge — core in GLSL ES 3.00 and
+// GL 4.20 (GL_ARB_shading_language_packing below 4.20; the GLSL emitter adds the #extension
+// on demand); SPIR-V lowers to GLSL.std.450 PackHalf2x16/UnpackHalf2x16. Unlike the emit-only
+// markers above these carry REAL bodies: the CPU converts are RNE like the GPU ops, and das
+// half2 is bit-layout-identical to the packed uint (lane 0 low), so CPU == GPU exactly.
+def public packHalf2x16(v : float2) : uint {
+    return unsafe(reinterpret<uint>(half2(v)))
+}
+
+def public unpackHalf2x16(bits : uint) : float2 {
+    return float2(unsafe(reinterpret<half2>(bits)))
+}

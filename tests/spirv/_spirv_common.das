@@ -1753,3 +1753,36 @@ def public rt_stage_emitter_opcodes : table<uint> {
     }
     return <- s
 }
+
+// ===== 16/8-bit lattice: width converts (half<->float FConvert, short<-int SConvert,
+// ushort<-uint UConvert) — the only genuinely new opcodes of the lattice arc (fp16
+// arithmetic reuses FAdd/FMul/...; the Float16/Int16/Int8 capabilities are pulled by
+// the type factories and don't enter the opcode census). =====
+def public lattice_emitter_opcodes : table<uint> {
+    var s <- rt_stage_emitter_opcodes()
+    for (op in [SpvOp.FConvert, SpvOp.SConvert, SpvOp.UConvert]) {
+        s |> insert(uint(op))
+    }
+    return <- s
+}
+
+var @ssbo @binding = 0 lat_data : array<float>
+
+[compute_shader(local_size_x=64, name="lattice_spv"), marker(no_coverage)]
+def lattice_kernel {
+    let gi = gl_GlobalInvocationID.x
+    var h = half4(1h, 2h, 3h, 4h)                // const composite (f16 lanes)
+    let s = half4(lat_data[gi])                   // splat-with-convert: FConvert f32->f16 + construct
+    h = h * s                                     // FMul on f16 lanes
+    h = h + half4(0.25h)                          // FAdd on f16 lanes
+    let n = short4(-3, 7, 100, -100)              // per-lane SConvert i32->i16 (runtime shape)
+    let un = ushort2(1u, 65535u)                  // per-lane UConvert u32->u16
+    let w = int4(n)                               // widen SConvert i16->i32
+    let uw = uint2(un)                            // widen UConvert u16->u32
+    let f = float4(h)                             // FConvert f16->f32
+    lat_data[gi] = f.x + f.w + float(w.y) + float(uw.x) + float(1.5h)
+}
+
+def public lattice_words : array<uint> {
+    return clone_to_move(lattice_spv)
+}

@@ -1538,9 +1538,12 @@ local-GPU behavioral proof through dasVulkan.
 - **Atomics — 64-bit (`Int64Atomics`), float (`AtomicFloat32AddEXT`).** Wishlist.
 - **Missing sampler types — `sampler2DMS`, `samplerCubeShadow`, `sampler2DArrayShadow`.** Declare in
   `spirv_builtins.das` when a tutorial needs them.
-- **Wider numeric types — 16-bit (`Float16`/`Int16` caps) and 64-bit (`Float64`/`Int64`).** `double`
-  rejected for shader function params (`spirv_emit.das:~2730`); `var d : double` rejected. No tutorial
-  blocker.
+- **Wider numeric types — 64-bit (`Float64`/`Int64`).** `double` rejected for shader function params
+  (`spirv_emit.das:~2730`); `var d : double` rejected. No tutorial blocker. **The 16/8-bit half LANDED**
+  (shader-lattice arc): float16/half2-4, int8/uint8/int16/uint16 scalars, short/ushort/byte/ubyte 2-4
+  vectors — types/consts/locals/ctors/converts/fp16 arithmetic, `Float16`/`Int16`/`Int8` caps via the
+  width-generic type factories, `StorageInputOutput16` varyings, GLSL.std.450 pack/unpackHalf2x16;
+  8/16-lane forms + lattice UBO/SSBO members stay fail-closed. Conformance: `tests/spirv/test_conf_*`.
 - **Interpolation qualifiers beyond `@flat`** — `noperspective` / `centroid` / `sample`. No blocker.
 
 ### Explicit non-goals (clarified by the audit, do not plan)
