@@ -397,6 +397,23 @@ def context_specs : array<ContextSpec> {
                 w |> write("\}\n\n")
                 w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_ubo_array_glsl\}\\n\")\n\}\n")
             }),
+        // members hidden behind nested structs must be found by the recursive scan (Copilot R3)
+        ContextSpec(name = "_fc_lattice_ubo_nested", rail = "glsl", needle = "16/8-bit lattice members have no std140 layout",
+            body = build_string() $(var w) {
+                w |> write("options no_unused_function_arguments = false\n\n")
+                w |> write("[unused_argument(program, blockName, size)] def std140_reset(program : uint; blockName : string; size : int) \{\}\n")
+                w |> write("[unused_argument(program, blockName, offset, value)] def std140_set(program : uint; blockName : string; offset : uint; value) \{\}\n")
+                w |> write("[unused_argument(program, blockName, bindingPoint)] def std140_flush(program : uint; blockName : string; bindingPoint : int) \{\}\n\n")
+                w |> write("struct FcInnerLat \{\n    h : half4\n\}\n\n")
+                w |> write("struct FcUboNestLat \{\n    a : float4\n    inner : FcInnerLat\n\}\n\n")
+                w |> write("var @uniform fc_ugn_lat : FcUboNestLat\n")
+                w |> write("var @out fc_ugn_color : float4\n\n")
+                w |> write("[fragment_program(name=\"fc_lat_ubo_nested_glsl\")]\n")
+                w |> write("def fc_lat_ubo_nested_fragment \{\n")
+                w |> write("    fc_ugn_color = fc_ugn_lat.a\n")
+                w |> write("\}\n\n")
+                w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_ubo_nested_glsl\}\\n\")\n\}\n")
+            }),
         // loose lattice uniforms must get the designed interface diagnostic from the BIND
         // generator (glsl_opengl), not a typer error on the generated glUniformAny call
         ContextSpec(name = "_fc_lattice_uniform", rail = "glsl", needle = "not supported in shader interfaces", code = 50503,

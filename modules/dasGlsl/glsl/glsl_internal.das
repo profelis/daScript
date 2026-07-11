@@ -49,6 +49,30 @@ bitfield ShaderExportCaps {
     pack_std140_uniforms                        // emit a struct @uniform/@push_constant as a std140 interface block (UBO) instead of a free `uniform Struct name;`; the host binds it via glBindBufferRange (GL/WebGL2 portable floor)
 }
 
+// does this block-member type reach a 16/8-bit lattice element? peels array/fixed-array
+// dims and recurses nested structs — the std140 fail-closed scan must see hidden members
+[macro_function]
+def member_reaches_lattice(t : TypeDeclPtr) : bool {
+    var cur = t
+    while (cur != null && (cur.baseType == Type.tArray || cur.baseType == Type.tFixedArray)) {
+        cur = cur.firstType
+    }
+    if (cur == null) {
+        return false
+    }
+    if (lattice_small_type(cur.baseType)) {
+        return true
+    }
+    if (cur.baseType == Type.tStructure && cur.structType != null) {
+        for (f in cur.structType.fields) {
+            if (member_reaches_lattice(f._type)) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
 class GlslShader : AstFunctionAnnotation {
     shaderType = ShaderType.vertex
     write_version = true
@@ -102,12 +126,7 @@ class GlslShader : AstFunctionAnnotation {
             if (empty(latErr) && gvar._type.baseType == Type.tStructure && gvar._type.structType != null) {
                 if (gvar.annotation |> find_arg("uniform") is tBool || gvar.annotation |> find_arg("push_constant") is tBool) {
                     for (f in gvar._type.structType.fields) {
-                        // peel array/fixed-array dims — a half4[4] member is just as lattice
-                        var f_elem = f._type
-                        while (f_elem != null && (f_elem.baseType == Type.tArray || f_elem.baseType == Type.tFixedArray)) {
-                            f_elem = f_elem.firstType
-                        }
-                        if (f_elem != null && lattice_small_type(f_elem.baseType)) {
+                        if (member_reaches_lattice(f._type)) {
                             latErr = "uniform block '{gvar.name}' field '{f.name}': 16/8-bit lattice members have no std140 layout (not supported yet)"
                             break
                         }
