@@ -3051,11 +3051,10 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
     let c = t.config
     // head_size % 32: the per-head epilogues slice on head boundaries, and the wo-input requant
     // needs whole 32-quant groups per head (real targets are 64/128/256; stories15M's 48 falls back)
-    // !wscale_f16: the chains hoist f32 scale-plane pointers — the f16-plane twins are stage 2
-    // of the rail; until then an f16 model decodes through the per-op dispatch path
-    return (g_fused_decode && t.quant == QuantMode.q8 && !t.wscale_f16 && g_use_rope_table
+    return (g_fused_decode && t.quant == QuantMode.q8 && g_use_rope_table
         && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
         && get_jobque_team_mode() && kernel_backend_has_rows()
+        && (!t.wscale_f16 || kernel_backend_has_rows16())
         && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
 }
 
@@ -3163,17 +3162,30 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         var kcl = kv_layer_kbase(s, l, c.seq_len)  // layer-base byte pointers (stores + the _d read dispatch)
         var vcl = kv_layer_vbase(s, l, c.seq_len)
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))   // this layer's physical runs (fork-safe hoist)
-        // weight region bases (element offsets into the Q8 blob, scales at /32)
+        // weight region bases (element offsets into the Q8 blob, scales at /32); wscale_f16
+        // models carry the binary16 plane instead (qscales is freed — hoist only the live one)
+        let f16w = t.wscale_f16
+        let mmrows16 = mm_q8q8_rows16_fn()
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
-        let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        var wsb : float const? = null
+        var wsb16 : uint16 const? = null
+        if (f16w) {
+            wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+        } else {
+            wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        }
         let wpq = wqb + t.wq_offs[l]
         let wsq = wsb + t.wq_offs[l] / 32l
+        let wsq16 = wsb16 + t.wq_offs[l] / 32l
         let wpk = wqb + t.wk_offs[l]
         let wsk = wsb + t.wk_offs[l] / 32l
+        let wsk16 = wsb16 + t.wk_offs[l] / 32l
         let wpv = wqb + t.wv_offs[l]
         let wsv = wsb + t.wv_offs[l] / 32l
+        let wsv16 = wsb16 + t.wv_offs[l] / 32l
         let wpo = wqb + t.wo_offs[l]
         let wso = wsb + t.wo_offs[l] / 32l
+        let wso16 = wsb16 + t.wo_offs[l] / 32l
         // this position's rope table row (dual-rope arches: the sliding class's row)
         let swa_row = is_sliding && has_dual_rope(c)
         let crow = swa_row ? reinterpret<float const?>(addr(s.rope_cos_swa[0])) : reinterpret<float const?>(addr(s.rope_cos[0]))
@@ -3207,7 +3219,11 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                     while (r < rend) {
                         if (r < qd) {
                             let r1 = min(rend, qd)
-                            invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r, r1)
+                            if (f16w) {
+                                invoke(mmrows16, qp, wpq, wsq16, xqp, xsp, dim, r, r1)
+                            } else {
+                                invoke(mmrows, qp, wpq, wsq, xqp, xsp, dim, r, r1)
+                            }
                             if (bqp != null) {
                                 add_inplace(qp + r, bqp + bqoff + r, r1 - r)
                             }
@@ -3215,7 +3231,11 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         } elif (r < qd + kv_dim) {
                             let r0 = r - qd
                             let r1 = min(rend, qd + kv_dim) - qd
-                            invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r1)
+                            if (f16w) {
+                                invoke(mmrows16, kp, wpk, wsk16, xqp, xsp, dim, r0, r1)
+                            } else {
+                                invoke(mmrows, kp, wpk, wsk, xqp, xsp, dim, r0, r1)
+                            }
                             if (bkp != null) {
                                 add_inplace(kp + r0, bkp + bkvoff + r0, r1 - r0)
                             }
@@ -3223,7 +3243,11 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         } else {
                             let r0 = r - qd - kv_dim
                             let r1 = min(rend, qd + 2l * kv_dim) - qd - kv_dim
-                            invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r1)
+                            if (f16w) {
+                                invoke(mmrows16, vp, wpv, wsv16, xqp, xsp, dim, r0, r1)
+                            } else {
+                                invoke(mmrows, vp, wpv, wsv, xqp, xsp, dim, r0, r1)
+                            }
                             if (bvp != null) {
                                 add_inplace(vp + r0, bvp + bkvoff + r0, r1 - r0)
                             }
@@ -3402,7 +3426,11 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                 unsafe {
                     let r0 = int64(jb) * 32l
                     let r1 = int64(je) * 32l
-                    invoke(mmrows, xb2p, wpo, wso, xqp, xsp, qd, r0, r1)
+                    if (f16w) {
+                        invoke(mmrows16, xb2p, wpo, wso16, xqp, xsp, qd, r0, r1)
+                    } else {
+                        invoke(mmrows, xb2p, wpo, wso, xqp, xsp, qd, r0, r1)
+                    }
                     if (bop != null) {
                         add_inplace(xb2p + r0, bop + booff + r0, r1 - r0)
                     }
@@ -3440,8 +3468,9 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
 // serial tail runs post-norm and/or the fused add+scale after the rendezvous.
 def private fused_ffn_ok(t : Model; l : int64) : bool {
     let c = t.config
-    return (g_fused_decode && t.quant == QuantMode.q8 && !t.wscale_f16
+    return (g_fused_decode && t.quant == QuantMode.q8
         && get_jobque_team_mode() && kernel_backend_has_rows()
+        && (!t.wscale_f16 || kernel_backend_has_rows16())
         && lanes_for_work(c.dim * layer_hidden(t, l), g_gemv_lane_cap) > 1)
 }
 
@@ -3488,25 +3517,41 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         var xsp = addr(s.xs[0])
         var xq2p = addr(s.xq2[0])
         var xs2p = addr(s.xs2[0])
+        let f16w = t.wscale_f16
+        let mmrows16 = mm_q8q8_rows16_fn()
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
-        let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        var wsb : float const? = null
+        var wsb16 : uint16 const? = null
+        if (f16w) {
+            wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+        } else {
+            wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        }
         let w1o = t.w1_offs[l]
         let w3o = t.w3_offs[l]
         let w2o = t.w2_offs[l]
         let wp1 = wqb + w1o
         let ws1 = wsb + w1o / 32l
+        let ws116 = wsb16 + w1o / 32l
         let wp3 = wqb + w3o
         let ws3 = wsb + w3o / 32l
+        let ws316 = wsb16 + w3o / 32l
         let wp2 = wqb + w2o
         let ws2 = wsb + w2o / 32l
+        let ws216 = wsb16 + w2o / 32l
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             unsafe {
                 let r0 = int64(jb) * 32l
                 let r1 = int64(je) * 32l
                 if (stage == 0) {
                     // paired gate/up rows, then act + requant on exactly these rows
-                    invoke(mmrows, gup, wp1, ws1, xqp, xsp, dim, r0, r1)
-                    invoke(mmrows, gup + hidden, wp3, ws3, xqp, xsp, dim, r0, r1)
+                    if (f16w) {
+                        invoke(mmrows16, gup, wp1, ws116, xqp, xsp, dim, r0, r1)
+                        invoke(mmrows16, gup + hidden, wp3, ws316, xqp, xsp, dim, r0, r1)
+                    } else {
+                        invoke(mmrows, gup, wp1, ws1, xqp, xsp, dim, r0, r1)
+                        invoke(mmrows, gup + hidden, wp3, ws3, xqp, xsp, dim, r0, r1)
+                    }
                     if (vec) {
                         if (is_gelu) {
                             geglu4(gup + r0, gup + hidden + r0, r1 - r0)
@@ -3528,7 +3573,11 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
                 } else {
                     // down-projection rows + residual add (post-norm / layer_out_scale arches
                     // defer the add — the caller's serial tail owns it)
-                    invoke(mmrows, xbp, wp2, ws2, xq2p, xs2p, hidden, r0, r1)
+                    if (f16w) {
+                        invoke(mmrows16, xbp, wp2, ws216, xq2p, xs2p, hidden, r0, r1)
+                    } else {
+                        invoke(mmrows, xbp, wp2, ws2, xq2p, xs2p, hidden, r0, r1)
+                    }
                     if (!defer_add) {
                         add_inplace(xp + r0, xbp + r0, r1 - r0)
                     }
@@ -4314,8 +4363,9 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
 // mm_fblob and can't), team mode + a backend row core, 32-aligned vocab, and worth threading.
 def private fused_cls_ok(t : Model) : bool {
     let c = t.config
-    return (g_fused_decode && t.quant == QuantMode.q8 && !t.wscale_f16
+    return (g_fused_decode && t.quant == QuantMode.q8
         && get_jobque_team_mode() && kernel_backend_has_rows()
+        && (!t.wscale_f16 || kernel_backend_has_rows16())
         && c.vocab_size % 32l == 0l
         && lanes_for_work(c.dim * c.vocab_size, g_gemv_lane_cap) > 1)
 }
@@ -4339,13 +4389,27 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
         var lp = addr(s.logits[0])
         var xqp = addr(s.xq[0])
         var xsp = addr(s.xs[0])
+        let f16w = t.wscale_f16
+        let mmrows16 = mm_q8q8_rows16_fn()
         let wp = reinterpret<int8 const?>(addr(t.qblob[0])) + t.wcls_off
-        let ws = reinterpret<float const?>(addr(t.qscales[0])) + t.wcls_off / 32l
+        var wsb : float const? = null
+        var wsb16 : uint16 const? = null
+        if (f16w) {
+            wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+        } else {
+            wsb = reinterpret<float const?>(addr(t.qscales[0]))
+        }
+        let ws = wsb + t.wcls_off / 32l
+        let ws16 = wsb16 + t.wcls_off / 32l
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             unsafe {
                 let r0 = int64(jb) * 32l
                 let r1 = int64(je) * 32l
-                invoke(mmrows, lp, wp, ws, xqp, xsp, dim, r0, r1)
+                if (f16w) {
+                    invoke(mmrows16, lp, wp, ws16, xqp, xsp, dim, r0, r1)
+                } else {
+                    invoke(mmrows, lp, wp, ws, xqp, xsp, dim, r0, r1)
+                }
                 softcap4(lp + r0, r1 - r0, cap)
             }
         }

@@ -1146,6 +1146,7 @@ var g_mm_q8q8_group3_s16 = @@q8q8_unset_group3_s16
 var g_mm_q8q8_groupn_s16 = @@q8q8_unset_groupn_s16
 var g_mm_q8q8_rows_s16 = @@q8q8_unset_rows_s16
 var g_active_has_wscale16 = false   // does the active backend carry the f16-scale twins?
+var g_active_has_rows16 = false     // ... including the f16-scale row-range GEMV core?
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 
@@ -1258,6 +1259,7 @@ def private activate(be : KernelBackend) {
     g_mm_q8q8_groupn_s16 = be.groupn_s16
     g_mm_q8q8_rows_s16 = be.mm_rows_s16
     g_active_has_wscale16 = !(be.mm_s16 == @@q8q8_unset_kernel_s16)
+    g_active_has_rows16 = !(be.mm_rows_s16 == @@q8q8_unset_rows_s16)
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
@@ -1409,6 +1411,12 @@ def kernel_backend_has_wscale16() : bool {
 //! twin of mm_q8q8_rows_fn. Same read-into-a-local rule.
 def mm_q8q8_rows16_fn() : MatmulQ8Q8RowsFnS16 {
     return g_mm_q8q8_rows_s16
+}
+
+//! Does the active backend carry the f16-scale row-range GEMV core? The chains' twin of
+//! kernel_backend_has_rows — a wscale_f16 model's fused chains gate on it.
+def kernel_backend_has_rows16() : bool {
+    return g_active_has_rows16
 }
 
 //! Registered backend names (diagnostics / tests).

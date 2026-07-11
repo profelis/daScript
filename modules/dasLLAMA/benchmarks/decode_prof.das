@@ -68,7 +68,7 @@ struct Args {
     @clarg_doc = "GEMV chunks per lane (fine-grain self-serve tail; default 8; 1 = the old equal split; -1 = keep default)"
     fine : int = -1
 
-    @clarg_doc = "Weight-scale plane A/B: 1 = convert to f16 at load (llama.cpp byte parity; per-op dispatch path until the chains learn it), 0 = keep f32, -1 = keep default"
+    @clarg_doc = "Weight-scale plane A/B: 1 = convert to f16 at load (llama.cpp byte parity), 0 = keep f32, -1 = keep default"
     wscale_f16 : int = -1
 
     @clarg_doc = "A/B: size chunk counts to workers only (the pre-fix split), not workers + caller lane"
@@ -247,6 +247,11 @@ def main() {
     if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
         pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
     }
+    // the wscale rail is a LOAD-TIME convert — the flag must land before load_gguf
+    if (cfg.wscale_f16 >= 0) {
+        set_wscale_f16(cfg.wscale_f16 != 0)
+        print("wscale_f16 override: {cfg.wscale_f16 != 0}\n")
+    }
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)
     let ctx_cap = max(2048l, max(p, p2) + n + 8l)
@@ -257,10 +262,6 @@ def main() {
     if (cfg.target_work >= 1) {
         set_target_chunk_work(int64(cfg.target_work))
         print("target_chunk_work override: {cfg.target_work}\n")
-    }
-    if (cfg.wscale_f16 >= 0) {
-        set_wscale_f16(cfg.wscale_f16 != 0)
-        print("wscale_f16 override: {cfg.wscale_f16 != 0}\n")
     }
     if (cfg.gemv_cap >= 0) {
         set_gemv_lane_cap(cfg.gemv_cap)
