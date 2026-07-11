@@ -4,10 +4,12 @@ Tests use the `dastest` framework. Test files live in `tests/` with per-module s
 
 ## AOT registration (REQUIRED for new test directories)
 
-CI's `test_aot` binary runs EVERY test under `tests/` with AOT enabled (`fail_on_no_aot`).
-Creating a new test directory ⇒ register it in `tests/aot/CMakeLists.txt` (5-step pattern in
-`skills/aot_testing.md` § "Registering a New Test Directory"), or CI fails with
-`error[50101]: AOT link failed`.
+The full `test_aot` binary runs EVERY test under `tests/` with AOT enabled (`fail_on_no_aot`).
+It builds+runs on the NIGHTLY CI cron and in `preflight --full` — per-PR CI only builds the
+`tests/language` subset (`test_aot_subset`) as a compile gate, so a missing registration
+passes PR CI and fails the nightly. Creating a new test directory ⇒ register it in
+`tests/aot/CMakeLists.txt` (5-step pattern in `skills/aot_testing.md` § "Registering a New
+Test Directory"), or the nightly/preflight fails with `error[50101]: AOT link failed`.
 
 If a specific file genuinely can't AOT (emitter bug, interpreted-only by design): put
 `options no_aot` IN THE FILE **and** exclude it from the directory's AOT glob, with a

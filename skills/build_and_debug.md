@@ -18,8 +18,8 @@ The repo builds on **Windows, Linux, macOS, iOS, Android, and WASM** (CI runs th
 - **Run a script:** `<daslang-binary> path/to/script.das`
 - **Compile-only check:** `<daslang-binary> -compile-only path/to/script.das` — compiles without simulation or execution, useful for syntax/type checking without needing a window or GL context. Use `-dry-run` to also simulate (but not execute).
 - **Run tests:** `<daslang-binary> dastest/dastest.das -- --test path/to/test.das`
-- **AOT tests:** `cmake --build build --config Release --target test_aot` then `<test_aot-binary> -use-aot dastest/dastest.das -- --use-aot --test tests`
-- **IMPORTANT:** When adding a new test directory under `tests/`, register it in `tests/aot/CMakeLists.txt` for AOT compilation. See `skills/aot_testing.md` for the step-by-step pattern. CI runs ALL tests with AOT enabled — unregistered test directories cause `error[50101]: AOT link failed`
+- **AOT tests (full):** `cmake --build build --config Release --target test_aot` then `<test_aot-binary> -use-aot dastest/dastest.das -- --use-aot --test tests`. The full binary is `EXCLUDE_FROM_ALL` (~1080 AOT TUs); the default build only makes `test_aot_subset` (tests/language — the per-PR CI gate; `--target run_tests_aot_subset` sweeps it)
+- **IMPORTANT:** When adding a new test directory under `tests/`, register it in `tests/aot/CMakeLists.txt` for AOT compilation. See `skills/aot_testing.md` for the step-by-step pattern. The nightly CI + `preflight --full` run ALL tests with AOT enabled — unregistered test directories cause `error[50101]: AOT link failed` there (per-PR CI won't catch it)
 
 This skill uses `bin/Release/daslang.exe` in examples below (the dominant local-dev case); substitute the right path on other platforms.
 

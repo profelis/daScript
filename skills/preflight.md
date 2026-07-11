@@ -28,26 +28,32 @@ the CI ref, never a working-tree copy.
 | Workflow | Trigger | Jobs |
 |---|---|---|
 | `build.yml` (per-PR) | every PR commit (via `pull_request`) + pushes to `master` | `build` matrix (5 targets × Debug/Release/RelWithDebInfo × sanitizers), `bundle_smoke`, `build_linux_gcc` |
-| `build.yml` (nightly) | the `schedule` cron (daily 08:00 UTC) runs these two *in isolation* | `build_windows_mingw`, `build_windows_clangcl` — the two ~26-min toolchain long-poles, gated OFF per-PR CI (alt-toolchain, lowest per-PR signal). A break here surfaces within ~24 h, not at PR time. |
+| `build.yml` (nightly) | the `schedule` cron (daily 02:00 UTC) | `build_windows_mingw` + `build_windows_clangcl` (the two toolchain long-poles, gated OFF per-PR CI — alt-toolchain, lowest per-PR signal) **plus the full build matrix — its Release cells (sanitizers included) run the full AOT sweep** ("Slow Release Tests"). A break in any of these surfaces within ~24 h, not at PR time. |
 | `extended_checks.yml` | every PR | linux + darwin15-arm64 + windows, ALL release modules ON |
 | `wasm_build.yml` | every PR | emscripten build of `web/` on 3 OSes + `wasm_cross` |
 | `build_eastl.yml` | every PR | EASTL shadow-config build + no-fileio build (linux clang) |
 | `doc.yml` | only if `doc/**`, `daslib/**`, or `src/builtin/**` changed | seven doc gates |
 | `playground-e2e.yml` | only if `site/**` / `web/examples/ui/**` changed | Playwright on the web playground |
 
-> A manual **`workflow_dispatch`** of `build.yml` runs the **whole** workflow — every per-PR job *and* both nightly toolchains. Only the cron `schedule` runs the two toolchains alone (the per-PR jobs are gated off `schedule`).
+> A manual **`workflow_dispatch`** of `build.yml` runs the **whole** workflow — every per-PR job, both nightly toolchains, *and* the full AOT sweep. The cron `schedule` runs the two toolchains + the full build matrix (Release cells add the full AOT sweep; Debug cells ride along — `matrix` isn't available in a job-level `if`, so they can't be excluded); `bundle_smoke` and `build_linux_gcc` are gated off `schedule`.
 
 ## build.yml — the build matrix
 
 Per-lane steps: build → JIT prewarm → JIT test sweep → interpreter sweep →
-`ctest -L small` → AOT sweep (Release lanes only).
+`ctest -L small`. The full AOT sweep runs on the NIGHTLY cron and on manual
+`workflow_dispatch` runs only (Release
+lanes incl. sanitizers + mingw/clang-cl); per-PR lanes just build
+`test_aot_subset` (tests/language, part of ALL) as a compile+link gate and run
+no AOT tests. **`preflight --full`'s full AOT gate is therefore the only
+pre-push check for AOT regressions outside tests/language — don't skip it.**
 
 | CI step | Local mirror | Notes |
 |---|---|---|
-| Interpreter sweep | `<daslang> dastest/dastest.das -- --color --failures-only --timeout 900 --test tests` | |
-| JIT sweep | `<daslang> dastest/dastest.das -jit -- --jit-opt-level=3 --color --failures-only --timeout 900 --test tests` | Windows-local `clang-cl` link failures are env noise — the catchable class is LLVM verifier errors; full end-to-end JIT needs WSL/mac. See `skills/make_pr.md` §2.5 for the 2-test smoke version |
+| Interpreter sweep | `<daslang> dastest/dastest.das -- --color --failures-only --timeout 1800 --test tests` | |
+| JIT sweep | `<daslang> dastest/dastest.das -jit -- --jit-opt-level=3 --color --failures-only --timeout 1800 --test tests` | Windows-local `clang-cl` link failures are env noise — the catchable class is LLVM verifier errors; full end-to-end JIT needs WSL/mac. See `skills/make_pr.md` §2.5 for the 2-test smoke version |
 | Small C++ tests | `ctest --test-dir build --build-config Release -L small --output-on-failure` | drop `--build-config` on single-config generators. **Run this after touching `tests-cpp/`** — and remember MSVC tolerates C++ that clang/gcc reject (the doctest bit-field incident); see `skills/writing_cpp_tests.md` |
-| AOT sweep | `cmake --build build --config Release --target test_aot`, then `bin/Release/test_aot.exe -use-aot dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test tests` | Release lanes only in CI |
+| AOT sweep (full) | `cmake --build build --config Release --target test_aot`, then `bin/Release/test_aot.exe -use-aot dastest/dastest.das -- --use-aot --color --failures-only --timeout 1800 --test tests` | nightly CI + manual `workflow_dispatch` only — this local mirror is the only pre-push gate for it |
+| AOT subset gate | `cmake --build build --config Release --target test_aot_subset` (optionally `--target run_tests_aot_subset` to also sweep tests/language) | what per-PR CI lanes actually build (part of ALL) |
 | Debug lanes | `cmake --build build --config Debug --target daslang`, then the sweep against `bin/Debug/daslang.exe` — safe in-checkout: Debug coexists with Release by design (`bin/Debug/`, `_debug.shared_module` suffix) | Debug bypasses the fused interpreter permutations — a fix that lands only in the fused path passes Release everywhere and trips Debug; conversely fused-path bugs need Release. If you touched `src/simulate/simulate_fusion_*`, run both configs |
 | Sanitizer lanes (linux Release asan/tsan/ubsan) | WSL: `CC=clang CXX=clang++ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDAS_USE_SANITIZER=<asan\|tsan\|ubsan>`, then the JIT sweep on `tests/language` | not mirrorable on Windows/mac. CI applies LSan suppressions (`format_error`, `uriParseSingleUriA`, `uriMakeOwner`) — see the workflow's Test step |
 | linux_arm / darwin lanes | mac: same commands as linux. From Windows: not mirrorable | ARM-specific reds (LLVM SelectionDAG, alignment) are CI-only signals |

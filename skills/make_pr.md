@@ -199,7 +199,7 @@ taskkill /F /IM mcp.exe 2>/dev/null
 cmake --build build --config Release --target test_aot -j 64 -- /nodeReuse:false
 
 # Run AOT tests (must match CI: -use-aot before --, --use-aot after --)
-bin/Release/test_aot.exe -use-aot dastest/dastest.das -- --use-aot --color --failures-only --timeout 900 --test tests
+bin/Release/test_aot.exe -use-aot dastest/dastest.das -- --use-aot --color --failures-only --timeout 1800 --test tests
 ```
 
 Use `timeout: 0` (no timeout) for the cmake build — it can take 2-25 minutes.
@@ -342,7 +342,7 @@ Stage, commit, push, and create the PR using GitHub MCP tools or `gh` CLI. Follo
 | JIT smoke | `daslang.exe -jit <test>.das 2>&1 \| grep -iE "verifier\|Both operands"` | Empty output = pass. Windows `clang-cl` link fail is local-only, ignore |
 | Type-system/generics | sequence smoke (`skills/preflight.md`) + externals sweep (`skills/abi_break_sweep.md`) | Only for type-system / AST-layout / daslib-generics changes |
 | AOT build | `cmake --build build --config Release --target test_aot -j 64` | Kill daslang first. Register new test dirs |
-| AOT tests | `test_aot.exe -use-aot dastest/dastest.das -- --use-aot --test tests` | Same as regular tests |
+| AOT tests | `test_aot.exe -use-aot dastest/dastest.das -- --use-aot --test tests` | Same as regular tests. PR CI only builds the tests/language subset (`test_aot_subset`) — this local full gate + the nightly cron are the only full-AOT checks |
 | Docs | `das2rst.das` (loop until clean) + stubs + Uncategorized + untracked + Sphinx latex AND html | Any daslib/src-builtin/RST change triggers all seven gates — `skills/preflight.md` |
 | Format | MCP `format_file` with comma-separated list or glob of changed `.das` files (single call) | Only changed files |
 | `.md` stop | `git diff --name-only origin/master..HEAD \| grep '\.md$'` | If any match: STOP, list changes, ask user to review BEFORE push |

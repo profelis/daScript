@@ -551,6 +551,29 @@ list(FILTER AOT_LANGUAGE_TEST_FILES EXCLUDE REGEX "failed_|cant_|invalid_")
 # Exclude module files (they are compiled via DAS_AOT_LIB below)
 list(FILTER AOT_LANGUAGE_TEST_FILES EXCLUDE REGEX "/_")
 
+# Minimal daslib closure for test_aot_subset: ONLY the daslib modules whose
+# runtime functions tests/language actually calls (50101 otherwise). This is
+# NOT the all-daslib coverage lib above — keep it minimal; a new tests/language
+# test requiring another runtime daslib module extends this list. Leaf-first.
+SET(AOT_SUBSET_DASLIB_MODULE_FILES
+    daslib/math_bits.das
+    daslib/random.das
+    daslib/defer.das
+    daslib/strings_boost.das
+    daslib/enum_trait.das
+    daslib/regex.das
+    daslib/regex_boost.das
+    daslib/static_let.das
+    daslib/faker.das
+    daslib/fuzzer.das
+    daslib/coroutines.das
+    daslib/contracts.das
+    daslib/apply.das
+    daslib/templates.das
+    daslib/rtti.das
+    daslib/archive.das
+)
+
 # Language test module files (libraries required by tests)
 SET(AOT_LANGUAGE_MODULE_FILES
     tests/language/_distinct_fixture.das
@@ -924,6 +947,10 @@ add_custom_target(test_aot_language_modules)
 SET(LANGUAGE_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_LANGUAGE_MODULE_FILES}" LANGUAGE_MODULES_AOT_GENERATED_SRC test_aot_language_modules daslang)
 
+add_custom_target(test_aot_subset_daslib_modules)
+SET(SUBSET_DASLIB_MODULES_AOT_GENERATED_SRC)
+DAS_AOT_LIB("${AOT_SUBSET_DASLIB_MODULE_FILES}" SUBSET_DASLIB_MODULES_AOT_GENERATED_SRC test_aot_subset_daslib_modules daslang)
+
 add_custom_target(test_aot_daslib)
 SET(DASLIB_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_DASLIB_TEST_FILES}" DASLIB_AOT_GENERATED_SRC test_aot_daslib daslang)
@@ -1023,6 +1050,7 @@ SOURCE_GROUP_FILES("aot generated" SPIRV_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" SPIRV_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" LANGUAGE_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" LANGUAGE_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" SUBSET_DASLIB_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASLIB_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DECS_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASLIB_AOT_GENERATED_SRC)
@@ -1041,8 +1069,12 @@ SOURCE_GROUP_FILES("aot generated" PUGIXML_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASHV_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" DASHV_AOT_GENERATED_SRC)
 
-# Build the test_aot executable using the same main.cpp as daslang
-add_executable(test_aot ${DAS_DASCRIPT_MAIN_SRC}
+# Build the test_aot executable using the same main.cpp as daslang.
+# EXCLUDE_FROM_ALL: the full binary (~1080 AOT TUs + heavy link) is built only
+# where it's explicitly requested — the nightly CI cron and `preflight --full`
+# (both via `--target test_aot` / `--target run_tests_aot`). Per-PR CI builds
+# test_aot_subset below instead.
+add_executable(test_aot EXCLUDE_FROM_ALL ${DAS_DASCRIPT_MAIN_SRC}
     ${TEST_AOT_GENERATED_SRC}
     ${TESTING_AOT_GENERATED_SRC}
     ${ALGORITHM_AOT_GENERATED_SRC}
@@ -1180,7 +1212,34 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_mcp
     test_aot_lsp
 )
-target_include_directories(test_aot PRIVATE ${NEED_MODULES_PATH} ${PROJECT_SOURCE_DIR}/modules/dasUnitTest ${PROJECT_SOURCE_DIR}/modules/dasLiveHost/src ${AUDIO_INCLUDE_DIR} ${CIPIC_HRTF_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/modules/dasMinfft/minfft ${PROJECT_SOURCE_DIR}/modules/dasPUGIXML/pugixml ${PROJECT_SOURCE_DIR}/modules/dasHV/hv/$<CONFIG>/include ${SQLITE_INCLUDE_DIR})
-target_compile_definitions(test_aot PRIVATE DAS_TEST_AOT MINFFT_SINGLE HRTF_SAMPLE_RATE=${DAS_AUDIO_SAMPLE_RATE})
+# Shared between test_aot and test_aot_subset — the two binaries MUST compile
+# main.cpp identically (a define present on one but not the other silently
+# changes module registration between the per-PR gate and the nightly binary).
+SET(TEST_AOT_INCLUDE_DIRS ${NEED_MODULES_PATH} ${PROJECT_SOURCE_DIR}/modules/dasUnitTest ${PROJECT_SOURCE_DIR}/modules/dasLiveHost/src ${AUDIO_INCLUDE_DIR} ${CIPIC_HRTF_INCLUDE_DIR} ${PROJECT_SOURCE_DIR}/modules/dasMinfft/minfft ${PROJECT_SOURCE_DIR}/modules/dasPUGIXML/pugixml ${PROJECT_SOURCE_DIR}/modules/dasHV/hv/$<CONFIG>/include ${SQLITE_INCLUDE_DIR})
+SET(TEST_AOT_COMPILE_DEFS DAS_TEST_AOT MINFFT_SINGLE HRTF_SAMPLE_RATE=${DAS_AUDIO_SAMPLE_RATE})
+
+target_include_directories(test_aot PRIVATE ${TEST_AOT_INCLUDE_DIRS})
+target_compile_definitions(test_aot PRIVATE ${TEST_AOT_COMPILE_DEFS})
 SETUP_CPP11(test_aot)
-SETUP_LTO(test_aot)
+# No SETUP_LTO: LTCG over ~1080 AOT TUs was a 21-minute link on MSVC CI for a
+# test binary that measures correctness, not performance.
+
+### AOT subset target — the per-PR CI gate
+# tests/language only (+ dastest/testing.das and the language fixture modules).
+# Part of the default build on every lane, Debug included: a fast compile+link
+# gate (~230 TUs, no LTO). The full suite builds and runs on the nightly cron.
+add_executable(test_aot_subset ${DAS_DASCRIPT_MAIN_SRC}
+    ${TESTING_AOT_GENERATED_SRC}
+    ${LANGUAGE_AOT_GENERATED_SRC}
+    ${LANGUAGE_MODULES_AOT_GENERATED_SRC}
+    ${SUBSET_DASLIB_MODULES_AOT_GENERATED_SRC}
+)
+TARGET_LINK_LIBRARIES(test_aot_subset libDaScriptAot ${SRC_LIBRARIES} ${DAS_MODULES_LIBS})
+ADD_DEPENDENCIES(test_aot_subset libDaScriptAot
+    test_aot_testing
+    test_aot_language test_aot_language_modules
+    test_aot_subset_daslib_modules
+)
+target_include_directories(test_aot_subset PRIVATE ${TEST_AOT_INCLUDE_DIRS})
+target_compile_definitions(test_aot_subset PRIVATE ${TEST_AOT_COMPILE_DEFS})
+SETUP_CPP11(test_aot_subset)
