@@ -333,8 +333,9 @@ def private ssbo_element_layout(var m : SpirvModule; sname : string; et : TypeDe
         if (!bs.ok) return (ok = false, elem_type = 0u, stride = 0)
         return (ok = true, elem_type = bs.type_id, stride = round_up(bs.size, bs.align))
     }
-    // 32-bit scalar or its 2/3/4 vector (scalar_class rejects bool and non-numeric base types)
-    if (component_count(bt) >= 1 && scalar_class(bt) >= 0) {
+    // 32-bit scalar or its 2/3/4 vector (scalar_class rejects bool and non-numeric base types;
+    // the width gate keeps 16/8-bit lattice elements out until the storage-caps wave)
+    if (component_count(bt) >= 1 && scalar_class(bt) >= 0 && scalar_width(bt) == 32) {
         return (ok = true, elem_type = emit_type(m, et), stride = round_up(std140_size(bt), std140_align(bt)))
     }
     errors |> push("ssbo '{sname}' element type {bt} is not supported (a 32-bit scalar, a vector of those, or a struct of those)")
@@ -407,7 +408,9 @@ def private is_emittable_value_type(t : TypeDecl?) : bool {
     if (matrix_info(t).ok) return true
     let bt = t.baseType
     if (bt == Type.tFixedArray && t.firstType != null) return is_emittable_value_type(t.firstType)
-    return scalar_class(bt) >= 0 || bt == Type.tBool
+    // scalar_class >= 0 no longer implies 32-bit (the lattice classifies) — width-gate until
+    // the 16/8-bit emission wave lands
+    return (scalar_class(bt) >= 0 && scalar_width(bt) == 32) || bt == Type.tBool
 }
 
 // gl_MeshVerticesEXT / gl_PrimitiveTriangleIndicesEXT — the mesh per-vertex / per-primitive Output
@@ -1620,7 +1623,7 @@ def private emit_mul(var m : SpirvModule; op2 : ExprOp2?; e : ExpressionPtr; l, 
 def private declare_local_var(var m : SpirvModule; var ctx : EmitCtx; v : VariablePtr; var errors : array<string>) {
     if (key_exists(ctx.local_vars, intptr(v))) return
     let bt = v._type.baseType
-    if (scalar_class(bt) < 0 && bt != Type.tBool && bt != Type.tFixedArray) {
+    if ((scalar_class(bt) < 0 || scalar_width(bt) != 32) && bt != Type.tBool && bt != Type.tFixedArray) {
         // emit_type would panic on an unsupported base type; reject with a clean error instead.
         if (cpu_only_lattice_width(bt)) {
             errors |> push("local '{v.name}': type {bt} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)")
