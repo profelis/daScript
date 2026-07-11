@@ -2348,8 +2348,8 @@ def private attn_head_decode(var arow : float?; var xbp : float?; qp : float con
                 arow[j - kstart] = kv_score(qp, qq, qsp, kcp, (rowbase + j) * kdim + khoff, qoff, head_size) * scale
             }
         }
-        if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-            softcap(arow, cnt, attn_softcap)
+        if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax (softcap4 = the flash-prefill form)
+            softcap4(arow, cnt, attn_softcap)
         }
         if (sinksp != null) {  // gpt-oss: this head's sink logit joins the softmax denominator
             softmax_sink(arow, cnt, sinksp[hh])
@@ -3244,12 +3244,11 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             let hh = qh0 + g
                             var arow = attp + hh * seq_len
                             if (attn_softcap > 0.0) {
-                                softcap(arow + j0, j1 - j0, attn_softcap)
+                                softcap4(arow + j0, j1 - j0, attn_softcap)
                             }
-                            var m = arow[j0]   // slices are non-empty by construction
-                            for (j in range64(j0 + 1l, j1)) {
-                                m = max(m, arow[j])
-                            }
+                            // hand-vectorized max reduction — order-independent, so bit-identical
+                            // to the scalar scan (slices are non-empty by construction)
+                            let m = hmax(unsafe(arow + j0), j1 - j0)
                             // exponentials in place over the slice — exp4 fast path, clamped to
                             // -80 like the prefill flash fold (underflow -> ~0, negligible);
                             // element-constructed float4: slice offsets carry no 16B alignment
@@ -3295,10 +3294,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         let hh = int64(h)
                         let qoff = hh * head_size
                         let fbase = hh * int64(nsl)
-                        var mg = flmp[fbase]
-                        for (sl in range64(1l, int64(nsl))) {
-                            mg = max(mg, flmp[fbase + sl])
-                        }
+                        var mg = hmax(unsafe(flmp + fbase), int64(nsl))
                         if (sinksp != null) {
                             mg = max(mg, sinksp[hh])
                         }
@@ -4741,7 +4737,7 @@ def private attn_head_blocked(var attp_h : float?; var xbp : float?; qp : float 
                 let cnt = ap + 1l - kstart_p
                 let rbase = bi * maxctx
                 if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                    softcap(attp_h + rbase, cnt, attn_softcap)
+                    softcap4(attp_h + rbase, cnt, attn_softcap)
                 }
                 if (sinksp != null) {  // gpt-oss: sink joins the denominator
                     softmax_sink(attp_h + rbase, cnt, sinksp[hh])
@@ -4803,7 +4799,7 @@ def private attn_head_classic(var attp_h : float?; var xbp : float?; qp : float 
                 }
             }
             if (attn_softcap > 0.0) {  // Gemma2: soft-cap scores before softmax
-                softcap(attp_h, cnt, attn_softcap)
+                softcap4(attp_h, cnt, attn_softcap)
             }
             if (sinksp != null) {  // gpt-oss: sink joins the denominator
                 softmax_sink(attp_h, cnt, sinksp[hh])
