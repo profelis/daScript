@@ -324,10 +324,13 @@ def failure(tb : Asserter?; msg = "") : bool {
     return false
 }
 
-//! Skip the current test arm: logs `msg`, lands the arm in the suite's skipped count (not a
-//! pass), and unwinds — statements after `t |> skip(...)` do not run.
+//! Skip the current test arm: logs `msg` and lands the arm in the suite's skipped count (not a
+//! pass). Does NOT unwind — use the arm-fatal shape `if (gate) { t |> skip("..."); return }`.
+//! (The panicking T.skipNow unwind proved fragile at volume from AOT-compiled tests; a plain
+//! flag + caller return needs none of it.)
 def skip(t : T?; msg : string) {
-    t->skipAt(msg, get_line_info(1))
+    t->logAt(msg, get_line_info(1))
+    t.onSkipNow |> invoke()
 }
 
 typedef RunT = variant<lmd1 : lambda<(t : T?) : void>; func1 : function<(t : T?) : void>>
