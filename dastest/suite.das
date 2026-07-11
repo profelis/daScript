@@ -504,6 +504,7 @@ def private test_any(name : string; func; args_num : int; var context : FileCtx;
             // unwind and never lands here. Propagate as a skip, not an error.
             deliberateRecover = true
             skipped = true
+            dt = get_time_usec(t0)
         }
         if (!deliberateRecover) {
             dt = get_time_usec(t0)
