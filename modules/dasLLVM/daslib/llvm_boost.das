@@ -510,25 +510,25 @@ def is_lattice_op2_native(expr : ExprOp2?) {
 }
 
 def isExprOp2_Func(expr : ExprOp2?) {
+    if (!expr.func.flags.builtIn) {
+        return true     // user-defined operator (incl. on lattice types) — always the function path
+    }
     if (is_lattice_small_type(expr.left._type.baseType)
             || is_lattice_small_type(expr.right._type.baseType)) {
         return !is_lattice_op2_native(expr)
-    }
-    if (!expr.func.flags.builtIn) {
-        return true
     }
     return expr.left._type.isHandle || expr.right._type.isHandle
 }
 
 def isExprOp1_Func(expr : ExprOp1?) {
+    if (!expr.func.flags.builtIn) {
+        return true     // user-defined operator (incl. on lattice types) — always the function path
+    }
     assume sbt = expr.subexpr._type.baseType
     if (is_lattice_small_type(sbt)) {
         if (is_f16_small_type(sbt) && (expr.op == "+" || expr.op == "-")) {
             return !g_lattice_fp16_ops_native
         }
-        return true
-    }
-    if (!expr.func.flags.builtIn) {
         return true
     }
     return expr.subexpr._type.isHandle
