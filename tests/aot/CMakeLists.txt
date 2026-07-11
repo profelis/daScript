@@ -509,7 +509,12 @@ SET(AOT_MSL_MODULE_FILES
 # AOT for metal test files (real-GPU behavioral gate vs the CPU-reference oracle). Guarded
 # requires (`require ?das_metal`) make the files compile everywhere — on non-Apple platforms
 # they reduce to the CPU-reference half, and the stubs generated there match that reduction.
+# The shared fixture module (generic GPU helpers) is AOT-compiled as a library below.
 FILE(GLOB AOT_METAL_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/metal/*.das")
+list(FILTER AOT_METAL_FILES EXCLUDE REGEX "/_")
+SET(AOT_METAL_MODULE_FILES
+    tests/metal/_metal_common.das
+)
 
 # AOT for daslib test files
 SET(AOT_DASLIB_TEST_FILES
@@ -959,6 +964,10 @@ add_custom_target(test_aot_metal)
 SET(METAL_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_METAL_FILES}" METAL_AOT_GENERATED_SRC test_aot_metal daslang)
 
+add_custom_target(test_aot_metal_modules)
+SET(METAL_MODULES_AOT_GENERATED_SRC)
+DAS_AOT_LIB("${AOT_METAL_MODULE_FILES}" METAL_MODULES_AOT_GENERATED_SRC test_aot_metal_modules daslang)
+
 add_custom_target(test_aot_fixed_array)
 SET(FIXED_ARRAY_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_FIXED_ARRAY_FILES}" FIXED_ARRAY_AOT_GENERATED_SRC test_aot_fixed_array daslang)
@@ -1180,6 +1189,7 @@ add_executable(test_aot EXCLUDE_FROM_ALL ${DAS_DASCRIPT_MAIN_SRC}
     ${MSL_AOT_GENERATED_SRC}
     ${MSL_MODULES_AOT_GENERATED_SRC}
     ${METAL_AOT_GENERATED_SRC}
+    ${METAL_MODULES_AOT_GENERATED_SRC}
     ${FIXED_ARRAY_AOT_GENERATED_SRC}
     ${TYPEMACRO_AOT_GENERATED_SRC}
     ${LANGUAGE_AOT_GENERATED_SRC}
@@ -1233,7 +1243,7 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_loops
     test_aot_glsl
     test_aot_spirv test_aot_spirv_modules
-    test_aot_msl test_aot_msl_modules test_aot_metal
+    test_aot_msl test_aot_msl_modules test_aot_metal test_aot_metal_modules
     test_aot_fixed_array test_aot_typemacro
     test_aot_language test_aot_language_modules
     test_aot_daslib_modules test_aot_decs_modules test_aot_dasllama_modules

@@ -14,9 +14,13 @@ require daslib/strings_boost
 def test_msl_census(t : T?) {
     t |> run("emitter census == declared set (all fixtures)") <| @(t : T?) {
         var present : table<string>
-        for (kind in split(mul_ab_msl_census, "\n")) {
-            present |> insert(kind)
+        var censuses <- all_msl_censuses()
+        for (cen in censuses) {
+            for (kind in split(cen, "\n")) {
+                present |> insert(kind)
+            }
         }
+        delete censuses
         var declared <- declared_msl_census()
         for (kind in keys(present)) {
             t |> success(key_exists(declared, kind), "emitted `{kind}` is in the declared set")

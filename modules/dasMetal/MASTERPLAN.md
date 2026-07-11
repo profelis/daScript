@@ -341,6 +341,37 @@ never AOT'd — a runtime `declared_msl_census()` there would 50101 under `test_
 das gotcha for kernel authors: emitter-facing das reserved words `label`/`expect` (now in
 CLAUDE.md gotchas). CI paravirtual probe still pending first push.
 
+**2026-07-11 — Phase 2 landed: arithmetic + control-flow breadth.** The emitter now covers the
+full dasSpirv-Phase-2-equivalent inventory: scalar arithmetic + bitwise + shifts for
+uint/int/float (float `%` → `fmod` — MSL `%` is integral-only), componentwise vector arithmetic
+incl. `vec*scalar` broadcast and vector negate, comparisons per scalar class, das's scalar-bool
+vector `==`/`!=` (→ `all(...)`/`any(...)` — MSL's own vector compare yields `boolN`), logical
+`&&`/`||`/`!` (short-circuit matches C on both sides), ternary, pre/post `++`/`--` (statement-level
+das postfix arrives as prefix in the AST; value-level postfix survives), compound assignment
+(arithmetic + bitwise), mutable locals + das zero-init locals (`var x : T` → `T x = {};`),
+if/elif/else chains (emitted flat as `} else if`), `while`, `break`/`continue`, void `return`, and
+`for (i in range/urange(...))` — with the das-semantics subtlety that range endpoints evaluate
+ONCE: a non-constant end is hoisted into a loop-scoped comma-declared local
+(`for (int k = lo, k_end = expr; ...)`), proven behaviorally by a fixture that mutates the end's
+source variable inside the body. New frontend surface: **`@uniform @binding = N` scalar/vector
+members** → `constant T& name [[buffer(N)]]` (read-only — a written uniform is a clean error;
+arrays stay `@ssbo`), which is what the **in-kernel bounds guard** (`if (i >= n) return`) reads.
+Literal fixes: das prints integral floats bare ("2" + `f` is invalid MSL → `.0` appended,
+non-finite = error) and uints as hex (decimal via int64 detour). Census grew 13 → 106 kinds.
+Tests: `tests/msl` 37/37 — per-class shape asserts + goldens (uarith/iarith/farith/vecarith/
+control/loops), census union == declared both directions, and a fail-closed suite
+(`_fail_closed/` + compile_issues, mirroring tests/spirv): written `@uniform`, array `@uniform`,
+value `return`, unsupported call. `tests/metal` 14/14 on M1 Max — every fixture regresses GPU vs
+the CPU-reference oracle (ints bit-exact incl. wrap/truncation, floats fastmath-tolerance), with
+the loops kernel dispatched on a deliberately NON-exact grid (1000 threads @ 64/tg → 1024
+launched) over sentinel-filled buffers compared across the FULL padded range — a broken guard
+shows as clobbered sentinels. Shared GPU helpers live in `tests/metal/_metal_common.das` as
+GENERIC functions (untyped `dev`/`buf` params): generics only instantiate at call sites inside
+`static_if (builtin_module_exists(das_metal))`, so the fixture compiles on every platform;
+AOT-wired as `test_aot_metal_modules` (msl-modules pattern; the metal glob gained the `/_` filter).
+Green: interp + `-jit` + static binary, MCP lint + CI lint clean. das gotchas hit: `expect` is
+reserved (fixture param renamed `want`); `float4 + float` does NOT broadcast in das (only `*`/`/`).
+
 **2026-07-11 — pipeline: fixup-set global inits now infer; dasSpirv blob fill patch→fixup**
 (rides this branch — surfaced reviewing dasMetal's apply/fixup model). Boris called dasSpirv's
 patch+astChanged blob fill a workaround for a compiler gap; confirmed and fixed. Diagnosis
