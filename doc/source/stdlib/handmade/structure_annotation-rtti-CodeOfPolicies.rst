@@ -68,6 +68,8 @@ Disables the dead-store-elimination optimizer pass. Host-side counterpart of ``o
 Disables the common-subexpression-elimination optimizer pass. Host-side counterpart of ``options disable_cse`` (the option overrides the policy).
 Disables ``[inline]`` splicing - annotated calls stay regular calls. The declaration-level contract checks (body shape, recursion through the inline graph, taking the address) still run; call-site splice checks do not apply, since nothing splices. Host-side counterpart of ``options disable_inline`` (the option overrides the policy).
 Disables automatic inlining: block-literal call sites stay regular calls and invoke-of-literal sites stay invokes. ``[inline]`` splicing is unaffected. Host-side counterpart of ``options disable_auto_inline`` (the option overrides the policy).
+Heuristic best-effort inlining of plain calls and operator sites (optimized builds only): small non-generic callees splice, silently declining anything unspliceable. Host-side counterpart of ``options auto_inline_functions`` (the option overrides the policy). ``disable_auto_inline`` overrides.
+Node budget for ``auto_inline_functions``: a loop-free callee body up to this many AST nodes is worth splicing (default 32); private callees referenced exactly once are exempt. Host-side counterpart of ``options auto_inline_cost``.
 Disables compile-time function evaluation (RunFolding of pure calls over constant arguments). Host-side counterpart of ``options disable_run`` (the option overrides the policy).
 Disables infer-time constant folding.
 Fails compilation if AOT is not available.
