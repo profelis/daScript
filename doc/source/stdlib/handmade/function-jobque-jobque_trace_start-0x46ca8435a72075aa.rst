@@ -1,0 +1,1 @@
+Arms the per-lane JobQue event tracer: every worker lane records publish, chunk, stage-wait and wake events into a preallocated ring of events_per_lane entries (oldest events are overwritten once the ring wraps). Recording is a few plain stores per event, so it is safe to arm around a live workload window.

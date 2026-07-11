@@ -16,6 +16,7 @@ def private restore_shaping_defaults() {
     set_batch_lane_cap(0)
     set_matmul_min_chunk_rows(16)
     set_matmul_min_chunk_rows_gemv(64)
+    set_gemv_chunks_per_lane(1)   // equal split — the fine-grain default gets its own arm
     set_gemv_wave_fill(true)
     set_batch_grid_2d(0)
 }
@@ -181,6 +182,17 @@ def test_matmul_chunks_gemv(t : T?) {
             restore_shaping_defaults()
             set_matmul_min_chunk_rows_gemv(0)
             t |> equal(matmul_chunks_gemv(16, 3, huge), lanes * 3, "grain disabled returns the raw want")
+            restore_shaping_defaults()
+        }
+        t |> run("fine-grain mode (the shipped default): whole grain waves, capped at the fine count") @(t : T?) {
+            set_gemv_chunks_per_lane(8)
+            if (lanes >= 2) {
+                t |> equal(matmul_chunks_gemv(64 * lanes * 4, 8, huge), lanes * 4, "whole 64-row waves; the oversplit arg is inert in fine mode")
+                t |> equal(matmul_chunks_gemv(64 * lanes * 100, 1, huge), lanes * 8, "wave count caps at gemv_chunks_per_lane")
+            }
+            if (lanes > 2) {
+                t |> equal(matmul_chunks_gemv(32, 1, huge), 1, "sub-wave rows fall through to the grain-limited split")
+            }
             restore_shaping_defaults()
         }
     }
