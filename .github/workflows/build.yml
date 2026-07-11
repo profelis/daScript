@@ -6,13 +6,20 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # Nightly: runs the heavy Windows toolchain builds (mingw, clang-cl) that are
-    # gated OFF per-PR/push CI below — see their `if:`. The matrix / bundle_smoke /
-    # gcc jobs are gated off `schedule`, so the nightly cron runs just the two
-    # toolchains (plus the lightweight `pre_job` setup they depend on). A manual
-    # `workflow_dispatch` is NOT gated off — it runs the FULL workflow: every
-    # per-PR job AND both toolchains.
-    - cron: '0 8 * * *'
+    # Nightly: runs everything the per-PR lanes deliberately skip —
+    #  * the heavy Windows toolchain builds (mingw, clang-cl), gated OFF per-PR
+    #    below (see their `if:`), including their FULL AOT sweeps;
+    #  * the main matrix (Release cells carry the FULL test_aot build + AOT
+    #    suite — "Slow Release Tests"; Debug cells ride along, matrix can't be
+    #    filtered in a job-level `if`). Per-PR CI only builds test_aot_subset
+    #    (tests/language, part of ALL) as a compile+link gate and runs no AOT
+    #    tests at all.
+    # bundle_smoke / gcc stay per-PR-only. A manual `workflow_dispatch` runs
+    # the FULL workflow: every per-PR job, both toolchains, and the full AOT
+    # suite.
+    # 02:00 UTC: dead time for EU working hours — the nightly is ~11 jobs and
+    # must not compete with daytime PR lanes for runners.
+    - cron: '0 2 * * *'
 defaults:
   run:
     shell: bash
@@ -51,9 +58,17 @@ jobs:
   build:
   ###########################################################
     needs: pre_job
-    # Per-PR/push lane (also runs on manual `workflow_dispatch`); skipped only on
-    # the nightly `schedule` cron, when just the toolchain jobs run.
-    if: needs.pre_job.outputs.should_skip != 'true' && github.event_name != 'schedule'
+    # Per-PR/push lane (also on manual `workflow_dispatch`). On the nightly
+    # `schedule` cron the matrix runs too — the Release cells carry the full
+    # AOT suite (see "Slow Release Tests") — unconditionally on the canonical
+    # repo (no pre_job skip: master unchanged overnight must still produce the
+    # nightly AOT signal). Debug cells ride along at night without an AOT step;
+    # `matrix` context is not available in a job-level `if`, so they can't be
+    # excluded here (actions runs with a matrix clause fail as a workflow-file
+    # error before any job spawns).
+    if: >-
+      (github.event_name == 'schedule' && github.repository == 'GaijinEntertainment/daScript')
+      || (github.event_name != 'schedule' && needs.pre_job.outputs.should_skip != 'true')
     runs-on: ${{ matrix.runner }}
     # actions: write needed for `gh cache delete` in the sccache refresh step.
     permissions:
@@ -519,7 +534,11 @@ jobs:
             ;;
         esac
     - name: "Slow Release Tests"
-      if: matrix.cmake_preset == 'Release'
+      # Full AOT suite: builds the full test_aot (EXCLUDE_FROM_ALL, ~1080 AOT
+      # TUs — the single biggest CI cost) via the run_tests_aot dependency and
+      # sweeps all of tests/. Nightly + manual dispatch only; per-PR lanes get
+      # the test_aot_subset compile+link gate from the Build step instead.
+      if: matrix.cmake_preset == 'Release' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
       run: |
         set -eux
         case "${{ matrix.target }}${{ matrix.architecture }}" in

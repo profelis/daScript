@@ -341,7 +341,7 @@ For path/filename ops use `fio` helpers (`base_name`/`dir_name`/`path_join`/etc.
 Most layout is obvious from `ls`. Non-obvious ones worth knowing:
 
 - `daslib/aot_cpp.das` — AOT C++ emitter lives here, NOT in C++ (`src/ast/ast_aot_cpp.cpp` was deleted; only the header remains)
-- `tests/aot/CMakeLists.txt` — register new test directories here for AOT compilation
+- `tests/aot/CMakeLists.txt` — register new test directories here for AOT compilation. Two AOT binaries: `test_aot_subset` (tests/language only, in ALL — the per-PR CI compile gate) and full `test_aot` (`EXCLUDE_FROM_ALL`, ~1080 AOT TUs — nightly CI + `preflight --full` only, via `--target test_aot`/`run_tests_aot`)
 - `dastest/` — test framework (used by both `tests/` and external repos)
 - `utils/detect-dupe/` (in-repo dupe finder) and `utils/find-dupe/` (Claude-based judge that needs `daspkg install --root utils/find-dupe` + `ANTHROPIC_API_KEY`) — both also exposed as MCP tools
 - `utils/mcp/`, `utils/daslang-live/`, `utils/daspkg/` — in-tree tools (most also have skills under `skills/`)

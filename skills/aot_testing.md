@@ -30,6 +30,15 @@ Key helpers used by the emitter:
 
 `tests/aot/CMakeLists.txt` defines the `test_aot` executable — a standalone binary with AOT stubs compiled in. It uses the same `main.cpp` as `daslang` but links additional AOT-generated object files.
 
+**Two binaries since 2026-07:**
+
+| Binary | Contents | In default build (ALL)? | Who builds/runs it |
+|---|---|---|---|
+| `test_aot_subset` | `tests/language` + its `_*` fixtures + `dastest/testing.das` + the minimal daslib runtime closure (`AOT_SUBSET_DASLIB_MODULE_FILES` — random/regex/faker/fuzzer/coroutines/archive/strings_boost etc., ~15 small files; a language test requiring another runtime daslib module fails 50101 → extend that list) — ~230 AOT TUs total | YES — every CI lane, Debug included | Per-PR CI, as a **compile+link gate only** (no AOT test run on PRs); locally via `run_tests_aot_subset` |
+| `test_aot` | everything (~1080 AOT TUs) | NO — `EXCLUDE_FROM_ALL` | Nightly CI cron (all Release matrix lanes incl. sanitizers, plus mingw/clang-cl) and `preflight --full`, both via `--target test_aot` / `run_tests_aot` |
+
+Neither binary uses LTO (the full binary's LTCG link alone was ~21 min on MSVC CI). Consequence: **an AOT regression outside `tests/language` does NOT fail PR CI** — it's caught by local `preflight --full` before push, or by the nightly.
+
 ### Structure
 
 ```
@@ -77,7 +86,7 @@ The `-use-aot` flag enables AOT for sub-compiled test files even when the host b
 
 ## Adding Tests to AOT — CRITICAL
 
-**Every test directory under `tests/` must be registered in `tests/aot/CMakeLists.txt`**. The `test_aot` binary (built on Linux/macOS CI) runs ALL tests under `tests/` with AOT enabled. If a test directory's AOT stubs aren't generated and linked, `test_aot` will fail with `error[50101]: AOT link failed`.
+**Every test directory under `tests/` must be registered in `tests/aot/CMakeLists.txt`**. The full `test_aot` binary (nightly CI + `preflight --full`) runs ALL tests under `tests/` with AOT enabled. If a test directory's AOT stubs aren't generated and linked, `test_aot` will fail with `error[50101]: AOT link failed`. PR CI won't catch the missing registration (it only builds the `tests/language` subset) — the nightly and preflight will, so register up front.
 
 This applies to ALL test directories (e.g., `tests/fio/`, `tests/fs/`, `tests/json/`), not just `tests/aot/`. See the "Registering a New Test Directory" section below.
 
