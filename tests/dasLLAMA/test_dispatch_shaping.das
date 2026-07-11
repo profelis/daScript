@@ -10,13 +10,15 @@ require math
 // floors). Pure shaping math — no kernels, no model. The shapers read get_dispatch_lanes(),
 // so every case runs inside with_job_que; knobs are restored after each case.
 
-def private restore_shaping_defaults() {
+// pin the FIXTURE baseline every arm assumes (1M target, equal split) — deliberately NOT the
+// shipped defaults (target 1, fine 8); the fine-grain arm covers those explicitly
+def private pin_shaping_baseline() {
     set_target_chunk_work(1_000_000l)
     set_gemv_lane_cap(0)
     set_batch_lane_cap(0)
     set_matmul_min_chunk_rows(16)
     set_matmul_min_chunk_rows_gemv(64)
-    set_gemv_chunks_per_lane(1)   // equal split — the fine-grain default gets its own arm
+    set_gemv_chunks_per_lane(1)
     set_gemv_wave_fill(true)
     set_batch_grid_2d(0)
 }
@@ -24,7 +26,7 @@ def private restore_shaping_defaults() {
 [test]
 def test_lanes_for_work(t : T?) {
     with_job_que() {
-        restore_shaping_defaults()
+        pin_shaping_baseline()
         let lanes = get_dispatch_lanes()
         t |> run("boundary: 1 lane below 2x target (the old 2M inline boundary)") @(t : T?) {
             t |> equal(lanes_for_work(1l, 0), 1)
@@ -57,7 +59,7 @@ def test_lanes_for_work(t : T?) {
             t |> equal(lanes_for_work(1_000_000_000_000l, 0), 1, "huge target = never parallel")
             set_target_chunk_work(1l)
             t |> equal(lanes_for_work(int64(lanes) * 10l, 0), lanes, "target 1 = full lanes for any real matmul")
-            restore_shaping_defaults()
+            pin_shaping_baseline()
         }
     }
 }
@@ -65,7 +67,7 @@ def test_lanes_for_work(t : T?) {
 [test]
 def test_matmul_chunks_batch(t : T?) {
     with_job_que() {
-        restore_shaping_defaults()
+        pin_shaping_baseline()
         let lanes = get_dispatch_lanes()
         let huge = 1_000_000_000_000l
         t |> run("sub-2x-target work returns the inline signal") @(t : T?) {
@@ -84,11 +86,11 @@ def test_matmul_chunks_batch(t : T?) {
         t |> run("grain off = raw L x oversplit; batch cap bounds L") @(t : T?) {
             set_matmul_min_chunk_rows(0)
             t |> equal(matmul_chunks(8, 4, huge), lanes * 4, "grain disabled returns the raw want")
-            restore_shaping_defaults()
+            pin_shaping_baseline()
             set_batch_lane_cap(2)
             let capped = matmul_chunks(16 * lanes * 8, 4, huge)
             t |> equal(capped, min(2, lanes) * 4, "cap bounds the wave width")
-            restore_shaping_defaults()
+            pin_shaping_baseline()
         }
     }
 }
@@ -96,7 +98,7 @@ def test_matmul_chunks_batch(t : T?) {
 [test]
 def test_matmul_grid(t : T?) {
     with_job_que() {
-        restore_shaping_defaults()
+        pin_shaping_baseline()
         let lanes = get_dispatch_lanes()
         let huge = 1_000_000_000_000l
         // the starved fixture: mr=4 units sized so the grain caps 1-D at lanes-1 chunks (< L)
@@ -120,7 +122,7 @@ def test_matmul_grid(t : T?) {
             }
             t |> equal(matmul_grid(4 * lanes * 8, 4l, 4, huge, 2048l, 4).y, 1, "unstarved shape stays 1-D")
             t |> equal(matmul_grid(4 * lanes * 8, 4l, 4, 1_999_999l, 2048l, 4).y, 1, "inline signal stays 1-D")
-            restore_shaping_defaults()
+            pin_shaping_baseline()
         }
         t |> run("knob 2 (wave-aligned): rc*ntc is whole L-waves, or falls back 1-D") @(t : T?) {
             set_batch_grid_2d(2)
@@ -132,7 +134,7 @@ def test_matmul_grid(t : T?) {
                 t |> success(g.x * g.y >= lanes * 4, "the grid covers the oversplit target")
                 t |> equal(matmul_grid(sunits, 4l, 4, huge, 16l, 4).y, 1, "alignment that can't fit the tiles stays 1-D")
             }
-            restore_shaping_defaults()
+            pin_shaping_baseline()
         }
         t |> run("row cells clamp to whole units; knob value clamps to [0,2]") @(t : T?) {
             set_batch_grid_2d(1)
@@ -145,7 +147,7 @@ def test_matmul_grid(t : T?) {
             t |> equal(get_batch_grid_2d(), 2)
             set_batch_grid_2d(-3)
             t |> equal(get_batch_grid_2d(), 0)
-            restore_shaping_defaults()
+            pin_shaping_baseline()
         }
     }
 }
@@ -153,7 +155,7 @@ def test_matmul_grid(t : T?) {
 [test]
 def test_matmul_chunks_gemv(t : T?) {
     with_job_que() {
-        restore_shaping_defaults()
+        pin_shaping_baseline()
         let lanes = get_dispatch_lanes()
         let huge = 1_000_000_000_000l
         t |> run("sub-2x-target work returns the inline signal") @(t : T?) {
@@ -174,15 +176,15 @@ def test_matmul_chunks_gemv(t : T?) {
             if (lanes >= 2) {
                 t |> equal(matmul_chunks_gemv(64 * (lanes - 1), 1, huge), lanes - 1, "wave fill off keeps the grain count")
             }
-            restore_shaping_defaults()
+            pin_shaping_baseline()
         }
         t |> run("gemv cap bounds the lanes; grain off = raw L x oversplit") @(t : T?) {
             set_gemv_lane_cap(2)
             t |> equal(matmul_chunks_gemv(64 * lanes, 1, huge), min(2, lanes))
-            restore_shaping_defaults()
+            pin_shaping_baseline()
             set_matmul_min_chunk_rows_gemv(0)
             t |> equal(matmul_chunks_gemv(16, 3, huge), lanes * 3, "grain disabled returns the raw want")
-            restore_shaping_defaults()
+            pin_shaping_baseline()
         }
         t |> run("fine-grain mode (the shipped default): whole grain waves, capped at the fine count") @(t : T?) {
             set_gemv_chunks_per_lane(8)
@@ -193,7 +195,7 @@ def test_matmul_chunks_gemv(t : T?) {
             if (lanes > 2) {
                 t |> equal(matmul_chunks_gemv(32, 1, huge), 1, "sub-wave rows fall through to the grain-limited split")
             }
-            restore_shaping_defaults()
+            pin_shaping_baseline()
         }
     }
 }

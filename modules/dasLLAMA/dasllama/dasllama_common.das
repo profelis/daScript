@@ -3163,29 +3163,36 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         var vcl = kv_layer_vbase(s, l, c.seq_len)
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))   // this layer's physical runs (fork-safe hoist)
         // weight region bases (element offsets into the Q8 blob, scales at /32); wscale_f16
-        // models carry the binary16 plane instead (qscales is freed — hoist only the live one)
+        // models carry the binary16 plane instead (qscales is freed) — each plane's pointers
+        // are formed only in its own branch, so no offset is ever taken off a null base
         let f16w = t.wscale_f16
         let mmrows16 = mm_q8q8_rows16_fn()
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
-        var wsb : float const? = null
-        var wsb16 : uint16 const? = null
+        var wsq : float const? = null
+        var wsk : float const? = null
+        var wsv : float const? = null
+        var wso : float const? = null
+        var wsq16 : uint16 const? = null
+        var wsk16 : uint16 const? = null
+        var wsv16 : uint16 const? = null
+        var wso16 : uint16 const? = null
         if (f16w) {
-            wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+            let wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+            wsq16 = wsb16 + t.wq_offs[l] / 32l
+            wsk16 = wsb16 + t.wk_offs[l] / 32l
+            wsv16 = wsb16 + t.wv_offs[l] / 32l
+            wso16 = wsb16 + t.wo_offs[l] / 32l
         } else {
-            wsb = reinterpret<float const?>(addr(t.qscales[0]))
+            let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+            wsq = wsb + t.wq_offs[l] / 32l
+            wsk = wsb + t.wk_offs[l] / 32l
+            wsv = wsb + t.wv_offs[l] / 32l
+            wso = wsb + t.wo_offs[l] / 32l
         }
         let wpq = wqb + t.wq_offs[l]
-        let wsq = wsb + t.wq_offs[l] / 32l
-        let wsq16 = wsb16 + t.wq_offs[l] / 32l
         let wpk = wqb + t.wk_offs[l]
-        let wsk = wsb + t.wk_offs[l] / 32l
-        let wsk16 = wsb16 + t.wk_offs[l] / 32l
         let wpv = wqb + t.wv_offs[l]
-        let wsv = wsb + t.wv_offs[l] / 32l
-        let wsv16 = wsb16 + t.wv_offs[l] / 32l
         let wpo = wqb + t.wo_offs[l]
-        let wso = wsb + t.wo_offs[l] / 32l
-        let wso16 = wsb16 + t.wo_offs[l] / 32l
         // this position's rope table row (dual-rope arches: the sliding class's row)
         let swa_row = is_sliding && has_dual_rope(c)
         let crow = swa_row ? reinterpret<float const?>(addr(s.rope_cos_swa[0])) : reinterpret<float const?>(addr(s.rope_cos[0]))
@@ -3520,25 +3527,29 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         let f16w = t.wscale_f16
         let mmrows16 = mm_q8q8_rows16_fn()
         let wqb = reinterpret<int8 const?>(addr(t.qblob[0]))
-        var wsb : float const? = null
-        var wsb16 : uint16 const? = null
-        if (f16w) {
-            wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
-        } else {
-            wsb = reinterpret<float const?>(addr(t.qscales[0]))
-        }
         let w1o = t.w1_offs[l]
         let w3o = t.w3_offs[l]
         let w2o = t.w2_offs[l]
+        var ws1 : float const? = null
+        var ws3 : float const? = null
+        var ws2 : float const? = null
+        var ws116 : uint16 const? = null
+        var ws316 : uint16 const? = null
+        var ws216 : uint16 const? = null
+        if (f16w) {
+            let wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+            ws116 = wsb16 + w1o / 32l
+            ws316 = wsb16 + w3o / 32l
+            ws216 = wsb16 + w2o / 32l
+        } else {
+            let wsb = reinterpret<float const?>(addr(t.qscales[0]))
+            ws1 = wsb + w1o / 32l
+            ws3 = wsb + w3o / 32l
+            ws2 = wsb + w2o / 32l
+        }
         let wp1 = wqb + w1o
-        let ws1 = wsb + w1o / 32l
-        let ws116 = wsb16 + w1o / 32l
         let wp3 = wqb + w3o
-        let ws3 = wsb + w3o / 32l
-        let ws316 = wsb16 + w3o / 32l
         let wp2 = wqb + w2o
-        let ws2 = wsb + w2o / 32l
-        let ws216 = wsb16 + w2o / 32l
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             unsafe {
                 let r0 = int64(jb) * 32l
@@ -4392,15 +4403,13 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
         let f16w = t.wscale_f16
         let mmrows16 = mm_q8q8_rows16_fn()
         let wp = reinterpret<int8 const?>(addr(t.qblob[0])) + t.wcls_off
-        var wsb : float const? = null
-        var wsb16 : uint16 const? = null
+        var ws : float const? = null
+        var ws16 : uint16 const? = null
         if (f16w) {
-            wsb16 = reinterpret<uint16 const?>(addr(t.qscales16[0]))
+            ws16 = reinterpret<uint16 const?>(addr(t.qscales16[0])) + t.wcls_off / 32l
         } else {
-            wsb = reinterpret<float const?>(addr(t.qscales[0]))
+            ws = reinterpret<float const?>(addr(t.qscales[0])) + t.wcls_off / 32l
         }
-        let ws = wsb + t.wcls_off / 32l
-        let ws16 = wsb16 + t.wcls_off / 32l
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             unsafe {
                 let r0 = int64(jb) * 32l
