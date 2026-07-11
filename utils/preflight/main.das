@@ -742,8 +742,10 @@ def gate_tests_jit(ctx : PreflightCtx) : GateResult {
         return GateResult(name = "tests-jit", status = GateStatus.Skip, seconds = seconds_since(t0),
             detail = "JIT probe failed (see output) — most common cause: daslang built without dasLLVM (-DDAS_LLVM_DISABLED=OFF)", output = probe.out)
     }
+    // Isolated-parallel like CI's run_tests_jit (~3x faster than sequential, identical
+    // pass/fail set; workers mint the dll cache themselves). Timeout matches CI's 1800.
     return run_test_gate("tests-jit",
-        [ctx.daslang, "dastest/dastest.das", "-jit", "--", "--jit-opt-level=3", "--failures-only", "--timeout", "900", "--test", "tests"],
+        [ctx.daslang, "dastest/dastest.das", "-jit", "--", "--jit-opt-level=3", "--failures-only", "--isolated-mode", "--batch", "4", "--timeout", "1800", "--test", "tests"],
         "JIT suite failures")
 }
 
