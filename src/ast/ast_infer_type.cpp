@@ -2849,6 +2849,7 @@ namespace das {
                     // string finalizeName = (fn->module->name.empty() ? "_" : fn->module->name) + "::finalize";
                     string finalizeName = "_::finalize";
                     auto finalizeFn = new ExprCall(expr->at, finalizeName);
+                    finalizeFn->generated = true;   // anchored at the `delete` token, not call text
                     finalizeFn->arguments.push_back(expr->subexpr->clone());
                     return finalizeFn;
                 } else {

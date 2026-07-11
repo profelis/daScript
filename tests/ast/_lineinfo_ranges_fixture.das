@@ -27,6 +27,11 @@ def use_lets() {
     print("{cc} {dd} {ee} {ff}")
 }
 
+def use_fmt() : int {
+    let ss = "pi={3.14159:.3f} ok"
+    return ss == "" ? 0 : 1
+}
+
 def use_closures() {
     apply_it() $(q : int) {
         print("{q}")
