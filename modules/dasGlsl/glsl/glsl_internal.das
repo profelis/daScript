@@ -94,6 +94,26 @@ class GlslShader : AstFunctionAnnotation {
         return true
     }
     def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
+        // 16/8-bit lattice members in @uniform/@push_constant blocks fail closed HERE — before
+        // the bind-uniform glue generates (an unpackable block would otherwise silently downgrade
+        // to the loose per-field binder, and the diagnostic would be an incidental GL-bind error)
+        var latErr = ""
+        for_each_global(compiling_module()) $(gvar) {
+            if (empty(latErr) && gvar._type.baseType == Type.tStructure && gvar._type.structType != null) {
+                if (gvar.annotation |> find_arg("uniform") is tBool || gvar.annotation |> find_arg("push_constant") is tBool) {
+                    for (f in gvar._type.structType.fields) {
+                        if (lattice_small_type(f._type.baseType)) {
+                            latErr = "uniform block '{gvar.name}' field '{f.name}': 16/8-bit lattice members have no std140 layout (not supported yet)"
+                            break
+                        }
+                    }
+                }
+            }
+        }
+        if (!empty(latErr)) {
+            errors := latErr
+            return false
+        }
         for_each_function(compiling_module(), bind_uniform_function_name(func)) $(bfun) {
             if (bfun.flags.exports) {
                 bfun.flags.exports = false
@@ -390,6 +410,9 @@ class GlslExport : AstVisitor {
                 }
             } elif (glsl_types |> key_exists(et.baseType)) {
                 tw |> write(glsl_types?[et.baseType] ?? "error")
+            } elif (cpu_only_lattice_width(et.baseType)) {
+                error("type {et.baseType} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)", t.at)
+                tw |> write("error")
             } else {
                 error("unsupported type {et.baseType}", t.at)
                 tw |> write("error")
@@ -1291,6 +1314,25 @@ class GlslExport : AstVisitor {
         unsafe {
             fnName = glsl_function_name(reinterpret<FunctionPtr>(expr.func))
         }
+        // 16/8-bit lattice values crossing a call (ctor/convert/builtin): an unmapped name
+        // would pass through VERBATIM below and poison the text silently — fail closed instead.
+        // Type-driven (result + args), so converts like float(h) are caught by the arg scan.
+        var latticeCross = lattice_small_type(expr._type.baseType)
+        if (!latticeCross) {
+            for (arg in expr.arguments) {
+                if (lattice_small_type(arg._type.baseType)) {
+                    latticeCross = true
+                    break
+                }
+            }
+        }
+        if (latticeCross) {
+            if (cpu_only_lattice_width(expr._type.baseType)) {
+                error("call '{fnName}': type {expr._type.baseType} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)", expr.at)
+            } else {
+                error("call '{fnName}': 16/8-bit lattice types are not supported yet", expr.at)
+            }
+        }
         if (caps.output_compatibility_constructors) {
             glsl_compatibility_constructors |> get(fnName) $(newName) {
                 fnName = newName
@@ -1969,6 +2011,11 @@ class GlslExport : AstVisitor {
 // string
     def override preVisitExprConstString(expr : ExprConstString?) : void {
         error("string constant is not supported", expr.at)
+    }
+// const float16 — backstop: without an override the adapter default emits NOTHING (silent
+// malformed GLSL). Becomes float16_t(...) ctor emission when the lattice wave lands.
+    def override preVisitExprConstFloat16(expr : ExprConstFloat16?) : void {
+        error("float16 constant is not supported yet", expr.at)
     }
 // const double
     def override preVisitExprConstDouble(expr : ExprConstDouble?) : void {

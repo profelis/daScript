@@ -222,29 +222,43 @@ def emit_reject_fixture(spec : ShaderTypeSpec; rail : string) {
             } else {
                 writer |> write("require glsl/glsl_opengl\n")
                 writer |> write("\n")
+                writer |> write("var @inout fc_conf_{spec.name}_uv : float2\n")
                 writer |> write("var @out fc_conf_{spec.name}_color : float4\n")
                 writer |> write("\n")
                 writer |> write("[fragment_program(name=\"fc_conf_{spec.name}_glsl\")]\n")
                 writer |> write("def fc_conf_{spec.name}_fragment \{\n")
             }
+            // the lattice value must FLOW into the shader output: dasGlsl's fixup runs
+            // post-optimization, so an unused local is DCE'd before the emitter can reject it
+            // (dasSpirv's patch runs pre-DCE — but keep both rails uniform)
+            var elem = "v"
+            if (spec.arity > 4) {
+                elem = "v.s0"       // xyzw stays <= 4 lanes; .s namespace covers 8/16
+            } elif (spec.arity > 1) {
+                elem = "v.x"
+            }
             if (spec.kind == "memzero") {
-                // side-effecting statement on a consumed value — survives the optimizer, so the
-                // emitter's explicit rejection is guaranteed to be reached
+                // side-effecting statement on a consumed value — optimizer-proof
                 writer |> write("    var v = float4(0., 0., 0., 1.)\n")
                 writer |> write("    memzero(v)\n")
+            } elif (rail == "glsl" && spec.arity == 1) {
+                // scalar lattice consts FOLD (float(1.5h) -> 1.5f at compile time) — seed from
+                // the varying so the value is runtime-dependent and survives to the emitter
+                writer |> write("    var v = {spec.name}(fc_conf_{spec.name}_uv.x)\n")
+            } elif (spec.arity == 1 && spec.kind == "half") {
+                writer |> write("    var v = 1.5h\n")          // scalar float16 has no float16(float16) ctor
             } else {
                 writer |> write("    var v = {ctor(spec, 1)}\n")
-                if (spec.arity > 1) {
-                    writer |> write("    let r = v.x\n")
-                } else {
-                    writer |> write("    let r = v\n")
-                }
             }
             if (rail == "glsl") {
                 if (spec.kind == "memzero") {
                     writer |> write("    fc_conf_{spec.name}_color = v\n")
                 } else {
-                    writer |> write("    fc_conf_{spec.name}_color = float4(0., 0., 0., 1.)\n")
+                    writer |> write("    fc_conf_{spec.name}_color = float4(float({elem}), 0., 0., 1.)\n")
+                }
+            } else {
+                if (spec.kind != "memzero") {
+                    writer |> write("    let r = {elem}\n")
                 }
             }
             writer |> write("\}\n")
@@ -261,6 +275,99 @@ def emit_reject_fixture(spec : ShaderTypeSpec; rail : string) {
         f |> fwrite(body)
     }
     to_log(LOG_INFO, "[gen_shader_conformance] DONE {path} ({get_time_usec(t0)}us)\n")
+}
+
+// context fixtures: lattice types in interface blocks (UBO / SSBO / push constants) must fail
+// closed per context — these pin the per-context diagnostics on both rails
+struct ContextSpec {
+    name : string
+    rail : string
+    body : string
+    needle : string
+}
+
+def context_specs : array<ContextSpec> {
+    return <- [
+        ContextSpec(name = "_fc_lattice_ubo", rail = "spirv", needle = "field 'h': type tHalf4 is not supported",
+            body = build_string() $(var w) {
+                w |> write("struct FcUboLat \{\n    a : float4\n    h : half4\n\}\n\n")
+                w |> write("var @uniform @binding = 0 fc_u_lat : FcUboLat\n")
+                w |> write("var @ssbo @binding = 1 fc_u_out : array<float>\n\n")
+                w |> write("[compute_shader(local_size_x=64, name=\"fc_lat_ubo_spv\")]\n")
+                w |> write("def fc_lat_ubo_kernel \{\n")
+                w |> write("    let gi = gl_GlobalInvocationID.x\n")
+                w |> write("    fc_u_out[gi] = fc_u_lat.a.x\n")
+                w |> write("\}\n")
+            }),
+        ContextSpec(name = "_fc_lattice_ssbo", rail = "spirv", needle = "element type tHalf4 is not supported",
+            body = build_string() $(var w) {
+                w |> write("var @ssbo @binding = 0 fc_s_lat : array<half4>\n\n")
+                w |> write("[compute_shader(local_size_x=64, name=\"fc_lat_ssbo_spv\")]\n")
+                w |> write("def fc_lat_ssbo_kernel \{\n")
+                w |> write("    let gi = gl_GlobalInvocationID.x\n")
+                w |> write("    fc_s_lat[gi] = fc_s_lat[gi]\n")
+                w |> write("\}\n")
+            }),
+        ContextSpec(name = "_fc_lattice_push", rail = "spirv", needle = "field 's': type tShort2 is not supported",
+            body = build_string() $(var w) {
+                w |> write("struct FcPushLat \{\n    a : float4\n    s : short2\n\}\n\n")
+                w |> write("var @push_constant fc_p_lat : FcPushLat\n")
+                w |> write("var @ssbo @binding = 0 fc_p_out : array<float>\n\n")
+                w |> write("[compute_shader(local_size_x=64, name=\"fc_lat_push_spv\")]\n")
+                w |> write("def fc_lat_push_kernel \{\n")
+                w |> write("    let gi = gl_GlobalInvocationID.x\n")
+                w |> write("    fc_p_out[gi] = fc_p_lat.a.x\n")
+                w |> write("\}\n")
+            }),
+        ContextSpec(name = "_fc_lattice_ubo", rail = "glsl", needle = "16/8-bit lattice members have no std140 layout",
+            body = build_string() $(var w) {
+                w |> write("options no_unused_function_arguments = false\n\n")
+                w |> write("[unused_argument(program, blockName, size)] def std140_reset(program : uint; blockName : string; size : int) \{\}\n")
+                w |> write("[unused_argument(program, blockName, offset, value)] def std140_set(program : uint; blockName : string; offset : uint; value) \{\}\n")
+                w |> write("[unused_argument(program, blockName, bindingPoint)] def std140_flush(program : uint; blockName : string; bindingPoint : int) \{\}\n\n")
+                w |> write("struct FcUboLat \{\n    a : float4\n    h : half4\n\}\n\n")
+                w |> write("var @uniform fc_ug_lat : FcUboLat\n")
+                w |> write("var @out fc_ug_color : float4\n\n")
+                w |> write("[fragment_program(name=\"fc_lat_ubo_glsl\")]\n")
+                w |> write("def fc_lat_ubo_fragment \{\n")
+                w |> write("    fc_ug_color = fc_ug_lat.a\n")
+                w |> write("\}\n\n")
+                w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_ubo_glsl\}\\n\")\n\}\n")
+            }),
+        ContextSpec(name = "_fc_lattice_ssbo", rail = "glsl", needle = "16/8-bit lattice types are not supported yet",
+            body = build_string() $(var w) {
+                w |> write("var @ssbo fc_sg_lat : array<half4>\n")
+                w |> write("var @out fc_sg_color : float4\n\n")
+                w |> write("[fragment_program(name=\"fc_lat_ssbo_glsl\")]\n")
+                w |> write("def fc_lat_ssbo_fragment \{\n")
+                w |> write("    fc_sg_color = float4(float(fc_sg_lat[0].x), 0., 0., 1.)\n")
+                w |> write("\}\n\n")
+                w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_ssbo_glsl\}\\n\")\n\}\n")
+            })
+    ]
+}
+
+def emit_context_fixture(cs : ContextSpec) {
+    let dir = get_das_root() + "/tests/{cs.rail}/_fail_closed"
+    mkdir(dir)
+    let path = "{dir}/{cs.name}.das"
+    to_log(LOG_INFO, "[gen_shader_conformance] START {path}\n")
+    fopen(path, "wb") $(f) {
+        let body = build_string() $(var writer) {
+            writer |> write("// GENERATED by utils/dasgen/gen_shader_conformance.das — DO NOT EDIT\n")
+            writer |> write("expect 50501\n")
+            writer |> write("\n")
+            writer |> write("options gen2\n")
+            if (cs.rail == "spirv") {
+                writer |> write("\nrequire spirv/spirv_shader\nrequire spirv/spirv_builtins public\n\n")
+            } else {
+                writer |> write("\nrequire glsl/glsl_opengl\n\n")
+            }
+            writer |> write(cs.body)
+        }
+        f |> fwrite(body)
+    }
+    to_log(LOG_INFO, "[gen_shader_conformance] DONE {path}\n")
 }
 
 def emit_reject_runner(specs : array<ShaderTypeSpec>; rail : string) {
@@ -316,12 +423,61 @@ def emit_reject_runner(specs : array<ShaderTypeSpec>; rail : string) {
                     writer |> write("        check_rejects(t, \"_fc_conf_{spec.name}\", \"{needle}\")\n")
                 }
             }
+            var ctx <- context_specs()
+            for (cs in ctx) {
+                if (cs.rail == rail) {
+                    writer |> write("        check_rejects(t, \"{cs.name}\", \"{cs.needle}\")\n")
+                }
+            }
+            delete ctx
             writer |> write("    \}\n")
             writer |> write("\}\n")
         }
         f |> fwrite(body)
     }
     to_log(LOG_INFO, "[gen_shader_conformance] DONE {path} ({get_time_usec(t0)}us)\n")
+}
+
+// one reject row per lattice type. `cpu_only` widths get the dedicated CPU-only diagnostic;
+// shader-legal widths get the generic not-supported one (flipped to emit rows by later waves)
+def push_lattice_row(var specs : array<ShaderTypeSpec>; name, kind : string; arity : int; cpu_only : bool; enum_name : string) {
+    let spv = cpu_only ? "is CPU-only" : "type {enum_name} is not supported"
+    let glsl = cpu_only ? "is CPU-only" : "unsupported type {enum_name}"
+    specs |> push(ShaderTypeSpec(name = name, glsl_name = "", arity = arity, kind = kind, has_arith = false,
+        reject = true, rails = "both", spv_needle = spv, glsl_needle = glsl))
+}
+
+def push_lattice_rows(var specs : array<ShaderTypeSpec>) {
+    // fp16 family
+    push_lattice_row(specs, "float16", "half", 1, false, "tFloat16")
+    push_lattice_row(specs, "half2", "half", 2, false, "tHalf2")
+    push_lattice_row(specs, "half3", "half", 3, false, "tHalf3")
+    push_lattice_row(specs, "half4", "half", 4, false, "tHalf4")
+    push_lattice_row(specs, "half8", "half", 8, true, "tHalf8")
+    // pre-lattice small scalars (in shader scope per the arc, reject until the feature waves)
+    push_lattice_row(specs, "int8", "int", 1, false, "tInt8")
+    push_lattice_row(specs, "uint8", "uint", 1, false, "tUInt8")
+    push_lattice_row(specs, "int16", "int", 1, false, "tInt16")
+    push_lattice_row(specs, "uint16", "uint", 1, false, "tUInt16")
+    // int lattice vectors
+    push_lattice_row(specs, "short2", "int", 2, false, "tShort2")
+    push_lattice_row(specs, "short3", "int", 3, false, "tShort3")
+    push_lattice_row(specs, "short4", "int", 4, false, "tShort4")
+    push_lattice_row(specs, "short8", "int", 8, true, "tShort8")
+    push_lattice_row(specs, "ushort2", "uint", 2, false, "tUShort2")
+    push_lattice_row(specs, "ushort3", "uint", 3, false, "tUShort3")
+    push_lattice_row(specs, "ushort4", "uint", 4, false, "tUShort4")
+    push_lattice_row(specs, "ushort8", "uint", 8, true, "tUShort8")
+    push_lattice_row(specs, "byte2", "int", 2, false, "tByte2")
+    push_lattice_row(specs, "byte3", "int", 3, false, "tByte3")
+    push_lattice_row(specs, "byte4", "int", 4, false, "tByte4")
+    push_lattice_row(specs, "byte8", "int", 8, true, "tByte8")
+    push_lattice_row(specs, "byte16", "int", 16, true, "tByte16")
+    push_lattice_row(specs, "ubyte2", "uint", 2, false, "tUByte2")
+    push_lattice_row(specs, "ubyte3", "uint", 3, false, "tUByte3")
+    push_lattice_row(specs, "ubyte4", "uint", 4, false, "tUByte4")
+    push_lattice_row(specs, "ubyte8", "uint", 8, true, "tUByte8")
+    push_lattice_row(specs, "ubyte16", "uint", 16, true, "tUByte16")
 }
 
 [export]
@@ -351,6 +507,9 @@ def main {
         ShaderTypeSpec(name = "memzero", glsl_name = "", arity = 1, kind = "memzero", has_arith = false,
             reject = true, rails = "glsl", spv_needle = "", glsl_needle = "memzero is not supported")
     ]
+    // 16/8-bit lattice: ALL rows reject until the feature waves land (W3+ SPIR-V, W5 GLSL flip
+    // shader-legal rows to emit); the 8/16-lane forms are PERMANENT rejects (CPU-only widths)
+    push_lattice_rows(specs)
     for (spec in specs) {
         if (spec.reject) {
             if (spec.rails == "both" || spec.rails == "spirv") {
@@ -364,6 +523,11 @@ def main {
             emit_glsl_test(spec)
         }
     }
+    var ctx <- context_specs()
+    for (cs in ctx) {
+        emit_context_fixture(cs)
+    }
+    delete ctx
     emit_reject_runner(specs, "spirv")
     emit_reject_runner(specs, "glsl")
     to_log(LOG_INFO, "[gen_shader_conformance] generated {length(specs)} row(s)\n")

@@ -24,6 +24,22 @@ def public matrix_info(t : TypeDecl?) : tuple<ok : bool; width : int; cols : int
     return (ok = false, width = 0, cols = 0)
 }
 
+// The whole 16/8-bit lattice (contiguous appended block in the Type enum) — the types the
+// shader emitters must fail closed on until their feature waves land.
+def public lattice_small_type(bt : Type) : bool {
+    return int(bt) >= int(Type.tFloat16) && int(bt) <= int(Type.tUByte16)
+}
+
+// The 8/16-lane lattice forms (half8, short8/ushort8, byte8/16, ubyte8/16) are CPU-only by
+// design: shader vectors cap at 4 lanes on every target (SPIR-V OpTypeVector, GLSL vecN).
+// Both shader emitters key their dedicated fail-closed diagnostic on this predicate.
+def public cpu_only_lattice_width(bt : Type) : bool {
+    return (bt == Type.tHalf8
+        || bt == Type.tShort8 || bt == Type.tUShort8
+        || bt == Type.tByte8 || bt == Type.tByte16
+        || bt == Type.tUByte8 || bt == Type.tUByte16)
+}
+
 // Type -> scalar class: 0 signed int, 1 unsigned int, 2 float (scalars and their 2/3/4 vectors);
 // -1 for anything else. The supported interface-block leaf set is exactly these 32-bit numerics.
 def public scalar_class(bt : Type) : int {

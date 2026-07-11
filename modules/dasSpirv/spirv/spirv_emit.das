@@ -1622,7 +1622,11 @@ def private declare_local_var(var m : SpirvModule; var ctx : EmitCtx; v : Variab
     let bt = v._type.baseType
     if (scalar_class(bt) < 0 && bt != Type.tBool && bt != Type.tFixedArray) {
         // emit_type would panic on an unsupported base type; reject with a clean error instead.
-        errors |> push("local '{v.name}': type {bt} is not supported yet (only 32-bit int/uint/float scalars+vectors, bool, and fixed arrays)")
+        if (cpu_only_lattice_width(bt)) {
+            errors |> push("local '{v.name}': type {bt} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)")
+        } else {
+            errors |> push("local '{v.name}': type {bt} is not supported yet (only 32-bit int/uint/float scalars+vectors, bool, and fixed arrays)")
+        }
         return
     }
     let vt = emit_type(m, v._type)

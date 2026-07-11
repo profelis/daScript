@@ -5,6 +5,7 @@ options gen2
 
 require glsl/glsl_opengl
 
+var @inout fc_conf_memzero_uv : float2
 var @out fc_conf_memzero_color : float4
 
 [fragment_program(name="fc_conf_memzero_glsl")]
