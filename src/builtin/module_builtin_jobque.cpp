@@ -805,8 +805,9 @@ namespace das {
     }
 
     // per-lane event tracer (JobQue::traceStart/traceStop/traceSave): every lane records
-    // publish/chunk/stage-wait/wake events on one global clock; save writes chrome://tracing
-    // JSON for Perfetto — one row per lane, the gaps read directly off the timeline.
+    // publish/chunk/stage-wait/wake/fifo-job events on one global clock; save writes
+    // chrome://tracing JSON for Perfetto — one row per lane, the gaps read directly off the
+    // timeline.
     void jobque_trace_start ( int32_t eventsPerLane, Context * context, LineInfoArg * at ) {
         if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
         g_jobQue->traceStart(eventsPerLane);
