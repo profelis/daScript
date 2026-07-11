@@ -872,6 +872,23 @@ namespace das {
                                 if ( !cle->type ) {
                                     cle->type = new TypeDecl(*expr->variable->init->type);
                                 }
+                                // the let coerced the init to the variable's type - a null
+                                // literal (void?) into a typed pointer being the canonical
+                                // case - and no infer runs after this substitution: the
+                                // propagated read must carry the VARIABLE's type, or a
+                                // downstream consumer sees void? where float? stood
+                                // (SimulateVisitor::visit(ExprSafeAt*) crashed on the null
+                                // firstType). isSameType can't gate this - void pointers
+                                // match any pointer there - so test the shape directly
+                                if ( cle->type->isVoidPointer()
+                                    && expr->variable->type->isPointer()
+                                    && expr->variable->type->firstType
+                                    && !expr->variable->type->firstType->isVoid() ) {
+                                    bool wasConst = cle->type->constant;
+                                    cle->type = new TypeDecl(*expr->variable->type);
+                                    cle->type->ref = false;
+                                    cle->type->constant = wasConst;
+                                }
                                 return cle;
                             }
                         }

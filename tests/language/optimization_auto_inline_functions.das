@@ -145,6 +145,35 @@ def make_node_stmts(v : int) : Node? {
 
 def len_plus(xs : array<int>; k : int) : int => length(xs) + k
 
+def private chain_inner(k : int) : tuple<ok : bool; xs : array<string>> {
+    var r : tuple<ok : bool; xs : array<string>>
+    r.ok = k > 0
+    r.xs |> push("x{k}")
+    return <- r
+}
+
+def private chain_outer(k : int) : tuple<ok : bool; xs : array<string>> {
+    // same-round chained splice: the trailing move-return's subexpr is the
+    // previous splice's untyped result-temp read - the store must stay a move
+    return <- chain_inner(k + 1)
+}
+
+def private mk_node(k : int) : Node? => new Node(v = k)
+
+def private node_via_call(k : int) : Node? {
+    // move-return of a COPYABLE (pointer) call result: the result-temp store
+    // must demote to a copy (ExprMove from a copyable rvalue is 30941)
+    return <- mk_node(k)
+}
+
+def ref_binder(var v : array<int>) : int {
+    // body binds a local reference: the heuristic tier declines (a chained
+    // splice could hand the binding a non-addressable substitution)
+    var a & = unsafe(v[0])
+    a++
+    return a
+}
+
 [export]
 def target_expr_body(a, b : int) : int {
     return small_mul(a, b) + small_mul(b, a + 1)
@@ -239,6 +268,32 @@ def target_const_empty_array(k : int) : int {
 }
 
 [export]
+def target_move_chain(k : int) : int {
+    var t <- chain_outer(k)
+    let n = length(t.xs)
+    delete t
+    return n
+}
+
+[export]
+def target_move_copyable(k : int) : int {
+    var p = node_via_call(k)
+    let r = p != null ? p.v : -1
+    unsafe {
+        delete p
+    }
+    return r
+}
+
+[export]
+def target_ref_binder(a, b, c : int) : int {
+    var v <- [a, b, c]
+    let r = ref_binder(v)
+    delete v
+    return r
+}
+
+[export]
 def target_impure_args(a, b : int) : int {
     // impure arguments must keep call-order evaluation through the splice
     return small_mul(side("a", a), side("b", b))
@@ -287,6 +342,15 @@ def test_auto_inline_functions_fired(t : T?) {
             let b = body_of(t, "target_mixed_ternary_graft")
             t |> success(!has(b, "make_node("), "call is gone: {b}")
         }
+        t |> run("chained move-return splices keep the move") @(t : T?) {
+            let b = body_of(t, "target_move_chain")
+            t |> success(!has(b, "chain_outer("), "outer call is gone: {b}")
+            t |> success(!has(b, "chain_inner("), "inner call is gone: {b}")
+        }
+        t |> run("copyable move-return call splices via a copy store") @(t : T?) {
+            let b = body_of(t, "target_move_copyable")
+            t |> success(!has(b, "node_via_call("), "call is gone: {b}")
+        }
     }
 }
 
@@ -322,6 +386,10 @@ def test_auto_inline_functions_declines(t : T?) {
         t |> run("generic instance stays a call") @(t : T?) {
             let b = body_of(t, "target_generic")
             t |> success(has(b, "gadd"), "call stays regular: {b}")
+        }
+        t |> run("reference-binding callee stays a call") @(t : T?) {
+            let b = body_of(t, "target_ref_binder")
+            t |> success(has(b, "ref_binder("), "call stays regular: {b}")
         }
         t |> run("statement-body callee in a mixed-type ternary stays a call") @(t : T?) {
             let b = body_of(t, "target_mixed_ternary_stmts")
@@ -362,5 +430,10 @@ def test_auto_inline_functions_behavior(t : T?) {
     }
     t |> run("const empty-array argument results match") @(t : T?) {
         t |> equal(target_const_empty_array(5), 5)
+    }
+    t |> run("move-return results match") @(t : T?) {
+        t |> equal(target_move_chain(1), 1)
+        t |> equal(target_move_copyable(7), 7)
+        t |> equal(target_ref_binder(10, 20, 30), 11)
     }
 }

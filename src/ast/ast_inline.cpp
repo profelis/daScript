@@ -24,13 +24,14 @@ namespace das {
     //    callee shape, [unsafe_operation]/[unsafe_deref], recursion through the splice
     //    graph, private symbols, call position - declines SILENTLY (counted, logged under
     //    log_optimization). `options disable_auto_inline` (or the policy) turns it off.
-    //    With `options auto_inline_functions` (opt-in, same policy family) the AUTO tier
-    //    also takes UNSIGNALED plain calls whose callee is worth splicing: loop-free and
-    //    within the `auto_inline_cost` node budget, or private and referenced exactly
-    //    once (the body moves, it cannot grow the program). Generic instances stay out
-    //    of this tier (explicit flavors and inferer-manufactured argument shapes are
-    //    splice hazards - see autoEligibleCall). [never_inline] opts a function out of
-    //    every best-effort tier; combining it with [inline] is an error.
+    //    With `options auto_inline_functions` (opt-in, same policy family) the AUTO
+    //    tier also takes UNSIGNALED plain calls and operator sites whose callee is
+    //    worth splicing: loop-free and within the `auto_inline_cost` node budget, or
+    //    private and referenced exactly once (the body moves, it cannot grow the
+    //    program). Generic instances stay out of this tier (explicit flavors and
+    //    inferer-manufactured argument shapes are splice hazards - see
+    //    autoEligibleCall). [never_inline] opts a function out of every best-effort
+    //    tier; combining it with [inline] is an error.
     //    A plain unsafe body (hasUnsafe) splices: compiled callees lost their `unsafe { }`
     //    wrappers to foldUnsafe and would re-error on the caller's re-infer, so the spliced
     //    body rides the result-temp path under a generated statement-position ExprUnsafe -
@@ -1056,6 +1057,20 @@ namespace das {
 
     namespace {
 
+        // any local declared as a reference (`let & =` / `var & =`), including the
+        // manufactured argument references of an earlier splice round
+        bool bindsLocalRef ( Expression * root ) {
+            bool found = false;
+            lookupExpressions(root, [&](Expression * e) {
+                if ( found || !e->rtti_isLet() ) return;
+                auto let = static_cast<ExprLet *>(e);
+                for ( auto & v : let->variables ) {
+                    if ( v->type && v->type->ref ) { found = true; return; }
+                }
+            });
+            return found;
+        }
+
         // a call (or invoke) passing a `#` argument where the resolved target's parameter
         // is neither `#` nor implicit. the binding is tolerated on the original node (the
         // genericFunction short-circuit) and the locked-name fallback re-resolves it after
@@ -1205,6 +1220,16 @@ namespace das {
                 } else if ( reinferFragile(fn->body) ) {
                     ok = false;
                     why = "body carries a temporary-flavored call";
+                } else if ( bindsLocalRef(fn->body) ) {
+                    // a `let & =` in the body re-binds its initializer under the caller's
+                    // scope, and a CHAINED splice can substitute the initializer's leaf
+                    // with a non-addressable expression (proven: decs' req_hash ->
+                    // compile_request -> lookup_request chain, where a previously
+                    // manufactured arg reference ended up bound to a temporary - 31019).
+                    // note this also catches this pass's own manufactured references,
+                    // stopping re-splice chains at the first reference-binding body
+                    ok = false;
+                    why = "body binds a local reference";
                 } else if ( annotatedCallee(fn, why) ) {
                     ok = false;     // an annotation may carry call-site semantics
                                     // (verifyCall & co) that a splice would bypass
@@ -1907,8 +1932,18 @@ namespace das {
                         string resName = "__inl" + to_string(inlineId) + "_res";
                         splice.push_back(makeUninitDecl(callLike->at, resName, subjResult));
                         auto ret = static_cast<ExprReturn *>(trailing);
-                        // `return <- x` becomes a move into the result temp, `return x` a copy
-                        Expression * store = ret->moveSemantics
+                        // `return <- x` becomes a move into the result temp, `return x` a copy.
+                        // a move store is illegal from a copyable rvalue - `return <- g(...)`
+                        // of a pointer result must store as a COPY (identical semantics for
+                        // an rvalue; ExprMove rejects it, 30941). only a PROVEN copyable
+                        // rvalue demotes: an untyped subexpr (a same-round chained splice's
+                        // manufactured result-temp read) keeps the move - those reads are
+                        // references, and demoting a non-copyable to a copy is 30950
+                        bool storeAsCopy = ret->moveSemantics
+                            && ret->subexpr && ret->subexpr->type
+                            && !ret->subexpr->type->ref
+                            && ret->subexpr->type->canCopy();
+                        Expression * store = (ret->moveSemantics && !storeAsCopy)
                             ? static_cast<Expression *>(new ExprMove(ret->at,
                                 new ExprVar(ret->at, resName), ret->subexpr))
                             : static_cast<Expression *>(new ExprCopy(ret->at,

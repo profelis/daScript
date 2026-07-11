@@ -700,7 +700,7 @@ typedef enum das_bool_policy {
     DAS_POLICY_LOG_OPTIMIZATION,                 // Log optimizer rewrites (per-pass fired/nothing lines, inline/devirt sites and declines)
     DAS_POLICY_LOG_OPTIMIZATION_PASSES,          // Log the AST after every optimizer pass (verbose)
     DAS_POLICY_FUSION,                           // Fuse interpreter nodes into wider superinstructions at simulate time (default: on)
-    DAS_POLICY_AUTO_INLINE_FUNCTIONS             // Heuristic best-effort inlining of plain calls to small [inline]-shaped functions (silent declines; optimized builds only)
+    DAS_POLICY_AUTO_INLINE_FUNCTIONS             // Heuristic best-effort inlining of plain calls and operator sites of small [inline]-shaped functions (opt-in; silent declines; optimized builds only)
 } das_bool_policy;
 
 // Integer policy fields (stack size, heap limits).

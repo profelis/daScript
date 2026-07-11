@@ -1605,7 +1605,7 @@ namespace das
         /*option*/ bool disable_cse = false;                       // disable the common-subexpression-elimination pass
         /*option*/ bool disable_inline = false;                    // disable the [inline] function inliner (calls stay regular calls; declaration-level contract checks - shape, recursion, @@ - still lint)
         /*option*/ bool disable_auto_inline = false;               // disable automatic inlining of block-literal call sites and invoke-of-literal devirtualization ([inline] splicing is unaffected)
-        /*option*/ bool auto_inline_functions = false;             // heuristic best-effort inlining of plain calls to small [inline]-shaped functions (silent declines; optimized builds only; disable_auto_inline overrides)
+        /*option*/ bool auto_inline_functions = false;             // heuristic best-effort inlining of plain calls and operator sites of small [inline]-shaped functions (opt-in; silent declines; optimized builds only; disable_auto_inline overrides)
         /*option*/ int32_t auto_inline_cost = 32;                  // auto_inline_functions budget: a callee body up to this many AST nodes is worth splicing (private single-call callees are exempt)
         /*option*/ bool disable_run = false;                       // disable compile-time function evaluation (RunFolding of pure calls over constants)
         /*option*/ bool no_infer_time_folding = false;             // disable infer-time constant folding
