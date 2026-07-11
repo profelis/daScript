@@ -219,6 +219,7 @@ namespace das {
             L.ev.resize(size_t(das::max(eventsPerLane, 1024)));
             L.n = 0;
         }
+        mTraceT0 = uint64_t(ref_time_ticks());  // wake spans clamp their park-t0 to the session start
         mTraceOn.store(1, std::memory_order_seq_cst);
     }
 
@@ -492,7 +493,11 @@ namespace das {
                         || mTeamSeq.load(std::memory_order_seq_cst) != teamSeqSeen;
                 });
                 mParkedWorkers.fetch_sub(1, std::memory_order_relaxed);
-                if ( p0 ) traceEvent(threadIndex, TraceTag::Wake, p0, uint64_t(ref_time_ticks()), 0, 1, 0);
+                if ( p0 && mTraceOn.load(std::memory_order_relaxed) ) {
+                    // re-check: tracing may have stopped while we were parked; a wake into a NEWER
+                    // session clamps its park-t0 to that session's start (no pre-session spans)
+                    traceEvent(threadIndex, TraceTag::Wake, das::max(p0, mTraceT0), uint64_t(ref_time_ticks()), 0, 1, 0);
+                }
                 if ( mShutdown ) break;
                 if ( mFifo.empty() ) continue;      // team wake, no fifo work → back to the spin/team poll
                 job = das::move(mFifo.front().function);

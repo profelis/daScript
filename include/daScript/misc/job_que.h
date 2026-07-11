@@ -300,6 +300,7 @@ namespace das {
         };
         atomic<int32_t> mTraceOn{0};
         atomic<int32_t> mTraceTag{0};   // current op tag (traceSetTag) — folded into ChainPublish.stage's high bits
+        uint64_t mTraceT0 = 0;          // session start tick — wake spans clamp their park-t0 to it
         vector<LaneTrace> mTrace;
         __forceinline void traceEvent ( int lane, TraceTag tag, uint64_t t0, uint64_t t1,
                 uint32_t stage, uint32_t arg, uint32_t chain ) {
