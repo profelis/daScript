@@ -36,6 +36,8 @@ let GGML_TYPE_F32 = 0
 let GGML_TYPE_F16 = 1
 let GGML_TYPE_Q4_0 = 2
 let GGML_TYPE_Q8_0 = 8
+let GGML_TYPE_Q4_K = 12
+let GGML_TYPE_Q6_K = 14
 let GGML_TYPE_BF16 = 30
 let GGML_TYPE_MXFP4 = 39
 
@@ -399,6 +401,83 @@ def gguf_find_tensor(m : GGUFMeta; name : string) : int {
     return -1
 }
 
+// ===== K-quant superblock dequant (256-weight superblocks, ggml Q4_K / Q6_K) =====
+
+// int8 read (K-quant sub-scales are signed bytes)
+def private rd_i8(b : array<uint8> | #; o : int64) : int {
+    let u = int(b[o])
+    return u < 128 ? u : u - 256
+}
+
+// 6-bit sub-scale/min unpack for Q4_K/Q5_K superblocks (ggml get_scale_min_k4). The 12 scale
+// bytes hold 8 scales + 8 mins: j<4 live in the low 6 bits of bytes j / j+4; j>=4 split as
+// low-4 in byte j+4 (scale = low nibble, min = high) + top-2 of bytes j-4 / j.
+def private q4k_scale_min(b : array<uint8> | #; so, j : int64) : int2 {
+    if (j < 4l) {
+        return int2(int(b[so + j]) & 63, int(b[so + j + 4l]) & 63)
+    }
+    let sc = (int(b[so + j + 4l]) & 15) | ((int(b[so + j - 4l]) >> 6) << 4)
+    let mn = (int(b[so + j + 4l]) >> 4) | ((int(b[so + j]) >> 6) << 4)
+    return int2(sc, mn)
+}
+
+//! Dequantize one Q4_K superblock (144 bytes at `bo`: fp16 d, fp16 dmin, 12 bytes of 6-bit
+//! sub-scales/mins for 8 sub-blocks of 32, 128 nibble bytes) into dst[doff .. doff+256).
+//! w = (d*sc)*q - (dmin*m) with q the RAW nibble — the min term absorbs the offset. Per 64-weight
+//! chunk the 32 quant bytes carry weights 0..31 in low nibbles, 32..63 in high (ggml order).
+//! Matches llama.cpp dequantize_row_q4_K op-for-op, so the expansion is bit-exact.
+def dequant_q4k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array<float>; doff : int64) {
+    let d = f16_to_f32(rd_u16(bytes, bo))
+    let dmin = f16_to_f32(rd_u16(bytes, bo + 2l))
+    let so = bo + 4l    // 12 scale/min bytes
+    var qo = bo + 16l   // 128 quant bytes
+    var dsto = doff
+    for (js in range64(4l)) {   // 4 chunks of 64 weights = sub-blocks 2js, 2js+1
+        let s0 = q4k_scale_min(bytes, so, 2l * js)
+        let s1 = q4k_scale_min(bytes, so, 2l * js + 1l)
+        let d1 = d * float(s0.x)
+        let m1 = dmin * float(s0.y)
+        let d2 = d * float(s1.x)
+        let m2 = dmin * float(s1.y)
+        for (l in range64(32l)) {
+            let b = int(bytes[qo + l])
+            dst[dsto + l] = d1 * float(b & 15) - m1
+            dst[dsto + 32l + l] = d2 * float(b >> 4) - m2
+        }
+        qo += 32l
+        dsto += 64l
+    }
+}
+
+//! Dequantize one Q6_K superblock (210 bytes at `bo`: 128 low-nibble bytes ql, 64 high-2-bit
+//! bytes qh, 16 int8 sub-scales for 16 sub-blocks of 16, fp16 d) into dst[doff .. doff+256).
+//! w = (d*sc)*q with q = (ql | qh<<4) - 32. Matches llama.cpp dequantize_row_q6_K op-for-op.
+def dequant_q6k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array<float>; doff : int64) {
+    let d = f16_to_f32(rd_u16(bytes, bo + 208l))
+    var qlo = bo          // ql cursor (64 bytes per 128-weight half)
+    var qho = bo + 128l   // qh cursor (32 bytes per half)
+    var sco = bo + 192l   // sub-scale cursor (8 per half)
+    var dsto = doff
+    for (_half in range(2)) {
+        for (l in range64(32l)) {
+            let si = l / 16l
+            let hl = int(bytes[qho + l])
+            let q1 = ((int(bytes[qlo + l]) & 15) | (((hl >> 0) & 3) << 4)) - 32
+            let q2 = ((int(bytes[qlo + 32l + l]) & 15) | (((hl >> 2) & 3) << 4)) - 32
+            let q3 = ((int(bytes[qlo + l]) >> 4) | (((hl >> 4) & 3) << 4)) - 32
+            let q4 = ((int(bytes[qlo + 32l + l]) >> 4) | (((hl >> 6) & 3) << 4)) - 32
+            dst[dsto + l] = d * float(rd_i8(bytes, sco + si)) * float(q1)
+            dst[dsto + 32l + l] = d * float(rd_i8(bytes, sco + si + 2l)) * float(q2)
+            dst[dsto + 64l + l] = d * float(rd_i8(bytes, sco + si + 4l)) * float(q3)
+            dst[dsto + 96l + l] = d * float(rd_i8(bytes, sco + si + 6l)) * float(q4)
+        }
+        qlo += 64l
+        qho += 32l
+        sco += 8l
+        dsto += 128l
+    }
+}
+
 //! Decode tensor `name` (F32 or F16 on disk) into dst[dst_off ..] as fp32. Panics if the
 //! tensor is missing, has a different element count than expected, or uses a type we don't
 //! yet read (quantized types are wired in a later step).
@@ -409,7 +488,8 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
     }
     let nelem = m.tensors[ti].n_elem
     // src_off (element offset into the tensor) reads a sub-range — used to split fused qkv / gate_up
-    // tensors (Phi3). For quantized types it must be 32-aligned so it lands on a block boundary.
+    // tensors (Phi3). For quantized types it must be 32-aligned so it lands on a block boundary
+    // (256-aligned for the K-quant superblock types — those arms check).
     if (src_off + expect_n > nelem) {
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {nelem} elems")
     }
@@ -465,6 +545,26 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             }
             bo += 16l
         }
+    } elif (gtype == GGML_TYPE_Q4_K) {
+        if (src_off % 256l != 0l || expect_n % 256l != 0l) {
+            panic("gguf: tensor '{name}' Q4_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
+        }
+        let nb = expect_n / 256l
+        var bo = base + (src_off / 256l) * 144l
+        for (blk in range64(nb)) {
+            dequant_q4k_superblock(bytes, bo, dst, dst_off + blk * 256l)
+            bo += 144l
+        }
+    } elif (gtype == GGML_TYPE_Q6_K) {
+        if (src_off % 256l != 0l || expect_n % 256l != 0l) {
+            panic("gguf: tensor '{name}' Q6_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
+        }
+        let nb = expect_n / 256l
+        var bo = base + (src_off / 256l) * 210l
+        for (blk in range64(nb)) {
+            dequant_q6k_superblock(bytes, bo, dst, dst_off + blk * 256l)
+            bo += 210l
+        }
     } elif (gtype == GGML_TYPE_MXFP4) {
         // block of 32: 1 E8M0 scale byte + 16 nibble bytes (low nibbles = elems 0..15, high = 16..31);
         // x = e2m1[nibble] * scale — both sides carry the ×2/÷2 ggml convention (see MXFP4_KVALUES)
@@ -481,7 +581,7 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             bo += 16l
         }
     } else {
-        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/Q8_0/Q4_0/MXFP4)")
+        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q6_K/MXFP4)")
     }
 }
 
