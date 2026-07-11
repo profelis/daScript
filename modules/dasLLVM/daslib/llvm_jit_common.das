@@ -447,6 +447,13 @@ var public g_target_os_linux = false
 // Cross aarch64 triples read the force string only, same contract as the x64 tiers above.
 var public g_target_arm64_i8mm = false
 
+// ARMv8.2 fullfp16 (native half arithmetic — fadd.4h/8h etc.). Same detection contract as
+// i8mm, except darwin-arm64 is unconditionally true: LLVMGetHostCPUFeatures is empty on
+// macOS and every darwin-arm64 host is Apple Silicon (M1+), which always has fullfp16.
+// The target machine needs no feature append: Linux host feature strings carry +fullfp16
+// explicitly, and on macOS the host CPU name (apple-m1, ...) implies it in the backend.
+var public g_target_arm64_fullfp16 = false
+
 def private arm64_forced_feature(name : string) : bool {
     for (part in split(get_env_variable("DAS_JIT_ARM64_FORCE_FEATURES"), ",")) {
         if (part == name) {
@@ -607,6 +614,9 @@ def public init_jit_target_flags(target_triple : string = "") {
     // LLVM's host-features string OR the arm force env; cross aarch64 triples the env only.
     g_target_arm64_i8mm = g_target_is_aarch64 && (arm64_forced_feature("i8mm")
         || (empty(target_triple) && host_llvm_feature("i8mm")))
+    // aarch64 fullfp16 (see declaration comment): darwin-arm64 == Apple Silicon == always
+    g_target_arm64_fullfp16 = g_target_is_aarch64 && (arm64_forced_feature("fullfp16")
+        || (empty(target_triple) && (host_llvm_feature("fullfp16") || get_platform_name() == "darwin")))
     // fp16 operators lower as promote-compute-narrow IR wherever half converts are
     // hardware (routing truth for isExprOp2/Op1_Func — lives in llvm_boost)
     g_lattice_fp16_ops_native = g_target_is_aarch64 || g_target_x64_f16c

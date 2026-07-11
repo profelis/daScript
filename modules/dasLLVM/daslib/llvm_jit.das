@@ -2892,8 +2892,11 @@ class public LlvmJitVisitor : AstVisitor {
         if (is_f16_small_type(opType.baseType)) {
             // fp16 family (float16 scalar + halfN): the reference semantics ARE promote-to-
             // f32 -> compute -> round-back (RNE), which is exactly fpext -> fop -> fptrunc.
-            // Compares run on the promoted floats (conversion is exact, so predicates agree).
-            // Only routed here when g_lattice_fp16_ops_native (aarch64 || x64-F16C).
+            // With native fullfp16 (arm64) the ops run directly on half — bit-identical for
+            // single ops, since f32 carries 2p+2 precision bits of f16 (the double-rounding
+            // safety bound for + - * /). Compares are exact either way. Only routed here
+            // when g_lattice_fp16_ops_native (aarch64 || x64-F16C).
+            let native = g_target_arm64_fullfp16
             let halfT = (opType.isVectorType
                 ? LLVMVectorType(types.t_half, uint(opType.vectorDim))
                 : types.t_half)
@@ -2901,8 +2904,12 @@ class public LlvmJitVisitor : AstVisitor {
                 ? LLVMVectorType(types.t_float, uint(opType.vectorDim))
                 : types.t_float)
             let rmw = isReadModifyWriteOp2(expr.op)
-            var lf = LLVMBuildFPExt(g_builder, rmw ? r2v_left : left, promoteT, "")
-            var rf = LLVMBuildFPExt(g_builder, right, promoteT, "")
+            var lf = rmw ? r2v_left : left
+            var rf = right
+            if (!native) {
+                lf = LLVMBuildFPExt(g_builder, lf, promoteT, "")
+                rf = LLVMBuildFPExt(g_builder, rf, promoteT, "")
+            }
             if (expr.op == "==" || expr.op == "!=" || expr.op == "<" || expr.op == "<=" || expr.op == ">" || expr.op == ">=") {
                 var opR = LLVMBuildFCmp(g_builder, get_float_compare_op(expr, string(expr.op)), lf, rf, "")
                 if (opType.isVectorType) {
@@ -2924,7 +2931,9 @@ class public LlvmJitVisitor : AstVisitor {
                 failed_E(expr, "unsupported fp16 operator {expr.op}")
                 return
             }
-            res = LLVMBuildFPTrunc(g_builder, res, halfT, "")
+            if (!native) {
+                res = LLVMBuildFPTrunc(g_builder, res, halfT, "")
+            }
             if (rmw) {
                 setE(expr, LLVMBuildStoreAligned(g_builder, res, left, uint(expr.left._type.alignOf)))
             } else {
