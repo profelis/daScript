@@ -699,7 +699,8 @@ typedef enum das_bool_policy {
     DAS_POLICY_DISABLE_RUN,                      // Disable compile-time function evaluation (RunFolding of pure calls over constant arguments)
     DAS_POLICY_LOG_OPTIMIZATION,                 // Log optimizer rewrites (per-pass fired/nothing lines, inline/devirt sites and declines)
     DAS_POLICY_LOG_OPTIMIZATION_PASSES,          // Log the AST after every optimizer pass (verbose)
-    DAS_POLICY_FUSION                            // Fuse interpreter nodes into wider superinstructions at simulate time (default: on)
+    DAS_POLICY_FUSION,                           // Fuse interpreter nodes into wider superinstructions at simulate time (default: on)
+    DAS_POLICY_AUTO_INLINE_FUNCTIONS             // Heuristic best-effort inlining of plain calls to small [inline]-shaped functions (silent declines; optimized builds only)
 } das_bool_policy;
 
 // Integer policy fields (stack size, heap limits).
@@ -708,7 +709,8 @@ typedef enum das_int_policy {
     DAS_POLICY_MAX_HEAP_ALLOCATED,               // Max heap allocated in bytes (uint64, 0 = unlimited)
     DAS_POLICY_MAX_STRING_HEAP_ALLOCATED,         // Max string heap allocated in bytes (uint64, 0 = unlimited)
     DAS_POLICY_HEAP_SIZE_HINT,                   // Initial heap size hint in bytes (uint32)
-    DAS_POLICY_STRING_HEAP_SIZE_HINT             // Initial string heap size hint in bytes (uint32)
+    DAS_POLICY_STRING_HEAP_SIZE_HINT,            // Initial string heap size hint in bytes (uint32)
+    DAS_POLICY_AUTO_INLINE_COST                  // auto_inline_functions node budget (int32, default 32)
 } das_int_policy;
 
 // Create a new policies object with default values.

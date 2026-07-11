@@ -30,3 +30,4 @@ Function has try\recover blocks.
 Function has unsafe operations made by user.
 Function is a const class method.
 Function is a user-defined property (a backtick-named getter).
+Function is annotated ``[never_inline]`` - it is excluded from best-effort (auto) inlining.

@@ -24,6 +24,13 @@ namespace das {
     //    callee shape, [unsafe_operation]/[unsafe_deref], recursion through the splice
     //    graph, private symbols, call position - declines SILENTLY (counted, logged under
     //    log_optimization). `options disable_auto_inline` (or the policy) turns it off.
+    //    With `options auto_inline_functions` (opt-in, same policy family) the AUTO tier
+    //    also takes UNSIGNALED plain calls whose callee is worth splicing: loop-free and
+    //    within the `auto_inline_cost` node budget, or private and referenced exactly
+    //    once (the body moves, it cannot grow the program). Generic instances stay out
+    //    of this tier (explicit flavors and inferer-manufactured argument shapes are
+    //    splice hazards - see autoEligibleCall). [never_inline] opts a function out of
+    //    every best-effort tier; combining it with [inline] is an error.
     //    A plain unsafe body (hasUnsafe) splices: compiled callees lost their `unsafe { }`
     //    wrappers to foldUnsafe and would re-error on the caller's re-infer, so the spliced
     //    body rides the result-temp path under a generated statement-position ExprUnsafe -
@@ -441,11 +448,69 @@ namespace das {
             return false;
         }
 
-        bool autoEligibleCall ( ExprCall * call ) {
+        // ----- worthiness metric (heuristic plain-call candidacy) -----
+
+        struct BodyCost {
+            int  nodes = 0;
+            bool hasLoop = false;
+        };
+
+        BodyCost bodyCost ( Expression * body ) {
+            BodyCost bc;
+            lookupExpressions(body, [&](Expression * e) {
+                bc.nodes ++;
+                if ( e->rtti_isFor() || e->rtti_isWhile() ) bc.hasLoop = true;
+            });
+            return bc;
+        }
+
+        // best-effort candidacy configuration for one patch round. blockLiterals is the
+        // pre-existing auto tier (block-literal call sites + devirt); functions is the
+        // opt-in heuristic tier over plain calls (auto_inline_functions), bounded by the
+        // node budget (auto_inline_cost). both caches live for one round - splices
+        // change bodies, so nothing carries across rounds
+        struct AutoInlineCfg {
+            bool blockLiterals = false;
+            bool functions = false;
+            int  budget = 32;
+            das_hash_map<Function *, bool> * worthCache = nullptr;
+            das_hash_set<Function *> * budgetExempt = nullptr;  // private, referenced exactly once
+        };
+
+        // worth splicing unsignaled: small enough that per-site growth stays bounded,
+        // and loop-free - a loop body's runtime dwarfs the call overhead while the
+        // splice inflates code. a private called-exactly-once callee is exempt from
+        // both: its body MOVES rather than duplicates (removeUnusedSymbols reaps the
+        // husk), so size cannot grow no matter what it holds
+        bool worthAutoInline ( Function * fn, const AutoInlineCfg & cfg ) {
+            if ( cfg.budgetExempt && cfg.budgetExempt->find(fn)!=cfg.budgetExempt->end() ) return true;
+            if ( !cfg.worthCache ) return false;
+            auto it = cfg.worthCache->find(fn);
+            if ( it != cfg.worthCache->end() ) return it->second;
+            BodyCost bc = bodyCost(fn->body);
+            bool ok = !bc.hasLoop && bc.nodes <= cfg.budget;
+            (*cfg.worthCache)[fn] = ok;
+            return ok;
+        }
+
+        bool autoEligibleCall ( ExprCall * call, const AutoInlineCfg & cfg ) {
             if ( !call->func || call->func->mustInline || call->func->builtIn ) return false;
             if ( !call->func->body || call->func->isTemplate ) return false;
-            for ( auto & a : call->arguments ) {
-                if ( a->rtti_isMakeBlock() ) return true;
+            if ( call->func->neverInline ) return false;    // explicit opt-out, both tiers
+            if ( cfg.blockLiterals ) {
+                for ( auto & a : call->arguments ) {
+                    if ( a->rtti_isMakeBlock() ) return true;
+                }
+            }
+            // generic INSTANCES stay out of the unsignaled heuristic tier (the signaled
+            // block-literal tier above keeps them, behind its proven flavor gates).
+            // instances carry splice hazards plain functions can't have - explicit
+            // const/ref-locked parameter flavors, and inferer-manufactured argument
+            // shapes: to_array_move's heap-mode array literal spliced into a generated
+            // `let <-` re-infers under the in-place make-local protocol and corrupts
+            // the array header (probe-verified: garbage sums, SIGSEGV)
+            if ( cfg.functions && !call->func->fromGeneric ) {
+                return worthAutoInline(call->func, cfg);
             }
             return false;
         }
@@ -456,10 +521,10 @@ namespace das {
         // splice step lowers those constructs first when statements are needed.
         class InlineCollect : public Visitor {
         public:
-            InlineCollect ( bool autoOn ) : autoEnabled(autoOn) {}
+            InlineCollect ( const AutoInlineCfg & cfg ) : autoCfg(cfg) {}
             vector<PlannedSite> sites;      // in visit order: within a block, increasing index
         protected:
-            bool autoEnabled;
+            const AutoInlineCfg & autoCfg;
             vector<StmtAnchor> blockStack;
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             virtual void preVisit ( ExprBlock * blk ) override {
@@ -492,13 +557,13 @@ namespace das {
                 Visitor::preVisit(expr);
                 if ( expr->func && expr->func->mustInline ) {
                     plan(expr, SiteKind::MustCall);
-                } else if ( autoEnabled && autoEligibleCall(expr) ) {
+                } else if ( autoEligibleCall(expr, autoCfg) ) {
                     plan(expr, SiteKind::AutoCall);
                 }
             }
             virtual void preVisit ( ExprInvoke * expr ) override {
                 Visitor::preVisit(expr);
-                if ( !autoEnabled || expr->isInvokeMethod || expr->arguments.empty() ) return;
+                if ( !autoCfg.blockLiterals || expr->isInvokeMethod || expr->arguments.empty() ) return;
                 Expression * a0 = expr->arguments[0];
                 if ( a0->rtti_isR2V() ) a0 = static_cast<ExprRef2Value *>(a0)->subexpr;
                 if ( a0->rtti_isMakeBlock() || a0->rtti_isVar() ) plan(expr, SiteKind::Devirt);
@@ -1009,18 +1074,19 @@ namespace das {
         }
 
         // recursion over the whole splice graph - [inline] calls and auto-eligible
-        // block-literal calls alike - would re-manufacture eligible sites every round
-        bool spliceGraphReaches ( Function * target, Function * cur, das_hash_set<Function *> & visited ) {
+        // calls alike - would re-manufacture eligible sites every round
+        bool spliceGraphReaches ( Function * target, Function * cur, const AutoInlineCfg & cfg,
+                das_hash_set<Function *> & visited ) {
             if ( !cur->body ) return false;
             bool found = false;
             lookupExpressions(cur->body, [&](Expression * expr) {
                 if ( found || !expr->rtti_isCall() ) return;
                 auto call = static_cast<ExprCall *>(expr);
                 if ( !call->func ) return;
-                if ( !call->func->mustInline && !autoEligibleCall(call) ) return;
+                if ( !call->func->mustInline && !autoEligibleCall(call, cfg) ) return;
                 if ( call->func==target ) { found = true; return; }
                 if ( visited.insert(call->func).second ) {
-                    if ( spliceGraphReaches(target, call->func, visited) ) found = true;
+                    if ( spliceGraphReaches(target, call->func, cfg, visited) ) found = true;
                 }
             });
             return found;
@@ -1037,7 +1103,7 @@ namespace das {
             TextWriter * logs = nullptr;
             bool logOpt = false;
             bool mustEnabled = true;
-            bool autoEnabled = false;
+            AutoInlineCfg autoCfg;
             bool changed = false;
             int inlined = 0;        // [inline] sites
             int inlinedAuto = 0;    // auto block-literal call sites
@@ -1093,7 +1159,7 @@ namespace das {
                         why = "body carries a generic type witness";
                     } else {
                         das_hash_set<Function *> visited;
-                        if ( spliceGraphReaches(fn, fn, visited) ) {
+                        if ( spliceGraphReaches(fn, fn, autoCfg, visited) ) {
                             ok = false;
                             why = "recursive through the inline graph";
                         }
@@ -1192,12 +1258,12 @@ namespace das {
         };
 
         void InlinePatch::processFunction ( Function * fn ) {
-            InlineCollect collect(autoEnabled);
+            InlineCollect collect(autoCfg);
             fn->body->visit(collect);
             if ( collect.sites.empty() ) return;
             // let-bound block literals this function's invokes may resolve to
             das_hash_map<Variable *, ExprMakeBlock *> bindings;
-            if ( autoEnabled ) {
+            if ( autoCfg.blockLiterals ) {
                 BlockBindingScan bscan;
                 fn->body->visit(bscan);
                 for ( auto & kv : bscan.binding ) {
@@ -1781,7 +1847,7 @@ namespace das {
 
         // DFS postorder over the splice graph inside this module, [inline] functions
         // first: a chain f -> g -> h splices already-inlined bodies in a single round
-        void orderInlineFunctions ( Module * thisMod, Function * fn, bool autoOn,
+        void orderInlineFunctions ( Module * thisMod, Function * fn, const AutoInlineCfg & cfg,
                 vector<Function *> & order, das_hash_set<Function *> & seen ) {
             if ( !fn->body || fn->isTemplate || fn->stub ) return;
             if ( fn->module != thisMod ) return;
@@ -1790,8 +1856,8 @@ namespace das {
                 if ( expr->rtti_isCall() ) {
                     auto call = static_cast<ExprCall *>(expr);
                     if ( !call->func ) return;
-                    if ( call->func->mustInline || (autoOn && autoEligibleCall(call)) ) {
-                        orderInlineFunctions(thisMod, call->func, autoOn, order, seen);
+                    if ( call->func->mustInline || autoEligibleCall(call, cfg) ) {
+                        orderInlineFunctions(thisMod, call->func, cfg, order, seen);
                     }
                 }
             });
@@ -1906,20 +1972,31 @@ namespace das {
             }
         };
 
-        bool canonicalizeReturns ( Function * fn ) {
+        bool canonicalizeReturns ( Function * fn, const AutoInlineCfg & cfg ) {
             if ( !fn->body || !fn->body->rtti_isBlock() ) return false;
             if ( fn->generator || fn->isTemplate ) return false;
             // [inline] bodies stay untouched: their shape contract is fail-closed, and a
             // multi-exit [inline] callee must be the same compile error at every -O level
             if ( fn->mustInline ) return false;
-            // only a function with a block parameter can ever be an auto splice callee
-            // (candidacy requires a block LITERAL argument), so canonicalizing anything
-            // else buys no splice and costs a re-infer round on every module that has one
+            if ( fn->neverInline ) return false;    // never a candidate - don't reshape
+            // the rewrite costs a re-infer round on every module that has one, so only
+            // functions that can plausibly become splice candidates qualify: a block
+            // parameter (block-literal-arg candidacy), or - heuristic tier on - a body
+            // that pre-screens close to the worthiness budget (25% slack: folding can
+            // shrink a body into budget) or a budget-exempt private single-call callee
             bool hasBlockParam = false;
             for ( auto & arg : fn->arguments ) {
                 if ( arg->type && arg->type->baseType==Type::tBlock ) { hasBlockParam = true; break; }
             }
-            if ( !hasBlockParam ) return false;
+            if ( !hasBlockParam ) {
+                if ( !cfg.functions ) return false;
+                bool exempt = cfg.budgetExempt
+                    && cfg.budgetExempt->find(fn)!=cfg.budgetExempt->end();
+                if ( !exempt ) {
+                    BodyCost bc = bodyCost(fn->body);
+                    if ( bc.hasLoop || bc.nodes > cfg.budget + cfg.budget/4 ) return false;
+                }
+            }
             // goto can target a label in a tail this pass would move into an else arm; the
             // feature is rare enough that any use opts the whole function out
             bool hasGotoOrLabel = false;
@@ -1944,6 +2021,64 @@ namespace das {
         // best-effort inlining is an optimization: it stays out of unoptimized builds
         bool autoEnabled = getOptimize()
             && !options.getBoolOption("disable_auto_inline", policies.disable_auto_inline);
+        // the heuristic tier over plain calls is opt-in on top of the block-literal tier
+        bool autoFns = autoEnabled
+            && options.getBoolOption("auto_inline_functions", policies.auto_inline_functions);
+        das_hash_map<Function *, bool> worthCache;
+        das_hash_set<Function *> budgetExempt;
+        AutoInlineCfg autoCfg;
+        autoCfg.blockLiterals = autoEnabled;
+        autoCfg.functions = autoFns;
+        autoCfg.budget = options.getIntOption("auto_inline_cost", policies.auto_inline_cost);
+        autoCfg.worthCache = &worthCache;
+        autoCfg.budgetExempt = &budgetExempt;
+        // private functions referenced exactly once - by a plain call in a function
+        // body - are budget-exempt: the splice moves the body rather than duplicating
+        // it (removeUnusedSymbols reaps the husk). private is what makes the count
+        // sound: every possible reference is inside this module, in front of us now.
+        // any other reference kind (operator call, @@, an initializer) disqualifies
+        if ( autoFns && !failed() ) {
+            das_hash_map<Function *, int> refs;         // every reference, anywhere
+            das_hash_map<Function *, int> callSites;    // plain-call sites in function bodies
+            auto interesting = [&](Function * f) -> bool {
+                // fromGeneric excluded: instances are STAMPED private by instantiation,
+                // which would sweep library generics into the exemption - the heuristic
+                // tier keeps instances out entirely (see autoEligibleCall)
+                return f && f->privateFunction && !f->fromGeneric && f->module==thisModule.get()
+                    && f->body && !f->builtIn && !f->isTemplate
+                    && !f->addr && !f->addressTaken && !f->mustInline && !f->neverInline
+                    && !f->exports && !f->init && !f->shutdown && !f->lateInit
+                    && !f->macroFunction;
+            };
+            auto scanRefs = [&](Expression * root, bool inBody) {
+                lookupExpressions(root, [&](Expression * e) {
+                    Function * f = nullptr;
+                    bool plainCall = false;
+                    if ( e->rtti_isCall() ) { f = static_cast<ExprCall *>(e)->func; plainCall = true; }
+                    else if ( e->rtti_isOp1() ) f = static_cast<ExprOp1 *>(e)->func;
+                    else if ( e->rtti_isOp2() ) f = static_cast<ExprOp2 *>(e)->func;
+                    else if ( e->rtti_isOp3() ) f = static_cast<ExprOp3 *>(e)->func;
+                    else if ( e->rtti_isAddr() ) f = static_cast<ExprAddr *>(e)->func;
+                    if ( !f || !interesting(f) ) return;
+                    refs[f] ++;
+                    if ( inBody && plainCall ) callSites[f] ++;
+                });
+            };
+            thisModule->functions.foreach([&](auto fn) {
+                if ( fn->body ) scanRefs(fn->body, true);
+            });
+            for ( auto & var : thisModule->globals.each() ) {
+                if ( var->init ) scanRefs(var->init, false);
+            }
+            for ( auto & st : thisModule->structures.each() ) {
+                for ( auto & fld : st->fields ) {
+                    if ( fld.init ) scanRefs(fld.init, false);
+                }
+            }
+            for ( auto & kv : refs ) {
+                if ( kv.second==1 && callSites[kv.first]==1 ) budgetExempt.insert(kv.first);
+            }
+        }
         // canonicalize early-exit shapes ahead of candidacy: single exit is an inline shape
         // requirement, and the rewrite must settle (re-infer) before anything splices on
         // top of it. gated with auto inlining rather than bare optimization:
@@ -1952,7 +2087,7 @@ namespace das {
         if ( autoEnabled && !failed() ) {
             bool canon = false;
             thisModule->functions.foreach([&](auto fn) {
-                canon |= canonicalizeReturns(fn);
+                canon |= canonicalizeReturns(fn, autoCfg);
             });
             if ( canon ) return true;
         }
@@ -1975,14 +2110,14 @@ namespace das {
         patch.logs = daScriptEnvironment::getBound()->g_compilerLog;
         patch.logOpt = options.getBoolOption("log_optimization", policies.log_optimization);
         patch.mustEnabled = mustEnabled && anyInline;
-        patch.autoEnabled = autoEnabled;
+        patch.autoCfg = autoCfg;
         vector<Function *> order;
         das_hash_set<Function *> seen;
         thisModule->functions.foreach([&](auto fn) {
-            if ( fn->mustInline ) orderInlineFunctions(thisModule.get(), fn, autoEnabled, order, seen);
+            if ( fn->mustInline ) orderInlineFunctions(thisModule.get(), fn, autoCfg, order, seen);
         });
         thisModule->functions.foreach([&](auto fn) {
-            orderInlineFunctions(thisModule.get(), fn, autoEnabled, order, seen);
+            orderInlineFunctions(thisModule.get(), fn, autoCfg, order, seen);
         });
         for ( auto fn : order ) {
             patch.processFunction(fn);

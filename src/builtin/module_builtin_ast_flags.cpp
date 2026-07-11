@@ -204,7 +204,7 @@ namespace das {
             "addressTaken", "propertyFunction", "pinvoke", "jitOnly", "isStaticClassMethod", "requestNoJit",
             "jitContextAndLineInfo", "nodiscard", "captureString", "callCaptureString", "hasStringBuilder",
             "recursive", "isTemplate", "unsafeWhenNotCloneArray", "stub", "lateShutdown", "hasTryRecover",
-            "hasUnsafe", "isConstClassMethod", "isCustomProperty"
+            "hasUnsafe", "isConstClassMethod", "isCustomProperty", "neverInline"
         };
         return ft;
     }

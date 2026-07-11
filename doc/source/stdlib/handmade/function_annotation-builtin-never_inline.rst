@@ -1,0 +1,1 @@
+Keeps the function out of best-effort (automatic) inlining: block-literal call-site splicing and the heuristic plain-call tier (options auto_inline_functions) both skip it. Combining it with [inline] is a compile-time error - the two contracts are contradictory.

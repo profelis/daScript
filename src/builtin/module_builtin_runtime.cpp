@@ -120,7 +120,11 @@ namespace das
     // compilation error reported here at lint (post-infer, so generics check per-instantiation)
     struct InlineFunctionAnnotation : MarkFunctionAnnotation {
         InlineFunctionAnnotation() : MarkFunctionAnnotation("inline") { }
-        virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, string &) override {
+        virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, string & err) override {
+            if ( func->neverInline ) {
+                err = "[inline] conflicts with [never_inline]";
+                return false;
+            }
             func->mustInline = true;
             return true;
         };
@@ -128,6 +132,20 @@ namespace das
                 const AnnotationArgumentList &, string & err) override {
             return checkInlineShape(func, err) && checkInlineRecursion(func, err);
         }
+    };
+
+    // [never_inline] - keep this function out of best-effort (auto) inlining. [inline]
+    // stays a hard error to combine; block-literal and heuristic auto tiers decline
+    struct NeverInlineFunctionAnnotation : MarkFunctionAnnotation {
+        NeverInlineFunctionAnnotation() : MarkFunctionAnnotation("never_inline") { }
+        virtual bool apply(const FunctionPtr & func, ModuleGroup &, const AnnotationArgumentList &, string & err) override {
+            if ( func->mustInline ) {
+                err = "[never_inline] conflicts with [inline]";
+                return false;
+            }
+            func->neverInline = true;
+            return true;
+        };
     };
 
     struct RequestNoDiscardFunctionAnnotation : MarkFunctionAnnotation {
@@ -1992,6 +2010,7 @@ namespace das
         addAnnotation(new RequestJitFunctionAnnotation());
         addAnnotation(new RequestNoJitFunctionAnnotation());
         addAnnotation(new InlineFunctionAnnotation());
+        addAnnotation(new NeverInlineFunctionAnnotation());
         addAnnotation(new RequestNoDiscardFunctionAnnotation());
         addAnnotation(new DeprecatedFunctionAnnotation());
         addAnnotation(new AliasCMRESFunctionAnnotation());

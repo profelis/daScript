@@ -221,7 +221,7 @@ namespace das {
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
         static constexpr uint32_t getVersion () {
-            return 101;   // 101: 16/8-bit type lattice tags (100: tune_frozen, 99: distinct types)
+            return 102;   // 102: auto_inline_functions/auto_inline_cost policies + neverInline flag (101: 16/8-bit lattice, 100: tune_frozen)
         }
 
         void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup );

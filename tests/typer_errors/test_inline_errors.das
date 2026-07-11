@@ -60,4 +60,8 @@ def test_inline_contract_errors(t : T?) {
         t |> expect_issue("_inline_coalesce.das",
             "inside ?? or a safe-navigation suffix")
     }
+    t |> run("[inline] combined with [never_inline]") @(t : T?) {
+        t |> expect_issue("_inline_never_inline_conflict.das",
+            "[never_inline] conflicts with [inline]")
+    }
 }

@@ -294,6 +294,19 @@ Optimization and AOT
     calls - while the declaration-level contract checks (body shape, recursion, ``@@``)
     still run; call-site splice checks do not apply, since nothing splices.
 
+    Separately from the ``[inline]`` contract, optimized builds also inline best-effort
+    (silent declines, never errors): calls passing a block literal argument splice
+    automatically, and with ``options auto_inline_functions`` (or the host-side
+    ``CodeOfPolicies::auto_inline_functions``) so do plain calls to small non-generic
+    callees - loop-free bodies within the ``auto_inline_cost`` node budget (default 32),
+    or private functions referenced exactly once, whose body moves rather than
+    duplicates. ``options disable_auto_inline`` turns all best-effort splicing off.
+
+``[never_inline]``
+    Keeps the function out of best-effort (automatic) inlining - block-literal call-site
+    splicing and the heuristic ``auto_inline_functions`` tier both skip it. Combining it
+    with ``[inline]`` is a compile-time error: the two contracts are contradictory.
+
 ``[hybrid]``
     Marks a function as an AOT hybrid — it can call interpreted code from AOT context.
 
