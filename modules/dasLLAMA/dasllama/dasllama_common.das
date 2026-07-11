@@ -771,9 +771,11 @@ def private resolve_arch(var t : Model; arch : string) {
     t.blocks = g_arch_registry[arch].blocks
 }
 
-// The wscale_f16 rail's load-time switch (see Model.qscales16): default off; box-profile
-// runtime knob `wscale_f16` / benches flip it before load_gguf.
-var g_wscale_f16 = false
+// The wscale_f16 rail's load-time switch (see Model.qscales16): default ON — llama.cpp byte
+// parity, free at 16 lanes on the 3990X, +5.4% on the byte-bound M1; every backend carries the
+// s16 twins (the loader falls back to f32 with a warning otherwise). Box-profile runtime knob
+// `wscale_f16` / benches flip it before load_gguf; decode_prof --wscale-f16 0 is the A/B rail.
+var g_wscale_f16 = true
 def public set_wscale_f16(on : bool) {
     g_wscale_f16 = on
 }
