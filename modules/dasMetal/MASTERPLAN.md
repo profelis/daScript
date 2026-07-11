@@ -321,8 +321,12 @@ the four metal files; `tests/msl` + `tests/metal` registered in `tests/aot/CMake
 (fixture `_msl_common` AOT_LIB'd per the `_spirv_common` precedent; macro-only metal
 modules deliberately not AOT'd, per the spirv_emit precedent).
 Probe results (annotation plumbing — risk 4 CLOSED, no struct-param fallback needed):
-`[function_macro]` fires on class methods with `classParent`/`isClassMethod` set already at
-`apply`; the method MUST get `exports = true` in apply or it is culled before `fixup` runs;
+`[function_macro]` fires on class methods. The apply/fixup division is dasGlsl's, strictly:
+`apply` is pre-infer (types unresolved — aliases still aliases), so it does ONLY the two
+type-independent actions: `exports = true` (the method is otherwise culled before `fixup`
+runs — probe-verified) and declaring the fixed-type (`tString`/`tBool`) companion globals so
+consumers resolve in the first inference pass. ALL type-dependent work — member scan,
+write-set, emission — runs in `fixup`, post-infer, where `fld._type` is resolved;
 `@ssbo`/`@binding` field annotations read via `field.annotation |> find_arg`; the member
 scan skips `__rtti`/`__finalize` + function-typed fields (classes store methods as fields);
 by fixup time the `with(self)` wrapper is optimizer-dropped and access is
