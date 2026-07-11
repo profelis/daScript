@@ -20,7 +20,7 @@ def conf_uint_kernel {
     v = v * uint(2u)
     v = v - s
     let r = v
-    conf_uint_data[gi] = r
+    conf_uint_data[gi] = uint(r)
 }
 
 [test]

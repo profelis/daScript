@@ -98,4 +98,7 @@ def main {
     // form, the mesh reads its survivor-list slice.
     emit_golden(dir, "task_payload", task_payload_words())
     emit_golden(dir, "mesh_payload", mesh_payload_words())
+    // 16/8-bit lattice: ctors + width converts + fp16 arithmetic (pins the FConvert/SConvert/
+    // UConvert emission and the type-factory-pulled Float16/Int16 capabilities)
+    emit_golden(dir, "lattice", lattice_words())
 }

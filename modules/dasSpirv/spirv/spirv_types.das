@@ -34,6 +34,28 @@ def public emit_type(var m : SpirvModule; t : TypeDecl?) : uint {
     if (bt == Type.tFloat2) return type_vector(m, type_float(m, 32u), 2)
     if (bt == Type.tFloat3) return type_vector(m, type_float(m, 32u), 3)
     if (bt == Type.tFloat4) return type_vector(m, type_float(m, 32u), 4)
+    // 16/8-bit lattice (shader-legal 2/3/4-lane forms + scalars; the type factories pull the
+    // Float16/Int16/Int8 capabilities). 8/16-lane forms never reach here (fail-closed gates).
+    if (bt == Type.tFloat16) return type_float(m, 16u)
+    if (bt == Type.tInt16) return type_int(m, 16u, 1u)
+    if (bt == Type.tUInt16) return type_int(m, 16u, 0u)
+    if (bt == Type.tInt8) return type_int(m, 8u, 1u)
+    if (bt == Type.tUInt8) return type_int(m, 8u, 0u)
+    if (bt == Type.tHalf2) return type_vector(m, type_float(m, 16u), 2)
+    if (bt == Type.tHalf3) return type_vector(m, type_float(m, 16u), 3)
+    if (bt == Type.tHalf4) return type_vector(m, type_float(m, 16u), 4)
+    if (bt == Type.tShort2) return type_vector(m, type_int(m, 16u, 1u), 2)
+    if (bt == Type.tShort3) return type_vector(m, type_int(m, 16u, 1u), 3)
+    if (bt == Type.tShort4) return type_vector(m, type_int(m, 16u, 1u), 4)
+    if (bt == Type.tUShort2) return type_vector(m, type_int(m, 16u, 0u), 2)
+    if (bt == Type.tUShort3) return type_vector(m, type_int(m, 16u, 0u), 3)
+    if (bt == Type.tUShort4) return type_vector(m, type_int(m, 16u, 0u), 4)
+    if (bt == Type.tByte2) return type_vector(m, type_int(m, 8u, 1u), 2)
+    if (bt == Type.tByte3) return type_vector(m, type_int(m, 8u, 1u), 3)
+    if (bt == Type.tByte4) return type_vector(m, type_int(m, 8u, 1u), 4)
+    if (bt == Type.tUByte2) return type_vector(m, type_int(m, 8u, 0u), 2)
+    if (bt == Type.tUByte3) return type_vector(m, type_int(m, 8u, 0u), 3)
+    if (bt == Type.tUByte4) return type_vector(m, type_int(m, 8u, 0u), 4)
     // fixed array: float2[3] -> OpTypeArray(element, length). Outermost dim is fixedDim; the
     // element (firstType) may itself be a fixed array for multi-dim, so recurse.
     if (bt == Type.tFixedArray && t.firstType != null) {
@@ -54,6 +76,11 @@ def public emit_component_type(var m : SpirvModule; t : TypeDecl?) : uint {
     if (bt == Type.tUInt || bt == Type.tUInt2 || bt == Type.tUInt3 || bt == Type.tUInt4) return type_int(m, 32u, 0u)
     if (bt == Type.tFloat || bt == Type.tFloat2 || bt == Type.tFloat3 || bt == Type.tFloat4) return type_float(m, 32u)
     if (bt == Type.tBool) return type_bool(m)
+    if (bt == Type.tFloat16 || bt == Type.tHalf2 || bt == Type.tHalf3 || bt == Type.tHalf4) return type_float(m, 16u)
+    if (bt == Type.tInt16 || bt == Type.tShort2 || bt == Type.tShort3 || bt == Type.tShort4) return type_int(m, 16u, 1u)
+    if (bt == Type.tUInt16 || bt == Type.tUShort2 || bt == Type.tUShort3 || bt == Type.tUShort4) return type_int(m, 16u, 0u)
+    if (bt == Type.tInt8 || bt == Type.tByte2 || bt == Type.tByte3 || bt == Type.tByte4) return type_int(m, 8u, 1u)
+    if (bt == Type.tUInt8 || bt == Type.tUByte2 || bt == Type.tUByte3 || bt == Type.tUByte4) return type_int(m, 8u, 0u)
     panic("emit_component_type: unsupported baseType {bt}")
     return 0u
 }

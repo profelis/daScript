@@ -20,7 +20,7 @@ def conf_int2_kernel {
     v = v * int2(2, 2)
     v = v - s
     let r = v.x + v.y
-    conf_int2_data[gi] = r
+    conf_int2_data[gi] = int(r)
 }
 
 [test]

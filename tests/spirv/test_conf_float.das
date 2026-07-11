@@ -20,7 +20,7 @@ def conf_float_kernel {
     v = v * float(2.)
     v = v - s
     let r = v
-    conf_float_data[gi] = r
+    conf_float_data[gi] = float(r)
 }
 
 [test]

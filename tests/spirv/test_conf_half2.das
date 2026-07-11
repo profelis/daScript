@@ -9,24 +9,24 @@ require spirv/spirv_shader
 require spirv/spirv_dis
 require spirv/spirv_grammar
 
-var @ssbo @binding = 0 conf_int_data : array<int>
+var @ssbo @binding = 0 conf_half2_data : array<float>
 
-[compute_shader(local_size_x=64, name="conf_int_spv"), marker(no_coverage)]
-def conf_int_kernel {
+[compute_shader(local_size_x=64, name="conf_half2_spv"), marker(no_coverage)]
+def conf_half2_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = int(1)
-    let s = conf_int_data[gi]
+    var v = half2(1h, 2h)
+    let s = half2(conf_half2_data[gi])
     v = v + s
-    v = v * int(2)
+    v = v * half2(2h, 2h)
     v = v - s
-    let r = v
-    conf_int_data[gi] = int(r)
+    let r = v.x + v.y
+    conf_half2_data[gi] = float(r)
 }
 
 [test]
-def test_conf_int_spirv(t : T?) {
-    t |> run("conformance int: emits and validates") <| @(t : T?) {
-        var words <- clone_to_move(conf_int_spv)
+def test_conf_half2_spirv(t : T?) {
+    t |> run("conformance half2: emits and validates") <| @(t : T?) {
+        var words <- clone_to_move(conf_half2_spv)
         t |> success(length(words) > 5, "has words")
         t |> equal(words[0], SPV_MAGIC)
         t |> equal(count_op(words, SpvOp.EntryPoint), 1)

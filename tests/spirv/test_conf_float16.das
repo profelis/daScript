@@ -9,24 +9,24 @@ require spirv/spirv_shader
 require spirv/spirv_dis
 require spirv/spirv_grammar
 
-var @ssbo @binding = 0 conf_int_data : array<int>
+var @ssbo @binding = 0 conf_float16_data : array<float>
 
-[compute_shader(local_size_x=64, name="conf_int_spv"), marker(no_coverage)]
-def conf_int_kernel {
+[compute_shader(local_size_x=64, name="conf_float16_spv"), marker(no_coverage)]
+def conf_float16_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = int(1)
-    let s = conf_int_data[gi]
+    var v = 1.5h
+    let s = float16(conf_float16_data[gi])
     v = v + s
-    v = v * int(2)
+    v = v * 2h
     v = v - s
     let r = v
-    conf_int_data[gi] = int(r)
+    conf_float16_data[gi] = float(r)
 }
 
 [test]
-def test_conf_int_spirv(t : T?) {
-    t |> run("conformance int: emits and validates") <| @(t : T?) {
-        var words <- clone_to_move(conf_int_spv)
+def test_conf_float16_spirv(t : T?) {
+    t |> run("conformance float16: emits and validates") <| @(t : T?) {
+        var words <- clone_to_move(conf_float16_spv)
         t |> success(length(words) > 5, "has words")
         t |> equal(words[0], SPV_MAGIC)
         t |> equal(count_op(words, SpvOp.EntryPoint), 1)

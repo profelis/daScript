@@ -18,10 +18,10 @@ struct ShaderTypeSpec {
     arity : int             // 1 for scalars
     kind : string           // ctor-argument literal spelling: "float" | "int" | "uint" | "double"
     has_arith : bool        // + - * work on the type in shader code
-    reject : bool           // fail-closed row: the emitter(s) must reject with the needles below
-    rails : string          // which emitters the row targets: "both" | "spirv" | "glsl"
-    spv_needle : string     // required substring of the SPIR-V emitter diagnostic
-    glsl_needle : string    // required substring of the GLSL emitter diagnostic
+    spv_mode : string       // "emit" | "reject" | "skip" — the dasSpirv rail's expectation
+    glsl_mode : string      // "emit" | "reject" | "skip" — the dasGlsl rail's expectation
+    spv_needle : string     // required substring of the SPIR-V emitter diagnostic (reject rows)
+    glsl_needle : string    // required substring of the GLSL emitter diagnostic (reject rows)
 }
 
 let LANE_LETTERS = fixed_array("x", "y", "z", "w")
@@ -40,6 +40,9 @@ def lit(kind : string; v : int) : string {
 }
 
 def ctor_gen(spec : ShaderTypeSpec; lane : block<(i : int) : int>) : string {
+    if (spec.arity == 1 && spec.kind == "half") {
+        return lit(spec.kind, invoke(lane, 0))      // bare literal: no float16(float16) ctor exists
+    }
     if (spec.arity == 1) {
         return "{spec.name}({lit(spec.kind, invoke(lane, 0))})"
     }
@@ -63,11 +66,17 @@ def ctor(spec : ShaderTypeSpec; base : int) : string {
 // the shader body shared by both rails: local ctor + splat + (arith) + swizzle read,
 // reduced to one scalar so the value flows into the output (nothing dead-code-elided)
 def emit_body(var writer; spec : ShaderTypeSpec; seed : string) {
-    writer |> write("    var v = {ctor(spec, 1)}\n")
+    if (spec.arity == 1 && spec.kind == "half") {
+        writer |> write("    var v = 1.5h\n")   // scalar float16 has no float16(float16) ctor
+    } else {
+        writer |> write("    var v = {ctor(spec, 1)}\n")
+    }
     if (spec.arity > 1) {
         writer |> write("    let s = {spec.name}({seed})\n")
-    } else {
+    } elif (spec.name == "float" || spec.name == "int" || spec.name == "uint") {
         writer |> write("    let s = {seed}\n")
+    } else {
+        writer |> write("    let s = {spec.name}({seed})\n")    // scalar convert, e.g. float16(f32)
     }
     if (spec.has_arith) {
         writer |> write("    v = v + s\n")
@@ -116,7 +125,7 @@ def emit_spirv_test(spec : ShaderTypeSpec) {
             writer |> write("def conf_{spec.name}_kernel \{\n")
             writer |> write("    let gi = gl_GlobalInvocationID.x\n")
             emit_body(writer, spec, "conf_{spec.name}_data[gi]")
-            writer |> write("    conf_{spec.name}_data[gi] = r\n")
+            writer |> write("    conf_{spec.name}_data[gi] = {ssbo_elem(spec)}(r)\n")
             writer |> write("\}\n")
             writer |> write("\n")
             writer |> write("[test]\n")
@@ -418,7 +427,8 @@ def emit_reject_runner(specs : array<ShaderTypeSpec>; rail : string) {
             writer |> write("def test_conf_rejects_{rail}(t : T?) \{\n")
             writer |> write("    t |> run(\"conformance reject rows fail closed\") <| @(t : T?) \{\n")
             for (spec in specs) {
-                if (spec.reject && (spec.rails == "both" || spec.rails == rail)) {
+                let mode = rail == "spirv" ? spec.spv_mode : spec.glsl_mode
+                if (mode == "reject") {
                     let needle = rail == "spirv" ? spec.spv_needle : spec.glsl_needle
                     writer |> write("        check_rejects(t, \"_fc_conf_{spec.name}\", \"{needle}\")\n")
                 }
@@ -438,46 +448,52 @@ def emit_reject_runner(specs : array<ShaderTypeSpec>; rail : string) {
     to_log(LOG_INFO, "[gen_shader_conformance] DONE {path} ({get_time_usec(t0)}us)\n")
 }
 
-// one reject row per lattice type. `cpu_only` widths get the dedicated CPU-only diagnostic;
-// shader-legal widths get the generic not-supported one (flipped to emit rows by later waves)
-def push_lattice_row(var specs : array<ShaderTypeSpec>; name, kind : string; arity : int; cpu_only : bool; enum_name : string) {
-    let spv = cpu_only ? "is CPU-only" : "type {enum_name} is not supported"
-    let glsl = cpu_only ? "is CPU-only" : "unsupported type {enum_name}"
-    specs |> push(ShaderTypeSpec(name = name, glsl_name = "", arity = arity, kind = kind, has_arith = false,
-        reject = true, rails = "both", spv_needle = spv, glsl_needle = glsl))
+// one row per lattice type. Shader-legal widths EMIT on the SPIR-V rail (types/consts/ctors/
+// converts/arith landed) and stay reject on GLSL until its wave; CPU-only widths (8/16-lane)
+// reject on both rails with the dedicated diagnostic, permanently.
+def push_lattice_row(var specs : array<ShaderTypeSpec>; name, glsl_name, kind : string; arity : int; cpu_only, arith : bool; enum_name : string) {
+    if (cpu_only) {
+        specs |> push(ShaderTypeSpec(name = name, glsl_name = "", arity = arity, kind = kind, has_arith = false,
+            spv_mode = "reject", glsl_mode = "reject",
+            spv_needle = "is CPU-only", glsl_needle = "is CPU-only"))
+    } else {
+        specs |> push(ShaderTypeSpec(name = name, glsl_name = glsl_name, arity = arity, kind = kind, has_arith = arith,
+            spv_mode = "emit", glsl_mode = "reject",
+            spv_needle = "", glsl_needle = "unsupported type {enum_name}"))
+    }
 }
 
 def push_lattice_rows(var specs : array<ShaderTypeSpec>) {
-    // fp16 family
-    push_lattice_row(specs, "float16", "half", 1, false, "tFloat16")
-    push_lattice_row(specs, "half2", "half", 2, false, "tHalf2")
-    push_lattice_row(specs, "half3", "half", 3, false, "tHalf3")
-    push_lattice_row(specs, "half4", "half", 4, false, "tHalf4")
-    push_lattice_row(specs, "half8", "half", 8, true, "tHalf8")
-    // pre-lattice small scalars (in shader scope per the arc, reject until the feature waves)
-    push_lattice_row(specs, "int8", "int", 1, false, "tInt8")
-    push_lattice_row(specs, "uint8", "uint", 1, false, "tUInt8")
-    push_lattice_row(specs, "int16", "int", 1, false, "tInt16")
-    push_lattice_row(specs, "uint16", "uint", 1, false, "tUInt16")
-    // int lattice vectors
-    push_lattice_row(specs, "short2", "int", 2, false, "tShort2")
-    push_lattice_row(specs, "short3", "int", 3, false, "tShort3")
-    push_lattice_row(specs, "short4", "int", 4, false, "tShort4")
-    push_lattice_row(specs, "short8", "int", 8, true, "tShort8")
-    push_lattice_row(specs, "ushort2", "uint", 2, false, "tUShort2")
-    push_lattice_row(specs, "ushort3", "uint", 3, false, "tUShort3")
-    push_lattice_row(specs, "ushort4", "uint", 4, false, "tUShort4")
-    push_lattice_row(specs, "ushort8", "uint", 8, true, "tUShort8")
-    push_lattice_row(specs, "byte2", "int", 2, false, "tByte2")
-    push_lattice_row(specs, "byte3", "int", 3, false, "tByte3")
-    push_lattice_row(specs, "byte4", "int", 4, false, "tByte4")
-    push_lattice_row(specs, "byte8", "int", 8, true, "tByte8")
-    push_lattice_row(specs, "byte16", "int", 16, true, "tByte16")
-    push_lattice_row(specs, "ubyte2", "uint", 2, false, "tUByte2")
-    push_lattice_row(specs, "ubyte3", "uint", 3, false, "tUByte3")
-    push_lattice_row(specs, "ubyte4", "uint", 4, false, "tUByte4")
-    push_lattice_row(specs, "ubyte8", "uint", 8, true, "tUByte8")
-    push_lattice_row(specs, "ubyte16", "uint", 16, true, "tUByte16")
+    // fp16 family — closed arithmetic
+    push_lattice_row(specs, "float16", "float16_t", "half", 1, false, true, "tFloat16")
+    push_lattice_row(specs, "half2", "f16vec2", "half", 2, false, true, "tHalf2")
+    push_lattice_row(specs, "half3", "f16vec3", "half", 3, false, true, "tHalf3")
+    push_lattice_row(specs, "half4", "f16vec4", "half", 4, false, true, "tHalf4")
+    push_lattice_row(specs, "half8", "", "half", 8, true, false, "tHalf8")
+    // pre-lattice small scalars — STORAGE types (error 30230: no numeric operators), convert-only
+    push_lattice_row(specs, "int8", "int8_t", "int", 1, false, false, "tInt8")
+    push_lattice_row(specs, "uint8", "uint8_t", "uint", 1, false, false, "tUInt8")
+    push_lattice_row(specs, "int16", "int16_t", "int", 1, false, false, "tInt16")
+    push_lattice_row(specs, "uint16", "uint16_t", "uint", 1, false, false, "tUInt16")
+    // int lattice vectors — storage + converts, no closed arithmetic
+    push_lattice_row(specs, "short2", "i16vec2", "int", 2, false, false, "tShort2")
+    push_lattice_row(specs, "short3", "i16vec3", "int", 3, false, false, "tShort3")
+    push_lattice_row(specs, "short4", "i16vec4", "int", 4, false, false, "tShort4")
+    push_lattice_row(specs, "short8", "", "int", 8, true, false, "tShort8")
+    push_lattice_row(specs, "ushort2", "u16vec2", "uint", 2, false, false, "tUShort2")
+    push_lattice_row(specs, "ushort3", "u16vec3", "uint", 3, false, false, "tUShort3")
+    push_lattice_row(specs, "ushort4", "u16vec4", "uint", 4, false, false, "tUShort4")
+    push_lattice_row(specs, "ushort8", "", "uint", 8, true, false, "tUShort8")
+    push_lattice_row(specs, "byte2", "i8vec2", "int", 2, false, false, "tByte2")
+    push_lattice_row(specs, "byte3", "i8vec3", "int", 3, false, false, "tByte3")
+    push_lattice_row(specs, "byte4", "i8vec4", "int", 4, false, false, "tByte4")
+    push_lattice_row(specs, "byte8", "", "int", 8, true, false, "tByte8")
+    push_lattice_row(specs, "byte16", "", "int", 16, true, false, "tByte16")
+    push_lattice_row(specs, "ubyte2", "u8vec2", "uint", 2, false, false, "tUByte2")
+    push_lattice_row(specs, "ubyte3", "u8vec3", "uint", 3, false, false, "tUByte3")
+    push_lattice_row(specs, "ubyte4", "u8vec4", "uint", 4, false, false, "tUByte4")
+    push_lattice_row(specs, "ubyte8", "", "uint", 8, true, false, "tUByte8")
+    push_lattice_row(specs, "ubyte16", "", "uint", 16, true, false, "tUByte16")
 }
 
 [export]
@@ -487,40 +503,39 @@ def main {
     // Lattice rows land in W1 (reject) and flip to emit as the feature waves ship.
     var specs <- [
         ShaderTypeSpec(name = "float", glsl_name = "float", arity = 1, kind = "float", has_arith = true,
-            reject = false, rails = "both", spv_needle = "", glsl_needle = ""),
+            spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
         ShaderTypeSpec(name = "float2", glsl_name = "vec2", arity = 2, kind = "float", has_arith = true,
-            reject = false, rails = "both", spv_needle = "", glsl_needle = ""),
+            spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
         ShaderTypeSpec(name = "float4", glsl_name = "vec4", arity = 4, kind = "float", has_arith = true,
-            reject = false, rails = "both", spv_needle = "", glsl_needle = ""),
+            spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
         ShaderTypeSpec(name = "int", glsl_name = "int", arity = 1, kind = "int", has_arith = true,
-            reject = false, rails = "both", spv_needle = "", glsl_needle = ""),
+            spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
         ShaderTypeSpec(name = "int2", glsl_name = "ivec2", arity = 2, kind = "int", has_arith = true,
-            reject = false, rails = "both", spv_needle = "", glsl_needle = ""),
+            spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
         ShaderTypeSpec(name = "uint", glsl_name = "uint", arity = 1, kind = "uint", has_arith = true,
-            reject = false, rails = "both", spv_needle = "", glsl_needle = ""),
+            spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
         ShaderTypeSpec(name = "uint4", glsl_name = "uvec4", arity = 4, kind = "uint", has_arith = true,
-            reject = false, rails = "both", spv_needle = "", glsl_needle = ""),
+            spv_mode = "emit", glsl_mode = "emit", spv_needle = "", glsl_needle = ""),
         // reject-rail controls: dasSpirv rejects double locals; dasGlsl supports double (GL 4.x fp64),
         // so its proven reject control is the memzero statement (side-effecting — optimizer-proof)
         ShaderTypeSpec(name = "double", glsl_name = "", arity = 1, kind = "double", has_arith = true,
-            reject = true, rails = "spirv", spv_needle = "tDouble is not supported", glsl_needle = ""),
+            spv_mode = "reject", glsl_mode = "skip", spv_needle = "tDouble is not supported", glsl_needle = ""),
         ShaderTypeSpec(name = "memzero", glsl_name = "", arity = 1, kind = "memzero", has_arith = false,
-            reject = true, rails = "glsl", spv_needle = "", glsl_needle = "memzero is not supported")
+            spv_mode = "skip", glsl_mode = "reject", spv_needle = "", glsl_needle = "memzero is not supported")
     ]
-    // 16/8-bit lattice: ALL rows reject until the feature waves land (W3+ SPIR-V, W5 GLSL flip
-    // shader-legal rows to emit); the 8/16-lane forms are PERMANENT rejects (CPU-only widths)
+    // 16/8-bit lattice: shader-legal rows EMIT on SPIR-V (this arc's waves 3+4), stay reject on
+    // GLSL until its wave; the 8/16-lane forms are PERMANENT rejects (CPU-only widths)
     push_lattice_rows(specs)
     for (spec in specs) {
-        if (spec.reject) {
-            if (spec.rails == "both" || spec.rails == "spirv") {
-                emit_reject_fixture(spec, "spirv")
-            }
-            if (spec.rails == "both" || spec.rails == "glsl") {
-                emit_reject_fixture(spec, "glsl")
-            }
-        } else {
+        if (spec.spv_mode == "emit") {
             emit_spirv_test(spec)
+        } elif (spec.spv_mode == "reject") {
+            emit_reject_fixture(spec, "spirv")
+        }
+        if (spec.glsl_mode == "emit") {
             emit_glsl_test(spec)
+        } elif (spec.glsl_mode == "reject") {
+            emit_reject_fixture(spec, "glsl")
         }
     }
     var ctx <- context_specs()

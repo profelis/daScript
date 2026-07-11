@@ -9,24 +9,21 @@ require spirv/spirv_shader
 require spirv/spirv_dis
 require spirv/spirv_grammar
 
-var @ssbo @binding = 0 conf_int_data : array<int>
+var @ssbo @binding = 0 conf_short2_data : array<int>
 
-[compute_shader(local_size_x=64, name="conf_int_spv"), marker(no_coverage)]
-def conf_int_kernel {
+[compute_shader(local_size_x=64, name="conf_short2_spv"), marker(no_coverage)]
+def conf_short2_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = int(1)
-    let s = conf_int_data[gi]
-    v = v + s
-    v = v * int(2)
-    v = v - s
-    let r = v
-    conf_int_data[gi] = int(r)
+    var v = short2(1, 2)
+    let s = short2(conf_short2_data[gi])
+    let r = v.x
+    conf_short2_data[gi] = int(r)
 }
 
 [test]
-def test_conf_int_spirv(t : T?) {
-    t |> run("conformance int: emits and validates") <| @(t : T?) {
-        var words <- clone_to_move(conf_int_spv)
+def test_conf_short2_spirv(t : T?) {
+    t |> run("conformance short2: emits and validates") <| @(t : T?) {
+        var words <- clone_to_move(conf_short2_spv)
         t |> success(length(words) > 5, "has words")
         t |> equal(words[0], SPV_MAGIC)
         t |> equal(count_op(words, SpvOp.EntryPoint), 1)

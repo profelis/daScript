@@ -9,24 +9,24 @@ require spirv/spirv_shader
 require spirv/spirv_dis
 require spirv/spirv_grammar
 
-var @ssbo @binding = 0 conf_int_data : array<int>
+var @ssbo @binding = 0 conf_half4_data : array<float>
 
-[compute_shader(local_size_x=64, name="conf_int_spv"), marker(no_coverage)]
-def conf_int_kernel {
+[compute_shader(local_size_x=64, name="conf_half4_spv"), marker(no_coverage)]
+def conf_half4_kernel {
     let gi = gl_GlobalInvocationID.x
-    var v = int(1)
-    let s = conf_int_data[gi]
+    var v = half4(1h, 2h, 3h, 4h)
+    let s = half4(conf_half4_data[gi])
     v = v + s
-    v = v * int(2)
+    v = v * half4(2h, 2h, 2h, 2h)
     v = v - s
-    let r = v
-    conf_int_data[gi] = int(r)
+    let r = v.x + v.w
+    conf_half4_data[gi] = float(r)
 }
 
 [test]
-def test_conf_int_spirv(t : T?) {
-    t |> run("conformance int: emits and validates") <| @(t : T?) {
-        var words <- clone_to_move(conf_int_spv)
+def test_conf_half4_spirv(t : T?) {
+    t |> run("conformance half4: emits and validates") <| @(t : T?) {
+        var words <- clone_to_move(conf_half4_spv)
         t |> success(length(words) > 5, "has words")
         t |> equal(words[0], SPV_MAGIC)
         t |> equal(count_op(words, SpvOp.EntryPoint), 1)
