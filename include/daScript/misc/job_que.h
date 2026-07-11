@@ -146,14 +146,14 @@ namespace das {
         // completes every dispatch. Composes with setWorkerLimit (dormant stays dormant).
         void setTeamRankGate ( bool on ) { mTeamRankGate.store(on ? 1 : 0, std::memory_order_relaxed); }
         bool getTeamRankGate () const { return mTeamRankGate.load(std::memory_order_relaxed) != 0; }
-        // Eager worker exit (opt-in: DAS_JOBQUE_TEAM_EAGER_EXIT=1 or this setter): workers skip
-        // the FINAL stage-barrier spin and leave the in-flight window as soon as their last-stage
-        // claims exhaust — the final join belongs to the caller alone, and a worker parked there
-        // holds no claim. Why it matters: a worker OS-preempted in that spin keeps mTeamInFlight
-        // nonzero long after the join, and the NEXT publish eats the whole preemption (the
-        // measured 10-500us "fat publish" tail). Intermediate barriers still spin in-flight —
-        // the claim loop doesn't re-verify the seq between chunks, which is the invariant the
-        // publisher's in-flight drain protects.
+        // Eager worker exit (default ON; DAS_JOBQUE_TEAM_EAGER_EXIT=0 or this setter opts out):
+        // workers skip the FINAL stage-barrier spin and leave the in-flight window as soon as
+        // their last-stage claims exhaust — the final join belongs to the caller alone, and a
+        // worker parked there holds no claim. Why it matters: a worker OS-preempted in that spin
+        // keeps mTeamInFlight nonzero long after the join, and the NEXT publish eats the whole
+        // preemption (the measured 10-500us "fat publish" tail — A/B'd to -90% on gemma-4-E2B).
+        // Intermediate barriers still spin in-flight — the claim loop doesn't re-verify the seq
+        // between chunks, which is the invariant the publisher's in-flight drain protects.
         void setTeamEagerExit ( bool on ) { mTeamEagerExit.store(on ? 1 : 0, std::memory_order_relaxed); }
         bool getTeamEagerExit () const { return mTeamEagerExit.load(std::memory_order_relaxed) != 0; }
         void teamParallelFor ( int numChunks, const JobChunk & work );   // work(chunkIndex, workerSlot); caller participates as slot getNumWorkers()
@@ -275,7 +275,7 @@ namespace das {
         bool             mLimitOrderSpread = false;
         // per-op worker participation gate (see setTeamRankGate)
         atomic<int32_t>  mTeamRankGate{0};
-        atomic<int32_t>  mTeamEagerExit{0};
+        atomic<int32_t>  mTeamEagerExit{1};
         // team dispatch anatomy profiler (env DAS_TEAM_PROF=1): per-op phase aggregates, dumped
         // at queue destruction. Caller-side counters except the two claim-timestamp slots;
         // worker stores happen only under the flag (they perturb the op being measured).

@@ -168,8 +168,8 @@ namespace das {
         mLimitOrderSpread = limitOrderEnv != nullptr && strcmp(limitOrderEnv, "spread") == 0;
         const char * rankGateEnv = getenv("DAS_JOBQUE_TEAM_RANK_GATE");   // =1: per-op worker participation gate (see setTeamRankGate)
         mTeamRankGate = (rankGateEnv != nullptr && atoi(rankGateEnv) != 0) ? 1 : 0;
-        const char * eagerExitEnv = getenv("DAS_JOBQUE_TEAM_EAGER_EXIT");   // =1: workers skip the final stage-barrier spin (see setTeamEagerExit)
-        mTeamEagerExit = (eagerExitEnv != nullptr && atoi(eagerExitEnv) != 0) ? 1 : 0;
+        const char * eagerExitEnv = getenv("DAS_JOBQUE_TEAM_EAGER_EXIT");   // =0 re-enables the final-barrier spin (see setTeamEagerExit)
+        mTeamEagerExit = (eagerExitEnv != nullptr) ? ((atoi(eagerExitEnv) != 0) ? 1 : 0) : 1;
         SetCurrentThreadPriority(JobPriority::High);
         for (int j = 0, js = mThreadCount; j < js; j++) {
             mThreads.emplace_back(make_unique<thread>([this, j]() {
