@@ -385,6 +385,7 @@ class GlslExport : AstVisitor {
     needs_f16 : bool = false
     needs_i16 : bool = false
     needs_i8 : bool = false
+    needs_arb_packing : bool = false    // packHalf2x16/unpackHalf2x16 below GL 4.20 (core in ES 3.00)
     es300_target : bool = false
     force_es300 : bool = false      // `es300=true` annotation arg — forces the ES rail (test-drivable)
     stnames   : table<string; bool>
@@ -1417,6 +1418,9 @@ class GlslExport : AstVisitor {
                 flag_lattice(arg._type.baseType, expr.at)
             }
         }
+        if ((fnName == "packHalf2x16" || fnName == "unpackHalf2x16") && !es300_target && version < 420) {
+            needs_arb_packing = true    // core since GL 4.20 and ES 3.00; extension below on desktop
+        }
         if (caps.output_compatibility_constructors) {
             glsl_compatibility_constructors |> get(fnName) $(newName) {
                 fnName = newName
@@ -2146,6 +2150,7 @@ def generate_glsl(fnMain : FunctionPtr; var errors : array<string>; shaderType :
     var needs_f16 = false
     var needs_i16 = false
     var needs_i8 = false
+    var needs_arb_packing = false
     var st = build_string() $(var writer) {
         var astVisitor = new GlslExport(writer, shaderType, version, comp_loc_size, caps)
         astVisitor.force_es300 = force_es300
@@ -2176,13 +2181,14 @@ def generate_glsl(fnMain : FunctionPtr; var errors : array<string>; shaderType :
         needs_f16 = astVisitor.needs_f16
         needs_i16 = astVisitor.needs_i16
         needs_i8 = astVisitor.needs_i8
+        needs_arb_packing = astVisitor.needs_arb_packing
         unsafe {
             delete astVisitor
         }
     }
     // demand-driven extension lines, spliced right after the #version line: emission set the
     // needs_* flags at every lattice touchpoint, so non-lattice shaders stay byte-identical
-    if (needs_f16 || needs_i16 || needs_i8) {
+    if (needs_f16 || needs_i16 || needs_i8 || needs_arb_packing) {
         var ext = ""
         if (needs_f16) {
             ext += "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n"
@@ -2192,6 +2198,9 @@ def generate_glsl(fnMain : FunctionPtr; var errors : array<string>; shaderType :
         }
         if (needs_i8) {
             ext += "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n"
+        }
+        if (needs_arb_packing) {
+            ext += "#extension GL_ARB_shading_language_packing : require\n"
         }
         let nl = find(st, "\n")
         if (nl >= 0 && starts_with(st, "#version")) {

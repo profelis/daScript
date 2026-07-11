@@ -1396,6 +1396,12 @@ def private ensure_ray_tracing(var m : SpirvModule; var ctx : EmitCtx) {
 // Only dependency-free builtin `math` functions appear here (no dead branches). Excluded on purpose:
 // daslang has no mix.
 def private glsl_ext_op(name : string; cls : int) : tuple<ok : bool; op : GLSLstd450> {
+    if (name == "packHalf2x16") {
+        return (ok = true, op = GLSLstd450.PackHalf2x16)     // float2 -> uint (RNE per lane)
+    }
+    if (name == "unpackHalf2x16") {
+        return (ok = true, op = GLSLstd450.UnpackHalf2x16)   // uint -> float2 (exact)
+    }
     if (name == "abs") {
         if (cls == 2) return (ok = true, op = GLSLstd450.FAbs)
         if (cls == 0) return (ok = true, op = GLSLstd450.SAbs)
