@@ -571,29 +571,10 @@ def public init_jit_clopts() {
     }
 }
 
-[macro_function]
-def public init_jit(cg_opt_level : uint; target_triple : string = "") {
-    // also prevent double init (g_mod != null)
-    return if (is_in_completion() || is_compiling_macros() || g_mod != null)
-    LLVMLinkInMCJIT()
-    LLVMInitializeAllTargetInfos()
-    LLVMInitializeAllTargets()
-    LLVMInitializeAllTargetMCs()
-    LLVMInitializeAllAsmPrinters()
-    init_jit_clopts()
-    g_ctx = LLVMContextCreate()
-    g_prim_t = new PrimitiveTypes(g_ctx)
-    g_failed = false
-    g_fn_types |> clear()
-    g_handled_field_offset_globals |> clear()
-    g_mod = LLVMModuleCreateWithNameInContext("llvm_jit_module", g_ctx)
-    LLVMCreateJITCompilerForModule(g_engine, g_mod, cg_opt_level)
-    // For cross-compile targets (wasm32, etc.) pin the module's data layout
-    // to the TARGET's, not the host's, BEFORE any IR is built. LLVM constant-
-    // folds GEPs eagerly using the module's current layout — if the host has
-    // 8-byte pointers and the target has 4-byte, every for-loop end-pointer
-    // GEP bakes in the wrong stride and the loop never terminates. The native
-    // path (empty triple) keeps the host default.
+// Pure target-truth computation — no LLVM state touched, so it is safe (and required) to
+// call BEFORE init_jit: the DisableJitVisitor pass consults the g_target_* gates through
+// has_intrinsic, and it runs before the LLVM module exists. init_jit re-runs it (idempotent).
+def public init_jit_target_flags(target_triple : string = "") {
     g_target_is_wasm = target_triple |> starts_with("wasm")
     // Host path (empty triple): the module targets the host, so the daslang binary's own arch is the
     // JIT target arch. Explicit cross-compile triple: read the arch off the triple prefix.
@@ -626,6 +607,32 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
     // LLVM's host-features string OR the arm force env; cross aarch64 triples the env only.
     g_target_arm64_i8mm = g_target_is_aarch64 && (arm64_forced_feature("i8mm")
         || (empty(target_triple) && host_llvm_feature("i8mm")))
+}
+
+[macro_function]
+def public init_jit(cg_opt_level : uint; target_triple : string = "") {
+    // also prevent double init (g_mod != null)
+    return if (is_in_completion() || is_compiling_macros() || g_mod != null)
+    LLVMLinkInMCJIT()
+    LLVMInitializeAllTargetInfos()
+    LLVMInitializeAllTargets()
+    LLVMInitializeAllTargetMCs()
+    LLVMInitializeAllAsmPrinters()
+    init_jit_clopts()
+    g_ctx = LLVMContextCreate()
+    g_prim_t = new PrimitiveTypes(g_ctx)
+    g_failed = false
+    g_fn_types |> clear()
+    g_handled_field_offset_globals |> clear()
+    g_mod = LLVMModuleCreateWithNameInContext("llvm_jit_module", g_ctx)
+    LLVMCreateJITCompilerForModule(g_engine, g_mod, cg_opt_level)
+    // For cross-compile targets (wasm32, etc.) pin the module's data layout
+    // to the TARGET's, not the host's, BEFORE any IR is built. LLVM constant-
+    // folds GEPs eagerly using the module's current layout — if the host has
+    // 8-byte pointers and the target has 4-byte, every for-loop end-pointer
+    // GEP bakes in the wrong stride and the loop never terminates. The native
+    // path (empty triple) keeps the host default.
+    init_jit_target_flags(target_triple)
     if (!(target_triple |> empty())) {
         // wasm32 target isn't always part of LLVMInitializeAllTargets in
         // prebuilt LLVM.dll — call the explicit wasm initializer when needed.
@@ -641,7 +648,7 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
         // is the tier truth (see the g_target_x64_* gates above) and must
         // reach any codegen off this machine too.
         let features = (g_target_is_wasm ? wasm_target_features()
-            : (x64_cross ? x64_forced_plus_features() : ""))
+            : (g_target_is_x64 ? x64_forced_plus_features() : ""))   // inside the non-empty-triple branch, is_x64 == x64-cross
         with_target_machine(target_triple, "", features, cg_opt_level) $(targetMachine : LLVMTargetMachineRef) {
             let dl = LLVMCreateTargetDataLayout(targetMachine)
             LLVMSetModuleDataLayout(g_mod, dl)

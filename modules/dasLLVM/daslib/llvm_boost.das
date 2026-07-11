@@ -481,6 +481,12 @@ def public is_lattice_small_type(t : Type) {
     return int(t) >= int(Type.tFloat16) && int(t) <= int(Type.tUByte16)
 }
 
+// the fp16 sub-family (scalar float16 + half2/3/4/8) — fpext/fptrunc through half needs
+// hardware convert support (any aarch64, or x86-64 with F16C); the int lattice does not
+def public is_f16_small_type(t : Type) {
+    return int(t) >= int(Type.tFloat16) && int(t) <= int(Type.tHalf8)
+}
+
 def isExprOp2_Func(expr : ExprOp2?) {
     if (is_lattice_small_type(expr.left._type.baseType)
             || is_lattice_small_type(expr.right._type.baseType)

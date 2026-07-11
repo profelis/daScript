@@ -372,6 +372,9 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     // `options fast_math` (or policies.fast_math) is the one knob; `_jit_fast_math` kept as a legacy alias
     g_jit_fast_math = (prog._options |> find_arg("fast_math") ?as tBool ?? prog.policies.fast_math) || (prog._options |> find_arg("_jit_fast_math") ?as tBool ?? false)
 
+    // the disable pass consults target-gated intrinsic tables (has_intrinsic) — the
+    // g_target_* truth must be set BEFORE it runs, not first at init_jit time below
+    init_jit_target_flags(target_triple)
     make_visitor(*disableJitVisitor) $(disableJitVisitorAdapter) {
         prog |> for_each_module() $(mod) {
             mod |> for_each_function("") $(fun) {

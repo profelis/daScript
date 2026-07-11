@@ -7951,9 +7951,11 @@ class public DisableJitVisitor : AstVisitor {
                 disable = true
             }
         }
-        if (!disable && expr.func.flags.builtIn) {
-            // lattice values cross the extern ABI as LLVM half / packed vectors, but the
-            // C++ side expects the das slot conventions — fall back until the marshal wave
+        if (!disable && expr.func.flags.builtIn && !has_intrinsic(expr)) {
+            // lattice values crossing a builtin call lower as intrinsics (ctors/converts/
+            // sat-narrows emit IR directly); anything NOT in the intrinsic tables would hit
+            // the direct-extern ABI, where LLVM half / packed vectors mismatch the C++ das
+            // slot conventions — those still fall back
             var lattice = is_lattice_small_type(expr._type.baseType)
             if (!lattice) {
                 for (arg in expr.arguments) {
