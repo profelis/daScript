@@ -1836,6 +1836,7 @@ struct Session {
     hb2_b : array<float>      // FFN gate (npos x hidden_dim)
     xqb : array<int8>         // batched activation Q8 quants (npos x max(dim, hidden_dim))
     xsb : array<float>        // batched activation Q8 scales (npos x max(dim, hidden_dim) / 32)
+    xbsb : array<int>         // batched per-16 activation sums (npos x maxn / 16) — the kq batch tile's offset term
     // flash-attention per-head packing scratch (empty unless AttnPrefillMode.flash; sized in
     // forward_prefill to n_heads × tile, so each head's tile work is contention-free when threaded)
     fa_q : array<float>       // packed Q tile [n_heads × QT × head_size]
@@ -3181,14 +3182,30 @@ def private mm_kq(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x 
     mm_at_kq_pre(y, t, fmt, woff, xq, xs, xbs, n, d)
 }
 
-// Batched K-quant matmul: positions run serially, each bs-quantized into the shared decode
-// scratch then a full row GEMV (which parallelizes over d). Exact — the mx4 expand-to-q8 trick
-// is lossy for asymmetric K-quants, so prefill pays a slower path until a native tile lands.
-def private mm_b_kq(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; var xbs : array<int>; n, d, npos : int64) {
+// Batched K-quant matmul. Repacked loads with a kq batch kernel run the native tile: one
+// threaded bs-requant of the whole activation image, then ONE weight-stationary GEMM (weights
+// stream once per 4-token tile — bit-for-bit npos x the per-position GEMV). Otherwise (disk-
+// order planes / no tile) positions run serially, each bs-quantized into the decode scratch
+// then a full row GEMV — exact; the mx4 expand-to-q8 trick is lossy for asymmetric K-quants.
+def private mm_b_kq(var s : Session; var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; n, d, npos : int64) {
+    if (t.kq_repacked && kernel_backend_has_kq_batch()) {
+        requant_rows_q8_bs(x, n, npos, s.xqb, s.xsb, s.xbsb)
+        let ts_gemm = ref_time_ticks()
+        let fi = fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : 6)
+        if (fmt == KqFmt.k4) {
+            matmul_kq_batch(fi, y, t.k4q, t.k4s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+        } elif (fmt == KqFmt.k5) {
+            matmul_kq_batch(fi, y, t.k5q, t.k5s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+        } else {
+            matmul_kq_batch(fi, y, t.k6q, t.k6s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+        }
+        prof_add("mm_gemm", ts_gemm)
+        return
+    }
     unsafe {
         for (p in range64(npos)) {
-            quantize_q8_0_bs_into_ptr(addr(x[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), 0l, 0l, 0l)
-            mm_at_kq_pre(y, t, fmt, woff, xq, xs, xbs, n, d, p * d)
+            quantize_q8_0_bs_into_ptr(addr(x[p * n]), n, addr(s.xq[0]), addr(s.xs[0]), addr(s.xbs[0]), 0l, 0l, 0l)
+            mm_at_kq_pre(y, t, fmt, woff, s.xq, s.xs, s.xbs, n, d, p * d)
         }
     }
 }
@@ -3238,13 +3255,13 @@ def private mm_pre_f(var y : array<float>; t : Model; fmt : KqFmt; woff : int64;
     }
 }
 
-// Batched format router: q8 weights ride the batch tile; kq weights take the serial-per-position
-// plane GEMVs through the DECODE scratch (xq/xs/xbs — sized max(dim, hidden), not the batch planes).
+// Batched format router: q8 weights ride the batch tile; kq weights take the native kq tile
+// (repacked loads) or the serial-per-position fallback (see mm_b_kq).
 def private mm_b_f(var s : Session; var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; n, d, npos : int64) {
     if (fmt == KqFmt.q8) {
         mm_b(y, t, woff, x, s.xqb, s.xsb, n, d, npos)
     } else {
-        mm_b_kq(y, t, fmt, woff, x, s.xq, s.xs, s.xbs, n, d, npos)
+        mm_b_kq(s, y, t, fmt, woff, x, n, d, npos)
     }
 }
 
@@ -3278,6 +3295,30 @@ def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<i
                 for (p in range(rb, re)) {
                     let pp = int64(p)
                     quantize_q8_0_into_ptr(xp + pp * n, n, qp, sp, pp * n, pp * nb)
+                }
+            }
+        }
+    }
+    prof_add("mm_requant", ts_rq)
+}
+
+// The bs twin of requant_rows_q8: quants + scales byte-identical, plus the per-16 sums the kq
+// batch tile's offset term consumes (row p's sums at xbsb[p * n/16 ..)).
+def private requant_rows_q8_bs(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>; var xbsb : array<int>) {
+    let nb = n / 32l
+    let nh = n / 16l
+    let ts_rq = ref_time_ticks()
+    unsafe {
+        let xp = reinterpret<float const?>(addr(x[0]))
+        var qp = addr(xqb[0])
+        var sp = addr(xsb[0])
+        var bp = addr(xbsb[0])
+        let rq_par = n * npos >= g_requant_par_threshold
+        maybe_parallel_for(rq_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+            unsafe {
+                for (p in range(rb, re)) {
+                    let pp = int64(p)
+                    quantize_q8_0_bs_into_ptr(xp + pp * n, n, qp, sp, bp, pp * n, pp * nb, pp * nh)
                 }
             }
         }
@@ -6770,6 +6811,9 @@ def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : 
     s.hb2_b |> resize(npos * hidden)
     s.xqb |> resize(npos * maxn)
     s.xsb |> resize(npos * maxn / 32l)
+    if (t.kquant_native) {   // kq batch tile: per-16 sums beside the batch quants
+        s.xbsb |> resize(npos * maxn / 16l)
+    }
     if (has_ple(c)) {   // gemma-4 E-series PLE prefill scratch (npos positions)
         let all = c.n_layers * c.n_embd_per_layer
         s.ple_inp |> resize(npos * all)
@@ -6912,6 +6956,9 @@ def private batch_decode_alloc(t : Model; var s : Session; nrows : int64) {
     s.hb2_b |> resize(nrows * hidden)
     s.xqb |> resize(nrows * maxn)
     s.xsb |> resize(nrows * maxn / 32l)
+    if (t.kquant_native) {   // kq batch tile: per-16 sums beside the batch quants
+        s.xbsb |> resize(nrows * maxn / 16l)
+    }
     if (s.kv_dtype_k == KVDtype.q8_0) {   // batch query-quant planes (dtypes snapshotted before this)
         s.attq |> resize(nrows * qd)
         s.atts |> resize(nrows * qd / 32l)
@@ -7147,7 +7194,7 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
         mm_fblob_b(ws.logits_b, t, t.tok_emb_off, ws.scr.xb_b, dim, vocab, nrows)
     } elif (cls_fmt != KqFmt.q8) {
-        mm_b_kq(ws.logits_b, t, cls_fmt, t.wcls_off, ws.scr.xb_b, ws.scr.xq, ws.scr.xs, ws.scr.xbs, dim, vocab, nrows)
+        mm_b_kq(ws.scr, ws.logits_b, t, cls_fmt, t.wcls_off, ws.scr.xb_b, dim, vocab, nrows)
     } else {
         mm_b(ws.logits_b, t, t.wcls_off, ws.scr.xb_b, ws.scr.xqb, ws.scr.xsb, dim, vocab, nrows)
     }

@@ -1073,6 +1073,10 @@ typedef MatmulKqRowsFn = function<(var yp : float?; kqp : uint8 const?; ksp : ui
 // The fmt-branched full K-quant GEMV (fmt 4/5/6; internal fork over d rows) and plane repack.
 typedef MatmulKqFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64) : void>
 typedef RepackKqFn = function<(fmt : int; var kq : uint8?; var ks : uint8?; n : int64; d : int64) : void>
+// Batched K-quant GEMM (the kq prefill tile): activations an [ntok x n] image with per-token
+// scale (n/32) and bsum (n/16) rows; Y token-major [ntok x d]. Bit-for-bit ntok x the fmt's
+// per-position GEMV over the same repacked planes.
+typedef MatmulKqBatchFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64; ntok : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
 //! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
@@ -1114,6 +1118,7 @@ struct KernelBackend {
     kq_rows_k4 : MatmulKqRowsFn = @@kq_unset_rows
     kq_rows_k5 : MatmulKqRowsFn = @@kq_unset_rows
     kq_rows_k6 : MatmulKqRowsFn = @@kq_unset_rows
+    kq_batch : MatmulKqBatchFn = @@kq_unset_batch
     repack_kq : RepackKqFn = @@repack_kq_identity
     needs_repack : bool
     // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the interleaved
@@ -1169,7 +1174,9 @@ var g_mm_kq = @@kq_unset_kernel
 var g_kq_rows_k4 = @@kq_unset_rows
 var g_kq_rows_k5 = @@kq_unset_rows
 var g_kq_rows_k6 = @@kq_unset_rows
+var g_mm_kq_batch = @@kq_unset_batch
 var g_active_has_kq = false         // does the active backend carry the native K-quant slots?
+var g_active_has_kq_batch = false   // ... including the batched kq GEMM (the prefill tile)?
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend is selected
@@ -1279,6 +1286,10 @@ def private kq_unset_kernel(fmt : int; var yp : float?; kqp : uint8 const?; ksp 
 def private kq_unset_rows(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) {
     panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant row-range GEMV cores (kq_rows_*)")
 }
+[unused_argument(fmt, yp, kqp, ksp, xqp, xsp, xbsp, n, d, ntok)]
+def private kq_unset_batch(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, ntok : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant batch kernel (kq_batch)")
+}
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
@@ -1302,7 +1313,9 @@ def private activate(be : KernelBackend) {
     g_kq_rows_k4 = be.kq_rows_k4
     g_kq_rows_k5 = be.kq_rows_k5
     g_kq_rows_k6 = be.kq_rows_k6
+    g_mm_kq_batch = be.kq_batch
     g_active_has_kq = !(be.mm_kq == @@kq_unset_kernel)
+    g_active_has_kq_batch = !(be.kq_batch == @@kq_unset_batch)
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
     g_repack_kq = be.repack_kq
@@ -1476,6 +1489,27 @@ def kq_rows_fn(fmt : int) : MatmulKqRowsFn {
     if (fmt == 4) return g_kq_rows_k4
     if (fmt == 5) return g_kq_rows_k5
     return g_kq_rows_k6
+}
+
+//! Does the active backend carry the batched kq GEMM (kq_batch — the prefill tile)? The
+//! batched dispatch gates on it and falls back to serial per-position GEMVs when down.
+def kernel_backend_has_kq_batch() : bool {
+    return g_active_has_kq_batch
+}
+
+//! Batched K-quant GEMM over a REPACKED plane pair at plane-local element offset `woff`
+//! (blob+offset form): ntok activation rows -> token-major Y [ntok x d]. Bit-for-bit ntok x
+//! matmul_kq_active. Callers guard with kq_repacked && kernel_backend_has_kq_batch().
+def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d, ntok : int64) {
+    let sb = woff / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    unsafe {
+        invoke(g_mm_kq_batch, fmt, addr(y[0]),
+            reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<int const?>(addr(xbs[0])), n, d, ntok)
+    }
 }
 
 //! Native K-quant GEMV over a REPACKED plane pair at plane-local element offset `woff`

@@ -240,6 +240,49 @@ def k6q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp :
     }
 }
 
+//! The K-quant TILE companions (the kq batch family): 4 tokens x mr rows per call over the
+//! grp<mr> kq planes — kqg/ksg are the GROUP plane bases (the batch wrapper offsets per
+//! group), activations an [ntok x n] image with per-token scale/bsum rows. The generated body
+//! unpacks each weight vector once per superblock and dots it against all 4 tokens
+//! (weight-stationary — the prefill fix for the serial per-position GEMVs); one call is
+//! bit-exact vs 4 per-token GEMVs. Reference bodies = per-token scalar grp walks, declining
+//! in lockstep via the shared predicate. Not `private`: called from lifted worker lambdas.
+[hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def k4q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
+    let mr = int64(q8q8_layout_gen())
+    unsafe {
+        for (t in range64(4l)) {
+            for (r in range64(mr)) {
+                yp[(t0 + t) * d + g * mr + r] = kq_grp_row_dot(4l, kqg, ksg, r, mr, xqp + (t0 + t) * n, xsp + (t0 + t) * (n / 32l), xbsp + (t0 + t) * (n / 16l), n)
+            }
+        }
+    }
+}
+
+[hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def k5q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
+    let mr = int64(q8q8_layout_gen())
+    unsafe {
+        for (t in range64(4l)) {
+            for (r in range64(mr)) {
+                yp[(t0 + t) * d + g * mr + r] = kq_grp_row_dot(5l, kqg, ksg, r, mr, xqp + (t0 + t) * n, xsp + (t0 + t) * (n / 32l), xbsp + (t0 + t) * (n / 16l), n)
+            }
+        }
+    }
+}
+
+[hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def k6q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
+    let mr = int64(q8q8_layout_gen())
+    unsafe {
+        for (t in range64(4l)) {
+            for (r in range64(mr)) {
+                yp[(t0 + t) * d + g * mr + r] = kq_grp_row_dot(6l, kqg, ksg, r, mr, xqp + (t0 + t) * n, xsp + (t0 + t) * (n / 32l), xbsp + (t0 + t) * (n / 16l), n)
+            }
+        }
+    }
+}
+
 //! The f16-scale GEMV companion (the wscale_f16 rail): q8q8_gemv_gen's twin over the raw
 //! binary16 group-scale plane (Model.qscales16 — the repacked f32 plane, converted in place,
 //! element order preserved). Same rows-range contract; the generated body differs only in the
@@ -335,6 +378,9 @@ def q8q8_tile_s16_gen(var yp : float?; wg : int8 const?; sg : uint16 const?; xqp
  tune_companion(fn = "k4q8_gemv_gen", gen = "dasllama_gemm_gen::k4_gemv"),
  tune_companion(fn = "k5q8_gemv_gen", gen = "dasllama_gemm_gen::k5_gemv"),
  tune_companion(fn = "k6q8_gemv_gen", gen = "dasllama_gemm_gen::k6_gemv"),
+ tune_companion(fn = "k4q8_tile_gen", gen = "dasllama_gemm_gen::k4_tile"),
+ tune_companion(fn = "k5q8_tile_gen", gen = "dasllama_gemm_gen::k5_tile"),
+ tune_companion(fn = "k6q8_tile_gen", gen = "dasllama_gemm_gen::k6_tile"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
  tune(gen = "dasllama_gemm_gen::q8q8_tile",
       fallback = "dot_vpdpbusd_width512_mr16_kstep2_gkstep2_bias128;dot_vpdpbusd_width256_mr8_kstep2_gkstep2_bias128;dot_maddubs_width256_mr8_kstep2;kstep2"), unused_argument(xbsp),
@@ -1116,6 +1162,78 @@ def private kq_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : 
     }
 }
 
+// one (group range x token range) cell of the kq batch walk: TB token blocks outer, groups
+// inner, 4-token tile calls + per-token gemv tails — the q8 batch cell's shape with ts pinned
+// 4 (the kq tile is the 4-token vector form on every stamp; no TMUL kq tile exists, so the
+// amx tokstep never applies)
+def private kq_batch_cell_gen(fmt : int; var myp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, mr, TB : int64; ub, ue : int; tb0, tend : int64) {
+    let nsb = n / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    let nb32 = n / 32l
+    let nb16 = n / 16l
+    unsafe {
+        var tb = tb0
+        while (tb < tend) {
+            let tbe = min(tb + TB, tend)
+            let tb4 = tb + ((tbe - tb) / 4l) * 4l
+            for (gi in range(ub, ue)) {
+                let g = int64(gi)
+                let kqg = kqp + g * mr * nsb * qsb
+                let ksg = ksp + g * mr * nsb * ssb
+                var tk = tb
+                while (tk < tb4) {
+                    if (fmt == 4) {
+                        k4q8_tile_gen(myp, kqg, ksg, xqp, xsp, xbsp, n, d, g, tk)
+                    } elif (fmt == 5) {
+                        k5q8_tile_gen(myp, kqg, ksg, xqp, xsp, xbsp, n, d, g, tk)
+                    } else {
+                        k6q8_tile_gen(myp, kqg, ksg, xqp, xsp, xbsp, n, d, g, tk)
+                    }
+                    tk += 4l
+                }
+                while (tk < tbe) {   // token tail (< 4): the rows core, one position
+                    if (fmt == 4) {
+                        k4q8_gemv_gen(myp + tk * d, kqp, ksp, xqp + tk * n, xsp + tk * nb32, xbsp + tk * nb16, n, g * mr, (g + 1l) * mr)
+                    } elif (fmt == 5) {
+                        k5q8_gemv_gen(myp + tk * d, kqp, ksp, xqp + tk * n, xsp + tk * nb32, xbsp + tk * nb16, n, g * mr, (g + 1l) * mr)
+                    } else {
+                        k6q8_gemv_gen(myp + tk * d, kqp, ksp, xqp + tk * n, xsp + tk * nb32, xbsp + tk * nb16, n, g * mr, (g + 1l) * mr)
+                    }
+                    tk++
+                }
+            }
+            tb += TB
+        }
+    }
+}
+
+// kq_batch slot: batched K-quant GEMM over the repacked planes — group chunks parallel, the
+// cell walk above per chunk, row tails (d % mr) disk-order per token via the portable dots
+def private kq_batch_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, ntok : int64) {
+    let nsb = n / 256l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+    var myp = yp
+    let TB = effective_token_block(g_q8_token_block, n)
+    maybe_parallel_for(0, int(ng), matmul_chunks_gemv(int(ng * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(ub, ue) {
+        kq_batch_cell_gen(fmt, myp, kqp, ksp, xqp, xsp, xbsp, n, d, mr, TB, ub, ue, 0l, ntok)
+    }
+    unsafe {
+        for (tk in range64(ntok)) {
+            for (i in range64(ng * mr, d)) {
+                if (fmt == 4) {
+                    myp[tk * d + i] = dot_k4q8(kqp + i * nsb * 128l, ksp + i * nsb * 32l, xqp + tk * n, xsp + tk * (n / 32l), xbsp + tk * (n / 16l), n)
+                } elif (fmt == 5) {
+                    myp[tk * d + i] = dot_k5q8(kqp + i * nsb * 160l, ksp + i * nsb * 32l, xqp + tk * n, xsp + tk * (n / 32l), xbsp + tk * (n / 16l), n)
+                } else {
+                    myp[tk * d + i] = dot_k6q8(kqp + i * nsb * 192l, ksp + i * nsb * 18l, xqp + tk * n, xsp + tk * (n / 32l), xbsp + tk * (n / 16l), n)
+                }
+            }
+        }
+    }
+}
+
 // ===== f16-scale twins (the wscale_f16 rail): the same slot traversals over the binary16
 // group-scale plane — generated cores via the s16 companions, row-major tails via
 // dot_q8q8_f16s, token tails via the s16 rows core (no laneq fork needed: the generated
@@ -1411,7 +1529,7 @@ def dasllama_math_gen_register() {
             mm_rows_s16 = @@q8q8_gemv_s16_gen,
             mm_kq = @@kq_kernel_gen, repack_kq = @@repack_kq_gen,
             kq_rows_k4 = @@k4q8_gemv_gen, kq_rows_k5 = @@k5q8_gemv_gen,
-            kq_rows_k6 = @@k6q8_gemv_gen,
+            kq_rows_k6 = @@k6q8_gemv_gen, kq_batch = @@kq_batch_kernel_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
             q8_kgroup = @@q8q8_kgroup_gen,

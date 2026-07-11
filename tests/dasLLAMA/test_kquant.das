@@ -411,6 +411,132 @@ def test_kq_repack_grp(t : T?) {
     }
 }
 
+// Tile-vs-GEMV gate: the kq 4-token tile must be BIT-exact vs 4 per-token GEMVs over the same
+// repacked planes (the tile's per-token fold order IS the GEMV's). Repack at the layout
+// companion's mr — the same value the stubs/kernels read, so this holds on the reference
+// bodies (interp) AND the stamped kernels (-jit) alike.
+def private kq_tile_gate(t : T?; fmt : int) {
+    let n = 512l
+    let d = 32l
+    let ntok = 7l   // 4-token tile + a 3-token gemv tail
+    let nsb = n / 256l
+    let mr = int64(q8q8_layout_gen())
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
+    var kq : array<uint8>
+    var ks : array<uint8>
+    kq |> resize(int(d * nsb * qsb))
+    ks |> resize(int(d * nsb * ssb))
+    for (r in range64(d)) {
+        for (s in range64(nsb)) {
+            if (fmt == 4) {
+                transcode_q4k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } elif (fmt == 5) {
+                transcode_q5k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } else {
+                transcode_q6k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            }
+        }
+        var st = 0xDEADBEFu + uint(r) * 0x9E3779Bu
+        for (i in range64(nsb * qsb)) {
+            st = st * 1664525u + 1013904223u
+            kq[r * nsb * qsb + i] = uint8(uint(kq[r * nsb * qsb + i]) ^ (st >> 16u))
+        }
+    }
+    unsafe {
+        if (fmt == 4) {
+            repack_k4_grp(addr(kq[0]), addr(ks[0]), n, d, mr)
+        } elif (fmt == 5) {
+            repack_k5_grp(addr(kq[0]), addr(ks[0]), n, d, mr)
+        } else {
+            repack_k6_grp(addr(kq[0]), addr(ks[0]), n, d, mr)
+        }
+    }
+    // ntok-row activation image, bs-quantized per row
+    var src : array<float>
+    src |> resize(int(ntok * n))
+    for (i in range64(ntok * n)) {
+        src[i] = 0.9 * sin(float(i) * 0.31) + 0.5 * cos(float(i) * 0.043)
+    }
+    var xq : array<int8>
+    var xs : array<float>
+    var xbs : array<int>
+    xq |> resize(int(ntok * n))
+    xs |> resize(int(ntok * n / 32l))
+    xbs |> resize(int(ntok * n / 16l))
+    unsafe {
+        for (p in range64(ntok)) {
+            quantize_q8_0_bs_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 32l), p * (n / 16l))
+        }
+    }
+    var ytile : array<float>
+    var ygemv : array<float>
+    ytile |> resize(int(ntok * d))
+    ygemv |> resize(int(ntok * d))
+    unsafe {
+        let ng = d / mr
+        for (g in range64(ng)) {
+            let kqg = addr(kq[g * mr * nsb * qsb])
+            let ksg = addr(ks[g * mr * nsb * ssb])
+            var tk = 0l
+            while (tk + 4l <= ntok) {   // whole tiles
+                if (fmt == 4) {
+                    k4q8_tile_gen(addr(ytile[0]), kqg, ksg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d, g, tk)
+                } elif (fmt == 5) {
+                    k5q8_tile_gen(addr(ytile[0]), kqg, ksg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d, g, tk)
+                } else {
+                    k6q8_tile_gen(addr(ytile[0]), kqg, ksg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d, g, tk)
+                }
+                tk += 4l
+            }
+            while (tk < ntok) {   // token tail via the rows core (the batch cell's shape)
+                if (fmt == 4) {
+                    k4q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 32l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
+                } elif (fmt == 5) {
+                    k5q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 32l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
+                } else {
+                    k6q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 32l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
+                }
+                tk++
+            }
+        }
+        for (p in range64(ntok)) {   // reference: one full GEMV per token
+            if (fmt == 4) {
+                k4q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 32l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
+            } elif (fmt == 5) {
+                k5q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 32l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
+            } else {
+                k6q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 32l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
+            }
+        }
+    }
+    var bad = 0
+    for (i in range64(ntok * d)) {
+        if (ytile[i] != ygemv[i]) {
+            bad++
+        }
+    }
+    t |> success(bad == 0, "kq tile bit-matches per-token GEMVs")
+    delete kq
+    delete ks
+    delete src
+    delete xq
+    delete xs
+    delete xbs
+    delete ytile
+    delete ygemv
+}
+
+[test]
+def test_kq_tile(t : T?) {
+    for (fmt in [4, 5, 6]) {
+        t |> run("k{fmt} 4-token tile bit-matches per-token GEMVs") @(t : T?) {
+            kq_tile_gate(t, fmt)
+        }
+    }
+}
+
 [test]
 def test_quantize_bs(t : T?) {
     t |> run("bs quantizer matches quantize_q8_0 byte-for-byte plus exact per-16 sums") @(t : T?) {
