@@ -16,7 +16,7 @@ struct ShaderTypeSpec {
     name : string           // das type name: "float4", "int2", "half4"
     glsl_name : string      // expected GLSL spelling: "vec4", "ivec2", "f16vec4"
     arity : int             // 1 for scalars
-    kind : string           // ctor-argument literal spelling: "float" | "int" | "uint" | "double"
+    kind : string           // ctor-argument literal spelling: "float" | "int" | "uint" | "double" | "half"; "memzero" = reject-control row
     has_arith : bool        // + - * work on the type in shader code
     spv_mode : string       // "emit" | "reject" | "skip" — the dasSpirv rail's expectation
     glsl_mode : string      // "emit" | "reject" | "skip" — the dasGlsl rail's expectation
@@ -380,6 +380,22 @@ def context_specs : array<ContextSpec> {
                 w |> write("    fc_ug_color = fc_ug_lat.a\n")
                 w |> write("\}\n\n")
                 w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_ubo_glsl\}\\n\")\n\}\n")
+            }),
+        // block members must peel array dims to the lattice element (Copilot R2)
+        ContextSpec(name = "_fc_lattice_ubo_array", rail = "glsl", needle = "16/8-bit lattice members have no std140 layout",
+            body = build_string() $(var w) {
+                w |> write("options no_unused_function_arguments = false\n\n")
+                w |> write("[unused_argument(program, blockName, size)] def std140_reset(program : uint; blockName : string; size : int) \{\}\n")
+                w |> write("[unused_argument(program, blockName, offset, value)] def std140_set(program : uint; blockName : string; offset : uint; value) \{\}\n")
+                w |> write("[unused_argument(program, blockName, bindingPoint)] def std140_flush(program : uint; blockName : string; bindingPoint : int) \{\}\n\n")
+                w |> write("struct FcUboFaLat \{\n    a : float4\n    h : half4[4]\n\}\n\n")
+                w |> write("var @uniform fc_uga_lat : FcUboFaLat\n")
+                w |> write("var @out fc_uga_color : float4\n\n")
+                w |> write("[fragment_program(name=\"fc_lat_ubo_array_glsl\")]\n")
+                w |> write("def fc_lat_ubo_array_fragment \{\n")
+                w |> write("    fc_uga_color = fc_uga_lat.a\n")
+                w |> write("\}\n\n")
+                w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_ubo_array_glsl\}\\n\")\n\}\n")
             }),
         // loose lattice uniforms must get the designed interface diagnostic from the BIND
         // generator (glsl_opengl), not a typer error on the generated glUniformAny call

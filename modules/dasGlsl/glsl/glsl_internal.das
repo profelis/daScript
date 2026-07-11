@@ -102,7 +102,12 @@ class GlslShader : AstFunctionAnnotation {
             if (empty(latErr) && gvar._type.baseType == Type.tStructure && gvar._type.structType != null) {
                 if (gvar.annotation |> find_arg("uniform") is tBool || gvar.annotation |> find_arg("push_constant") is tBool) {
                     for (f in gvar._type.structType.fields) {
-                        if (lattice_small_type(f._type.baseType)) {
+                        // peel array/fixed-array dims — a half4[4] member is just as lattice
+                        var f_elem = f._type
+                        while (f_elem != null && (f_elem.baseType == Type.tArray || f_elem.baseType == Type.tFixedArray)) {
+                            f_elem = f_elem.firstType
+                        }
+                        if (f_elem != null && lattice_small_type(f_elem.baseType)) {
                             latErr = "uniform block '{gvar.name}' field '{f.name}': 16/8-bit lattice members have no std140 layout (not supported yet)"
                             break
                         }
