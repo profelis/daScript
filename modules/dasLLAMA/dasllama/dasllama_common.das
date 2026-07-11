@@ -220,6 +220,11 @@ struct Model {
     wblob : array<float>
     qblob : array<int8>
     qscales : array<float>
+    // wscale_f16 rail: the Q8 weight-scale plane as raw binary16 halfwords — llama.cpp byte
+    // parity (34 vs 36 B per 32 weights). Built by wscale_convert_f16 post-repack (qscales is
+    // then freed); exactly one of qscales/qscales16 is populated for a q8 model.
+    qscales16 : array<uint16>
+    wscale_f16 : bool = false
     q4blob : array<uint8>
     q4scales : array<float>
     // Native-MXFP4 expert stacks (valid when experts_mx4): the routed we1/we2/we3 stacks live here
@@ -764,6 +769,36 @@ def private resolve_arch(var t : Model; arch : string) {
     t.arch = arch
     g_arch_registry[arch].configure(t.config)
     t.blocks = g_arch_registry[arch].blocks
+}
+
+// The wscale_f16 rail's load-time switch (see Model.qscales16): default off; box-profile
+// runtime knob `wscale_f16` / benches flip it before load_gguf.
+var g_wscale_f16 = false
+def public set_wscale_f16(on : bool) {
+    g_wscale_f16 = on
+}
+def public get_wscale_f16() : bool {
+    return g_wscale_f16
+}
+
+// Convert the (already repacked/permuted) f32 scale plane to raw binary16 halfwords and free the
+// f32 plane. f16->f32->f16 round-trips exactly, so for gguf-Q8 tensors the halfword plane equals
+// the disk scales bit-for-bit and every dot is bit-identical to the f32 plane; runtime-quantized
+// tensors (f32/bf16-source weights on a q8 load) take one f16 rounding on their scales. Gated on
+// the active backend carrying the f16-scale kernel twins.
+def private wscale_convert_f16(var t : Model) {
+    if (!kernel_backend_has_wscale16()) {
+        to_log(LOG_WARNING, "dasLLAMA: wscale_f16 requested but backend '{active_kernel_backend()}' has no f16-scale kernels — keeping the f32 scale plane\n")
+        return
+    }
+    let n = long_length(t.qscales)
+    t.qscales16 |> resize(int(n))
+    unsafe {
+        cvt_f32_to_f16(addr(t.qscales16[0]), addr(t.qscales[0]), n)
+    }
+    delete t.qscales
+    t.wscale_f16 = true
+    to_log(LOG_INFO, "dasLLAMA: weight-scale plane converted to f16 ({n} scales, -{n * 2l} bytes)\n")
 }
 
 //! Load a llama-architecture GGUF into the split layout at the requested precision. The big weights
@@ -1365,6 +1400,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 repack_mx4_stacks(t)
             }
         }
+        if (mode == QuantMode.q8 && g_wscale_f16) {
+            wscale_convert_f16(t)
+        }
     }
     fclose(f)
     return <- t
@@ -1382,6 +1420,9 @@ def quantize_weights(var t : Model) {
     // same backend-for-load select + in-place repack as the load_gguf Q8 path (no-op off-ARM)
     if (select_matmul_backend_for_load()) {
         repack_q8_weights(t)
+    }
+    if (g_wscale_f16) {
+        wscale_convert_f16(t)
     }
 }
 
@@ -1416,7 +1457,7 @@ def footprint(t : Model) : MemFootprint {
     let aux = long_length(t.fblob) * 4l
     let wf = long_length(t.wblob) * 4l
     let q8 = long_length(t.qblob)                 // int8 -> 1 byte each
-    let q8s = long_length(t.qscales) * 4l
+    let q8s = long_length(t.qscales) * 4l + long_length(t.qscales16) * 2l
     let q4 = long_length(t.q4blob)                // uint8 (two nibbles) -> 1 byte each
     let q4s = long_length(t.q4scales) * 4l
     let mx4 = long_length(t.mxq)                  // uint8 (two nibbles) -> 1 byte each
@@ -1777,6 +1818,7 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "matmul_min_chunk_rows") $(v) { set_matmul_min_chunk_rows(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "matmul_min_chunk_rows_gemv") $(v) { set_matmul_min_chunk_rows_gemv(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "gemv_chunks_per_lane") $(v) { set_gemv_chunks_per_lane(int(min(v, 2147483647l))) }
+    apply_i64_knob(rt, "wscale_f16") $(v) { set_wscale_f16(v != 0l) }
     apply_i64_knob(rt, "gemv_lane_cap") $(v) { set_gemv_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_lane_cap") $(v) { set_batch_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_grid_2d") $(v) { set_batch_grid_2d(int(min(v, 2l))) }
@@ -2724,7 +2766,11 @@ def private add_bias(var y : array<float>; yoff : int64; b : array<float>; boff,
 // offset; scales start at woff/32 (woff is block-aligned for every 2D tensor).
 def private mm_at_q8(var y : array<float>; t : Model; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; n, d : int64) {
     quantize_q8_0_into(x, n, xq, xs, 0l, 0l)
-    matmul_q8q8(y, t.qblob, t.qscales, woff, xq, xs, n, d)
+    if (t.wscale_f16) {
+        matmul_q8q8(y, t.qblob, t.qscales16, woff, xq, xs, n, d)
+    } else {
+        matmul_q8q8(y, t.qblob, t.qscales, woff, xq, xs, n, d)
+    }
 }
 
 // Q4 matmul with the weight in the quantized blob (4-bit, two per byte) + its per-block scales.
@@ -2759,7 +2805,11 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
         }
     } elif (t.quant == QuantMode.q8 && lanes_for_work(dim * (qd + 2l * kv), g_gemv_lane_cap) > 1) {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
-        matmul_q8q8_group3(s.q, s.k, s.v, t.qblob, t.qscales, qoff, koff, voff, s.xq, s.xs, dim, qd, kv, kv)
+        if (t.wscale_f16) {
+            matmul_q8q8_group3(s.q, s.k, s.v, t.qblob, t.qscales16, qoff, koff, voff, s.xq, s.xs, dim, qd, kv, kv)
+        } else {
+            matmul_q8q8_group3(s.q, s.k, s.v, t.qblob, t.qscales, qoff, koff, voff, s.xq, s.xs, dim, qd, kv, kv)
+        }
     } else {
         mm(s.q, t, qoff, s.xb, s.xq, s.xs, dim, qd)
         mm(s.k, t, koff, s.xb, s.xq, s.xs, dim, kv)
@@ -2771,7 +2821,11 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
 // quantizes the shared rmsnormed activation once per layer and reuses it across every expert's
 // gate/up matmul instead of re-quantizing per call.
 def private mm_at_q8_pre(var y : array<float>; t : Model; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    matmul_q8q8(y, t.qblob, t.qscales, woff, xq, xs, n, d)
+    if (t.wscale_f16) {
+        matmul_q8q8(y, t.qblob, t.qscales16, woff, xq, xs, n, d)
+    } else {
+        matmul_q8q8(y, t.qblob, t.qscales, woff, xq, xs, n, d)
+    }
 }
 
 // Native-MXFP4 GEMV against a PRE-quantized activation: the weight region [d x n] lives in the
@@ -2785,11 +2839,19 @@ def private mm_at_mx4_pre(var y : array<float>; t : Model; woff : int64; xq : ar
 // The boffs forms fold each region's fblob bias vector into the workers' stores (gpt-oss expert
 // biases) — bit-identical to a post-pass add_bias, minus its serial caller-side cost.
 def private mm_at_q8_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, n, d)
+    if (t.wscale_f16) {
+        matmul_q8q8_groupn(y, t.qblob, t.qscales16, offs, nregions, xq, xs, n, d)
+    } else {
+        matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, n, d)
+    }
 }
 
 def private mm_at_q8_groupn(var y : array<float>; t : Model; offs, boffs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
-    matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, t.fblob, boffs, n, d)
+    if (t.wscale_f16) {
+        matmul_q8q8_groupn(y, t.qblob, t.qscales16, offs, nregions, xq, xs, t.fblob, boffs, n, d)
+    } else {
+        matmul_q8q8_groupn(y, t.qblob, t.qscales, offs, nregions, xq, xs, t.fblob, boffs, n, d)
+    }
 }
 
 def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
@@ -2851,7 +2913,11 @@ def private mm_b_mx4_pre(var y : array<float>; t : Model; woff : int64; xqb : ar
 // expert bucket).
 def private mm_b_q8_pre(var y : array<float>; t : Model; woff : int64; xqb : array<int8>; xsb : array<float>; n, d, npos : int64) {
     let ts_gemm = ref_time_ticks()
-    matmul_q8q8_batch(y, t.qblob, t.qscales, woff, xqb, xsb, n, d, npos)
+    if (t.wscale_f16) {
+        matmul_q8q8_batch(y, t.qblob, t.qscales16, woff, xqb, xsb, n, d, npos)
+    } else {
+        matmul_q8q8_batch(y, t.qblob, t.qscales, woff, xqb, xsb, n, d, npos)
+    }
     prof_add("mm_gemm", ts_gemm)
 }
 
@@ -2985,7 +3051,9 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
     let c = t.config
     // head_size % 32: the per-head epilogues slice on head boundaries, and the wo-input requant
     // needs whole 32-quant groups per head (real targets are 64/128/256; stories15M's 48 falls back)
-    return (g_fused_decode && t.quant == QuantMode.q8 && g_use_rope_table
+    // !wscale_f16: the chains hoist f32 scale-plane pointers — the f16-plane twins are stage 2
+    // of the rail; until then an f16 model decodes through the per-op dispatch path
+    return (g_fused_decode && t.quant == QuantMode.q8 && !t.wscale_f16 && g_use_rope_table
         && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
@@ -3372,7 +3440,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
 // serial tail runs post-norm and/or the fused add+scale after the rendezvous.
 def private fused_ffn_ok(t : Model; l : int64) : bool {
     let c = t.config
-    return (g_fused_decode && t.quant == QuantMode.q8
+    return (g_fused_decode && t.quant == QuantMode.q8 && !t.wscale_f16
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && lanes_for_work(c.dim * layer_hidden(t, l), g_gemv_lane_cap) > 1)
 }
@@ -4209,12 +4277,23 @@ def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
 def private dequant_q8_row(t : Model; off, n : int64; var dst : float?) {
     unsafe {
         let qp = addr(t.qblob[off])
-        let sp = addr(t.qscales[off / 32l])
-        for (b in range64(n / 32l)) {
-            let sc = sp[b]
-            let base = b * 32l
-            for (k in range64(32l)) {
-                dst[base + k] = float(qp[base + k]) * sc
+        if (t.wscale_f16) {
+            let sp = addr(t.qscales16[off / 32l])
+            for (b in range64(n / 32l)) {
+                let sc = f16_to_f32(uint(sp[b]))
+                let base = b * 32l
+                for (k in range64(32l)) {
+                    dst[base + k] = float(qp[base + k]) * sc
+                }
+            }
+        } else {
+            let sp = addr(t.qscales[off / 32l])
+            for (b in range64(n / 32l)) {
+                let sc = sp[b]
+                let base = b * 32l
+                for (k in range64(32l)) {
+                    dst[base + k] = float(qp[base + k]) * sc
+                }
             }
         }
     }
@@ -4235,7 +4314,7 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
 // mm_fblob and can't), team mode + a backend row core, 32-aligned vocab, and worth threading.
 def private fused_cls_ok(t : Model) : bool {
     let c = t.config
-    return (g_fused_decode && t.quant == QuantMode.q8
+    return (g_fused_decode && t.quant == QuantMode.q8 && !t.wscale_f16
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && c.vocab_size % 32l == 0l
         && lanes_for_work(c.dim * c.vocab_size, g_gemv_lane_cap) > 1)

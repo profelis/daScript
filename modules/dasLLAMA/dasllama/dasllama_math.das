@@ -1041,6 +1041,14 @@ typedef MatmulQ8Q8GroupNFn = function<(var yp : float?; wp : int8 const?; sp : f
 // evenly and Q8 block epilogues stay aligned); same per-row dots as the mm slot — bit-identical.
 typedef MatmulQ8Q8RowsFn = function<(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n : int64; rb : int64; re : int64) : void>
 typedef MatmulMx4GroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// f16-weight-scale twins (the wscale_f16 rail): identical contracts to the Fn above them, except
+// the per-32-block WEIGHT scale plane is raw binary16 halfwords (Model.qscales16) instead of f32 —
+// llama.cpp byte parity, 34 vs 36 B per 32 weights. Activation scales (xsp) stay f32 everywhere.
+typedef MatmulQ8Q8FnS16 = function<(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64) : void>
+typedef MatmulQ8Q8BatchFnS16 = function<(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n : int64; d : int64; ntok : int64) : void>
+typedef MatmulQ8Q8Group3FnS16 = function<(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : uint16 const?; woff0 : int64; woff1 : int64; woff2 : int64; xqp : int8 const?; xsp : float const?; n : int64; d0 : int64; d1 : int64; d2 : int64) : void>
+typedef MatmulQ8Q8GroupNFnS16 = function<(var yp : float?; wp : int8 const?; sp : uint16 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+typedef MatmulQ8Q8RowsFnS16 = function<(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n : int64; rb : int64; re : int64) : void>
 // Is this backend selectable RIGHT NOW? Evaluated at (load-)select/pin time — NOT at
 // registration ([init]s run before the JIT installs generated code, so a predicate reading a
 // JIT-stamped value answers with its reference tier there). Lets one module register several
@@ -1082,6 +1090,13 @@ struct KernelBackend {
     // Optional row-range GEMV core (see MatmulQ8Q8RowsFn) — backends without one keep the panic
     // stub, and the fused multi-stage decode falls back to the per-op dispatch path.
     mm_rows : MatmulQ8Q8RowsFn = @@q8q8_unset_rows
+    // Optional f16-scale twins (the wscale_f16 rail). All-or-nothing per backend: the loader's
+    // plane convert gates on kernel_backend_has_wscale16(), keyed off mm_s16 alone.
+    mm_s16 : MatmulQ8Q8FnS16 = @@q8q8_unset_kernel_s16
+    batch_s16 : MatmulQ8Q8BatchFnS16 = @@q8q8_unset_batch_s16
+    group3_s16 : MatmulQ8Q8Group3FnS16 = @@q8q8_unset_group3_s16
+    groupn_s16 : MatmulQ8Q8GroupNFnS16 = @@q8q8_unset_groupn_s16
+    mm_rows_s16 : MatmulQ8Q8RowsFnS16 = @@q8q8_unset_rows_s16
     needs_repack : bool
     // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the interleaved
     // byte-for-byte expand map (expand_mx4_region_q8's direct-interleave branch): nibble byte
@@ -1125,6 +1140,12 @@ var g_mm_q8q8_groupn = @@q8q8_unset_groupn
 var g_mm_mx4q8_groupn = @@mx4q8_unset_groupn
 var g_mm_q8q8_rows = @@q8q8_unset_rows
 var g_active_has_rows = false       // does the active backend carry a row-range GEMV core?
+var g_mm_q8q8_s16 = @@q8q8_unset_kernel_s16
+var g_mm_q8q8_batch_s16 = @@q8q8_unset_batch_s16
+var g_mm_q8q8_group3_s16 = @@q8q8_unset_group3_s16
+var g_mm_q8q8_groupn_s16 = @@q8q8_unset_groupn_s16
+var g_mm_q8q8_rows_s16 = @@q8q8_unset_rows_s16
+var g_active_has_wscale16 = false   // does the active backend carry the f16-scale twins?
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 
@@ -1197,6 +1218,28 @@ def private q8q8_unset_rows(var yp : float?; wp : int8 const?; sp : float const?
 }
 [unused_argument(yp, wn, we, offs, nregions, xqp, xsp, bp, boffs, n, d)]
 def private mx4q8_unset_groupn(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) { no_backend() }
+// The f16-scale stubs are reachable with a registered backend (the twins are optional) — a
+// wscale_f16 model must never activate a backend without them; the loader gates the convert.
+[unused_argument(yp, wp, sp, xqp, xsp, n, d)]
+def private q8q8_unset_kernel_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no f16-scale kernels (mm_s16)")
+}
+[unused_argument(yp, wp, sp, xqp, xsp, n, d, ntok)]
+def private q8q8_unset_batch_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no f16-scale batch kernel (batch_s16)")
+}
+[unused_argument(y0p, y1p, y2p, wp, sp, woff0, woff1, woff2, xqp, xsp, n, d0, d1, d2)]
+def private q8q8_unset_group3_s16(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : uint16 const?; woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no f16-scale group3 kernel (group3_s16)")
+}
+[unused_argument(yp, wp, sp, offs, nregions, xqp, xsp, bp, boffs, n, d)]
+def private q8q8_unset_groupn_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no f16-scale groupN kernel (groupn_s16)")
+}
+[unused_argument(yp, wp, sp, xqp, xsp, n, rb, re)]
+def private q8q8_unset_rows_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no f16-scale row-range GEMV core (mm_rows_s16)")
+}
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
@@ -1209,6 +1252,12 @@ def private activate(be : KernelBackend) {
     g_mm_mx4q8_groupn = be.groupn_mx4
     g_mm_q8q8_rows = be.mm_rows
     g_active_has_rows = !(be.mm_rows == @@q8q8_unset_rows)
+    g_mm_q8q8_s16 = be.mm_s16
+    g_mm_q8q8_batch_s16 = be.batch_s16
+    g_mm_q8q8_group3_s16 = be.group3_s16
+    g_mm_q8q8_groupn_s16 = be.groupn_s16
+    g_mm_q8q8_rows_s16 = be.mm_rows_s16
+    g_active_has_wscale16 = !(be.mm_s16 == @@q8q8_unset_kernel_s16)
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
     g_active_backend = be.name
@@ -1350,6 +1399,18 @@ def mm_q8q8_rows_fn() : MatmulQ8Q8RowsFn {
     return g_mm_q8q8_rows
 }
 
+//! Does the active backend carry the f16-scale kernel twins (the wscale_f16 rail)? The loader's
+//! scale-plane convert gates on this — without them the model keeps the f32 plane (logged).
+def kernel_backend_has_wscale16() : bool {
+    return g_active_has_wscale16
+}
+
+//! The active backend's f16-scale row-range GEMV core (see MatmulQ8Q8RowsFnS16) — the chains'
+//! twin of mm_q8q8_rows_fn. Same read-into-a-local rule.
+def mm_q8q8_rows16_fn() : MatmulQ8Q8RowsFnS16 {
+    return g_mm_q8q8_rows_s16
+}
+
 //! Registered backend names (diagnostics / tests).
 def kernel_backend_names() : array<string> {
     return <- [for (k in keys(g_kernel_backends)); k]
@@ -1438,6 +1499,63 @@ def matmul_q8q8_group3(var y0 : array<float>; var y1 : array<float>; var y2 : ar
             reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
             woff0, woff1, woff2,
             reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d0, d1, d2)
+    }
+}
+
+// ===== f16-weight-scale overloads (the wscale_f16 rail) — same contracts, ws is the raw
+// binary16 plane (Model.qscales16); overload resolution keys on the scale array type =====
+
+//! Blob+offset form over the f16 scale plane — dispatches to the backend's mm_s16 twin.
+def matmul_q8q8(var y : array<float>; wq : array<int8>; ws : array<uint16>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_s16, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<uint16 const?>(addr(ws[woff / 32l])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+    }
+}
+
+//! Blob+offset batch form over the f16 scale plane (batch_s16).
+def matmul_q8q8_batch(var y : array<float>; wq : array<int8>; ws : array<uint16>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_batch_s16, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<uint16 const?>(addr(ws[woff / 32l])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+    }
+}
+
+//! Q/K/V group form over the f16 scale plane (group3_s16).
+def matmul_q8q8_group3(var y0 : array<float>; var y1 : array<float>; var y2 : array<float>;
+                       wq : array<int8>; ws : array<uint16>; woff0, woff1, woff2 : int64;
+                       xq : array<int8>; xs : array<float>; n, d0, d1, d2 : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_group3_s16, addr(y0[0]), addr(y1[0]), addr(y2[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<uint16 const?>(addr(ws[0])),
+            woff0, woff1, woff2,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d0, d1, d2)
+    }
+}
+
+//! Region-list form over the f16 scale plane (groupn_s16).
+def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<uint16> | #; offs : array<int64>; nregions : int64;
+                       xq : array<int8>; xs : array<float>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_groupn_s16, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<uint16 const?>(addr(ws[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            null, null, n, d)
+    }
+}
+
+//! Biased region-list form over the f16 scale plane (groupn_s16).
+def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<uint16> | #; offs : array<int64>; nregions : int64;
+                       xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
+    unsafe {
+        invoke(g_mm_q8q8_groupn_s16, addr(y[0]),
+            reinterpret<int8 const?>(addr(wq[0])), reinterpret<uint16 const?>(addr(ws[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
     }
 }
 

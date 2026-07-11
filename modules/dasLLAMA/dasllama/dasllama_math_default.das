@@ -4,6 +4,7 @@ module dasllama_math_default shared public
 
 require dasllama/dasllama_math       // KernelBackend + register_kernel_backend + the matmul_chunks shapers + repack_q8q8_identity
 require dasllama/dasllama_tune       // [tuned]: reconstitute dot_q8q8 from its template with per-box loop hints
+require llvm/daslib/f16_cvt          // dot_q8q8_f16s widens the binary16 weight scale in-loop
 require daslib/jobque_boost public   // parallel_for / notify_and_release (the kernels expand parallel_for)
 require dasllama/dasllama_par        // maybe_parallel_for
 require math
@@ -36,6 +37,27 @@ def template dot_q8q8_template(wq : int8 const ?; ws : float const ?; xq : int8 
 //! dequant-in-dot dot_q8 on the kernel bench. n must be a multiple of 32.
 [hint(unsafe_range_check, noalias = wq, noalias = xq, noalias = ws, noalias = xs), tuned(fallback = "vec16")]
 def dot_q8q8(wq : int8 const?; ws : float const?; xq : int8 const?; xs : float const?; n : int64) : float {}
+
+[hint(unsafe_range_check, noalias = wq, noalias = xq, noalias = ws, noalias = xs)]
+def template dot_q8q8_f16s_template(wq : int8 const ?; ws : uint16 const ?; xq : int8 const ?; xs : float const ?; n : int64) : float {
+    var acc = 0.0
+    let nb = n / 32l
+    for (bi in range64(nb)) {
+        let base = bi * 32l
+        var iacc = 0
+        for [tune = 1] (k in range64(32l)) {
+            iacc += int(unsafe(wq[base + k])) * int(unsafe(xq[base + k]))
+        }
+        acc += float(iacc) * f16_to_f32(uint(unsafe(ws[bi]))) * unsafe(xs[bi])
+    }
+    return acc
+}
+
+//! The wscale_f16 twin of dot_q8q8: the per-block WEIGHT scale is a raw binary16 halfword,
+//! widened in-loop (vcvtph2ps/fcvtl under the JIT — the f16-KV codec lesson). Bit-identical to
+//! dot_q8q8 over the f32 plane those halfwords widen to. n must be a multiple of 32.
+[hint(unsafe_range_check, noalias = wq, noalias = xq, noalias = ws, noalias = xs), tuned(fallback = "vec16")]
+def dot_q8q8_f16s(wq : int8 const?; ws : uint16 const?; xq : int8 const?; xs : float const?; n : int64) : float {}
 
 // ----- parallel_for dispatch profiler (off by default) -----
 // When on, the batch kernel records each worker's start time (relative to the parallel_for start) into
@@ -175,6 +197,93 @@ def private q8q8_group3_kernel(var y0p : float?; var y1p : float?; var y2p : flo
                     let r = g - d0 - d1
                     w2[r] = dot_q8q8(wp + woff2 + r * n, sp + woff2 / 32l + r * nb, xqp, xsp, n)
                 }
+            }
+        }
+    }
+}
+
+// ===== f16-scale twins (the wscale_f16 rail): the same portable loops over the binary16
+// weight-scale plane, one dot swap — bit-identical to the f32 forms over the widened plane =====
+
+def private q8q8_kernel_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
+        unsafe {
+            for (i in range(rb, re)) {
+                myp[i] = dot_q8q8_f16s(wp + int64(i) * n, sp + int64(i) * nb, xqp, xsp, n)
+            }
+        }
+    }
+}
+
+def private q8q8_batch_kernel_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    let nb = n / 32l
+    var myp = yp
+    maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+        unsafe {
+            for (i in range(rb, re)) {
+                let wrow = wp + int64(i) * n
+                let srow = sp + int64(i) * nb
+                for (tk in range64(ntok)) {
+                    myp[tk * d + int64(i)] = dot_q8q8_f16s(wrow, srow, xqp + tk * n, xsp + tk * nb, n)
+                }
+            }
+        }
+    }
+}
+
+// Not `private`: invoked through the kernel pointer from lifted worker lambdas.
+def q8q8_rows_kernel_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
+    let nb = n / 32l
+    unsafe {
+        for (i in range64(rb, re)) {
+            yp[i] = dot_q8q8_f16s(wp + i * n, sp + i * nb, xqp, xsp, n)
+        }
+    }
+}
+
+def private q8q8_group3_kernel_s16(var y0p : float?; var y1p : float?; var y2p : float?; wp : int8 const?; sp : uint16 const?;
+                                   woff0, woff1, woff2 : int64; xqp : int8 const?; xsp : float const?; n, d0, d1, d2 : int64) {
+    let nb = n / 32l
+    let dtot = d0 + d1 + d2
+    var w0 = y0p
+    var w1 = y1p
+    var w2 = y2p
+    maybe_parallel_for(0, int(dtot), matmul_chunks_gemv(int(dtot), 1, n * dtot)) $(rb, re) {
+        unsafe {
+            for (gi in range(rb, re)) {
+                let g = int64(gi)
+                if (g < d0) {
+                    w0[g] = dot_q8q8_f16s(wp + woff0 + g * n, sp + woff0 / 32l + g * nb, xqp, xsp, n)
+                } elif (g < d0 + d1) {
+                    let r = g - d0
+                    w1[r] = dot_q8q8_f16s(wp + woff1 + r * n, sp + woff1 / 32l + r * nb, xqp, xsp, n)
+                } else {
+                    let r = g - d0 - d1
+                    w2[r] = dot_q8q8_f16s(wp + woff2 + r * n, sp + woff2 / 32l + r * nb, xqp, xsp, n)
+                }
+            }
+        }
+    }
+}
+
+def q8q8_groupn_kernel_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nb = n / 32l
+    var myp = yp
+    maybe_parallel_for(0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), 1, n * d * nregions)) $(rb, re) {
+        unsafe {
+            for (i in range(rb, re)) {
+                let ii = int64(i)
+                let r = ii / d
+                let row = ii % d
+                let woff = offs[r * 2l]
+                let xoff = offs[r * 2l + 1l]
+                var v = dot_q8q8_f16s(wp + woff + row * n, sp + woff / 32l + row * nb, xqp + xoff, xsp + xoff / 32l, n)
+                if (bp != null) {
+                    v += bp[boffs[r] + row]
+                }
+                myp[ii] = v
             }
         }
     }
@@ -340,5 +449,8 @@ def dasllama_math_default_register() {
         mx4_batch = @@mx4q8_batch_kernel, mx4_batch_groupn = @@mx4q8_batch_groupn_kernel,
         groupn = @@q8q8_groupn_kernel, groupn_mx4 = @@mx4q8_groupn_kernel,
         mm_rows = @@q8q8_rows_kernel,
+        mm_s16 = @@q8q8_kernel_s16, batch_s16 = @@q8q8_batch_kernel_s16,
+        group3_s16 = @@q8q8_group3_kernel_s16, groupn_s16 = @@q8q8_groupn_kernel_s16,
+        mm_rows_s16 = @@q8q8_rows_kernel_s16,
         needs_repack = false, priority = 0))
 }
