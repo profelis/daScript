@@ -324,12 +324,14 @@ def failure(tb : Asserter?; msg = "") : bool {
     return false
 }
 
-//! Skip the current test arm: logs `msg` and lands the arm in the suite's skipped count (not a
-//! pass). Does NOT unwind — use the arm-fatal shape `if (gate) { t |> skip("..."); return }`.
-//! (The panicking T.skipNow unwind proved fragile at volume from AOT-compiled tests; a plain
-//! flag + caller return needs none of it.)
+//! Skip the current test arm: prints `msg` and lands the arm in the suite's skipped count (not
+//! a pass). Does NOT unwind — use the arm-fatal shape `if (gate) { t |> skip("..."); return }`.
+//! Deliberately avoids both T.skipNow (its panic from AOT-compiled test frames corrupted state
+//! at volume) and onLog (the log handler grows dastest-owned arrays under the TEST context —
+//! a cross-context allocation that corrupted the heap at skip volume; skips don't need the
+//! failure-report message capture, so the reason prints directly).
 def skip(t : T?; msg : string) {
-    t->logAt(msg, get_line_info(1))
+    to_log(LOG_INFO, "\tskipped: {msg}\n")
     t.onSkipNow |> invoke()
 }
 
