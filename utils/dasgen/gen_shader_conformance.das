@@ -152,7 +152,7 @@ def emit_spirv_test(spec : ShaderTypeSpec) {
 
 // GLSL fragment seed: derive the working value from the varying so nothing constant-folds away
 def seed_expr(spec : ShaderTypeSpec) : string {
-    if (spec.kind == "float") {
+    if (spec.kind == "float" || spec.kind == "half") {
         return "conf_{spec.name}_uv.x"
     }
     if (spec.kind == "uint") {
@@ -343,7 +343,7 @@ def context_specs : array<ContextSpec> {
                 w |> write("\}\n\n")
                 w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_ubo_glsl\}\\n\")\n\}\n")
             }),
-        ContextSpec(name = "_fc_lattice_ssbo", rail = "glsl", needle = "16/8-bit lattice types are not supported yet",
+        ContextSpec(name = "_fc_lattice_ssbo", rail = "glsl", needle = "not supported in shader interfaces",
             body = build_string() $(var w) {
                 w |> write("var @ssbo fc_sg_lat : array<half4>\n")
                 w |> write("var @out fc_sg_color : float4\n\n")
@@ -352,6 +352,19 @@ def context_specs : array<ContextSpec> {
                 w |> write("    fc_sg_color = float4(float(fc_sg_lat[0].x), 0., 0., 1.)\n")
                 w |> write("\}\n\n")
                 w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_ssbo_glsl\}\\n\")\n\}\n")
+            }),
+        // the ES/WebGL2 rail has no GL_EXT_shader_explicit_arithmetic_types — any lattice use
+        // rejects (es300=true annotation arg = the test-drivable rail override)
+        ContextSpec(name = "_fc_lattice_es300", rail = "glsl", needle = "not available on the ES/WebGL2 rail",
+            body = build_string() $(var w) {
+                w |> write("var @inout fc_es_uv : float2\n")
+                w |> write("var @out fc_es_color : float4\n\n")
+                w |> write("[fragment_program(name=\"fc_lat_es300_glsl\", es300=true)]\n")
+                w |> write("def fc_lat_es300_fragment \{\n")
+                w |> write("    var v = half4(1h, 2h, 3h, 4h)\n")
+                w |> write("    fc_es_color = float4(float(v.x), 0., 0., 1.)\n")
+                w |> write("\}\n\n")
+                w |> write("[export]\ndef main \{\n    print(\"\{fc_lat_es300_glsl\}\\n\")\n\}\n")
             })
     ]
 }
@@ -451,6 +464,7 @@ def emit_reject_runner(specs : array<ShaderTypeSpec>; rail : string) {
 // one row per lattice type. Shader-legal widths EMIT on the SPIR-V rail (types/consts/ctors/
 // converts/arith landed) and stay reject on GLSL until its wave; CPU-only widths (8/16-lane)
 // reject on both rails with the dedicated diagnostic, permanently.
+[unused_argument(enum_name)]
 def push_lattice_row(var specs : array<ShaderTypeSpec>; name, glsl_name, kind : string; arity : int; cpu_only, arith : bool; enum_name : string) {
     if (cpu_only) {
         specs |> push(ShaderTypeSpec(name = name, glsl_name = "", arity = arity, kind = kind, has_arith = false,
@@ -458,8 +472,8 @@ def push_lattice_row(var specs : array<ShaderTypeSpec>; name, glsl_name, kind : 
             spv_needle = "is CPU-only", glsl_needle = "is CPU-only"))
     } else {
         specs |> push(ShaderTypeSpec(name = name, glsl_name = glsl_name, arity = arity, kind = kind, has_arith = arith,
-            spv_mode = "emit", glsl_mode = "reject",
-            spv_needle = "", glsl_needle = "unsupported type {enum_name}"))
+            spv_mode = "emit", glsl_mode = "emit",
+            spv_needle = "", glsl_needle = ""))
     }
 }
 

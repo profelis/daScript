@@ -24,10 +24,12 @@ def public matrix_info(t : TypeDecl?) : tuple<ok : bool; width : int; cols : int
     return (ok = false, width = 0, cols = 0)
 }
 
-// The whole 16/8-bit lattice (contiguous appended block in the Type enum) — the types the
-// shader emitters must fail closed on until their feature waves land.
+// The whole 16/8-bit type set of the shader arc: the lattice proper (contiguous appended
+// block in the Type enum) PLUS the pre-lattice small scalars, which live in the enum's old
+// region (near tInt) and are NOT covered by the range check.
 def public lattice_small_type(bt : Type) : bool {
-    return int(bt) >= int(Type.tFloat16) && int(bt) <= int(Type.tUByte16)
+    return ((int(bt) >= int(Type.tFloat16) && int(bt) <= int(Type.tUByte16))
+        || bt == Type.tInt8 || bt == Type.tUInt8 || bt == Type.tInt16 || bt == Type.tUInt16)
 }
 
 // The 8/16-lane lattice forms (half8, short8/ushort8, byte8/16, ubyte8/16) are CPU-only by

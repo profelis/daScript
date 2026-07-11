@@ -196,7 +196,8 @@ class GlslShader : AstFunctionAnnotation {
         if (glob != null && glob.init == null) {
             if (glob.name == argName) {
                 let caps = buildCaps()
-                let gres = generate_glsl(func, err, shaderType, version, compute_local_size, caps)
+                let es300_arg = args |> find_arg("es300") ?as tBool ?? false
+                let gres = generate_glsl(func, err, shaderType, version, compute_local_size, caps, es300_arg)
                 let shader_text = "{gres.inout_stub}{get_glsl_prefix()}{gres.body}"
                 glob.init = new ExprConstString(at = func.at,
                     value := shader_text,
@@ -267,7 +268,29 @@ let private glsl_types <- {
     Type.tRange         => "ivec2",
     Type.tURange        => "uvec2",
     Type.tVoid          => "void",
-    Type.tEnumeration   => "int"
+    Type.tEnumeration   => "int",
+    // 16/8-bit lattice — GL_EXT_shader_explicit_arithmetic_types_* spellings (the demand-driven
+    // pre-scan emits the matching #extension lines; the ES/WebGL2 rail rejects these entirely)
+    Type.tFloat16       => "float16_t",
+    Type.tHalf2         => "f16vec2",
+    Type.tHalf3         => "f16vec3",
+    Type.tHalf4         => "f16vec4",
+    Type.tInt16         => "int16_t",
+    Type.tShort2        => "i16vec2",
+    Type.tShort3        => "i16vec3",
+    Type.tShort4        => "i16vec4",
+    Type.tUInt16        => "uint16_t",
+    Type.tUShort2       => "u16vec2",
+    Type.tUShort3       => "u16vec3",
+    Type.tUShort4       => "u16vec4",
+    Type.tInt8          => "int8_t",
+    Type.tByte2         => "i8vec2",
+    Type.tByte3         => "i8vec3",
+    Type.tByte4         => "i8vec4",
+    Type.tUInt8         => "uint8_t",
+    Type.tUByte2        => "u8vec2",
+    Type.tUByte3        => "u8vec3",
+    Type.tUByte4        => "u8vec4"
 }
 
 let private glsl_handle_types <- {
@@ -286,6 +309,27 @@ let private glsl_functions <- {
     "uint2"    =>  "uvec2",
     "uint3"    =>  "uvec3",
     "uint4"    =>  "uvec4",
+    // 16/8-bit lattice ctors + converts (das_sv_cvt externs share the ctor names)
+    "float16"   =>  "float16_t",
+    "half2"     =>  "f16vec2",
+    "half3"     =>  "f16vec3",
+    "half4"     =>  "f16vec4",
+    "int16"     =>  "int16_t",
+    "short2"    =>  "i16vec2",
+    "short3"    =>  "i16vec3",
+    "short4"    =>  "i16vec4",
+    "uint16"    =>  "uint16_t",
+    "ushort2"   =>  "u16vec2",
+    "ushort3"   =>  "u16vec3",
+    "ushort4"   =>  "u16vec4",
+    "int8"      =>  "int8_t",
+    "byte2"     =>  "i8vec2",
+    "byte3"     =>  "i8vec3",
+    "byte4"     =>  "i8vec4",
+    "uint8"     =>  "uint8_t",
+    "ubyte2"    =>  "u8vec2",
+    "ubyte3"    =>  "u8vec3",
+    "ubyte4"    =>  "u8vec4",
     "floori"    =>  "floor",
     "lerp"      =>  "mix",
     "atan2"     =>  "atan",
@@ -335,6 +379,14 @@ class GlslExport : AstVisitor {
     errors : array<string>
     writer : StringBuilderWriter?
     tab : int = 0
+    // demand-driven GL_EXT_shader_explicit_arithmetic_types_* flags: set at every emission
+    // site that touches a lattice type; generate_glsl splices the matching #extension lines
+    // right after the #version line, so non-lattice shaders stay byte-identical
+    needs_f16 : bool = false
+    needs_i16 : bool = false
+    needs_i8 : bool = false
+    es300_target : bool = false
+    force_es300 : bool = false      // `es300=true` annotation arg — forces the ES rail (test-drivable)
     stnames   : table<string; bool>
     depFun    : table<uint64; bool>
     depVar    : table<uint64; bool>
@@ -393,6 +445,27 @@ class GlslExport : AstVisitor {
         }
     }
 // GLSL TYPE
+    // one lattice-type touchpoint: records which GL_EXT_shader_explicit_arithmetic_types_*
+    // subset the shader needs, and rejects on the ES/WebGL2 rail (the EXT family does not
+    // exist there — mediump is a hint, not a type, and would break CPU==GPU exactness)
+    def flag_lattice(bt : Type; at : LineInfo) {
+        if (!lattice_small_type(bt)) {
+            return
+        }
+        if (es300_target) {
+            error("type {bt}: 16/8-bit lattice types are not available on the ES/WebGL2 rail (no GL_EXT_shader_explicit_arithmetic_types there)", at)
+            return
+        }
+        if (bt == Type.tFloat16 || bt == Type.tHalf2 || bt == Type.tHalf3 || bt == Type.tHalf4) {
+            needs_f16 = true
+        } elif (bt == Type.tInt8 || bt == Type.tUInt8 || bt == Type.tByte2 || bt == Type.tByte3 || bt == Type.tByte4
+                || bt == Type.tUByte2 || bt == Type.tUByte3 || bt == Type.tUByte4) {
+            needs_i8 = true
+        } else {
+            needs_i16 = true
+        }
+    }
+
     def describe_glsl_type_ex(t : TypeDeclPtr; write_dim : bool) {
         let st = build_string() $(var tw) {
             // if t.flags.ref
@@ -409,6 +482,7 @@ class GlslExport : AstVisitor {
                     tw |> write(glsl_handle_types?[aname] ?? "error")
                 }
             } elif (glsl_types |> key_exists(et.baseType)) {
+                flag_lattice(et.baseType, t.at)
                 tw |> write(glsl_types?[et.baseType] ?? "error")
             } elif (cpu_only_lattice_width(et.baseType)) {
                 error("type {et.baseType} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)", t.at)
@@ -606,7 +680,7 @@ class GlslExport : AstVisitor {
         // the host and would need an explicit target flag threaded into GlslExport;
         // not wired yet.) ES 3.00 already matches what desktop core wants minus the
         // version token, so the body emission below is unchanged.
-        var es300 = get_platform_name() == "emscripten"
+        var es300 = get_platform_name() == "emscripten" || force_es300
         if (!es300) {
             for (a in get_command_line_arguments()) {
                 if (find(a, "wasm32") >= 0 || find(a, "emscripten") >= 0) {
@@ -615,6 +689,7 @@ class GlslExport : AstVisitor {
                 }
             }
         }
+        es300_target = es300    // the lattice flagging sites reject on the ES rail (no EXT there)
         if (caps.write_version) {
             if (es300) {
                 *writer |> write("#version 300 es\n")
@@ -1059,6 +1134,15 @@ class GlslExport : AstVisitor {
     }
     def override preVisitGlobalLetVariable(arg : VariablePtr; lastArg : bool) {
         line(arg.at)
+        // 16/8-bit lattice globals fail closed: varyings have no f16 attribute-upload path in
+        // dasOpenGL, loose uniforms have no glUniform f16 setters, blocks are gated at patch
+        // (std140) — the v1 GLSL lattice surface is shader-internal compute only
+        assume gbt = arg._type.baseType
+        let g_elem_lattice = arg._type.baseType == Type.tArray && arg._type.firstType != null && lattice_small_type(arg._type.firstType.baseType)
+        if (lattice_small_type(gbt) || g_elem_lattice) {
+            error("global '{arg.name}': 16/8-bit lattice types are not supported in shader interfaces (in/out/uniform/ssbo) yet", arg.at)
+            return
+        }
         if (caps.restrict_array_as_result) {
             if (arg._type.baseType == Type.tFixedArray) {
                 let need_init = arg.annotation |> find_arg("need_init") ?as tBool ?? true
@@ -1314,23 +1398,23 @@ class GlslExport : AstVisitor {
         unsafe {
             fnName = glsl_function_name(reinterpret<FunctionPtr>(expr.func))
         }
-        // 16/8-bit lattice values crossing a call (ctor/convert/builtin): an unmapped name
-        // would pass through VERBATIM below and poison the text silently — fail closed instead.
-        // Type-driven (result + args), so converts like float(h) are caught by the arg scan.
+        // 16/8-bit lattice values crossing a call: ctors/converts are name-mapped below and user
+        // functions declare through describe_glsl_type_ex — but the saturating narrows have no
+        // GLSL builtin (clamp-expansion is a later wave) and CPU-only widths never emit.
         var latticeCross = lattice_small_type(expr._type.baseType)
-        if (!latticeCross) {
-            for (arg in expr.arguments) {
-                if (lattice_small_type(arg._type.baseType)) {
-                    latticeCross = true
-                    break
-                }
-            }
+        var cpuOnlyCross = cpu_only_lattice_width(expr._type.baseType)
+        for (arg in expr.arguments) {
+            latticeCross ||= lattice_small_type(arg._type.baseType)
+            cpuOnlyCross ||= cpu_only_lattice_width(arg._type.baseType)
         }
-        if (latticeCross) {
-            if (cpu_only_lattice_width(expr._type.baseType)) {
-                error("call '{fnName}': type {expr._type.baseType} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)", expr.at)
-            } else {
-                error("call '{fnName}': 16/8-bit lattice types are not supported yet", expr.at)
+        if (cpuOnlyCross) {
+            error("call '{fnName}': CPU-only lattice width (8/16-lane forms do not exist in shaders — vectors cap at 4 lanes)", expr.at)
+        } elif (latticeCross && ends_with(fnName, "_sat")) {
+            error("call '{fnName}': saturating narrows are not supported in shaders yet", expr.at)
+        } elif (latticeCross) {
+            flag_lattice(expr._type.baseType, expr.at)
+            for (arg in expr.arguments) {
+                flag_lattice(arg._type.baseType, expr.at)
             }
         }
         if (caps.output_compatibility_constructors) {
@@ -1862,13 +1946,16 @@ class GlslExport : AstVisitor {
     def override preVisitExprConstBitfield(expr : ExprConstBitfield?) : void {
         *writer |> write("{expr.value}")
     }
-// const int 8
+// const int 8 — ctor form: under GL_EXT_shader_explicit_arithmetic_types a bare int literal
+// is 32-bit and does not implicitly narrow
     def override preVisitExprConstInt8(expr : ExprConstInt8?) : void {
-        *writer |> write("{expr.value}")
+        flag_lattice(Type.tInt8, expr.at)
+        *writer |> write("int8_t({expr.value})")
     }
 // const int 16
     def override preVisitExprConstInt16(expr : ExprConstInt16?) : void {
-        *writer |> write("{expr.value}")
+        flag_lattice(Type.tInt16, expr.at)
+        *writer |> write("int16_t({expr.value})")
     }
 // const int 64
     def override preVisitExprConstInt64(expr : ExprConstInt64?) : void {
@@ -1904,11 +1991,13 @@ class GlslExport : AstVisitor {
     }
 // const uint 8
     def override preVisitExprConstUInt8(expr : ExprConstUInt8?) : void {
-        *writer |> write("{expr.value}")
+        flag_lattice(Type.tUInt8, expr.at)
+        *writer |> write("uint8_t({expr.value})")
     }
 // const uint 16
     def override preVisitExprConstUInt16(expr : ExprConstUInt16?) : void {
-        *writer |> write("{expr.value}")
+        flag_lattice(Type.tUInt16, expr.at)
+        *writer |> write("uint16_t({expr.value})")
     }
 // const uint 64
     def override preVisitExprConstUInt64(expr : ExprConstUInt64?) : void {
@@ -2012,10 +2101,11 @@ class GlslExport : AstVisitor {
     def override preVisitExprConstString(expr : ExprConstString?) : void {
         error("string constant is not supported", expr.at)
     }
-// const float16 — backstop: without an override the adapter default emits NOTHING (silent
-// malformed GLSL). Becomes float16_t(...) ctor emission when the lattice wave lands.
+// const float16 — ctor form (the EXT's float16_t(x) conversion; the exact `hf`-suffix
+// literal is spottier across drivers). Promoting the value through float is exact.
     def override preVisitExprConstFloat16(expr : ExprConstFloat16?) : void {
-        error("float16 constant is not supported yet", expr.at)
+        flag_lattice(Type.tFloat16, expr.at)
+        *writer |> write("float16_t({glsl_float_literal(float(expr.value))})")
     }
 // const double
     def override preVisitExprConstDouble(expr : ExprConstDouble?) : void {
@@ -2050,11 +2140,15 @@ class GlslExport : AstVisitor {
 }
 
 [macro_function]
-def generate_glsl(fnMain : FunctionPtr; var errors : array<string>; shaderType : ShaderType; version : int; comp_loc_size : int3; caps : ShaderExportCaps) : tuple<body : string; inout_stub : string; inout_decl : string> {
+def generate_glsl(fnMain : FunctionPtr; var errors : array<string>; shaderType : ShaderType; version : int; comp_loc_size : int3; caps : ShaderExportCaps; force_es300 : bool = false) : tuple<body : string; inout_stub : string; inout_decl : string> {
     var inout_stub = ""
     var inout_decl = ""
-    let st = build_string() $(var writer) {
+    var needs_f16 = false
+    var needs_i16 = false
+    var needs_i8 = false
+    var st = build_string() $(var writer) {
         var astVisitor = new GlslExport(writer, shaderType, version, comp_loc_size, caps)
+        astVisitor.force_es300 = force_es300
         make_visitor(*astVisitor) $(adapter) {
             astVisitor.astVisitorAdapter = adapter
             collect_dependencies(fnMain) $(vfun, vvar) {
@@ -2079,8 +2173,31 @@ def generate_glsl(fnMain : FunctionPtr; var errors : array<string>; shaderType :
         errors <- astVisitor.errors
         inout_stub = astVisitor.inout_stub
         inout_decl = astVisitor.inout_decl
+        needs_f16 = astVisitor.needs_f16
+        needs_i16 = astVisitor.needs_i16
+        needs_i8 = astVisitor.needs_i8
         unsafe {
             delete astVisitor
+        }
+    }
+    // demand-driven extension lines, spliced right after the #version line: emission set the
+    // needs_* flags at every lattice touchpoint, so non-lattice shaders stay byte-identical
+    if (needs_f16 || needs_i16 || needs_i8) {
+        var ext = ""
+        if (needs_f16) {
+            ext += "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n"
+        }
+        if (needs_i16) {
+            ext += "#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require\n"
+        }
+        if (needs_i8) {
+            ext += "#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require\n"
+        }
+        let nl = find(st, "\n")
+        if (nl >= 0 && starts_with(st, "#version")) {
+            st = slice(st, 0, nl + 1) + ext + slice(st, nl + 1)
+        } else {
+            st = ext + st
         }
     }
     if (DEBUG_SHADER_TEXT) {
