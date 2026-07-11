@@ -14,7 +14,7 @@ for e in ev:
     if e["name"] == "publish":
         c = chains[a["chain"]]
         c["pub"] = (t0, dur)
-        c["nstages"] = a["stage"]
+        c["nstages"] = a["stage"] & 0xFF   # publish packs nstages | tag<<8
         c["total"] = a["arg"]
     elif e["name"] == "chunk":
         chains[a["chain"]]["chunks"][a["stage"]].append((t0, dur, tid))

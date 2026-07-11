@@ -6,7 +6,7 @@ ev = [e for e in ev if e.get("ph") == "X"]
 nstages = {}
 for e in ev:
     if e["name"] == "publish":
-        nstages[e["args"]["chain"]] = e["args"]["stage"]
+        nstages[e["args"]["chain"]] = e["args"]["stage"] & 0xFF   # publish packs nstages | tag<<8
 
 # per chain+stage: per-lane last chunk end
 by = defaultdict(lambda: defaultdict(list))

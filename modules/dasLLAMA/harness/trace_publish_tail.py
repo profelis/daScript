@@ -5,14 +5,14 @@ ev = [e for e in ev if e.get("ph") == "X"]
 nstages = {}
 for e in ev:
     if e["name"] == "publish":
-        nstages[e["args"]["chain"]] = e["args"]["stage"]
+        nstages[e["args"]["chain"]] = e["args"]["stage"] & 0xFF   # publish packs nstages | tag<<8
 
 pubs = sorted((e for e in ev if e["name"] == "publish"), key=lambda e: e["ts"])
 fat = [e for e in pubs if e["dur"] > 5.0]
 print(f"publishes={len(pubs)}  dur>5us={len(fat)}  dur p50={st.median(e['dur'] for e in pubs):.2f}  max={max(e['dur'] for e in pubs):.1f}us")
 for e in fat[:12]:
     a = e["args"]
-    print(f"  fat publish: t={e['ts']/1000:.2f}ms dur={e['dur']:.1f}us stages={a['stage']} chunks={a['arg']} chain={a['chain']}")
+    print(f"  fat publish: t={e['ts']/1000:.2f}ms dur={e['dur']:.1f}us stages={a['stage'] & 0xFF} chunks={a['arg']} chain={a['chain']}")
 
 # post-classifier gap: last chunk end of each 1-stage chain -> next publish t0
 cls_end = {}
