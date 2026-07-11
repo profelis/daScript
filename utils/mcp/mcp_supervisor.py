@@ -18,6 +18,8 @@ own supervisor, which spawns that worktree's own daslang. No ports, no config.
 
 .mcp.json (written by --emit-config / setup.das):
     "daslang": { "command": "python", "args": ["utils/mcp/mcp_supervisor.py"] }
+(the command is whichever of python/python3 resolves on PATH — stock macOS
+ships only python3 — falling back to the absolute interpreter path)
 
 Pre-build guard: kill the daslang child (a `daslang.exe` running mcp\\main.das)
 to release its DLL locks; build; the next tool call respawns the fresh binary.
@@ -28,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -235,6 +238,16 @@ def _default_launcher() -> list[str]:
     return [os.path.join(REPO_ROOT, "bin", "daslang"), main_das]  # best-guess fallback
 
 
+def _python_launcher() -> str:
+    """The launcher Claude Code should spawn the supervisor with: the first of
+    python/python3 that resolves on PATH (stock macOS ships only python3), else
+    the absolute path of the interpreter running this emit."""
+    for name in ("python", "python3"):
+        if shutil.which(name):
+            return name
+    return sys.executable
+
+
 def write_mcp_json(repo_root: str) -> bool:
     """Set mcpServers.daslang to spawn this supervisor over stdio, preserving
     every other server (github, …). Atomic; never clobbers an unparseable file.
@@ -259,7 +272,7 @@ def write_mcp_json(repo_root: str) -> bool:
         print(f"  WARNING: {path} has a non-object 'mcpServers'; leaving it untouched", flush=True)
         return False
     prev = servers.get("daslang", {})
-    entry = {"command": "python", "args": ["utils/mcp/mcp_supervisor.py"]}
+    entry = {"command": _python_launcher(), "args": ["utils/mcp/mcp_supervisor.py"]}
     if isinstance(prev, dict) and "defer_loading" in prev:
         entry["defer_loading"] = prev["defer_loading"]
     servers["daslang"] = entry
