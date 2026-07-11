@@ -168,6 +168,8 @@ namespace das {
         mLimitOrderSpread = limitOrderEnv != nullptr && strcmp(limitOrderEnv, "spread") == 0;
         const char * rankGateEnv = getenv("DAS_JOBQUE_TEAM_RANK_GATE");   // =1: per-op worker participation gate (see setTeamRankGate)
         mTeamRankGate = (rankGateEnv != nullptr && atoi(rankGateEnv) != 0) ? 1 : 0;
+        const char * eagerExitEnv = getenv("DAS_JOBQUE_TEAM_EAGER_EXIT");   // =1: workers skip the final stage-barrier spin (see setTeamEagerExit)
+        mTeamEagerExit = (eagerExitEnv != nullptr && atoi(eagerExitEnv) != 0) ? 1 : 0;
         SetCurrentThreadPriority(JobPriority::High);
         for (int j = 0, js = mThreadCount; j < js; j++) {
             mThreads.emplace_back(make_unique<thread>([this, j]() {
@@ -615,6 +617,10 @@ namespace das {
                 }
                 mTeamRemainingS[s].fetch_sub(1, std::memory_order_release);
             }
+            // eager exit: the FINAL join belongs to the caller (its remaining==0 spin), and we
+            // hold no claim after the overflow — spinning here only widens the in-flight window
+            // the next publish must drain, so a preemption in this spin becomes a fat publish.
+            if ( s == nStages - 1 && mTeamEagerExit.load(std::memory_order_relaxed) ) break;
             // stage barrier: stage s+1 reads what stage s wrote, so wait for ALL of stage s —
             // the acquire pairs with every serving lane's release decrement.
             uint64_t w0 = tracing ? uint64_t(ref_time_ticks()) : 0;
