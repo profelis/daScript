@@ -54,6 +54,9 @@ namespace das {
         vector<VariableNameAndPosition>   *pNameList;
         TypeDecl                *pTypeDecl = nullptr;
         Expression              *pInit = nullptr;
+        LineInfo                atEnd;      // end of the last real token of the declaration;
+                                            // the grammar rule also swallows the (possibly
+                                            // lexer-synthesized) SEMICOLON, so @decl overshoots
         bool                    init_via_move = false;
         bool                    init_via_clone = false;
         bool                    override = false;

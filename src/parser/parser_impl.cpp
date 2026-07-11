@@ -1046,6 +1046,13 @@ namespace das {
         auto pLet = new ExprLet();
         pLet->at = kwd_letAt;
         pLet->atInit = declAt;
+        if ( decl->atEnd.line ) {
+            // declAt includes the terminating SEMICOLON, which for newline-terminated
+            // statements is lexer-synthesized and occupies phantom columns past the
+            // source text — clamp to the last real token of the declaration
+            pLet->atInit.last_line = decl->atEnd.last_line;
+            pLet->atInit.last_column = decl->atEnd.last_column;
+        }
         pLet->inScope = inScope;
         pLet->isTupleExpansion = decl->isTupleExpansion;
         if ( decl->pTypeDecl ) {
@@ -1105,6 +1112,11 @@ namespace das {
         auto pLet = new ExprLet();
         pLet->at = kwd_letAt;
         pLet->atInit = declAt;
+        if ( !decl.empty() && decl.back()->atEnd.line ) {
+            // same phantom-SEMICOLON clamp as ast_Let, using the last declaration's end
+            pLet->atInit.last_line = decl.back()->atEnd.last_line;
+            pLet->atInit.last_column = decl.back()->atEnd.last_column;
+        }
         pLet->inScope = inScope;
         for ( auto pDecl : decl ) {
             if ( pDecl->pTypeDecl ) {

@@ -2111,10 +2111,14 @@ namespace das {
         argV->capture_as_ref = true;
         func->arguments.insert(func->arguments.begin(), argV);
         // with self ...
+        // the wrapper block and `with` are coextensive with the user's body —
+        // give them its span, not the method-name token (tooling reads block->at
+        // as the brace range)
+        auto bodyAt = func->body ? func->body->at : func->at;
         auto block = new ExprBlock();
-        block->at = func->at;
+        block->at = bodyAt;
         auto wth = new ExprWith();
-        wth->at = func->at;
+        wth->at = bodyAt;
         auto wvar = new ExprVar(func->at,"self");
         wvar->generated = true;
         wth->with = wvar;
