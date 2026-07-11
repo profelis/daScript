@@ -102,5 +102,23 @@ def test_half2_conformance(t : T?) {
         t |> success(b - a == half2(1., 2.), "sub")
         t |> success(a * b == half2(2., 8.), "mul")
         t |> success(b / a == half2(2., 2.), "div")
+        var c = a
+        c += b
+        t |> success(c == a + b, "add assign")
+        c -= b
+        t |> success(c == a, "sub assign")
+        t |> success(-a == half2(-1., -2.), "unary minus")
+        t |> success(a * 2h == a + a, "vec mul scalar")
+        t |> success(2h * a == a + a, "scalar mul vec")
+        t |> success((a + a) / 2h == a, "vec div scalar")
+        c = a
+        c *= 2h
+        t |> success(c == a + a, "mul assign scalar")
+    }
+    t |> run("converts") @(t : T?) {
+        let a = half2(1., 2.)
+        let f = float2(a)
+        t |> success(f == float2(1., 2.), "widen to float")
+        t |> success(half2(f) == a, "narrow round trip")
     }
 }

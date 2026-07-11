@@ -76,5 +76,16 @@ def test_float16_conformance(t : T?) {
         t |> success(b - a == float16(1.), "sub")
         t |> success(a * b == float16(2.), "mul")
         t |> success(b / a == float16(2.), "div")
+        var c = a
+        c += b
+        t |> success(c == a + b, "add assign")
+        c -= b
+        t |> success(c == a, "sub assign")
+        t |> success(-a == float16(-1.), "unary minus")
+    }
+    t |> run("converts") @(t : T?) {
+        let a = 1.5h
+        t |> equal(float(a), 1.5)
+        t |> success(float16(1.5) == a, "narrow round trip")
     }
 }

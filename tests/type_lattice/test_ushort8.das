@@ -92,4 +92,7 @@ def test_ushort8_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        t |> success(ushort8(ubyte8(1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u)) == ushort8(1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u), "widen from 8-bit")
+    }
 }

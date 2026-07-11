@@ -472,26 +472,63 @@ def describe(blk : LLVMOpaqueBasicBlock?) {
     return st
 }
 
-// 16/8-bit lattice types (contiguous appended block in the Type enum). Ops on these route
-// through the function path — visitExprOp2_NonMonade only lowers float/int/uint vector
-// bases natively, and an unrouted lattice op would hard-fail JIT emission via g_errors.
-// Until the fp16 operators carry builtin addresses, the function path cleanly drops the
-// enclosing function to the interpreter (DisableJitVisitor).
+// 16/8-bit lattice types (contiguous appended block in the Type enum)
 def public is_lattice_small_type(t : Type) {
     return int(t) >= int(Type.tFloat16) && int(t) <= int(Type.tUByte16)
 }
 
+// the fp16 sub-family (scalar float16 + half2/3/4/8) — fpext/fptrunc through half needs
+// hardware convert support (any aarch64, or x86-64 with F16C); the int lattice does not
+def public is_f16_small_type(t : Type) {
+    return int(t) >= int(Type.tFloat16) && int(t) <= int(Type.tHalf8)
+}
+
+// set by init_jit_target_flags (llvm_jit_common): true when the target lowers half
+// converts in hardware (aarch64 || x64-F16C), so fp16 operators may emit
+// promote-compute-narrow IR in visitExprOp2/Op1_NonMonade instead of falling back
+var public g_lattice_fp16_ops_native = false
+
+// Lattice op routing: ops NonMonade lowers natively return true here; everything else
+// lattice-typed routes to the function path, where the DisableJitVisitor builtin-address
+// gates cleanly drop the enclosing function to the interpreter.
+def is_lattice_op2_native(expr : ExprOp2?) {
+    assume lbt = expr.left._type.baseType
+    if (expr.op == "==" || expr.op == "!=") {
+        // int-lattice equality is icmp+reduce (unconditional); fp16 compares promote
+        // through float, so they ride the hardware-convert gate
+        return is_f16_small_type(lbt) ? g_lattice_fp16_ops_native : true
+    }
+    if (is_f16_small_type(lbt) || is_f16_small_type(expr.right._type.baseType)) {
+        // the closed fp16 arithmetic + scalar ordered compares
+        if (expr.op == "+" || expr.op == "-" || expr.op == "*" || expr.op == "/" ||
+                expr.op == "+=" || expr.op == "-=" || expr.op == "*=" || expr.op == "/=" ||
+                expr.op == "<" || expr.op == "<=" || expr.op == ">" || expr.op == ">=") {
+            return g_lattice_fp16_ops_native
+        }
+    }
+    return false
+}
+
 def isExprOp2_Func(expr : ExprOp2?) {
+    if (!expr.func.flags.builtIn) {
+        return true     // user-defined operator (incl. on lattice types) — always the function path
+    }
     if (is_lattice_small_type(expr.left._type.baseType)
-            || is_lattice_small_type(expr.right._type.baseType)
-            || !expr.func.flags.builtIn) {
-        return true
+            || is_lattice_small_type(expr.right._type.baseType)) {
+        return !is_lattice_op2_native(expr)
     }
     return expr.left._type.isHandle || expr.right._type.isHandle
 }
 
 def isExprOp1_Func(expr : ExprOp1?) {
-    if (is_lattice_small_type(expr.subexpr._type.baseType) || !expr.func.flags.builtIn) {
+    if (!expr.func.flags.builtIn) {
+        return true     // user-defined operator (incl. on lattice types) — always the function path
+    }
+    assume sbt = expr.subexpr._type.baseType
+    if (is_lattice_small_type(sbt)) {
+        if (is_f16_small_type(sbt) && (expr.op == "+" || expr.op == "-")) {
+            return !g_lattice_fp16_ops_native
+        }
         return true
     }
     return expr.subexpr._type.isHandle

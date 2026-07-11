@@ -2511,7 +2511,9 @@ class public LlvmJitVisitor : AstVisitor {
             var data_bytes = LLVMBuildPointerCast(g_builder, data, LLVMPointerType(types.t_int8, 0u), "")
             // Stride const must match tidx width — Array.size-derived `tail` is i64,
             // dim-derived tail is i32; an i32 ConstI32 against i64 tidx is a verifier error.
-            var stride = LLVMConstInt(LLVMTypeOf(tidx), 12ul, 0)
+            // das packs 3-lane elements (12B float3/int3, 6B half3/short3, 3B byte3) while
+            // LLVM GEP on <3 x T> would advance by the padded alloc size — use the das stride.
+            var stride = LLVMConstInt(LLVMTypeOf(tidx), uint64(elemType.sizeOf), 0)
             var data_idx = LLVMBuildMul(g_builder, tidx, stride, "")
             ptr_idx = LLVMBuildGEP2(g_builder, types.t_int8, data_bytes, data_idx, "")
             ptr_idx = LLVMBuildPointerCast(g_builder, ptr_idx, LLVMPointerType(type_to_llvm_type(elemType), 0u), name)
@@ -2887,6 +2889,58 @@ class public LlvmJitVisitor : AstVisitor {
             right = LLVMBuildAnd(g_builder, right, LLVMConstInt(type_to_llvm_type(opType), uint64((opType.sizeOf * 8) - 1), 0), "")
             right = build_broadcast_vector(g_builder, shiftType, right)
         }
+        if (is_f16_small_type(opType.baseType)) {
+            // fp16 family (float16 scalar + halfN): the reference semantics ARE promote-to-
+            // f32 -> compute -> round-back (RNE), which is exactly fpext -> fop -> fptrunc.
+            // With native fullfp16 (arm64) the ops run directly on half — bit-identical for
+            // single ops, since f32 carries 2p+2 precision bits of f16 (the double-rounding
+            // safety bound for + - * /). Compares are exact either way. Only routed here
+            // when g_lattice_fp16_ops_native (aarch64 || x64-F16C).
+            let native = g_target_arm64_fullfp16
+            let halfT = (opType.isVectorType
+                ? LLVMVectorType(types.t_half, uint(opType.vectorDim))
+                : types.t_half)
+            let promoteT = (opType.isVectorType
+                ? LLVMVectorType(types.t_float, uint(opType.vectorDim))
+                : types.t_float)
+            let rmw = isReadModifyWriteOp2(expr.op)
+            var lf = rmw ? r2v_left : left
+            var rf = right
+            if (!native) {
+                lf = LLVMBuildFPExt(g_builder, lf, promoteT, "")
+                rf = LLVMBuildFPExt(g_builder, rf, promoteT, "")
+            }
+            if (expr.op == "==" || expr.op == "!=" || expr.op == "<" || expr.op == "<=" || expr.op == ">" || expr.op == ">=") {
+                var opR = LLVMBuildFCmp(g_builder, get_float_compare_op(expr, string(expr.op)), lf, rf, "")
+                if (opType.isVectorType) {
+                    opR = reduce_bit_vector(opR, opType.vectorDim, string(expr.op))
+                }
+                setE(expr, opR)
+                return
+            }
+            var res : LLVMOpaqueValue?
+            if (expr.op == "+" || expr.op == "+=") {
+                res = LLVMBuildFAdd(g_builder, lf, rf, "")
+            } elif (expr.op == "-" || expr.op == "-=") {
+                res = LLVMBuildFSub(g_builder, lf, rf, "")
+            } elif (expr.op == "*" || expr.op == "*=") {
+                res = LLVMBuildFMul(g_builder, lf, rf, "")
+            } elif (expr.op == "/" || expr.op == "/=") {
+                res = LLVMBuildFDiv(g_builder, lf, rf, "")
+            } else {
+                failed_E(expr, "unsupported fp16 operator {expr.op}")
+                return
+            }
+            if (!native) {
+                res = LLVMBuildFPTrunc(g_builder, res, halfT, "")
+            }
+            if (rmw) {
+                setE(expr, LLVMBuildStoreAligned(g_builder, res, left, uint(expr.left._type.alignOf)))
+            } else {
+                setE(expr, res)
+            }
+            return
+        }
         if (expr.op == "+") {
             if (isNumeric(opType)) {
                 setE(expr, LLVMBuildAdd(g_builder, left, right, ""))
@@ -3007,12 +3061,12 @@ class public LlvmJitVisitor : AstVisitor {
             }
         } elif (expr.op == "<" || expr.op == ">" || expr.op == "<=" || expr.op == ">=" || expr.op == "==" || expr.op == "!=") {
             var opR : LLVMOpaqueValue?
-            if (expr.left._type.isSignedInteger || (expr.left._type.isVectorType && (expr.left._type.vectorBaseType == Type.tInt || expr.left._type.vectorBaseType == Type.tInt64)) || expr.left._type.isEnum) {
+            if (expr.left._type.isSignedInteger || (expr.left._type.isVectorType && (expr.left._type.vectorBaseType == Type.tInt || expr.left._type.vectorBaseType == Type.tInt64 || expr.left._type.vectorBaseType == Type.tInt16 || expr.left._type.vectorBaseType == Type.tInt8)) || expr.left._type.isEnum) {
                 opR = LLVMBuildICmp(g_builder, get_int_compare_op(expr, string(expr.op)), left, right, "")
                 if (expr.left._type.isVectorType) {
                     opR = reduce_bit_vector(opR, expr.left._type.vectorDim, string(expr.op))
                 }
-            } elif (expr.left._type.isUnsignedInteger || (expr.left._type.isVectorType && (expr.left._type.vectorBaseType == Type.tUInt || expr.left._type.vectorBaseType == Type.tUInt64))) {
+            } elif (expr.left._type.isUnsignedInteger || (expr.left._type.isVectorType && (expr.left._type.vectorBaseType == Type.tUInt || expr.left._type.vectorBaseType == Type.tUInt64 || expr.left._type.vectorBaseType == Type.tUInt16 || expr.left._type.vectorBaseType == Type.tUInt8))) {
                 opR = LLVMBuildICmp(g_builder, get_uint_compare_op(expr, string(expr.op)), left, right, "")
                 if (expr.left._type.isVectorType) {
                     opR = reduce_bit_vector(opR, expr.left._type.vectorDim, string(expr.op))
@@ -6080,7 +6134,10 @@ class public LlvmJitVisitor : AstVisitor {
         } elif (expr.op == "-") {
             if (isNumeric(opType)) {
                 setE(expr, LLVMBuildNeg(g_builder, sexpr, ""))
-            } elif (opType.isFloatOrDouble || (opType.isVectorType && opType.vectorBaseType == Type.tFloat)) {
+            } elif (opType.isFloatOrDouble || (opType.isVectorType && opType.vectorBaseType == Type.tFloat)
+                    || is_f16_small_type(opType.baseType)) {
+                // fp16 negate = IEEE sign flip; identical to the reference promote-negate-
+                // narrow (both preserve payload bits), no rounding involved
                 setE(expr, LLVMBuildFNeg(g_builder, sexpr, ""))
             } else {
                 failed_E(expr, "unsupported - type {opType}")
@@ -6088,7 +6145,8 @@ class public LlvmJitVisitor : AstVisitor {
         } elif (expr.op == "+") {
             if (isNumeric(opType)) {
                 setE(expr, sexpr)
-            } elif (opType.isFloatOrDouble || (opType.isVectorType && opType.vectorBaseType == Type.tFloat)) {
+            } elif (opType.isFloatOrDouble || (opType.isVectorType && opType.vectorBaseType == Type.tFloat)
+                    || is_f16_small_type(opType.baseType)) {
                 setE(expr, sexpr)
             } else {
                 failed_E(expr, "unsupported + type {opType}")
@@ -6723,6 +6781,41 @@ class public LlvmJitVisitor : AstVisitor {
         return tres
     }
 
+    // 16/8-bit lattice vectors <-> the das vec4f slot. One shuffle widens/narrows between
+    // the value's lane count and its full-128-bit form; one bitcast crosses to <4 x float>.
+    // Little-endian lane order makes this byte-identical to cast<T>::from/to (memcpy of the
+    // packed value into the slot's low bytes). Tail lanes are zero-filled, not undef — see
+    // the poison note at cast_to_vec4f.
+    def lattice_full_lane_count(etype : TypeDeclPtr) : int {
+        assume vbt = etype.vectorBaseType
+        return (vbt == Type.tInt8 || vbt == Type.tUInt8) ? 16 : 8
+    }
+
+    def lattice_vec_to_vec4f(etype : TypeDeclPtr; tsrc : LLVMOpaqueValue?) {
+        let lanes = etype.vectorDim
+        let fullLanes = lattice_full_lane_count(etype)
+        var wide = tsrc
+        if (lanes != fullLanes) {
+            // tail indices land on lane 0 of the zero operand (source lanes are 0..lanes-1)
+            let mask <- [for (i in range(fullLanes)); min(i, lanes)]
+            let zero = LLVMConstNull(LLVMTypeOf(tsrc))
+            wide = LLVMBuildShuffleVector(g_builder, types, tsrc, zero, mask, "lattice_widen")
+        }
+        return LLVMBuildBitCast(g_builder, wide, types.LLVMFloat4Type(), "return_result")
+    }
+
+    def vec4f_to_lattice_vec(etype : TypeDeclPtr; v4f : LLVMOpaqueValue?) {
+        let lanes = etype.vectorDim
+        let fullLanes = lattice_full_lane_count(etype)
+        let elemT = base_type_to_llvm_type(etype.vectorBaseType)
+        var wide = LLVMBuildBitCast(g_builder, v4f, LLVMVectorType(elemT, uint(fullLanes)), "vec4f_to_lattice")
+        if (lanes == fullLanes) {
+            return wide
+        }
+        let mask <- [for (i in range(lanes)); i]
+        return LLVMBuildShuffleVector(g_builder, types, wide, wide, mask, "lattice_narrow")
+    }
+
     def cast_from_vec4f_workhorse(etype : TypeDeclPtr; expr : ExpressionPtr; v4f : LLVMOpaqueValue?) {
         let bt = etype.baseType
         if (bt == Type.tInt || bt == Type.tUInt || bt == Type.tBitfield || bt == Type.tEnumeration) {
@@ -6790,6 +6883,14 @@ class public LlvmJitVisitor : AstVisitor {
             return cast_from_vec4f_ptr(v4f, ptr_type)
         } elif (bt == Type.tRange64 || bt == Type.tURange64) {
             return LLVMBuildBitCast(g_builder, v4f, types.LLVMRange64Type(), "vec4f_to_range64")
+        } elif (bt == Type.tFloat16) {
+            // scalar convention: bits ride widened in lane 0, like int16 (cast<float16_t>)
+            var tbit = LLVMBuildExtractElement(g_builder, v4f, types.ConstI32(0ul), "")
+            var tres = LLVMBuildBitCast(g_builder, tbit, types.t_int32, "vec4f_to_int")
+            var hbits = LLVMBuildTruncOrBitCast(g_builder, tres, types.t_int16, "int_to_half_bits")
+            return LLVMBuildBitCast(g_builder, hbits, types.t_half, "vec4f_to_half")
+        } elif (is_lattice_small_type(bt)) {
+            return vec4f_to_lattice_vec(etype, v4f)
         } else {
             failed_E(expr, "unsupported cast_from_vec4f cast {describe(etype)} workhorse")
         }
@@ -6898,6 +6999,14 @@ class public LlvmJitVisitor : AstVisitor {
                 tres = LLVMBuildShuffleVector(g_builder, types, tsrc, tsrc, [ 0, 1, 2, -1], "return_result")
             } elif (bt == Type.tFloat4) {
                 tres = tsrc
+            } elif (bt == Type.tFloat16) {
+                // scalar convention: bits ride widened in lane 0, like int16 (cast<float16_t>)
+                var hbits = LLVMBuildBitCast(g_builder, tsrc, types.t_int16, "half_bits")
+                var tibit = LLVMBuildZExt(g_builder, hbits, types.t_int32, "int_bit")
+                var tbit = LLVMBuildBitCast(g_builder, tibit, types.t_float, "tbit")
+                tres = LLVMBuildInsertElement(g_builder, vres, tbit, types.ConstI32(0ul), "return_result")
+            } elif (is_lattice_small_type(bt)) {
+                tres = lattice_vec_to_vec4f(etype, tsrc)
             } elif (bt == Type.tString || bt == Type.tPointer) {
                 tres = cast_ptr_to_vec4f(tsrc)
             } else {
@@ -7817,30 +7926,14 @@ class public DisableJitVisitor : AstVisitor {
     def TypeInfoVisitor {
         disable = false
     }
-    // 16/8-bit lattice floor: plain loads/stores/moves of lattice values lower natively
-    // (the types are mapped), and lattice calls/ops fall back via the builtin-address gates
-    // below. What has no lowering yet is indexing and locals-with-init — gate those two
-    // RARE node kinds only (a generic preVisitExpression gate costs an adapter call per
-    // expression and blows the per-file JIT budget on daslib-sized programs).
+    // 16/8-bit lattice floor: data movement (loads/stores/moves/locals/indexing/swizzles)
+    // and the vec4f wrapper ABI lower natively; what still falls back is lattice values
+    // crossing a BUILTIN CALL boundary (ctors/converts/operators) — the builtin-address
+    // gates below catch those until the per-op emission wave completes.
     def lattice_fallback(t : TypeDeclPtr; at : LineInfo) {
         if (!disable && t != null && is_lattice_small_type(t.baseType)) {
             to_log(LOG_WARNING, "LLVM JIT: 16/8-bit lattice type `{describe(t)}` at {at}, falling back to interpreter.\n")
             disable = true
-        }
-    }
-    def override preVisitExprLetVariable(expr : ExprLet?; arg : VariablePtr; lastArg : bool) : void {
-        lattice_fallback(arg._type, arg.at)
-    }
-    def override preVisitExprSwizzle(expr : ExprSwizzle?) : void {
-        lattice_fallback(expr.value._type, expr.at)
-    }
-    def override preVisitFunction(fun : FunctionPtr) : void {
-        // signature-level gate: the interp<->jit wrappers marshal args/results through
-        // vec4f slots, and that marshaling is not lattice-aware yet (a vec4f <-> <4 x half>
-        // bitcast is invalid IR — one bad function fails the whole module)
-        lattice_fallback(fun.result, fun.at)
-        for (arg in fun.arguments) {
-            lattice_fallback(arg._type, arg.at)
         }
     }
     def override preVisitExprTypeInfo(expr : ExprTypeInfo?) : void {
@@ -7895,7 +7988,6 @@ class public DisableJitVisitor : AstVisitor {
                 "type {type_str} to be used in JIT, keeping interpreter mode.\n")
             disable = true
         }
-        lattice_fallback(expr.subexpr._type, expr.at)
     }
 
     def override preVisitExprForSource(var expr : ExprFor?, var source : ExpressionPtr, last : bool) {
@@ -7915,9 +8007,11 @@ class public DisableJitVisitor : AstVisitor {
                 disable = true
             }
         }
-        if (!disable && expr.func.flags.builtIn) {
-            // lattice values cross the extern ABI as LLVM half / packed vectors, but the
-            // C++ side expects the das slot conventions — fall back until the marshal wave
+        if (!disable && expr.func.flags.builtIn && !has_intrinsic(expr)) {
+            // lattice values crossing a builtin call lower as intrinsics (ctors/converts/
+            // sat-narrows emit IR directly); anything NOT in the intrinsic tables would hit
+            // the direct-extern ABI, where LLVM half / packed vectors mismatch the C++ das
+            // slot conventions — those still fall back
             var lattice = is_lattice_small_type(expr._type.baseType)
             if (!lattice) {
                 for (arg in expr.arguments) {

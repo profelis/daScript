@@ -95,4 +95,12 @@ def test_ushort2_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = ushort2(1u, 2u)
+        let w = uint2(a)
+        t |> success(w == uint2(1u, 2u), "widen")
+        t |> success(ushort2(w) == a, "narrow round trip")
+        let s = ushort2_sat(uint2(100000u, 1u))
+        t |> success(s == ushort2(65535u, 1u), "sat clamp")
+    }
 }

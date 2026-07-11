@@ -98,4 +98,12 @@ def test_ubyte4_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = ubyte4(1u, 2u, 3u, 4u)
+        let w = uint4(a)
+        t |> success(w == uint4(1u, 2u, 3u, 4u), "widen")
+        t |> success(ubyte4(w) == a, "narrow round trip")
+        let s = ubyte4_sat(uint4(100000u, 1u, 2u, 3u))
+        t |> success(s == ubyte4(255u, 1u, 2u, 3u), "sat clamp")
+    }
 }

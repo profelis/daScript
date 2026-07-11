@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x3eul   // 16/8-bit type lattice tags (0x3d: distinct types)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x3ful   // lattice native lowering: marshal/ctors/converts/fp16 ops (0x3e: lattice tags)
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -372,6 +372,11 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     // `options fast_math` (or policies.fast_math) is the one knob; `_jit_fast_math` kept as a legacy alias
     g_jit_fast_math = (prog._options |> find_arg("fast_math") ?as tBool ?? prog.policies.fast_math) || (prog._options |> find_arg("_jit_fast_math") ?as tBool ?? false)
 
+    // the disable pass consults target-gated intrinsic tables (has_intrinsic) — the
+    // g_target_* truth must be set BEFORE it runs, not first at init_jit time below.
+    // Standalone exes target a GENERIC CPU (write_exe use_host_cpu=false default), so
+    // host cpuid features must not leak into their emission (host_features=false).
+    init_jit_target_flags(target_triple, !gen_exe)
     make_visitor(*disableJitVisitor) $(disableJitVisitorAdapter) {
         prog |> for_each_module() $(mod) {
             mod |> for_each_function("") $(fun) {
@@ -380,9 +385,8 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
                 if (fun.flags.used && (jit_all_functions || rqj)) {
                     if (!fun.moreFlags.requestNoJit) {
                         disableJitVisitor.disable = false
-                        // the signature gate must run explicitly — `visit(fun)` does not
-                        // dispatch preVisitFunction through the adapter
-                        disableJitVisitor->preVisitFunction(fun)
+                        // if DisableJitVisitor ever grows a preVisitFunction check again, it must
+                        // be dispatched explicitly here — `visit(fun)` never calls preVisitFunction
                         fun |> visit(disableJitVisitorAdapter)
                         if (!disableJitVisitor.disable) {
                             fun.moreFlags.requestJit = true
@@ -414,7 +418,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
         // Pass target_triple so init_jit can pin the module data layout
             // BEFORE IR construction (wasm32 cross-compile needs 4-byte pointer
             // sizes baked into GEP folding from the very first IR instruction).
-            init_jit(opt_level |> uint, target_triple)
+            init_jit(opt_level |> uint, target_triple, !gen_exe)
 
         var jit_flags : LlvmJitFlags
         jit_flags.emit_prologue = emit_prologue

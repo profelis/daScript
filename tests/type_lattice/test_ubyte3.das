@@ -97,4 +97,12 @@ def test_ubyte3_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = ubyte3(1u, 2u, 3u)
+        let w = uint3(a)
+        t |> success(w == uint3(1u, 2u, 3u), "widen")
+        t |> success(ubyte3(w) == a, "narrow round trip")
+        let s = ubyte3_sat(uint3(100000u, 1u, 2u))
+        t |> success(s == ubyte3(255u, 1u, 2u), "sat clamp")
+    }
 }

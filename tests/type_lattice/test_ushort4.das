@@ -98,4 +98,12 @@ def test_ushort4_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = ushort4(1u, 2u, 3u, 4u)
+        let w = uint4(a)
+        t |> success(w == uint4(1u, 2u, 3u, 4u), "widen")
+        t |> success(ushort4(w) == a, "narrow round trip")
+        let s = ushort4_sat(uint4(100000u, 1u, 2u, 3u))
+        t |> success(s == ushort4(65535u, 1u, 2u, 3u), "sat clamp")
+    }
 }

@@ -104,5 +104,15 @@ def test_uint4_conformance(t : T?) {
         t |> success(a + b == uint4(3u, 6u, 9u, 12u), "add")
         t |> success(b - a == uint4(1u, 2u, 3u, 4u), "sub")
         t |> success(a * b == uint4(2u, 8u, 18u, 32u), "mul")
+        var c = a
+        c += b
+        t |> success(c == a + b, "add assign")
+        c -= b
+        t |> success(c == a, "sub assign")
+        t |> success(a * 2u == a + a, "vec mul scalar")
+        t |> success(2u * a == a + a, "scalar mul vec")
+        c = a
+        c *= 2u
+        t |> success(c == a + a, "mul assign scalar")
     }
 }

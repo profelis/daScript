@@ -99,5 +99,25 @@ def test_half8_conformance(t : T?) {
         t |> success(b - a == half8(1., 2., 3., 4., 5., 6., 7., 8.), "sub")
         t |> success(a * b == half8(2., 8., 18., 32., 50., 72., 98., 128.), "mul")
         t |> success(b / a == half8(2., 2., 2., 2., 2., 2., 2., 2.), "div")
+        var c = a
+        c += b
+        t |> success(c == a + b, "add assign")
+        c -= b
+        t |> success(c == a, "sub assign")
+        t |> success(-a == half8(-1., -2., -3., -4., -5., -6., -7., -8.), "unary minus")
+        t |> success(a * 2h == a + a, "vec mul scalar")
+        t |> success(2h * a == a + a, "scalar mul vec")
+        t |> success((a + a) / 2h == a, "vec div scalar")
+        c = a
+        c *= 2h
+        t |> success(c == a + a, "mul assign scalar")
+    }
+    t |> run("converts") @(t : T?) {
+        let lo = float4(1., 2., 3., 4.)
+        let hi = float4(5., 6., 7., 8.)
+        let p = half8(lo, hi)
+        t |> success(p == half8(1., 2., 3., 4., 5., 6., 7., 8.), "pack")
+        t |> success(half8_lo(p) == lo, "unpack lo")
+        t |> success(half8_hi(p) == hi, "unpack hi")
     }
 }

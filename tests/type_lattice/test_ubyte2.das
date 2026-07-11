@@ -95,4 +95,12 @@ def test_ubyte2_conformance(t : T?) {
         let s = "{a}"
         t |> success(!empty(s), "interpolates")
     }
+    t |> run("converts") @(t : T?) {
+        let a = ubyte2(1u, 2u)
+        let w = uint2(a)
+        t |> success(w == uint2(1u, 2u), "widen")
+        t |> success(ubyte2(w) == a, "narrow round trip")
+        let s = ubyte2_sat(uint2(100000u, 1u))
+        t |> success(s == ubyte2(255u, 1u), "sat clamp")
+    }
 }
