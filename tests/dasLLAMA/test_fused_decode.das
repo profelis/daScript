@@ -303,8 +303,8 @@ def test_fused_decode_pre_post_norm(t : T?) {
             for (name in ["gemma-3-1b-it-Q8_0.gguf", "gemma-2-2b-it-Q8_0.gguf", "gemma-4-E2B-it-Q8_0.gguf"]) {
                 let path = path_join(models_dir(), name)
                 if (!stat(path).is_valid) {
-                    // deliberately NOT `t |> skip` — skip unwinds the whole arm, and this loop
-                    // must keep testing the models that ARE present
+                    // deliberately NOT `t |> skip` — it would mark the WHOLE arm skipped even
+                    // when the loop goes on to exercise the models that ARE present
                     t |> success(true, "skipped: {path} not present")
                     continue
                 }

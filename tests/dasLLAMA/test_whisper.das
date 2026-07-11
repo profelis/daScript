@@ -649,7 +649,7 @@ def test_gemma4a_audio_oracle(t : T?) {
         let wav = path_join(corpus_dir(), "gemma4a_test2.wav")
         let samples <- read_wav_pcm16_mono(wav)
         if (empty(samples)) {
-            delete m.dec.wblob   // free the weights BEFORE the skip — skip unwinds the arm
+            delete m.dec.wblob
             delete m.g4a.blob
             t |> skip("gemma4a_test2.wav not present")
             return
