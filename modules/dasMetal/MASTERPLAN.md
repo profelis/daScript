@@ -41,12 +41,16 @@ dasSpirv and is reused as-is.
    (`src/dasMetal.mm`) over the system Metal.framework — ~18 externs for the compute subset.
    (metal-cpp + dasClangBind rejected: vendored headers and binder churn for an ~18-extern
    surface; revisit only if the surface outgrows hand maintenance.)
-4. **The authoring surface IS dasSpirv's.** Same `@ssbo`/`@binding` field annotations, same
-   builtin globals — `msl_shader` does `require spirv/spirv_builtins public` (dasSpirv is
-   unconditional in-tree pure das, present on every platform, so this dependency always
-   resolves). dasMetal adds only the `[metal_kernel]` annotation + the MSL emitter. One
-   source function can stack `[compute_shader, metal_kernel]` → the cross-backend parity
-   gate. **Zero edits to shipped dasSpirv/dasGlsl.**
+4. **Class-based authoring: kernels are class methods, resources are class members.** A
+   compute pass is a `class` whose `@ssbo @binding = N` members declare the buffers and
+   whose `[metal_kernel]` methods are the kernels — no module-scope resource globals (they
+   pollute the namespace and don't scale to two kernels with different buffer sets in one
+   file), and members→kernel-parameters is exactly MSL's own model. Multiple kernels over
+   one buffer set = multiple methods in one class. Builtin globals
+   (`gl_GlobalInvocationID`, …) are still reused via `require spirv/spirv_builtins public`
+   (dasSpirv is unconditional in-tree pure das — always resolves). Because the body is
+   ordinary daslang, the same method also executes on the CPU — the primary correctness
+   oracle (Test architecture). **Zero edits to shipped dasSpirv/dasGlsl.**
 5. **Naming.** C++ module `das_metal` (`Module("das_metal")`, class `Module_DasMetal`). das
    files under `metal/`: `require metal/msl_shader`, `require metal/das_metal_boost`.
    Consumers guard: `require ?das_metal metal/das_metal_boost` +
@@ -60,9 +64,11 @@ dasSpirv and is reused as-is.
    emitter on a real M-series GPU. The only hand-written MSL ever permitted is the Phase-0
    dev-scaffold **inline string** proving the binding, deleted when Phase 1 lands (the
    `_handbuild_square.das` pattern). **No `.msl` file is ever committed.**
-8. **Parity compiles with fast-math OFF.** Metal's runtime compiler defaults fast-math ON,
-   which breaks CPU↔GPU float comparison. All test/parity pipelines compile with safe math;
-   a boost-level knob re-enables fast-math for perf kernels.
+8. **`fastmath` is a `[metal_kernel]` property, ON by default.** daslang's own posture is
+   fastmath-on, so we are not chasing bit-exact float parity; Metal's runtime compiler also
+   defaults fast-math ON and we keep it. Float oracles compare with tolerance (ints
+   bit-exact). `[metal_kernel(fastmath=false)]` per kernel when isolating a divergence
+   needs strict IEEE.
 
 ## Architecture
 
@@ -73,13 +79,13 @@ dasSpirv and is reused as-is.
 | `src/dasMetal.mm` | hand | `Module("das_metal")` — Obj-C++ shim over Metal.framework. Opaque annotated handles (device, queue, command buffer, compute encoder, pipeline state, library, function, buffer) + the extern surface below. Compiled with ARC; handles cross to das as `__bridge_retained void*`; `metal_release` = `__bridge_transfer`. Shim-side live-object counter for the leak gate. APPLE-only; links `-framework Metal -framework Foundation`. |
 | `metal/msl_types.das` | hand | daslang `TypeDecl` → MSL type name (uint/int/float/bool, 2/3/4-vectors; later the 16/8-bit lattice — MSL has native `half`). |
 | `metal/msl_emit.das` | hand | The text emitter: `[macro_function] generate_msl(fn, var errors, cfg, var census) : string`. Manual recursion (`emit_value`/`emit_stmt`, mirroring `spirv_emit`). Kernel-signature synthesis from `@ssbo` globals (the one structural novelty — below). Records the construct census at every emit site. |
-| `metal/msl_shader.das` | hand | `[metal_kernel]` function-macro (`MetalKernel : AstFunctionAnnotation`, modeled on `SpirvShader`). `apply` declares the public ``{name}`msl : string`` global; **`fixup` fills `glob.init = new ExprConstString(...)`** — string capture is call-free, so fixup suffices (dasGlsl precedent; the patch/astChanged dance dasSpirv needed for `array<uint>` does not apply). Does `require spirv/spirv_builtins public`. |
+| `metal/msl_shader.das` | hand | `[metal_kernel]` function-macro (`MetalKernel : AstFunctionAnnotation`, modeled on `SpirvShader`), applied to a **class method**; args: `name`, `fastmath` (default **true**, surfaced to the host via a companion ``{name}`msl_fastmath : bool`` global feeding the pipeline-compile options). `apply` declares the public ``{name}`msl : string`` global; **`fixup` fills `glob.init = new ExprConstString(...)`** — string capture is call-free, so fixup suffices (dasGlsl precedent; the patch/astChanged dance dasSpirv needed for `array<uint>` does not apply). Does `require spirv/spirv_builtins public`. |
 | `metal/das_metal_boost.das` | hand | Host sugar over `das_metal`: `with_metal_device`, `pipeline_from_kernel` (compile + error surfacing), unified-memory buffer helpers, `run_compute_1d` one-liner, live-object leak assert. `require das_metal` → usable only where the C++ module exists. |
 | `CMakeLists.txt` | hand | `ADD_MODULE_DAS(metal metal …)` unconditional (emitter everywhere); `IF(APPLE)`: `ADD_MODULE_CPP(DasMetal)` + `ADD_MODULE_LIB` + frameworks. Install rule mirrors dasSpirv's. |
 
 **Extern surface (PoC-complete).** `metal_create_system_default_device`; device name +
 unified-memory query; `metal_new_command_queue`; `metal_new_library_from_source(dev, src,
-safe_math; var error)`; `metal_new_function(lib, name)`; `metal_new_compute_pipeline(dev,
+fastmath; var error)`; `metal_new_function(lib, name)`; `metal_new_compute_pipeline(dev,
 fn; var error)`; `metal_new_buffer(dev, bytes)` (storageModeShared);
 `metal_buffer_contents(buf) : void?` (the unified-memory pointer — host reads/writes it
 directly, no map/unmap); `metal_new_command_buffer(q)`; `metal_new_compute_encoder(cb)`;
@@ -89,16 +95,19 @@ as the Apple-silicon exact-grid fast path); `metal_end_encoding`; `metal_commit`
 `metal_wait_until_completed`; `metal_command_buffer_error`; `metal_release`;
 `metal_live_object_count`.
 
-**Kernel-signature lowering (the one structural novelty).** SPIR-V keeps `@ssbo` globals as
-module-scope `OpVariable`s; MSL has no module-scope device globals — each `@ssbo` global
-lowers to a kernel parameter `device T* name [[buffer(N)]]` (`device const T*` when the
-body never writes it; write-set collected in a pre-scan), and each referenced builtin
-lowers to a builtin-attributed parameter (`gl_GlobalInvocationID` →
-`uint3 gl_GlobalInvocationID [[thread_position_in_grid]]`). The parameter keeps the
-global's name and MSL is lexically scoped, so body references need **no rewriting**.
-`@binding` = the flat `[[buffer(N)]]` index; `@set` must be absent or 0 (clean error —
-Metal has no descriptor sets); duplicate bindings are a clean error. Identifiers colliding
-with MSL keywords (`kernel`, `device`, `constant`, `thread`, `half`, …) are mangled.
+**Kernel-signature lowering (the one structural novelty).** MSL has no module-scope device
+globals — and the authoring class's members map onto its model exactly: each `@ssbo`
+member lowers to a kernel parameter `device T* name [[buffer(N)]]` (`device const T*` when
+no kernel body writes it; member write-set collected in a pre-scan), and each referenced
+builtin global lowers to a builtin-attributed parameter (`gl_GlobalInvocationID` →
+`uint3 gl_GlobalInvocationID [[thread_position_in_grid]]`). Member access in the method
+body (bare `a` / `self.a`) emits as the bare parameter name, so the body needs no other
+rewriting. `@binding` = the flat `[[buffer(N)]]` index; `@set` must be absent or 0 (clean
+error — Metal has no descriptor sets); duplicate bindings within one class are a clean
+error. Identifiers colliding with MSL keywords (`kernel`, `device`, `constant`, `thread`,
+`half`, …) are mangled. The exact AST shape of method-member access (`ExprField` over
+`self`, constness, `ExprRef2Value` wrapping at fixup time) is dumped and recorded as the
+first Phase-1 step — the same discipline as dasSpirv's square AST dump.
 
 **Capture + cache.** Capture mirrors dasGlsl exactly (`ExprConstString` in fixup). A
 companion reflection global is deferred until the boost needs auto-binding (mirror
@@ -113,12 +122,14 @@ The a*b kernel, authored:
 ```das
 require metal/msl_shader
 
-var @ssbo @binding = 0 a : array<float>
-var @ssbo @binding = 1 b : array<float>
-var @ssbo @binding = 2 c : array<float>
+class MulAB {
+    @ssbo @binding = 0 a : array<float>
+    @ssbo @binding = 1 b : array<float>
+    @ssbo @binding = 2 c : array<float>
 
-[metal_kernel]
-def mul_ab { let i = gl_GlobalInvocationID.x; c[i] = a[i] * b[i] }
+    [metal_kernel]
+    def mul_ab { let i = gl_GlobalInvocationID.x; c[i] = a[i] * b[i] }
+}
 // host reads mul_ab`msl : string → pipeline_from_kernel → run_compute_1d
 ```
 
@@ -153,12 +164,16 @@ Three behavioral layers + enforcement gates:
    exists (no Xcode required — the OS MTLCompilerService), soft-skip elsewhere,
    hard-required on the macOS CI lane. (`xcrun metal` offline compile is a secondary local
    oracle only — it needs full Xcode, not CLT.)
-3. **Real-GPU behavioral gate — as early as Phase 1** (`tests/metal/`, Apple-only).
-   `run_compute_1d`, `c[i]==a[i]*b[i]`, exact float compare (products of small ints;
-   fast-math off). Files are `require ?das_metal` + `static_if builtin_module_exists`
-   guarded, so they compile and no-op cleanly on non-Apple lanes. Primary gate = **local
-   M-boxes**; CI = the macOS lane's paravirtual device (Phase-0 probe decides behavioral
-   vs compile-only).
+3. **Real-GPU behavioral gate vs the CPU-reference oracle — as early as Phase 1**
+   (`tests/metal/`, Apple-only). The kernel body is ordinary daslang, so the **same method
+   runs on the CPU**: a driver loop sets `gl_GlobalInvocationID` and calls the method on a
+   class instance whose members are plain arrays — that CPU run (interp/JIT) produces the
+   expected buffer contents with zero second-source effort. GPU results compare against
+   it: ints bit-exact, floats with tolerance (fastmath on both sides — settled decision 8;
+   the PoC's `a[i]*b[i]` on small ints is exact regardless). Files are `require ?das_metal`
+   + `static_if builtin_module_exists` guarded, so they compile and no-op cleanly on
+   non-Apple lanes. Primary gate = **local M-boxes**; CI = the macOS lane's paravirtual
+   device (Phase-0 probe decides behavioral vs compile-only).
 
 - **Gate A — LCOV** on runtime-reached files (`das_metal_boost`, `msl_types` where runtime
   code exists). The emitter is compile-time → census is its coverage proxy.
@@ -188,8 +203,8 @@ Three behavioral layers + enforcement gates:
   full scalar/vector arithmetic, comparisons, logical ops, mutable locals, if/else, while,
   range-for, break/continue, compound assignment. MSL is C-family — mostly emitter
   table-fill + tests; no structured-CFG hazard. The in-kernel bounds guard
-  (`if (i >= n) return` for non-exact grids) lands here. **First cross-backend parity
-  fixtures land here** (stacked `[compute_shader, metal_kernel]`).
+  (`if (i >= n) return` for non-exact grids) lands here. Every fixture regresses against
+  its CPU-reference run.
 - **Phase 3 — threadgroup memory + barriers + simdgroup ops.** `threadgroup` address
   space, `threadgroup_barrier(mem_flags)`, `simd_sum`/`simd_shuffle*`, the remaining
   builtin attributes (`thread_position_in_threadgroup`, `threadgroup_position_in_grid`,
@@ -201,15 +216,15 @@ Three behavioral layers + enforcement gates:
   dasLLAMA prize), buffer pooling, `MTLSharedEvent` sync, `MTLBinaryArchive` pipeline
   cache. Sized when we get there; a dasLLAMA offload experiment is the driver.
 
-## Cross-backend parity gate (Phase 2+)
+## Cross-backend parity (deferred — not a gate)
 
-One source function, both annotations stacked → two globals (``{name}`spirv`` words +
-``{name}`msl`` text). zen2 runs the SPIR-V via dasVulkan (lavapipe + real GPU); the M-box
-runs the MSL via `das_metal`. Integer fixtures compare bit-exact; float fixtures exact
-where arithmetic is exactly representable, ULP-bounded otherwise (fast-math off on both
-sides; lattice fixtures reuse `_lattice_gpu_parity`'s dual-reference discipline). Requires
-the two annotations not to fight in apply/patch (each adds its own global; both set
-exports) — verified by the first stacked fixture.
+Stacking `[compute_shader, metal_kernel]` on one function was the original parity idea;
+class-member authoring defers it — dasSpirv's frontend reads module globals, not class
+members. The primary correctness oracle is the CPU-reference run of the same das body
+(Test architecture, layer 3), which is cheaper and stricter than a second GPU. Cross-GPU
+parity (zen2 Vulkan vs M-box Metal) returns as a nice-to-have if/when dasSpirv gains the
+same class-member authoring — an in-tree follow-up, ours to make, not a dasMetal
+prerequisite.
 
 ## Top risks
 
@@ -224,8 +239,11 @@ exports) — verified by the first stacked fixture.
    keyword mangling, duplicate `@binding` = clean error, `@set` rejection. Fail-closed rule
    inherited from dasSpirv review hardening: every dispatch validates its input and errors
    cleanly — never a silent bad kernel, never a panic.
-4. **Float parity vs fast-math.** Settled decision 8; forgetting it produces
-   Heisenberg parity failures. The parity harness sets safe math unconditionally.
+4. **Class-method annotation plumbing.** `[metal_kernel]` must fire on a class method
+   (function_macro apply/fixup on methods; `@ssbo` field annotations on class members) —
+   unproven; probed first thing in Phase 1 before any emitter work. Fallback if it fights:
+   the struct-param form (`[metal_kernel] def mul_ab(var k : MulAB)` — free function,
+   resources still grouped in one type), same emitter, only the frontend scan differs.
 5. **Runtime-compile latency.** Per-pipeline `newLibraryWithSource` at startup is fine for
    tests/PoC; `MTLBinaryArchive` + codegen-version key is the escape hatch (Phase 5).
 6. **Census honesty for a text emitter.** No disassembler exists to recount text (dasSpirv
@@ -252,4 +270,8 @@ exports) — verified by the first stacked fixture.
 
 # Implementation log
 
-*(Phase 0 not started — 2026-07-11: masterplan authored.)*
+*(Phase 0 not started — 2026-07-11: masterplan authored; revised same day per review:
+class-based authoring (kernels = methods, resources = `@ssbo` members — no module-scope
+resource globals), `fastmath` a `[metal_kernel]` property defaulting ON, CPU-reference
+oracle promoted to the primary correctness gate, cross-backend GPU parity demoted to a
+deferred nice-to-have.)*
