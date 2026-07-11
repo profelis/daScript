@@ -131,6 +131,20 @@ def recur_inc(n : int) : int => n <= 0 ? 0 : recur_inc(n - 1) + 1  // nolint:LIN
 
 def gadd(a, b : auto) => a + b  // generic: instances stay out of the heuristic tier
 
+struct Node {
+    v : int
+}
+
+def make_node(v : int) : Node? => new Node(v = v)
+
+def make_node_stmts(v : int) : Node? {
+    var n = new Node(v = v)
+    n.v++
+    return n
+}
+
+def len_plus(xs : array<int>; k : int) : int => length(xs) + k
+
 [export]
 def target_expr_body(a, b : int) : int {
     return small_mul(a, b) + small_mul(b, a + 1)
@@ -193,6 +207,38 @@ def target_generic(a, b : int) : int {
 }
 
 [export]
+def target_mixed_ternary_graft(f : bool; v : int) : int {
+    // expression-body callee in a mixed-type ternary arm: the pure graft keeps
+    // the ternary intact, so the per-arm null-to-pointer coercion survives
+    var p = f ? make_node(v) : null
+    let r = p != null ? p.v : -1
+    unsafe {
+        delete p
+    }
+    return r
+}
+
+[export]
+def target_mixed_ternary_stmts(f : bool; v : int) : int {
+    // STATEMENT-body callee in a mixed-type ternary arm: the lazy lowering must
+    // decline - splitting the ternary into bare arm stores would lose the
+    // per-arm null-to-pointer coercion
+    var p = f ? make_node_stmts(v) : null
+    let r = p != null ? p.v : -1
+    unsafe {
+        delete p
+    }
+    return r
+}
+
+[export]
+def target_const_empty_array(k : int) : int {
+    // const non-copyable rvalue argument (the empty array literal): the arg temp
+    // must clone-initialize - a move from a constant is error 30940
+    return len_plus([], k)
+}
+
+[export]
 def target_impure_args(a, b : int) : int {
     // impure arguments must keep call-order evaluation through the splice
     return small_mul(side("a", a), side("b", b))
@@ -233,6 +279,14 @@ def test_auto_inline_functions_fired(t : T?) {
             let b = body_of(t, "target_private_once")
             t |> success(!has(b, "big_private_once("), "call is gone: {b}")
         }
+        t |> run("const empty-array argument splices via clone-init") @(t : T?) {
+            let b = body_of(t, "target_const_empty_array")
+            t |> success(!has(b, "len_plus("), "call is gone: {b}")
+        }
+        t |> run("expression-body callee grafts into a mixed-type ternary") @(t : T?) {
+            let b = body_of(t, "target_mixed_ternary_graft")
+            t |> success(!has(b, "make_node("), "call is gone: {b}")
+        }
     }
 }
 
@@ -269,6 +323,10 @@ def test_auto_inline_functions_declines(t : T?) {
             let b = body_of(t, "target_generic")
             t |> success(has(b, "gadd"), "call stays regular: {b}")
         }
+        t |> run("statement-body callee in a mixed-type ternary stays a call") @(t : T?) {
+            let b = body_of(t, "target_mixed_ternary_stmts")
+            t |> success(has(b, "make_node_stmts("), "call stays regular: {b}")
+        }
     }
 }
 
@@ -295,5 +353,14 @@ def test_auto_inline_functions_behavior(t : T?) {
         let r = target_impure_args(6, 7)
         t |> equal(r, 42)
         t |> equal(g_log, "ab")
+    }
+    t |> run("mixed-type ternary results match") @(t : T?) {
+        t |> equal(target_mixed_ternary_graft(true, 7), 7)
+        t |> equal(target_mixed_ternary_graft(false, 7), -1)
+        t |> equal(target_mixed_ternary_stmts(true, 7), 8)
+        t |> equal(target_mixed_ternary_stmts(false, 7), -1)
+    }
+    t |> run("const empty-array argument results match") @(t : T?) {
+        t |> equal(target_const_empty_array(5), 5)
     }
 }

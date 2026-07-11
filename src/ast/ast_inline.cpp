@@ -930,7 +930,7 @@ namespace das {
 
         // manufactured `let/var name [&] = init` (or an uninitialized declaration)
         ExprLet * makeTemp ( const LineInfo & at, const string & name, Expression * init,
-                             bool isConst, bool isRef, bool viaMove ) {
+                             bool isConst, bool isRef, bool viaMove, bool viaClone = false ) {
             auto var = new Variable();
             var->name = name;
             var->at = at;
@@ -943,6 +943,7 @@ namespace das {
             var->type->ref = isRef;
             var->init = init;
             var->init_via_move = viaMove;
+            var->init_via_clone = viaClone;
             auto let = new ExprLet();
             let->at = at;
             let->atInit = init ? init->at : at;
@@ -1486,9 +1487,12 @@ namespace das {
                     if ( leafA->rtti_isR2V() ) leafA = static_cast<ExprRef2Value *>(leafA)->subexpr;
                     bool leafConst = leafA->rtti_isConstant();
                     bool leafVar = leafA->rtti_isVar();
+                    // a non-copyable CONST source cannot move into its temp (30940) - the
+                    // original call only ever BOUND it; the temp clone-initializes instead
                     auto makeArgTemp = [&]( Expression * init, bool cnst, bool ref, bool viaMove ) {
                         string tname = "__inl" + to_string(inlineId) + "_arg_" + P->name;
-                        temps.push_back(makeTemp(callLike->at, tname, init, cnst, ref, viaMove));
+                        bool viaClone = viaMove && init->type && init->type->constant;
+                        temps.push_back(makeTemp(callLike->at, tname, init, cnst, ref, viaMove && !viaClone, viaClone));
                         sub.tempName = tname;
                     };
                     if ( leafA->rtti_isTypeDecl() ) {
@@ -1721,6 +1725,26 @@ namespace das {
                 }
                 if ( pos==SitePosition::Lazy ) {
                     auto lazy = path.lazyOps.back();    // outermost lazy op on the path
+                    // a ternary lowers by SPLITTING into bare arm stores (the fresh hoist
+                    // rides the same var+if path a round later), and a bare store loses
+                    // the per-arm coercion the ternary provided - a void? panic arm into
+                    // a typed pointer (the macro-generated `as` guard being the canonical
+                    // case), null literals, derived views - and copies a ref result by
+                    // value. only same-typed, by-value arms survive the split; anything
+                    // else keeps the call
+                    if ( lazy->rtti_isOp3() ) {
+                        auto op3 = static_cast<ExprOp3 *>(lazy);
+                        auto & lt = op3->left->type;
+                        auto & rt = op3->right->type;
+                        bool armsMatch = lt && rt && lazy->type && !lazy->type->ref
+                            && !lt->isVoid() && !rt->isVoid()
+                            && !lt->isVoidPointer() && !rt->isVoidPointer()
+                            && lt->isSameType(*rt, RefMatters::no, ConstMatters::no, TemporaryMatters::yes);
+                        if ( !armsMatch ) {
+                            siteFail(site, "can't inline " + subjName + " inside a mixed-type ternary - hoist the call into its own statement", callLike->at);
+                            continue;
+                        }
+                    }
                     // when the lazy op is the whole init of a single GENERATED temp (a
                     // hoist from a previous round), rewrite it to var + if form in place.
                     // a USER declaration never takes this branch - replacing it would drop
@@ -1742,7 +1766,8 @@ namespace das {
                         // rejects initialization from a const reference. a non-copyable
                         // lazy result (ternary of arrays) must move into the hoist
                         bool viaMove = lazy->type && !lazy->type->canCopy();
-                        auto hoist = makeTemp(callLike->at, tname, lazy, false, false, viaMove);
+                        bool viaClone = viaMove && lazy->type->constant;   // move-from-const is 30940
+                        auto hoist = makeTemp(callLike->at, tname, lazy, false, false, viaMove && !viaClone, viaClone);
                         ReplaceNode rn;
                         rn.what = lazy;
                         rn.with = new ExprVar(callLike->at, tname);
@@ -1820,7 +1845,9 @@ namespace das {
                         pe->alwaysSafe = true;          // generated binding to real storage
                         splice.push_back(makeTemp(pe->at, tname, pe, pe->type->constant, true, false));
                     } else if ( pe->type && !pe->type->canCopy() ) {
-                        splice.push_back(makeTemp(pe->at, tname, pe, false, false, true));  // move the rvalue
+                        // move the rvalue; a CONST non-copyable rvalue clone-initializes (30940)
+                        bool viaClone = pe->type->constant;
+                        splice.push_back(makeTemp(pe->at, tname, pe, false, false, !viaClone, viaClone));
                     } else {
                         splice.push_back(makeTemp(pe->at, tname, pe, false, false, false));
                     }

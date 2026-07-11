@@ -68,4 +68,8 @@ def test_inline_contract_errors(t : T?) {
         t |> expect_issue("_inline_never_inline_conflict.das",
             "[never_inline] conflicts with [inline]")
     }
+    t |> run("[inline] call in a mixed-type ternary arm") @(t : T?) {
+        t |> expect_issue("_inline_mixed_ternary.das",
+            "inside a mixed-type ternary")
+    }
 }
