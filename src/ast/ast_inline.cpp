@@ -151,6 +151,25 @@ namespace das {
             return isalpha(uint8_t(name[0])) || name[0]=='_';
         }
 
+        // operator names whose call sites dispatch through ExprOp1/2/3 - the node kinds
+        // the splicer plans. punctuation functions dispatched elsewhere ([] via ExprAt,
+        // ?? via null-coalescing, . via properties, clone/finalize via their own nodes)
+        // cannot honor the [inline] contract and stay refused
+        bool exprOpDispatchedName ( const string & name ) {
+            static const das_hash_set<string> ops = {
+                // unary (ExprOp1); ++/-- pre, +++/--- post
+                "!", "~", "++", "--", "+++", "---",
+                // binary (ExprOp2); +/-/* /% shared with unary by arity
+                "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "<<<", ">>>",
+                "&&", "||", "^^", "==", "!=", ">", "<", ">=", "<=",
+                "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+                "<<=", ">>=", "<<<=", ">>>=", "&&=", "||=", "^^=",
+                // ternary (ExprOp3)
+                "?"
+            };
+            return ops.find(name) != ops.end();
+        }
+
         // ----- callee param read statistics (for tier B) -----
 
         struct ParamReadStats {
@@ -493,6 +512,21 @@ namespace das {
             return ok;
         }
 
+        // the unsignaled heuristic tier, per callee. generic INSTANCES stay out (the
+        // signaled block-literal tier keeps them, behind its proven flavor gates):
+        // instances carry splice hazards plain functions can't have - explicit
+        // const/ref-locked parameter flavors, and inferer-manufactured argument
+        // shapes: to_array_move's heap-mode array literal spliced into a generated
+        // `let <-` re-infers under the in-place make-local protocol and corrupts
+        // the array header (probe-verified: garbage sums, SIGSEGV)
+        bool autoEligibleFn ( Function * fn, const AutoInlineCfg & cfg ) {
+            if ( !fn || fn->mustInline || fn->builtIn ) return false;
+            if ( !fn->body || fn->isTemplate ) return false;
+            if ( fn->neverInline ) return false;    // explicit opt-out, both tiers
+            if ( !cfg.functions || fn->fromGeneric ) return false;
+            return worthAutoInline(fn, cfg);
+        }
+
         bool autoEligibleCall ( ExprCall * call, const AutoInlineCfg & cfg ) {
             if ( !call->func || call->func->mustInline || call->func->builtIn ) return false;
             if ( !call->func->body || call->func->isTemplate ) return false;
@@ -502,17 +536,20 @@ namespace das {
                     if ( a->rtti_isMakeBlock() ) return true;
                 }
             }
-            // generic INSTANCES stay out of the unsignaled heuristic tier (the signaled
-            // block-literal tier above keeps them, behind its proven flavor gates).
-            // instances carry splice hazards plain functions can't have - explicit
-            // const/ref-locked parameter flavors, and inferer-manufactured argument
-            // shapes: to_array_move's heap-mode array literal spliced into a generated
-            // `let <-` re-infers under the in-place make-local protocol and corrupts
-            // the array header (probe-verified: garbage sums, SIGSEGV)
-            if ( cfg.functions && !call->func->fromGeneric ) {
-                return worthAutoInline(call->func, cfg);
+            return autoEligibleFn(call->func, cfg);
+        }
+
+        // a call-like splice edge: a direct call, or an operator-overload site. eligibility
+        // for the auto tier differs by node kind (block-literal candidacy is per-call), so
+        // the walkers test with autoEligibleCall for calls and autoEligibleFn for ops.
+        // rtti_isOp2 is true for copy/move/clone too - their func, when set at all, never
+        // passes the eligibility gates, so the over-approximation is harmless
+        Function * callLikeFunc ( Expression * expr ) {
+            if ( expr->rtti_isCall() ) return static_cast<ExprCall *>(expr)->func;
+            if ( expr->rtti_isOp1() || expr->rtti_isOp2() || expr->rtti_isOp3() ) {
+                return static_cast<ExprCallFunc *>(expr)->func;
             }
-            return false;
+            return nullptr;
         }
 
         // one walk per function: for every statement its (block, index) anchor, and
@@ -561,6 +598,18 @@ namespace das {
                     plan(expr, SiteKind::AutoCall);
                 }
             }
+            // operator-overload sites. dispatch is exact-typed, so these never fire
+            // for ExprCopy/ExprMove/ExprClone (which derive from ExprOp2)
+            void planOp ( ExprCallFunc * expr ) {
+                if ( expr->func && expr->func->mustInline ) {
+                    plan(expr, SiteKind::MustCall);
+                } else if ( autoEligibleFn(expr->func, autoCfg) ) {
+                    plan(expr, SiteKind::AutoCall);
+                }
+            }
+            virtual void preVisit ( ExprOp1 * expr ) override { Visitor::preVisit(expr); planOp(expr); }
+            virtual void preVisit ( ExprOp2 * expr ) override { Visitor::preVisit(expr); planOp(expr); }
+            virtual void preVisit ( ExprOp3 * expr ) override { Visitor::preVisit(expr); planOp(expr); }
             virtual void preVisit ( ExprInvoke * expr ) override {
                 Visitor::preVisit(expr);
                 if ( !autoCfg.blockLiterals || expr->isInvokeMethod || expr->arguments.empty() ) return;
@@ -612,14 +661,19 @@ namespace das {
         void childrenInEvalOrder ( Expression * e, vector<pair<Expression *,int>> & out ) {
             out.clear();
             if ( e->rtti_isOp3() ) {
+                // a user-overloaded op3 evaluates as a call - every operand eager;
+                // only the builtin form selects its arms lazily
                 auto op3 = static_cast<ExprOp3 *>(e);
+                int lazyArm = (!op3->func || op3->func->builtIn) ? 1 : 0;
                 out.emplace_back(op3->subexpr, 0);
-                out.emplace_back(op3->left, 1);
-                out.emplace_back(op3->right, 1);
+                out.emplace_back(op3->left, lazyArm);
+                out.emplace_back(op3->right, lazyArm);
             } else if ( e->rtti_isOp2() ) {
-                // covers copy/move/clone too: destination address first, then the value
+                // covers copy/move/clone too: destination address first, then the value.
+                // &&/|| short-circuit only in builtin form - a user overload is a call
                 auto op2 = static_cast<ExprOp2 *>(e);
-                bool lazyRight = op2->op=="&&" || op2->op=="||";
+                bool lazyRight = (op2->op=="&&" || op2->op=="||")
+                    && (!op2->func || op2->func->builtIn);
                 out.emplace_back(op2->left, 0);
                 out.emplace_back(op2->right, lazyRight ? 1 : 0);
             } else if ( e->rtti_isNullCoalescing() ) {
@@ -924,10 +978,13 @@ namespace das {
         if ( fn->isClassMethod || fn->classParent ) { err = "[inline] does not support class methods"; return false; }
         if ( fn->isCustomProperty || fn->propertyFunction ) { err = "[inline] does not support property functions"; return false; }
         // a generic instance is named `origin`<hash> - judge by the origin's name.
-        // operator overloads (punctuation names) are called through ExprOp nodes,
-        // which the splicer does not visit, so they can't honor the contract
+        // ExprOp-dispatched operator overloads splice; punctuation functions whose
+        // call sites are other node kinds ([], ??, properties) can't honor the contract
         const string & plainName = fn->fromGeneric ? fn->fromGeneric->name : fn->name;
-        if ( !isPlainIdentifier(plainName) ) { err = "[inline] does not support operator overloads ('" + plainName + "')"; return false; }
+        if ( !isPlainIdentifier(plainName) && !exprOpDispatchedName(plainName) ) {
+            err = "[inline] does not support operator '" + plainName + "' - its call sites do not splice";
+            return false;
+        }
         if ( fn->result && !fn->result->isVoid() ) {
             if ( fn->result->ref ) {
                 err = "[inline] result must be by-value (or void)";
@@ -967,18 +1024,18 @@ namespace das {
         return true;
     }
 
-    // true when `fn` is reachable from its own body through direct calls to [inline]
-    // functions - splicing such a cycle would never terminate
+    // true when `fn` is reachable from its own body through direct calls (or operator
+    // sites) to [inline] functions - splicing such a cycle would never terminate
     static bool inlineGraphReaches ( Function * target, Function * cur, das_hash_set<Function *> & visited ) {
         if ( !cur->body ) return false;
         bool found = false;
         lookupExpressions(cur->body, [&](Expression * expr) {
-            if ( found || !expr->rtti_isCall() ) return;
-            auto call = static_cast<ExprCall *>(expr);
-            if ( !call->func || !call->func->mustInline ) return;
-            if ( call->func==target ) { found = true; return; }
-            if ( visited.insert(call->func).second ) {
-                if ( inlineGraphReaches(target, call->func, visited) ) found = true;
+            if ( found ) return;
+            Function * fn = callLikeFunc(expr);
+            if ( !fn || !fn->mustInline ) return;
+            if ( fn==target ) { found = true; return; }
+            if ( visited.insert(fn).second ) {
+                if ( inlineGraphReaches(target, fn, visited) ) found = true;
             }
         });
         return found;
@@ -1073,20 +1130,25 @@ namespace das {
             return true;
         }
 
-        // recursion over the whole splice graph - [inline] calls and auto-eligible
-        // calls alike - would re-manufacture eligible sites every round
+        // recursion over the whole splice graph - [inline] calls, auto-eligible calls,
+        // and operator sites alike - would re-manufacture eligible sites every round
         bool spliceGraphReaches ( Function * target, Function * cur, const AutoInlineCfg & cfg,
                 das_hash_set<Function *> & visited ) {
             if ( !cur->body ) return false;
             bool found = false;
             lookupExpressions(cur->body, [&](Expression * expr) {
-                if ( found || !expr->rtti_isCall() ) return;
-                auto call = static_cast<ExprCall *>(expr);
-                if ( !call->func ) return;
-                if ( !call->func->mustInline && !autoEligibleCall(call, cfg) ) return;
-                if ( call->func==target ) { found = true; return; }
-                if ( visited.insert(call->func).second ) {
-                    if ( spliceGraphReaches(target, call->func, cfg, visited) ) found = true;
+                if ( found ) return;
+                Function * fn = callLikeFunc(expr);
+                if ( !fn ) return;
+                if ( !fn->mustInline ) {
+                    bool eligible = expr->rtti_isCall()
+                        ? autoEligibleCall(static_cast<ExprCall *>(expr), cfg)
+                        : autoEligibleFn(fn, cfg);
+                    if ( !eligible ) return;
+                }
+                if ( fn==target ) { found = true; return; }
+                if ( visited.insert(fn).second ) {
+                    if ( spliceGraphReaches(target, fn, cfg, visited) ) found = true;
                 }
             });
             return found;
@@ -1296,7 +1358,7 @@ namespace das {
                     if ( !literal ) continue;   // not a traceable block literal
                     subjName = "block";
                 } else {
-                    calleeFn = static_cast<ExprCall *>(callLike)->func;
+                    calleeFn = static_cast<ExprCallFunc *>(callLike)->func;  // ExprCall or ExprOp1/2/3
                     subjName = calleeFn->name;
                 }
                 if ( !site.stmt || !site.anchor.block ) {
@@ -1332,6 +1394,7 @@ namespace das {
                 ExprBlock * body = nullptr;
                 TypeDecl * subjResult = nullptr;    // null = void result
                 SiteArgs sa;
+                vector<ExpressionPtr> opArgs;   // operator sites: operands as an argument vector
                 if ( site.kind==SiteKind::Devirt ) {
                     string why;
                     if ( !devirtShapeOk(literal, why) ) { decline(site, why, callLike->at); continue; }
@@ -1342,14 +1405,35 @@ namespace das {
                     if ( blk->returnType && !blk->returnType->isVoid() ) subjResult = blk->returnType;
                     sa.args = &inv->arguments; sa.ofs = 1; sa.params = &blk->arguments;
                 } else {
-                    auto call = static_cast<ExprCall *>(callLike);
                     if ( site.kind==SiteKind::MustCall ) {
                         if ( !calleeShapeOk(calleeFn) ) continue;   // lint reports at the declaration
                     } else {
                         string why;
                         if ( !autoCalleeOk(calleeFn, why) ) { decline(site, subjName + ": " + why, callLike->at); continue; }
                     }
-                    if ( call->arguments.size() != calleeFn->arguments.size() ) continue; // not fully inferred - defensive
+                    if ( callLike->rtti_isCall() ) {
+                        auto call = static_cast<ExprCall *>(callLike);
+                        if ( call->arguments.size() != calleeFn->arguments.size() ) continue; // not fully inferred - defensive
+                        sa.args = &call->arguments;
+                    } else {
+                        // an operator site: view the operands as an argument vector. read-only
+                        // by construction - args are cloned into temps or substitution plans,
+                        // and the op node itself is replaced wholesale at the end
+                        if ( callLike->rtti_isOp1() ) {
+                            opArgs.push_back(static_cast<ExprOp1 *>(callLike)->subexpr);
+                        } else if ( callLike->rtti_isOp2() ) {
+                            auto op2 = static_cast<ExprOp2 *>(callLike);
+                            opArgs.push_back(op2->left);
+                            opArgs.push_back(op2->right);
+                        } else {
+                            auto op3 = static_cast<ExprOp3 *>(callLike);
+                            opArgs.push_back(op3->subexpr);
+                            opArgs.push_back(op3->left);
+                            opArgs.push_back(op3->right);
+                        }
+                        if ( opArgs.size() != calleeFn->arguments.size() ) continue; // defensive
+                        sa.args = &opArgs;
+                    }
                     // a generic instance lives in the CALLER's module - judge its home
                     // (and the reachability of its references) by the generic's origin
                     Module * originModule = calleeFn->fromGeneric
@@ -1363,7 +1447,7 @@ namespace das {
                     }
                     body = static_cast<ExprBlock *>(calleeFn->body);
                     if ( calleeFn->result && !calleeFn->result->isVoid() ) subjResult = calleeFn->result;
-                    sa.args = &call->arguments; sa.ofs = 0; sa.params = &calleeFn->arguments;
+                    sa.ofs = 0; sa.params = &calleeFn->arguments;
                 }
                 // a callee body may itself contain manufactured __inl locals (interiors
                 // splice before their callers within a round, and the counter is
@@ -1853,12 +1937,13 @@ namespace das {
             if ( fn->module != thisMod ) return;
             if ( !seen.insert(fn).second ) return;
             lookupExpressions(fn->body, [&](Expression * expr) {
-                if ( expr->rtti_isCall() ) {
-                    auto call = static_cast<ExprCall *>(expr);
-                    if ( !call->func ) return;
-                    if ( call->func->mustInline || autoEligibleCall(call, cfg) ) {
-                        orderInlineFunctions(thisMod, call->func, cfg, order, seen);
-                    }
+                Function * callee = callLikeFunc(expr);
+                if ( !callee ) return;
+                bool eligible = callee->mustInline || (expr->rtti_isCall()
+                    ? autoEligibleCall(static_cast<ExprCall *>(expr), cfg)
+                    : autoEligibleFn(callee, cfg));
+                if ( eligible ) {
+                    orderInlineFunctions(thisMod, callee, cfg, order, seen);
                 }
             });
             order.push_back(fn);
