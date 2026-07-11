@@ -30,7 +30,7 @@ for e in ev:
                 st, nstages.get(ch, 0), ch, a.get("arg", 0), tags.get(ch, 0)])
 
 out.sort(key=lambda r: (r[0], r[1]))
-lanes = max(r[0] for r in out) + 1
+lanes = (max(r[0] for r in out) + 1) if out else 0   # empty window -> valid empty output
 span = hi - lo
 compact = json.dumps(out, separators=(",", ":"))
 open(dst, "w").write(f'{{"lanes":{lanes},"span":{span:.1f},"events":{compact}}}')
