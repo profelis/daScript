@@ -41,7 +41,7 @@ def model_available(t : T?; path : string) : bool {
         return false
     }
     if (!parity_full_mode() && st.size > LARGE_TIER_BYTES) {
-        t |> skip("{base_name(path)} is large-tier ({st.size / (1024ul * 1024ul * 1024ul)} GB) — set DASLLAMA_PARITY_FULL=1 to run")
+        t |> skip("{base_name(path)} is large-tier ({int64(st.size / (1024ul * 1024ul * 1024ul))} GB) — set DASLLAMA_PARITY_FULL=1 to run")
         return false
     }
     return true

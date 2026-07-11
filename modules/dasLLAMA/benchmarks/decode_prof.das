@@ -71,6 +71,9 @@ struct Args {
     @clarg_doc = "Weight-scale plane A/B: 1 = convert to f16 at load (llama.cpp byte parity), 0 = keep f32, -1 = keep default"
     wscale_f16 : int = -1
 
+    @clarg_doc = "Native K-quant planes A/B: 1 = keep Q4_K/Q5_K/Q6_K packed at load, 0 = q8-requant fallback, -1 = keep default"
+    kquant_native : int = -1
+
     @clarg_doc = "A/B: size chunk counts to workers only (the pre-fix split), not workers + caller lane"
     legacy_lanes : bool
 
@@ -251,6 +254,11 @@ def main() {
     if (cfg.wscale_f16 >= 0) {
         set_wscale_f16(cfg.wscale_f16 != 0)
         print("wscale_f16 override: {cfg.wscale_f16 != 0}\n")
+    }
+    // native K-quant planes are a LOAD-TIME layout decision — same rule
+    if (cfg.kquant_native >= 0) {
+        set_kquant_native(cfg.kquant_native != 0)
+        print("kquant_native override: {cfg.kquant_native != 0}\n")
     }
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)

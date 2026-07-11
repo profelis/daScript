@@ -33,6 +33,17 @@ enum QuantMode {
     q4
 }
 
+//! Per-weight storage format under a q8-mode load with native K-quant planes (kquant_native):
+//! q8 = qblob/qscales as always; k4/k5/k6 = the tensor's element offset indexes that format's
+//! plane pair (Model.k4q/k4s etc). A Q4_K_M file mixes formats PER TENSOR (attn_v/ffn_down and
+//! the tied embedding go Q6_K), so the tag rides per layer next to each offset array.
+enum KqFmt : uint8 {
+    q8
+    k4
+    k5
+    k6
+}
+
 //! FFN gate activation: silu = SwiGLU (Llama family), gelu = GeGLU (Gemma), swiglu_oai = the
 //! clamped SwiGLU with +1 on the up branch (gpt-oss).
 enum FfnAct {
@@ -242,6 +253,32 @@ struct Model {
     // expand bit-for-bit. ple_model_off indexes bf16blob when set, fblob otherwise.
     bf16blob : array<uint16>
     ple_model_bf16 : bool = false
+    // Native K-quant planes (valid when kquant_native): big weights whose disk type is
+    // Q4_K/Q5_K/Q6_K live in per-format plane pairs instead of qblob — quant payloads packed per
+    // 256-weight superblock (k4q 128B nibbles; k5q [128B nibbles][32B high-bits]; k6q
+    // [128B ql][64B qh]) plus scale planes (k4s/k5s: f16 (d*sc, dmin*m) pairs per 32-sub-block,
+    // 4B — the load-time unpack of the 6-bit packed sub-scales that keeps llama.cpp ALU-bound;
+    // k6s: the native 16 int8 sub-scales + f16 d, 18B, trivial to widen in-loop). The matching
+    // *_fmt tag says which plane a weight's element offset indexes: quant byte =
+    // (off/256)*{128,160,192}, scale byte = (off/32)*4 for k4/k5, (off/256)*18 for k6.
+    k4q : array<uint8>
+    k4s : array<uint8>
+    k5q : array<uint8>
+    k5s : array<uint8>
+    k6q : array<uint8>
+    k6s : array<uint8>
+    kquant_native : bool = false
+    // per-layer weight format tags (KqFmt; empty = all q8). Filled by detect_kq_formats before
+    // layout_offsets so the layout walks each tensor into its format's cursor.
+    wq_fmt : array<KqFmt>
+    wk_fmt : array<KqFmt>
+    wv_fmt : array<KqFmt>
+    wo_fmt : array<KqFmt>
+    w1_fmt : array<KqFmt>
+    w2_fmt : array<KqFmt>
+    w3_fmt : array<KqFmt>
+    wcls_fmt : KqFmt = KqFmt.q8
+    emb_fmt : KqFmt = KqFmt.q8
     // Attention projections use PER-LAYER offsets — tensor shapes differ per layer class on gemma4
     // (SWA 16Q/8KV heads of 256 vs global 16Q/1KV of 512); uniform arches fill the flat strides.
     // wv_offs[l] = -1 marks a layer with no attn_v tensor (V reuses the pre-norm K projection).
@@ -366,20 +403,58 @@ struct private LayoutSizes {
     wblob_n : int64   // element count of the big-weight region
     mx_n : int64      // element count of the native-MXFP4 expert planes (0 unless experts_mx4)
     bf16_n : int64    // halfword count of the native-BF16 region (0 unless ple_model_bf16)
+    k4_n : int64      // element counts of the native K-quant planes (0 unless kquant_native)
+    k5_n : int64
+    k6_n : int64
 }
 
-// Fill the dense FFN offset tables (w1/w2/w3), each a contiguous per-layer region, from `wo` — the
-// running big-weight cursor. Per-layer FFN width (gemma-4 E2B) reads t.ffn_w; empty = uniform `hidden`.
-// Keeping w1/w2/w3 as separate contiguous regions preserves the llama2.c checkpoint's block copy.
-def private fill_dense_ffn_offsets(var t : Model; wo, layers, dim, hidden : int64) : int64 {
-    var off = wo
+// The big-weight layout cursors: one element cursor per storage plane. kq_take advances the
+// cursor a weight's format tag selects, so layout_offsets stays a single linear walk.
+struct private KqCursors {
+    wo : int64   // qblob / wblob / q4blob (the classic parallel-offset region)
+    k4 : int64
+    k5 : int64
+    k6 : int64
+}
+
+def private kq_take(var cur : KqCursors; f : KqFmt; n : int64) : int64 {
+    if (f == KqFmt.k4) {
+        let o = cur.k4
+        cur.k4 += n
+        return o
+    }
+    if (f == KqFmt.k5) {
+        let o = cur.k5
+        cur.k5 += n
+        return o
+    }
+    if (f == KqFmt.k6) {
+        let o = cur.k6
+        cur.k6 += n
+        return o
+    }
+    let o = cur.wo
+    cur.wo += n
+    return o
+}
+
+// Format tag for layer l of a per-kind tag array; empty array (non-kq load) = q8.
+def private fmt_at(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
+
+//! Tied K-quant classifier: the embedding table lives in a native K-quant plane at wcls_off —
+//! no fp32 table, no qblob copy (the cls_q8 analog for kquant_native loads).
+def cls_kq(t : Model) : bool => t.kquant_native && t.config.shared_weights && t.emb_fmt != KqFmt.q8
+
+// Fill the dense FFN offset tables (w1/w2/w3), each a contiguous per-layer region, advancing the
+// cursor each weight's format selects. Per-layer FFN width (gemma-4 E2B) reads t.ffn_w; empty =
+// uniform `hidden`. Keeping w1/w2/w3 as separate contiguous regions preserves the llama2.c block copy.
+def private fill_dense_ffn_offsets(var t : Model; var cur : KqCursors; layers, dim, hidden : int64) {
     t.w1_offs |> clear(); t.w1_offs |> reserve(layers)
-    for (l in range64(layers)) { t.w1_offs |> push(off); off += dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]) }
+    for (l in range64(layers)) { t.w1_offs |> push(kq_take(cur, fmt_at(t.w1_fmt, l), dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]))) }
     t.w2_offs |> clear(); t.w2_offs |> reserve(layers)
-    for (l in range64(layers)) { t.w2_offs |> push(off); off += (empty(t.ffn_w) ? hidden : t.ffn_w[l]) * dim }
+    for (l in range64(layers)) { t.w2_offs |> push(kq_take(cur, fmt_at(t.w2_fmt, l), (empty(t.ffn_w) ? hidden : t.ffn_w[l]) * dim)) }
     t.w3_offs |> clear(); t.w3_offs |> reserve(layers)
-    for (l in range64(layers)) { t.w3_offs |> push(off); off += dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]) }
-    return off
+    for (l in range64(layers)) { t.w3_offs |> push(kq_take(cur, fmt_at(t.w3_fmt, l), dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]))) }
 }
 
 // Fill both offset tables from the config; return the element counts of each region. The big-weight
@@ -393,8 +468,8 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     let layers = c.n_layers
     var fo = 0l
     var bf16 = 0l
-    if (t.cls_q8) {
-        t.tok_emb_off = -1l   // no fp32 embedding table — rows dequant from emb_q8_off
+    if (t.cls_q8 || cls_kq(t)) {
+        t.tok_emb_off = -1l   // no fp32 embedding table — rows dequant from emb_q8_off / the kq plane
     } else {
         t.tok_emb_off = fo
         fo += c.vocab_size * dim
@@ -502,12 +577,11 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             kvrow += layer_kv_dim(c, l)
         }
     }
-    var wo = 0l
+    var cur = KqCursors()
     t.wq_offs |> clear()
     t.wq_offs |> reserve(layers)
     for (l in range64(layers)) {
-        t.wq_offs |> push(wo)
-        wo += dim * layer_qd(c, l)
+        t.wq_offs |> push(kq_take(cur, fmt_at(t.wq_fmt, l), dim * layer_qd(c, l)))
     }
     t.wk_offs |> clear()
     t.wk_offs |> reserve(layers)
@@ -515,8 +589,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         if (t.kv_src[l] != l) {
             t.wk_offs |> push(-1l)   // shared-KV layer (E-series): no attn_k of its own
         } else {
-            t.wk_offs |> push(wo)
-            wo += dim * layer_kv_dim(c, l)
+            t.wk_offs |> push(kq_take(cur, fmt_at(t.wk_fmt, l), dim * layer_kv_dim(c, l)))
         }
     }
     t.wv_offs |> clear()
@@ -526,15 +599,13 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         if (t.kv_src[l] != l || ((c.v_from_k_mask >> uint64(l)) & 1ul) != 0ul) {
             t.wv_offs |> push(-1l)
         } else {
-            t.wv_offs |> push(wo)
-            wo += dim * layer_kv_dim(c, l)
+            t.wv_offs |> push(kq_take(cur, fmt_at(t.wv_fmt, l), dim * layer_kv_dim(c, l)))
         }
     }
     t.wo_offs |> clear()
     t.wo_offs |> reserve(layers)
     for (l in range64(layers)) {
-        t.wo_offs |> push(wo)
-        wo += layer_qd(c, l) * dim
+        t.wo_offs |> push(kq_take(cur, fmt_at(t.wo_fmt, l), layer_qd(c, l) * dim))
     }
     var mx = 0l
     if (c.n_expert > 0l) {
@@ -551,53 +622,57 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             t.we3_off = mx
             mx += layers * c.n_expert * ege
         } else {
-            t.we1_off = wo
-            wo += layers * c.n_expert * ege
-            t.we2_off = wo
-            wo += layers * c.n_expert * ege
-            t.we3_off = wo
-            wo += layers * c.n_expert * ege
+            t.we1_off = cur.wo
+            cur.wo += layers * c.n_expert * ege
+            t.we2_off = cur.wo
+            cur.wo += layers * c.n_expert * ege
+            t.we3_off = cur.wo
+            cur.wo += layers * c.n_expert * ege
         }
         if (c.n_ff_shexp > 0l) {
             let she = dim * c.n_ff_shexp
-            t.wsh1_off = wo
-            wo += layers * she
-            t.wsh2_off = wo
-            wo += layers * she
-            t.wsh3_off = wo
-            wo += layers * she
+            t.wsh1_off = cur.wo
+            cur.wo += layers * she
+            t.wsh2_off = cur.wo
+            cur.wo += layers * she
+            t.wsh3_off = cur.wo
+            cur.wo += layers * she
         }
         if (c.moe_dense_shexp) {  // gemma4: the DENSE parallel shared expert (plain ffn gate/up/down)
-            wo = fill_dense_ffn_offsets(t, wo, layers, dim, hidden)
+            fill_dense_ffn_offsets(t, cur, layers, dim, hidden)
         }
     } else {
-        wo = fill_dense_ffn_offsets(t, wo, layers, dim, hidden)
+        fill_dense_ffn_offsets(t, cur, layers, dim, hidden)
     }
     if (has_ple(c)) {  // gemma-4 E-series PLE big weights: the Q8 token table + per-layer Q8 gate/proj
         let ple = c.n_embd_per_layer
-        t.ple_emb_off = wo   // linear, NOT repacked — gathered per token
-        wo += c.vocab_size * ple * layers
-        t.ple_gate_off = wo
-        wo += layers * dim * ple
-        t.ple_proj_off = wo
-        wo += layers * ple * dim
+        t.ple_emb_off = cur.wo   // linear, NOT repacked — gathered per token
+        cur.wo += c.vocab_size * ple * layers
+        t.ple_gate_off = cur.wo
+        cur.wo += layers * dim * ple
+        t.ple_proj_off = cur.wo
+        cur.wo += layers * ple * dim
     }
     if (c.shared_weights) {
         if (t.cls_q8) {
             // tied Q8: the classifier transcode (repacked like every 2D weight) + the linear
             // embedding copy the row reads dequant from
-            t.wcls_off = wo
-            wo += c.vocab_size * dim
-            t.emb_q8_off = wo
-            wo += c.vocab_size * dim
+            t.wcls_off = cur.wo
+            cur.wo += c.vocab_size * dim
+            t.emb_q8_off = cur.wo
+            cur.wo += c.vocab_size * dim
+        } elif (cls_kq(t)) {
+            // tied K-quant: ONE plane copy serves both the classifier matmul and the embedding
+            // row reads — the kq planes stay in disk order (no repack), so no second linear copy
+            t.wcls_off = kq_take(cur, t.emb_fmt, c.vocab_size * dim)
         } else {
             t.wcls_off = 0l   // unused — the classifier reads the fp32 embedding from fblob
         }
     } else {
-        t.wcls_off = wo
-        wo += c.vocab_size * dim
+        t.wcls_off = kq_take(cur, t.wcls_fmt, c.vocab_size * dim)
     }
-    return LayoutSizes(fblob_n = fo, wblob_n = wo, mx_n = mx, bf16_n = bf16)
+    return LayoutSizes(fblob_n = fo, wblob_n = cur.wo, mx_n = mx, bf16_n = bf16,
+                       k4_n = cur.k4, k5_n = cur.k5, k6_n = cur.k6)
 }
 
 // Reserve exact capacity then size — avoids the array allocator's power-of-2 rounding on big arrays.
@@ -697,8 +772,16 @@ def load_checkpoint(path : string) : Model {
 // Read one big 2D weight tensor into the active representation: transcode straight from disk when
 // the on-disk type already matches the target precision, otherwise dequant to a reused fp32 scratch
 // and quantize into the shared blob. `woff` is the weight-element offset; `scratch` is reused.
-def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var t : Model; woff, n : int64; var scratch : array<float>; src_off : int64 = 0l) {
-    if (t.quant == QuantMode.q8) {
+// `fmt` != q8 routes into that native K-quant plane pair (woff is then the plane-local offset the
+// layout's kq cursor assigned — the caller passes the tag it laid the tensor out with).
+def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var t : Model; woff, n : int64; var scratch : array<float>; src_off : int64 = 0l; fmt : KqFmt = KqFmt.q8) {
+    if (fmt == KqFmt.k4) {
+        gguf_transcode_q4k(m, bytes, name, t.k4q, t.k4s, woff, n, src_off)
+    } elif (fmt == KqFmt.k5) {
+        gguf_transcode_q5k(m, bytes, name, t.k5q, t.k5s, woff, n, src_off)
+    } elif (fmt == KqFmt.k6) {
+        gguf_transcode_q6k(m, bytes, name, t.k6q, t.k6s, woff, n, src_off)
+    } elif (t.quant == QuantMode.q8) {
         if (gguf_tensor_type(m, name) == GGML_TYPE_Q8_0) {
             gguf_transcode_q8_0(m, bytes, name, t.qblob, t.qscales, woff, woff / 32l, n, src_off)
         } else {
@@ -783,6 +866,81 @@ def public get_wscale_f16() : bool {
     return g_wscale_f16
 }
 
+// Native K-quant weight planes: Q4_K/Q5_K/Q6_K tensors stay packed in per-format planes (see
+// Model.k4q..k6s) instead of requantizing to Q8. Default OFF until the kernel tier lands — OFF
+// loads them through the q8-requant fallback exactly as before. Load-time switch (like wscale_f16).
+var private g_kquant_native = false
+
+//! Enable/disable native K-quant weight planes for subsequent loads (A/B rail; default off).
+def public set_kquant_native(on : bool) {
+    g_kquant_native = on
+}
+def public get_kquant_native() : bool {
+    return g_kquant_native
+}
+
+// GGML disk type -> plane format tag (non-K-quant types ride the classic q8 path)
+def private kq_fmt_of(gt : int) : KqFmt {
+    if (gt == GGML_TYPE_Q4_K) {
+        return KqFmt.k4
+    }
+    if (gt == GGML_TYPE_Q5_K) {
+        return KqFmt.k5
+    }
+    if (gt == GGML_TYPE_Q6_K) {
+        return KqFmt.k6
+    }
+    return KqFmt.q8
+}
+
+// Fill the per-kind weight format tags from the file's tensor types (q8-mode loads with the
+// kquant_native knob on). Fused-projection arches (Phi3) stay all-q8 — their sub-tensor slices
+// split fused tensors, and a K-quant split is only superblock-aligned by luck. MoE expert stacks
+// and PLE tables also stay q8 (requant fallback) — no kq kernels target them.
+def private detect_kq_formats(var t : Model; m : GGUFMeta) {
+    if (t.quant != QuantMode.q8 || !g_kquant_native || t.config.fused_qkv) {
+        return
+    }
+    let layers = t.config.n_layers
+    t.wq_fmt |> resize(layers)
+    t.wk_fmt |> resize(layers)
+    t.wv_fmt |> resize(layers)
+    t.wo_fmt |> resize(layers)
+    t.w1_fmt |> resize(layers)
+    t.w2_fmt |> resize(layers)
+    t.w3_fmt |> resize(layers)
+    var any = false
+    for (l in range64(layers)) {
+        t.wq_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_q.weight"))
+        t.wk_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_k.weight"))
+        t.wv_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_v.weight"))
+        t.wo_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_output.weight"))
+        t.w1_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate.weight"))
+        t.w2_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_down.weight"))
+        t.w3_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up.weight"))
+        any ||= t.wq_fmt[l] != KqFmt.q8 || t.wk_fmt[l] != KqFmt.q8 || t.wv_fmt[l] != KqFmt.q8
+        any ||= t.wo_fmt[l] != KqFmt.q8 || t.w1_fmt[l] != KqFmt.q8 || t.w2_fmt[l] != KqFmt.q8
+        any ||= t.w3_fmt[l] != KqFmt.q8
+    }
+    if (t.config.shared_weights) {
+        t.emb_fmt = kq_fmt_of(gguf_tensor_type(m, "token_embd.weight"))
+        any ||= t.emb_fmt != KqFmt.q8
+    } else {
+        t.wcls_fmt = kq_fmt_of(gguf_tensor_type(m, "output.weight"))
+        any ||= t.wcls_fmt != KqFmt.q8
+    }
+    if (!any) {   // nothing K-quant in the file: drop the tags so fmt_at short-circuits on empty
+        delete t.wq_fmt
+        delete t.wk_fmt
+        delete t.wv_fmt
+        delete t.wo_fmt
+        delete t.w1_fmt
+        delete t.w2_fmt
+        delete t.w3_fmt
+    }
+    t.kquant_native = any
+}
+
 // Convert the (already repacked/permuted) f32 scale plane to raw binary16 halfwords and free the
 // f32 plane. f16->f32->f16 round-trips exactly, so for gguf-Q8 tensors the halfword plane equals
 // the disk scales bit-for-bit and every dot is bit-identical to the f32 plane; runtime-quantized
@@ -794,6 +952,9 @@ def private wscale_convert_f16(var t : Model) {
         return
     }
     let n = long_length(t.qscales)
+    if (n == 0l) {   // every big weight lives in a native plane (kq/mx4) — nothing to convert
+        return
+    }
     t.qscales16 |> resize(int(n))
     unsafe {
         cvt_f32_to_f16(addr(t.qscales16[0]), addr(t.qscales[0]), n)
@@ -816,14 +977,20 @@ def private repack_q8_weights(var t : Model) {
     for (l in range64(c.n_layers)) {
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
-        repack_q8q8_weight(t.qblob, t.qscales, t.wq_offs[l], dim, qd)
-        if (t.wk_offs[l] >= 0l) {   // absent on E-series shared-KV layers
+        // K-quant-tagged weights live in the kq planes (disk order, never repacked) — their
+        // offsets are NOT qblob offsets, so repacking them here would permute foreign memory
+        if (fmt_at(t.wq_fmt, l) == KqFmt.q8) {
+            repack_q8q8_weight(t.qblob, t.qscales, t.wq_offs[l], dim, qd)
+        }
+        if (t.wk_offs[l] >= 0l && fmt_at(t.wk_fmt, l) == KqFmt.q8) {   // absent on E-series shared-KV layers
             repack_q8q8_weight(t.qblob, t.qscales, t.wk_offs[l], dim, kv)
         }
-        if (t.wv_offs[l] >= 0l) {
+        if (t.wv_offs[l] >= 0l && fmt_at(t.wv_fmt, l) == KqFmt.q8) {
             repack_q8q8_weight(t.qblob, t.qscales, t.wv_offs[l], dim, kv)
         }
-        repack_q8q8_weight(t.qblob, t.qscales, t.wo_offs[l], qd, dim)
+        if (fmt_at(t.wo_fmt, l) == KqFmt.q8) {
+            repack_q8q8_weight(t.qblob, t.qscales, t.wo_offs[l], qd, dim)
+        }
         if (has_ple(c)) {  // gemma-4 E-series per-layer PLE gate/proj (the emb table stays linear, unpacked)
             let ple = c.n_embd_per_layer
             repack_q8q8_weight(t.qblob, t.qscales, t.ple_gate_off + l * dim * ple, dim, ple)
@@ -846,20 +1013,32 @@ def private repack_q8_weights(var t : Model) {
                 repack_q8q8_weight(t.qblob, t.qscales, t.wsh3_off + l * she, dim, c.n_ff_shexp)
             }
             if (c.moe_dense_shexp) {  // gemma4: the dense parallel shared expert repacks like a plain FFN
-                repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, hidden)
-                repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], hidden, dim)
-                repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, hidden)
+                if (fmt_at(t.w1_fmt, l) == KqFmt.q8) {
+                    repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, hidden)
+                }
+                if (fmt_at(t.w2_fmt, l) == KqFmt.q8) {
+                    repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], hidden, dim)
+                }
+                if (fmt_at(t.w3_fmt, l) == KqFmt.q8) {
+                    repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, hidden)
+                }
             }
         } else {
             let h = layer_hidden(t, l)
-            repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, h)
-            repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], h, dim)
-            repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, h)
+            if (fmt_at(t.w1_fmt, l) == KqFmt.q8) {
+                repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, h)
+            }
+            if (fmt_at(t.w2_fmt, l) == KqFmt.q8) {
+                repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], h, dim)
+            }
+            if (fmt_at(t.w3_fmt, l) == KqFmt.q8) {
+                repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, h)
+            }
         }
     }
-    if (!c.shared_weights || t.cls_q8) {
+    if ((!c.shared_weights && t.wcls_fmt == KqFmt.q8) || t.cls_q8) {
         // the linear copy at emb_q8_off is deliberately NOT repacked — embedding-row dequant
-        // indexes it directly
+        // indexes it directly. K-quant classifiers (either tying) stay in their plane, unpacked.
         repack_q8q8_weight(t.qblob, t.qscales, t.wcls_off, dim, c.vocab_size)
     }
 }
@@ -1155,6 +1334,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         // fp32 path (a requantized classifier would drift from the oracle for no parity gain).
         t.cls_q8 = (t.config.shared_weights && mode == QuantMode.q8
             && gguf_tensor_type(m, "token_embd.weight") == GGML_TYPE_Q8_0)
+        // per-tensor K-quant format tags (kquant_native rail; no-op when the knob is off or the
+        // file has no K-quant tensors) — must precede layout_offsets, which walks the tags
+        detect_kq_formats(t, m)
         // logit soft-caps from metadata when present (gemma2: 50/30, gemma4: final 30 only);
         // configure()'s values stay as the fallback for files without the keys
         if (gguf_has(m, "{arch}.attn_logit_softcapping")) {
@@ -1208,6 +1390,24 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             t.mxs |> reserve(sz.mx_n / 32l)
             t.mxs |> resize(sz.mx_n / 32l)
         }
+        if (sz.k4_n > 0l) {
+            t.k4q |> reserve((sz.k4_n / 256l) * K4_QSB)
+            t.k4q |> resize((sz.k4_n / 256l) * K4_QSB)
+            t.k4s |> reserve((sz.k4_n / 256l) * K4_SSB)
+            t.k4s |> resize((sz.k4_n / 256l) * K4_SSB)
+        }
+        if (sz.k5_n > 0l) {
+            t.k5q |> reserve((sz.k5_n / 256l) * K5_QSB)
+            t.k5q |> resize((sz.k5_n / 256l) * K5_QSB)
+            t.k5s |> reserve((sz.k5_n / 256l) * K5_SSB)
+            t.k5s |> resize((sz.k5_n / 256l) * K5_SSB)
+        }
+        if (sz.k6_n > 0l) {
+            t.k6q |> reserve((sz.k6_n / 256l) * K6_QSB)
+            t.k6q |> resize((sz.k6_n / 256l) * K6_QSB)
+            t.k6s |> reserve((sz.k6_n / 256l) * K6_SSB)
+            t.k6s |> resize((sz.k6_n / 256l) * K6_SSB)
+        }
         if (mode == QuantMode.q8) {
             t.qblob |> reserve(sz.wblob_n)
             t.qblob |> resize(sz.wblob_n)
@@ -1221,9 +1421,10 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         } else {
             reserve_resize(t.wblob, sz.wblob_n)
         }
-        // embedding + norms -> fblob (decoded to fp32 from whatever the disk type is); cls_q8 keeps
-        // the embedding out of fblob — both Q8 copies transcode with the big weights below
-        if (!t.cls_q8) {
+        // embedding + norms -> fblob (decoded to fp32 from whatever the disk type is); cls_q8 /
+        // cls_kq keep the embedding out of fblob — the quantized copies transcode with the big
+        // weights below
+        if (!t.cls_q8 && !cls_kq(t)) {
             gguf_read_tensor_f32(m, bytes, "token_embd.weight", t.fblob, t.tok_emb_off, vocab * dim)
         }
         // gpt-oss names its pre-FFN norm post_attention_norm (same graph role as ffn_norm)
@@ -1287,15 +1488,15 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wk_offs[l], dim * kv_l, scratch, dim * qd_l)
                 load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wv_offs[l], dim * kv_l, scratch, dim * qd_l + dim * kv_l)
             } else {
-                load_big(m, bytes, "blk.{l}.attn_q.weight", t, t.wq_offs[l], dim * qd_l, scratch)
+                load_big(m, bytes, "blk.{l}.attn_q.weight", t, t.wq_offs[l], dim * qd_l, scratch, 0l, fmt_at(t.wq_fmt, l))
                 if (t.wk_offs[l] >= 0l) {   // absent on E-series shared-KV layers (reuse the source layer's K)
-                    load_big(m, bytes, "blk.{l}.attn_k.weight", t, t.wk_offs[l], dim * kv_l, scratch)
+                    load_big(m, bytes, "blk.{l}.attn_k.weight", t, t.wk_offs[l], dim * kv_l, scratch, 0l, fmt_at(t.wk_fmt, l))
                 }
                 if (t.wv_offs[l] >= 0l) {   // absent on gemma4 global (V-from-K) + E-series shared-KV layers
-                    load_big(m, bytes, "blk.{l}.attn_v.weight", t, t.wv_offs[l], dim * kv_l, scratch)
+                    load_big(m, bytes, "blk.{l}.attn_v.weight", t, t.wv_offs[l], dim * kv_l, scratch, 0l, fmt_at(t.wv_fmt, l))
                 }
             }
-            load_big(m, bytes, "blk.{l}.attn_output.weight", t, t.wo_offs[l], qd_l * dim, scratch)
+            load_big(m, bytes, "blk.{l}.attn_output.weight", t, t.wo_offs[l], qd_l * dim, scratch, 0l, fmt_at(t.wo_fmt, l))
             if (t.config.n_expert > 0l) {
                 // MoE: fp32 router (+ shared-expert gate vector) -> fblob; the 3D expert stacks are
                 // expert-major on disk, so ONE contiguous load lands every expert's 2D matrix at its
@@ -1345,9 +1546,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                     load_big(m, bytes, "blk.{l}.ffn_up_shexp.weight", t, t.wsh3_off + l * she, she, scratch)
                 }
                 if (t.config.moe_dense_shexp) {  // gemma4: the DENSE parallel shared expert (plain ffn gate/up/down)
-                    load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_offs[l], dim * hidden, scratch)
-                    load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * hidden, scratch)
-                    load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], hidden * dim, scratch)
+                    load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_offs[l], dim * hidden, scratch, 0l, fmt_at(t.w1_fmt, l))
+                    load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * hidden, scratch, 0l, fmt_at(t.w3_fmt, l))
+                    load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], hidden * dim, scratch, 0l, fmt_at(t.w2_fmt, l))
                 }
             } elif (t.config.fused_qkv) {
                 load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w1_offs[l], dim * hidden, scratch, 0l)
@@ -1355,9 +1556,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], hidden * dim, scratch)
             } else {
                 let h = layer_hidden(t, l)   // gemma-4 E2B varies this per layer
-                load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_offs[l], dim * h, scratch)
-                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * h, scratch)
-                load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], h * dim, scratch)
+                load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_offs[l], dim * h, scratch, 0l, fmt_at(t.w1_fmt, l))
+                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * h, scratch, 0l, fmt_at(t.w3_fmt, l))
+                load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], h * dim, scratch, 0l, fmt_at(t.w2_fmt, l))
             }
             if (has_ple(t.config)) {  // gemma-4 E-series: per-layer PLE gate (dim->ple) + proj (ple->dim), Q8
                 let ple = t.config.n_embd_per_layer
@@ -1369,11 +1570,15 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             load_big(m, bytes, "per_layer_token_embd.weight", t, t.ple_emb_off, vocab * t.config.n_embd_per_layer * layers, scratch)
         }
         if (!t.config.shared_weights) {
-            load_big(m, bytes, "output.weight", t, t.wcls_off, vocab * dim, scratch)
+            load_big(m, bytes, "output.weight", t, t.wcls_off, vocab * dim, scratch, 0l, t.wcls_fmt)
         } elif (t.cls_q8) {
             // tied Q8: classifier copy (repacked below) + the linear copy embedding rows read
             gguf_transcode_q8_0(m, bytes, "token_embd.weight", t.qblob, t.qscales, t.wcls_off, t.wcls_off / 32l, vocab * dim)
             gguf_transcode_q8_0(m, bytes, "token_embd.weight", t.qblob, t.qscales, t.emb_q8_off, t.emb_q8_off / 32l, vocab * dim)
+        } elif (cls_kq(t)) {
+            // tied K-quant: ONE plane copy serves the classifier matmul and embedding row reads
+            // (the kq planes stay in disk order — no repack, so no second linear copy)
+            load_big(m, bytes, "token_embd.weight", t, t.wcls_off, vocab * dim, scratch, 0l, t.emb_fmt)
         }
         // Qwen2 Q/K/V projection biases — small fp32 tensors, kept dense
         if (t.config.attn_qkv_bias) {
@@ -1450,6 +1655,8 @@ struct MemFootprint {
     q4_scale_bytes : int64
     mx4_bytes : int64
     mx4_scale_bytes : int64
+    kq_bytes : int64         // native K-quant planes: quant payloads (k4q+k5q+k6q)
+    kq_scale_bytes : int64   // ... and their scale planes (k4s+k5s+k6s)
     total : int64
 }
 
@@ -1464,9 +1671,12 @@ def footprint(t : Model) : MemFootprint {
     let q4s = long_length(t.q4scales) * 4l
     let mx4 = long_length(t.mxq)                  // uint8 (two nibbles) -> 1 byte each
     let mx4s = long_length(t.mxs)                 // raw E8M0 -> 1 byte per 32-block
+    let kq = long_length(t.k4q) + long_length(t.k5q) + long_length(t.k6q)
+    let kqs = long_length(t.k4s) + long_length(t.k5s) + long_length(t.k6s)
     return MemFootprint(aux_fp32_bytes = aux, weight_fp32_bytes = wf, q8_bytes = q8, q8_scale_bytes = q8s,
                         q4_bytes = q4, q4_scale_bytes = q4s, mx4_bytes = mx4, mx4_scale_bytes = mx4s,
-                        total = aux + wf + q8 + q8s + q4 + q4s + mx4 + mx4s)
+                        kq_bytes = kq, kq_scale_bytes = kqs,
+                        total = aux + wf + q8 + q8s + q4 + q4s + mx4 + mx4s + kq + kqs)
 }
 
 //! A caller-owned paged KV-cache pool (``create_kv_pool_``). Pages chunk POSITIONS (codec blocks
@@ -1828,6 +2038,7 @@ def apply_box_profile_runtime(path : string = "") {
     apply_i64_knob(rt, "matmul_min_chunk_rows_gemv") $(v) { set_matmul_min_chunk_rows_gemv(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "gemv_chunks_per_lane") $(v) { set_gemv_chunks_per_lane(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "wscale_f16") $(v) { set_wscale_f16(v != 0l) }
+    apply_i64_knob(rt, "kquant_native") $(v) { set_kquant_native(v != 0l) }
     apply_i64_knob(rt, "gemv_lane_cap") $(v) { set_gemv_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_lane_cap") $(v) { set_batch_lane_cap(int(min(v, 2147483647l))) }
     apply_i64_knob(rt, "batch_grid_2d") $(v) { set_batch_grid_2d(int(min(v, 2l))) }
