@@ -373,8 +373,10 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     g_jit_fast_math = (prog._options |> find_arg("fast_math") ?as tBool ?? prog.policies.fast_math) || (prog._options |> find_arg("_jit_fast_math") ?as tBool ?? false)
 
     // the disable pass consults target-gated intrinsic tables (has_intrinsic) — the
-    // g_target_* truth must be set BEFORE it runs, not first at init_jit time below
-    init_jit_target_flags(target_triple)
+    // g_target_* truth must be set BEFORE it runs, not first at init_jit time below.
+    // Standalone exes target a GENERIC CPU (write_exe use_host_cpu=false default), so
+    // host cpuid features must not leak into their emission (host_features=false).
+    init_jit_target_flags(target_triple, !gen_exe)
     make_visitor(*disableJitVisitor) $(disableJitVisitorAdapter) {
         prog |> for_each_module() $(mod) {
             mod |> for_each_function("") $(fun) {
@@ -416,7 +418,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
         // Pass target_triple so init_jit can pin the module data layout
             // BEFORE IR construction (wasm32 cross-compile needs 4-byte pointer
             // sizes baked into GEP folding from the very first IR instruction).
-            init_jit(opt_level |> uint, target_triple)
+            init_jit(opt_level |> uint, target_triple, !gen_exe)
 
         var jit_flags : LlvmJitFlags
         jit_flags.emit_prologue = emit_prologue

@@ -580,8 +580,15 @@ def public init_jit_clopts() {
 
 // Pure target-truth computation — no LLVM state touched, so it is safe (and required) to
 // call BEFORE init_jit: the DisableJitVisitor pass consults the g_target_* gates through
-// has_intrinsic, and it runs before the LLVM module exists. init_jit re-runs it (idempotent).
-def public init_jit_target_flags(target_triple : string = "") {
+// has_intrinsic, and it runs before the LLVM module exists. init_jit re-runs it (idempotent —
+// callers must pass the SAME host_features both times or the pass and emission diverge).
+//
+// host_features=false (standalone-exe builds): the artifact targets a GENERIC CPU of the host
+// arch (write_exe use_host_cpu=false is the redistributable default), so every cpuid/host-
+// feature-derived gate must be conservative — host-F16C leaking into a generic x64 exe emits
+// fpext-through-half that lowers to compiler-rt libcalls (__extendhfsf2) msvcrt never links.
+// Env-FORCED features stay honored (explicit emission-only rail, same contract as cross triples).
+def public init_jit_target_flags(target_triple : string = ""; host_features : bool = true) {
     g_target_is_wasm = target_triple |> starts_with("wasm")
     // Host path (empty triple): the module targets the host, so the daslang binary's own arch is the
     // JIT target arch. Explicit cross-compile triple: read the arch off the triple prefix.
@@ -592,20 +599,19 @@ def public init_jit_target_flags(target_triple : string = "") {
         ? get_architecture_name() == "x86_64"
         : (starts_with(target_triple, "x86_64") || starts_with(target_triple, "amd64")))
     // AVX2 gate for the x64 intrinsic table (see the declaration comment): host targets take the
-    // running box's cpuid truth. Explicit x64 cross triples take DAS_JIT_X64_FORCE_FEATURES as
-    // the ONLY tier truth (emission-only artifacts, never executed) — no env, no AVX emission,
-    // which keeps the pre-force cross behavior.
-    let x64_cross = g_target_is_x64 && !empty(target_triple)
-    g_target_x64_avx2 = g_target_is_x64 && (x64_cross ? x64_forced_feature("avx2") : cpu_supports("avx2"))
-    g_target_x64_f16c = g_target_is_x64 && (x64_cross ? x64_forced_feature("f16c") : cpu_supports("f16c"))
+    // running box's cpuid truth. Explicit x64 cross triples — and generic-CPU exe builds — take
+    // DAS_JIT_X64_FORCE_FEATURES as the ONLY tier truth (emission-only artifacts).
+    let forced_only = (g_target_is_x64 && !empty(target_triple)) || !host_features
+    g_target_x64_avx2 = g_target_is_x64 && (forced_only ? x64_forced_feature("avx2") : cpu_supports("avx2"))
+    g_target_x64_f16c = g_target_is_x64 && (forced_only ? x64_forced_feature("f16c") : cpu_supports("f16c"))
     // Matrix-tier gates (see the declaration comment): cpuid truth OR'd with the
     // DAS_JIT_X64_FORCE_FEATURES emission-only override; forced-only on cross triples.
-    g_target_x64_vnni256 = g_target_x64_avx2 && (x64_tier_feature("avxvnni", x64_cross)
-        || (x64_tier_feature("avx512vnni", x64_cross) && x64_tier_feature("avx512vl", x64_cross)))
-    g_target_x64_avx512bw = g_target_x64_avx2 && x64_tier_feature("avx512f", x64_cross) && x64_tier_feature("avx512bw", x64_cross)
-    g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_tier_feature("avx512vnni", x64_cross)
-    g_target_x64_vnniint8 = g_target_x64_avx2 && x64_tier_feature("avxvnniint8", x64_cross)
-    g_target_x64_amx = g_target_is_x64 && x64_tier_feature("amx-tile", x64_cross) && x64_tier_feature("amx-int8", x64_cross)
+    g_target_x64_vnni256 = g_target_x64_avx2 && (x64_tier_feature("avxvnni", forced_only)
+        || (x64_tier_feature("avx512vnni", forced_only) && x64_tier_feature("avx512vl", forced_only)))
+    g_target_x64_avx512bw = g_target_x64_avx2 && x64_tier_feature("avx512f", forced_only) && x64_tier_feature("avx512bw", forced_only)
+    g_target_x64_avx512vnni = g_target_x64_avx512bw && x64_tier_feature("avx512vnni", forced_only)
+    g_target_x64_vnniint8 = g_target_x64_avx2 && x64_tier_feature("avxvnniint8", forced_only)
+    g_target_x64_amx = g_target_is_x64 && x64_tier_feature("amx-tile", forced_only) && x64_tier_feature("amx-int8", forced_only)
     // target OS truth (native = host platform; cross = the triple's OS field)
     g_target_os_linux = (empty(target_triple)
         ? get_platform_name() == "linux"
@@ -613,17 +619,19 @@ def public init_jit_target_flags(target_triple : string = "") {
     // aarch64 i8mm tier (see the g_target_arm64_i8mm declaration comment): host targets read
     // LLVM's host-features string OR the arm force env; cross aarch64 triples the env only.
     g_target_arm64_i8mm = g_target_is_aarch64 && (arm64_forced_feature("i8mm")
-        || (empty(target_triple) && host_llvm_feature("i8mm")))
-    // aarch64 fullfp16 (see declaration comment): darwin-arm64 == Apple Silicon == always
+        || (empty(target_triple) && host_features && host_llvm_feature("i8mm")))
+    // aarch64 fullfp16 (see declaration comment): darwin-arm64 == Apple Silicon == always.
+    // Generic-exe builds stay off — the promote/narrow path is ARMv8.0-legal, fullfp16 is not.
     g_target_arm64_fullfp16 = g_target_is_aarch64 && (arm64_forced_feature("fullfp16")
-        || (empty(target_triple) && (host_llvm_feature("fullfp16") || get_platform_name() == "darwin")))
-    // fp16 operators lower as promote-compute-narrow IR wherever half converts are
-    // hardware (routing truth for isExprOp2/Op1_Func — lives in llvm_boost)
+        || (empty(target_triple) && host_features && (host_llvm_feature("fullfp16") || get_platform_name() == "darwin")))
+    // fp16 operators lower as promote-compute-narrow IR wherever half converts are hardware
+    // (routing truth for isExprOp2/Op1_Func — lives in llvm_boost). aarch64 needs no feature
+    // gate: f16<->f32 converts are ARMv8.0 baseline, so even generic-exe aarch64 stays native.
     g_lattice_fp16_ops_native = g_target_is_aarch64 || g_target_x64_f16c
 }
 
 [macro_function]
-def public init_jit(cg_opt_level : uint; target_triple : string = "") {
+def public init_jit(cg_opt_level : uint; target_triple : string = ""; host_features : bool = true) {
     // also prevent double init (g_mod != null)
     return if (is_in_completion() || is_compiling_macros() || g_mod != null)
     LLVMLinkInMCJIT()
@@ -645,7 +653,7 @@ def public init_jit(cg_opt_level : uint; target_triple : string = "") {
     // 8-byte pointers and the target has 4-byte, every for-loop end-pointer
     // GEP bakes in the wrong stride and the loop never terminates. The native
     // path (empty triple) keeps the host default.
-    init_jit_target_flags(target_triple)
+    init_jit_target_flags(target_triple, host_features)
     if (!(target_triple |> empty())) {
         // wasm32 target isn't always part of LLVMInitializeAllTargets in
         // prebuilt LLVM.dll — call the explicit wasm initializer when needed.
