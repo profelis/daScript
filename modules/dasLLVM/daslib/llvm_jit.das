@@ -2889,6 +2889,49 @@ class public LlvmJitVisitor : AstVisitor {
             right = LLVMBuildAnd(g_builder, right, LLVMConstInt(type_to_llvm_type(opType), uint64((opType.sizeOf * 8) - 1), 0), "")
             right = build_broadcast_vector(g_builder, shiftType, right)
         }
+        if (is_f16_small_type(opType.baseType)) {
+            // fp16 family (float16 scalar + halfN): the reference semantics ARE promote-to-
+            // f32 -> compute -> round-back (RNE), which is exactly fpext -> fop -> fptrunc.
+            // Compares run on the promoted floats (conversion is exact, so predicates agree).
+            // Only routed here when g_lattice_fp16_ops_native (aarch64 || x64-F16C).
+            let halfT = (opType.isVectorType
+                ? LLVMVectorType(types.t_half, uint(opType.vectorDim))
+                : types.t_half)
+            let promoteT = (opType.isVectorType
+                ? LLVMVectorType(types.t_float, uint(opType.vectorDim))
+                : types.t_float)
+            let rmw = isReadModifyWriteOp2(expr.op)
+            var lf = LLVMBuildFPExt(g_builder, rmw ? r2v_left : left, promoteT, "")
+            var rf = LLVMBuildFPExt(g_builder, right, promoteT, "")
+            if (expr.op == "==" || expr.op == "!=" || expr.op == "<" || expr.op == "<=" || expr.op == ">" || expr.op == ">=") {
+                var opR = LLVMBuildFCmp(g_builder, get_float_compare_op(expr, string(expr.op)), lf, rf, "")
+                if (opType.isVectorType) {
+                    opR = reduce_bit_vector(opR, opType.vectorDim, string(expr.op))
+                }
+                setE(expr, opR)
+                return
+            }
+            var res : LLVMOpaqueValue?
+            if (expr.op == "+" || expr.op == "+=") {
+                res = LLVMBuildFAdd(g_builder, lf, rf, "")
+            } elif (expr.op == "-" || expr.op == "-=") {
+                res = LLVMBuildFSub(g_builder, lf, rf, "")
+            } elif (expr.op == "*" || expr.op == "*=") {
+                res = LLVMBuildFMul(g_builder, lf, rf, "")
+            } elif (expr.op == "/" || expr.op == "/=") {
+                res = LLVMBuildFDiv(g_builder, lf, rf, "")
+            } else {
+                failed_E(expr, "unsupported fp16 operator {expr.op}")
+                return
+            }
+            res = LLVMBuildFPTrunc(g_builder, res, halfT, "")
+            if (rmw) {
+                setE(expr, LLVMBuildStoreAligned(g_builder, res, left, uint(expr.left._type.alignOf)))
+            } else {
+                setE(expr, res)
+            }
+            return
+        }
         if (expr.op == "+") {
             if (isNumeric(opType)) {
                 setE(expr, LLVMBuildAdd(g_builder, left, right, ""))
@@ -3009,12 +3052,12 @@ class public LlvmJitVisitor : AstVisitor {
             }
         } elif (expr.op == "<" || expr.op == ">" || expr.op == "<=" || expr.op == ">=" || expr.op == "==" || expr.op == "!=") {
             var opR : LLVMOpaqueValue?
-            if (expr.left._type.isSignedInteger || (expr.left._type.isVectorType && (expr.left._type.vectorBaseType == Type.tInt || expr.left._type.vectorBaseType == Type.tInt64)) || expr.left._type.isEnum) {
+            if (expr.left._type.isSignedInteger || (expr.left._type.isVectorType && (expr.left._type.vectorBaseType == Type.tInt || expr.left._type.vectorBaseType == Type.tInt64 || expr.left._type.vectorBaseType == Type.tInt16 || expr.left._type.vectorBaseType == Type.tInt8)) || expr.left._type.isEnum) {
                 opR = LLVMBuildICmp(g_builder, get_int_compare_op(expr, string(expr.op)), left, right, "")
                 if (expr.left._type.isVectorType) {
                     opR = reduce_bit_vector(opR, expr.left._type.vectorDim, string(expr.op))
                 }
-            } elif (expr.left._type.isUnsignedInteger || (expr.left._type.isVectorType && (expr.left._type.vectorBaseType == Type.tUInt || expr.left._type.vectorBaseType == Type.tUInt64))) {
+            } elif (expr.left._type.isUnsignedInteger || (expr.left._type.isVectorType && (expr.left._type.vectorBaseType == Type.tUInt || expr.left._type.vectorBaseType == Type.tUInt64 || expr.left._type.vectorBaseType == Type.tUInt16 || expr.left._type.vectorBaseType == Type.tUInt8))) {
                 opR = LLVMBuildICmp(g_builder, get_uint_compare_op(expr, string(expr.op)), left, right, "")
                 if (expr.left._type.isVectorType) {
                     opR = reduce_bit_vector(opR, expr.left._type.vectorDim, string(expr.op))
@@ -6082,7 +6125,10 @@ class public LlvmJitVisitor : AstVisitor {
         } elif (expr.op == "-") {
             if (isNumeric(opType)) {
                 setE(expr, LLVMBuildNeg(g_builder, sexpr, ""))
-            } elif (opType.isFloatOrDouble || (opType.isVectorType && opType.vectorBaseType == Type.tFloat)) {
+            } elif (opType.isFloatOrDouble || (opType.isVectorType && opType.vectorBaseType == Type.tFloat)
+                    || is_f16_small_type(opType.baseType)) {
+                // fp16 negate = IEEE sign flip; identical to the reference promote-negate-
+                // narrow (both preserve payload bits), no rounding involved
                 setE(expr, LLVMBuildFNeg(g_builder, sexpr, ""))
             } else {
                 failed_E(expr, "unsupported - type {opType}")
@@ -6090,7 +6136,8 @@ class public LlvmJitVisitor : AstVisitor {
         } elif (expr.op == "+") {
             if (isNumeric(opType)) {
                 setE(expr, sexpr)
-            } elif (opType.isFloatOrDouble || (opType.isVectorType && opType.vectorBaseType == Type.tFloat)) {
+            } elif (opType.isFloatOrDouble || (opType.isVectorType && opType.vectorBaseType == Type.tFloat)
+                    || is_f16_small_type(opType.baseType)) {
                 setE(expr, sexpr)
             } else {
                 failed_E(expr, "unsupported + type {opType}")

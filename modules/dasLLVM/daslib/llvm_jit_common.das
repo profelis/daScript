@@ -607,6 +607,9 @@ def public init_jit_target_flags(target_triple : string = "") {
     // LLVM's host-features string OR the arm force env; cross aarch64 triples the env only.
     g_target_arm64_i8mm = g_target_is_aarch64 && (arm64_forced_feature("i8mm")
         || (empty(target_triple) && host_llvm_feature("i8mm")))
+    // fp16 operators lower as promote-compute-narrow IR wherever half converts are
+    // hardware (routing truth for isExprOp2/Op1_Func — lives in llvm_boost)
+    g_lattice_fp16_ops_native = g_target_is_aarch64 || g_target_x64_f16c
 }
 
 [macro_function]
