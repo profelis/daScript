@@ -39,7 +39,9 @@ the CI ref, never a working-tree copy.
 
 ## build.yml — the build matrix
 
-Per-lane steps: build → JIT prewarm → JIT test sweep → interpreter sweep →
+Per-lane steps: build → JIT test sweep (isolated-parallel; it mints the dll
+cache itself — the old separate "Prewarm JIT cache" step is gone) →
+interpreter sweep →
 `ctest -L small`. The full AOT sweep runs on the NIGHTLY cron and on manual
 `workflow_dispatch` runs only (Release
 lanes incl. sanitizers + mingw/clang-cl); per-PR lanes just build
@@ -50,7 +52,7 @@ pre-push check for AOT regressions outside tests/language — don't skip it.**
 | CI step | Local mirror | Notes |
 |---|---|---|
 | Interpreter sweep | `<daslang> dastest/dastest.das -- --color --failures-only --timeout 1800 --test tests` | |
-| JIT sweep | `<daslang> dastest/dastest.das -jit -- --jit-opt-level=3 --color --failures-only --timeout 1800 --test tests` | Windows-local `clang-cl` link failures are env noise — the catchable class is LLVM verifier errors; full end-to-end JIT needs WSL/mac. See `skills/make_pr.md` §2.5 for the 2-test smoke version |
+| JIT sweep | `<daslang> dastest/dastest.das -jit -- --jit-opt-level=3 --color --failures-only --isolated-mode --batch 4 --timeout 1800 --test tests` | isolated-PARALLEL (2×hw-thread workers, 4 files/batch, ~3× vs sequential, identical pass/fail set; CI's retry drops `--batch` for one-process-per-test). Windows-local `clang-cl` link failures are env noise — the catchable class is LLVM verifier errors; full end-to-end JIT needs WSL/mac. See `skills/make_pr.md` §2.5 for the 2-test smoke version |
 | Small C++ tests | `ctest --test-dir build --build-config Release -L small --output-on-failure` | drop `--build-config` on single-config generators. **Run this after touching `tests-cpp/`** — and remember MSVC tolerates C++ that clang/gcc reject (the doctest bit-field incident); see `skills/writing_cpp_tests.md` |
 | AOT sweep (full) | `cmake --build build --config Release --target test_aot`, then `bin/Release/test_aot.exe -use-aot dastest/dastest.das -- --use-aot --color --failures-only --timeout 1800 --test tests` | nightly CI + manual `workflow_dispatch` only — this local mirror is the only pre-push gate for it |
 | AOT subset gate | `cmake --build build --config Release --target test_aot_subset` (optionally `--target run_tests_aot_subset` to also sweep tests/language) | what per-PR CI lanes actually build (part of ALL) |

@@ -41,7 +41,8 @@ pointers whose only reference is a local in a jitted frame — native-stack loca
 invisible to the collector, so GC-semantics tests are interp-only; the other former `-jit`
 skips were lifted once `jit_enabled` started triggering daslib/quote lowering). Two traps:
 a whole-folder JIT/AOT failure usually means a missing entry here, NOT a per-file fix; and
-the `jit_cache_all_tests` prewarm target (utils/CMakeLists.txt) does NOT consult it — its
+the `jit_cache_all_tests` prewarm target (utils/CMakeLists.txt — local-use only since CI's
+isolated-parallel JIT sweep mints the dll cache itself) does NOT consult it — its
 `--exclude` list mirrors the skips manually and must be updated in the same change.
 Per-function `[no_jit]` is the finer-grained alternative when only some functions in a
 kept folder can't JIT — put it on the function whose CODE diverges under JIT, not just the

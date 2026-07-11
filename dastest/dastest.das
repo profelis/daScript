@@ -479,6 +479,11 @@ def main() : int {
     }
     var test_args <- parse_result |> move_unwrap
 
+    // Set BEFORE the --run worker early-return below: workers must honor
+    // --failures-only too, or every PASS line of every test flows through the
+    // captured pipe (parent-side display filtering already handles the rest).
+    log::failuresOnly = test_args.failures_only
+
     if (!empty(test_args.run)) {
         // Isolated/semi-isolated worker subprocess: run each --run file in this
         // one process, emitting a ##dastest## JSON report PER FILE as it
@@ -508,7 +513,6 @@ def main() : int {
         return rc
     }
 
-    log::failuresOnly = test_args.failures_only
 
     var res : SuiteResult
     let startTime = ref_time_ticks()
@@ -637,8 +641,11 @@ def main() : int {
         // Forward --stack-on-exception to each worker: the flag sets the test
         // context's at-throw stack walk, and the tests run in the worker, not here.
         let stackExcFlag = test_args.stack_on_exception ? " --stack-on-exception" : ""
+        // Forward --failures-only so workers suppress per-test PASS lines at the
+        // source instead of streaming them all through the captured pipe.
+        let failuresOnlyFlag = test_args.failures_only ? " --failures-only" : ""
         let cmdPrefix = "{launchPrefix} {jitstr} {aotstr} --"
-        let cmdSuffix = " {benchstr}{log::useTtyColors ? " --color" : ""}{headlessFlag}{stackExcFlag}"
+        let cmdSuffix = " {benchstr}{log::useTtyColors ? " --color" : ""}{headlessFlag}{stackExcFlag}{failuresOnlyFlag}"
         let batchSize = max(1, test_args.batch)
         // Group files into batches of batchSize. Each batch is run by one worker
         // subprocess (batchCmd); per-file singleCmds are kept so a crash can be

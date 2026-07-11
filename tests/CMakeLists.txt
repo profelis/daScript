@@ -38,11 +38,19 @@ if(NOT DAS_TOOLS_DISABLED)
             set(_DAS_JIT_LINKER_STRING "--jit-linker-string=-fsanitize=thread")
         endif()
         set(_DAS_JIT_FLAGS ${_DAS_JIT_LINKER_STRING} $<IF:$<CONFIG:Debug>,--jit-opt-level=0,--jit-opt-level=3>)
+        # Primary JIT sweep runs isolated-PARALLEL (2x-hw-thread worker
+        # subprocesses, 4 files per batch): ~3x FASTER wall-clock than the sequential
+        # sweep with an identical pass/fail set, and cold-cache parallel beats
+        # warm sequential — which is what made the CI "Prewarm JIT cache" step
+        # redundant. Safe because each test program owns its dll-cache path
+        # (.jitted_scripts/<namespace>/<contenthash>) and each file runs in
+        # exactly one batch. The _isolated retry stays batch-1 (one process per
+        # test — max crash isolation, and a batch crash re-dispatches per-file).
         add_custom_target(run_tests_jit
-            COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -jit -- ${_DAS_JIT_FLAGS} ${_DAS_TEST_COMMON} --timeout 1800
+            COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -jit -- ${_DAS_JIT_FLAGS} ${_DAS_TEST_COMMON} --isolated-mode --batch 4 --timeout 1800
             DEPENDS daslang
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-            COMMENT "Running tests (JIT)"
+            COMMENT "Running tests (JIT, isolated-parallel)"
         )
         add_custom_target(run_tests_jit_isolated
             COMMAND $<TARGET_FILE:daslang> ${_DAS_DASTEST} -jit -- ${_DAS_JIT_FLAGS} ${_DAS_TEST_COMMON} --isolated-mode --timeout 3600
