@@ -485,6 +485,28 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
     }
 }
 
+//! Copy a BF16 tensor's raw halfwords into dst[dst_off..] — no fp32 expand (read kernels widen
+//! in-loop by the exact bit shift). Requires the tensor to be BF16 on disk (check gguf_tensor_type).
+def gguf_transcode_bf16(m : GGUFMeta; bytes : array<uint8> | #; name : string; var dst : array<uint16>; dst_off, expect_n : int64) {
+    let ti = gguf_find_tensor(m, name)
+    if (ti < 0) {
+        panic("gguf: tensor '{name}' not found")
+    }
+    if (m.tensors[ti].ggml_type != GGML_TYPE_BF16) {
+        panic("gguf: tensor '{name}' is not BF16 (type {m.tensors[ti].ggml_type})")
+    }
+    if (expect_n != m.tensors[ti].n_elem) {
+        panic("gguf: tensor '{name}' has {m.tensors[ti].n_elem} elems, expected {expect_n}")
+    }
+    let base = m.data_offset + m.tensors[ti].offset
+    unsafe {
+        let src = temp_array(reinterpret<uint16?>(addr(bytes[base])), expect_n, type<uint16>)
+        for (i in range64(expect_n)) {
+            dst[dst_off + i] = src[i]
+        }
+    }
+}
+
 //! The on-disk ggml type of tensor `name` (GGML_TYPE_*), or -1 if the tensor is absent. Lets a
 //! caller pick the direct-transcode path when the disk type already matches the target precision.
 def gguf_tensor_type(m : GGUFMeta; name : string) : int {

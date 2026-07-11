@@ -232,6 +232,11 @@ struct Model {
     mxq : array<uint8>
     mxs : array<uint8>
     experts_mx4 : bool = false
+    // gemma-4 E-series: per_layer_model_proj kept in its native BF16 halfwords — half the
+    // per-token read; dot_bf16 widens by the exact bit shift, so the math matches the fp32
+    // expand bit-for-bit. ple_model_off indexes bf16blob when set, fblob otherwise.
+    bf16blob : array<uint16>
+    ple_model_bf16 : bool = false
     // Attention projections use PER-LAYER offsets — tensor shapes differ per layer class on gemma4
     // (SWA 16Q/8KV heads of 256 vs global 16Q/1KV of 512); uniform arches fill the flat strides.
     // wv_offs[l] = -1 marks a layer with no attn_v tensor (V reuses the pre-norm K projection).
@@ -355,6 +360,7 @@ struct private LayoutSizes {
     fblob_n : int64   // element count of the fp32 aux region
     wblob_n : int64   // element count of the big-weight region
     mx_n : int64      // element count of the native-MXFP4 expert planes (0 unless experts_mx4)
+    bf16_n : int64    // halfword count of the native-BF16 region (0 unless ple_model_bf16)
 }
 
 // Fill the dense FFN offset tables (w1/w2/w3), each a contiguous per-layer region, from `wo` — the
@@ -381,6 +387,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     let hidden = c.hidden_dim
     let layers = c.n_layers
     var fo = 0l
+    var bf16 = 0l
     if (t.cls_q8) {
         t.tok_emb_off = -1l   // no fp32 embedding table — rows dequant from emb_q8_off
     } else {
@@ -463,8 +470,13 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         fo += c.n_embd_per_layer
         t.ple_post_off = fo
         fo += layers * dim
-        t.ple_model_off = fo
-        fo += dim * c.n_embd_per_layer * layers
+        if (t.ple_model_bf16) {
+            t.ple_model_off = 0l
+            bf16 = dim * c.n_embd_per_layer * layers
+        } else {
+            t.ple_model_off = fo
+            fo += dim * c.n_embd_per_layer * layers
+        }
     }
     // Per-layer KV source + cache-row prefix. A shared layer (E-series) contributes NO width and
     // aliases its source layer's slot, so kv_cache_off returns the source base and its own K/V are
@@ -580,7 +592,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         t.wcls_off = wo
         wo += c.vocab_size * dim
     }
-    return LayoutSizes(fblob_n = fo, wblob_n = wo, mx_n = mx)
+    return LayoutSizes(fblob_n = fo, wblob_n = wo, mx_n = mx, bf16_n = bf16)
 }
 
 // Reserve exact capacity then size — avoids the array allocator's power-of-2 rounding on big arrays.
@@ -1140,11 +1152,19 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             && gguf_tensor_type(m, "blk.0.ffn_gate_exps.weight") == GGML_TYPE_MXFP4
             && gguf_tensor_type(m, "blk.0.ffn_down_exps.weight") == GGML_TYPE_MXFP4
             && gguf_tensor_type(m, "blk.0.ffn_up_exps.weight") == GGML_TYPE_MXFP4)
+        // gemma-4 E-series: keep per_layer_model_proj in its native BF16 — half the per-token
+        // read; dot_bf16's widen is the exact bit shift, so the values match the fp32 expand
+        t.ple_model_bf16 = (has_ple(t.config)
+            && gguf_tensor_type(m, "per_layer_model_proj.weight") == GGML_TYPE_BF16)
         let kv = t.config.kv_dim
         let qd = t.config.n_heads * t.config.head_size   // query width (== dim except Gemma2)
         let sz = layout_offsets(t)
         // fp32 aux (embedding + norms) is always present; the big-weight storage matches `mode`
         reserve_resize(t.fblob, sz.fblob_n)
+        if (sz.bf16_n > 0l) {
+            t.bf16blob |> reserve(sz.bf16_n)
+            t.bf16blob |> resize(sz.bf16_n)
+        }
         if (sz.mx_n > 0l) {
             t.mxq |> reserve(sz.mx_n / 2l)
             t.mxq |> resize(sz.mx_n / 2l)
@@ -1209,9 +1229,13 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
         }
         gguf_read_tensor_f32(m, bytes, "output_norm.weight", t.fblob, t.rms_final_off, dim)
-        if (has_ple(t.config)) {  // gemma-4 E-series PLE globals: fp32 model-proj + proj-norm (both fblob)
+        if (has_ple(t.config)) {  // gemma-4 E-series PLE globals: model-proj (native bf16 when on disk) + proj-norm
             let ple = t.config.n_embd_per_layer
-            gguf_read_tensor_f32(m, bytes, "per_layer_model_proj.weight", t.fblob, t.ple_model_off, dim * ple * layers)
+            if (t.ple_model_bf16) {
+                gguf_transcode_bf16(m, bytes, "per_layer_model_proj.weight", t.bf16blob, t.ple_model_off, dim * ple * layers)
+            } else {
+                gguf_read_tensor_f32(m, bytes, "per_layer_model_proj.weight", t.fblob, t.ple_model_off, dim * ple * layers)
+            }
             gguf_read_tensor_f32(m, bytes, "per_layer_proj_norm.weight", t.fblob, t.ple_pnorm_off, ple)
         }
         // big 2D weights -> active precision. ggml stores them row-major [out x in] = our convention.
@@ -3974,12 +3998,18 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
 // in s.ple_inp[0..npos*all), add the projected embedding branch. proj = rmsnorm((1/√dim)·(model_proj·
 // embd)); ple_inp = (gathered + proj)/√2. embd_scaled is the sqrt(dim)-scaled residual (s.x / s.x_b).
 def private ple_pre_finish(t : Model; var s : Session; embd_scaled : array<float>; npos : int64) {
+    trace_tag(TRACE_TAG_PLE)   // decode: runs between cls and layer 0, would inherit the stale cls tag
     let c = t.config
     let ple = c.n_embd_per_layer
     let all = c.n_layers * ple
     scale_inplace(unsafe(addr(s.ple_inp[0])), sqrt(float(ple)), npos * all)
-    // model_proj · embedding (batched over positions), then × 1/√dim
-    mm_fblob_b(s.ple_proj, t, t.ple_model_off, embd_scaled, c.dim, all, npos)
+    // model_proj · embedding (batched over positions), then × 1/√dim — native-BF16 rows when
+    // the load kept them (dot_bf16 = exact widen, bit-identical), else the fp32 expand
+    if (t.ple_model_bf16) {
+        matmul_bf16_batch(s.ple_proj, t.bf16blob, t.ple_model_off, embd_scaled, c.dim, all, npos)
+    } else {
+        mm_fblob_b(s.ple_proj, t, t.ple_model_off, embd_scaled, c.dim, all, npos)
+    }
     scale_inplace(unsafe(addr(s.ple_proj[0])), 1.0 / sqrt(float(c.dim)), npos * all)
     // RMSNorm each (position, layer) ple-slice with the single proj-norm vector
     rms_batch(s.ple_proj, s.ple_proj, t, t.ple_pnorm_off, ple, npos * c.n_layers)
@@ -4212,6 +4242,48 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
     }
 }
 
+// Can the classifier run as the fused matmul+softcap team chain? Q8 wcls (the tied-f32 load takes
+// mm_fblob and can't), team mode + a backend row core, 32-aligned vocab, and worth threading.
+def private fused_cls_ok(t : Model) : bool {
+    let c = t.config
+    return (g_fused_decode && t.quant == QuantMode.q8
+        && get_jobque_team_mode() && kernel_backend_has_rows()
+        && c.vocab_size % 32l == 0l
+        && lanes_for_work(c.dim * c.vocab_size, g_gemv_lane_cap) > 1)
+}
+
+// Fused classifier + final-logit softcap: one team chain over 32-row vocab groups, each chunk
+// soft-capping the rows it just produced (cache-hot) — a serial softcap over a 256k vocab was
+// 2-4ms of every-lane-idle per token. Same row dots and same softcap4 element order as the
+// unfused mm + softcap4 pair, so bit-identical to it.
+def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
+    let c = t.config
+    let dim = c.dim
+    let vocab = c.vocab_size
+    quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+    let mmrows = mm_q8q8_rows_fn()
+    let ngrp = int(vocab / 32l)
+    let n0 = chain_stage_chunks(ngrp, int(vocab), dim * vocab)
+    s.chain_stages |> resize(1)
+    s.chain_stages[0] = int3(0, ngrp, n0)
+    count_parallel_dispatch(min(n0, ngrp))
+    unsafe {
+        var lp = addr(s.logits[0])
+        var xqp = addr(s.xq[0])
+        var xsp = addr(s.xs[0])
+        let wp = reinterpret<int8 const?>(addr(t.qblob[0])) + t.wcls_off
+        let ws = reinterpret<float const?>(addr(t.qscales[0])) + t.wcls_off / 32l
+        team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
+            unsafe {
+                let r0 = int64(jb) * 32l
+                let r1 = int64(je) * 32l
+                invoke(mmrows, lp, wp, ws, xqp, xsp, dim, r0, r1)
+                softcap4(lp + r0, r1 - r0, cap)
+            }
+        }
+    }
+}
+
 def forward(t : Model; var s : Session; token, pos : int64) {
     let c = t.config
     let dim = c.dim
@@ -4254,15 +4326,21 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     let ts_final = ref_time_ticks()
     trace_tag(TRACE_TAG_CLS)
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
-    if (c.shared_weights && !t.cls_q8) {
-        // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
-        mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+    let tied_f32 = c.shared_weights && !t.cls_q8
+    if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
+        // Gemma2/E-series: soft-cap fused into the classifier chunks
+        cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
-        // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
-        mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
-    }
-    if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
-        softcap(s.logits, c.vocab_size, c.final_logit_softcap)
+        if (tied_f32) {
+            // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
+            mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+        } else {
+            // untied — or the tied classifier's Q8 transcode (the exact quants llama.cpp matmuls)
+            mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
+        }
+        if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
+            softcap4(s.logits, c.vocab_size, c.final_logit_softcap)
+        }
     }
     for (id in t.suppress) {  // gemma4: pin the checkpoint's suppressed token ids to -inf
         s.logits[id] = -1.0e30
@@ -6064,13 +6142,18 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     let ts_final = ref_time_ticks()
     let last = npos - 1l
     rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
-    if (c.shared_weights && !t.cls_q8) {
-        mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+    let tied_f32 = c.shared_weights && !t.cls_q8
+    if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
+        cls_softcap_chain(t, s, c.final_logit_softcap)
     } else {
-        mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
-    }
-    if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
-        softcap(s.logits, c.vocab_size, c.final_logit_softcap)
+        if (tied_f32) {
+            mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+        } else {
+            mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
+        }
+        if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits
+            softcap4(s.logits, c.vocab_size, c.final_logit_softcap)
+        }
     }
     for (id in t.suppress) {  // gemma4: pin the checkpoint's suppressed token ids to -inf
         s.logits[id] = -1.0e30
@@ -6381,7 +6464,7 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
         unsafe {
             var lbp = addr(ws.logits_b[0])
             for (i in range64(nrows)) {
-                softcap(lbp + i * vocab, vocab, c.final_logit_softcap)
+                softcap4(lbp + i * vocab, vocab, c.final_logit_softcap)
             }
         }
     }

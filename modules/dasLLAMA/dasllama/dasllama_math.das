@@ -82,6 +82,22 @@ def template axpy_f16_template(var d : float ?; s : uint16 const ?; scale : floa
 [hint(unsafe_range_check, noalias = d, noalias = s), tuned]
 def axpy_f16(var d : float?; s : uint16 const?; scale : float; n : int64) {}
 
+//! Dot of an f32 row against a bfloat16 (bf16-in-uint16) row. The widen is the exact high-half
+//! bit shift, so the dots are bit-identical to pre-expanding the weight to fp32 — at half the
+//! weight bandwidth (llama.cpp's AVX2 ggml_vec_dot_bf16 widens the same way, but it also
+//! truncates the ACTIVATION to bf16; keeping ours f32 is strictly more precise).
+[hint(unsafe_range_check, noalias = a, noalias = b)]
+def template dot_bf16_template(a : float const ?; b : uint16 const ?; n : int64) : float {
+    var acc = 0.0
+    for [tune = 1] (j in range64(n)) {
+        acc = mad(unsafe(a[j]), unsafe(reinterpret<float>(uint(unsafe(b[j])) << 16u)), acc)
+    }
+    return acc
+}
+
+[hint(unsafe_range_check, noalias = a, noalias = b), tuned]
+def dot_bf16(a : float const?; b : uint16 const?; n : int64) : float {}
+
 //! f32 -> f16 row convert (the codec store). Clamps to ±65504 so inf can NEVER enter the cache —
 //! O(kv_dim) per token, free next to the reads.
 [hint(unsafe_range_check, noalias = d, noalias = s)]
@@ -706,6 +722,29 @@ def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array
                     let wrow = wp + int64(i) * n
                     for (tk in range64(ntok)) {
                         yp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! Batched matvec against a native-BF16 weight [d x n] at halfword offset woff: Y [ntok x d]
+//! token-major. Per-row dot order matches matmul_batch on the fp32 expand and dot_bf16's widen
+//! is exact, so this is bit-for-bit the same Y at half the weight read. Decode (ntok == 1)
+//! takes the GEMV chunk shaper — fine-grain self-serve splits apply.
+def matmul_bf16_batch(var y : array<float>; w : array<uint16>; woff : int64; x : array<float>; n, d, ntok : int64) {
+    unsafe {
+        var yp = addr(y[0])
+        let wp = reinterpret<uint16 const?>(addr(w[woff]))
+        let xp = reinterpret<float const?>(addr(x[0]))
+        let nch = ntok == 1l ? matmul_chunks_gemv(int(d), 1, n * d) : matmul_chunks(int(d), 1, n * d * ntok)
+        maybe_parallel_for(0, int(d), nch) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let wrow = wp + int64(i) * n
+                    for (tk in range64(ntok)) {
+                        yp[tk * d + int64(i)] = dot_bf16(xp + tk * n, wrow, n)
                     }
                 }
             }
@@ -2084,7 +2123,8 @@ def softcap(var x : array<float> | #; size : int64; cap : float) {
 
 //! Vectorized logit soft-capping: x = cap * tanh(x/cap), float4 with exp4 via the same identity as
 //! geglu4 (tanh(a) = 1 - 2/(1+exp(2a))). ~2 ulp, NOT bit-exact vs the scalar libm-tanh softcap. Flash
-//! attention soft-caps the whole Q×KV score tile in one sweep. Tail runs the scalar form.
+//! attention soft-caps the whole Q×KV score tile in one sweep; the final classifier logits use it too
+//! (a 256k-vocab scalar-tanh pass was 2-4ms of every-lane-idle per token). Tail runs the scalar form.
 def softcap4(var x : float?; size : int64; cap : float) {
     let one = float4(1.0, 1.0, 1.0, 1.0)
     let two = float4(2.0, 2.0, 2.0, 2.0)
@@ -2103,6 +2143,9 @@ def softcap4(var x : float?; size : int64; cap : float) {
             x[i] = cap * tanh(x[i] * inv)
         }
     }
+}
+def softcap4(var x : array<float> | #; size : int64; cap : float) {
+    softcap4(unsafe(addr(x[0])), size, cap)
 }
 
 //! RoPE — rotary position embedding. Rotates each adjacent coordinate pair (2j, 2j+1)
