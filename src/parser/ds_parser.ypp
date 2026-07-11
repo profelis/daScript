@@ -2735,16 +2735,19 @@ let_variable_name_with_pos_list
 let_variable_declaration    /* let x; is prohibited. this one can't have uninitialized variable which has no type */
     :   let_variable_name_with_pos_list[list] ':' type_declaration_no_options[typeDecl] semicolon {
         $$ = new VariableDeclaration($list,$typeDecl,nullptr);
+        $$->atEnd = tokAt(scanner,@typeDecl);
     }
     |   let_variable_name_with_pos_list[list] ':' type_declaration_no_options[typeDecl] copy_or_move_or_clone[com] expr[init] semicolon {
         $$ = new VariableDeclaration($list,$typeDecl,$init);
         $$->init_via_move  = ($com & CorM_MOVE) !=0;
         $$->init_via_clone = ($com & CorM_CLONE) !=0;
+        $$->atEnd = tokAt(scanner,@init);
     }
     |   let_variable_name_with_pos_list[list] ':' type_declaration_no_options[typeDecl] copy_or_move_or_clone[com] expr_pipe[init] {
         $$ = new VariableDeclaration($list,$typeDecl,$init);
         $$->init_via_move  = ($com & CorM_MOVE) !=0;
         $$->init_via_clone = ($com & CorM_CLONE) !=0;
+        $$->atEnd = tokAt(scanner,@init);
     }
     |   let_variable_name_with_pos_list[list] optional_ref[ref] copy_or_move_or_clone[com] expr[init] semicolon {
         auto typeDecl = new TypeDecl(Type::autoinfer);
@@ -2753,6 +2756,7 @@ let_variable_declaration    /* let x; is prohibited. this one can't have uniniti
         $$ = new VariableDeclaration($list,typeDecl,$init);
         $$->init_via_move  = ($com & CorM_MOVE) !=0;
         $$->init_via_clone = ($com & CorM_CLONE) !=0;
+        $$->atEnd = tokAt(scanner,@init);
     }
     |   let_variable_name_with_pos_list[list] optional_ref[ref] copy_or_move_or_clone[com] expr_pipe[init] {
         auto typeDecl = new TypeDecl(Type::autoinfer);
@@ -2761,6 +2765,7 @@ let_variable_declaration    /* let x; is prohibited. this one can't have uniniti
         $$ = new VariableDeclaration($list,typeDecl,$init);
         $$->init_via_move  = ($com & CorM_MOVE) !=0;
         $$->init_via_clone = ($com & CorM_CLONE) !=0;
+        $$->atEnd = tokAt(scanner,@init);
     }
     ;
 

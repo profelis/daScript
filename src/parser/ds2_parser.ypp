@@ -1566,9 +1566,13 @@ expression_block_finally
     ;
 
 expression_block
-    :   {
+    /* the push_nesteds action sits AFTER '{' (mirroring expression_if_block) so the
+       hidden mid-rule symbol doesn't become @1 — an empty action carries a zero-width
+       between-token location, which used to leak into @$ and make every closure body
+       reported one column early via ast_makeBlock's tokAt(@block) */
+    :   '{' [bbegin] {
         yyextra->push_nesteds(DAS_EMIT_SEMICOLON);
-    } '{' [bbegin] expressions[block] {
+    } expressions[block] {
         yyextra->pop_nesteds();
     } '}' expression_block_finally[fin] {
         $$ = $block;
@@ -1862,6 +1866,7 @@ tuple_expansion_variable_declaration
         $$->init_via_move  = ($com & CorM_MOVE) !=0;
         $$->init_via_clone = ($com & CorM_CLONE) !=0;
         $$->isTupleExpansion = true;
+        $$->atEnd = tokAt(scanner,@init);
     }
     |   '(' tuple_expansion[list] ')' optional_ref[ref] copy_or_move_or_clone[com] expr[init] SEMICOLON {
         auto typeDecl = new TypeDecl(Type::autoinfer);
@@ -1871,6 +1876,7 @@ tuple_expansion_variable_declaration
         $$->init_via_move  = ($com & CorM_MOVE) !=0;
         $$->init_via_clone = ($com & CorM_CLONE) !=0;
         $$->isTupleExpansion = true;
+        $$->atEnd = tokAt(scanner,@init);
     }
     ;
 
@@ -2027,7 +2033,8 @@ expr_full_block_assumed_piped
         $$ = ast_makeBlock(scanner,$bal,$annL,$clist,$list,$result,$block,tokAt(scanner,@block),tokAt(scanner,@annL),tokAt(scanner,@clist));
     }
     |   '{' expressions[block] '}' {
-        $$ = ast_makeBlock(scanner,0,nullptr,nullptr,nullptr,new TypeDecl(Type::autoinfer),$block,tokAt(scanner,@block),tokAt(scanner,@block),LineInfo());
+        // block span is brace-to-brace (@$), not the statements' span (@block)
+        $$ = ast_makeBlock(scanner,0,nullptr,nullptr,nullptr,new TypeDecl(Type::autoinfer),$block,tokAt(scanner,@$),tokAt(scanner,@$),LineInfo());
     }
     ;
 
@@ -2854,11 +2861,13 @@ variable_declaration_list
 let_variable_declaration    /* let x; is prohibited. this one can't have uninitialized variable which has no type */
     :   let_variable_name_with_pos_list[list] ':' type_declaration_no_options[typeDecl] SEMICOLON {
         $$ = new VariableDeclaration($list,$typeDecl,nullptr);
+        $$->atEnd = tokAt(scanner,@typeDecl);
     }
     |   let_variable_name_with_pos_list[list] ':' type_declaration_no_options[typeDecl] copy_or_move_or_clone[com] expr[init] SEMICOLON {
         $$ = new VariableDeclaration($list,$typeDecl,$init);
         $$->init_via_move  = ($com & CorM_MOVE) !=0;
         $$->init_via_clone = ($com & CorM_CLONE) !=0;
+        $$->atEnd = tokAt(scanner,@init);
     }
     |   let_variable_name_with_pos_list[list] optional_ref[ref] copy_or_move_or_clone[com] expr[init] SEMICOLON {
         auto typeDecl = new TypeDecl(Type::autoinfer);
@@ -2867,6 +2876,7 @@ let_variable_declaration    /* let x; is prohibited. this one can't have uniniti
         $$ = new VariableDeclaration($list,typeDecl,$init);
         $$->init_via_move  = ($com & CorM_MOVE) !=0;
         $$->init_via_clone = ($com & CorM_CLONE) !=0;
+        $$->atEnd = tokAt(scanner,@init);
     }
     ;
 

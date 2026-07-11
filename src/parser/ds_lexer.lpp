@@ -254,6 +254,9 @@ void das_accept_cpp_comment ( vector<CommentReader *> & crdi, yyscan_t scanner, 
 <strfmt>\}                {
     BEGIN(normal);
     unput('}');
+    // the '}' will be lexed again in <normal> — undo this match's column
+    // advance or every token after a `{x:fmt}` interpolation shifts right
+    YYCOLUMN(yyextra->das_yycolumn--, "UNPUT } after string format");
 }
 <strfmt>.                 {
     yylval_param->ch = *yytext;
