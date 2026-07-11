@@ -48,6 +48,8 @@ def test_conf_rejects_glsl(t : T?) {
         check_rejects(t, "_fc_conf_ubyte8", "is CPU-only")
         check_rejects(t, "_fc_conf_ubyte16", "is CPU-only")
         check_rejects(t, "_fc_lattice_ubo", "16/8-bit lattice members have no std140 layout")
+        check_rejects(t, "_fc_lattice_uniform", "not supported in shader interfaces")
+        check_rejects(t, "_fc_lattice_fixed_array", "not supported in shader interfaces")
         check_rejects(t, "_fc_lattice_ssbo", "not supported in shader interfaces")
         check_rejects(t, "_fc_lattice_es300", "not available on the ES/WebGL2 rail")
     }

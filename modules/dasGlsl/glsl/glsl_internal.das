@@ -1137,10 +1137,13 @@ class GlslExport : AstVisitor {
         line(arg.at)
         // 16/8-bit lattice globals fail closed: varyings have no f16 attribute-upload path in
         // dasOpenGL, loose uniforms have no glUniform f16 setters, blocks are gated at patch
-        // (std140) — the v1 GLSL lattice surface is shader-internal compute only
-        assume gbt = arg._type.baseType
-        let g_elem_lattice = arg._type.baseType == Type.tArray && arg._type.firstType != null && lattice_small_type(arg._type.firstType.baseType)
-        if (lattice_small_type(gbt) || g_elem_lattice) {
+        // (std140) — the v1 GLSL lattice surface is shader-internal compute only.
+        // peel array/fixed-array dims to the ultimate element (half4[4], array<half4[2]>, ...)
+        var g_elem = arg._type
+        while (g_elem != null && (g_elem.baseType == Type.tArray || g_elem.baseType == Type.tFixedArray)) {
+            g_elem = g_elem.firstType
+        }
+        if (g_elem != null && lattice_small_type(g_elem.baseType)) {
             error("global '{arg.name}': 16/8-bit lattice types are not supported in shader interfaces (in/out/uniform/ssbo) yet", arg.at)
             return
         }
