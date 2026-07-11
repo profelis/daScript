@@ -8,4 +8,9 @@ def initialize(project_path : string) {
         // where dasModuleMetal.shared_module does not exist
         register_dynamic_module("{project_path}/dasModuleMetal.shared_module", "Module_DasMetal")
     }
+    // the MSL emitter is pure das — registered on ALL platforms (tests/msl runs everywhere)
+    let metal_paths = ["msl_types", "msl_emit", "msl_shader", "das_metal_boost"]
+    for (path in metal_paths) {
+        register_native_path("metal", "{path}", "{project_path}/metal/{path}.das")
+    }
 }

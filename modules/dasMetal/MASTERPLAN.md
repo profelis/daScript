@@ -301,3 +301,38 @@ in MSL strings must be escaped `\{`/`\}` (string interpolation).
 PR/master-push/dispatch only and the branch is local; the macOS lanes are `macos-15` /
 `macos-26` Apple-Silicon (M2) runners with the Apple Paravirtual device. Resolve when the
 arc branch first goes to CI; until then CI posture = compile gate, behavioral = M-boxes.
+
+**2026-07-11 — Phase 1 landed: a*b through the REAL emitter (the PoC milestone).**
+`metal/msl_types.das` (32-bit scalar + 2/3/4-vector map), `metal/msl_emit.das`
+(`generate_msl` — member scan with duplicate-binding/`@set`/non-`@ssbo` fail-closed errors,
+write-set pre-scan for `device` vs `device const`, builtin classifier, manual-recursion
+statement/expression emit with fused census recording, MSL keyword mangling),
+`metal/msl_shader.das` (`[metal_kernel]` — apply declares 4 companion globals
+`N`/`N_entry`/`N_fastmath`/`N_census`, fixup fills all as constant nodes),
+`metal/das_metal_boost.das` v1 (`with_metal_device`, `pipeline_from_source`,
+`run_compute_1d`, `assert_no_metal_leaks`). Emitted text matches this file's expected
+emission byte-for-byte (modulo param-wrap indent + defensive parens). Gates green on M1 Max:
+`tests/msl` (shape asserts + golden snapshot + census == declared set both directions, 8/8)
+and `tests/metal` (emitted MSL on GPU == CPU-reference run of the same method — the driver
+loop feeds `gl_GlobalInvocationID` — plus leak gate, 2/2); both suites pass through the
+dynamic AND static binaries. Phase-0 scaffold deleted on schedule. Wiring: unconditional
+`ADD_MODULE_DAS` + dasSpirv-style install rule; `.das_module` `register_native_path` for
+the four metal files; `tests/msl` + `tests/metal` registered in `tests/aot/CMakeLists.txt`
+(fixture `_msl_common` AOT_LIB'd per the `_spirv_common` precedent; macro-only metal
+modules deliberately not AOT'd, per the spirv_emit precedent).
+Probe results (annotation plumbing — risk 4 CLOSED, no struct-param fallback needed):
+`[function_macro]` fires on class methods with `classParent`/`isClassMethod` set already at
+`apply`; the method MUST get `exports = true` in apply or it is culled before `fixup` runs;
+`@ssbo`/`@binding` field annotations read via `field.annotation |> find_arg`; the member
+scan skips `__rtti`/`__finalize` + function-typed fields (classes store methods as fields);
+by fixup time the `with(self)` wrapper is optimizer-dropped and access is
+`ExprAt(ExprField(ExprVar(self), name), index)` — but under `no_optimizations` compiles
+(lint/LSP) the wrapper + non-folded shapes survive, so the emitter treats `ExprWith` as
+transparent (census-silent, or the gate would depend on optimization level).
+Plan deviations, both deliberate: builtins come from `require daslib/shader_lingua_franca
+public` (where the compute IDs actually live — `spirv/spirv_builtins` merely re-exports
+them and adds VK-specific surface dasMetal doesn't want); the declared census lives in the
+test fixture `_msl_common.das`, not the emitter (the emitter modules are macro-only and
+never AOT'd — a runtime `declared_msl_census()` there would 50101 under `test_aot`).
+das gotcha for kernel authors: emitter-facing das reserved words `label`/`expect` (now in
+CLAUDE.md gotchas). CI paravirtual probe still pending first push.

@@ -893,6 +893,24 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 | math_pack_unpack.das | pack_float_to_byte / unpack_byte_to_float with fuzzing | |
 | math_quaternions.das | Quaternion operations with fuzzing | |
 
+## msl/
+
+> dasMetal's MSL text backend (pure das — runs on every platform).
+
+| File | Description | Expects errors |
+|---|---|---|
+| _msl_common.das | *(helper)* Shared fixture — the Phase-1 `[metal_kernel]` a*b class + the declared census (gate B contract) | |
+| test_msl_mul.das | a*b kernel text assertions — signature shape, buffer attributes, write-set const-ness, builtin param, companion globals, golden snapshot | |
+| test_msl_census.das | Census gate — union of emitted construct kinds across all fixtures == declared set, both directions | |
+
+## metal/
+
+> Real-GPU behavioral gate (Apple). Guarded requires — on non-Apple platforms the files compile and run the CPU-reference half only.
+
+| File | Description | Expects errors |
+|---|---|---|
+| test_metal_mul_ab.das | Emitted a*b MSL executed on the GPU vs the CPU-reference run of the same method (driver loop feeds gl_GlobalInvocationID); leak gate | |
+
 ## option/
 
 | File | Description | Expects errors |

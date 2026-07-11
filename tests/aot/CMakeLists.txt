@@ -496,6 +496,21 @@ SET(AOT_SPIRV_MODULE_FILES
     tests/spirv/_spirv_common.das
 )
 
+# AOT for msl test files (dasMetal: AST->MSL text backend). Text-emission tests; the shared
+# fixture module is AOT-compiled as a library below. The macro-only metal modules (msl_types /
+# msl_emit / msl_shader) are NOT listed: they run at compile time and contribute no runtime
+# functions (spirv_emit precedent).
+FILE(GLOB AOT_MSL_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/msl/*.das")
+list(FILTER AOT_MSL_FILES EXCLUDE REGEX "/_")
+SET(AOT_MSL_MODULE_FILES
+    tests/msl/_msl_common.das
+)
+
+# AOT for metal test files (real-GPU behavioral gate vs the CPU-reference oracle). Guarded
+# requires (`require ?das_metal`) make the files compile everywhere — on non-Apple platforms
+# they reduce to the CPU-reference half, and the stubs generated there match that reduction.
+FILE(GLOB AOT_METAL_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/metal/*.das")
+
 # AOT for daslib test files
 SET(AOT_DASLIB_TEST_FILES
     tests/daslib/clargs_test.das
@@ -932,6 +947,18 @@ add_custom_target(test_aot_spirv_modules)
 SET(SPIRV_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_SPIRV_MODULE_FILES}" SPIRV_MODULES_AOT_GENERATED_SRC test_aot_spirv_modules daslang)
 
+add_custom_target(test_aot_msl)
+SET(MSL_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_MSL_FILES}" MSL_AOT_GENERATED_SRC test_aot_msl daslang)
+
+add_custom_target(test_aot_msl_modules)
+SET(MSL_MODULES_AOT_GENERATED_SRC)
+DAS_AOT_LIB("${AOT_MSL_MODULE_FILES}" MSL_MODULES_AOT_GENERATED_SRC test_aot_msl_modules daslang)
+
+add_custom_target(test_aot_metal)
+SET(METAL_AOT_GENERATED_SRC)
+DAS_AOT("${AOT_METAL_FILES}" METAL_AOT_GENERATED_SRC test_aot_metal daslang)
+
 add_custom_target(test_aot_fixed_array)
 SET(FIXED_ARRAY_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_FIXED_ARRAY_FILES}" FIXED_ARRAY_AOT_GENERATED_SRC test_aot_fixed_array daslang)
@@ -1049,6 +1076,9 @@ SOURCE_GROUP_FILES("aot generated" LOOPS_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" GLSL_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" SPIRV_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" SPIRV_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" MSL_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" MSL_MODULES_AOT_GENERATED_SRC)
+SOURCE_GROUP_FILES("aot generated" METAL_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" LANGUAGE_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" LANGUAGE_MODULES_AOT_GENERATED_SRC)
 SOURCE_GROUP_FILES("aot generated" SUBSET_DASLIB_MODULES_AOT_GENERATED_SRC)
@@ -1147,6 +1177,9 @@ add_executable(test_aot EXCLUDE_FROM_ALL ${DAS_DASCRIPT_MAIN_SRC}
     ${GLSL_AOT_GENERATED_SRC}
     ${SPIRV_AOT_GENERATED_SRC}
     ${SPIRV_MODULES_AOT_GENERATED_SRC}
+    ${MSL_AOT_GENERATED_SRC}
+    ${MSL_MODULES_AOT_GENERATED_SRC}
+    ${METAL_AOT_GENERATED_SRC}
     ${FIXED_ARRAY_AOT_GENERATED_SRC}
     ${TYPEMACRO_AOT_GENERATED_SRC}
     ${LANGUAGE_AOT_GENERATED_SRC}
@@ -1200,6 +1233,7 @@ ADD_DEPENDENCIES(test_aot libDaScriptAot
     test_aot_loops
     test_aot_glsl
     test_aot_spirv test_aot_spirv_modules
+    test_aot_msl test_aot_msl_modules test_aot_metal
     test_aot_fixed_array test_aot_typemacro
     test_aot_language test_aot_language_modules
     test_aot_daslib_modules test_aot_decs_modules test_aot_dasllama_modules
