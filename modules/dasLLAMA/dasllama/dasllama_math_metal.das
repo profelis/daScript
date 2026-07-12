@@ -15,10 +15,14 @@ require metal/das_metal_boost
 //   DASLLAMA_WSCALE_F16=0             (keep the f32 scale plane — the override swaps only the f32 batch slot)
 //   DASLLAMA_PIN_BATCH_BACKEND=metal
 //
-// The kernel is the ggml mul_mm shape: each threadgroup (128 threads = 4 simdgroups) owns a
-// 32x32 C block; per 32-k step it dequantizes the Q8 activation and weight blocks into f16
-// threadgroup tiles (scale folded in), barriers, and each simdgroup runs its 16x16 quadrant as
-// 2x2 8x8 tiles via the MIXED simdgroup mac (f32 accumulators, f16 operands). Dequant-to-half
+// Two kernels, both 128 threads (4 simdgroups) per threadgroup, picked per shape by the driver
+// (bench_metal_gemm_kernels.das is the lab that tuned them): a 32x32-C-block kernel for small
+// grids and a 64x64 one (halves both device re-read directions, 16 macs per 8 tile loads) that
+// wins ~1.6x on every big shape but starves below ~128 threadgroups. Per 32-k step each kernel
+// dequantizes Q8 activation/weight blocks into f16 threadgroup tiles with RUN-STAGING (one
+// thread = one 16-element contiguous run = one scale load + four byte4 device loads — the
+// staging knockout showed per-element scale reloads were 55% of kernel time), barriers, and
+// runs 8x8 simdgroup tiles via the MIXED mac (f32 accumulators, f16 operands). Dequant-to-half
 // carries ggml's tolerance envelope: int8 quants are exact in half, the folded scale product
 // rounds — pinned runs compare against CPU within relative tolerance, not bit-exact.
 //
@@ -29,9 +33,9 @@ require metal/das_metal_boost
 // masking — pad activations are zeroed, pad output rows are never read back).
 
 class MetalQ8Gemm {
-    @ssbo @binding = 0 wq : array<int8>     // W [d x n] row-major Q8 quants
+    @ssbo @binding = 0 wq : array<byte4>    // W [d x n] row-major Q8 quants (byte4 view — 4-wide loads)
     @ssbo @binding = 1 ws : array<float>    // W scales [d x n/32]
-    @ssbo @binding = 2 xq : array<int8>     // X [M' x n] Q8 quants (M' = 32-padded ntok)
+    @ssbo @binding = 2 xq : array<byte4>    // X [M' x n] Q8 quants (M' = 64-padded ntok)
     @ssbo @binding = 3 xs : array<float>    // X scales [M' x n/32]
     @ssbo @binding = 4 y : array<float>     // Y [M' x d]
     @uniform @binding = 5 kdim : uint       // n (K)
@@ -52,16 +56,40 @@ class MetalQ8Gemm {
         var c01 : simdgroup_float8x8
         var c10 : simdgroup_float8x8
         var c11 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let run = lid % 64u                 // 64 A runs on threads 0-63, 64 B runs on 64-127
+        let rr = run / 2u                   // row within the 32-row tile
+        let c0 = (run % 2u) * 16u           // k offset within the 32-k block
         var kb = 0u
         while (kb * 32u < kdim) {
-            var e = lid                     // stage 2x1024 tile elements, 8 per thread
-            while (e < 1024u) {
-                let r = e / 32u
-                let c = e % 32u
-                let k = kb * 32u + c
-                ta[e] = float16(float(xq[(mBase + r) * kdim + k]) * xs[(mBase + r) * (kdim / 32u) + kb])
-                tb[c * 32u + r] = float16(float(wq[(nBase + r) * kdim + k]) * ws[(nBase + r) * (kdim / 32u) + kb])
-                e += 128u
+            let k40 = (kb * 32u + c0) / 4u
+            if (lid < 64u) {
+                let s = xs[(mBase + rr) * (kdim / 32u) + kb]
+                let src = (mBase + rr) * kdim4 + k40
+                let dst = rr * 32u + c0
+                var i4 = 0u
+                while (i4 < 4u) {
+                    let v = float4(int4(xq[src + i4])) * s
+                    let o = dst + i4 * 4u
+                    ta[o] = float16(v.x)
+                    ta[o + 1u] = float16(v.y)
+                    ta[o + 2u] = float16(v.z)
+                    ta[o + 3u] = float16(v.w)
+                    i4++
+                }
+            } else {
+                let s = ws[(nBase + rr) * (kdim / 32u) + kb]
+                let src = (nBase + rr) * kdim4 + k40
+                var i4 = 0u
+                while (i4 < 4u) {
+                    let v = float4(int4(wq[src + i4])) * s
+                    let o = c0 + i4 * 4u
+                    tb[o * 32u + rr] = float16(v.x)
+                    tb[(o + 1u) * 32u + rr] = float16(v.y)
+                    tb[(o + 2u) * 32u + rr] = float16(v.z)
+                    tb[(o + 3u) * 32u + rr] = float16(v.w)
+                    i4++
+                }
             }
             barrier()
             var k8 = 0u
@@ -92,11 +120,154 @@ class MetalQ8Gemm {
     }
 }
 
+// The big-grid kernel: 64x64 C block per threadgroup — halves BOTH device re-read directions
+// vs 32x32 and runs 16 macs per 8 tile loads (each simdgroup owns a 32x32 quadrant, 16
+// accumulators); staging is perfectly balanced (every thread stages one A and one B 16-run).
+// Requires d % 64 == 0 and a big enough grid — the driver falls back to MetalQ8Gemm otherwise.
+class MetalQ8Gemm64 {
+    @ssbo @binding = 0 wq : array<byte4>    // W [d x n] row-major Q8 quants (byte4 view)
+    @ssbo @binding = 1 ws : array<float>    // W scales [d x n/32]
+    @ssbo @binding = 2 xq : array<byte4>    // X [M' x n] Q8 quants (M' = 64-padded ntok)
+    @ssbo @binding = 3 xs : array<float>    // X scales [M' x n/32]
+    @ssbo @binding = 4 y : array<float>     // Y [M' x d]
+    @uniform @binding = 5 kdim : uint       // n (K)
+    @uniform @binding = 6 ndim : uint       // d (N)
+    @workgroup ta : float16[2048]           // A block: 64 tokens x 32 k, dequantized
+    @workgroup tb : float16[2048]           // B block: 32 k x 64 outputs, dequantized + transposed
+
+    [metal_kernel(name="metal_q8_gemm64_msl")]
+    def metal_q8_gemm64 {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let ntileN = ndim / 64u
+        let mBase = (gl_WorkGroupID.x / ntileN) * 64u
+        let nBase = (gl_WorkGroupID.x % ntileN) * 64u
+        let qm = (sg / 2u) * 32u            // this simdgroup's 32x32 quadrant of the C block
+        let qn = (sg % 2u) * 32u
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        var c20 : simdgroup_float8x8
+        var c21 : simdgroup_float8x8
+        var c22 : simdgroup_float8x8
+        var c23 : simdgroup_float8x8
+        var c30 : simdgroup_float8x8
+        var c31 : simdgroup_float8x8
+        var c32 : simdgroup_float8x8
+        var c33 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let ra = lid / 2u                   // one A run and one B run per thread
+        let c0a = (lid % 2u) * 16u
+        var kb = 0u
+        while (kb * 32u < kdim) {
+            {
+                let s = xs[(mBase + ra) * (kdim / 32u) + kb]
+                let src = (mBase + ra) * kdim4 + (kb * 32u + c0a) / 4u
+                let dst = ra * 32u + c0a
+                var i4 = 0u
+                while (i4 < 4u) {
+                    let v = float4(int4(xq[src + i4])) * s
+                    let o = dst + i4 * 4u
+                    ta[o] = float16(v.x)
+                    ta[o + 1u] = float16(v.y)
+                    ta[o + 2u] = float16(v.z)
+                    ta[o + 3u] = float16(v.w)
+                    i4++
+                }
+            }
+            {
+                let sw = ws[(nBase + ra) * (kdim / 32u) + kb]
+                let srcw = (nBase + ra) * kdim4 + (kb * 32u + c0a) / 4u
+                var j4 = 0u
+                while (j4 < 4u) {
+                    let v = float4(int4(wq[srcw + j4])) * sw
+                    let o = c0a + j4 * 4u
+                    tb[o * 64u + ra] = float16(v.x)
+                    tb[(o + 1u) * 64u + ra] = float16(v.y)
+                    tb[(o + 2u) * 64u + ra] = float16(v.z)
+                    tb[(o + 3u) * 64u + ra] = float16(v.w)
+                    j4++
+                }
+            }
+            barrier()
+            var k8 = 0u
+            while (k8 < 32u) {
+                var a0 : simdgroup_half8x8
+                var a1 : simdgroup_half8x8
+                var a2 : simdgroup_half8x8
+                var a3 : simdgroup_half8x8
+                var b0 : simdgroup_half8x8
+                var b1 : simdgroup_half8x8
+                var b2 : simdgroup_half8x8
+                var b3 : simdgroup_half8x8
+                simdgroup_load(a0, ta, qm * 32u + k8, 32u)
+                simdgroup_load(a1, ta, (qm + 8u) * 32u + k8, 32u)
+                simdgroup_load(a2, ta, (qm + 16u) * 32u + k8, 32u)
+                simdgroup_load(a3, ta, (qm + 24u) * 32u + k8, 32u)
+                simdgroup_load(b0, tb, k8 * 64u + qn, 64u)
+                simdgroup_load(b1, tb, k8 * 64u + (qn + 8u), 64u)
+                simdgroup_load(b2, tb, k8 * 64u + (qn + 16u), 64u)
+                simdgroup_load(b3, tb, k8 * 64u + (qn + 24u), 64u)
+                simdgroup_multiply_accumulate(c00, a0, b0, c00)
+                simdgroup_multiply_accumulate(c01, a0, b1, c01)
+                simdgroup_multiply_accumulate(c02, a0, b2, c02)
+                simdgroup_multiply_accumulate(c03, a0, b3, c03)
+                simdgroup_multiply_accumulate(c10, a1, b0, c10)
+                simdgroup_multiply_accumulate(c11, a1, b1, c11)
+                simdgroup_multiply_accumulate(c12, a1, b2, c12)
+                simdgroup_multiply_accumulate(c13, a1, b3, c13)
+                simdgroup_multiply_accumulate(c20, a2, b0, c20)
+                simdgroup_multiply_accumulate(c21, a2, b1, c21)
+                simdgroup_multiply_accumulate(c22, a2, b2, c22)
+                simdgroup_multiply_accumulate(c23, a2, b3, c23)
+                simdgroup_multiply_accumulate(c30, a3, b0, c30)
+                simdgroup_multiply_accumulate(c31, a3, b1, c31)
+                simdgroup_multiply_accumulate(c32, a3, b2, c32)
+                simdgroup_multiply_accumulate(c33, a3, b3, c33)
+                k8 += 8u
+            }
+            barrier()
+            kb++
+        }
+        let row0 = mBase + qm
+        let col0 = nBase + qn
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c20, y, (row0 + 16u) * ndim + col0, ndim)
+        simdgroup_store(c21, y, (row0 + 16u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c22, y, (row0 + 16u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c23, y, (row0 + 16u) * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c30, y, (row0 + 24u) * ndim + col0, ndim)
+        simdgroup_store(c31, y, (row0 + 24u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c32, y, (row0 + 24u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c33, y, (row0 + 24u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+//! Pick the 64x64 kernel when the shape divides evenly and the grid is big enough to fill the
+//! GPU (below ~128 threadgroups the 32x32 kernel's occupancy wins — lab-measured on M1 Max).
+//! Shared with the resident-prefill driver so both dispatch paths agree.
+def public gemm_use64(mp, d : int64) : bool {
+    return (d % 64l) == 0l && (mp / 64l) * (d / 64l) >= 128l
+}
+
 // ===== host driver =====
 
 var private g_dev : MetalDevice?
 var private g_queue : MetalCommandQueue?
 var private g_pso : MetalComputePipeline?
+var private g_pso64 : MetalComputePipeline?
 var private g_failed = false
 var private g_wbufs : table<uint64; MetalBuffer?>   // intptr(region base) -> lazily uploaded weights
 var private g_sbufs : table<uint64; MetalBuffer?>   // intptr(region base) -> lazily uploaded scales
@@ -142,6 +313,10 @@ def public metal_gemm_shutdown {
         metal_release(g_pso)
         g_pso = null
     }
+    if (g_pso64 != null) {
+        metal_release(g_pso64)
+        g_pso64 = null
+    }
     if (g_queue != null) {
         metal_release(g_queue)
         g_queue = null
@@ -169,8 +344,15 @@ def private metal_gemm_init : bool {
     g_queue = metal_new_command_queue(g_dev)
     var err : string
     g_pso = pipeline_from_source(g_dev, metal_q8_gemm_msl, metal_q8_gemm_msl_entry, metal_q8_gemm_msl_fastmath, err)
-    if (g_pso == null) {
+    if (g_pso != null) {
+        g_pso64 = pipeline_from_source(g_dev, metal_q8_gemm64_msl, metal_q8_gemm64_msl_entry, metal_q8_gemm64_msl_fastmath, err)
+    }
+    if (g_pso == null || g_pso64 == null) {
         to_log(LOG_ERROR, "dasLLAMA metal: kernel compile failed — {err}\n")
+        if (g_pso != null) {
+            metal_release(g_pso)
+            g_pso = null
+        }
         metal_release(g_queue)
         g_queue = null
         metal_release(g_dev)
@@ -216,7 +398,7 @@ def metal_q8q8_batch(var yp : float?; wp : int8 const?; sp : float const?; xqp :
         return
     }
     let nb = n / 32l
-    let mp = ((ntok + 31l) / 32l) * 32l     // kernel has no edge masking — pad M to 32 rows
+    let mp = ((ntok + 63l) / 64l) * 64l     // kernels have no edge masking — pad M to 64 rows
     var wbuf = upload_region(g_wbufs, unsafe(reinterpret<void?>(wp)), uint64(d * n))
     var sbuf = upload_region(g_sbufs, unsafe(reinterpret<void?>(sp)), uint64(d * nb * 4l))
     var xqbuf = pool_acquire(g_pool, g_dev, uint64(mp * n))
@@ -233,9 +415,10 @@ def metal_q8q8_batch(var yp : float?; wp : int8 const?; sp : float const?; xqp :
     var kdimbuf = uniform_u32(uint(n))
     var ndimbuf = uniform_u32(uint(d))
     var err : string
-    let groups = uint((mp / 32l) * (d / 32l))
+    let use64 = gemm_use64(mp, d)
+    let groups = uint(use64 ? (mp / 64l) * (d / 64l) : (mp / 32l) * (d / 32l))
     let ran = with_compute_encoder(g_queue, err) $(enc : MetalComputeEncoder?) {
-        metal_set_pipeline(enc, g_pso)
+        metal_set_pipeline(enc, use64 ? g_pso64 : g_pso)
         metal_set_buffer(enc, wbuf, 0ul, 0)
         metal_set_buffer(enc, sbuf, 0ul, 1)
         metal_set_buffer(enc, xqbuf, 0ul, 2)

@@ -426,6 +426,7 @@ var private g_max_npos = 2048l          // naive-attention P footprint cap: head
 var private g_prefills = 0l
 var private g_declines = 0l
 var private g_pso_gemm : MetalComputePipeline?
+var private g_pso_gemm64 : MetalComputePipeline?
 var private g_pso_quant : MetalComputePipeline?
 var private g_pso_rms : MetalComputePipeline?
 var private g_pso_rope : MetalComputePipeline?
@@ -467,6 +468,10 @@ def public metal_prefill_shutdown {
     if (g_pso_gemm != null) {
         metal_release(g_pso_gemm)
         g_pso_gemm = null
+    }
+    if (g_pso_gemm64 != null) {
+        metal_release(g_pso_gemm64)
+        g_pso_gemm64 = null
     }
     if (g_pso_quant != null) {
         metal_release(g_pso_quant)
@@ -537,6 +542,7 @@ def private metal_prefill_init : bool {
     g_queue = metal_new_command_queue(g_dev)
     var ok = true
     g_pso_gemm = compile_pso(metal_q8_gemm_msl, metal_q8_gemm_msl_entry, metal_q8_gemm_msl_fastmath, ok)
+    g_pso_gemm64 = compile_pso(metal_q8_gemm64_msl, metal_q8_gemm64_msl_entry, metal_q8_gemm64_msl_fastmath, ok)
     g_pso_quant = compile_pso(metal_q8_quant_msl, metal_q8_quant_msl_entry, metal_q8_quant_msl_fastmath, ok)
     g_pso_rms = compile_pso(metal_rmsnorm_msl, metal_rmsnorm_msl_entry, metal_rmsnorm_msl_fastmath, ok)
     g_pso_rope = compile_pso(metal_rope_msl, metal_rope_msl_entry, metal_rope_msl_fastmath, ok)
@@ -618,7 +624,8 @@ def private prefill_supported(t : Model; s : Session; npos, start_pos : int64) :
 }
 
 def private enc_gemm(enc : MetalComputeEncoder?; bwq, bws, bxq, bxs, by, bkdim, bndim : MetalBuffer?; mp, d : int64) {
-    metal_set_pipeline(enc, g_pso_gemm)
+    let use64 = gemm_use64(mp, d)
+    metal_set_pipeline(enc, use64 ? g_pso_gemm64 : g_pso_gemm)
     metal_set_buffer(enc, bwq, 0ul, 0)
     metal_set_buffer(enc, bws, 0ul, 1)
     metal_set_buffer(enc, bxq, 0ul, 2)
@@ -626,7 +633,8 @@ def private enc_gemm(enc : MetalComputeEncoder?; bwq, bws, bxq, bxs, by, bkdim, 
     metal_set_buffer(enc, by, 0ul, 4)
     metal_set_buffer(enc, bkdim, 0ul, 5)
     metal_set_buffer(enc, bndim, 0ul, 6)
-    metal_dispatch_threadgroups(enc, uint3(uint((mp / 32l) * (d / 32l)), 1u, 1u), uint3(128u, 1u, 1u))
+    let groups = uint(use64 ? (mp / 64l) * (d / 64l) : (mp / 32l) * (d / 32l))
+    metal_dispatch_threadgroups(enc, uint3(groups, 1u, 1u), uint3(128u, 1u, 1u))
 }
 
 def private enc_quant(enc : MetalComputeEncoder?; bx, bxq, bxs, bn, bnblk : MetalBuffer?; nblk : int64) {
@@ -724,7 +732,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     let kv_mul = n_heads / layer_n_kv_heads(c, 0l)
     let scale = 1.0 / sqrt(float(head_size))
     let half = head_size / 2l
-    let mp = ((npos + 31l) / 32l) * 32l
+    let mp = ((npos + 63l) / 64l) * 64l    // 64 = the big GEMM kernel's M tile; attention kernels only assume %32
     let maxn = max(qd, hidden)
     // pooled per-prefill buffers (activations sized mp rows — the GEMM has no edge masking; rows
     // past npos are never read by the norm/rope/attention/elementwise kernels, and stale bytes in

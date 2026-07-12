@@ -20,28 +20,28 @@ let N = 128     // K: weight row length, %32
 let D = 64      // output rows, %32
 let NTOK = 40   // deliberately unpadded — exercises the 32-row pad rail (M' = 64)
 
-def private fill_case(var wq : array<int8>; var ws : array<float>; var xq : array<int8>; var xs : array<float>; pow2_scales : bool) {
-    wq |> resize(D * N)
-    ws |> resize(D * (N / 32))
-    xq |> resize(NTOK * N)
-    xs |> resize(NTOK * (N / 32))
-    for (i in range(D * N)) {
+def private fill_case(var wq : array<int8>; var ws : array<float>; var xq : array<int8>; var xs : array<float>; pow2_scales : bool; n, d, ntok : int) {
+    wq |> resize(d * n)
+    ws |> resize(d * (n / 32))
+    xq |> resize(ntok * n)
+    xs |> resize(ntok * (n / 32))
+    for (i in range(d * n)) {
         wq[i] = int8((i * 7) % 255 - 127)
     }
-    for (i in range(NTOK * N)) {
+    for (i in range(ntok * n)) {
         xq[i] = int8((i * 11) % 255 - 127)
     }
-    for (i in range(D * (N / 32))) {
+    for (i in range(d * (n / 32))) {
         ws[i] = pow2_scales ? (((i % 3) == 0) ? 0.5 : (((i % 3) == 1) ? 0.25 : 2.0)) : (0.013 + 0.001 * float(i % 17))
     }
-    for (i in range(NTOK * (N / 32))) {
+    for (i in range(ntok * (n / 32))) {
         xs[i] = pow2_scales ? (((i % 2) == 0) ? 1.0 : 0.125) : (0.021 + 0.003 * float(i % 13))
     }
 }
 
-def private run_batch(var y : array<float>; wq : array<int8>; ws : array<float>; xq : array<int8>; xs : array<float>) {
-    y |> resize(NTOK * D)
-    matmul_q8q8_batch(y, wq, ws, 0l, xq, xs, int64(N), int64(D), int64(NTOK))
+def private run_batch(var y : array<float>; wq : array<int8>; ws : array<float>; xq : array<int8>; xs : array<float>; n, d, ntok : int) {
+    y |> resize(ntok * d)
+    matmul_q8q8_batch(y, wq, ws, 0l, xq, xs, int64(n), int64(d), int64(ntok))
 }
 
 [test]
@@ -62,11 +62,11 @@ def test_metal_gemm_vs_portable(t : T?) {
             var want : array<float>
             var got : array<float>
             // exact case: pow2 scales, GPU path forced (min_ntok 1)
-            fill_case(wq, ws, xq, xs, true)
-            run_batch(want, wq, ws, xq, xs)                 // portable serves the batch slot
+            fill_case(wq, ws, xq, xs, true, N, D, NTOK)
+            run_batch(want, wq, ws, xq, xs, N, D, NTOK)     // portable serves the batch slot
             select_batch_backend("metal")
             set_metal_gemm_min_ntok(1l)
-            run_batch(got, wq, ws, xq, xs)
+            run_batch(got, wq, ws, xq, xs, N, D, NTOK)
             let st = metal_gemm_stats()
             if (st.dispatches == 0l) {
                 // registered but no usable device (or compile failure) — the fallback served it;
@@ -84,17 +84,36 @@ def test_metal_gemm_vs_portable(t : T?) {
                 }
             }
             t |> equal(bad_exact, 0)                        // pow2 scales: bit-exact
+            // 64x64-kernel case: a big output dim pushes the grid past the gemm_use64 threshold,
+            // so this exact compare runs through the big-tile kernel (the D=64 case above stays
+            // on the 32x32 kernel — both dispatch paths covered). Fresh fill sizes = fresh weight
+            // arrays, so drop the pointer-keyed cache first.
+            metal_gemm_shutdown()
+            let D64 = 8192
+            t |> success(gemm_use64(64l, int64(D64)), "test shape reaches the 64x64 kernel path")
+            fill_case(wq, ws, xq, xs, true, N, D64, NTOK)
+            select_batch_backend("portable")
+            run_batch(want, wq, ws, xq, xs, N, D64, NTOK)
+            select_batch_backend("metal")
+            run_batch(got, wq, ws, xq, xs, N, D64, NTOK)
+            var bad64 = 0
+            for (k in range(NTOK * D64)) {
+                if (got[k] != want[k]) {
+                    bad64++
+                }
+            }
+            t |> equal(bad64, 0)                            // pow2 scales: bit-exact on the 64 path too
             // tolerance case: arbitrary scales carry the dequant-to-half rounding. The refill
             // reuses the SAME arrays, so the pointer-keyed lazy weight cache must be dropped —
             // in production weights are load-once-stable (the documented cache contract). The
             // oracle run pins "portable" explicitly: select_batch_backend("") only clears the
             // standing pin — the slot restores at the NEXT whole-backend activation.
             metal_gemm_shutdown()
-            fill_case(wq, ws, xq, xs, false)
+            fill_case(wq, ws, xq, xs, false, N, D, NTOK)
             select_batch_backend("portable")
-            run_batch(want, wq, ws, xq, xs)
+            run_batch(want, wq, ws, xq, xs, N, D, NTOK)
             select_batch_backend("metal")
-            run_batch(got, wq, ws, xq, xs)
+            run_batch(got, wq, ws, xq, xs, N, D, NTOK)
             // each dequantized half rounds at 2^-11 relative, so a product carries ~2^-10 of its
             // own magnitude — the error bound scales with the DOT ENVELOPE sum |w·x| (cancellation
             // makes |y| itself arbitrarily smaller), 2e-3 = 2x margin over the worst case
@@ -116,7 +135,7 @@ def test_metal_gemm_vs_portable(t : T?) {
             // small-ntok delegation: below the threshold the CPU fallback serves the call
             set_metal_gemm_min_ntok(1000l)
             let fb0 = metal_gemm_stats().fallbacks
-            run_batch(got, wq, ws, xq, xs)
+            run_batch(got, wq, ws, xq, xs, N, D, NTOK)
             t |> success(metal_gemm_stats().fallbacks > fb0, "small batches delegate to the CPU kernel")
             var bad_fb = 0
             for (k in range(NTOK * D)) {

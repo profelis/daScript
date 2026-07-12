@@ -582,6 +582,8 @@ gemm-only knockout == full-chain delta, so inter-dispatch drains cost ~nothing) 
 the ~2x-to-roofline headroom the clean round mapped): double-buffered staging, bigger C tiles
 per threadgroup, wider k-steps — iterate via bench_gemm_iso, not full prefills. Secondary
 (measured small): concurrent-dispatch encoder + explicit barriers for q/k/v + w1/w3 overlap.
+*(Done — see the 2026-07-12 Phase 6e entry: the winning levers turned out to be run-staging +
+64x64, and the intuition list above all lost individually.)*
 
 **2026-07-11 — pipeline: fixup-set global inits now infer; dasSpirv blob fill patch→fixup**
 (rides this branch — surfaced reviewing dasMetal's apply/fixup model). Boris called dasSpirv's
@@ -600,3 +602,39 @@ Consequence for annotation authors: fixup now sees PRE-optimize AST (dasMetal's 
 handles both shapes; dasGlsl goldens unchanged — 98/98). Regression test independent of dasSpirv:
 `tests/language/test_fixup_global_init.das` + `_fixup_init_macro.das`. Green: tests/spirv 238/238
 (generation in fixup), glsl, msl, metal, language — dynamic + static binaries.
+
+**2026-07-12 — Phase 6e: Q8 GEMM kernel iteration — pp512 1594 → 2398 tok/s (DIRTY).** The
+promised kernel round, run entirely in a new in-process lab
+(`modules/dasLLAMA/benchmarks/matmul/bench_metal_gemm_kernels.das`): candidate `[metal_kernel]`
+variants head-to-head against the production MSL in ONE process, GPU-timestamped
+(`with_compute_encoder_timed`), interleaved best-of-N rounds, bit-exact-by-construction data
+(quants in [-8,7], pow2 scales ⇒ every f32 partial sum exact ⇒ any accumulation order gives
+identical bits; each variant compares bit-exact vs v0, v0 vs a CPU reference). **The knockout
+pair re-aimed the whole round:** staging-removed vs math-removed timing attributed **55% of
+kernel time to dequant staging** (per-element scale reloads + scalar loads), NOT to tile loads
+(tile-major and pad-36 layouts ≈ neutral ⇒ no meaningful bank-conflict tax) and NOT to barriers
+(~2%). Every intuition variant tried FIRST lost: bigger C tiles (0.75–0.95x), double buffering
+(0.86–0.99x), k=64 (0.51x), int4-shift-unpack (worse than byte4), register prefetch (worse),
+256 threads (worse) — on M1 Max occupancy is brutally sensitive to threadgroup-memory growth
+*while staging is expensive*. The two changes that compose into the win: **run-staging** (one
+thread = one contiguous 16-element run = ONE scale load + four `byte4` device loads, +40%) and
+THEN the **64x64 C block** (halves both device re-read directions, 16 macs per 8 tile loads —
+the tile-size rematch only wins once staging is cheap: +64% total, 3390–3650 GMAC/s vs the old
+kernel's 2090–2200; math-only ceiling ~4900). **Shipped as a two-kernel dispatch** in
+dasllama_math_metal: `metal_q8_gemm` (32x32, run-staged vec4) + `metal_q8_gemm64` (64x64),
+`gemm_use64(mp, d)` picks 64 when `d % 64 == 0` and the grid is ≥128 threadgroups (below that
+the 32-kernel's occupancy wins — the kv 2048x512 shape); both drivers (5c batch donor + 6c
+resident prefill) pad M to 64 (prefill's mp doubles as attention np32 — its kernels only assume
+%32; pad rows stay garbage-by-design, contained by GEMM row independence). Quant buffers are
+`array<byte4>` VIEWS in the kernel classes only — host buffers unchanged. **End-to-end (M1 Max,
+DIRTY): pp512 2398 tok/s (was 1594; lcpp full-Metal 3960 = 1.65x away, was 2.5x), N=256 2229
+(was 1421); N=512 GPU-busy 289 → 188 ms** — matches the iso ratio, GEMM chain ~151 ms of it.
+Donor-path iso (through the synchronous submit+memcpy tax): big shapes 2072–3112 GMAC/s
+(+40–56%); kv stays donor-tax-bound at ~1000. Gates green: test_metal_gemm (extended with a
+D=8192 case so BOTH dispatch paths get the bit-exact compare), prefill kernel units, 40-token
+greedy 1B parity, leak gates, full dasLLAMA suite. das gotcha hit: the MSL emitter flattens
+bare `{ }` blocks (locals collide in one MSL scope — rename or use a real `if` scope).
+Emitter-extension ideas the lab priced but did not take (ledger): `half4` threadgroup stores +
+a `simdgroup_load` transpose-flag overload (each ~<10% at high risk). Remaining from here:
+the clean measurement round (Parsec OFF) + concurrent-dispatch encoder (secondary, measured
+small), then PR.
