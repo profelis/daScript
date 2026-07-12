@@ -272,7 +272,7 @@ class WildcardPriorityServer : HvWebServer {
 
 [test]
 def test_wildcard_priority(t : T?) {
-    with_test_server(type<WildcardPriorityServer>, 19009) $(base_url) {
+    with_test_server(type<WildcardPriorityServer>, PORT_WILDCARD_PRIORITY) $(base_url) {
         t |> run("literal GET /status outranks ANY *") @(t : T?) {
             GET("{base_url}/status") <| $(resp) {
                 t |> equal(string(resp.body), "specific")

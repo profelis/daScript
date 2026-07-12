@@ -28,6 +28,7 @@ let PORT_FORMS          = 19006
 let PORT_WEBSOCKETS     = 19007
 let PORT_SSE            = 19008
 let PORT_WRITER_CONNECTED = 19009
+let PORT_WILDCARD_PRIORITY = 19010
 
 // ──────────────────────────────────────────────────────────────────────────
 // Generic server lifecycle
