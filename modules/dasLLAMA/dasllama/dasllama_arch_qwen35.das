@@ -17,6 +17,15 @@ def private configure_qwen35(var c : Config) {
     c.post_attn_is_ffn_norm = true
 }
 
+// qwen35moe (Qwen3.6-35B-A3B, Qwen3.5-397B): the same hybrid attention + a routed-experts FFN —
+// softmax top-k with renorm (llama.cpp hardcodes norm_w for this arch; metadata overrides) and
+// the qwen2moe-style sigmoid-gated shared expert (loader-detected via ffn_up_shexp).
+def private configure_qwen35moe(var c : Config) {
+    configure_qwen35(c)
+    c.moe = true
+    c.norm_topk_prob = true
+}
+
 [init]
 def register_arch_qwen35() {
     var d = ArchDesc(name = "qwen35", configure = @@configure_qwen35)
@@ -25,5 +34,10 @@ def register_arch_qwen35() {
     d.chat.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
     d.chat.assistant_open.parts <- [chat_special("<|im_start|>"), chat_text("assistant\n")]
     d.chat.stop <- ["<|im_end|>", "<|endoftext|>"]
+    // (clone the template BEFORE register_arch moves `d`)
+    var dm = ArchDesc(name = "qwen35moe", configure = @@configure_qwen35moe)
+    dm.blocks = qwen35moe_blocks()
+    dm.chat := d.chat
     register_arch("qwen35", d)
+    register_arch("qwen35moe", dm)
 }

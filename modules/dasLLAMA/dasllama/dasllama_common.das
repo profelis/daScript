@@ -377,6 +377,11 @@ struct Model {
     dn_dt_off : int64           // ssm_dt.bias: layers x dt_rank
     dn_a_off : int64            // ssm_a (= -exp(A_log), precomputed on disk): layers x dt_rank
     dn_norm_off : int64         // ssm_norm (gated out-norm weight, shared across heads): layers x d_state
+    // ssm_beta/ssm_alpha ride the DISK type like llama.cpp: quantized files matmul them q8
+    // (dnbeta/dnalpha_offs above); F32 files (35B-A3B) keep them fp32 in fblob and matmul fp32
+    dn_ba_f32 : bool = false
+    dn_betaf_off : int64        // fblob: layers x (dim x dt_rank), valid when dn_ba_f32
+    dn_alphaf_off : int64
 }
 
 // ===== Arch registry: per-architecture blocks + chat template =====
@@ -559,6 +564,12 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         fo += layers * c.ssm_dt_rank
         t.dn_norm_off = fo
         fo += layers * c.ssm_d_state
+        if (t.dn_ba_f32) {  // F32-on-disk ssm_beta/ssm_alpha stay fp32 (llama.cpp matmuls them f32)
+            t.dn_betaf_off = fo
+            fo += layers * dim * c.ssm_dt_rank
+            t.dn_alphaf_off = fo
+            fo += layers * dim * c.ssm_dt_rank
+        }
     }
     if (c.n_expert > 0l) {  // MoE: per-layer router matrices + shared-expert gate vectors, fp32
         t.router_off = fo
@@ -673,9 +684,9 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         t.dngate_offs |> clear(); t.dngate_offs |> reserve(layers)
         for (l in range64(layers)) { t.dngate_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * c.ssm_d_inner) : -1l) }
         t.dnbeta_offs |> clear(); t.dnbeta_offs |> reserve(layers)
-        for (l in range64(layers)) { t.dnbeta_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
+        for (l in range64(layers)) { t.dnbeta_offs |> push(layer_is_recurrent(c, l) && !t.dn_ba_f32 ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
         t.dnalpha_offs |> clear(); t.dnalpha_offs |> reserve(layers)
-        for (l in range64(layers)) { t.dnalpha_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
+        for (l in range64(layers)) { t.dnalpha_offs |> push(layer_is_recurrent(c, l) && !t.dn_ba_f32 ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
         t.dnout_offs |> clear(); t.dnout_offs |> reserve(layers)
         for (l in range64(layers)) { t.dnout_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, c.ssm_d_inner * dim) : -1l) }
     }
@@ -1117,8 +1128,10 @@ def private repack_q8_weights(var t : Model) {
             let cd = dn_conv_dim(c)
             repack_q8q8_weight(t.qblob, t.qscales, t.dnqkv_offs[l], dim, cd)
             repack_q8q8_weight(t.qblob, t.qscales, t.dngate_offs[l], dim, c.ssm_d_inner)
-            repack_q8q8_weight(t.qblob, t.qscales, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
-            repack_q8q8_weight(t.qblob, t.qscales, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
+            if (t.dnbeta_offs[l] >= 0l) {   // -1 when beta/alpha ship F32 (fblob, no repack)
+                repack_q8q8_weight(t.qblob, t.qscales, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
+                repack_q8q8_weight(t.qblob, t.qscales, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
+            }
             repack_q8q8_weight(t.qblob, t.qscales, t.dnout_offs[l], c.ssm_d_inner, dim)
         }
         if (has_ple(c)) {  // gemma-4 E-series per-layer PLE gate/proj (the emb table stays linear, unpacked)
@@ -1287,8 +1300,12 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 panic("dasLLAMA: feed_forward_length array has {length(t.ffn_w)} entries, expected {layers}")
             }
             for (w in t.ffn_w) { hidden = max(hidden, w) }
-        } else {
+        } elif (gguf_has(m, "{arch}.feed_forward_length")) {
             hidden = gguf_int(m, bytes, "{arch}.feed_forward_length")
+        } elif (!t.config.moe) {
+            // pure-MoE files (qwen35moe) drop the key — every FFN is router + experts; a dense
+            // arch without it is a broken file
+            panic("dasLLAMA: {arch}.feed_forward_length missing")
         }
         let n_heads = gguf_int(m, bytes, "{arch}.attention.head_count")
         let seq_len = gguf_int(m, bytes, "{arch}.context_length")
@@ -1585,6 +1602,15 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         // per-tensor K-quant format tags (kquant_native rail; no-op when the knob is off or the
         // file has no K-quant tensors) — must precede layout_offsets, which walks the tags
         detect_kq_formats(t, m)
+        // ssm_beta/ssm_alpha disk type routes their matmul (must precede layout_offsets): F32
+        // files keep them fp32 in fblob (llama.cpp matmuls f32); quantized files ride qblob
+        if (t.config.recr_mask != 0ul) {
+            var frl = 0l
+            while (!layer_is_recurrent(t.config, frl)) {
+                frl++
+            }
+            t.dn_ba_f32 = gguf_tensor_type(m, "blk.{frl}.ssm_beta.weight") == GGML_TYPE_F32
+        }
         // logit soft-caps from metadata when present (gemma2: 50/30, gemma4: final 30 only);
         // configure()'s values stay as the fallback for files without the keys
         if (gguf_has(m, "{arch}.attn_logit_softcapping")) {
@@ -1698,6 +1724,10 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_dt.bias", t.fblob, t.dn_dt_off + l * nvh, nvh)
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_a", t.fblob, t.dn_a_off + l * nvh, nvh)
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_norm.weight", t.fblob, t.dn_norm_off + l * t.config.ssm_d_state, t.config.ssm_d_state)
+                if (t.dn_ba_f32) {  // F32-on-disk beta/alpha stay fp32
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_beta.weight", t.fblob, t.dn_betaf_off + l * dim * nvh, dim * nvh)
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_alpha.weight", t.fblob, t.dn_alphaf_off + l * dim * nvh, dim * nvh)
+                }
             }
             if (t.config.layer_out_scale) {  // gemma4: one output scalar per layer
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.layer_output_scale.weight", t.fblob, t.out_scale_off + l, 1l)
@@ -1739,11 +1769,14 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             let qd_l = layer_qd(t.config, l)
             if (layer_is_recurrent(t.config, l)) {
                 // qwen35 deltanet projections: fused [q;k;v] + z gate + per-v-head beta/alpha + out
+                // (beta/alpha skip the big-weight path when they ship F32 — read into fblob above)
                 let cd = dn_conv_dim(t.config)
                 load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch)
                 load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch)
-                load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
-                load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                if (!t.dn_ba_f32) {
+                    load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                    load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                }
                 load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch)
             } elif (t.config.fused_qkv) {
                 // Phi3: attn_qkv rows are [q (qd) ; k (kv) ; v (kv)], ffn_up rows are [gate ; up] (hidden each).
@@ -4752,8 +4785,13 @@ def private deltanet_decode(t : Model; var s : Session; l : int64) {
     let ts_qkv = ref_time_ticks()
     mm_f(s.dn_qkv, t, KqFmt.q8, t.dnqkv_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, cd)
     mm_f(s.dn_z, t, KqFmt.q8, t.dngate_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, di)
-    mm_f(s.dn_beta, t, KqFmt.q8, t.dnbeta_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
-    mm_f(s.dn_g, t, KqFmt.q8, t.dnalpha_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+    if (t.dn_ba_f32) {   // F32-on-disk beta/alpha matmul fp32, like llama.cpp
+        mm_fblob(s.dn_beta, t, t.dn_betaf_off + l * dim * nvh, s.xb, dim, nvh)
+        mm_fblob(s.dn_g, t, t.dn_alphaf_off + l * dim * nvh, s.xb, dim, nvh)
+    } else {
+        mm_f(s.dn_beta, t, KqFmt.q8, t.dnbeta_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+        mm_f(s.dn_g, t, KqFmt.q8, t.dnalpha_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+    }
     prof_add("mm_qkv", ts_qkv)
     let ts_attn = ref_time_ticks()
     unsafe {
@@ -6657,8 +6695,13 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
     let ts_qkv = ref_time_ticks()
     mm_b_f(s, s.dn_qkv_b, t, KqFmt.q8, t.dnqkv_offs[l], s.xb_b, dim, cd, npos)
     mm_b_f(s, s.dn_z_b, t, KqFmt.q8, t.dngate_offs[l], s.xb_b, dim, di, npos)
-    mm_b_f(s, s.dn_beta_b, t, KqFmt.q8, t.dnbeta_offs[l], s.xb_b, dim, nvh, npos)
-    mm_b_f(s, s.dn_g_b, t, KqFmt.q8, t.dnalpha_offs[l], s.xb_b, dim, nvh, npos)
+    if (t.dn_ba_f32) {   // F32-on-disk beta/alpha matmul fp32, like llama.cpp
+        mm_fblob_b(s.dn_beta_b, t, t.dn_betaf_off + l * dim * nvh, s.xb_b, dim, nvh, npos)
+        mm_fblob_b(s.dn_g_b, t, t.dn_alphaf_off + l * dim * nvh, s.xb_b, dim, nvh, npos)
+    } else {
+        mm_b_f(s, s.dn_beta_b, t, KqFmt.q8, t.dnbeta_offs[l], s.xb_b, dim, nvh, npos)
+        mm_b_f(s, s.dn_g_b, t, KqFmt.q8, t.dnalpha_offs[l], s.xb_b, dim, nvh, npos)
+    }
     prof_add("mm_qkv", ts_qkv)
     let ts_attn = ref_time_ticks()
     unsafe {
