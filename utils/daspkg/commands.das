@@ -1881,8 +1881,12 @@ let RELEASE_MANIFEST = ".daspkg_release.manifest"
 
 def private clean_previous_release(bundle_dir : string) {
     let mpath = path_join(bundle_dir, RELEASE_MANIFEST)
+    if (!fexist(mpath)) {
+        return   // first release into this dir (or a pre-manifest bundle): nothing to clean
+    }
     let body = fread(mpath)
     if (empty(body)) {
+        to_log(LOG_WARNING, "release: {RELEASE_MANIFEST} exists but reads empty — skipping cleanup; stale files from a previous release may remain\n")
         return
     }
     for (line in split(body, "\n")) {
