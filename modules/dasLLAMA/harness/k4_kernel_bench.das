@@ -4,7 +4,6 @@ options stack = 131072
 
 require dasllama/dasllama_math_gen
 require dasllama/dasllama_math
-require daslib/fio
 require math
 
 // Q4_K (k4q8) kernel microbench — the seam-bisection ground floor: raw kernel, one thread,
@@ -72,7 +71,7 @@ def main {
         // GEMV (decode shape): full matrix, one token
         k4q8_gemv_gen(yp, kqp, ksp, xqp, xsp, xbsp, int64(N), 0l, int64(D))   // warmup + codegen
         var best_us = 999999999l
-        for (r in range(ROUNDS)) {
+        for (_r in range(ROUNDS)) {
             let t0 = ref_time_ticks()
             k4q8_gemv_gen(yp, kqp, ksp, xqp, xsp, xbsp, int64(N), 0l, int64(D))
             let us = int64(get_time_usec(t0))
@@ -85,7 +84,7 @@ def main {
         // TILE (prefill shape): 64 tokens x full matrix, weight-stationary 4-token blocks
         let ngroups = int64(D) / mr
         var best_tile_us = 999999999l
-        for (r in range(ROUNDS)) {
+        for (_r in range(ROUNDS)) {
             let t0 = ref_time_ticks()
             for (g in range64(ngroups)) {
                 var t0k = 0l

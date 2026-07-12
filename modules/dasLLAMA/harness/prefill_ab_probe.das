@@ -2,11 +2,10 @@ options gen2
 options persistent_heap
 options stack = 262144
 
-require dasllama/dasllama_transformer
+require dasllama/dasllama_common
 require dasllama/dasllama_math
 require daslib/jobque_boost
 require daslib/fio
-require math
 
 def bench(tr : Model; toks : array<int64>; dt : KVDtype) {
     var s <- make_run_state(tr.config, dt, dt)
