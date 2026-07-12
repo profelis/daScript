@@ -1,6 +1,7 @@
 options gen2
 options rtti
 options no_coverage // shape pins: injected coverage calls legitimately block the folds
+options auto_inline_functions = false // shape pins: splices rewrite the very call shapes the folds are probed on
 
 require daslib/ast
 require daslib/rtti

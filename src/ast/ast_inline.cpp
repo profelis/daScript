@@ -676,9 +676,11 @@ namespace das {
                 out.emplace_back(op3->right, lazyArm);
             } else if ( e->rtti_isOp2() ) {
                 // covers copy/move/clone too: destination address first, then the value.
-                // &&/|| short-circuit only in builtin form - a user overload is a call
+                // &&/|| (and their &&=/||= assignment forms) short-circuit only in
+                // builtin form - a user overload is a call
                 auto op2 = static_cast<ExprOp2 *>(e);
-                bool lazyRight = (op2->op=="&&" || op2->op=="||")
+                bool lazyRight = (op2->op=="&&" || op2->op=="||"
+                        || op2->op=="&&=" || op2->op=="||=")
                     && (!op2->func || op2->func->builtIn);
                 out.emplace_back(op2->left, 0);
                 out.emplace_back(op2->right, lazyRight ? 1 : 0);
@@ -731,6 +733,32 @@ namespace das {
             } else if ( e->rtti_isUnsafe() ) {
                 out.emplace_back(static_cast<ExprUnsafe *>(e)->body, 0);
             }
+        }
+
+        // mirrors lint's 30250 detection (ast_lint.cpp preVisit(ExprAt)): two non-deref
+        // ref lookups into the same table - by textual identity - within one statement.
+        // lint runs AFTER the patch slot, so splicing a call out of such a statement
+        // would erase the diagnostic while keeping the UB; those sites decline instead.
+        // scope matches lint's: same-statement expressions only (childrenInEvalOrder),
+        // nested block statements are their own lint scope
+        void scanStatementTableAts ( Expression * e, das_hash_set<uint64_t> & seen, bool & collides ) {
+            if ( !e || collides ) return;
+            if ( e->rtti_isAt() ) {
+                auto at = static_cast<ExprAt *>(e);
+                if ( !at->underDeref && at->subexpr->type && at->subexpr->type->isGoodTableType() ) {
+                    auto h = hash64z(at->subexpr->describe().c_str());
+                    if ( !seen.insert(h).second ) { collides = true; return; }
+                }
+            }
+            vector<pair<Expression *,int>> kids;
+            childrenInEvalOrder(e, kids);
+            for ( auto & k : kids ) scanStatementTableAts(k.first, seen, collides);
+        }
+        bool statementHasTableLookupCollision ( Expression * stmt ) {
+            das_hash_set<uint64_t> seen;
+            bool collides = false;
+            scanStatementTableAts(stmt, seen, collides);
+            return collides;
         }
 
         // conservative purity for tier-B substitution and prefix hoisting. the
@@ -1447,6 +1475,13 @@ namespace das {
                     }
                 }
                 if ( !siteLive ) continue;
+                // a statement lint will reject as 30250 (same-table lookup collision)
+                // must reach lint intact - splicing would erase the error, not the UB.
+                // MUST sites keep the [inline] contract (master semantics)
+                if ( site.kind!=SiteKind::MustCall && statementHasTableLookupCollision(site.stmt) ) {
+                    decline(site, "the statement has a potential table lookup collision (error 30250 preserved for lint)", callLike->at);
+                    continue;
+                }
                 // ----- subject shape gates -----
                 ExprBlock * body = nullptr;
                 TypeDecl * subjResult = nullptr;    // null = void result
@@ -1781,6 +1816,29 @@ namespace das {
                 }
                 if ( pos==SitePosition::Lazy ) {
                     auto lazy = path.lazyOps.back();    // outermost lazy op on the path
+                    // `a &&= call()` / `a ||= call()` evaluate the RHS conditionally and
+                    // produce no value, so the temp-hoist path below cannot apply; lower
+                    // the statement itself to if-form: `if (a) a = call()` (negated for
+                    // ||=). the LHS is then read twice, so only a plain variable
+                    // qualifies - anything else declines and keeps the call
+                    if ( lazy->rtti_isOp2() ) {
+                        auto sop = static_cast<ExprOp2 *>(lazy);
+                        if ( sop->op=="&&=" || sop->op=="||=" ) {
+                            if ( site.stmt!=lazy || !sop->left->rtti_isVar() ) {
+                                siteFail(site, "can't inline " + subjName + " in the right side of " + sop->op + " - hoist the call into its own statement", callLike->at);
+                                continue;
+                            }
+                            auto & list = site.anchor.block->list;
+                            auto thenBlk = new ExprBlock();
+                            thenBlk->at = sop->at;
+                            thenBlk->list.push_back(new ExprCopy(sop->at, sop->left->clone(), sop->right));
+                            ExpressionPtr cond = sop->left->clone();
+                            if ( sop->op=="||=" ) cond = new ExprOp1(sop->at, "!", cond);
+                            list[anchorIndex] = new ExprIfThenElse(sop->at, cond, thenBlk, nullptr);
+                            changed = true;
+                            continue;
+                        }
+                    }
                     // a ternary lowers by SPLITTING into bare arm stores (the fresh hoist
                     // rides the same var+if path a round later), and a bare store loses
                     // the per-arm coercion the ternary provided - a void? panic arm into
@@ -2199,9 +2257,13 @@ namespace das {
         // best-effort inlining is an optimization: it stays out of unoptimized builds
         bool autoEnabled = getOptimize()
             && !options.getBoolOption("disable_auto_inline", policies.disable_auto_inline);
-        // the heuristic tier over plain calls is opt-in on top of the block-literal tier
+        // the heuristic tier over plain calls is opt-in on top of the block-literal tier.
+        // strict aliasing mode (`options no_aliasing`) reports call-result aliasing as
+        // errors; splicing those calls away would change which programs compile, so the
+        // heuristic tier stands down there - diagnostics must not depend on a perf knob
         bool autoFns = autoEnabled
-            && options.getBoolOption("auto_inline_functions", policies.auto_inline_functions);
+            && options.getBoolOption("auto_inline_functions", policies.auto_inline_functions)
+            && !options.getBoolOption("no_aliasing", policies.no_aliasing);
         das_hash_map<Function *, bool> worthCache;
         das_hash_set<Function *> budgetExempt;
         AutoInlineCfg autoCfg;
