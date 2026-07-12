@@ -40,6 +40,21 @@ def main {
     if (has_env_variable("DASLLAMA_PIN_BATCH_BACKEND")) {
         select_batch_backend(get_env_variable("DASLLAMA_PIN_BATCH_BACKEND"))
     }
+    // the metal batch donor's rail: keep the f32 scale plane (the batch override swaps only the
+    // f32 batch slot, and a wscale16 load would route prefill through batch_s16 instead)
+    if (has_env_variable("DASLLAMA_WSCALE_F16")) {
+        set_wscale_f16(get_env_variable("DASLLAMA_WSCALE_F16") != "0")
+    }
+    // the resident whole-prefill override (dasMetal Phase 6): claims the ENTIRE layer stack;
+    // needs the f32 scale plane like the batch donor (DASLLAMA_WSCALE_F16=0)
+    if (has_env_variable("DASLLAMA_PIN_PREFILL")) {
+        let pf = get_env_variable("DASLLAMA_PIN_PREFILL")
+        if (!select_prefill_override(pf)) {
+            print("prefill override `{pf}` not registered on this build\n")
+        } else {
+            print("prefill override: {pf}\n")
+        }
+    }
     print("loading {path}\n")
     var t <- load_gguf(path, QuantMode.q8)
     t.config.seq_len = min(t.config.seq_len, 8192l)   // cap KV cache (Llama-3 context length is 131072)
