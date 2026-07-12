@@ -217,7 +217,7 @@ def private kq_dot_gate(t : T?; fmt : int) {
         perturb_quants(blk2, 0, 192)    // ql + qh
     }
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
     var kq : array<uint8>
     var ks : array<uint8>
     kq |> resize(2l * qsb)
@@ -256,11 +256,16 @@ def private kq_dot_gate(t : T?; fmt : int) {
     xq |> resize(n)
     xs |> resize(n / 32l)
     xbs |> resize(n / 16l)
-    quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
-    // fp64 elementwise reference over the SAME quantized activation
+    if (fmt == 4) {   // kq v2: k4 reads Q8_K-form activations (per-256 scale)
+        quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    } else {
+        quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    }
+    // fp64 elementwise reference over the SAME quantized activation (k4 = Q8_K form: per-256 scale)
+    let sdiv = fmt == 4 ? 256l : 32l
     var ref = 0.0lf
     for (i in range64(n)) {
-        ref += double(w[i]) * double(xq[i]) * double(xs[i / 32l])
+        ref += double(w[i]) * double(xq[i]) * double(xs[i / sdiv])
     }
     var got = 0.0
     unsafe {
@@ -300,7 +305,7 @@ def private kq_repack_gate(t : T?; fmt : int; mr : int64) {
     let d = 32l
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
     var kq : array<uint8>
     var ks : array<uint8>
@@ -334,7 +339,11 @@ def private kq_repack_gate(t : T?; fmt : int; mr : int64) {
     xq |> resize(n)
     xs |> resize(n / 32l)
     xbs |> resize(n / 16l)
-    quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    if (fmt == 4) {   // kq v2: k4 reads Q8_K-form activations (per-256 scale)
+        quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    } else {
+        quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    }
     var want : array<float>
     var wrow : array<float>
     want |> resize(int(d))
@@ -422,7 +431,7 @@ def private kq_tile_gate(t : T?; fmt : int) {
     let nsb = n / 256l
     let mr = kq_layout_of(fmt)   // the format's OWN layout companion (per-format tune families)
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
     var kq : array<uint8>
     var ks : array<uint8>
@@ -467,7 +476,11 @@ def private kq_tile_gate(t : T?; fmt : int) {
     xbs |> resize(int(ntok * n / 16l))
     unsafe {
         for (p in range64(ntok)) {
-            quantize_q8_0_bs_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 32l), p * (n / 16l))
+            if (fmt == 4) {   // kq v2: Q8_K form, per-256 scale rows
+                quantize_q8_k_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 256l), p * (n / 16l))
+            } else {
+                quantize_q8_0_bs_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 32l), p * (n / 16l))
+            }
         }
     }
     var ytile : array<float>
@@ -492,7 +505,7 @@ def private kq_tile_gate(t : T?; fmt : int) {
             }
             while (tk < ntok) {   // token tail via the rows core (the batch cell's shape)
                 if (fmt == 4) {
-                    k4q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 32l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
+                    k4q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 256l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
                 } elif (fmt == 5) {
                     k5q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 32l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
                 } else {
@@ -503,7 +516,7 @@ def private kq_tile_gate(t : T?; fmt : int) {
         }
         for (p in range64(ntok)) {   // reference: one full GEMV per token
             if (fmt == 4) {
-                k4q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 32l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
+                k4q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 256l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
             } elif (fmt == 5) {
                 k5q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 32l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
             } else {
@@ -548,7 +561,7 @@ def private kq_groupn_gate(t : T?; fmt : int) {
     let nreg = 3l
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
     var kq : array<uint8>
     var ks : array<uint8>
@@ -584,7 +597,11 @@ def private kq_groupn_gate(t : T?; fmt : int) {
     xbs |> resize(int(nreg * n / 16l))
     unsafe {
         for (p in range64(nreg)) {
-            quantize_q8_0_bs_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 32l), p * (n / 16l))
+            if (fmt == 4) {   // kq v2: Q8_K form, per-256 scale rows
+                quantize_q8_k_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 256l), p * (n / 16l))
+            } else {
+                quantize_q8_0_bs_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 32l), p * (n / 16l))
+            }
         }
     }
     var offs_sh : array<int64>
@@ -610,7 +627,7 @@ def private kq_groupn_gate(t : T?; fmt : int) {
                 let ksr = addr(ks[sb * ssb])
                 if (fmt == 4) {
                     want_sh[r * d + row] = dot_k4q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
-                    want_pr[r * d + row] = dot_k4q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n)
+                    want_pr[r * d + row] = dot_k4q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 256l)]), addr(xbs[r * (n / 16l)]), n)
                 } elif (fmt == 5) {
                     want_sh[r * d + row] = dot_k5q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
                     want_pr[r * d + row] = dot_k5q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n)
@@ -663,7 +680,7 @@ def private kq_groupn_gate(t : T?; fmt : int) {
             let ksr = addr(ks[r * d * nsb * ssb])
             if (fmt == 4) {
                 k4q8_gemv_gen(addr(want_sh[r * d]), kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, 0l, d)
-                k4q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
+                k4q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 256l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
             } elif (fmt == 5) {
                 k5q8_gemv_gen(addr(want_sh[r * d]), kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, 0l, d)
                 k5q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)

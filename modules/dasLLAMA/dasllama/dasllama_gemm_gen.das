@@ -874,7 +874,140 @@ def private or_bit_x10(te : TileEmit; var w, bytes, maskv : LLVMOpaqueValue?; na
 // Fold per 32-sub-block: f += xs[b]·(s⊙float(Σq·a) − o⊙Σa) with Σa off the per-16 xbs plane
 // (k6: o = 32·s folds as s⊙(float(Σq·a) − 32·Σa16) per 16-half). Identical loads re-emitted
 // per sub-block (k6 qh groups, d vector) GVN to one — the file-wide splat discipline.
+// kq v2 (k4): integer sub-scale and bsums-x-mins folds against Q8_K-form activations — the
+// lcpp scheme. The nibble walk and token dots are the shared kq lattice; the fold pays ONE
+// float fma pair per superblock per (token, row-quad) instead of two per 32-block: each
+// block's int32 row-dot folds as sc·(lo+hi) into iacc and its per-32 activation sum as mn·Σa
+// into bacc (both exact — sc,mn ≤ 63 keep 8-block sums far inside int32), then d/dmin (f16
+// rows) and the per-superblock activation scale d8 close the superblock in two fmas.
+def private emit_block_k4v2(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f : LLVMOpaqueValue? [8]; tokBase, tokCount : int) {
+    let b = te.builder
+    let rq = te.rq
+    let mr = te.interleave
+    let w8 = te.width / 8
+    var wb = LLVMBuildMul(b, sbi, te.types->ConstI64(uint64(mr * 128)), "wb")
+    var sb = LLVMBuildMul(b, sbi, te.types->ConstI64(uint64(mr * 20)), "sb")
+    var xb = LLVMBuildMul(b, sbi, te.types->ConstI64(0x100ul), "xb")
+    var gb = LLVMBuildShl(b, sbi, te.types->ConstI64(3ul), "gb")
+    let memBcast = te.dotKind != DOT_SDOT && te.dotKind != DOT_SMMLA
+    let madd16 = memBcast && te.dotKind == DOT_MADDUBS
+    // weight-side superblock scales: f16 d/dmin rows + the repack-decoded u8 sc/mn rows
+    var dv : LLVMOpaqueValue? [2]
+    var mv : LLVMOpaqueValue? [2]
+    for (qd in range(rq)) {
+        dv[qd] = load_f16_vec_at(te, te.sg, LLVMBuildAdd(b, sb, te.types->ConstI64(uint64(2 * (qd * te.rv))), ""), "d{qd}")
+        mv[qd] = load_f16_vec_at(te, te.sg, LLVMBuildAdd(b, sb, te.types->ConstI64(uint64(2 * mr + 2 * (qd * te.rv))), ""), "dm{qd}")
+    }
+    var iacc : LLVMOpaqueValue? [8]
+    var bacc : LLVMOpaqueValue? [8]
+    for (i in range(tokCount * rq)) {
+        iacc[i] = LLVMConstNull(te.vni32)
+        bacc[i] = LLVMConstNull(te.vni32)
+    }
+    var vri8 = LLVMVectorType(te.types.t_int8, uint(te.rv))
+    for (blk in range(8)) {
+        var xoff0 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32)), "")
+        var xoff1 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32 + 16)), "")
+        var xv0 : LLVMOpaqueValue? [4]
+        var xv1 : LLVMOpaqueValue? [4]
+        if (!memBcast) {
+            for (i in range(tokCount)) {
+                xv0[i] = load_v16i8(te, te.x[tokBase + i], xoff0, "x{tokBase + i}_{blk}lo")
+                xv1[i] = load_v16i8(te, te.x[tokBase + i], xoff1, "x{tokBase + i}_{blk}hi")
+            }
+        }
+        var a0 : LLVMOpaqueValue? [8]     // [token * rq + qd]; tokCount*rq <= 8 (nrsplit*vq rail)
+        var a1 : LLVMOpaqueValue? [8]
+        for (i in range(tokCount * rq)) {
+            a0[i] = LLVMConstNull(te.vni32)
+            a1[i] = LLVMConstNull(te.vni32)
+        }
+        var p16lo : LLVMOpaqueValue? [8]
+        for (i in range(tokCount * rq)) {
+            p16lo[i] = null
+        }
+        for (j in range(4)) {
+            for (qd in range(rq)) {
+                // weight vectors unpacked ONCE, dotted against every token below
+                var noff = LLVMBuildAdd(b, wb, te.types->ConstI64(uint64((blk * 16 + j * 4) * mr + qd * w8)), "")
+                var nv = load_vec(te, te.vwi8, te.wg, noff, "nv{blk}_{j * rq + qd}")
+                var wlo = LLVMBuildAnd(b, nv, splat_i8w(te, 15), "wlo{blk}_{j * rq + qd}")
+                var whi = LLVMBuildLShr(b, nv, splat_i8w(te, 4), "whi{blk}_{j * rq + qd}")
+                if (memBcast) {
+                    var doff0 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32 + j * 4)), "")
+                    var doff1 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32 + 16 + j * 4)), "")
+                    for (i in range(tokCount)) {
+                        var xlo = bcast_dword(te, te.x[tokBase + i], doff0, "xd{tokBase + i}_{blk}_{j}a")
+                        var xhi = bcast_dword(te, te.x[tokBase + i], doff1, "xd{tokBase + i}_{blk}_{j}b")
+                        if (madd16) {
+                            let k = i * rq + qd
+                            p16lo[k] = madd16_acc(te, madd16_acc(te, p16lo[k], wlo, xlo), whi, xhi)
+                        } else {
+                            a0[i * rq + qd] = kq_dot_mem(te, a0[i * rq + qd], wlo, xlo)
+                            a1[i * rq + qd] = kq_dot_mem(te, a1[i * rq + qd], whi, xhi)
+                        }
+                    }
+                } else {
+                    for (i in range(tokCount)) {
+                        a0[i * rq + qd] = kq_dot_lane(te, a0[i * rq + qd], wlo, xv0[i], j)
+                        a1[i * rq + qd] = kq_dot_lane(te, a1[i * rq + qd], whi, xv1[i], j)
+                    }
+                }
+            }
+        }
+        if (madd16) {   // k4: one widen per (token, qd) for the whole sub-block
+            for (k in range(tokCount * rq)) {
+                a0[k] = madd16_flush(te, a0[k], p16lo[k])
+                p16lo[k] = null
+            }
+        }
+        // the integer fold: iacc += sc·(lo+hi), bacc += mn·Σa32 — no float ops per block
+        var scv : LLVMOpaqueValue? [2]
+        var mnv : LLVMOpaqueValue? [2]
+        for (qd in range(rq)) {
+            var scp = LLVMBuildGEP2(b, te.types.t_int8, te.sg, LLVMBuildAdd(b, sb, te.types->ConstI64(uint64(4 * mr + blk * mr + qd * te.rv)), ""), "scp{blk}_{qd}")
+            var mnp = LLVMBuildGEP2(b, te.types.t_int8, te.sg, LLVMBuildAdd(b, sb, te.types->ConstI64(uint64(12 * mr + blk * mr + qd * te.rv)), ""), "mnp{blk}_{qd}")
+            scv[qd] = LLVMBuildZExt(b, LLVMBuildLoad2Aligned(b, vri8, scp, 1u, ""), te.vni32, "sc{blk}_{qd}")
+            mnv[qd] = LLVMBuildZExt(b, LLVMBuildLoad2Aligned(b, vri8, mnp, 1u, ""), te.vni32, "mn{blk}_{qd}")
+        }
+        var bIdx = LLVMBuildAdd(b, gb, te.types->ConstI64(uint64(blk)), "b{blk}")
+        var bi2 = LLVMBuildShl(b, bIdx, te.types->ConstI64(1ul), "")
+        var bi2b = LLVMBuildAdd(b, bi2, te.types->ConstI64(1ul), "")
+        for (i in range(tokCount)) {
+            let tk = tokBase + i
+            var bp0 = LLVMBuildGEP2(b, te.types.t_int32, te.xbs[tk], bi2, "bp{tk}_{blk}a")
+            var bs0 = LLVMBuildLoad2Aligned(b, te.types.t_int32, bp0, 4u, "bs{tk}_{blk}a")
+            var bp1 = LLVMBuildGEP2(b, te.types.t_int32, te.xbs[tk], bi2b, "bp{tk}_{blk}b")
+            var bs1 = LLVMBuildLoad2Aligned(b, te.types.t_int32, bp1, 4u, "bs{tk}_{blk}b")
+            var a32 = LLVMBuildAdd(b, bs0, bs1, "a32{tk}_{blk}")
+            var a32v = splat_i32(te, a32, "a32v{tk}_{blk}")
+            for (qd in range(rq)) {
+                var acc = LLVMBuildAdd(b, a0[i * rq + qd], a1[i * rq + qd], "acc{tk}_{blk}_{qd}")
+                iacc[i * rq + qd] = LLVMBuildAdd(b, iacc[i * rq + qd], LLVMBuildMul(b, scv[qd], acc, ""), "ia{tk}_{blk}_{qd}")
+                bacc[i * rq + qd] = LLVMBuildAdd(b, bacc[i * rq + qd], LLVMBuildMul(b, mnv[qd], a32v, ""), "ba{tk}_{blk}_{qd}")
+            }
+        }
+    }
+    // the superblock fold: f += float(iacc)·(d·d8); f -= float(bacc)·(dmin·d8)
+    for (i in range(tokCount)) {
+        let tk = tokBase + i
+        var qp = LLVMBuildGEP2(b, te.types.t_float, te.xs[tk], sbi, "qp{tk}")
+        var d8 = LLVMBuildLoad2Aligned(b, te.types.t_float, qp, 4u, "d8{tk}")
+        var d8v = splat_f32(te, d8, "d8v{tk}")
+        for (qd in range(rq)) {
+            var ds = LLVMBuildFMul(b, dv[qd], d8v, "ds{tk}_{qd}")
+            var ms = LLVMBuildFNeg(b, LLVMBuildFMul(b, mv[qd], d8v, ""), "ms{tk}_{qd}")
+            f[i * rq + qd] = fold_fma(te, LLVMBuildSIToFP(b, iacc[i * rq + qd], te.vnf32, ""), ds, f[i * rq + qd], "f{tk}_{qd}s")
+            f[i * rq + qd] = fold_fma(te, LLVMBuildSIToFP(b, bacc[i * rq + qd], te.vnf32, ""), ms, f[i * rq + qd], "f{tk}_{qd}m")
+        }
+    }
+}
+
 def private emit_block_kq(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f : LLVMOpaqueValue? [8]; tokBase, tokCount : int) {
+    if (te.kq == 4) {
+        emit_block_k4v2(te, sbi, f, tokBase, tokCount)
+        return
+    }
     let b = te.builder
     let rq = te.rq
     let mr = te.interleave
@@ -2195,7 +2328,7 @@ def private kq_gemv_gen_impl(var gc : LlvmCodeCtx; fmt : int) : bool {
     let rev = LLVMGetParam(gc.impl, 8u)
     sa.nb = LLVMBuildSDiv(b, n, te.types->ConstI64(0x100ul), "nsb")
     var qrow = LLVMBuildMul(b, sa.nb, te.types->ConstI64(uint64(fmt == 4 ? 128 : (fmt == 5 ? 160 : 192))), "qrow")
-    var srow = LLVMBuildMul(b, sa.nb, te.types->ConstI64(uint64(fmt == 6 ? 18 : 32)), "srow")
+    var srow = LLVMBuildMul(b, sa.nb, te.types->ConstI64(uint64(fmt == 6 ? 18 : (fmt == 4 ? 20 : 32))), "srow")
     sa.d = te.types->ConstI64(0ul)
     sa.t0 = te.types->ConstI64(0ul)
     let mrC = te.types->ConstI64(uint64(te.interleave))
@@ -2267,7 +2400,9 @@ def private kq_tile_gen_impl(var gc : LlvmCodeCtx; fmt : int) : bool {
     sa.g = LLVMGetParam(gc.impl, 8u)
     sa.t0 = LLVMGetParam(gc.impl, 9u)
     sa.nb = LLVMBuildSDiv(b, n, te.types->ConstI64(0x100ul), "nsb")
-    var nb32 = LLVMBuildSDiv(b, n, te.types->ConstI64(32ul), "nb32")
+    // k4 (kq v2) reads Q8_K-form activations: the scale plane is PER-SUPERBLOCK (n/256 per
+    // token); k5/k6 keep the Q8_0-form per-32 plane. bsums are per-16 for all three.
+    var nb32 = fmt == 4 ? sa.nb : LLVMBuildSDiv(b, n, te.types->ConstI64(32ul), "nb32")
     var nb16 = LLVMBuildSDiv(b, n, te.types->ConstI64(16ul), "nb16")
     for (tk in range(4)) {
         var tRow = LLVMBuildAdd(b, sa.t0, te.types->ConstI64(uint64(tk)), "")

@@ -513,13 +513,17 @@ def dequant_q6k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array
 
 // ===== K-quant native-plane transcode (superblock payloads -> split quant/scale planes) =====
 // Plane layouts (per 256-weight superblock; element offsets are plane-local and superblock-aligned):
-//   k4 quant: 128B nibbles verbatim            k4 scale: 8 x (f16 d*sc, f16 dmin*m) = 32B
-//   k5 quant: [128B nibbles][32B high-bits]    k5 scale: same 32B pair form
+//   k4 quant: 128B nibbles verbatim            k4 scale: [f16 d][f16 dmin][12B 6-bit sc/mn][4B pad] = 20B
+//   k5 quant: [128B nibbles][32B high-bits]    k5 scale: 8 x (f16 d*sc, f16 dmin*m) = 32B
 //   k6 quant: [128B ql][64B qh]                k6 scale: [16 x int8 sub-scales][f16 d] = 18B
-// The f16 (s, o) pairs are the load-time unpack of the 6-bit packed sub-scales — the hot loop
-// reads them directly instead of re-deriving per dot (llama.cpp's ALU bill). f16 rounding of
-// d*sc / dmin*m is <= 2^-12 relative — far below the 4/5-bit quant noise; the plane-dequant
-// reference below applies the SAME rounding, so kernels gate bit-exactly against it.
+// k4 keeps the DISK scale block verbatim (kq v2 — the lcpp fold scheme: integer sub-scale and
+// bsums-x-mins accumulation against per-256 Q8_K activations, one d*d8 float fold per
+// superblock); the 4B pad brings the stride to 20 so the grp repack can decode the 6-bit
+// packing into [d][dmin][sc u8][mn u8] rows IN PLACE. k5's f16 (s, o) pairs are the v1
+// load-time unpack of the 6-bit sub-scales — f16 rounding of d*sc / dmin*m is <= 2^-12
+// relative, and the k5 plane-dequant reference applies the SAME rounding, so those kernels
+// gate bit-exactly against it. k4/k6 plane dequants are bit-exact vs the DISK dequant (their
+// planes are verbatim).
 
 def private wr_f16(var p : array<uint8>; o : int64; v : float) {
     let h = f32_to_f16(v)
@@ -528,14 +532,14 @@ def private wr_f16(var p : array<uint8>; o : int64; v : float) {
 }
 
 //! Transcode one Q4_K superblock (144 bytes at `bo`) into the k4 planes: nibbles verbatim to
-//! kq[kqo..+128), f16 (d*sc, dmin*m) pairs to ks[kso..+32).
+//! kq[kqo..+128), the disk scale block verbatim to ks[kso..+16) (f16 d, f16 dmin, 12 bytes of
+//! 6-bit sub-scales/mins) + 4 zero pad bytes (stride 20 — see the plane-layout comment above).
 def transcode_q4k_superblock(bytes : array<uint8> | #; bo : int64; var kq : array<uint8>; kqo : int64; var ks : array<uint8>; kso : int64) {
-    let d = f16_to_f32(rd_u16(bytes, bo))
-    let dmin = f16_to_f32(rd_u16(bytes, bo + 2l))
-    for (j in range64(8l)) {
-        let sm = q4k_scale_min(bytes, bo + 4l, j)
-        wr_f16(ks, kso + j * 4l, d * float(sm.x))
-        wr_f16(ks, kso + j * 4l + 2l, dmin * float(sm.y))
+    for (i in range64(16l)) {
+        ks[kso + i] = bytes[bo + i]   // f16 d, f16 dmin, 12 packed scale/min bytes — disk order
+    }
+    for (i in range64(4l)) {
+        ks[kso + 16l + i] = uint8(0)
     }
     for (i in range64(128l)) {
         kq[kqo + i] = bytes[bo + 16l + i]
@@ -577,16 +581,23 @@ def private rd_pair(ks : array<uint8> | #; o : int64) : float2 {
 }
 
 //! Reference dequant of one k4-plane superblock (the exact math the k4 kernels must reproduce):
-//! w = s*q - o with the plane's f16-rounded (s, o) pairs.
+//! w = (d*sc)*q - (dmin*m) with the plane's verbatim disk scale block — bit-identical to the
+//! disk dequant (kq v2: the plane IS the disk block, split).
 def dequant_k4_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
+    let d = f16_to_f32(rd_u16(ks, kso))
+    let dmin = f16_to_f32(rd_u16(ks, kso + 2l))
     var dsto = doff
     for (js in range64(4l)) {
-        let p0 = rd_pair(ks, kso + 2l * js * 4l)
-        let p1 = rd_pair(ks, kso + (2l * js + 1l) * 4l)
+        let s0 = q4k_scale_min(ks, kso + 4l, 2l * js)
+        let s1 = q4k_scale_min(ks, kso + 4l, 2l * js + 1l)
+        let d1 = d * float(s0.x)
+        let m1 = dmin * float(s0.y)
+        let d2 = d * float(s1.x)
+        let m2 = dmin * float(s1.y)
         for (l in range64(32l)) {
             let b = int(kq[kqo + 32l * js + l])
-            dst[dsto + l] = p0.x * float(b & 15) - p0.y
-            dst[dsto + 32l + l] = p1.x * float(b >> 4) - p1.y
+            dst[dsto + l] = d1 * float(b & 15) - m1
+            dst[dsto + 32l + l] = d2 * float(b >> 4) - m2
         }
         dsto += 64l
     }
@@ -640,7 +651,7 @@ def dequant_k6_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<u
 
 // K-quant plane strides (bytes per 256-weight superblock)
 let K4_QSB = 128l
-let K4_SSB = 32l
+let K4_SSB = 20l   // kq v2: 16B verbatim disk scale block + 4B pad (repack decodes in place)
 let K5_QSB = 160l
 let K5_SSB = 32l
 let K6_QSB = 192l
@@ -666,7 +677,7 @@ def private kq_transcode_base(m : GGUFMeta; name : string; want_type : int; type
 }
 
 //! Transcode a Q4_K tensor into the k4 planes at plane-local element offset `eloff` (from the
-//! layout's k4 cursor): quant bytes at (eloff/256)*128, scale pairs at (eloff/256)*32.
+//! layout's k4 cursor): quant bytes at (eloff/256)*128, scale blocks at (eloff/256)*20.
 def gguf_transcode_q4k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
     var bo = kq_transcode_base(m, name, GGML_TYPE_Q4_K, "Q4_K", src_off, expect_n, 144l)
     var kqo = (eloff / 256l) * K4_QSB

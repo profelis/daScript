@@ -464,17 +464,28 @@ what it costs today and what the fix would change.
   loader; oracle = llama.cpp mtmd (GGUF pairs ship). ~1 modest arc; the encoder is SHARED
   infrastructure — the same implementation unlocks Ultravox (llama-3 decoder ✓ have it) and
   ~80% of a Whisper-proper port later.
-- **kq tile emitter headroom vs lcpp — the post-tune dense K-quant prefill gap (M1, 2026-07-12).**
-  Per-format tune families landed (k4/k5/k6 own manifest entries; M1 crowns mr4 everywhere,
-  pp512 +10/+26/+22% on Qwen3-4B Q4_K_M/Q5_K_M/Q6_K) but dense kq prefill still trails lcpp
-  0.88×/0.77×/0.72× while decode is at parity (0.94-1.02) and MoE prefill WINS (1.13×). The
-  residual is `emit_block_kq` itself: k5/k6 tiles run 52-58 GMAC/s/core vs lcpp's ~80 effective
-  from plain hand-NEON vec_dots (no repack on their side for k5/k6!) — the Q5 high-bit OR and
-  Q6 6-bit unpack sequences want NEON-shaped emission (tbl/shrn forms), and the 4-token tile
-  wants a wider token axis so one unpack feeds more dots (mr8+nrsplit4 declines on the shared
-  q-reg budget today; a kq-specific budget or an unpack-to-L1-scratch shape would lift it).
-  Sized: ~1.4-1.5× on the k5/k6 tile = the remaining ~25% of dense K-quant pp. Fixture fallout:
-  gen_tune_probe kq families re-race, test_kquant tile/gemv bit-gates re-verify per emitter change.
+- **kq v2 for k5/k6 — finish what the k4 rework proved (M1, 2026-07-12).** The k4 family now
+  runs the lcpp fold scheme (kq v2: Q8_K-form activations — per-256 scale + per-16 bsums —
+  verbatim disk scale planes decoded at repack, integer sub-scale/mins folds, ONE float fma
+  pair per superblock) and dense Q4_K_M prefill went 0.88× → **1.00× lcpp** (pp512 158.0 vs
+  158.2) with tg UP at 0.98× and MoE 1.34×/1.03×. (Correction to the earlier entry: lcpp DOES
+  repack all of Q4_K/Q5_K/Q6_K on ARM — 8x4 dotprod GEMMs on M1; only their AVX2 side is
+  Q4_K-only.) k5/k6 still run v1 (per-32 float folds, f16 pair planes) at 0.75×/0.72× lcpp pp —
+  port them onto the same skeleton: k6's planes are already verbatim (signed per-16 sub-scales
+  → sext instead of zext, two int accumulators); k5 needs the k4 plane treatment (verbatim
+  12B packing + high-bit OR kept). That also DELETES the dual-form activation plumbing's
+  Q8_0 side for kq (all kq becomes Q8_K) and the moe_pair mixed-form guards.
+- **Fused decode chains regrain for kq v2 (spotted landing k4 v2, 2026-07-12).** The chains'
+  mid-chain requants slice at 32-element/per-head grain — Q8_K needs whole 256-superblocks —
+  so k4 layers are gated OUT of both chains (fused_attn_ok/fused_ffn_ok) and take the per-op
+  decode path. tg still improved (v2 gemv +15% covered the chain loss) but the chain win is
+  on the table: regrain the w2-input requant to 256-row chunks and the wo-input requant to
+  head PAIRS (head_size 128 × 2 = one superblock). Sized: a few % tg on k4-heavy models.
+- **kq v2 on zen2/SPR — the x64 lattice race (after k5/k6 v2).** The v2 emitter folds are
+  lattice-generic (maddubs/vpdpbusd kq grid rows emit the same integer scheme, bias128+kq
+  dropped as untested); zen2's lcpp lead was its AVX2 Q4_K 8x8 repack GEMM, and lcpp has NO
+  x64 repack for Q5_K/Q6_K — post-v2 zen2 should reach Q4_K parity and WIN Q5/Q6. Needs the
+  zen2 tune run + per-op race; SPR when a box respins.
 - **kq tune bench lacks a MoE-shaped cell row (spotted validating the mr4 crowns, 2026-07-12).**
   The mr4 tile crown gave dense pp +10-26% but gave back ~3% MoE prefill on qwen3moe-30B
   (fused expert cells average ~32 tokens per expert with d=768-class group spans — a regime
