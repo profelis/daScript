@@ -2053,7 +2053,7 @@ def private run_lab(b : B?; variants) {
     assert_no_metal_leaks()
 }
 
-[benchmark]
+[benchmark, unused_argument(b)]   // b is consumed only inside the Apple static_if half
 def bench_metal_gemm_kernels(b : B?) {
     if (!jit_enabled()) {
         to_log(LOG_WARNING, "skipped: interpreted (dasLLAMA benchmarks are JIT-only)\n")
