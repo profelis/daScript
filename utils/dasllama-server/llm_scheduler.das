@@ -50,6 +50,7 @@ struct PendingReq {
     params : SamplingParams = SamplingParams()
     max_new : int64 = 256l                  // reply token budget (>= 1)
     seed : int = 0                          // != 0 => set_seed at admit (reproducible sampling)
+    t_submit : int64                        // ref_time_ticks at submit (queue-wait logging)
 }
 
 //! One active generation stream: the owned KV session plus its request state. Managed wholly by
@@ -149,7 +150,11 @@ def submit(model : Model; var sch : Scheduler; var req : PendingReq) : bool {
     if (int64(length(sch.queue)) >= sch.max_queue) {
         return false
     }
+    req.t_submit = ref_time_ticks()
     sch.queue |> emplace(req)
+    if (int64(length(sch.queue)) + int64(length(sch.streams)) > sch.max_streams) {
+        to_log(LOG_INFO, "[req {sch.queue[length(sch.queue) - 1].id}] queued: depth {length(sch.queue)}, active {length(sch.streams)}/{sch.max_streams}\n")
+    }
     return true
 }
 
@@ -157,10 +162,13 @@ def submit(model : Model; var sch : Scheduler; var req : PendingReq) : bool {
 def private finish_stream(var st : Stream; finish : string; var events : array<SchedEvent>) {
     st.state = StreamState.done
     st.finish = finish
+    let gen_us = st.t_first != 0l ? int64(get_time_usec(st.t_first)) : 0l
+    let rate = gen_us > 0l ? 1000000.0 * float(st.n_gen) / float(gen_us) : 0.0
+    to_log(LOG_INFO, "[stream {st.id}] finish: reason={finish}, gen={st.n_gen} tok in {gen_us / 1000l}ms ({rate} tok/s), total {int64(get_time_usec(st.t_admit)) / 1000l}ms\n")
     events |> push(SchedEvent(stream = st.id, kind = SchedEventKind.finished, finish = finish,
                               n_prompt = int64(length(st.prompt)), n_gen = st.n_gen,
                               n_cached = st.n_cached, ttft_us = st.ttft_us,
-                              gen_us = st.t_first != 0l ? int64(get_time_usec(st.t_first)) : 0l))
+                              gen_us = gen_us))
 }
 
 // Sample the next token from st.session's fresh logits and run the emit protocol — stop-id check,
@@ -171,6 +179,7 @@ def private sample_advance(m : Model; var st : Stream; var events : array<SchedE
     if (st.t_first == 0l) {
         st.t_first = ref_time_ticks()
         st.ttft_us = int64(get_time_usec(st.t_admit))
+        to_log(LOG_INFO, "[stream {st.id}] first token after {st.ttft_us / 1000l}ms\n")
     }
     for (sid in st.stop_ids) {
         if (tok == sid) {
@@ -194,6 +203,7 @@ def private sample_advance(m : Model; var st : Stream; var events : array<SchedE
 def evict(var sch : Scheduler; id : int64; var events : array<SchedEvent>) : bool {
     for (i in range64(int64(length(sch.streams)))) {
         if (sch.streams[i].id == id && sch.streams[i].state != StreamState.done) {
+            to_log(LOG_WARNING, "[stream {id}] evicting: client disconnected mid-generation\n")
             finish_stream(sch.streams[i], "evicted", events)
             sch.n_evicted ++
             return true
@@ -230,12 +240,19 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
             st.n_prefilled = matched
             st.n_cached = matched
             sch.cached_tokens += matched
+            if (matched > 0l) {
+                to_log(LOG_INFO, "[stream {st.id}] prefix cache HIT: {matched}/{length(st.prompt)} tok attached, no prefill for them\n")
+            } else {
+                to_log(LOG_INFO, "[stream {st.id}] prefix cache MISS: full {length(st.prompt)}-tok prefill\n")
+            }
         } else {
             st.session <- create_session(m, sch.kv_dtype)
         }
         if (sch.queue[0].seed != 0) {
             set_seed(st.session, sch.queue[0].seed)
         }
+        let wait_ms = sch.queue[0].t_submit != 0l ? int64(get_time_usec(sch.queue[0].t_submit)) / 1000l : 0l
+        to_log(LOG_INFO, "[stream {st.id}] start: prompt={length(st.prompt)} tok (cached={st.n_cached}), queue_wait={wait_ms}ms, active={length(sch.streams) + 1}/{sch.max_streams}\n")
         sch.streams |> emplace(st)
         delete sch.queue[0]   // erase is a raw memmove — finalize what the move-out left behind
         sch.queue |> erase(0)
@@ -283,6 +300,10 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         eval(m, sch.streams[i].session, sch.chunk)
         sch.streams[i].n_prefilled += take
         if (sch.streams[i].n_prefilled >= np) {
+            let pf_ms = int64(get_time_usec(sch.streams[i].t_admit)) / 1000l
+            let pf_tok = np - sch.streams[i].n_cached
+            let pf_rate = pf_ms > 0l ? 1000.0 * float(pf_tok) / float(pf_ms) : 0.0
+            to_log(LOG_INFO, "[stream {sch.streams[i].id}] prefill done: {pf_tok} tok in {pf_ms}ms ({pf_rate} tok/s)\n")
             sch.streams[i].state = StreamState.decoding   // before sampling: sample_advance may finish it
             if (sample_advance(m, sch.streams[i], events)) {   // the final chunk's logits sample the first token inline
                 sch.gen_tokens ++

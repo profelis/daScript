@@ -234,6 +234,7 @@ def private error_body(msg, kind : string) : string {
 
 // Terminal error on a streaming route's writer (chat/completions run through the writer).
 def private bad_request(srv : WebSocketServer; var writer : HttpResponseWriter?; msg : string) {
+    to_log(LOG_WARNING, "dasllama-server: 400 rejected: {msg}\n")
     respond(srv, writer, int(http_status.BAD_REQUEST), "application/json",
             error_body(msg, "invalid_request_error"))
 }
@@ -371,10 +372,12 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
     preq.close_toks <- close_toks
     if (!submit(g_model, g_sched, preq)) {
         delete preq
+        to_log(LOG_WARNING, "dasllama-server: 503 queue full ({g_sched.max_queue}) — rejected {prefix} request ({np} tok)\n")
         respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
                 error_body("the server is at capacity ({g_sched.max_queue} requests queued) — retry shortly", "server_error"))
         return
     }
+    to_log(LOG_INFO, "[req {rid}] {prefix}: prompt={np} tok, stream={streaming}, max_new={max_new}\n")
     var wire <- StreamWire(writer = writer, streaming = streaming, is_chat = is_chat,
                            id = cid, created = created)
     g_wires[rid] <- wire
@@ -692,12 +695,19 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
             to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
         } else {
             let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
-            let kv_mode = page_rows > 0l ? "paged P={page_rows}, prefix cache {pfx_desc} pages" : "flat"
+            let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
             to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode})\n")
             while (!g_should_stop) {
                 server->tick()   // drains queued handlers: requests parse + render + submit here
                 reap_disconnected(server.server)
+                let t_step = ref_time_ticks()
                 let busy = scheduler_step(g_model, g_sched, g_events)
+                let step_ms = int64(get_time_usec(t_step)) / 1000l
+                if (step_ms > 3000l) {
+                    // the "why does it pause" catcher: one decode step / prefill chunk should be
+                    // well under a second — anything slower means contention or a stall
+                    to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms (active={n_active(g_sched)}, queued={n_queued(g_sched)})\n")
+                }
                 flush_events(server.server)
                 if (!busy) {
                     sleep(2u)
