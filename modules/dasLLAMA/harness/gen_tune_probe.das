@@ -534,10 +534,15 @@ def kq_layout_mrs(fmt : int64) : table<string; int> {
 
 // one kq tile sweep: every (4-token, group) unit through `tile` on the variant's grp<mr>
 // planes — the kq tile contract is always 4 tokens per call (no amx tokstep: the kq planes
-// have no TMUL form, amx perms ride the busd lattice)
+// have no TMUL form, amx perms ride the busd lattice). k5/k6 tiles read the byte-expanded
+// panel unpacked per group (the batch cell's amortized shape — the bench cost is honest)
 def run_kq_tile(tile; fx : KqFixture; kq : array<uint8>; ks : array<uint8>; mr : int64; var y : array<float>) {
     let ng = fx.d / mr
     verify(fx.ntok % 4l == 0l)
+    var panel : array<uint8>
+    if (fx.fmt != 4l) {
+        panel |> resize(int(mr * fx.nsb * 256l))
+    }
     unsafe {
         let kqp = addr(kq[0])
         let ksp = addr(ks[0])
@@ -546,8 +551,12 @@ def run_kq_tile(tile; fx : KqFixture; kq : array<uint8>; ks : array<uint8>; mr :
         let xbsp = addr(fx.xbs[0])
         var yp = addr(y[0])
         for (g in range64(ng)) {
-            let kqg = kqp + g * mr * fx.nsb * kq_qsb(fx.fmt)
+            var kqg = kqp + g * mr * fx.nsb * kq_qsb(fx.fmt)
             let ksg = ksp + g * mr * fx.nsb * kq_ssb(fx.fmt)
+            if (fx.fmt != 4l) {
+                unpack_kq_panel_grp(fx.fmt, kqg, addr(panel[0]), mr, fx.nsb)
+                kqg = addr(panel[0])
+            }
             var t0 = 0l
             while (t0 < fx.ntok) {
                 invoke(tile, yp, kqg, ksg, xqp, xsp, xbsp, fx.n, fx.d, g, t0)
@@ -555,6 +564,7 @@ def run_kq_tile(tile; fx : KqFixture; kq : array<uint8>; ks : array<uint8>; mr :
             }
         }
     }
+    delete panel
 }
 
 // one kq gemv rows-core sweep over all rows for token 0 (the group walk is inside the

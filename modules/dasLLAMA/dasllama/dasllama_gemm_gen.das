@@ -289,6 +289,10 @@ struct private TileEmit {
     kq : int                             // 4/5/6 = K-quant superblock emitter (0 = not kq): the
                                          // block unit is a 256-weight superblock over the grp<mr>
                                          // kq planes; dots run unsigned-q (kq_dot_lane)
+    kqBytes : bool                       // kq weights are a BYTE-EXPANDED panel (the tile's
+                                         // per-token-block scratch — see unpack_kq_panel_grp):
+                                         // wlo/whi load verbatim, no 5/6-bit unpack. k5/k6
+                                         // tiles only; gemv and k4 read the packed planes
     t_amx : LLVMOpaqueType?              // x86_amx — virtual tile values (the TMUL tile, slice I)
     tload_decl : LLVMOpaqueValue?        // llvm.x86.tileloadd64.internal (latch: raw tileloadd64)
     tload_ty : LLVMOpaqueType?
@@ -872,6 +876,11 @@ def private or_bit_x10(te : TileEmit; var w, bytes, maskv : LLVMOpaqueValue?; na
 //   k6  = k4-shaped low nibbles + high 2-bit groups [half 0..1][jj 0..7][row][4B] (jj covers the
 //       half's 32 byte columns; block g of the half reads jj=j (lo) / j+4 (hi) at uniform shift
 //       2g); scales [16 x mr int8 sc][mr f16 d] — NATIVE per-16 SIGNED sub-scales
+//   kqBytes (the k5/k6 TILE form) — kqg is a BYTE-EXPANDED scratch panel (unpack_kq_panel_grp:
+//       [blk][j][row][4B] full-byte weight k, then the k+16 region at +128*mr, qsb 256): wlo/whi
+//       load verbatim, zero unpack ALU. The batch cell unpacks it once per (group, token-block),
+//       so the 5/6-bit deposit amortizes over TB tokens instead of the tile's 4 — while the DRAM
+//       planes keep the packed 160/192B form the (bandwidth-bound) GEMV decode path streams
 // kq v2 (all three formats): integer sub-scale and bsums folds against Q8_K-form activations
 // (per-256 scale d8, per-16 bsums) — the lcpp scheme. The nibble walk and token dots are the
 // shared kq lattice; the fold pays ONE float fma pair (k4/k5) or fma (k6) per superblock per
@@ -886,7 +895,7 @@ def private emit_block_kqv2(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f
     let mr = te.interleave
     let w8 = te.width / 8
     let k6 = te.kq == 6
-    let qsb = te.kq == 4 ? 128 : (te.kq == 5 ? 160 : 192)
+    let qsb = te.kq == 4 ? 128 : (te.kqBytes ? 256 : (te.kq == 5 ? 160 : 192))
     var wb = LLVMBuildMul(b, sbi, te.types->ConstI64(uint64(mr * qsb)), "wb")
     var sb = LLVMBuildMul(b, sbi, te.types->ConstI64(uint64(mr * (k6 ? 18 : 20))), "sb")
     var xb = LLVMBuildMul(b, sbi, te.types->ConstI64(0x100ul), "xb")
@@ -945,17 +954,26 @@ def private emit_block_kqv2(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f
         }
         for (j in range(4)) {
             for (qd in range(rq)) {
-                // weight vectors unpacked ONCE, dotted against every token below
+                // weight vectors unpacked ONCE, dotted against every token below; a kqBytes
+                // panel (the k5/k6 tile scratch) loads the wlo/whi images verbatim instead
                 var noff = LLVMBuildAdd(b, wb, te.types->ConstI64(uint64((blk * 16 + j * 4) * mr + qd * w8)), "")
-                var nv = load_vec(te, te.vwi8, te.wg, noff, "nv{blk}_{j * rq + qd}")
-                var wlo = LLVMBuildAnd(b, nv, splat_i8w(te, 15), "wlo{blk}_{j * rq + qd}")
-                var whi = LLVMBuildLShr(b, nv, splat_i8w(te, 4), "whi{blk}_{j * rq + qd}")
-                if (te.kq == 5) {
+                var wlo : LLVMOpaqueValue?
+                var whi : LLVMOpaqueValue?
+                if (te.kqBytes) {
+                    var hoff2 = LLVMBuildAdd(b, noff, te.types->ConstI64(uint64(128 * mr)), "")
+                    wlo = load_vec(te, te.vwi8, te.wg, noff, "wlo{blk}_{j * rq + qd}")
+                    whi = load_vec(te, te.vwi8, te.wg, hoff2, "whi{blk}_{j * rq + qd}")
+                } else {
+                    var nv = load_vec(te, te.vwi8, te.wg, noff, "nv{blk}_{j * rq + qd}")
+                    wlo = LLVMBuildAnd(b, nv, splat_i8w(te, 15), "wlo{blk}_{j * rq + qd}")
+                    whi = LLVMBuildLShr(b, nv, splat_i8w(te, 4), "whi{blk}_{j * rq + qd}")
+                }
+                if (te.kq == 5 && !te.kqBytes) {
                     var hoff = LLVMBuildAdd(b, wb, te.types->ConstI64(uint64(128 * mr + (blk * 4 + j) * mr + qd * te.rv)), "")
                     var hb = load_row_bytes_x4(te, te.wg, hoff, "qh{blk}_{j * rq + qd}")
                     wlo = or_bit_x10(te, wlo, hb, maskLo, "wlo5{blk}_{j * rq + qd}")
                     whi = or_bit_x10(te, whi, hb, maskHi, "whi5{blk}_{j * rq + qd}")
-                } elif (k6) {
+                } elif (k6 && !te.kqBytes) {
                     let g2 = (blk % 4) * 2
                     let hbase = 128 * mr + ((blk / 4) * 8) * 4 * mr
                     var hloOff = LLVMBuildAdd(b, wb, te.types->ConstI64(uint64(hbase + j * 4 * mr + qd * w8)), "")
@@ -2266,7 +2284,7 @@ def private kq_tile_gen_impl(var gc : LlvmCodeCtx; fmt : int) : bool {
     if (perm_declines(gc, p0)) return false
     let p = companion_perm(p0)
 
-    var te = TileEmit(kq = fmt)
+    var te = TileEmit(kq = fmt, kqBytes = fmt != 4)
     if (!setup_tile_emit(te, gc, p, false)) return false
 
     let b = gc.jit.builder

@@ -471,20 +471,24 @@ what it costs today and what the fix would change.
   +15% covered the chain loss) but the chain win is on the table: regrain the w2-input
   requant to 256-row chunks and the wo-input requant to head PAIRS (head_size 128 × 2 = one
   superblock). Sized: a few % tg on kq models.
-- **k5/k6 kernel unpack gap — CONFIRMED by iso (M1, 2026-07-12 clean-box read).** Tile
-  GMAC/s: k4 97.0, k5 65.2 (0.67 of k4), k6 57.6 (0.59); gemv: k4 64.3, k5 27.5 (0.43 of
-  k4 — ALU-strangled at 19.4 GB/s weight stream vs k4's 37.2), k6 34.5. The e2e clean race
-  (warm cache, quiet box): lcpp 172/131/138.5 pp512 on Q4/Q5/Q6, das 151–163 (bimodal) /
-  110 / 111 → 0.88–0.95× / 0.84× / 0.80×. NOTE the recalibration: the session-2 "k4 parity"
-  (158.0 vs 158.2) was two load-depressed numbers coinciding — lcpp's true clean Q4 is
-  ~172, its effective tile ~107, so even k4 trails ~9% at the kernel. The unpack is the
-  lever for all three: k5's load_row_bytes_x4 byte-gather + or_bit_x10 (cmtst/bsl per
-  half), k6's two extra qh vector loads + shift/and/shl per (j, qd). We OWN the repack —
-  candidates: pre-expanded k5 high-bit rows (trade plane bytes for ALU), a tbl-based
-  deposit, k6 qh pre-shift at repack. The k5 GEMV (decode) is its own sub-item — 27.5
-  GMAC/s means Q5 decode leans on lcpp's Q5 being equally slow. Also on the table: the das
-  prefill run-to-run bimodality (150↔163 on Q4 while llama-bench holds ±0.3% — suspect
-  E-core lane placement; lcpp pins/QoS-hints its threads).
+- **✅ SHIPPED (kq v3 panel-scratch, 2026-07-12 PM): the k5/k6 kernel unpack lever.** The
+  tile now reads a BYTE-EXPANDED panel (one byte per weight — zero unpack ALU) that the
+  batch cell unpacks from the packed grp planes once per (group, token-block)
+  (`unpack_kq_panel_grp`, SWAR uint64 deposit), amortizing the 5/6-bit deposit over TB=128
+  tokens instead of the tile's 4; the DRAM planes KEEP the packed 160/192 B/superblock form
+  the decode path streams. M1 Max e2e (Qwen3-4B, warm/quiet, 3 alternated reps): Q5 pp512
+  110 → 150–168 (lcpp 131 → das 1.14–1.28×), Q6 111 → 140–143 (lcpp 138.5 → 1.01–1.03×),
+  tg64 at v2 parity (Q5 ~33.7, Q6 ~30.5, Q4 control untouched). Iso tile: k5 65→89, k6
+  58→76 GMAC/s at the probe's ×16 amortization (~94/~79 effective at production ×32).
+  **THE LESSON (measured, do not re-learn):** pure byte-expanded DRAM planes (no scratch)
+  win the same pp but cost tg −30%/−20% on Q5/Q6 — M1 Max decode is DRAM-bound at the
+  model level (~90 GB/s effective), so plane bytes ARE decode time; k4 stays nibble-packed
+  everywhere for the same reason. Residual headroom, ledgered: (a) k6 tile 76 vs k4 95 —
+  the per-16 SIGNED sub-scale fold pays 2 scale-row sexts + 4 muls per block vs k4/k5's 1;
+  (b) k5 unpack still ~6% of production tile (the broadcast+carry deposit — a generated
+  NEON tbl/cmtst unpack kernel would close it); (c) the das prefill run-to-run bimodality
+  (Q5 150↔168 this round, Q4 155↔166 while llama-bench holds ±0.3% — suspect E-core lane
+  placement; lcpp pins/QoS-hints its threads).
 - **kq v2 on zen2/SPR — the x64 lattice race (k5/k6 v2 landed 2026-07-12 — unblocked).** The v2 emitter folds are
   lattice-generic (maddubs/vpdpbusd kq grid rows emit the same integer scheme, bias128+kq
   dropped as untested); zen2's lcpp lead was its AVX2 Q4_K 8x8 repack GEMM, and lcpp has NO

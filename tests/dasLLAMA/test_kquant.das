@@ -563,19 +563,28 @@ def private kq_tile_gate(t : T?; fmt : int) {
     var ygemv : array<float>
     ytile |> resize(int(ntok * d))
     ygemv |> resize(int(ntok * d))
+    // k5/k6 tiles read the byte-expanded panel the batch cell unpacks per (group, token-block)
+    // — the gate covers unpack_kq_panel_grp too (tile-over-panel vs gemv-over-packed planes)
+    var panel : array<uint8>
+    if (fmt != 4) {
+        panel |> resize(int(mr * nsb * 256l))
+    }
     unsafe {
         let ng = d / mr
         for (g in range64(ng)) {
             let kqg = addr(kq[g * mr * nsb * qsb])
             let ksg = addr(ks[g * mr * nsb * ssb])
+            if (fmt != 4) {
+                unpack_kq_panel_grp(int64(fmt), kqg, addr(panel[0]), mr, nsb)
+            }
             var tk = 0l
             while (tk + 4l <= ntok) {   // whole tiles
                 if (fmt == 4) {
                     k4q8_tile_gen(addr(ytile[0]), kqg, ksg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d, g, tk)
                 } elif (fmt == 5) {
-                    k5q8_tile_gen(addr(ytile[0]), kqg, ksg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d, g, tk)
+                    k5q8_tile_gen(addr(ytile[0]), addr(panel[0]), ksg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d, g, tk)
                 } else {
-                    k6q8_tile_gen(addr(ytile[0]), kqg, ksg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d, g, tk)
+                    k6q8_tile_gen(addr(ytile[0]), addr(panel[0]), ksg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d, g, tk)
                 }
                 tk += 4l
             }
@@ -609,6 +618,7 @@ def private kq_tile_gate(t : T?; fmt : int) {
     t |> success(bad == 0, "kq tile bit-matches per-token GEMVs")
     delete kq
     delete ks
+    delete panel
     delete src
     delete xq
     delete xs

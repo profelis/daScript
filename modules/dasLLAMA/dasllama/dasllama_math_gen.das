@@ -301,13 +301,15 @@ def k6q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp :
 // have no TMUL/MMA form. Fallbacks mirror the q8 per-ISA chain flavors; arm64 lands on the
 // measured M1 tile winner (mr4 — grp4 planes, single-unpack tile).
 
-//! The K-quant TILE kernels (the kq batch family): 4 tokens x mr rows per call over the
-//! grp<mr> kq planes — kqg/ksg are the GROUP plane bases (the batch wrapper offsets per
-//! group), activations an [ntok x n] image with per-token scale/bsum rows. The generated body
-//! unpacks each weight vector once per superblock and dots it against all 4 tokens
-//! (weight-stationary — the prefill fix for the serial per-position GEMVs); one call is
-//! bit-exact vs 4 per-token GEMVs. Reference bodies = per-token scalar grp walks, declining
-//! in lockstep via the shared predicate. Not `private`: called from lifted worker lambdas.
+//! The K-quant TILE kernels (the kq batch family): 4 tokens x mr rows per call — ksg is the
+//! group's scale-plane base; kqg is the group's QUANT panel: k4 the packed grp<mr> plane
+//! itself, k5/k6 the BYTE-EXPANDED scratch the batch cell unpacks once per (group,
+//! token-block) (unpack_kq_panel_grp, qsb 256 — the kqBytes tile form: verbatim wlo/whi
+//! loads, the 5/6-bit deposit amortized over TB tokens instead of the tile's 4).
+//! Activations an [ntok x n] image with per-token scale/bsum rows. One call is bit-exact vs
+//! 4 per-token GEMVs over the same weights. Reference bodies = per-token scalar grp walks
+//! (byte-panel form for k5/k6), declining in lockstep via the shared predicate. Not
+//! `private`: called from lifted worker lambdas.
 [tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8, nrsplit = 2),
  tune_perm(dot = "maddubs", width = 256, mr = 8, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, nrsplit = 2, requires = "avx2"),
  tune_perm(dot = "vpdpbusd", width = 256, mr = 8, requires = "avxvnni|avx512vnni"), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, nrsplit = 2, requires = "avxvnni|avx512vnni"),
@@ -342,7 +344,7 @@ def k5q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp :
     unsafe {
         for (t in range64(4l)) {
             for (r in range64(mr)) {
-                yp[(t0 + t) * d + g * mr + r] = kq_grp_row_dot(5l, kqg, ksg, r, mr, xqp + (t0 + t) * n, xsp + (t0 + t) * (n / 256l), xbsp + (t0 + t) * (n / 16l), n)
+                yp[(t0 + t) * d + g * mr + r] = kq_grp_row_dot_b(5l, kqg, ksg, r, mr, xqp + (t0 + t) * n, xsp + (t0 + t) * (n / 256l), xbsp + (t0 + t) * (n / 16l), n)
             }
         }
     }
@@ -362,7 +364,7 @@ def k6q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp :
     unsafe {
         for (t in range64(4l)) {
             for (r in range64(mr)) {
-                yp[(t0 + t) * d + g * mr + r] = kq_grp_row_dot(6l, kqg, ksg, r, mr, xqp + (t0 + t) * n, xsp + (t0 + t) * (n / 256l), xbsp + (t0 + t) * (n / 16l), n)
+                yp[(t0 + t) * d + g * mr + r] = kq_grp_row_dot_b(6l, kqg, ksg, r, mr, xqp + (t0 + t) * n, xsp + (t0 + t) * (n / 256l), xbsp + (t0 + t) * (n / 16l), n)
             }
         }
     }
@@ -792,6 +794,125 @@ def repack_k6_grp(var kq : uint8?; var ks : uint8?; n, d, mr : int64) {
     }
     delete tq
     delete ts
+}
+
+//! Unpack ONE group's packed grp<mr> k5/k6 quant panel (nsb superblocks x mr rows) into the
+//! BYTE-EXPANDED tile form: per superblock [blk][j][row][4B] full-byte weight k (128*mr), then
+//! the k+16 region at +128*mr — the wlo/whi images the kqBytes tile stamps load verbatim
+//! (qsb 256). The batch cell calls this once per (group, token-block), so the 5/6-bit deposit
+//! amortizes over TB tokens while the DRAM planes keep the packed form the bandwidth-bound
+//! GEMV decode path streams. Public: the tile gates and the tune probe build their byte
+//! fixtures through it.
+// SWAR over uint64 lanes — 16 output bytes per (blk, j, 4-row block) via two word ops (mr is
+// always a multiple of 4). k5 deposit: broadcast each row's high-bit byte across its 4 t-lanes,
+// select bit t per lane (SEL, values ≤ 8), then any-set → 0x10 via the add-carry test
+// ((x + 0x7F) & 0x80 per lane, no lane overflow) shifted to bit 4. k6: the 2-bit tops sit at
+// a uniform shift per block — one shift+mask per word.
+[hint(unsafe_range_check, noalias = kqg, noalias = dst)]
+def unpack_kq_panel_grp(fmt : int64; kqg : uint8 const?; var dst : uint8?; mr, nsb : int64) {
+    let LO4 = 0x0F0F0F0F0F0F0F0Ful
+    let SEL = 0x0804020108040201ul   // LE lane t (0..3, twice) selects high-bit t
+    let C7F = 0x7F7F7F7F7F7F7F7Ful
+    let C80 = 0x8080808080808080ul
+    let TOP2 = 0x0303030303030303ul
+    unsafe {
+        for (sbi in range64(nsb)) {
+            let qb = sbi * (fmt == 5l ? 160l : 192l) * mr
+            let ob = sbi * 256l * mr
+            for (blk in range64(8l)) {
+                let g2 = uint64((blk % 4l) * 2l)
+                let hbase = qb + 128l * mr + (blk / 4l) * 32l * mr   // k6 high plane (k5 ignores)
+                for (j in range64(4l)) {
+                    let gcol = ((blk * 4l + j) * mr) * 4l
+                    var r4 = 0l
+                    while (r4 < mr) {
+                        let np = kqg + (qb + gcol + r4 * 4l)
+                        let nw = reinterpret<uint64 const?>(np)
+                        var lop = dst + (ob + gcol + r4 * 4l)
+                        var hip = dst + (ob + 128l * mr + gcol + r4 * 4l)
+                        var low = reinterpret<uint64?>(lop)
+                        var hiw = reinterpret<uint64?>(hip)
+                        if (fmt == 5l) {
+                            let hp = kqg + (qb + 128l * mr + (blk * 4l + j) * mr + r4)
+                            let hb = reinterpret<uint const?>(hp)[0]   // 4 rows' high-bit bytes
+                            for (w in range64(2l)) {
+                                let n = nw[w]
+                                let b0 = uint64((hb >> uint(16l * w)) & 0xFFu) * 0x01010101ul
+                                let b1 = uint64((hb >> uint(16l * w + 8l)) & 0xFFu) * 0x01010101ul
+                                let hbw = b0 | (b1 << 32ul)
+                                let dl = (((hbw & SEL) + C7F) & C80) >> 3ul
+                                let dh = ((((hbw >> 4ul) & SEL) + C7F) & C80) >> 3ul
+                                low[w] = (n & LO4) | dl
+                                hiw[w] = ((n >> 4ul) & LO4) | dh
+                            }
+                        } else {
+                            let h0w = reinterpret<uint64 const?>(kqg + (hbase + (j * mr + r4) * 4l))
+                            let h1w = reinterpret<uint64 const?>(kqg + (hbase + ((j + 4l) * mr + r4) * 4l))
+                            for (w in range64(2l)) {
+                                let n = nw[w]
+                                low[w] = (n & LO4) | (((h0w[w] >> g2) & TOP2) << 4ul)
+                                hiw[w] = ((n >> 4ul) & LO4) | (((h1w[w] >> g2) & TOP2) << 4ul)
+                            }
+                        }
+                        r4 += 4l
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! kq_grp_row_dot's twin over a BYTE-EXPANDED panel (unpack_kq_panel_grp's output, qsb 256) —
+//! the k5/k6 tile wrappers' reference body. Same integer folds and per-superblock float fold,
+//! so it is bit-exact against the packed-plane dot over the same weights. fmt picks the scale
+//! form only (5 = u8 sc/mn rows + d/dmin, 6 = signed per-16 sub-scales + d).
+def kq_grp_row_dot_b(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, mr : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64) : float {
+    var acc = 0.0
+    let nsb = n / 256l
+    let ssb = fmt == 6l ? 18l : 20l
+    unsafe {
+        for (sbi in range64(nsb)) {
+            let qb = sbi * 256l * mr
+            let sb = sbi * ssb * mr
+            var isum = 0
+            var bsum = 0
+            for (blk in range64(8l)) {
+                let b = sbi * 8l + blk
+                var ilo = 0
+                var ihi = 0
+                for (j in range64(4l)) {
+                    for (t in range64(4l)) {
+                        let qlo = int(kqg[qb + ((blk * 4l + j) * mr + r) * 4l + t])
+                        let qhi = int(kqg[qb + 128l * mr + ((blk * 4l + j) * mr + r) * 4l + t])
+                        ilo += qlo * int(xqp[b * 32l + j * 4l + t])
+                        ihi += qhi * int(xqp[b * 32l + 16l + j * 4l + t])
+                    }
+                }
+                if (fmt == 6l) {
+                    let s0 = int(int8(ksg[sb + 2l * blk * mr + r]))
+                    let s1 = int(int8(ksg[sb + (2l * blk + 1l) * mr + r]))
+                    isum += s0 * ilo + s1 * ihi
+                    bsum += s0 * xbsp[b * 2l] + s1 * xbsp[b * 2l + 1l]
+                } else {
+                    let sc = int(ksg[sb + 4l * mr + blk * mr + r])
+                    let mn = int(ksg[sb + 12l * mr + blk * mr + r])
+                    isum += sc * (ilo + ihi)
+                    bsum += mn * (xbsp[b * 2l] + xbsp[b * 2l + 1l])
+                }
+            }
+            if (fmt == 6l) {
+                let dk6 = f16_to_f32(uint(ksg[sb + 16l * mr + 2l * r]) | (uint(ksg[sb + 16l * mr + 2l * r + 1l]) << 8u))
+                acc += float(isum - 32 * bsum) * (dk6 * xsp[sbi])
+            } else {
+                let dd = f16_to_f32(uint(ksg[sb + 2l * r]) | (uint(ksg[sb + 2l * r + 1l]) << 8u))
+                let dm = f16_to_f32(uint(ksg[sb + 2l * mr + 2l * r]) | (uint(ksg[sb + 2l * mr + 2l * r + 1l]) << 8u))
+                let d8 = xsp[sbi]
+                acc += float(isum) * (dd * d8)
+                acc -= float(bsum) * (dm * d8)
+            }
+        }
+    }
+    return acc
 }
 
 // the backend kq repack slot: same layout companion as the Q8/mx4 repacks — one stamped mr
@@ -1250,13 +1371,20 @@ def private kq_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : 
 // one (group range x token range) cell of the kq batch walk: TB token blocks outer, groups
 // inner, 4-token tile calls + per-token gemv tails — the q8 batch cell's shape with ts pinned
 // 4 (the kq tile is the 4-token vector form on every stamp; no TMUL kq tile exists, so the
-// amx tokstep never applies)
+// amx tokstep never applies). k5/k6 tiles read a BYTE-EXPANDED scratch panel unpacked here
+// once per (group, token-block) — the deposit amortizes over TB tokens while the DRAM planes
+// keep the packed form the gemv tails (and the bandwidth-bound decode path) stream.
 def private kq_batch_cell_gen(fmt : int; var myp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, mr, TB : int64; ub, ue : int; tb0, tend : int64) {
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
     let ssb = fmt == 6 ? 18l : 20l
     let nb16 = n / 16l
+    var scratch : array<uint8>
+    if (fmt != 4) {
+        scratch |> resize(int(mr * nsb * 256l))
+    }
     unsafe {
+        var scp = fmt != 4 ? addr(scratch[0]) : reinterpret<uint8?>(null)
         var tb = tb0
         while (tb < tend) {
             let tbe = min(tb + TB, tend)
@@ -1266,13 +1394,16 @@ def private kq_batch_cell_gen(fmt : int; var myp : float?; kqp : uint8 const?; k
                 let kqg = kqp + g * mr * nsb * qsb
                 let ksg = ksp + g * mr * nsb * ssb
                 var tk = tb
+                if (tk < tb4 && fmt != 4) {
+                    unpack_kq_panel_grp(int64(fmt), kqg, scp, mr, nsb)
+                }
                 while (tk < tb4) {
                     if (fmt == 4) {
                         k4q8_tile_gen(myp, kqg, ksg, xqp, xsp, xbsp, n, d, g, tk)
                     } elif (fmt == 5) {
-                        k5q8_tile_gen(myp, kqg, ksg, xqp, xsp, xbsp, n, d, g, tk)
+                        k5q8_tile_gen(myp, scp, ksg, xqp, xsp, xbsp, n, d, g, tk)
                     } else {
-                        k6q8_tile_gen(myp, kqg, ksg, xqp, xsp, xbsp, n, d, g, tk)
+                        k6q8_tile_gen(myp, scp, ksg, xqp, xsp, xbsp, n, d, g, tk)
                     }
                     tk += 4l
                 }
@@ -1290,6 +1421,7 @@ def private kq_batch_cell_gen(fmt : int; var myp : float?; kqp : uint8 const?; k
             tb += TB
         }
     }
+    delete scratch
 }
 
 // kq_batch slot: batched K-quant GEMM over the repacked planes — group chunks parallel, the
