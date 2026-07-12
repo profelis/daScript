@@ -40,6 +40,13 @@ def main {
     if (has_env_variable("DASLLAMA_PIN_BATCH_BACKEND")) {
         select_batch_backend(get_env_variable("DASLLAMA_PIN_BATCH_BACKEND"))
     }
+    // A/B the deltanet prefill algorithm on hybrid (qwen35) models: recurrent vs chunked (default)
+    if (has_env_variable("DASLLAMA_DN_PREFILL")) {
+        let dnm = (get_env_variable("DASLLAMA_DN_PREFILL") == "recurrent"
+            ? DnPrefillMode.recurrent : DnPrefillMode.chunked)
+        set_deltanet_prefill_mode(dnm)
+        print("deltanet prefill mode override: {dnm}\n")   // the EFFECTIVE mode, not the raw env value
+    }
     // the metal batch donor's rail: keep the f32 scale plane (the batch override swaps only the
     // f32 batch slot, and a wscale16 load would route prefill through batch_s16 instead)
     if (has_env_variable("DASLLAMA_WSCALE_F16")) {

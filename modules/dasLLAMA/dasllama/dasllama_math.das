@@ -2290,6 +2290,29 @@ def silu(var x : array<float> | #; size : int64) {
     silu(unsafe(addr(x[0])), size)
 }
 
+//! Softplus, matching ggml's op_softplus exactly: x > 20 → x, else log(1 + exp(x)).
+def softplus(x : float) : float => x > 20.0 ? x : log(1.0 + exp(x))
+
+//! Row-wise L2 normalization in place (ggml_l2_norm): scale = 1 / max(sqrt(Σx²), eps), the
+//! square-sum accumulated in double like ggml's ggml_float. Used on the deltanet q/k heads.
+[hint(noalias = v)]
+def l2_norm_rows(var v : float?; rows, row_size : int64; eps : float) {
+    unsafe {
+        for (r in range64(rows)) {
+            let base = r * row_size
+            var sum = 0.0lf
+            for (i in range64(row_size)) {
+                let x = v[base + i]
+                sum += double(x * x)
+            }
+            let scale = 1.0 / max(sqrt(float(sum)), eps)
+            for (i in range64(row_size)) {
+                v[base + i] *= scale
+            }
+        }
+    }
+}
+
 //! GELU, tanh approximation (HF's gelu_pytorch_tanh): the GeGLU gate nonlinearity (Gemma2).
 //! gelu(x) = 0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3))). In place over the first `size`
 //! elements. ggml's LLM_FFN_GELU approximates this same form via an fp16 lookup table; we
@@ -2673,6 +2696,55 @@ def template rope_scaled_neox_tab_template(var v : float ?; head_size, n : int64
 //! can't do this: its interleaved (2j, 2j+1) layout is stride-2 and the JIT won't emit vld2/vst2 for it.
 [hint(noalias = v, noalias = cosrow, noalias = sinrow), tuned]
 def rope_scaled_neox_tab(var v : float?; head_size, n : int64; cosrow : float const?; sinrow : float const?) {}
+
+//! NEOX RoPE over only the FIRST `rot` dims of each head (partial rotary — qwen35: 64 of 256).
+//! Pairs are (base+j, base+j+rot/2) and frequencies run over `rot` (ggml_rope_multi's n_rot),
+//! so this matches rope_scaled_neox with head_size = rot except heads stride by the real
+//! head_size and dims >= rot pass through untouched. Text-only M-RoPE degenerates to exactly
+//! this (see the qwen3vl precedent in dasllama_arch_qwen3.das).
+[hint(noalias = v, noalias = ff)]
+def rope_scaled_neox_part(var v : float?; pos, head_size, rot, n : int64; theta, fscale : float; has_ff : bool; ff : float const?; mscale : float = 1.0) {
+    unsafe {
+        let half = rot / 2l
+        let posf = float(pos) * fscale
+        for (h in range64(n / head_size)) {
+            let base = h * head_size
+            for (j in range64(half)) {
+                var freq = 1.0 / pow(theta, float(2l * j) / float(rot))
+                if (has_ff) {
+                    freq /= ff[j]
+                }
+                let angle = posf * freq
+                let fcr = cos(angle) * mscale
+                let fci = sin(angle) * mscale
+                let v0 = v[base + j]
+                let v1 = v[base + j + half]
+                v[base + j] = v0 * fcr - v1 * fci
+                v[base + j + half] = v0 * fci + v1 * fcr
+            }
+        }
+    }
+}
+
+//! Table form of rope_scaled_neox_part: cosrow/sinrow are one position's rot/2-wide row of a
+//! table built by build_rope_table with head_size = rot. Bit-identical to the direct form.
+[hint(noalias = v, noalias = cosrow, noalias = sinrow)]
+def rope_scaled_neox_tab_part(var v : float?; head_size, rot, n : int64; cosrow : float const?; sinrow : float const?) {
+    unsafe {
+        let half = rot / 2l
+        for (h in range64(n / head_size)) {
+            let base = h * head_size
+            for (j in range64(half)) {
+                let fcr = cosrow[j]
+                let fci = sinrow[j]
+                let v0 = v[base + j]
+                let v1 = v[base + j + half]
+                v[base + j] = v0 * fcr - v1 * fci
+                v[base + j + half] = v0 * fci + v1 * fcr
+            }
+        }
+    }
+}
 
 //! Dispatch RoPE by the model's convention: NEOX (Qwen2/Phi3/Gemma2) or the default NORM (Llama).
 //! mscale is the LongRoPE magnitude factor (1.0 for everything but Phi3); only the NEOX path uses it.

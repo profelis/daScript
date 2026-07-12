@@ -120,7 +120,7 @@ When you discover something new about daslang syntax, semantics, or conventions 
 - **Named arguments:** `foo([name = value])` with square brackets
 - **Block arguments:** block/lambda after `func()` pipes as last arg. No `$` for parameterless blocks: `defer() { ... }`. With params: `build_string() $(var writer) { ... }`. Lambdas: `emplace() @(x : int) { ... }`. **Arrow shorthand for single-expression blocks:** `arr |> sort() $(a, b) => a < b`. Defaulted parameters sitting between the explicit args and a trailing block are padded automatically — don't spell them out
 - **Lambda:** `@(args) { body }` or `@@(args) { body }` (no-capture). **Inline arrow form:** `@(x) => expr` (capture lambda) and `@@(x) => expr` (no-capture function pointer) — preferred for short transforms passed as arguments: `sometimes(pat, @@(x) => fast(x, 2.0lf))`
-- **Function/method arrow body:** `def add(a, b : int) : int => a + b` — single-expression body, return type optional (`def add(a, b : int) => a + b` infers). Works on class methods too: `def get() : int => count + 2`
+- **Function/method arrow body:** `def add(a, b : int) : int => a + b` — single-expression body, return type optional (`def add(a, b : int) => a + b` infers). Works on class methods too: `def get() : int => count + 2`. The body must START on the `=>` line — `def f() : int64 =>` followed by a newline is `error[30151]` (probe-verified 2026-07-12); wrap a long body by opening `(` on the `=>` line and breaking inside the parens
 - **Generator:** `$() { yield value; }` or `$ { yield value; }`
 - **Tuple `=>`:** `a => b` creates `tuple<auto;auto>`
 - **`typeinfo`:** `typeinfo trait_name(type<T>)` — trait name outside parens

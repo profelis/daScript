@@ -101,11 +101,13 @@ def init_byte2uni() {
     }
 }
 
-// ===== BPE pre-tokenizer (port of llama.cpp unicode_regex_split_custom_llama3 / _qwen2) =====
+// ===== BPE pre-tokenizer (port of llama.cpp unicode_regex_split_custom_llama3 / _qwen2 / _qwen35) =====
 // Splits codepoints into word lengths per the regex; classification via the dasllama_unicode
 // tables so the split matches llama.cpp's exactly. llama3 and qwen2 differ in exactly one
 // rule — digit runs: llama3 chunks \p{N}{1,3}, qwen2 emits one digit per token (\p{N}).
-// `group_digits` selects between them (true = llama3, false = qwen2); everything else is shared.
+// `group_digits` selects between them (true = llama3, false = qwen2). qwen35 = qwen2 digits
+// plus `marks`: letter runs absorb combining marks ([\p{L}\p{M}]+) and the punctuation class
+// excludes them ([^\s\p{L}\p{M}\p{N}]+); everything else is shared.
 
 def private tolower_ascii(c : int) : int {
     return (c >= 'A' && c <= 'Z') ? c + 32 : c
@@ -113,6 +115,13 @@ def private tolower_ascii(c : int) : int {
 
 def private uL(cpts : array<int>; pos : int) : bool {
     return pos >= 0 && pos < length(cpts) && cpt_is_letter(cpts[pos])
+}
+// letter-or-mark: the qwen35 letter class [\p{L}\p{M}] when marks, plain \p{L} otherwise
+def private is_lm(cpt : int; marks : bool) : bool {
+    return cpt_is_letter(cpt) || (marks && cpt_is_mark(cpt))
+}
+def private uLM(cpts : array<int>; pos : int; marks : bool) : bool {
+    return pos >= 0 && pos < length(cpts) && is_lm(cpts[pos], marks)
 }
 def private uN(cpts : array<int>; pos : int) : bool {
     return pos >= 0 && pos < length(cpts) && cpt_is_number(cpts[pos])
@@ -124,7 +133,7 @@ def private uC(cpts : array<int>; pos : int) : int {
     return (pos >= 0 && pos < length(cpts)) ? cpts[pos] : -1
 }
 
-def private pretok_split(cpts : array<int>; group_digits : bool) : array<int> {
+def private pretok_split(cpts : array<int>; group_digits : bool; marks : bool = false) : array<int> {
     var offs : array<int>
     let n = length(cpts)
     var prev_end = 0
@@ -150,11 +159,12 @@ def private pretok_split(cpts : array<int>; group_digits : bool) : array<int> {
             }
         }
 
-        // [^\r\n\p{L}\p{N}]?\p{L}+  (optional non-letter prefix, then letters)
+        // [^\r\n\p{L}\p{N}]?\p{L}+  (optional non-letter prefix, then letters;
+        // marks widens the run class to [\p{L}\p{M}]+)
         if (!(cpt == 13 || cpt == 10 || cpt_is_number(cpt))) {
-            if (cpt_is_letter(cpt) || uL(cpts, pos + 1)) {
+            if (is_lm(cpt, marks) || uLM(cpts, pos + 1, marks)) {
                 pos++
-                while (uL(cpts, pos)) {
+                while (uLM(cpts, pos, marks)) {
                     pos++
                 }
                 offs |> push(pos - prev_end); prev_end = pos
@@ -180,13 +190,14 @@ def private pretok_split(cpts : array<int>; group_digits : bool) : array<int> {
             continue
         }
 
-        // <space>?[^\s\p{L}\p{N}]+[\r\n]*  (optional space, then a non-space/letter/number run)
+        // <space>?[^\s\p{L}\p{N}]+[\r\n]*  (optional space, then a non-space/letter/number run;
+        // marks also excludes \p{M} from the run class)
         let probe = (cpt == 32) ? pos + 1 : pos
-        if (!(uW(cpts, probe) || uL(cpts, probe) || uN(cpts, probe))) {
+        if (!(uW(cpts, probe) || uLM(cpts, probe, marks) || uN(cpts, probe))) {
             if (cpt == 32) {
                 pos++
             }
-            while (!(uW(cpts, pos) || uL(cpts, pos) || uN(cpts, pos)) && pos < n) {
+            while (!(uW(cpts, pos) || uLM(cpts, pos, marks) || uN(cpts, pos)) && pos < n) {
                 pos++
             }
             var c2 = uC(cpts, pos)
@@ -548,13 +559,16 @@ def bpe_encode(tk : BpeTokenizer; text : string) : array<int64> {
     }
     var ids : array<int64>
     let cpts <- utf8_to_cpts(text)
-    // gpt-4o and tekken have their own case-structured splits; qwen2 splits digits
-    // one-at-a-time (\p{N}); llama3 / default groups up to three (\p{N}{1,3})
+    // gpt-4o and tekken have their own case-structured splits; qwen2/qwen35 split digits
+    // one-at-a-time (\p{N}); llama3 / default groups up to three (\p{N}{1,3}); qwen35
+    // additionally absorbs combining marks into letter runs
     var offs : array<int>
     if (tk.pre == "gpt-4o") {
         offs <- pretok_split_gpt4o(cpts)
     } elif (tk.pre == "tekken") {
         offs <- pretok_split_tekken(cpts)
+    } elif (tk.pre == "qwen35") {
+        offs <- pretok_split(cpts, false, true)
     } else {
         offs <- pretok_split(cpts, tk.pre != "qwen2")
     }

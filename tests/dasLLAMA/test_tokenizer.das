@@ -88,3 +88,15 @@ def test_tokenizer_llama_bpe(t : T?) {
         corpus_gate(t, path)
     }
 }
+
+[test]
+def test_tokenizer_qwen35(t : T?) {
+    t |> run("qwen35 BPE (mark-absorbing letter runs) vs the llama.cpp corpus") @(t : T?) {
+        let path = path_join(models_dir(), "ggml-vocab-qwen35.gguf")
+        if (!stat(path).is_valid) {
+            t |> skip("{path} not present")
+            return
+        }
+        corpus_gate(t, path)
+    }
+}
