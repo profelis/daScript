@@ -97,10 +97,14 @@ class SpirvShader : AstFunctionAnnotation {
         // GPU compilers do their own inlining — the CPU auto-inliner (patchInline, which shares
         // this patch slot and runs once annotation patches go quiet) must not reshape the shader
         // tree the emitter reads at fixup. Callee-side neverInline pins every reachable function;
-        // flag writes need no re-infer, so astChanged stays untouched.
+        // flag writes need no re-infer, so astChanged stays untouched. SAME-MODULE only: that is
+        // the inliner's whole candidate universe, and the flag folds into the semantic hash — a
+        // cross-module mark desyncs that module's separately-compiled AOT registration (50101).
         collect_dependencies(func) $(vfun, _vvar) {
             for (dfn in vfun) {
-                dfn.moreFlags.neverInline = true
+                if (dfn._module == compiling_module()) {
+                    dfn.moreFlags.neverInline = true
+                }
             }
         }
         // Backend body-fill: the dummy bind_uniform / push_constants functions were reserved in apply();

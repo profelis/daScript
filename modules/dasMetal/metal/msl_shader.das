@@ -62,10 +62,14 @@ class MetalKernel : AstFunctionAnnotation {
         // reshape the kernel tree the emitter reads at fixup (today that's helper-into-helper
         // splices; the inliner already declines the annotated method itself). Callee-side
         // neverInline pins every reachable function; flag writes need no re-infer, so
-        // astChanged stays untouched. Same fence as SpirvShader.patch.
+        // astChanged stays untouched. SAME-MODULE only — the inliner's whole candidate universe,
+        // and a cross-module mark desyncs that module's separately-compiled AOT registration
+        // (the flag folds into the semantic hash → 50101). Same fence as SpirvShader.patch.
         collect_dependencies(func) $(vfun, _vvar) {
             for (dfn in vfun) {
-                dfn.moreFlags.neverInline = true
+                if (dfn._module == compiling_module()) {
+                    dfn.moreFlags.neverInline = true
+                }
             }
         }
         return true
