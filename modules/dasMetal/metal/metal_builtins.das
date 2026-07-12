@@ -50,3 +50,134 @@ var gl_SubgroupID : uint                // simdgroup within the group  -> [[simd
 [unused_argument(mask), sideeffects] def public simd_shuffle_xor(v : float; mask : uint) : float { return v }
 [unused_argument(mask), sideeffects] def public simd_shuffle_xor(v : int; mask : uint) : int { return v }
 [unused_argument(mask), sideeffects] def public simd_shuffle_xor(v : uint; mask : uint) : uint { return v }
+
+// ===== simdgroup_matrix 8x8 tiles (Metal spellings; reference bodies = CPU semantics) =====
+// The reference structs hold a row-major 8x8 tile; every op below is the FULL cooperative tile
+// operation per call (on GPU all lanes of a simdgroup execute it together; the width-1 CPU replay
+// does the whole tile each call — idempotent, so sequential replay stays a valid oracle for
+// kernels whose sgmat calls sit in simdgroup-uniform flow). The emitter lowers by NAME; on GPU
+// these are the opaque hardware tile types — reaching into `.data` inside a kernel fails closed.
+
+struct public simdgroup_float8x8 {
+    data : float[64]
+}
+
+struct public simdgroup_half8x8 {
+    data : float16[64]
+}
+
+def public make_filled_simdgroup_float8x8(v : float) : simdgroup_float8x8 {
+    var m : simdgroup_float8x8
+    for (k in range(64)) {
+        m.data[k] = v
+    }
+    return m
+}
+
+def public make_filled_simdgroup_half8x8(v : float16) : simdgroup_half8x8 {
+    var m : simdgroup_half8x8
+    for (k in range(64)) {
+        m.data[k] = v
+    }
+    return m
+}
+
+// simdgroup_load(m, src, offset, stride): the 8x8 tile whose (r, c) element is
+// src[offset + r*stride + c]. `src` is untyped so one spelling covers @ssbo array<T> (device)
+// and @workgroup T[N] (threadgroup) sources; the element type must match the matrix.
+def public simdgroup_load(var m : simdgroup_float8x8; src; offset : uint; stride : uint) {
+    for (r in range(8)) {
+        for (c in range(8)) {
+            m.data[r * 8 + c] = src[int(offset) + r * int(stride) + c]
+        }
+    }
+}
+
+def public simdgroup_load(var m : simdgroup_half8x8; src; offset : uint; stride : uint) {
+    for (r in range(8)) {
+        for (c in range(8)) {
+            m.data[r * 8 + c] = src[int(offset) + r * int(stride) + c]
+        }
+    }
+}
+
+// simdgroup_store(m, dst, offset, stride): the tile back out — @ssbo destinations only.
+def public simdgroup_store(m : simdgroup_float8x8; var dst; offset : uint; stride : uint) {
+    for (r in range(8)) {
+        for (c in range(8)) {
+            dst[int(offset) + r * int(stride) + c] = m.data[r * 8 + c]
+        }
+    }
+}
+
+def public simdgroup_store(m : simdgroup_half8x8; var dst; offset : uint; stride : uint) {
+    for (r in range(8)) {
+        for (c in range(8)) {
+            dst[int(offset) + r * int(stride) + c] = m.data[r * 8 + c]
+        }
+    }
+}
+
+// simdgroup_multiply_accumulate(d, a, b, c): d = a*b + c. d may alias c (each element is read
+// before its slot is written). The mixed overload is the GEMM workhorse: f16 operand tiles into
+// f32 accumulators — an f16 product is exact in f32, matching the hardware's widened MAC.
+def public simdgroup_multiply_accumulate(var d : simdgroup_float8x8; a, b, c : simdgroup_float8x8) {
+    for (r in range(8)) {
+        for (cc in range(8)) {
+            var acc = c.data[r * 8 + cc]
+            for (k in range(8)) {
+                acc += a.data[r * 8 + k] * b.data[k * 8 + cc]
+            }
+            d.data[r * 8 + cc] = acc
+        }
+    }
+}
+
+def public simdgroup_multiply_accumulate(var d : simdgroup_half8x8; a, b, c : simdgroup_half8x8) {
+    for (r in range(8)) {
+        for (cc in range(8)) {
+            var acc = c.data[r * 8 + cc]
+            for (k in range(8)) {
+                acc += a.data[r * 8 + k] * b.data[k * 8 + cc]
+            }
+            d.data[r * 8 + cc] = acc
+        }
+    }
+}
+
+def public simdgroup_multiply_accumulate(var d : simdgroup_float8x8; a, b : simdgroup_half8x8; c : simdgroup_float8x8) {
+    for (r in range(8)) {
+        for (cc in range(8)) {
+            var acc = c.data[r * 8 + cc]
+            for (k in range(8)) {
+                acc += float(a.data[r * 8 + k]) * float(b.data[k * 8 + cc])
+            }
+            d.data[r * 8 + cc] = acc
+        }
+    }
+}
+
+// simdgroup_multiply(d, a, b): d = a*b.
+def public simdgroup_multiply(var d : simdgroup_float8x8; a, b : simdgroup_float8x8) {
+    for (r in range(8)) {
+        for (cc in range(8)) {
+            var acc = 0.0
+            for (k in range(8)) {
+                acc += a.data[r * 8 + k] * b.data[k * 8 + cc]
+            }
+            d.data[r * 8 + cc] = acc
+        }
+    }
+}
+
+def public simdgroup_multiply(var d : simdgroup_half8x8; a, b : simdgroup_half8x8) {
+    for (r in range(8)) {
+        for (cc in range(8)) {
+            var acc = 0.0h
+            for (k in range(8)) {
+                acc += a.data[r * 8 + k] * b.data[k * 8 + cc]
+            }
+            d.data[r * 8 + cc] = acc
+        }
+    }
+}

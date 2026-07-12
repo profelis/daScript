@@ -376,6 +376,77 @@ class PackedVec3 {
     }
 }
 
+// Phase-5 simdgroup_matrix: the reference-body 8x8 tile family — zero-init + filled locals,
+// device loads at runtime offset/stride, multiply and multiply-accumulate at f32 and f16,
+// stores back out
+class SgMatTile {
+    @ssbo @binding = 0 fa : array<float>
+    @ssbo @binding = 1 fb : array<float>
+    @ssbo @binding = 2 fc : array<float>
+    @ssbo @binding = 3 fd : array<float>
+    @ssbo @binding = 4 ha : array<float16>
+    @ssbo @binding = 5 hb : array<float16>
+    @ssbo @binding = 6 hc : array<float16>
+    @uniform @binding = 7 base : uint
+
+    [metal_kernel(name="sgmat_msl"), marker(no_coverage)]
+    def sgmat_tile {
+        var ma : simdgroup_float8x8
+        var mb : simdgroup_float8x8
+        simdgroup_load(ma, fa, base, 8u)
+        simdgroup_load(mb, fb, base, 8u)
+        var mm = make_filled_simdgroup_float8x8(0.0)
+        simdgroup_multiply(mm, ma, mb)
+        simdgroup_store(mm, fc, base, 8u)
+        var acc = make_filled_simdgroup_float8x8(1.0)
+        simdgroup_multiply_accumulate(acc, ma, mb, acc)
+        simdgroup_store(acc, fd, base, 8u)
+        var hx : simdgroup_half8x8
+        var hy : simdgroup_half8x8
+        simdgroup_load(hx, ha, 0u, 8u)
+        simdgroup_load(hy, hb, 0u, 8u)
+        var hm = make_filled_simdgroup_half8x8(0.5h)
+        simdgroup_multiply(hm, hx, hy)
+        var hacc : simdgroup_half8x8
+        simdgroup_multiply_accumulate(hacc, hx, hy, hm)
+        simdgroup_store(hacc, hc, 0u, 8u)
+    }
+}
+
+// Phase-5 tiled-GEMM shape: one C tile per threadgroup — cooperative threadgroup staging of f16
+// tiles + barrier + the MIXED mac (f32 accumulators, f16 operands, the offload kernel's combo)
+// walking K in 8-steps; M = N = 8, K = kdim
+class SgMatTiled {
+    @ssbo @binding = 0 xa : array<float16>
+    @ssbo @binding = 1 wb : array<float16>
+    @ssbo @binding = 2 yo : array<float>
+    @uniform @binding = 3 kdim : uint
+    @workgroup ta : float16[64]
+    @workgroup tb : float16[64]
+
+    [metal_kernel(name="sgmat_tiled_msl"), marker(no_coverage)]
+    def sgmat_tiled {
+        let lid = gl_LocalInvocationID.x
+        var acc : simdgroup_float8x8
+        var kk = 0u
+        while (kk < kdim) {
+            ta[lid] = xa[(lid / 8u) * kdim + (kk + (lid % 8u))]
+            ta[lid + 32u] = xa[((lid + 32u) / 8u) * kdim + (kk + ((lid + 32u) % 8u))]
+            tb[lid] = wb[(kk * 8u) + lid]
+            tb[lid + 32u] = wb[(kk * 8u) + (lid + 32u)]
+            barrier()
+            var ma : simdgroup_half8x8
+            var mb : simdgroup_half8x8
+            simdgroup_load(ma, ta, 0u, 8u)
+            simdgroup_load(mb, tb, 0u, 8u)
+            simdgroup_multiply_accumulate(acc, ma, mb, acc)
+            barrier()
+            kk += 8u
+        }
+        simdgroup_store(acc, yo, 0u, 8u)
+    }
+}
+
 //! Gate B: exactly the construct kinds the fixture set must emit — the census meta-test
 //! asserts equality with the observed union in both directions.
 def public declared_msl_census : table<string> {
@@ -559,6 +630,22 @@ def public declared_msl_census : table<string> {
         "op.add_assign.i32",
         "op.add_assign.f32",
         "op.mul_assign.f32",
+        // simdgroup_matrix (Phase 5): locals, fills, loads (device + threadgroup), stores,
+        // multiply, multiply-accumulate (all-f32, all-f16, and the mixed f32-acc/f16-operand combo)
+        "stmt.var.sgmat",
+        "stmt.var.sgmat.zero",
+        "call.sgmat_fill.f32",
+        "call.sgmat_fill.f16",
+        "call.sgmat_load.f32",
+        "call.sgmat_load.f16",
+        "call.sgmat_load_tg.f16",
+        "call.sgmat_store.f32",
+        "call.sgmat_store.f16",
+        "call.sgmat_mul.f32",
+        "call.sgmat_mul.f16",
+        "call.sgmat_mac.f32",
+        "call.sgmat_mac.f16",
+        "call.sgmat_mac.mixed",
         // statements
         "stmt.let",
         "stmt.var",
@@ -579,5 +666,6 @@ def public declared_msl_census : table<string> {
 def public all_msl_censuses : array<string> {
     return <- [mul_ab_msl_census, uarith_msl_census, iarith_msl_census, farith_msl_census,
         vecarith_msl_census, control_msl_census, loops_msl_census, reduce_msl_census, simd_msl_census,
-        halfarith_msl_census, latconv_msl_census, packed3_msl_census]
+        halfarith_msl_census, latconv_msl_census, packed3_msl_census, sgmat_msl_census,
+        sgmat_tiled_msl_census]
 }

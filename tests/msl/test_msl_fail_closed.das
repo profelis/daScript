@@ -8,7 +8,9 @@ options no_aot     // invokes the compiler at runtime (compile_file) — not AOT
 // construct; we compile it with compile_file and assert the error text carries the specific
 // diagnostic. The fixtures span the rejection surface: a WRITTEN @uniform (write-set scan),
 // an ARRAY @uniform (member scan), a VALUE return (statement emit), a user-function CALL (the
-// emit_call_value whitelist backstop), a BOUND @workgroup, and a dynamic-array @workgroup.
+// emit_call_value whitelist backstop), a BOUND @workgroup, and a dynamic-array @workgroup; the
+// Phase-5 simdgroup_matrix surface: `.data` access in a kernel, an @ssbo of tiles, a non-member
+// load source, and a threadgroup store.
 
 require dastest/testing_boost public
 require daslib/ast
@@ -53,5 +55,9 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_lattice_wide", "is CPU-only (8/16-lane lattice forms do not exist in shaders")
         check_rejects(t, "_fc_lattice_wide_local", "is CPU-only (8/16-lane lattice forms do not exist in shaders")
         check_rejects(t, "_fc_packed_partial", "component or swizzle writes into a packed 3-lane buffer element")
+        check_rejects(t, "_fc_sgmat_field", "field access `.data` is not a kernel-class member access")
+        check_rejects(t, "_fc_sgmat_member", "element type metal_builtins::simdgroup_float8x8 has no MSL form")
+        check_rejects(t, "_fc_sgmat_src", "simdgroup_load source must be an @ssbo or @workgroup member")
+        check_rejects(t, "_fc_sgmat_store_tg", "simdgroup_store targets an @ssbo buffer")
     }
 }

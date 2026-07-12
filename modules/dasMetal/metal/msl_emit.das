@@ -61,6 +61,19 @@ def private msl_safe_name(name : string) : string {
     return key_exists(MSL_RESERVED, name) ? "{name}_" : name
 }
 
+// a call to a GENERIC instance arrives named `__::module`name`hash` (the sgmat load/store
+// overloads take an untyped buffer parameter, so they instantiate); the base name is the
+// segment before the trailing hash — plain calls pass through
+def private call_base_name(cname : string) : string {
+    if ((cname |> find("`")) < 0) {
+        return cname
+    }
+    var parts <- split(cname, "`")
+    let base = length(parts) >= 2 ? parts[length(parts) - 2] : cname
+    delete parts
+    return base
+}
+
 def private err(var ctx : MslCtx; at : LineInfo; msg : string) {
     ctx.errors |> push("{msg} at line {int(at.line)}")
 }
@@ -300,7 +313,13 @@ def private scan_body(var ctx : MslCtx; e : Expression?) {
         }
         scan_body(ctx, (e as ExprFor).body)
     } elif (e is ExprCall) {
-        for (arg in (e as ExprCall).arguments) {
+        let ecs = e as ExprCall
+        // simdgroup_store writes through its buffer argument — without this the write-set scan
+        // would lower the parameter `device const`
+        if (call_base_name("{ecs.name}") == "simdgroup_store" && length(ecs.arguments) == 4) {
+            mark_write_target(ctx, ecs.arguments[1])
+        }
+        for (arg in ecs.arguments) {
             scan_body(ctx, arg)
         }
     } elif (e is ExprReturn) {
@@ -678,11 +697,36 @@ def private das_type_spelling(bt : Type) : string {
     return cc > 1 ? "{base}{cc}" : base
 }
 
+// simdgroup_matrix reference structs (metal_builtins) — the das struct name IS the MSL spelling
+def private sgmat_type_name(t : TypeDecl?) : string {
+    if (t == null || t.baseType != Type.tStructure || t.structType == null ||
+            "{t.structType._module.name}" != "metal_builtins") {
+        return ""
+    }
+    let name = "{t.structType.name}"
+    return (name == "simdgroup_float8x8" || name == "simdgroup_half8x8") ? name : ""
+}
+
+def private sgmat_census_class(sgname : string) : string {
+    return sgname == "simdgroup_half8x8" ? "f16" : "f32"
+}
+
+def private sgmat_elem_name(sgname : string) : string {
+    return sgname == "simdgroup_half8x8" ? "half" : "float"
+}
+
+// das zero-init has one sound MSL spelling for the opaque tile types: a zero fill (= {} does not
+// construct a simdgroup_matrix)
+def private sgmat_zero_fill(sgname : string) : string {
+    let zero = sgname == "simdgroup_half8x8" ? "0.0h" : "0.0f"
+    return "make_filled_simdgroup_matrix<{sgmat_elem_name(sgname)}, 8, 8>({zero})"
+}
+
 // simdgroup intrinsics + the ctor/convert/saturating-narrow family are the only calls with a
 // VALUE lowering (metal_builtins declares the simd set for float/int/uint; the identity stub
 // bodies never matter here — only the call AST is read)
 def private emit_call_value(var ctx : MslCtx; ec : ExprCall?) : string {
-    let cname = "{ec.name}"
+    let cname = call_base_name("{ec.name}")
     let na = length(ec.arguments)
     if (cname == "simd_sum") {
         if (na != 1) {
@@ -702,6 +746,15 @@ def private emit_call_value(var ctx : MslCtx; ec : ExprCall?) : string {
         let l = emit_value(ctx, ec.arguments[1])
         note(ctx, "call.{cname}.{census_class(ec._type)}")
         return "{cname}({v}, {l})"
+    } elif (cname == "make_filled_simdgroup_float8x8" || cname == "make_filled_simdgroup_half8x8") {
+        if (na != 1) {
+            err(ctx, ec.at, "{cname} takes exactly one fill value")
+            return "/*call {cname}*/"
+        }
+        let sgname = cname == "make_filled_simdgroup_half8x8" ? "simdgroup_half8x8" : "simdgroup_float8x8"
+        let v = emit_value(ctx, ec.arguments[0])
+        note(ctx, "call.sgmat_fill.{sgmat_census_class(sgname)}")
+        return "make_filled_simdgroup_matrix<{sgmat_elem_name(sgname)}, 8, 8>({v})"
     }
     // ctor / convert / saturating-narrow calls: the call name IS the das spelling of the result
     // type, optionally + "_sat" for the clamping narrows. A CPU-only-width ctor (half8(...),
@@ -834,6 +887,75 @@ def private emit_store_target(var ctx : MslCtx; e : Expression?) : string {
     return emit_value(ctx, e)
 }
 
+// simdgroup_load(m, src, offset, stride) / simdgroup_store(m, dst, offset, stride): the buffer
+// argument must be a kernel-class member — @ssbo (device) for both, @workgroup (threadgroup)
+// additionally as a load source — and lowers as `name + offset`. Element-type agreement is
+// enforced upstream by the das overloads (the reference body indexes src/dst with the matrix's
+// element type).
+def private emit_sgmat_load_store(var ctx : MslCtx; ec : ExprCall?; indent : string; var lines : array<string>) {
+    let cname = call_base_name("{ec.name}")
+    let isLoad = cname == "simdgroup_load"
+    if (length(ec.arguments) != 4) {
+        err(ctx, ec.at, "{cname} takes (matrix, buffer, offset, stride)")
+        return
+    }
+    let sgname = sgmat_type_name(ec.arguments[0]._type)
+    if (empty(sgname)) {
+        err(ctx, ec.at, "{cname} first argument must be a simdgroup matrix")
+        return
+    }
+    let mem = member_lookup(ctx, ec.arguments[1])
+    if (empty(mem)) {
+        err(ctx, ec.at, "{cname} {isLoad ? "source" : "destination"} must be an @ssbo{isLoad ? " or @workgroup" : ""} member")
+        return
+    }
+    let m = ctx.members[mem]
+    if (m.uniform) {
+        err(ctx, ec.at, "{cname} cannot address a @uniform member — use an @ssbo buffer")
+        return
+    }
+    if (m.workgroup && !isLoad) {
+        err(ctx, ec.at, "simdgroup_store targets an @ssbo buffer — threadgroup stores are not supported")
+        return
+    }
+    let mv = emit_value(ctx, ec.arguments[0])
+    let off = emit_value(ctx, ec.arguments[2])
+    let stride = emit_value(ctx, ec.arguments[3])
+    let cls = sgmat_census_class(sgname)
+    if (isLoad) {
+        note(ctx, m.workgroup ? "call.sgmat_load_tg.{cls}" : "call.sgmat_load.{cls}")
+    } else {
+        note(ctx, "call.sgmat_store.{cls}")
+    }
+    lines |> push("{indent}{cname}({mv}, {m.msl_name} + {off}, {stride});")
+}
+
+// simdgroup_multiply_accumulate(d, a, b, c) / simdgroup_multiply(d, a, b) — argument-type combos
+// are enforced upstream by the das overload set (all-f32, all-f16, and mac's mixed f32-acc/f16-ab)
+def private emit_sgmat_multiply(var ctx : MslCtx; ec : ExprCall?; indent : string; var lines : array<string>) {
+    let cname = call_base_name("{ec.name}")
+    let isMac = cname == "simdgroup_multiply_accumulate"
+    let want = isMac ? 4 : 3
+    if (length(ec.arguments) != want) {
+        err(ctx, ec.at, "{cname} takes {want} simdgroup-matrix arguments")
+        return
+    }
+    var classes : array<string>
+    var parts : array<string>
+    for (arg in ec.arguments) {
+        let sgname = sgmat_type_name(arg._type)
+        if (empty(sgname)) {
+            err(ctx, arg.at, "{cname} arguments must be simdgroup matrices")
+            return
+        }
+        classes |> push(sgmat_census_class(sgname))
+        parts |> push(emit_value(ctx, arg))
+    }
+    let combo = (isMac && classes[0] == "f32" && classes[1] == "f16") ? "mixed" : classes[0]
+    note(ctx, isMac ? "call.sgmat_mac.{combo}" : "call.sgmat_mul.{combo}")
+    lines |> push("{indent}{cname}({join(parts, ", ")});")
+}
+
 // ===== statement emission =====
 
 def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var lines : array<string>) {
@@ -851,6 +973,20 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
         emit_stmt(ctx, (e as ExprWith).body, indent, lines)
     } elif (e is ExprLet) {
         for (v in (e as ExprLet).variables) {
+            let sgname = sgmat_type_name(v._type)
+            if (!empty(sgname)) {
+                let sgVarName = string(v.name)
+                ctx.renames[sgVarName] = msl_safe_name(sgVarName)
+                if (v.init == null) {
+                    note(ctx, "stmt.var.sgmat.zero")
+                    lines |> push("{indent}{sgname} {ctx.renames[sgVarName]} = {sgmat_zero_fill(sgname)};")
+                } else {
+                    let init = emit_value(ctx, v.init)
+                    note(ctx, "stmt.var.sgmat")
+                    lines |> push("{indent}{sgname} {ctx.renames[sgVarName]} = {init};")
+                }
+                continue
+            }
             if (reject_cpu_only_width(ctx, v.at, v._type)) {
                 continue
             }
@@ -930,7 +1066,7 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
         emit_for(ctx, e as ExprFor, indent, lines)
     } elif (e is ExprCall) {
         let ec = e as ExprCall
-        let cname = "{ec.name}"
+        let cname = call_base_name("{ec.name}")
         // both lower to Metal's one threadgroup rendezvous+fence: MSL has no execution-free
         // threadgroup memory fence (pre-MSL-3.2), so memoryBarrierShared() strengthens to the full
         // barrier — the same lowering SPIRV-Cross ships under MoltenVK
@@ -941,8 +1077,12 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
             }
             note(ctx, cname == "barrier" ? "call.barrier" : "call.memory_barrier_shared")
             lines |> push("{indent}threadgroup_barrier(mem_flags::mem_threadgroup);")
+        } elif (cname == "simdgroup_load" || cname == "simdgroup_store") {
+            emit_sgmat_load_store(ctx, ec, indent, lines)
+        } elif (cname == "simdgroup_multiply_accumulate" || cname == "simdgroup_multiply") {
+            emit_sgmat_multiply(ctx, ec, indent, lines)
         } else {
-            err(ctx, ec.at, "call `{cname}` as a statement has no MSL lowering — only barrier() / memoryBarrierShared() sync calls are supported")
+            err(ctx, ec.at, "call `{cname}` as a statement has no MSL lowering — only barrier()/memoryBarrierShared() sync and the simdgroup_matrix ops are supported")
         }
     } elif (e is ExprBreak) {
         note(ctx, "stmt.break")
