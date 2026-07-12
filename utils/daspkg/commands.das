@@ -1388,9 +1388,17 @@ struct private DasModuleEntry {
     package_dir : string            //!< absolute path to the enclosing daspkg package
 }
 
+struct private TuneScopeDep {
+    name : string                   //!< [tune_scope] name
+    manifest : string               //!< the app tune sidecar the winners live in
+    tuner : string                  //!< tuner harness path ("" = none declared)
+    complete : bool                 //!< every [tune] kernel of this scope has a fresh sidecar entry
+}
+
 struct private ReleaseDeps {
     shared_modules : array<SharedModuleEntry>
     das_modules : array<DasModuleEntry>
+    tune_scopes : array<TuneScopeDep>
 }
 
 def private read_release_deps(path : string; var deps : ReleaseDeps) : bool {
@@ -1409,6 +1417,16 @@ def private read_release_deps(path : string; var deps : ReleaseDeps) : bool {
     }
     deps = from_JV(parsed, type<ReleaseDeps>)
     return true
+}
+
+// the exact env+cmd shape llvm_tune's policy rail uses for scope tuners (the env prefix
+// leads so the line never starts with a quote — cmd.exe strips a LEADING one)
+def private release_tuner_cmd(daslang : string; ts : TuneScopeDep) : string {
+    let win = get_platform_name() == "windows"
+    let envs = (win ?
+        "set \"DAS_TUNE_MODE=tune\"&& set \"DAS_TUNE_MANIFEST={ts.manifest}\"&& " :
+        "DAS_TUNE_MODE=tune DAS_TUNE_MANIFEST=\"{ts.manifest}\" ")
+    return "{envs}\"{daslang}\" -jit \"{ts.tuner}\" -dasroot \"{get_das_root()}\""
 }
 
 // Bundle path for the standalone exe (daslang -exe appends `.exe` itself).
@@ -2021,6 +2039,44 @@ def cmd_release(root : string; out_dir : string) : int {
         }
         return 1
     }
+    // 1.5 Build-time tuning: the deps JSON reports each [tune_scope] with per-key
+    //     completeness against the app sidecar. Run the tuners of incomplete scopes and
+    //     REBUILD, so the shipped exe bakes measured winners instead of the generic
+    //     fallback stamps ("untuned does not start" applies to release artifacts at
+    //     BUILD time — the frozen exe itself never tunes).
+    {
+        var deps0 : ReleaseDeps
+        if (read_release_deps(deps_file, deps0)) {
+            var tuned_any = false
+            for (ts in deps0.tune_scopes) {
+                continue if (ts.complete)
+                if (empty(ts.tuner)) {
+                    to_log(LOG_WARNING, "release: tune scope `{ts.name}` is untuned and declares no tuner — shipping fallback stamps\n")
+                    continue
+                }
+                log("  tune: scope `{ts.name}` -> {ts.manifest}\n")
+                var tout : string
+                let trc = run_cmd(release_tuner_cmd(daslang, ts), tout)
+                if (trc != 0) {
+                    to_log(LOG_WARNING, "release: tuner for scope `{ts.name}` failed (rc={trc}) — shipping fallback stamps\n{tout}\n")
+                } else {
+                    tuned_any = true
+                }
+            }
+            if (tuned_any) {
+                log("  rebuild: baking the fresh tune winners into the exe\n")
+                var out2 : string
+                let rc2 = run_cmd(cmd, out2)
+                if (rc2 != 0) {
+                    to_log(LOG_ERROR, "release: daslang -exe rebuild failed (rc={rc2}):\n{out2}\n")
+                    if (fexist(deps_file)) {
+                        remove(deps_file)
+                    }
+                    return 1
+                }
+            }
+        }
+    }
     // daslang -exe writes <exe_path>.exe (the runnable binary) and <exe_path>.o
     // (a build-time object file). Drop the .o — it's not needed at runtime.
     let obj_path = "{exe_path}.o"
@@ -2114,6 +2170,28 @@ def cmd_release(root : string; out_dir : string) : int {
         shipped |> push(base_name(rel_path))
     }
     if (runtime_copy_failed) return 1
+
+    // 2.6 Ship the app tune sidecar beside the exe as <bundle>.tune.json — the exe's own
+    //     runtime resolution (`<exe-stem>.tune.json`) finds it there: the "runtime" knob
+    //     section travels with the artifact and the file documents the baked winners
+    //     (provenance included). Touch it NEWER than the exe: the sidecar predates the
+    //     build by construction, and a stale-looking sidecar would be ignored at runtime.
+    let sidecar_src = "{slice(main_path, 0, length(main_path) - 4)}.tune.json"
+    if (fexist(sidecar_src)) {
+        let sidecar_rel = "{bundle_name}.tune.json"
+        let sidecar_dst = path_join(bundle_dir, sidecar_rel)
+        var serr : string
+        if (!copy_file(sidecar_src, sidecar_dst, true, serr)) {
+            to_log(LOG_ERROR, "release: copy_file({sidecar_src} -> {sidecar_dst}) failed: {serr}\n")
+            return 1
+        }
+        var terr : string
+        if (!set_mtime(sidecar_dst, get_clock(), terr)) {
+            to_log(LOG_WARNING, "release: cannot touch {sidecar_dst}: {terr} — the shipped sidecar may read as stale\n")
+        }
+        log("  ship: {sidecar_rel} (tune sidecar)\n")
+        shipped |> push(sidecar_rel)
+    }
     if (runtime_copies == 0) {
         to_log(LOG_ERROR, "release: no daslang runtime libs matched `{runtime_glob}` under `{runtime_lib_dir}`; bundle would not load on a relocated machine\n")
         return 1

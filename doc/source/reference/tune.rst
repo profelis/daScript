@@ -205,11 +205,22 @@ A frozen artifact must not demand or run tuning:
 * **Standalone exe** (``llvm-jit -exe``) still *stamps* — an exe built beside a
   sidecar ships those winners (a local-use artifact by definition), and one
   built without ships the generic ``fallback=`` stamps — but the policy rail
-  is dead (no ``[tune_policy]``, no ``--tune``). A native exe carrying any
-  ``[llvm_code]`` kernel also *targets the build box* (CPU **and** feature
-  gates, decided before the target-flag pass) so the stamped generators
-  actually emit instead of declining to their reference bodies on the
-  generic-CPU rail; a kernel-free exe stays generic/redistributable.
+  is dead (no ``[tune_policy]``, no ``--tune``). The exe DOES get the status
+  ``[init]``, so the artifact self-reports its baked stamps
+  (``tune_status()`` / ``log_tune_status`` work inside a standalone exe). A
+  native exe carrying any ``[llvm_code]`` kernel also *targets the build box*
+  (CPU **and** feature gates, decided before the target-flag pass) so the
+  stamped generators actually emit instead of declining to their reference
+  bodies on the generic-CPU rail; a kernel-free exe stays
+  generic/redistributable.
+
+``daspkg release`` applies "untuned does not start" to artifacts at **build
+time**: the ``-exe`` build's release-deps JSON reports every scope with
+per-key completeness (``tune_scopes_status``); daspkg runs the tuners of
+incomplete scopes, rebuilds so the exe bakes the measured winners, and ships
+the sidecar beside the exe as ``<bundle>.tune.json`` (touched newer than the
+exe — the ``"runtime"`` knob section travels with the artifact, and the file
+documents the baked winners).
 
 Sidecar location and staleness
 ==============================

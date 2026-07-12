@@ -89,6 +89,8 @@ This forces a hard `require` even when the dependency is logically optional / in
 
 Note adapters can still *emit* code referencing the contributor's symbols by name (resolved at the user's splice site, like linq_fold_decs emitting `for_each_archetype` without requiring decs) — that's orthogonal to *registering* into the consumer's macro state, which is the part bound by the context model.
 
+The trap also bites READS: module B calling A's accessor function reads **B's context copy** of A's globals — silently empty, no error (2026-07-12: llvm_exe calling llvm_tune's scope bank got `{}` while llvm_tune's own annotations saw it filled). Anything another macro module must read goes through the **AST** (annotations/stamps — `tune_scopes_status(prog)` walks `[tune_scope]` declarations instead of the bank), **files**, or **env** — never a shared macro global.
+
 ## Structure macros — generating types and functions
 
 - **`[structure_macro(name=foo)]`** — annotation on a class inheriting `AstStructureAnnotation`; the `apply` method runs at compile time when a struct has `[foo]`. Use to generate companion types, operators, and functions.

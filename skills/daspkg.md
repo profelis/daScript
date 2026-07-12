@@ -177,6 +177,8 @@ def initialize(project_path : string) {
 
 The recipient can run the bundled exe **without daslang installed**. PR #1 (exe-relative shared modules, merged 2026-05-05) is the prerequisite — the runtime resolves dylibs against the exe's own directory first.
 
+**Build-time tuning (the `[tune]` framework):** the `-exe` build's deps JSON reports every `[tune_scope]` with per-key completeness against the app tune sidecar; `cmd_release` runs the tuners of incomplete scopes (`DAS_TUNE_MODE=tune`, `DAS_TUNE_MANIFEST=<sidecar>`), REBUILDS so the exe bakes the measured winners, and ships the sidecar beside the exe as `<bundle>.tune.json` (touched newer than the exe — a sidecar older than the binary reads as stale). The exe self-reports its baked stamps via `tune_status()`. See `skills/llvm_tune.md`.
+
 ### `release()` hook in `.das_package`
 
 A package's `.das_package` declares what `daspkg release` should ship:

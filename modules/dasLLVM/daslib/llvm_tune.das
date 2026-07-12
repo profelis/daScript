@@ -343,9 +343,9 @@ def private scope_fnames_joined(modName : string) : string {
     return join(names, ";")
 }
 
-//! One registered `[tune_scope]`'s identity + completeness, as reported by
-//! `tune_scopes_status()` — the macro-time surface build orchestrators (the `-exe`
-//! release-deps JSON, daspkg) read to decide whether to run tuners before a rebuild.
+//! One `[tune_scope]`'s identity + completeness, as reported by `tune_scopes_status()` —
+//! the macro-time surface build orchestrators (the `-exe` release-deps JSON, daspkg) read
+//! to decide whether to run tuners before a rebuild.
 struct TuneScopeStatus {
     name : string       //!< [tune_scope] name
     manifest : string   //!< the app sidecar the winners live in
@@ -353,20 +353,46 @@ struct TuneScopeStatus {
     complete : bool     //!< every [tune] kernel of this scope has a fresh sidecar entry
 }
 
-//! Every registered scope with its per-key completeness against the app sidecar — call at
-//! MACRO time (the scope bank is compile-time state). Deduped by scope name.
-def tune_scopes_status() : array<TuneScopeStatus> {
+//! Every declared scope in `prog` with its per-key completeness against the app sidecar,
+//! read OFF THE AST (the `[tune_scope]` structure annotations + each module's `[tune]`
+//! functions) — NOT off this module's macro globals: a shared module's globals are
+//! per-requiring-context copies, so a caller in another macro module (llvm_exe writing the
+//! release-deps JSON) would read an empty bank. Deduped by scope name.
+def tune_scopes_status(prog : Program?) : array<TuneScopeStatus> {
     var rows : array<TuneScopeStatus>
     var seen : table<string>
-    var scopes <- [for (scope in values(g_scopes)); scope]
-    for (scope in scopes) {
-        continue if (seen |> key_exists(scope.scopeName))
-        seen |> insert(scope.scopeName)
-        rows |> push(TuneScopeStatus(name = scope.scopeName, manifest = scope.manifestPath,
-            tuner = scope.tunerPath,
-            complete = tune_sidecar_entries_complete(scope.manifestPath, scope_fnames_joined(scope.modName))))
+    prog |> for_each_module() $(mod) {
+        var sname = ""
+        var tuner = ""
+        var declFile = ""
+        mod |> for_each_structure() $(st) {
+            for (ann in st.annotations) {
+                if (ann.annotation.name == "tune_scope") {
+                    let nv = find_arg(ann.arguments, "name")
+                    if (nv is tString) { sname = nv as tString }
+                    let tv = find_arg(ann.arguments, "tuner")
+                    if (tv is tString) { tuner = tv as tString }
+                    declFile = "{st.at.fileInfo.name}"
+                }
+            }
+        }
+        if (!empty(sname) && !(seen |> key_exists(sname))) {
+            seen |> insert(sname)
+            var fnames : array<string>
+            for_each_function(mod, "") $(fn) {
+                for (ann in fn.annotations) {
+                    if (ann.annotation.name == "tune") {
+                        fnames |> push("{fn.name}")
+                    }
+                }
+            }
+            let mpath = tune_manifest_path()
+            rows |> push(TuneScopeStatus(name = sname, manifest = mpath,
+                tuner = empty(tuner) ? "" : resolve_decl_path(declFile, tuner),
+                complete = tune_sidecar_entries_complete(mpath, join(fnames, ";"))))
+            delete fnames
+        }
     }
-    delete scopes
     delete seen
     return <- rows
 }

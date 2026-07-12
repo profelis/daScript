@@ -24,6 +24,7 @@ require daslib/defer
 require daslib/lpipe
 require daslib/rtti
 require daslib/clargs
+require llvm/daslib/llvm_tune   // tune_scopes_status for the release-deps JSON
 require daslib/json_boost
 require jit
 require daslib/fio
@@ -757,9 +758,17 @@ struct private DasModuleEntry {
     package_dir : string            //!< absolute path to the enclosing daspkg package (dir holding .das_package)
 }
 
+struct private TuneScopeDep {
+    name : string                   //!< [tune_scope] name
+    manifest : string               //!< the app tune sidecar the winners live in
+    tuner : string                  //!< tuner harness path ("" = none declared)
+    complete : bool                 //!< every [tune] kernel of this scope has a fresh sidecar entry
+}
+
 struct private ReleaseDeps {
     shared_modules : array<SharedModuleEntry>
     das_modules : array<DasModuleEntry>
+    tune_scopes : array<TuneScopeDep>   //!< daspkg release tunes incomplete scopes, then rebuilds
 }
 
 // If `-list-shared-modules <path>` was passed on the daslang command line,
@@ -865,6 +874,16 @@ def private write_release_deps(prog : Program?) {
             to_log(LOG_WARNING, "LLVM EXE: --force-shared-module `{name}` not registered (typo? not loaded by daslang)\n")
         }
     }
+    // Tune scopes + per-key completeness against the app sidecar: daspkg release reads
+    // this to run the tuners of incomplete scopes and rebuild, so the shipped exe carries
+    // measured winners instead of the generic fallback stamps.
+    var tstat <- tune_scopes_status(prog)
+    deps.tune_scopes |> reserve(length(tstat))
+    for (ts in tstat) {
+        deps.tune_scopes |> push(TuneScopeDep(name = ts.name, manifest = ts.manifest,
+            tuner = ts.tuner, complete = ts.complete))
+    }
+    delete tstat
     let dst_path = cfg.list_shared_modules
     fopen(dst_path, "wb") $(f) {
         if (f == null) {
