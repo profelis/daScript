@@ -73,6 +73,12 @@ def main {
             set_matmul_min_chunk_rows_gemv(mgv)
             print("gemv min chunk rows override: {mgv}\n")
         }
+        // A/B fused (region-list, default) vs per-expert expert GEMMs in the grouped MoE prefill
+        if (has_env_variable("DASLLAMA_MOE_FUSED")) {
+            let mf = to_int(get_env_variable("DASLLAMA_MOE_FUSED"))
+            set_moe_fused_expert_gemms(mf != 0)
+            print("moe_fused_expert_gemms override: {mf}\n")
+        }
         // A/B the 2-D batch chunk grid (0 = 1-D, 1 = fine grid, 2 = wave-aligned)
         if (has_env_variable("DASLLAMA_BATCH_GRID_2D")) {
             let bg2 = to_int(get_env_variable("DASLLAMA_BATCH_GRID_2D"))
