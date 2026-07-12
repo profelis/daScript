@@ -522,6 +522,43 @@ def matmul_kq(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : a
     }
 }
 
+//! Region-list K-quant GEMV over the DISK-ORDER planes (the groupn twin of matmul_kq, one
+//! flat fork like q8q8_groupn_kernel): `offs` packs (weight, activation) element-offset pairs,
+//! region r's rows land at y[r*d .. r*d+d). One fmt for the whole list — a MoE layer's expert
+//! stack is one tensor. No bias form (the only biased-experts arch, gpt-oss, is mx4).
+def matmul_kq_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; offs : array<int64> | #; nregions : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64) {
+    let nsb = n / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    unsafe {
+        let kqp = reinterpret<uint8 const?>(addr(kq[0]))
+        let ksp = reinterpret<uint8 const?>(addr(ks[0]))
+        let offp = reinterpret<int64 const?>(addr(offs[0]))
+        let xqp = reinterpret<int8 const?>(addr(xq[0]))
+        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xbsp = reinterpret<int const?>(addr(xbs[0]))
+        var myp = addr(y[0])
+        maybe_parallel_for(0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), 1, n * d * nregions)) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let ii = int64(i)
+                    let r = ii / d
+                    let row = ii % d
+                    let sb = offp[r * 2l] / 256l + row * nsb
+                    let xoff = offp[r * 2l + 1l]
+                    if (fmt == 4) {
+                        myp[ii] = dot_k4q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                    } elif (fmt == 5) {
+                        myp[ii] = dot_k5q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                    } else {
+                        myp[ii] = dot_k6q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
 //! MXFP4·Q8 dot, scalar reference form (mirrors ggml_vec_dot_mxfp4_q8_0's tail loop): per 32-block,
 //! each of the 16 nibble bytes pairs its low nibble with xq[j] and its high nibble with xq[j+16]
 //! through the doubled-e2m1 `lut`, the exact int32 block sum flushing through e8m0_half(we) × xs.

@@ -537,6 +537,178 @@ def test_kq_tile(t : T?) {
     }
 }
 
+// Groupn gate: the region-list kq GEMV (the MoE expert dispatch) must be BIT-exact vs per-row
+// disk dots — disk-order (the portable matmul_kq_groupn) AND repacked (kq_groupn_gen over
+// per-region grp slices, the per-expert-slice repack shape). Regions carry distinct LCG
+// payloads; both offs forms run — the shared activation image (gate/up, xoff 0) and
+// per-region activation rows (down, xoff = r*n).
+def private kq_groupn_gate(t : T?; fmt : int) {
+    let n = 512l
+    let d = 32l
+    let nreg = 3l
+    let nsb = n / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
+    var kq : array<uint8>
+    var ks : array<uint8>
+    kq |> resize(int(nreg * d * nsb * qsb))
+    ks |> resize(int(nreg * d * nsb * ssb))
+    for (r in range64(nreg * d)) {
+        for (s in range64(nsb)) {
+            if (fmt == 4) {
+                transcode_q4k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } elif (fmt == 5) {
+                transcode_q5k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } else {
+                transcode_q6k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            }
+        }
+        var st = 0x51ED270Bu + uint(r) * 0x85EBCA6Bu
+        for (i in range64(nsb * qsb)) {
+            st = st * 1664525u + 1013904223u
+            kq[r * nsb * qsb + i] = uint8(uint(kq[r * nsb * qsb + i]) ^ (st >> 16u))
+        }
+    }
+    // nreg activation rows, bs-quantized per row
+    var src : array<float>
+    src |> resize(int(nreg * n))
+    for (i in range64(nreg * n)) {
+        src[i] = 1.1 * sin(float(i) * 0.23) - 0.6 * cos(float(i) * 0.071)
+    }
+    var xq : array<int8>
+    var xs : array<float>
+    var xbs : array<int>
+    xq |> resize(int(nreg * n))
+    xs |> resize(int(nreg * n / 32l))
+    xbs |> resize(int(nreg * n / 16l))
+    unsafe {
+        for (p in range64(nreg)) {
+            quantize_q8_0_bs_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 32l), p * (n / 16l))
+        }
+    }
+    var offs_sh : array<int64>
+    var offs_pr : array<int64>
+    offs_sh |> reserve(int(nreg * 2l))
+    offs_pr |> reserve(int(nreg * 2l))
+    for (r in range64(nreg)) {
+        offs_sh |> push(r * d * n)
+        offs_sh |> push(0l)
+        offs_pr |> push(r * d * n)
+        offs_pr |> push(r * n)
+    }
+    // references: per-row disk dots for both activation bindings
+    var want_sh : array<float>
+    var want_pr : array<float>
+    want_sh |> resize(int(nreg * d))
+    want_pr |> resize(int(nreg * d))
+    unsafe {
+        for (r in range64(nreg)) {
+            for (row in range64(d)) {
+                let sb = (r * d + row) * nsb
+                let kqr = addr(kq[sb * qsb])
+                let ksr = addr(ks[sb * ssb])
+                if (fmt == 4) {
+                    want_sh[r * d + row] = dot_k4q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+                    want_pr[r * d + row] = dot_k4q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n)
+                } elif (fmt == 5) {
+                    want_sh[r * d + row] = dot_k5q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+                    want_pr[r * d + row] = dot_k5q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n)
+                } else {
+                    want_sh[r * d + row] = dot_k6q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+                    want_pr[r * d + row] = dot_k6q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n)
+                }
+            }
+        }
+    }
+    var y : array<float>
+    y |> resize(int(nreg * d))
+    var bad_dsh = 0
+    var bad_dpr = 0
+    matmul_kq_groupn(fmt, y, kq, ks, offs_sh, nreg, xq, xs, xbs, n, d)
+    for (i in range64(nreg * d)) {
+        if (y[i] != want_sh[i]) {
+            bad_dsh++
+        }
+    }
+    matmul_kq_groupn(fmt, y, kq, ks, offs_pr, nreg, xq, xs, xbs, n, d)
+    for (i in range64(nreg * d)) {
+        if (y[i] != want_pr[i]) {
+            bad_dpr++
+        }
+    }
+    t |> success(bad_dsh == 0, "disk groupn bit-matches per-row dots (shared image)")
+    t |> success(bad_dpr == 0, "disk groupn bit-matches per-row dots (per-region rows)")
+    // per-region grp repack (the per-expert-slice shape), then the gen driver over the slices.
+    // The grp reference is the ROWS CORE itself (one full-region call per region): under -jit
+    // that's the stamped kernel, whose float fold order differs from the portable dots at the
+    // last bit — the groupn driver's job is the region walk, so THAT must be bit-exact vs the
+    // per-region core calls (interp and stamped alike). Rows-core-vs-disk exactness for the
+    // das reference body is kq_repack_gate's gate.
+    let mr = int64(q8q8_layout_gen())
+    var bad_gsh = 0
+    var bad_gpr = 0
+    unsafe {
+        for (r in range64(nreg)) {
+            if (fmt == 4) {
+                repack_k4_grp(addr(kq[r * d * nsb * qsb]), addr(ks[r * d * nsb * ssb]), n, d, mr)
+            } elif (fmt == 5) {
+                repack_k5_grp(addr(kq[r * d * nsb * qsb]), addr(ks[r * d * nsb * ssb]), n, d, mr)
+            } else {
+                repack_k6_grp(addr(kq[r * d * nsb * qsb]), addr(ks[r * d * nsb * ssb]), n, d, mr)
+            }
+        }
+        for (r in range64(nreg)) {   // grp references: one direct rows-core call per region, both bindings
+            let kqr = addr(kq[r * d * nsb * qsb])
+            let ksr = addr(ks[r * d * nsb * ssb])
+            if (fmt == 4) {
+                k4q8_gemv_gen(addr(want_sh[r * d]), kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, 0l, d)
+                k4q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
+            } elif (fmt == 5) {
+                k5q8_gemv_gen(addr(want_sh[r * d]), kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, 0l, d)
+                k5q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
+            } else {
+                k6q8_gemv_gen(addr(want_sh[r * d]), kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, 0l, d)
+                k6q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
+            }
+        }
+        kq_groupn_gen(fmt, addr(y[0]), addr(kq[0]), addr(ks[0]), addr(offs_sh[0]), nreg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d)
+        for (i in range64(nreg * d)) {
+            if (y[i] != want_sh[i]) {
+                bad_gsh++
+            }
+        }
+        kq_groupn_gen(fmt, addr(y[0]), addr(kq[0]), addr(ks[0]), addr(offs_pr[0]), nreg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d)
+        for (i in range64(nreg * d)) {
+            if (y[i] != want_pr[i]) {
+                bad_gpr++
+            }
+        }
+    }
+    t |> success(bad_gsh == 0, "grp groupn bit-matches per-region rows-core calls (shared image)")
+    t |> success(bad_gpr == 0, "grp groupn bit-matches per-region rows-core calls (per-region rows)")
+    delete kq
+    delete ks
+    delete src
+    delete xq
+    delete xs
+    delete xbs
+    delete offs_sh
+    delete offs_pr
+    delete want_sh
+    delete want_pr
+    delete y
+}
+
+[test]
+def test_kq_groupn(t : T?) {
+    for (fmt in [4, 5, 6]) {
+        t |> run("k{fmt} region-list GEMV bit-matches per-row dots (disk + grp slices)") @(t : T?) {
+            kq_groupn_gate(t, fmt)
+        }
+    }
+}
+
 [test]
 def test_quantize_bs(t : T?) {
     t |> run("bs quantizer matches quantize_q8_0 byte-for-byte plus exact per-16 sums") @(t : T?) {

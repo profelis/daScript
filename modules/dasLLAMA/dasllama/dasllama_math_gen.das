@@ -1234,6 +1234,54 @@ def private kq_batch_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; 
     }
 }
 
+// kq_groupn slot: region-list kq GEMV — the kq twin of q8q8_groupn_gen. Region-contiguous
+// group spans through the fmt's rows core (each region offsets the plane bases by its own
+// superblock), row tails (d % mr) disk-order per region like kq_kernel_gen's. Not `private`:
+// the groupn bit-exactness gate in test_kquant drives it directly over per-region grp slices.
+def kq_groupn_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
+    let nsb = n / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+    var myp = yp
+    maybe_parallel_for(0, int(nregions * ng), matmul_chunks_gemv(int(nregions * ng * mr), get_q8_batch_chunks_per_job(), n * d * nregions)) $(gb, ge) {
+        unsafe {
+            var gg = int64(gb)
+            while (gg < int64(ge)) {
+                let r = gg / ng
+                let gLocal = gg % ng
+                let gEnd = min(int64(ge) - r * ng, ng)
+                let sb = offs[r * 2l] / 256l
+                let xoff = offs[r * 2l + 1l]
+                if (fmt == 4) {
+                    k4q8_gemv_gen(myp + r * d, kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n, gLocal * mr, gEnd * mr)
+                } elif (fmt == 5) {
+                    k5q8_gemv_gen(myp + r * d, kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n, gLocal * mr, gEnd * mr)
+                } else {
+                    k6q8_gemv_gen(myp + r * d, kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n, gLocal * mr, gEnd * mr)
+                }
+                gg = r * ng + gEnd
+            }
+        }
+    }
+    unsafe {
+        for (r in range64(nregions)) {   // row tails (d % mr): disk-order per region
+            let sb = offs[r * 2l] / 256l
+            let xoff = offs[r * 2l + 1l]
+            for (i in range64(ng * mr, d)) {
+                if (fmt == 4) {
+                    myp[r * d + i] = dot_k4q8(kqp + (sb + i * nsb) * qsb, ksp + (sb + i * nsb) * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                } elif (fmt == 5) {
+                    myp[r * d + i] = dot_k5q8(kqp + (sb + i * nsb) * qsb, ksp + (sb + i * nsb) * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                } else {
+                    myp[r * d + i] = dot_k6q8(kqp + (sb + i * nsb) * qsb, ksp + (sb + i * nsb) * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                }
+            }
+        }
+    }
+}
+
 // ===== f16-scale twins (the wscale_f16 rail): the same slot traversals over the binary16
 // group-scale plane — generated cores via the s16 companions, row-major tails via
 // dot_q8q8_f16s, token tails via the s16 rows core (no laneq fork needed: the generated
@@ -1530,6 +1578,7 @@ def dasllama_math_gen_register() {
             mm_kq = @@kq_kernel_gen, repack_kq = @@repack_kq_gen,
             kq_rows_k4 = @@k4q8_gemv_gen, kq_rows_k5 = @@k5q8_gemv_gen,
             kq_rows_k6 = @@k6q8_gemv_gen, kq_batch = @@kq_batch_kernel_gen,
+            kq_groupn = @@kq_groupn_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
             q8_kgroup = @@q8q8_kgroup_gen,
