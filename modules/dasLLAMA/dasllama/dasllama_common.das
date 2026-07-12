@@ -290,6 +290,9 @@ struct Model {
     we3_fmt : array<KqFmt>
     wcls_fmt : KqFmt = KqFmt.q8
     emb_fmt : KqFmt = KqFmt.q8
+    // gemma4 E-series PLE token table (per_layer_token_embd) — gather-only (whole superblock-
+    // aligned rows dequant per token), never repacked, never matmul'd; kq tag = native planes
+    ple_emb_fmt : KqFmt = KqFmt.q8
     // Attention projections use PER-LAYER offsets — tensor shapes differ per layer class on gemma4
     // (SWA 16Q/8KV heads of 256 vs global 16Q/1KV of 512); uniform arches fill the flat strides.
     // wv_offs[l] = -1 marks a layer with no attn_v tensor (V reuses the pre-norm K projection).
@@ -655,10 +658,10 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     } else {
         fill_dense_ffn_offsets(t, cur, layers, dim, hidden)
     }
-    if (has_ple(c)) {  // gemma-4 E-series PLE big weights: the Q8 token table + per-layer Q8 gate/proj
+    if (has_ple(c)) {  // gemma-4 E-series PLE big weights: the token table + per-layer Q8 gate/proj
         let ple = c.n_embd_per_layer
-        t.ple_emb_off = cur.wo   // linear, NOT repacked — gathered per token
-        cur.wo += c.vocab_size * ple * layers
+        // gather-only rows, NOT repacked — kq tag keeps native planes (disk order), else q8 linear
+        t.ple_emb_off = kq_take(cur, t.ple_emb_fmt, c.vocab_size * ple * layers)
         t.ple_gate_off = cur.wo
         cur.wo += layers * dim * ple
         t.ple_proj_off = cur.wo
@@ -674,7 +677,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             cur.wo += c.vocab_size * dim
         } elif (cls_kq(t)) {
             // tied K-quant: ONE plane copy serves both the classifier matmul and the embedding
-            // row reads — the kq planes stay in disk order (no repack), so no second linear copy
+            // row reads (a repacking backend interleaves it in place; embed_row grp-gathers then)
             t.wcls_off = kq_take(cur, t.emb_fmt, c.vocab_size * dim)
         } else {
             t.wcls_off = 0l   // unused — the classifier reads the fp32 embedding from fblob
@@ -906,11 +909,14 @@ def private kq_fmt_of(gt : int) : KqFmt {
 }
 
 // Fill the per-kind weight format tags from the file's tensor types (q8-mode loads with the
-// kquant_native knob on). Fused-projection arches (Phi3) stay all-q8 — their sub-tensor slices
-// split fused tensors, and a K-quant split is only superblock-aligned by luck. MoE expert stacks
-// and PLE tables also stay q8 (requant fallback) — no kq kernels target them.
+// kquant_native knob on). Fused-projection arches (Phi3) split attn_qkv / ffn_up ([gate; up])
+// at load with row-aligned slice offsets (multiples of dim) — a K-quant tensor's row length is
+// % 256 by ggml, so every slice is superblock-aligned (same argument as the gemma4
+// ffn_gate_up_exps split); one disk tensor = one tag for its slices. MoE expert stacks ride
+// per-layer tags; PLE tables stay q8 (requant fallback) — no kq kernels target them.
 def private detect_kq_formats(var t : Model; m : GGUFMeta) {
-    if (t.quant != QuantMode.q8 || !g_kquant_native || t.config.fused_qkv) {
+    if (t.quant != QuantMode.q8 || !g_kquant_native
+            || (t.config.fused_qkv && t.config.dim % 256l != 0l)) {   // fused slice offsets are dim-multiples
         return
     }
     let layers = t.config.n_layers
@@ -923,13 +929,23 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
     t.w3_fmt |> resize(layers)
     var any = false
     for (l in range64(layers)) {
-        t.wq_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_q.weight"))
-        t.wk_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_k.weight"))
-        t.wv_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_v.weight"))
+        if (t.config.fused_qkv) {
+            let fqkv = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_qkv.weight"))
+            t.wq_fmt[l] = fqkv
+            t.wk_fmt[l] = fqkv
+            t.wv_fmt[l] = fqkv
+            let fgu = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up.weight"))
+            t.w1_fmt[l] = fgu
+            t.w3_fmt[l] = fgu
+        } else {
+            t.wq_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_q.weight"))
+            t.wk_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_k.weight"))
+            t.wv_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_v.weight"))
+            t.w1_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate.weight"))
+            t.w3_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up.weight"))
+        }
         t.wo_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_output.weight"))
-        t.w1_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate.weight"))
         t.w2_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_down.weight"))
-        t.w3_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up.weight"))
         any ||= t.wq_fmt[l] != KqFmt.q8 || t.wk_fmt[l] != KqFmt.q8 || t.wv_fmt[l] != KqFmt.q8
         any ||= t.wo_fmt[l] != KqFmt.q8 || t.w1_fmt[l] != KqFmt.q8 || t.w2_fmt[l] != KqFmt.q8
         any ||= t.w3_fmt[l] != KqFmt.q8
@@ -963,6 +979,12 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
     } else {
         t.wcls_fmt = kq_fmt_of(gguf_tensor_type(m, "output.weight"))
         any ||= t.wcls_fmt != KqFmt.q8
+    }
+    // E-series PLE token table: gather-only whole rows of layers*ple — row length must be
+    // superblock-aligned for the plane walk (256 % holds on E2B/E4B: ple 256)
+    if (has_ple(t.config) && (t.config.n_layers * t.config.n_embd_per_layer) % 256l == 0l) {
+        t.ple_emb_fmt = kq_fmt_of(gguf_tensor_type(m, "per_layer_token_embd.weight"))
+        any ||= t.ple_emb_fmt != KqFmt.q8
     }
     if (!any) {   // nothing K-quant in the file: drop the tags so fmt_at short-circuits on empty
         delete t.wq_fmt
@@ -1586,10 +1608,11 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             let qd_l = layer_qd(t.config, l)
             if (t.config.fused_qkv) {
                 // Phi3: attn_qkv rows are [q (qd) ; k (kv) ; v (kv)], ffn_up rows are [gate ; up] (hidden each).
-                // src_off slices the fused tensor, preserving its Q8 blocks (no fp32 requantize).
-                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wq_offs[l], dim * qd_l, scratch, 0l)
-                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wk_offs[l], dim * kv_l, scratch, dim * qd_l)
-                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wv_offs[l], dim * kv_l, scratch, dim * qd_l + dim * kv_l)
+                // src_off slices the fused tensor, preserving its Q8 blocks (no fp32 requantize); K-quant
+                // slices stay superblock-aligned (offsets are dim-multiples, dim % 256 gated in detect).
+                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wq_offs[l], dim * qd_l, scratch, 0l, fmt_at(t.wq_fmt, l))
+                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wk_offs[l], dim * kv_l, scratch, dim * qd_l, fmt_at(t.wk_fmt, l))
+                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wv_offs[l], dim * kv_l, scratch, dim * qd_l + dim * kv_l, fmt_at(t.wv_fmt, l))
             } else {
                 load_big(m, bytes, "blk.{l}.attn_q.weight", t, t.wq_offs[l], dim * qd_l, scratch, 0l, fmt_at(t.wq_fmt, l))
                 if (t.wk_offs[l] >= 0l) {   // absent on E-series shared-KV layers (reuse the source layer's K)
@@ -1655,9 +1678,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                     load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], hidden * dim, scratch, 0l, fmt_at(t.w2_fmt, l))
                 }
             } elif (t.config.fused_qkv) {
-                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w1_offs[l], dim * hidden, scratch, 0l)
-                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * hidden, scratch, dim * hidden)
-                load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], hidden * dim, scratch)
+                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w1_offs[l], dim * hidden, scratch, 0l, fmt_at(t.w1_fmt, l))
+                load_big(m, bytes, "blk.{l}.ffn_up.weight", t, t.w3_offs[l], dim * hidden, scratch, dim * hidden, fmt_at(t.w3_fmt, l))
+                load_big(m, bytes, "blk.{l}.ffn_down.weight", t, t.w2_offs[l], hidden * dim, scratch, 0l, fmt_at(t.w2_fmt, l))
             } else {
                 let h = layer_hidden(t, l)   // gemma-4 E2B varies this per layer
                 load_big(m, bytes, "blk.{l}.ffn_gate.weight", t, t.w1_offs[l], dim * h, scratch, 0l, fmt_at(t.w1_fmt, l))
@@ -1670,8 +1693,8 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 load_big(m, bytes, "blk.{l}.proj.weight", t, t.ple_proj_off + l * ple * dim, ple * dim, scratch)
             }
         }
-        if (has_ple(t.config)) {  // the Q8 per-layer token-embedding table [vocab x (ple*layers)], linear (gathered per token, never repacked)
-            load_big(m, bytes, "per_layer_token_embd.weight", t, t.ple_emb_off, vocab * t.config.n_embd_per_layer * layers, scratch)
+        if (has_ple(t.config)) {  // the per-layer token-embedding table [vocab x (ple*layers)], gathered per token, never repacked
+            load_big(m, bytes, "per_layer_token_embd.weight", t, t.ple_emb_off, vocab * t.config.n_embd_per_layer * layers, scratch, 0l, t.ple_emb_fmt)
         }
         if (!t.config.shared_weights) {
             load_big(m, bytes, "output.weight", t, t.wcls_off, vocab * dim, scratch, 0l, t.wcls_fmt)
@@ -4800,10 +4823,31 @@ def private ple_pre_finish(t : Model; var s : Session; embd_scaled : array<float
     scale_inplace(unsafe(addr(s.ple_inp[0])), 1.0 / sqrt(2.0), npos * all)
 }
 
+// One PLE token row (all = layers*ple elements, superblock-aligned by the detect gate) off the
+// gather's storage: native disk-order K-quant planes (the table is excluded from the grp repack)
+// or the q8 linear region on fallback loads.
+def private ple_gather_row(t : Model; row : int64; var dst : array<float>; doff : int64) {
+    let all = t.config.n_layers * t.config.n_embd_per_layer
+    let eloff = t.ple_emb_off + row * all
+    if (t.ple_emb_fmt == KqFmt.q8) {
+        dequant_q8_row(t, eloff, all, unsafe(addr(dst[doff])))
+        return
+    }
+    for (blk in range64(all / 256l)) {
+        let sb = (eloff + blk * 256l) / 256l
+        if (t.ple_emb_fmt == KqFmt.k4) {
+            dequant_k4_plane_superblock(t.k4q, sb * K4_QSB, t.k4s, sb * K4_SSB, dst, doff + blk * 256l)
+        } elif (t.ple_emb_fmt == KqFmt.k5) {
+            dequant_k5_plane_superblock(t.k5q, sb * K5_QSB, t.k5s, sb * K5_SSB, dst, doff + blk * 256l)
+        } else {
+            dequant_k6_plane_superblock(t.k6q, sb * K6_QSB, t.k6s, sb * K6_SSB, dst, doff + blk * 256l)
+        }
+    }
+}
+
 // Decode pre-step: gather the single token's per-layer embedding row, then finish.
 def private ple_pre_decode(t : Model; var s : Session; token : int64) {
-    let all = t.config.n_layers * t.config.n_embd_per_layer
-    dequant_q8_row(t, t.ple_emb_off + token * all, all, unsafe(addr(s.ple_inp[0])))
+    ple_gather_row(t, token, s.ple_inp, 0l)
     ple_pre_finish(t, s, s.x, 1l)
 }
 
@@ -4811,7 +4855,7 @@ def private ple_pre_decode(t : Model; var s : Session; token : int64) {
 def private ple_pre_prefill(t : Model; var s : Session; tokens : array<int64>; npos : int64) {
     let all = t.config.n_layers * t.config.n_embd_per_layer
     for (p in range64(npos)) {
-        dequant_q8_row(t, t.ple_emb_off + tokens[p] * all, all, unsafe(addr(s.ple_inp[p * all])))
+        ple_gather_row(t, tokens[p], s.ple_inp, p * all)
     }
     ple_pre_finish(t, s, s.x_b, npos)
 }
@@ -4821,7 +4865,7 @@ def private ple_pre_prefill(t : Model; var s : Session; tokens : array<int64>; n
 def private ple_pre_prefill_pad(t : Model; var s : Session; npos : int64) {
     let all = t.config.n_layers * t.config.n_embd_per_layer
     for (p in range64(npos)) {
-        dequant_q8_row(t, t.ple_emb_off, all, unsafe(addr(s.ple_inp[p * all])))
+        ple_gather_row(t, 0l, s.ple_inp, p * all)
     }
     ple_pre_finish(t, s, s.x_b, npos)
 }

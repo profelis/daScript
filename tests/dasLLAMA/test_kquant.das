@@ -825,6 +825,97 @@ def test_kq_load_layout(t : T?) {
     }
 }
 
+[test]
+def test_kq_fused_qkv_slices(t : T?) {
+    // Fused-projection (Phi3) gate-lift oracle: attn_qkv / ffn_up split at load with dim-multiple
+    // src_offs into the kq planes — a slice landing off by one superblock shows up as noise vs
+    // the file dequant. The K slice (src_off = dim*qd) is the non-trivial placement.
+    t |> run("phi3 fused attn_qkv K-quant slices land at their plane offsets (Phi-3.5 Q4_K_M)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Phi-3.5-mini-instruct-Q4_K_M.gguf")
+        if (!model_available(t, path)) {
+            return
+        }
+        pin_kernel_backend("portable")   // disk-order planes (the placement oracle, like test_kq_load_layout)
+        let prev_kq = get_kquant_native()
+        set_kquant_native(true)
+        var tr <- load_gguf(path, QuantMode.q8)
+        set_kquant_native(prev_kq)
+        clear_kernel_backend_pin()
+        t |> success(tr.kquant_native, "load detected native K-quant tensors")
+        t |> success(tr.wq_fmt[0] == KqFmt.k5 && tr.wk_fmt[0] == KqFmt.k5 && tr.wv_fmt[0] == KqFmt.k5,
+            "fused attn_qkv slices share the Q5_K tag")
+        t |> success(tr.w1_fmt[0] == KqFmt.k4 && tr.w3_fmt[0] == KqFmt.k4, "fused ffn_up gate/up slices tagged k4")
+        t |> success(tr.wcls_fmt == KqFmt.k6 && !cls_kq(tr), "untied Q6_K classifier tagged (no tied-cls path)")
+        let dim = tr.config.dim
+        let qd = layer_qd(tr.config, 0l)
+        let n = 262144l
+        var have : array<float>
+        have |> resize(n)
+        var gt = 0
+        // q slice (src_off 0): the trivial placement
+        dequant_plane_prefix(tr, tr.wq_fmt[0], tr.wq_offs[0], n, have)
+        var fq <- read_prefix(path, "blk.0.attn_qkv.weight", dim * qd + n, gt)
+        var want : array<float>
+        want |> resize(n)
+        for (i in range64(n)) {
+            want[i] = fq[i]
+        }
+        t |> success(rel_rms(have, want) < 1.0e-3, "q slice matches the file dequant (f16-pair rounding only)")
+        // k slice (src_off = dim*qd): the fused-split placement this arm exists for
+        dequant_plane_prefix(tr, tr.wk_fmt[0], tr.wk_offs[0], n, have)
+        for (i in range64(n)) {
+            want[i] = fq[dim * qd + i]
+        }
+        t |> success(rel_rms(have, want) < 1.0e-3, "k slice at src_off dim*qd matches the file dequant")
+        delete fq
+        delete want
+        delete have
+        delete tr
+    }
+}
+
+[test]
+def test_kq_ple_table(t : T?) {
+    // E-series PLE token table (family c): gather-only tensor rides native kq planes — the tag
+    // must take (a silent q8 fallback also passes parity, so pin it here) and whole-row plane
+    // dequant must match the file dequant at its offset.
+    t |> run("E-series PLE token table takes the kq plane path (gemma-4-E2B Q4_K_M)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-E2B-it-Q4_K_M.gguf")
+        if (!model_available(t, path)) {
+            return
+        }
+        pin_kernel_backend("portable")   // disk-order planes (the placement oracle)
+        let prev_kq = get_kquant_native()
+        set_kquant_native(true)
+        var tr <- load_gguf(path, QuantMode.q8)
+        set_kquant_native(prev_kq)
+        clear_kernel_backend_pin()
+        t |> success(tr.kquant_native, "load detected native K-quant tensors")
+        t |> success(tr.ple_emb_fmt == KqFmt.k5, "per_layer_token_embd tagged k5")
+        t |> success(tr.emb_fmt == KqFmt.k4 && cls_kq(tr), "tied k4 classifier takes the kq plane path")
+        // whole-row placement: rows 0..R of the table vs the file dequant (f16-pair rounding only)
+        let all = tr.config.n_layers * tr.config.n_embd_per_layer
+        let n = all * 16l
+        var have : array<float>
+        have |> resize(n)
+        dequant_plane_prefix(tr, tr.ple_emb_fmt, tr.ple_emb_off, n, have)
+        var gt = 0
+        var fdq <- read_prefix(path, "per_layer_token_embd.weight", n, gt)
+        t |> success(rel_rms(have, fdq) < 1.0e-3, "PLE table plane rows match the file dequant")
+        delete fdq
+        delete have
+        delete tr
+    }
+}
+
 // Dequant the first `n` elements of `name` into fp32; reports the on-disk type via `gt`.
 def private read_prefix(path, name : string; n : int64; var gt : int&) : array<float> {
     var dst : array<float>
