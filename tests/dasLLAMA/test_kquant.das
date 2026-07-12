@@ -97,9 +97,6 @@ def private build_q6k_block() : array<uint8> {
     return <- blkb
 }
 
-// f16 round-trip: the rounding the transcoded (s, o) pairs carry
-def private f16r(x : float) : float => f16_to_f32(f32_to_f16(x))
-
 [test]
 def test_q4k_synthetic(t : T?) {
     t |> run("Q4_K superblock unpacks the 6-bit scale/min packing") @(t : T?) {
@@ -138,38 +135,40 @@ def test_q4k_synthetic(t : T?) {
 
 [test]
 def test_kq_transcode_planes(t : T?) {
-    // The transcoded planes ARE the kernel-facing format: k4/k5 dequant must equal the file
-    // dequant with the (s, o) pairs' f16 rounding applied; k6 planes are verbatim, so exact.
-    t |> run("k4 planes reproduce the f16-rounded Q4_K dequant") @(t : T?) {
+    // The transcoded planes ARE the kernel-facing format, and they are verbatim disk splits for
+    // all three formats (kq v2) — every plane dequant must equal the FILE dequant bit-exactly.
+    t |> run("k4 planes reproduce the Q4_K dequant bit-exactly") @(t : T?) {
         let blkb <- build_q4k_block()
         var kq : array<uint8>
         var ks : array<uint8>
         kq |> resize(128)
-        ks |> resize(32)
+        ks |> resize(20)
         transcode_q4k_superblock(blkb, 0l, kq, 0l, ks, 0l)
+        var want : array<float>
+        want |> resize(256)
+        dequant_q4k_superblock(blkb, 0l, want, 0l)
         var dst : array<float>
         dst |> resize(256)
         dequant_k4_plane_superblock(kq, 0l, ks, 0l, dst, 0l)
         for (k in range(256)) {
-            let sub = k / 32
-            let expected = f16r(SYNTH_D * float(SYNTH_SC[sub])) * float(q4_pat(k)) - f16r(SYNTH_DMIN * float(SYNTH_MN[sub]))
-            t |> success(dst[k] == expected, "k4 plane element must match the f16-rounded value exactly")
+            t |> success(dst[k] == want[k], "k4 plane element must equal the file dequant bit-exactly")
         }
     }
-    t |> run("k5 planes reproduce the f16-rounded Q5_K dequant") @(t : T?) {
+    t |> run("k5 planes reproduce the Q5_K dequant bit-exactly") @(t : T?) {
         let blkb <- build_q5k_block()
         var kq : array<uint8>
         var ks : array<uint8>
         kq |> resize(160)
-        ks |> resize(32)
+        ks |> resize(20)
         transcode_q5k_superblock(blkb, 0l, kq, 0l, ks, 0l)
+        var want : array<float>
+        want |> resize(256)
+        dequant_q5k_superblock(blkb, 0l, want, 0l)
         var dst : array<float>
         dst |> resize(256)
         dequant_k5_plane_superblock(kq, 0l, ks, 0l, dst, 0l)
         for (k in range(256)) {
-            let sub = k / 32
-            let expected = f16r(SYNTH_D * float(SYNTH_SC[sub])) * float(q5_pat(k)) - f16r(SYNTH_DMIN * float(SYNTH_MN[sub]))
-            t |> success(dst[k] == expected, "k5 plane element must match the f16-rounded value exactly")
+            t |> success(dst[k] == want[k], "k5 plane element must equal the file dequant bit-exactly")
         }
     }
     t |> run("k6 planes reproduce the Q6_K dequant bit-exactly") @(t : T?) {
@@ -217,7 +216,7 @@ def private kq_dot_gate(t : T?; fmt : int) {
         perturb_quants(blk2, 0, 192)    // ql + qh
     }
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let ssb = fmt == 6 ? 18l : 20l
     var kq : array<uint8>
     var ks : array<uint8>
     kq |> resize(2l * qsb)
@@ -256,13 +255,9 @@ def private kq_dot_gate(t : T?; fmt : int) {
     xq |> resize(n)
     xs |> resize(n / 32l)
     xbs |> resize(n / 16l)
-    if (fmt == 4) {   // kq v2: k4 reads Q8_K-form activations (per-256 scale)
-        quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
-    } else {
-        quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
-    }
-    // fp64 elementwise reference over the SAME quantized activation (k4 = Q8_K form: per-256 scale)
-    let sdiv = fmt == 4 ? 256l : 32l
+    quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)   // kq v2: Q8_K-form activations, all formats
+    // fp64 elementwise reference over the SAME quantized activation (Q8_K form: per-256 scale)
+    let sdiv = 256l
     var ref = 0.0lf
     for (i in range64(n)) {
         ref += double(w[i]) * double(xq[i]) * double(xs[i / sdiv])
@@ -304,7 +299,7 @@ def private kq_gemv_rows_gate(t : T?; fmt : int) {
     let d = 8l
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let ssb = fmt == 6 ? 18l : 20l
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
     var kq : array<uint8>
     var ks : array<uint8>
@@ -338,11 +333,7 @@ def private kq_gemv_rows_gate(t : T?; fmt : int) {
     xq |> resize(n)
     xs |> resize(n / 32l)
     xbs |> resize(n / 16l)
-    if (fmt == 4) {   // kq v2: k4 reads Q8_K-form activations (per-256 scale)
-        quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
-    } else {
-        quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
-    }
+    quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)   // kq v2: Q8_K-form activations, all formats
     var y : array<float>
     y |> resize(int(d))
     matmul_kq(fmt, y, kq, ks, 0l, xq, xs, xbs, n, d)
@@ -398,7 +389,7 @@ def private kq_repack_gate(t : T?; fmt : int; mr : int64) {
     let d = 32l
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let ssb = fmt == 6 ? 18l : 20l
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
     var kq : array<uint8>
     var ks : array<uint8>
@@ -432,11 +423,7 @@ def private kq_repack_gate(t : T?; fmt : int; mr : int64) {
     xq |> resize(n)
     xs |> resize(n / 32l)
     xbs |> resize(n / 16l)
-    if (fmt == 4) {   // kq v2: k4 reads Q8_K-form activations (per-256 scale)
-        quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
-    } else {
-        quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
-    }
+    quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)   // kq v2: Q8_K-form activations, all formats
     var want : array<float>
     var wrow : array<float>
     want |> resize(int(d))
@@ -524,7 +511,7 @@ def private kq_tile_gate(t : T?; fmt : int) {
     let nsb = n / 256l
     let mr = kq_layout_of(fmt)   // the format's OWN layout companion (per-format tune families)
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let ssb = fmt == 6 ? 18l : 20l
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
     var kq : array<uint8>
     var ks : array<uint8>
@@ -569,11 +556,7 @@ def private kq_tile_gate(t : T?; fmt : int) {
     xbs |> resize(int(ntok * n / 16l))
     unsafe {
         for (p in range64(ntok)) {
-            if (fmt == 4) {   // kq v2: Q8_K form, per-256 scale rows
-                quantize_q8_k_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 256l), p * (n / 16l))
-            } else {
-                quantize_q8_0_bs_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 32l), p * (n / 16l))
-            }
+            quantize_q8_k_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 256l), p * (n / 16l))
         }
     }
     var ytile : array<float>
@@ -600,9 +583,9 @@ def private kq_tile_gate(t : T?; fmt : int) {
                 if (fmt == 4) {
                     k4q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 256l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
                 } elif (fmt == 5) {
-                    k5q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 32l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
+                    k5q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 256l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
                 } else {
-                    k6q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 32l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
+                    k6q8_gemv_gen(addr(ytile[tk * d]), addr(kq[0]), addr(ks[0]), addr(xq[tk * n]), addr(xs[tk * (n / 256l)]), addr(xbs[tk * (n / 16l)]), n, g * mr, (g + 1l) * mr)
                 }
                 tk++
             }
@@ -611,9 +594,9 @@ def private kq_tile_gate(t : T?; fmt : int) {
             if (fmt == 4) {
                 k4q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 256l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
             } elif (fmt == 5) {
-                k5q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 32l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
+                k5q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 256l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
             } else {
-                k6q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 32l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
+                k6q8_gemv_gen(addr(ygemv[p * d]), addr(kq[0]), addr(ks[0]), addr(xq[p * n]), addr(xs[p * (n / 256l)]), addr(xbs[p * (n / 16l)]), n, 0l, d)
             }
         }
     }
@@ -654,7 +637,7 @@ def private kq_groupn_gate(t : T?; fmt : int) {
     let nreg = 3l
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let ssb = fmt == 6 ? 18l : 20l
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
     var kq : array<uint8>
     var ks : array<uint8>
@@ -690,11 +673,7 @@ def private kq_groupn_gate(t : T?; fmt : int) {
     xbs |> resize(int(nreg * n / 16l))
     unsafe {
         for (p in range64(nreg)) {
-            if (fmt == 4) {   // kq v2: Q8_K form, per-256 scale rows
-                quantize_q8_k_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 256l), p * (n / 16l))
-            } else {
-                quantize_q8_0_bs_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 32l), p * (n / 16l))
-            }
+            quantize_q8_k_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 256l), p * (n / 16l))
         }
     }
     var offs_sh : array<int64>
@@ -723,10 +702,10 @@ def private kq_groupn_gate(t : T?; fmt : int) {
                     want_pr[r * d + row] = dot_k4q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 256l)]), addr(xbs[r * (n / 16l)]), n)
                 } elif (fmt == 5) {
                     want_sh[r * d + row] = dot_k5q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
-                    want_pr[r * d + row] = dot_k5q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n)
+                    want_pr[r * d + row] = dot_k5q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 256l)]), addr(xbs[r * (n / 16l)]), n)
                 } else {
                     want_sh[r * d + row] = dot_k6q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
-                    want_pr[r * d + row] = dot_k6q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n)
+                    want_pr[r * d + row] = dot_k6q8(kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 256l)]), addr(xbs[r * (n / 16l)]), n)
                 }
             }
         }
@@ -776,10 +755,10 @@ def private kq_groupn_gate(t : T?; fmt : int) {
                 k4q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 256l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
             } elif (fmt == 5) {
                 k5q8_gemv_gen(addr(want_sh[r * d]), kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, 0l, d)
-                k5q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
+                k5q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 256l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
             } else {
                 k6q8_gemv_gen(addr(want_sh[r * d]), kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, 0l, d)
-                k6q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 32l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
+                k6q8_gemv_gen(addr(want_pr[r * d]), kqr, ksr, addr(xq[r * n]), addr(xs[r * (n / 256l)]), addr(xbs[r * (n / 16l)]), n, 0l, d)
             }
         }
         kq_groupn_gen(fmt, addr(y[0]), addr(kq[0]), addr(ks[0]), addr(offs_sh[0]), nreg, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d)

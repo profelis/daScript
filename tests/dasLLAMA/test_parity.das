@@ -143,6 +143,25 @@ def test_parity_gemma2(t : T?) {
     }
 }
 
+// gemma-2-2b-it Q4_K_M (a local llama-quantize requant of the Q8_0 above) — the SOFTCAP arm of
+// the native-kq gate: final_logit_softcap routes decode logits through the fused classifier
+// chain (cls_softcap_chain), whose kq rows cores read Q8_K-form activations (kq v2). No other
+// fixture reaches that rail (Qwen3 has no softcap); its Q8_0-form feed shipped unnoticed with
+// the k4 rework because of exactly this hole. Oracle simple_ids per-file; continues identically
+// to GEMMA2_GEN.
+[test]
+def test_parity_gemma2_q4k(t : T?) {
+    t |> run("gemma2 forward (gemma-2-2b-it Q4_K_M, native kq planes + softcap classifier)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-2-2b-it-Q4_K_M.gguf")
+        if (!model_available(t, path)) return
+        t |> success(kq_parity_ok(path, GEMMA2_PROMPT, GEMMA2_GEN), "gemma2 Q4_K_M token-for-token")
+    }
+}
+
 // TinyLlama-1.1B-v0.3 F16, "Once upon a time" (BOS=1) — the old gguf_run.das oracle (llama.cpp greedy
 // on the same F16 file). Loaded fp32 (F16 -> fp32) to match how that oracle was produced.
 let TINYLLAMA_V03_PROMPT <- [1l, 9038l, 2501l, 263l, 931l]

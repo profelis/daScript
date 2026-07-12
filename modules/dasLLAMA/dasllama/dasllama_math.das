@@ -1637,7 +1637,7 @@ def matmul_kq_groupn_active(fmt : int; var y : array<float> | #; kq : array<uint
 def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d, ntok : int64) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq_batch, fmt, addr(y[0]),
             reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
@@ -1652,7 +1652,7 @@ def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; 
 def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq, fmt, addr(y[yoff]),
             reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
@@ -1667,7 +1667,7 @@ def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
 def repack_kq_weight(fmt : int; var kq : array<uint8>; var ks : array<uint8>; woff, n, d : int64) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_repack_kq, fmt, addr(kq[sb * qsb]), addr(ks[sb * ssb]), n, d)
     }

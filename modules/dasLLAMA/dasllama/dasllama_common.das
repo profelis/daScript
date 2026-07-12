@@ -2120,7 +2120,7 @@ struct Session {
     // on the kq-native paths; sized always (~KB)
     xbs : array<int>          // per-16 sums of xq (sized max(dim, hidden_dim) / 16)
     xbs2 : array<int>         // per-16 sums of xq2 (ffn width / 16)
-    kxq : array<int8>         // Q8_K-form activation quants (kq v2 — k4 weights read these; sized maxn)
+    kxq : array<int8>         // Q8_K-form activation quants (kq v2 — every kq weight reads these; sized maxn)
     kxs : array<float>        // Q8_K per-256 activation scales (maxn / 256)
     kxbs : array<int>         // Q8_K per-16 activation sums (maxn / 16)
     chain_stages : array<int3>  // stage defs, int3(range_begin, range_end, num_chunks)
@@ -2199,7 +2199,6 @@ struct Session {
     moe_xs : array<float>       // xb's per-block scales (dim / 32)
     // K-quant activation block sums for the expert dispatch (the moe twins of xbs/xbs2, filled
     // by the bs quantizers only on layers with kq-tagged expert stacks; sized always — ~KB)
-    moe_xbs : array<int>        // per-16 sums of moe_xq (dim / 16)
     moe_dbs : array<int>        // per-16 sums of moe_dq (k x n_ff_exp / 16)
     // grouped MoE prefill scratch — sized per prefill by ffn_moe_prefill_grouped; empty for dense
     // arches, decode, and the per-position reference path
@@ -2319,7 +2318,6 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
         }
         s.moe_xq |> resize(c.dim)
         s.moe_xs |> resize(c.dim / 32l)
-        s.moe_xbs |> resize(c.dim / 16l)
         s.moe_dbs |> resize(c.n_expert_used * c.n_ff_exp / 16l)
         s.moe_offs |> resize(2l * c.n_expert_used)
         s.moe_boffs |> resize(c.n_expert_used)
@@ -3493,14 +3491,14 @@ def private mm_qkv(var s : Session; t : Model; l : int64) {
         }
     } elif (fq != KqFmt.q8 || fk != KqFmt.q8 || fv != KqFmt.q8) {
         // K-quant projections (formats can MIX per layer — Q4_K_M keeps attn_v at Q6_K):
-        // one bs-quantize, then a per-format plane GEMV each
-        quantize_q8_0_bs_into(s.xb, dim, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
-        if (fq == KqFmt.k4 || fk == KqFmt.k4 || fv == KqFmt.k4) {   // kq v2: k4 reads the Q8_K form
-            quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
+        // one quantize per consumed form, then a per-format plane GEMV each
+        if (fq == KqFmt.q8 || fk == KqFmt.q8 || fv == KqFmt.q8) {
+            quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
         }
-        mm_pre_f(s.q, t, fq, qoff, s.xq, s.xs, s.xbs, s.kxq, s.kxs, s.kxbs, dim, qd)
-        mm_pre_f(s.k, t, fk, koff, s.xq, s.xs, s.xbs, s.kxq, s.kxs, s.kxbs, dim, kv)
-        mm_pre_f(s.v, t, fv, voff, s.xq, s.xs, s.xbs, s.kxq, s.kxs, s.kxbs, dim, kv)
+        quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)   // kq v2: every kq format
+        mm_pre_f(s.q, t, fq, qoff, s.xq, s.xs, s.kxq, s.kxs, s.kxbs, dim, qd)
+        mm_pre_f(s.k, t, fk, koff, s.xq, s.xs, s.kxq, s.kxs, s.kxbs, dim, kv)
+        mm_pre_f(s.v, t, fv, voff, s.xq, s.xs, s.kxq, s.kxs, s.kxbs, dim, kv)
     } elif (t.quant == QuantMode.q8 && lanes_for_work(dim * (qd + 2l * kv), g_gemv_lane_cap) > 1) {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
         if (t.wscale_f16) {
@@ -3582,14 +3580,10 @@ def private mm_at_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : in
     }
 }
 
-// K-quant matmul: bs-quantize the activation (quants + scales + the per-16 sums the offset term
-// needs), then the format's plane GEMV. The kq sibling of mm/mm_at_q8.
+// K-quant matmul: Q8_K-quantize the activation (quants + per-256 scales + the per-16 sums the
+// fold consumes), then the format's plane GEMV. The kq sibling of mm/mm_at_q8.
 def private mm_kq(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; var xq : array<int8>; var xs : array<float>; var xbs : array<int>; n, d : int64) {
-    if (fmt == KqFmt.k4) {   // kq v2: k4 reads the Q8_K form (per-256 scale) — fits the same scratch
-        quantize_q8_k_into(x, n, xq, xs, xbs, 0l, 0l, 0l)
-    } else {
-        quantize_q8_0_bs_into(x, n, xq, xs, xbs, 0l, 0l, 0l)
-    }
+    quantize_q8_k_into(x, n, xq, xs, xbs, 0l, 0l, 0l)
     mm_at_kq_pre(y, t, fmt, woff, xq, xs, xbs, n, d)
 }
 
@@ -3600,11 +3594,7 @@ def private mm_kq(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x 
 // then a full row GEMV — exact; the mx4 expand-to-q8 trick is lossy for asymmetric K-quants.
 def private mm_b_kq(var s : Session; var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x : array<float>; n, d, npos : int64) {
     if (t.kq_repacked && kernel_backend_has_kq_batch()) {
-        if (fmt == KqFmt.k4) {   // kq v2: k4 reads the Q8_K form — same scratch, per-call fill
-            requant_rows_q8k_bs(x, n, npos, s.xqb, s.xsb, s.xbsb)
-        } else {
-            requant_rows_q8_bs(x, n, npos, s.xqb, s.xsb, s.xbsb)
-        }
+        requant_rows_q8k_bs(x, n, npos, s.xqb, s.xsb, s.xbsb)   // kq v2: Q8_K-form image
         let ts_gemm = ref_time_ticks()
         let fi = fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : 6)
         if (fmt == KqFmt.k4) {
@@ -3619,11 +3609,7 @@ def private mm_b_kq(var s : Session; var y : array<float>; t : Model; fmt : KqFm
     }
     unsafe {
         for (p in range64(npos)) {
-            if (fmt == KqFmt.k4) {
-                quantize_q8_k_into_ptr(addr(x[p * n]), n, addr(s.xq[0]), addr(s.xs[0]), addr(s.xbs[0]), 0l, 0l, 0l)
-            } else {
-                quantize_q8_0_bs_into_ptr(addr(x[p * n]), n, addr(s.xq[0]), addr(s.xs[0]), addr(s.xbs[0]), 0l, 0l, 0l)
-            }
+            quantize_q8_k_into_ptr(addr(x[p * n]), n, addr(s.xq[0]), addr(s.xs[0]), addr(s.xbs[0]), 0l, 0l, 0l)
             mm_at_kq_pre(y, t, fmt, woff, s.xq, s.xs, s.xbs, n, d, p * d)
         }
     }
@@ -3705,20 +3691,16 @@ def private kq_rows_for(fmt : KqFmt) : MatmulKqRowsFn {
 // (the backend rows cores read the grp layout the loader wrote).
 def private kq_servable(t : Model; fmt : KqFmt) : bool => fmt == KqFmt.q8 || t.kq_repacked
 
-// kq v2 activation-form helpers: k4 reads Q8_K-form activations (per-256 scale); k5/k6 the
-// Q8_0 form. The MoE gate/up pair shares ONE gathered/quantized activation plane, so its two
-// stacks must agree on the form until kq v2 covers k5/k6.
-def private kq_k_form(f : KqFmt) : bool => f == KqFmt.k4
+// kq v2 activation form: every kq format reads Q8_K-form activations (per-256 scale + per-16
+// bsums). The MoE gate/up pair shares ONE gathered/quantized activation plane, so its two
+// stacks must agree on the form: both kq (Q8_K) or both q8 (Q8_0).
 def private moe_pair_kform(f1, f3 : KqFmt) : bool {
-    let k1 = kq_k_form(f1)
-    let k3 = kq_k_form(f3)
-    if (k1 != k3 && f1 != KqFmt.q8 && f3 != KqFmt.q8) {
-        panic("dasLLAMA: MoE gate/up expert stacks mix kq activation forms (Q4_K with Q5_K/Q6_K) — unsupported until kq v2 covers k5/k6")
+    let k1 = f1 != KqFmt.q8
+    let k3 = f3 != KqFmt.q8
+    if (k1 != k3) {
+        panic("dasLLAMA: MoE gate/up expert stacks mix q8 and K-quant weights — unsupported until per-stack activation planes land")
     }
-    if ((k1 || k3) && (f1 == KqFmt.q8 || f3 == KqFmt.q8)) {
-        panic("dasLLAMA: MoE gate/up expert stacks mix q8 and Q4_K — unsupported until per-stack activation planes land")
-    }
-    return k1 || k3
+    return k1
 }
 
 // Format router: q8-tagged weights take the classic mm; kq tags take the plane GEMV.
@@ -3730,15 +3712,13 @@ def private mm_f(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; x :
     }
 }
 
-// Pre-quantized format router (the activation was bs-quantized once — its quants/scales are
-// byte-identical to the plain quantizer's, so q8-tagged weights consume them unchanged).
-def private mm_pre_f(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; kxq : array<int8>; kxs : array<float>; kxbs : array<int>; n, d : int64) {
+// Pre-quantized format router: q8-tagged weights consume the Q8_0-form scratch (xq/xs);
+// kq-tagged weights the Q8_K-form scratch (kxq/kxs/kxbs — kq v2, all three formats).
+def private mm_pre_f(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : array<int8>; xs : array<float>; kxq : array<int8>; kxs : array<float>; kxbs : array<int>; n, d : int64) {
     if (fmt == KqFmt.q8) {
         mm_at_q8_pre(y, t, woff, xq, xs, n, d)
-    } elif (fmt == KqFmt.k4) {   // kq v2: k4 reads the Q8_K-form planes
-        mm_at_kq_pre(y, t, fmt, woff, kxq, kxs, kxbs, n, d)
     } else {
-        mm_at_kq_pre(y, t, fmt, woff, xq, xs, xbs, n, d)
+        mm_at_kq_pre(y, t, fmt, woff, kxq, kxs, kxbs, n, d)
     }
 }
 
@@ -4013,9 +3993,9 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
         && kq_servable(t, fmt_at(t.wq_fmt, l)) && kq_servable(t, fmt_at(t.wk_fmt, l))
         && kq_servable(t, fmt_at(t.wv_fmt, l)) && kq_servable(t, fmt_at(t.wo_fmt, l))
         // kq v2: the chain's wo-input requant slices per head (32-grain) — Q8_K needs whole
-        // 256-superblocks, so k4 layers take the per-op path until the chain regrains
-        && fmt_at(t.wq_fmt, l) != KqFmt.k4 && fmt_at(t.wk_fmt, l) != KqFmt.k4
-        && fmt_at(t.wv_fmt, l) != KqFmt.k4 && fmt_at(t.wo_fmt, l) != KqFmt.k4
+        // 256-superblocks, so kq layers take the per-op path until the chain regrains
+        && fmt_at(t.wq_fmt, l) == KqFmt.q8 && fmt_at(t.wk_fmt, l) == KqFmt.q8
+        && fmt_at(t.wv_fmt, l) == KqFmt.q8 && fmt_at(t.wo_fmt, l) == KqFmt.q8
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && (!t.wscale_f16 || kernel_backend_has_rows16())
         && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
@@ -4487,9 +4467,9 @@ def private fused_ffn_ok(t : Model; l : int64) : bool {
         && kq_servable(t, fmt_at(t.w1_fmt, l)) && kq_servable(t, fmt_at(t.w2_fmt, l))
         && kq_servable(t, fmt_at(t.w3_fmt, l))
         // kq v2: the chain's w2-input requant slices at 32-row grain — Q8_K needs whole
-        // 256-superblocks, so k4 layers take the per-op path until the chain regrains
-        && fmt_at(t.w1_fmt, l) != KqFmt.k4 && fmt_at(t.w2_fmt, l) != KqFmt.k4
-        && fmt_at(t.w3_fmt, l) != KqFmt.k4
+        // 256-superblocks, so kq layers take the per-op path until the chain regrains
+        && fmt_at(t.w1_fmt, l) == KqFmt.q8 && fmt_at(t.w2_fmt, l) == KqFmt.q8
+        && fmt_at(t.w3_fmt, l) == KqFmt.q8
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && (!t.wscale_f16 || kernel_backend_has_rows16())
         && lanes_for_work(c.dim * layer_hidden(t, l), g_gemv_lane_cap) > 1)
@@ -5130,22 +5110,25 @@ def private dense_ffn_inplace(t : Model; var s : Session; l : int64) {
         // K-quant FFN (Q4_K_M keeps ffn_down at Q6_K on some layers — formats mix): one
         // bs-quantize serves every format, gate/up as separate plane GEMVs, then the gated
         // half requants (with sums) for the down projection
-        quantize_q8_0_bs_into(s.xb, dim, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
-        if (f1 == KqFmt.k4 || f3 == KqFmt.k4) {   // kq v2: k4 reads the Q8_K form
+        if (f1 == KqFmt.q8 || f3 == KqFmt.q8) {
+            quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+        }
+        if (f1 != KqFmt.q8 || f3 != KqFmt.q8) {   // kq v2: every kq format reads the Q8_K form
             quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
         }
-        mm_pre_f(s.hb, t, f1, t.w1_offs[l], s.xq, s.xs, s.xbs, s.kxq, s.kxs, s.kxbs, dim, hidden)
-        mm_pre_f(s.hb2, t, f3, t.w3_offs[l], s.xq, s.xs, s.xbs, s.kxq, s.kxs, s.kxbs, dim, hidden)
+        mm_pre_f(s.hb, t, f1, t.w1_offs[l], s.xq, s.xs, s.kxq, s.kxs, s.kxbs, dim, hidden)
+        mm_pre_f(s.hb2, t, f3, t.w3_offs[l], s.xq, s.xs, s.kxq, s.kxs, s.kxbs, dim, hidden)
         prof_add("mm_ffn", ts_ffn)
         let ts_act = ref_time_ticks()
         gate_batch(s.hb, s.hb2, c.ffn_act, hidden, 1l)
         prof_add("act", ts_act)
         let ts_down = ref_time_ticks()
-        quantize_q8_0_bs_into(s.hb, hidden, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
-        if (f2 == KqFmt.k4) {   // kq v2
+        if (f2 == KqFmt.q8) {
+            quantize_q8_0_into(s.hb, hidden, s.xq, s.xs, 0l, 0l)
+        } else {   // kq v2
             quantize_q8_k_into(s.hb, hidden, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
         }
-        mm_pre_f(s.xb, t, f2, t.w2_offs[l], s.xq, s.xs, s.xbs, s.kxq, s.kxs, s.kxbs, hidden, dim)
+        mm_pre_f(s.xb, t, f2, t.w2_offs[l], s.xq, s.xs, s.kxq, s.kxs, s.kxbs, hidden, dim)
         prof_add("mm_ffn", ts_down)
     } elif (t.quant == QuantMode.q8) {
         // gate+up share the activation: ONE quantize + ONE region-list dispatch into ffn_gu's
@@ -5329,11 +5312,10 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
     let layer_kq = pre_q8 && moe_layer_kq(t, l)
     if (pre_q8) {
         let ts_rq = ref_time_ticks()
-        if (layer_kq) {   // bit-identical quants/scales; the bs form adds the per-16 sums the kq dots consume
-            quantize_q8_0_bs_into(s.xb, dim, s.moe_xq, s.moe_xs, s.moe_xbs, 0l, 0l, 0l)
-            if (moe_pair_kform(fmt_at(t.we1_fmt, l), fmt_at(t.we3_fmt, l))) {   // kq v2: k4 stacks read Q8_K-form
-                quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
-            }
+        if (layer_kq && moe_pair_kform(fmt_at(t.we1_fmt, l), fmt_at(t.we3_fmt, l))) {
+            // kq v2: kq gate/up stacks read the Q8_K-form scratch (the q8 image has no consumer
+            // — a q8/kq gate-up mix panics in moe_pair_kform)
+            quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
         } else {
             quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)
         }
@@ -5358,10 +5340,8 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             s.moe_offs[j * 2l + 1l] = 0l   // gates share the single hoisted xb image
             s.moe_boffs[j] = t.web1_off + e * nfe
         }
-        if (kq_k_form(f1)) {   // kq v2: k4 stacks read the Q8_K-form scratch
+        if (f1 != KqFmt.q8) {   // native K-quant expert stack reads the Q8_K-form scratch (never biased — detect guards that)
             mm_at_kq_groupn(s.moe_gu, t, f1, s.moe_offs, k, s.kxq, s.kxs, s.kxbs, dim, nfe)
-        } elif (f1 != KqFmt.q8) {   // native K-quant expert stack (never biased — detect guards that)
-            mm_at_kq_groupn(s.moe_gu, t, f1, s.moe_offs, k, s.moe_xq, s.moe_xs, s.moe_xbs, dim, nfe)
         } elif (t.experts_mx4) {   // native 4-bit expert weights — half the Q8 traffic
             if (biased) {
                 mm_at_mx4_groupn(s.moe_gu, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
@@ -5379,10 +5359,8 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
             s.moe_offs[j * 2l + 1l] = 0l   // ups read the same hoisted xb image (explicit, not inherited from the gate pass)
             s.moe_boffs[j] = t.web3_off + e * nfe
         }
-        if (kq_k_form(f3)) {   // kq v2
+        if (f3 != KqFmt.q8) {   // kq v2: Q8_K-form scratch
             mm_at_kq_groupn(s.moe_gu2, t, f3, s.moe_offs, k, s.kxq, s.kxs, s.kxbs, dim, nfe)
-        } elif (f3 != KqFmt.q8) {
-            mm_at_kq_groupn(s.moe_gu2, t, f3, s.moe_offs, k, s.moe_xq, s.moe_xs, s.moe_xbs, dim, nfe)
         } elif (t.experts_mx4) {
             if (biased) {
                 mm_at_mx4_groupn(s.moe_gu2, t, s.moe_offs, s.moe_boffs, k, s.moe_xq, s.moe_xs, dim, nfe)
@@ -5398,10 +5376,8 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
         let ts_act = ref_time_ticks()
         gate_batch(s.moe_gu, s.moe_gu2, c.ffn_act, nfe, k)
         prof_add("act", ts_act)
-        if (kq_k_form(f2)) {   // kq v2: the down stack reads Q8_K-form rows
+        if (f2 != KqFmt.q8) {   // kq v2: the down stack reads Q8_K-form rows
             requant_rows_q8k_bs(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds, s.moe_dbs)
-        } elif (f2 != KqFmt.q8) {   // bit-identical rows + the per-16 sums the down dots consume
-            requant_rows_q8_bs(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds, s.moe_dbs)
         } else {
             requant_rows_q8(s.moe_gu, nfe, k, s.moe_dq, s.moe_ds)   // books mm_requant
         }
@@ -5855,8 +5831,9 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
     let dim = c.dim
     let vocab = c.vocab_size
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
-    if (cls_fmt != KqFmt.q8) {
-        quantize_q8_0_bs_into(s.xb, dim, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
+    let is_kq = cls_fmt != KqFmt.q8
+    if (is_kq) {
+        quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)   // kq v2: the rows cores read Q8_K form
     } else {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
     }
@@ -5868,8 +5845,8 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
     count_parallel_dispatch(min(n0, ngrp))
     unsafe {
         var lp = addr(s.logits[0])
-        var xqp = addr(s.xq[0])
-        var xsp = addr(s.xs[0])
+        var xqp = is_kq ? addr(s.kxq[0]) : addr(s.xq[0])
+        var xsp = is_kq ? addr(s.kxs[0]) : addr(s.xs[0])
         let f16w = t.wscale_f16
         let mmrows16 = mm_q8q8_rows16_fn()
         let wp = cls_fmt == KqFmt.q8 ? reinterpret<int8 const?>(addr(t.qblob[0])) + t.wcls_off : null
@@ -5882,11 +5859,10 @@ def private cls_softcap_chain(t : Model; var s : Session; cap : float) {
                 ws = reinterpret<float const?>(addr(t.qscales[0])) + t.wcls_off / 32l
             }
         }
-        var xbsw : int? = cls_fmt != KqFmt.q8 ? addr(s.xbs[0]) : null
+        var xbsw : int? = is_kq ? addr(s.kxbs[0]) : null
         let kqpc = kq_plane_q(t, cls_fmt, t.wcls_off)
         let kspc = kq_plane_s(t, cls_fmt, t.wcls_off)
         let rowsc = kq_rows_for(cls_fmt)
-        let is_kq = cls_fmt != KqFmt.q8
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             unsafe {
                 let r0 = int64(jb) * 32l
@@ -7579,16 +7555,15 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     }
     prof_add("moe_route", ts_route)
 
-    // 2. quantize every normed activation row ONCE (same per-row quants as the decode hoist;
-    //    kq layers add the per-16 sums — bit-identical quants/scales either way)
-    if (kq_layer) {
-        requant_rows_q8_bs(s.xb_b, dim, npos, s.xqb, s.xsb, s.xbsb)
-        if (moe_pair_kform(f1, f3)) {   // kq v2: the k4 gathers read a Q8_K-form image
-            s.kxqb |> resize(npos * dim)
-            s.kxsb |> resize(npos * dim / 256l)
-            s.kxbsb |> resize(npos * dim / 16l)
-            requant_rows_q8k_bs(s.xb_b, dim, npos, s.kxqb, s.kxsb, s.kxbsb)
-        }
+    // 2. quantize every normed activation row ONCE (same per-row quants as the decode hoist).
+    //    kq v2: kq gate/up stacks gather off a Q8_K-form image; q8 stacks off the Q8_0 image
+    //    (a q8/kq gate-up mix panics in moe_pair_kform, so exactly one image is live)
+    let moe_kform = kq_layer && moe_pair_kform(f1, f3)
+    if (moe_kform) {
+        s.kxqb |> resize(npos * dim)
+        s.kxsb |> resize(npos * dim / 256l)
+        s.kxbsb |> resize(npos * dim / 16l)
+        requant_rows_q8k_bs(s.xb_b, dim, npos, s.kxqb, s.kxsb, s.kxbsb)
     } else {
         requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
     }
@@ -7602,7 +7577,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     if (fused) {
         trace_tag(TRACE_TAG_MOE)
         let ts_gather = ref_time_ticks()
-        moe_gather_rows(s, 0l, nk, dim, k, kq_layer, kq_layer && moe_pair_kform(f1, f3))
+        moe_gather_rows(s, 0l, nk, dim, k, moe_kform, moe_kform)
         prof_add("moe_gather", ts_gather)
         // region triples (woff, row0, cnt) per touched expert; the three planes share row0/cnt
         s.moe_offs1 |> clear(); s.moe_offs1 |> reserve(ne * 3l)
@@ -7665,12 +7640,8 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let ts_act = ref_time_ticks()
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, nk)
         prof_add("act", ts_act)
-        if (fused_kq) {   // bit-identical rows + the per-16 sums the kq down GEMM consumes
-            if (kq_k_form(f2)) {   // kq v2: the down stacks read Q8_K-form rows
-                requant_rows_q8k_bs(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs, s.moe_hbs)
-            } else {
-                requant_rows_q8_bs(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs, s.moe_hbs)
-            }
+        if (fused_kq) {   // kq v2: the down stacks read Q8_K-form rows (+ the per-16 sums the fold consumes)
+            requant_rows_q8k_bs(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs, s.moe_hbs)
         } else {
             requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
         }
@@ -7716,7 +7687,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             continue
         }
         let ts_gather = ref_time_ticks()
-        moe_gather_rows(s, b0, cnt, dim, k, kq_layer, kq_layer && moe_pair_kform(f1, f3))
+        moe_gather_rows(s, b0, cnt, dim, k, moe_kform, moe_kform)
         prof_add("moe_gather", ts_gather)
         let eg = l * ne + e
         let base = e * dim * nfe
@@ -7761,12 +7732,8 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let ts_act = ref_time_ticks()
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
         prof_add("act", ts_act)
-        if (f2 != KqFmt.q8) {   // bit-identical rows + the per-16 sums the kq down tile consumes
-            if (kq_k_form(f2)) {   // kq v2
-                requant_rows_q8k_bs(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs, s.moe_hbs)
-            } else {
-                requant_rows_q8_bs(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs, s.moe_hbs)
-            }
+        if (f2 != KqFmt.q8) {   // kq v2: Q8_K-form rows + the per-16 sums the fold consumes
+            requant_rows_q8k_bs(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs, s.moe_hbs)
         } else {
             requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)
         }
@@ -7964,14 +7931,13 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
     // 2. expert input = pre_ffw_norm_2(residual) per position, quantized ONCE for every expert GEMM
     //    (kq layers add the per-16 sums — bit-identical quants/scales either way)
     rms_batch(s.xb_b, s.x_b, t, t.rms_pre_ffn2_off + l * dim, dim, npos)
-    if (kq_layer) {
-        requant_rows_q8_bs(s.xb_b, dim, npos, s.xqb, s.xsb, s.xbsb)
-        if (moe_pair_kform(f1, f3)) {   // kq v2: the k4 gathers read a Q8_K-form image
-            s.kxqb |> resize(npos * dim)
-            s.kxsb |> resize(npos * dim / 256l)
-            s.kxbsb |> resize(npos * dim / 16l)
-            requant_rows_q8k_bs(s.xb_b, dim, npos, s.kxqb, s.kxsb, s.kxbsb)
-        }
+    // kq v2: kq gate/up stacks gather off a Q8_K-form image; q8 stacks off the Q8_0 image
+    let moe_kform = kq_layer && moe_pair_kform(f1, f3)
+    if (moe_kform) {
+        s.kxqb |> resize(npos * dim)
+        s.kxsb |> resize(npos * dim / 256l)
+        s.kxbsb |> resize(npos * dim / 16l)
+        requant_rows_q8k_bs(s.xb_b, dim, npos, s.kxqb, s.kxsb, s.kxbsb)
     } else {
         requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
     }
@@ -7986,7 +7952,7 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
             continue
         }
         let ts_gather = ref_time_ticks()
-        moe_gather_rows(s, b0, cnt, dim, k, kq_layer, kq_layer && moe_pair_kform(f1, f3))
+        moe_gather_rows(s, b0, cnt, dim, k, moe_kform, moe_kform)
         prof_add("moe_gather", ts_gather)
         let base = e * dim * nfe
         if (f1 != KqFmt.q8) {
@@ -8003,11 +7969,8 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, cnt)
         prof_add("act", ts_act)
         if (f2 != KqFmt.q8) {
-            if (kq_k_form(f2)) {   // kq v2
-                requant_rows_q8k_bs(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs, s.moe_hbs)
-            } else {
-                requant_rows_q8_bs(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs, s.moe_hbs)
-            }
+            // kq v2: Q8_K-form rows + the per-16 sums the fold consumes
+            requant_rows_q8k_bs(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs, s.moe_hbs)
             mm_b_kq_pre(s.moe_gout, t, f2, t.we2_offs[l] + base, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim, cnt)
         } else {
             requant_rows_q8(s.moe_ghb, nfe, cnt, s.moe_hq, s.moe_hs)

@@ -349,7 +349,7 @@ struct KqFixture {
 }
 
 def kq_qsb(fmt : int64) : int64 => fmt == 4l ? 128l : (fmt == 5l ? 160l : 192l)
-def kq_ssb(fmt : int64) : int64 => fmt == 6l ? 18l : (fmt == 4l ? 20l : 32l)
+def kq_ssb(fmt : int64) : int64 => fmt == 6l ? 18l : 20l
 
 // synthetic disk superblocks, varied per (row, superblock) so no two blocks repeat: any byte
 // is a legal quant, and the small d/dmin keep the f16 (s, o) pairs finite and row sums tame
@@ -427,29 +427,25 @@ def build_kq_fixture(fmt : int64; n, d, ntok : int64) : KqFixture {
             if (fmt == 4l) {
                 transcode_q4k_superblock(blkb, 0l, fx.kq, sb * 128l, fx.ks, sb * 20l)
             } elif (fmt == 5l) {
-                transcode_q5k_superblock(blkb, 0l, fx.kq, sb * 160l, fx.ks, sb * 32l)
+                transcode_q5k_superblock(blkb, 0l, fx.kq, sb * 160l, fx.ks, sb * 20l)
             } else {
                 transcode_q6k_superblock(blkb, 0l, fx.kq, sb * 192l, fx.ks, sb * 18l)
             }
         }
     }
     delete blkb
-    // activations: the production quantizers, whose bsums planes ARE the kq contract (per-16
-    // sums). k4 (kq v2) takes the Q8_K form — ONE scale per 256-superblock; k5/k6 the Q8_0 form
+    // activations: the production quantizer, whose bsums plane IS the kq contract (per-16
+    // sums). kq v2: every format takes the Q8_K form — ONE scale per 256-superblock
     var xrow : array<float>
     xrow |> resize(int(n))
     fx.xq |> resize(int(ntok * n))
-    fx.xs |> resize(int(ntok * (fmt == 4l ? n / 256l : n / 32l)))
+    fx.xs |> resize(int(ntok * (n / 256l)))
     fx.xbs |> resize(int(ntok * (n / 16l)))
     for (tk in range64(ntok)) {
         for (i in range64(n)) {
             xrow[i] = float((i + tk * 7l) % 23l) * 0.07 - 0.8
         }
-        if (fmt == 4l) {
-            quantize_q8_k_into(xrow, n, fx.xq, fx.xs, fx.xbs, tk * n, tk * (n / 256l), tk * (n / 16l))
-        } else {
-            quantize_q8_0_bs_into(xrow, n, fx.xq, fx.xs, fx.xbs, tk * n, tk * (n / 32l), tk * (n / 16l))
-        }
+        quantize_q8_k_into(xrow, n, fx.xq, fx.xs, fx.xbs, tk * n, tk * (n / 256l), tk * (n / 16l))
     }
     delete xrow
     // the oracle: the scalar grp walk off a grp4 copy (fold order is layout-independent)
@@ -464,7 +460,7 @@ def build_kq_fixture(fmt : int64; n, d, ntok : int64) : KqFixture {
             for (tk in range64(ntok)) {
                 for (r in range64(4l)) {
                     fx.yref[tk * d + g * 4l + r] = kq_grp_row_dot(fmt, kqg, ksg, r, 4l,
-                        addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (fmt == 4l ? n / 256l : n / 32l), addr(fx.xbs[0]) + tk * (n / 16l), n)
+                        addr(fx.xq[0]) + tk * n, addr(fx.xs[0]) + tk * (n / 256l), addr(fx.xbs[0]) + tk * (n / 16l), n)
                 }
             }
         }
