@@ -7,7 +7,8 @@ require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYL
 require dasllama/dasllama_math
 require dasllama/dasllama_math_default  // registers the portable Q8·Q8 backend at [init] (the fallback everywhere)
 require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backend at [init]; no-op off-ARM
-require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen public  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted. PUBLIC: re-exports llvm_tune so the auto-policy pass fires at app roots
+require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
+require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY llvm_tune (not math_gen's whole public surface — its jobque_boost would flood requirers with ambiguities): the auto-policy pass and tune_status reach every app that requires this module
 require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it

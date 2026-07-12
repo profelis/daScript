@@ -106,6 +106,16 @@ def private sidecar_for(app : string) : string {
     return "{stem}.tune.json"
 }
 
+// the binary THIS process runs as — argv[0] verbatim (a standalone exe is its own binary;
+// a `daslang app.das` run anchors on the daslang binary). NOT get_das_exe(): that derives
+// "<argv[0] dir>/daslang.exe" — the interpreter-to-SPAWN, which does not exist inside a
+// released bundle and silently mis-anchored the exe's sidecar + staleness checks.
+def private running_binary() : string {
+    // aliases a process-global Array header (locked) — do not delete
+    let argv <- get_command_line_arguments()
+    return empty(argv) ? "" : replace("{argv[0]}", "\\", "/")
+}
+
 // manual override for harnesses that manage their own sidecar location
 var private g_runtime_manifest = ""
 
@@ -124,7 +134,7 @@ def tune_manifest_path() : string {
     if (!empty(env)) return env
     if (!empty(g_runtime_manifest)) return g_runtime_manifest
     let app = tune_app_script()
-    return sidecar_for(empty(app) ? get_das_exe() : app)
+    return sidecar_for(empty(app) ? running_binary() : app)
 }
 
 //! True when the sidecar predates the binary that runs (or builds) the app — a rebuilt
@@ -135,7 +145,7 @@ def tune_sidecar_stale(path : string) : bool {
     var sfs : FStat
     return false if (!stat(path, sfs))   // absent is "missing", not "stale"
     var bfs : FStat
-    return false if (!stat(get_das_exe(), bfs))
+    return false if (!stat(running_binary(), bfs))
     return sfs.mtime < bfs.mtime
 }
 
@@ -202,7 +212,7 @@ def private load_sidecar_doc(path : string) : JsonValue? {
 
 // refresh "provenance" and write the document back
 def private save_sidecar_doc(path : string; var doc : JsonValue?) : bool {
-    update(doc, "provenance", JV((binary = get_das_exe(), platform = get_platform_name(),
+    update(doc, "provenance", JV((binary = running_binary(), platform = get_platform_name(),
         arch = get_architecture_name())))
     return fwrite(path, write_json(doc))
 }

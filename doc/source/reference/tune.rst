@@ -128,11 +128,27 @@ A library that owns tuned kernels declares one scope:
 
 ``tuner=`` (resolved against the declaring file) names the harness that
 regenerates this library's winners; the policy rail and ``--tune`` run it with
-``DAS_TUNE_MANIFEST`` pointed at the app sidecar. The winners themselves live
-in the ONE per-app file — every library's tuner **upserts its own keys** and
-preserves everyone else's (that upsert is the isolation contract; "is this
-scope tuned" is per-key completeness, not file existence). Reading winners
-needs no scope at all — every ``[tune]`` resolves against the app sidecar.
+``DAS_TUNE_MANIFEST`` pointed at the app sidecar. ``covers=`` (optional,
+``;``-joined module names) extends the scope's *demand* beyond its declaring
+module: the completeness check requires a sidecar entry for every ``[tune]``
+function AND every non-``perm=``-pinned ``[tuned]`` loop-hint kernel across
+the declaring + covered modules (dasLLAMA covers its math/quant modules, so
+first-start auto-tune sweeps loop hints too). The demand is AST-derived; a
+tuner that misses a demanded kernel re-tunes every start, and the startup
+warning **names the missing kernels**. The winners themselves live in the ONE
+per-app file — every library's tuner **upserts its own keys** and preserves
+everyone else's (that upsert is the isolation contract; "is this scope tuned"
+is per-key completeness, not file existence). Reading winners needs no scope
+at all — every ``[tune]`` resolves against the app sidecar.
+
+.. warning::
+
+   The default-``auto`` policy fires only for app roots that **see**
+   ``llvm_tune`` — a library owning scopes must re-export it
+   (``require llvm/daslib/llvm_tune public``), or its apps silently get no
+   default policy. Re-export ``llvm_tune`` alone, not your module's whole
+   public surface (a blanket ``public`` on a module that also re-exports
+   ``jobque_boost`` floods requirers with name ambiguities).
 
 Application policy — ``[tune_policy]`` and ``--tune``
 =====================================================
