@@ -6,9 +6,9 @@ options no_aot     // invokes the compiler at runtime (compile_file) — not AOT
 // every kernel-illegal construct with a CLEAN compile error (annotation fixup fails, errors
 // non-empty, no crash, no silent wrong kernel). Each fixture holds exactly one unsupported
 // construct; we compile it with compile_file and assert the error text carries the specific
-// diagnostic. The four fixtures span the rejection surface: a WRITTEN @uniform (write-set scan),
-// an ARRAY @uniform (member scan), a VALUE return (statement emit), and a CALL (the emit_value
-// unsupported-node backstop).
+// diagnostic. The fixtures span the rejection surface: a WRITTEN @uniform (write-set scan),
+// an ARRAY @uniform (member scan), a VALUE return (statement emit), a user-function CALL (the
+// emit_call_value whitelist backstop), a BOUND @workgroup, and a dynamic-array @workgroup.
 
 require dastest/testing_boost public
 require daslib/ast
@@ -47,6 +47,8 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_uniform_written", "@uniform member `n` is written")
         check_rejects(t, "_fc_uniform_array", "@uniform member `xs` must be a scalar or vector value")
         check_rejects(t, "_fc_return_value", "kernels return void")
-        check_rejects(t, "_fc_call", "expression ExprCall is not in the supported MSL subset")
+        check_rejects(t, "_fc_call", "call `helper` is not a supported MSL builtin")
+        check_rejects(t, "_fc_wg_binding", "threadgroup memory is not a bindable buffer")
+        check_rejects(t, "_fc_wg_type", "@workgroup member `tile` must be a scalar, vector, or single-dimension fixed array")
     }
 }

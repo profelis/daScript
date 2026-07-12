@@ -1,13 +1,15 @@
 options gen2
 options indenting = 4
 
-// MSL text emitter (Phase-2 subset: full scalar/vector arithmetic, comparisons, logical, control
-// flow). generate_msl lowers one [metal_kernel] class method to a Metal compute kernel: @ssbo class
-// members become device-pointer parameters (const when no statement writes them), @uniform members
-// become constant-address-space reference parameters, referenced builtin globals become attributed
-// parameters, the body lowers by manual recursion. Every construct records a census kind at its
-// emit site (gate B: the union across all test fixtures must equal declared_msl_census, both
-// directions — text has no disassembler, so the census IS the emitter's coverage proxy).
+// MSL text emitter (Phase-3 subset: full scalar/vector arithmetic, comparisons, logical, control
+// flow, threadgroup memory + barriers + simdgroup intrinsics). generate_msl lowers one
+// [metal_kernel] class method to a Metal compute kernel: @ssbo class members become device-pointer
+// parameters (const when no statement writes them), @uniform members become constant-address-space
+// reference parameters, @workgroup members become threadgroup declarations at the top of the kernel
+// body, referenced builtin globals become attributed parameters, the body lowers by manual
+// recursion. Every construct records a census kind at its emit site (gate B: the union across all
+// test fixtures must equal declared_msl_census, both directions — text has no disassembler, so the
+// census IS the emitter's coverage proxy).
 
 module msl_emit shared public
 
@@ -28,6 +30,8 @@ struct private MslMember {
     binding : int
     written : bool
     uniform : bool
+    workgroup : bool
+    wg_dim : int            // @workgroup fixed-array count; -1 = scalar/vector
 }
 
 struct private MslCtx {
@@ -61,6 +65,24 @@ def private err(var ctx : MslCtx; at : LineInfo; msg : string) {
 def private builtin_msl_info(name : string) : tuple<ok : bool; mslType : string; attr : string> {
     if (name == "gl_GlobalInvocationID") {
         return (ok = true, mslType = "uint3", attr = "thread_position_in_grid")
+    } elif (name == "gl_LocalInvocationID") {
+        return (ok = true, mslType = "uint3", attr = "thread_position_in_threadgroup")
+    } elif (name == "gl_WorkGroupID") {
+        return (ok = true, mslType = "uint3", attr = "threadgroup_position_in_grid")
+    } elif (name == "gl_NumWorkGroups") {
+        return (ok = true, mslType = "uint3", attr = "threadgroups_per_grid")
+    } elif (name == "gl_WorkGroupSize") {
+        return (ok = true, mslType = "uint3", attr = "threads_per_threadgroup")
+    } elif (name == "gl_LocalInvocationIndex") {
+        return (ok = true, mslType = "uint", attr = "thread_index_in_threadgroup")
+    } elif (name == "gl_SubgroupInvocationID") {
+        return (ok = true, mslType = "uint", attr = "thread_index_in_simdgroup")
+    } elif (name == "gl_SubgroupSize") {
+        return (ok = true, mslType = "uint", attr = "threads_per_simdgroup")
+    } elif (name == "gl_NumSubgroups") {
+        return (ok = true, mslType = "uint", attr = "simdgroups_per_threadgroup")
+    } elif (name == "gl_SubgroupID") {
+        return (ok = true, mslType = "uint", attr = "simdgroup_index_in_threadgroup")
     }
     return (ok = false, mslType = "", attr = "")
 }
@@ -75,6 +97,7 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
         }
         var isSsbo = false
         var isUniform = false
+        var isWorkgroup = false
         var binding = -1
         var setIdx = 0
         for (annDecl in fld.annotation) {
@@ -82,22 +105,48 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
                 isSsbo = true
             } elif (annDecl.name == "uniform") {
                 isUniform = true
+            } elif (annDecl.name == "workgroup") {
+                isWorkgroup = true
             } elif (annDecl.name == "binding" && annDecl.basicType == Type.tInt) {
                 binding = annDecl.iValue
             } elif (annDecl.name == "set" && annDecl.basicType == Type.tInt) {
                 setIdx = annDecl.iValue
             }
         }
-        if (!isSsbo && !isUniform) {
-            err(ctx, fld.at, "member `{fld.name}` is neither @ssbo nor @uniform — kernels support @ssbo array<T> buffers and @uniform scalar/vector values")
+        if (!isSsbo && !isUniform && !isWorkgroup) {
+            err(ctx, fld.at, "member `{fld.name}` is neither @ssbo, @uniform, nor @workgroup — kernels support @ssbo array<T> buffers, @uniform scalar/vector values, and @workgroup threadgroup memory")
             continue
         }
-        if (isSsbo && isUniform) {
-            err(ctx, fld.at, "member `{fld.name}` is both @ssbo and @uniform — pick one")
+        if ((isSsbo ? 1 : 0) + (isUniform ? 1 : 0) + (isWorkgroup ? 1 : 0) > 1) {
+            err(ctx, fld.at, "member `{fld.name}` mixes @ssbo/@uniform/@workgroup — pick one")
             continue
         }
         if (setIdx != 0) {
             err(ctx, fld.at, "member `{fld.name}` has @set = {setIdx} — Metal has no descriptor sets; only @set = 0 (or none) is allowed")
+        }
+        if (isWorkgroup) {
+            if (binding >= 0) {
+                err(ctx, fld.at, "@workgroup member `{fld.name}` has @binding = {binding} — threadgroup memory is not a bindable buffer")
+                continue
+            }
+            var wgElem = ""
+            var wgDim = -1
+            if (fld._type != null && fld._type.baseType == Type.tFixedArray && fld._type.firstType != null &&
+                    fld._type.firstType.baseType != Type.tFixedArray) {
+                wgElem = msl_type_name(fld._type.firstType)
+                wgDim = fld._type.fixedDim
+            } else {
+                wgElem = msl_type_name(fld._type)
+            }
+            if (empty(wgElem) || (wgDim == 0)) {
+                err(ctx, fld.at, "@workgroup member `{fld.name}` must be a scalar, vector, or single-dimension fixed array of those (e.g. uint[64]); got {fld._type == null ? "?" : describe(fld._type)}")
+                continue
+            }
+            let wgName = string(fld.name)
+            ctx.renames[wgName] = msl_safe_name(wgName)
+            ctx.members[wgName] = MslMember(msl_name = msl_safe_name(wgName), elem = wgElem, binding = -1,
+                written = false, uniform = false, workgroup = true, wg_dim = wgDim)
+            continue
         }
         if (binding < 0) {
             err(ctx, fld.at, "member `{fld.name}` has no @binding — every buffer needs an explicit [[buffer(N)]] index")
@@ -133,9 +182,15 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
         }
         ctx.renames[fldName] = msl_safe_name(fldName)
         ctx.members[fldName] = MslMember(msl_name = msl_safe_name(fldName), elem = elem, binding = binding,
-            written = false, uniform = isUniform)
+            written = false, uniform = isUniform, workgroup = false, wg_dim = -1)
     }
-    if (empty(ctx.errors) && empty(ctx.members)) {
+    var ssboCount = 0
+    for (m in values(ctx.members)) {
+        if (!m.uniform && !m.workgroup) {
+            ssboCount++
+        }
+    }
+    if (empty(ctx.errors) && ssboCount == 0) {
         err(ctx, fn.at, "kernel class `{fn.classParent.name}` has no @ssbo members — a kernel with no buffers cannot observe or produce anything")
     }
 }
@@ -513,9 +568,39 @@ def private emit_value(var ctx : MslCtx; e : Expression?) : string {
         let fv = emit_value(ctx, op3.right)
         note(ctx, "op.select")
         return "({c} ? {tv} : {fv})"
+    } elif (e is ExprCall) {
+        return emit_call_value(ctx, e as ExprCall)
     }
     err(ctx, e.at, "expression {e.__rtti} is not in the supported MSL subset")
     return "/*{e.__rtti}*/"
+}
+
+// simdgroup intrinsics are the only calls with a VALUE lowering (metal_builtins declares them for
+// float/int/uint; the identity stub bodies never matter here — only the call AST is read)
+def private emit_call_value(var ctx : MslCtx; ec : ExprCall?) : string {
+    let cname = "{ec.name}"
+    let na = length(ec.arguments)
+    if (cname == "simd_sum") {
+        if (na != 1) {
+            err(ctx, ec.at, "simd_sum takes exactly one argument")
+            return "/*call {cname}*/"
+        }
+        let v = emit_value(ctx, ec.arguments[0])
+        note(ctx, "call.simd_sum.{census_class(ec._type)}")
+        return "simd_sum({v})"
+    } elif (cname == "simd_shuffle" || cname == "simd_shuffle_up" ||
+            cname == "simd_shuffle_down" || cname == "simd_shuffle_xor") {
+        if (na != 2) {
+            err(ctx, ec.at, "{cname} takes exactly two arguments")
+            return "/*call {cname}*/"
+        }
+        let v = emit_value(ctx, ec.arguments[0])
+        let l = emit_value(ctx, ec.arguments[1])
+        note(ctx, "call.{cname}.{census_class(ec._type)}")
+        return "{cname}({v}, {l})"
+    }
+    err(ctx, ec.at, "call `{cname}` is not a supported MSL builtin — user function calls do not lower (a kernel is a single function)")
+    return "/*call {cname}*/"
 }
 
 def private base_is_self(ctx : MslCtx; e : Expression?) : bool {
@@ -616,6 +701,22 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
         lines |> push("{indent}\}")
     } elif (e is ExprFor) {
         emit_for(ctx, e as ExprFor, indent, lines)
+    } elif (e is ExprCall) {
+        let ec = e as ExprCall
+        let cname = "{ec.name}"
+        // both lower to Metal's one threadgroup rendezvous+fence: MSL has no execution-free
+        // threadgroup memory fence (pre-MSL-3.2), so memoryBarrierShared() strengthens to the full
+        // barrier — the same lowering SPIRV-Cross ships under MoltenVK
+        if (cname == "barrier" || cname == "memoryBarrierShared") {
+            if (!empty(ec.arguments)) {
+                err(ctx, ec.at, "{cname}() takes no arguments")
+                return
+            }
+            note(ctx, cname == "barrier" ? "call.barrier" : "call.memory_barrier_shared")
+            lines |> push("{indent}threadgroup_barrier(mem_flags::mem_threadgroup);")
+        } else {
+            err(ctx, ec.at, "call `{cname}` as a statement has no MSL lowering — only barrier() / memoryBarrierShared() sync calls are supported")
+        }
     } elif (e is ExprBreak) {
         note(ctx, "stmt.break")
         lines |> push("{indent}break;")
@@ -748,9 +849,25 @@ def public generate_msl(fn : FunctionPtr; var errors : array<string>; cfg : MslE
     var body_lines : array<string>
     emit_stmt(ctx, fn.body, "    ", body_lines)
 
+    // @workgroup members are not parameters — MSL has no module-scope threadgroup variables, so
+    // each lowers to a threadgroup declaration at the top of the kernel body (name-sorted)
+    var tg_lines : array<string>
+    var wg_names <- [for (name, m in keys(ctx.members), values(ctx.members)); name; where m.workgroup]
+    wg_names |> sort()
+    for (name in wg_names) {
+        let m = ctx.members[name]
+        if (m.wg_dim > 0) {
+            note(ctx, "decl.threadgroup_array")
+            tg_lines |> push("    threadgroup {m.elem} {m.msl_name}[{m.wg_dim}];")
+        } else {
+            note(ctx, "decl.threadgroup")
+            tg_lines |> push("    threadgroup {m.elem} {m.msl_name};")
+        }
+    }
+
     var params : array<string>
     params |> reserve((ctx.members |> length) + (ctx.builtins_used |> length))
-    var ordered <- [for (name in keys(ctx.members)); name]
+    var ordered <- [for (name, m in keys(ctx.members), values(ctx.members)); name; where !m.workgroup]
     ordered |> sort() $(a, b : string) : bool {
         let ba = ctx.members?[a] ?. binding ?? 0
         let bb = ctx.members?[b] ?. binding ?? 0
@@ -792,6 +909,7 @@ def public generate_msl(fn : FunctionPtr; var errors : array<string>; cfg : MslE
         "#include <metal_stdlib>\nusing namespace metal;\nkernel void {kernel_entry_name(fn, cfg)}(",
         join(params, ",\n        "),
         ") \{\n",
+        empty(tg_lines) ? "" : join(tg_lines, "\n") + "\n",
         join(body_lines, "\n"),
         "\n\}\n"
     ]

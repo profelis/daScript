@@ -20,7 +20,7 @@ options indenting = 4
 module msl_shader shared public
 
 require msl_emit public
-require daslib/shader_lingua_franca public
+require metal_builtins public
 require daslib/ast
 require daslib/ast_boost
 require daslib/templates_boost

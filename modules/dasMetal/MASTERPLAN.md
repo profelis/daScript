@@ -78,6 +78,7 @@ dasSpirv and is reused as-is.
 |---|---|---|
 | `src/dasMetal.mm` | hand | `Module("das_metal")` — Obj-C++ shim over Metal.framework. Opaque annotated handles (device, queue, command buffer, compute encoder, pipeline state, library, function, buffer) + the extern surface below. Compiled with ARC; handles cross to das as `__bridge_retained void*`; `metal_release` = `__bridge_transfer`. Shim-side live-object counter for the leak gate. APPLE-only; links `-framework Metal -framework Foundation`. |
 | `metal/msl_types.das` | hand | daslang `TypeDecl` → MSL type name (uint/int/float/bool, 2/3/4-vectors; later the 16/8-bit lattice — MSL has native `half`). |
+| `metal/metal_builtins.das` | hand | Metal-only builtin surface over the shared lingua franca (the spirv_builtins pattern): re-exports `daslib/shader_lingua_franca`, adds `gl_WorkGroupSize` + the four simdgroup IDs (GLSL subgroup spellings) and the `simd_sum`/`simd_shuffle*` intrinsics (Metal spellings, float/int/uint). Identity stub bodies = width-1 simdgroup CPU semantics. |
 | `metal/msl_emit.das` | hand | The text emitter: `[macro_function] generate_msl(fn, var errors, cfg, var census) : string`. Manual recursion (`emit_value`/`emit_stmt`, mirroring `spirv_emit`). Kernel-signature synthesis from `@ssbo` globals (the one structural novelty — below). Records the construct census at every emit site. |
 | `metal/msl_shader.das` | hand | `[metal_kernel]` function-macro (`MetalKernel : AstFunctionAnnotation`, modeled on `SpirvShader`), applied to a **class method**; args: `name`, `fastmath` (default **true**, surfaced to the host via a companion ``{name}`msl_fastmath : bool`` global feeding the pipeline-compile options). `apply` declares the public ``{name}`msl : string`` global; **`fixup` fills `glob.init = new ExprConstString(...)`** — string capture is call-free, so fixup suffices (dasGlsl precedent; the patch/astChanged dance dasSpirv needed for `array<uint>` does not apply). Does `require spirv/spirv_builtins public`. |
 | `metal/das_metal_boost.das` | hand | Host sugar over `das_metal`: `with_metal_device`, `pipeline_from_kernel` (compile + error surfacing), unified-memory buffer helpers, `run_compute_1d` one-liner, live-object leak assert. `require das_metal` → usable only where the C++ module exists. |
@@ -371,6 +372,42 @@ GENERIC functions (untyped `dev`/`buf` params): generics only instantiate at cal
 AOT-wired as `test_aot_metal_modules` (msl-modules pattern; the metal glob gained the `/_` filter).
 Green: interp + `-jit` + static binary, MCP lint + CI lint clean. das gotchas hit: `expect` is
 reserved (fixture param renamed `want`); `float4 + float` does NOT broadcast in das (only `*`/`/`).
+
+**2026-07-11 — Phase 3 landed: threadgroup memory + barriers + simdgroup ops.** New frontend
+surface, dasSpirv-aligned where the construct is shared: **`@workgroup` class members**
+(scalar/vector or single-dimension fixed array, e.g. `@workgroup tile : uint[64]`) lower to
+`threadgroup T name[N];` declarations at the top of the kernel body (MSL has no module-scope
+threadgroup variables; name-sorted, never parameters, @binding on one is a clean error, dynamic
+`array<T>` is a clean error); **`barrier()` / `memoryBarrierShared()`** (lingua franca) both lower
+to `threadgroup_barrier(mem_flags::mem_threadgroup)` — MSL has no execution-free threadgroup fence
+pre-MSL-3.2, so the memory-only form strengthens to the full rendezvous, the same lowering
+SPIRV-Cross ships under MoltenVK. New module **`metal/metal_builtins.das`** (pure das, ALL
+platforms — the spirv_builtins pattern: re-export lingua franca + add the Metal-only surface):
+`gl_WorkGroupSize : uint3` (a layout CONSTANT in GLSL, a real `[[threads_per_threadgroup]]` param
+in Metal), the four simdgroup IDs under their GLSL subgroup spellings (`gl_SubgroupInvocationID`/
+`gl_SubgroupSize`/`gl_NumSubgroups`/`gl_SubgroupID`), and the simd intrinsics under their Metal
+spellings — `simd_sum` + `simd_shuffle`/`_up`/`_down`/`_xor` × float/int/uint (15 overloads;
+identity stub bodies = the degenerate-but-valid width-1 simdgroup semantics for CPU replay). The
+builtin classifier now spans 10 attributes (`thread_position_in_threadgroup`,
+`threadgroup_position_in_grid`, `threadgroups_per_grid`, `thread_index_in_threadgroup`,
+`threads_per_threadgroup`, `thread_index_in_simdgroup`, `threads_per_simdgroup`,
+`simdgroups_per_threadgroup`, `simdgroup_index_in_threadgroup` + Phase-1's grid ID). Census
+106 → 143 kinds. Tests: `tests/msl` 48/48 — threadgroup + simd shape/golden fixtures, census both
+directions, fail-closed grew `_fc_wg_binding` (bound @workgroup) + `_fc_wg_type` (dynamic-array
+@workgroup) and the user-call needle moved to the new whitelist error. `tests/metal` 20/20 on
+M1 Max — **the CPU-reference oracle splits three ways by construct**: (a) `grid_ids` kernel (no
+barrier/simd) keeps the same-body sequential replay, driver sets all six builtin globals per
+thread, bit-exact; (b) the barrier tree-reduction kernels (uint wrap-exact + float
+fastmath-tolerance) compare against DIRECTLY COMPUTED per-group sums — a barrier kernel cannot be
+sequentially replayed (thread 0 would reduce before the other lanes load), so the honest oracle is
+the arithmetic itself; (c) the simd kernel uses a READBACK-DRIVEN oracle — the kernel reports each
+thread's simdgroup width/lane/id, the CPU recomputes every expected value from reported
+membership, layout-agnostic (M1 Max reports width 32; shuffles execute in simdgroup-uniform flow
+with undefined edge lanes selected away on the VALUE — a shuffle under divergence reads inactive
+lanes). Green: interp + `-jit` + static binary; MCP lint + CI lint clean. das gotcha hit: a value
+witness param (`witness : auto(TT)`) binds TT WITH the parameter's appended const (yields
+`array<T const>`) — even via `type<auto(TT)>`; the fix is `-const` at every use site
+(`array<TT -const>`, `_metal_common.das` `buf_download`).
 
 **2026-07-11 — pipeline: fixup-set global inits now infer; dasSpirv blob fill patch→fixup**
 (rides this branch — surfaced reviewing dasMetal's apply/fixup model). Boris called dasSpirv's

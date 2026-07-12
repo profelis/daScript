@@ -230,6 +230,63 @@ class Loops {
     }
 }
 
+// Phase-3 threadgroup memory + barriers: @workgroup members (fixed array + scalar) lower to
+// threadgroup declarations at the top of the kernel body; barrier() and memoryBarrierShared()
+// both lower to threadgroup_barrier(mem_flags::mem_threadgroup) — MSL has no execution-free
+// threadgroup fence; and the five workgroup-grid builtins lower to attributed parameters
+class Reduce {
+    @ssbo @binding = 0 src : array<uint>
+    @ssbo @binding = 1 dst : array<uint>
+    @workgroup tile : uint[64]
+    @workgroup total : uint
+
+    [metal_kernel(name="reduce_msl"), marker(no_coverage)]
+    def reduce {
+        let gid = gl_GlobalInvocationID.x
+        let lid = gl_LocalInvocationID.x
+        tile[lid] = src[gid]
+        barrier()
+        var s = gl_WorkGroupSize.x / 2u
+        while (s > 0u) {
+            if (lid < s) {
+                tile[lid] += tile[lid + s]
+            }
+            barrier()
+            s /= 2u
+        }
+        if (gl_LocalInvocationIndex == 0u) {
+            total = tile[0] + (gl_NumWorkGroups.x * 0u)
+            memoryBarrierShared()
+            dst[gl_WorkGroupID.x] = total
+        }
+    }
+}
+
+// Phase-3 simdgroup intrinsics: the four simdgroup builtins and all fifteen simd_* overloads
+// (sum + the four shuffles, each for float/int/uint)
+class Simd {
+    @ssbo @binding = 0 fa : array<float>
+    @ssbo @binding = 1 ia : array<int>
+    @ssbo @binding = 2 ua : array<uint>
+    @ssbo @binding = 3 fo : array<float>
+    @ssbo @binding = 4 io : array<int>
+    @ssbo @binding = 5 uo : array<uint>
+    @ssbo @binding = 6 meta : array<uint>
+
+    [metal_kernel(name="simd_msl"), marker(no_coverage)]
+    def simd_all {
+        let i = gl_GlobalInvocationID.x
+        let lane = gl_SubgroupInvocationID
+        fo[i] = ((simd_sum(fa[i]) + simd_shuffle(fa[i], lane)) +
+            (simd_shuffle_up(fa[i], 1u) + simd_shuffle_down(fa[i], 1u))) + simd_shuffle_xor(fa[i], 1u)
+        io[i] = ((simd_sum(ia[i]) + simd_shuffle(ia[i], lane)) +
+            (simd_shuffle_up(ia[i], 1u) + simd_shuffle_down(ia[i], 1u))) + simd_shuffle_xor(ia[i], 1u)
+        uo[i] = ((simd_sum(ua[i]) + simd_shuffle(ua[i], lane)) +
+            (simd_shuffle_up(ua[i], 1u) + simd_shuffle_down(ua[i], 1u))) + simd_shuffle_xor(ua[i], 1u)
+        meta[i] = (lane + gl_SubgroupSize) + (gl_NumSubgroups + gl_SubgroupID)
+    }
+}
+
 //! Gate B: exactly the construct kinds the fixture set must emit — the census meta-test
 //! asserts equality with the observed union in both directions.
 def public declared_msl_census : table<string> {
@@ -241,8 +298,47 @@ def public declared_msl_census : table<string> {
         "param.buffer_const",
         "param.uniform",
         "param.builtin.thread_position_in_grid",
+        "param.builtin.thread_position_in_threadgroup",
+        "param.builtin.threadgroup_position_in_grid",
+        "param.builtin.threadgroups_per_grid",
+        "param.builtin.threads_per_threadgroup",
+        "param.builtin.thread_index_in_threadgroup",
+        "param.builtin.thread_index_in_simdgroup",
+        "param.builtin.threads_per_simdgroup",
+        "param.builtin.simdgroups_per_threadgroup",
+        "param.builtin.simdgroup_index_in_threadgroup",
+        // threadgroup memory + synchronization
+        "decl.threadgroup",
+        "decl.threadgroup_array",
+        "call.barrier",
+        "call.memory_barrier_shared",
+        // simdgroup intrinsics
+        "call.simd_sum.f32",
+        "call.simd_sum.i32",
+        "call.simd_sum.u32",
+        "call.simd_shuffle.f32",
+        "call.simd_shuffle.i32",
+        "call.simd_shuffle.u32",
+        "call.simd_shuffle_up.f32",
+        "call.simd_shuffle_up.i32",
+        "call.simd_shuffle_up.u32",
+        "call.simd_shuffle_down.f32",
+        "call.simd_shuffle_down.i32",
+        "call.simd_shuffle_down.u32",
+        "call.simd_shuffle_xor.f32",
+        "call.simd_shuffle_xor.i32",
+        "call.simd_shuffle_xor.u32",
         // values
         "expr.builtin.thread_position_in_grid",
+        "expr.builtin.thread_position_in_threadgroup",
+        "expr.builtin.threadgroup_position_in_grid",
+        "expr.builtin.threadgroups_per_grid",
+        "expr.builtin.threads_per_threadgroup",
+        "expr.builtin.thread_index_in_threadgroup",
+        "expr.builtin.thread_index_in_simdgroup",
+        "expr.builtin.threads_per_simdgroup",
+        "expr.builtin.simdgroups_per_threadgroup",
+        "expr.builtin.simdgroup_index_in_threadgroup",
         "expr.var",
         "expr.member",
         "expr.index",
@@ -355,5 +451,5 @@ def public declared_msl_census : table<string> {
 //! Every fixture kernel's census companion, for the census meta-test's union.
 def public all_msl_censuses : array<string> {
     return <- [mul_ab_msl_census, uarith_msl_census, iarith_msl_census, farith_msl_census,
-        vecarith_msl_census, control_msl_census, loops_msl_census]
+        vecarith_msl_census, control_msl_census, loops_msl_census, reduce_msl_census, simd_msl_census]
 }
