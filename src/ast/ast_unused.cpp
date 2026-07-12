@@ -212,6 +212,20 @@ namespace das {
                 propagateRead(((ExprUnsafe *) expr)->body);
             }
         }
+        // a write through a local pointer variable is a write through whatever storage its
+        // initializer aliases — chase the init so the write reaches the true root (argument,
+        // addr(...), another alias). without this a `let q = p; write-through-q` function is
+        // judged pure and its calls are DCE'd, silently dropping the write (#3311 family);
+        // auto-inline's generated `let __inl*_arg_*` bindings are exactly this shape.
+        // conservative on purpose: a rebinding write (`q = null`) chases too — that only
+        // over-marks, never drops. globals are excluded (covered by accessGlobal tracking).
+        void propagateWriteThroughPointerAlias ( ExprVar * var ) {
+            const auto & vv = var->variable;
+            if ( !vv || vv->global ) return;
+            const auto & vt = vv->type;
+            if ( !vt || !vt->isPointer() || vt->ref ) return;
+            if ( vv->init ) propagateWrite(vv->init);
+        }
         void propagateWrite ( Expression * expr ) {
             if ( expr->rtti_isVar() ) {
                 auto var = (ExprVar *) expr;
@@ -219,6 +233,7 @@ namespace das {
                 if ( var->variable->loop_source ) {
                     propagateWrite(var->variable->loop_source);
                 }
+                propagateWriteThroughPointerAlias(var);
             } else if ( expr->rtti_isField() || expr->rtti_isSafeField()
                        || expr->rtti_isAsVariant() || expr->rtti_isSafeAsVariant() ) {
                 auto field = (ExprField *) expr;
@@ -279,6 +294,7 @@ namespace das {
                 if ( var->variable->loop_source ) {
                     propagateWrite(var->variable->loop_source);    /// this went to variable, we done via copy or move
                 }
+                propagateWriteThroughPointerAlias(var);
             } else if ( expr->rtti_isField() || expr->rtti_isSafeField()
                        || expr->rtti_isAsVariant() || expr->rtti_isSafeAsVariant() ) {
                 auto field = (ExprField *) expr;

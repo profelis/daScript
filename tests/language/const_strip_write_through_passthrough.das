@@ -40,6 +40,28 @@ def passthrough_mut(var p : float?; n : int) {
     leaf_mut(p, n)
 }
 
+// pointer-alias shapes: a write through a local pointer variable initialized from a
+// parameter must reach the parameter (else the function is judged pure and the call
+// is DCE'd — same silent-drop family as #3311, via the let-alias hop instead of the
+// const? forwarding). auto-inline generates exactly this binding for spliced args.
+def passthrough_alias(p : float const?; n : int) {
+    let q = p
+    leaf(q, n)
+}
+
+def passthrough_alias2(p : float const?; n : int) {
+    let q1 = p
+    let q2 = q1
+    leaf(q2, n)
+}
+
+def writer_via_copy(var p : float?; n : int) {
+    var w = p
+    unsafe {
+        for (i in range(n)) { w[i] = 7.0 }
+    }
+}
+
 def fill_zero(var a : float[4]) {
     for (i in range(4)) { a[i] = 0.0 }
 }
@@ -74,5 +96,26 @@ def test_const_strip_write_through_passthrough(t : T?) {
         fill_zero(d)
         unsafe { passthrough_mut(addr(d[0]), 4) }
         t |> equal(d[0], 7.0)
+    }
+    // (5) write forwarded through a `let q = p` pointer-alias local
+    t |> run("write through let-alias of const? param") @(t : T?) {
+        var e : float[4]
+        fill_zero(e)
+        unsafe { passthrough_alias(addr(e[0]), 4) }
+        t |> equal(e[0], 7.0)
+    }
+    // (6) two chained alias lets — chase must be transitive
+    t |> run("write through chained let-aliases") @(t : T?) {
+        var g : float[4]
+        fill_zero(g)
+        unsafe { passthrough_alias2(addr(g[0]), 4) }
+        t |> equal(g[0], 7.0)
+    }
+    // (7) direct write through `var w = p` copy of a mutable param — no reinterpret at all
+    t |> run("write through var-copy of mutable param") @(t : T?) {
+        var h : float[4]
+        fill_zero(h)
+        unsafe { writer_via_copy(addr(h[0]), 4) }
+        t |> equal(h[0], 7.0)
     }
 }
