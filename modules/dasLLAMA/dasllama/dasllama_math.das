@@ -3,6 +3,7 @@ options gen2
 module dasllama_math shared public
 
 require math
+require strings  // to_int: DASLLAMA_CALLER_PRIO env override in setup_dasllama_jobque_
 require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses the profile's team_rank_gate knob
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
@@ -397,6 +398,15 @@ def setup_dasllama_jobque_() {
     if (g_team_rank_gate >= 0 && !has_env_variable("DAS_JOBQUE_TEAM_RANK_GATE")) {
         set_jobque_team_rank_gate(g_team_rank_gate != 0)
     }
+    // the dispatch caller is load-bearing in team mode — only it publishes chains, so a
+    // descheduled caller idles every lane (4B Q4 32L trace: 13 all-lane holes/token, worst
+    // 329us = 1.7%). Que creation ran this thread at High (+1); claim the top notch.
+    // DASLLAMA_CALLER_PRIO=<-2..2> is the A/B rail (1 = the old High).
+    var prio = 2
+    if (has_env_variable("DASLLAMA_CALLER_PRIO")) {
+        prio = to_int(get_env_variable("DASLLAMA_CALLER_PRIO"))
+    }
+    set_current_thread_priority(clamp(prio, -2, 2))
 }
 
 // dasLLAMA matmuls are lockstep linear algebra: SMT siblings share the FMA/load ports, so the
