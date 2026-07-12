@@ -21,9 +21,11 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 
 | Flag | Short | Default | Meaning |
 |---|---|---|---|
-| `--model` | `-m` | *(required)* | GGUF model to serve |
+| `--config` | `-c` | — | TOML config file; keys mirror the long flag names, explicit CLI flags override |
+| `--model` | `-m` | *(required)* | GGUF model to serve (here or in `--config`) |
 | `--port` | `-p` | `8080` | Listen port |
 | `--quant` | `-q` | `q8` | Weight quantization: `fp32` \| `q8` \| `q4` |
+| `--kv-dtype` | — | `f16` | KV-cache codec: `f32` \| `f16` \| `q8_0` \| `tq4` (rotated 4-bit; needs pow2 head_size) |
 | `--asr` | `-a` | — | ASR model (whisper/parakeet/qwen3-asr) — enables the `/v1/audio/*` routes |
 | `--mmproj` | — | — | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
 | `--ctx` | — | `4096` | Context-length cap in tokens |
@@ -33,6 +35,18 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--prefix` | — | *auto* | Prefix-cache retention cap in pages (auto: one full context per stream; `-1` = unbounded) |
 | `--flat` | — | — | Flat preallocated KV sessions — disables paged serving and the prefix cache |
 | `--help` | `-?` | — | Show help and exit |
+
+A config file replaces long command lines (`--config server.toml`); keys are the long flag
+names with underscores:
+
+```toml
+model = "D:/models/SmolLM2-135M-Instruct-Q8_0.gguf"
+port = 8080
+quant = "q8"
+kv_dtype = "tq4"   # rotated 4-bit KV — half the q8_0 cache bytes
+ctx = 4096
+streams = 4
+```
 
 Chat and completion requests **batch continuously** (`llm_scheduler.das`): up to `--streams`
 generations run concurrently through one `eval_batch` decode step per tick, with long prompts

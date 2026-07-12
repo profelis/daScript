@@ -87,6 +87,7 @@ struct Scheduler {
     paged : bool
     pool : KVPool
     prefix : PrefixCache
+    kv_dtype : KVDtype = KVDtype.f16        // KV codec for every stream (pool-wide when paged)
     // per-step gather scratch. @do_not_delete is load-bearing: delete of a plain array<T?>
     // CASCADES to the pointees — these are borrowed rows into streams[i].session
     @do_not_delete batch_rows : array<Session?>
@@ -113,12 +114,13 @@ struct Scheduler {
 //! live sessions, the pool, and the workspace go with it.
 def create_scheduler(model : Model; max_streams : int64 = 4l; max_queue : int64 = 32l;
                      chunk_tokens : int64 = 64l; page_rows : int64 = 0l;
-                     prefix_groups : int64 = 0l) : Scheduler {
+                     prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16) : Scheduler {
     var sch <- Scheduler(ws <- create_batch_workspace(model), max_streams = max(1l, max_streams),
-                         max_queue = max(1l, max_queue), chunk_tokens = max(1l, chunk_tokens))
+                         max_queue = max(1l, max_queue), chunk_tokens = max(1l, chunk_tokens),
+                         kv_dtype = kv_dtype)
     if (page_rows > 0l) {
         sch.paged = true
-        sch.pool <- create_kv_pool(model, page_rows)
+        sch.pool <- create_kv_pool(model, page_rows, kv_dtype)
         sch.prefix <- create_prefix_cache(prefix_groups)
     }
     return <- sch
@@ -229,7 +231,7 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
             st.n_cached = matched
             sch.cached_tokens += matched
         } else {
-            st.session <- create_session(m)
+            st.session <- create_session(m, sch.kv_dtype)
         }
         if (sch.queue[0].seed != 0) {
             set_seed(st.session, sch.queue[0].seed)
