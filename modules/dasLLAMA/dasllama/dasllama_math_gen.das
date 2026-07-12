@@ -28,7 +28,12 @@ require math
 // biased busd512 on AVX512-VNNI boxes / biased busd256 on VEX-VNNI / maddubs on plain AVX2 /
 // kstep2 elsewhere — each ISA's measured tune winner as the manifest-less default);
 // DAS_TUNE_MODE=tune/test stamps the grid + the *_variants() registries for the harness
-// (gen_parity_probe / gen_tune_probe). This module registers TWO backends over the SAME
+// (gen_parity_probe / gen_tune_probe). The K-quant kernels are their OWN three [tune]
+// families (k4/k5/k6q8_tile_gen + gemv/layout companions, one manifest entry per format) —
+// the kq tiles measurably prefer different (mr, nrsplit) than the q8 crown (M1 2026-07-12:
+// k5 tile +30% on grp4/single-unpack vs the q8 grp8/nrsplit2 stamp), and per-format layout
+// companions let each format's planes take their own interleave. This module registers TWO
+// backends over the SAME
 // ISA-agnostic slot traversals: "arm64-gen" (priority 25, the arm64 load-select tier since
 // slice C) and "x64-gen" (priority 25, witness-gated — only selectable when the stamped
 // family emitted). dasllama_common pulls it in behind a path guard
@@ -199,14 +204,44 @@ def kq_grp_row_dot(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, mr : 
     return acc
 }
 
-//! The K-quant GEMV companions (kq stage 4, the sixth family slice): rows [rb, re) of one
-//! plane-region pair off the grp<mr> kq planes (repack_k4/k5/k6_grp — the SAME mr as the Q8
-//! layout). The generators emit the unsigned-quant superblock loop (dasllama_gemm_gen::k*_gemv);
-//! reference bodies = the scalar grp walk above, declining in lockstep via the shared predicate.
+//! The per-format K-quant layout companions: the plane interleave (mr) each format's stamped
+//! kernels read. Since the kq families tune separately (one [tune] entry per format below),
+//! each format's planes take its OWN winner's mr — k5/k6 tiles measurably prefer grp4 while
+//! the q8 family crowns grp8 (M1, 2026-07-12). Reference bodies = grp4, declining in lockstep
+//! with each family via the shared predicate.
+def k4q8_layout_gen() : int {
+    return q8q8_repack_type(GEMM_REFERENCE_MR).interleave
+}
+
+def k5q8_layout_gen() : int {
+    return q8q8_repack_type(GEMM_REFERENCE_MR).interleave
+}
+
+def k6q8_layout_gen() : int {
+    return q8q8_repack_type(GEMM_REFERENCE_MR).interleave
+}
+
+//! The stamped plane interleave for a runtime-dispatched format (the fmt-branched wrappers
+//! below take fmt as a value).
+def kq_layout_of(fmt : int) : int64 {
+    if (fmt == 4) {
+        return int64(k4q8_layout_gen())
+    }
+    if (fmt == 5) {
+        return int64(k5q8_layout_gen())
+    }
+    return int64(k6q8_layout_gen())
+}
+
+//! The K-quant GEMV kernels (kq stage 4): rows [rb, re) of one plane-region pair off the
+//! grp<mr> kq planes (repack_k4/k5/k6_grp — the format's OWN layout companion). The generators
+//! emit the unsigned-quant superblock loop (dasllama_gemm_gen::k*_gemv); reference bodies =
+//! the scalar grp walk above, declining in lockstep via the shared predicate. Companions of
+//! their format's tile family below (one manifest entry per format covers tile+gemv+layout).
 //! Not `private`: they ARE the kq_rows_* slots and are called from inside lifted worker lambdas.
 [hint(unsafe_range_check, noalias = kqp, noalias = ksp, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def k4q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) : void {
-    let mr = int64(q8q8_layout_gen())
+    let mr = int64(k4q8_layout_gen())
     let nsb = n / 256l
     unsafe {
         for (i in range64(rb, re)) {
@@ -218,7 +253,7 @@ def k4q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp :
 
 [hint(unsafe_range_check, noalias = kqp, noalias = ksp, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def k5q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) : void {
-    let mr = int64(q8q8_layout_gen())
+    let mr = int64(k5q8_layout_gen())
     let nsb = n / 256l
     unsafe {
         for (i in range64(rb, re)) {
@@ -230,7 +265,7 @@ def k5q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp :
 
 [hint(unsafe_range_check, noalias = kqp, noalias = ksp, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def k6q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) : void {
-    let mr = int64(q8q8_layout_gen())
+    let mr = int64(k6q8_layout_gen())
     let nsb = n / 256l
     unsafe {
         for (i in range64(rb, re)) {
@@ -240,16 +275,33 @@ def k6q8_gemv_gen(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp :
     }
 }
 
-//! The K-quant TILE companions (the kq batch family): 4 tokens x mr rows per call over the
+// The kq tune grids (one [tune] family per format): the kq emitters read only mr/nrsplit (+
+// the x64 dot lattice) off the perm — kstep is pinned 1 internally — so the grid is the
+// (mr, nrsplit) product per ISA tier. nrsplit token-splits the 4-token tile, re-running the
+// expensive kq unpack once per slice, so nrsplit-4 rows (single unpack) lead the tile bench
+// wherever the q-reg budget admits them (mr8 nrsplit4 declines on NEON: 16+8+10 > 32 regs).
+// bias128/smmla/amx rows are deliberately absent — the kq planes are natively unsigned and
+// have no TMUL/MMA form. Fallbacks mirror the q8 per-ISA chain flavors; arm64 lands on the
+// measured M1 tile winner (mr4 — grp4 planes, single-unpack tile).
+
+//! The K-quant TILE kernels (the kq batch family): 4 tokens x mr rows per call over the
 //! grp<mr> kq planes — kqg/ksg are the GROUP plane bases (the batch wrapper offsets per
 //! group), activations an [ntok x n] image with per-token scale/bsum rows. The generated body
 //! unpacks each weight vector once per superblock and dots it against all 4 tokens
 //! (weight-stationary — the prefill fix for the serial per-position GEMVs); one call is
 //! bit-exact vs 4 per-token GEMVs. Reference bodies = per-token scalar grp walks, declining
 //! in lockstep via the shared predicate. Not `private`: called from lifted worker lambdas.
-[hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
+[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8, nrsplit = 2),
+ tune_perm(dot = "maddubs", width = 256, mr = 8, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, nrsplit = 2, requires = "avx2"),
+ tune_perm(dot = "vpdpbusd", width = 256, mr = 8, requires = "avxvnni|avx512vnni"), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, nrsplit = 2, requires = "avxvnni|avx512vnni"),
+ tune_perm(dot = "vpdpbusd", width = 512, mr = 16, requires = "avx512vnni,avx512bw"), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, nrsplit = 2, requires = "avx512vnni,avx512bw"),
+ tune_companion(fn = "k4q8_gemv_gen", gen = "dasllama_gemm_gen::k4_gemv"),
+ tune_companion(fn = "k4q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
+ tune(gen = "dasllama_gemm_gen::k4_tile",
+      fallback = "dot_vpdpbusd_width512_mr16;dot_vpdpbusd_width256_mr8;dot_maddubs_width256_mr8;mr4"),
+ hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def k4q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
-    let mr = int64(q8q8_layout_gen())
+    let mr = int64(k4q8_layout_gen())
     unsafe {
         for (t in range64(4l)) {
             for (r in range64(mr)) {
@@ -259,9 +311,17 @@ def k4q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp :
     }
 }
 
-[hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
+[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8, nrsplit = 2),
+ tune_perm(dot = "maddubs", width = 256, mr = 8, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, nrsplit = 2, requires = "avx2"),
+ tune_perm(dot = "vpdpbusd", width = 256, mr = 8, requires = "avxvnni|avx512vnni"), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, nrsplit = 2, requires = "avxvnni|avx512vnni"),
+ tune_perm(dot = "vpdpbusd", width = 512, mr = 16, requires = "avx512vnni,avx512bw"), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, nrsplit = 2, requires = "avx512vnni,avx512bw"),
+ tune_companion(fn = "k5q8_gemv_gen", gen = "dasllama_gemm_gen::k5_gemv"),
+ tune_companion(fn = "k5q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
+ tune(gen = "dasllama_gemm_gen::k5_tile",
+      fallback = "dot_vpdpbusd_width512_mr16;dot_vpdpbusd_width256_mr8;dot_maddubs_width256_mr8;mr4"),
+ hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def k5q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
-    let mr = int64(q8q8_layout_gen())
+    let mr = int64(k5q8_layout_gen())
     unsafe {
         for (t in range64(4l)) {
             for (r in range64(mr)) {
@@ -271,9 +331,17 @@ def k5q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp :
     }
 }
 
-[hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
+[tune_perm(mr = 4), tune_perm(mr = 4, nrsplit = 2), tune_perm(mr = 8, nrsplit = 2),
+ tune_perm(dot = "maddubs", width = 256, mr = 8, requires = "avx2"), tune_perm(dot = "maddubs", width = 256, mr = 8, nrsplit = 2, requires = "avx2"),
+ tune_perm(dot = "vpdpbusd", width = 256, mr = 8, requires = "avxvnni|avx512vnni"), tune_perm(dot = "vpdpbusd", width = 256, mr = 8, nrsplit = 2, requires = "avxvnni|avx512vnni"),
+ tune_perm(dot = "vpdpbusd", width = 512, mr = 16, requires = "avx512vnni,avx512bw"), tune_perm(dot = "vpdpbusd", width = 512, mr = 16, nrsplit = 2, requires = "avx512vnni,avx512bw"),
+ tune_companion(fn = "k6q8_gemv_gen", gen = "dasllama_gemm_gen::k6_gemv"),
+ tune_companion(fn = "k6q8_layout_gen", gen = "dasllama_gemm_gen::q8q8_layout"),
+ tune(gen = "dasllama_gemm_gen::k6_tile",
+      fallback = "dot_vpdpbusd_width512_mr16;dot_vpdpbusd_width256_mr8;dot_maddubs_width256_mr8;mr4"),
+ hint(unsafe_range_check, noalias = kqg, noalias = ksg, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def k6q8_tile_gen(var yp : float?; kqg : uint8 const?; ksg : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
-    let mr = int64(q8q8_layout_gen())
+    let mr = int64(k6q8_layout_gen())
     unsafe {
         for (t in range64(4l)) {
             for (r in range64(mr)) {
@@ -375,12 +443,6 @@ def q8q8_tile_s16_gen(var yp : float?; wg : int8 const?; sg : uint16 const?; xqp
  tune_companion(fn = "q8q8_tile_s16_gen", gen = "dasllama_gemm_gen::q8q8_tile_s16"),
  tune_companion(fn = "q8q8_gemv_s16_gen", gen = "dasllama_gemm_gen::q8q8_gemv_s16"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
- tune_companion(fn = "k4q8_gemv_gen", gen = "dasllama_gemm_gen::k4_gemv"),
- tune_companion(fn = "k5q8_gemv_gen", gen = "dasllama_gemm_gen::k5_gemv"),
- tune_companion(fn = "k6q8_gemv_gen", gen = "dasllama_gemm_gen::k6_gemv"),
- tune_companion(fn = "k4q8_tile_gen", gen = "dasllama_gemm_gen::k4_tile"),
- tune_companion(fn = "k5q8_tile_gen", gen = "dasllama_gemm_gen::k5_tile"),
- tune_companion(fn = "k6q8_tile_gen", gen = "dasllama_gemm_gen::k6_tile"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
  tune(gen = "dasllama_gemm_gen::q8q8_tile",
       fallback = "dot_vpdpbusd_width512_mr16_kstep2_gkstep2_bias128;dot_vpdpbusd_width256_mr8_kstep2_gkstep2_bias128;dot_maddubs_width256_mr8_kstep2;kstep2"), unused_argument(xbsp),
@@ -712,11 +774,11 @@ def repack_k6_grp(var kq : uint8?; var ks : uint8?; n, d, mr : int64) {
 // the backend kq repack slot: same layout companion as the Q8/mx4 repacks — one stamped mr
 def private repack_kq_gen(fmt : int; var kq : uint8?; var ks : uint8?; n, d : int64) {
     if (fmt == 4) {
-        repack_k4_grp(kq, ks, n, d, int64(q8q8_layout_gen()))
+        repack_k4_grp(kq, ks, n, d, int64(k4q8_layout_gen()))
     } elif (fmt == 5) {
-        repack_k5_grp(kq, ks, n, d, int64(q8q8_layout_gen()))
+        repack_k5_grp(kq, ks, n, d, int64(k5q8_layout_gen()))
     } else {
-        repack_k6_grp(kq, ks, n, d, int64(q8q8_layout_gen()))
+        repack_k6_grp(kq, ks, n, d, int64(k6q8_layout_gen()))
     }
 }
 
@@ -1137,7 +1199,7 @@ def private mx4q8_groupn_gen(var yp : float?; wn : uint8 const?; we : uint8 cons
 // (tail rows stay disk-order in the repack)
 def private kq_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
     let nsb = n / 256l
-    let mr = int64(q8q8_layout_gen())
+    let mr = kq_layout_of(fmt)
     let ng = d / mr
     var myp = yp
     maybe_parallel_for(0, int(ng), matmul_chunks_gemv(int(ng * mr), get_q8_batch_chunks_per_job(), n * d)) $(rb, re) {
@@ -1212,7 +1274,7 @@ def private kq_batch_cell_gen(fmt : int; var myp : float?; kqp : uint8 const?; k
 // cell walk above per chunk, row tails (d % mr) disk-order per token via the portable dots
 def private kq_batch_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, ntok : int64) {
     let nsb = n / 256l
-    let mr = int64(q8q8_layout_gen())
+    let mr = kq_layout_of(fmt)
     let ng = d / mr
     var myp = yp
     let TB = effective_token_block(g_q8_token_block, n)
@@ -1246,7 +1308,7 @@ def private kq_batch_groupn_gen(fmt : int; var yp : float?; kqp : uint8 const?; 
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
     let ssb = fmt == 6 ? 18l : 32l
-    let mr = int64(q8q8_layout_gen())
+    let mr = kq_layout_of(fmt)
     let ng = d / mr
     let nb32 = n / 32l
     let nb16 = n / 16l
@@ -1295,7 +1357,7 @@ def kq_groupn_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 co
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
     let ssb = fmt == 6 ? 18l : 32l
-    let mr = int64(q8q8_layout_gen())
+    let mr = kq_layout_of(fmt)
     let ng = d / mr
     var myp = yp
     maybe_parallel_for(0, int(nregions * ng), matmul_chunks_gemv(int(nregions * ng * mr), get_q8_batch_chunks_per_job(), n * d * nregions)) $(gb, ge) {

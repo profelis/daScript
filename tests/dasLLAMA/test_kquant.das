@@ -420,7 +420,7 @@ def private kq_tile_gate(t : T?; fmt : int) {
     let d = 32l
     let ntok = 7l   // 4-token tile + a 3-token gemv tail
     let nsb = n / 256l
-    let mr = int64(q8q8_layout_gen())
+    let mr = kq_layout_of(fmt)   // the format's OWN layout companion (per-format tune families)
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
     let ssb = fmt == 6 ? 18l : 32l
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
@@ -645,7 +645,7 @@ def private kq_groupn_gate(t : T?; fmt : int) {
     // last bit — the groupn driver's job is the region walk, so THAT must be bit-exact vs the
     // per-region core calls (interp and stamped alike). Rows-core-vs-disk exactness for the
     // das reference body is kq_repack_gate's gate.
-    let mr = int64(q8q8_layout_gen())
+    let mr = kq_layout_of(fmt)   // the format's OWN layout companion (per-format tune families)
     var bad_gsh = 0
     var bad_gpr = 0
     unsafe {

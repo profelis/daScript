@@ -464,6 +464,23 @@ what it costs today and what the fix would change.
   loader; oracle = llama.cpp mtmd (GGUF pairs ship). ~1 modest arc; the encoder is SHARED
   infrastructure — the same implementation unlocks Ultravox (llama-3 decoder ✓ have it) and
   ~80% of a Whisper-proper port later.
+- **kq tile emitter headroom vs lcpp — the post-tune dense K-quant prefill gap (M1, 2026-07-12).**
+  Per-format tune families landed (k4/k5/k6 own manifest entries; M1 crowns mr4 everywhere,
+  pp512 +10/+26/+22% on Qwen3-4B Q4_K_M/Q5_K_M/Q6_K) but dense kq prefill still trails lcpp
+  0.88×/0.77×/0.72× while decode is at parity (0.94-1.02) and MoE prefill WINS (1.13×). The
+  residual is `emit_block_kq` itself: k5/k6 tiles run 52-58 GMAC/s/core vs lcpp's ~80 effective
+  from plain hand-NEON vec_dots (no repack on their side for k5/k6!) — the Q5 high-bit OR and
+  Q6 6-bit unpack sequences want NEON-shaped emission (tbl/shrn forms), and the 4-token tile
+  wants a wider token axis so one unpack feeds more dots (mr8+nrsplit4 declines on the shared
+  q-reg budget today; a kq-specific budget or an unpack-to-L1-scratch shape would lift it).
+  Sized: ~1.4-1.5× on the k5/k6 tile = the remaining ~25% of dense K-quant pp. Fixture fallout:
+  gen_tune_probe kq families re-race, test_kquant tile/gemv bit-gates re-verify per emitter change.
+- **kq tune bench lacks a MoE-shaped cell row (spotted validating the mr4 crowns, 2026-07-12).**
+  The mr4 tile crown gave dense pp +10-26% but gave back ~3% MoE prefill on qwen3moe-30B
+  (fused expert cells average ~32 tokens per expert with d=768-class group spans — a regime
+  the d=512/ntok=64 batch fixture doesn't represent; mr8's halved group count wins there).
+  Adding a MoE-cell-shaped fixture to kq_tune_family and weighting the decision (or a
+  per-model-class entry) recovers it. Sized: ~3% MoE pp on M1; re-check on zen2/SPR grids.
 - **AMX fold pipelining (double-buffered C spill) — only if amx silicon verdict ever flips.**
   lcpp's tinygemm_kernel_amx interleaves block i−1's AVX-512 scale-fold between block i's
   TMUL ops (double-buffered thread-local C scratch, mmq.cpp:2015-2105) — the fold hides under
