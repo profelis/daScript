@@ -78,6 +78,9 @@ def prefix_held_groups_(cache : PrefixCache) : int64 => int64(length(cache.entri
 //! prefills only the tail. Returns the matched token count (a multiple of ``page_rows``), capped
 //! at one token short of the prompt so the tail eval always produces the sampling logits.
 def prefix_attach_(var cache : PrefixCache; var pool : KVPool; var s : Session; prompt : array<int64>) : int64 {
+    if (!empty(s.dn_state_prefix)) {
+        panic("prefix_attach: hybrid (deltanet) models are not supported — KV pages alone cannot reconstruct recurrent state")
+    }
     if (s.kv_pool == null || s.kv_pool != unsafe(addr(pool))) {
         panic("prefix_attach: the session is not paged out of this pool")
     }

@@ -153,6 +153,18 @@ struct Config {
     moe_router_bias : bool = false     // ffn_gate_inp.bias on the router logits
     moe_exps_bias : bool = false       // per-expert ffn_{gate,up,down}_exps.bias
     post_attn_is_ffn_norm : bool = false // the pre-FFN norm tensor is named post_attention_norm (NOT Gemma2's extra post-norm)
+    // qwen35 hybrid (Qwen 3.5/3.6): Gated-DeltaNet recurrent layers between gated-attention layers.
+    // The three bools are arch opt-ins (configure); the rest is loader-filled from {arch}.ssm.* keys.
+    hybrid_deltanet : bool = false     // arch opt-in: read the ssm keys + the recurrent-layer mask
+    partial_rope : bool = false        // arch opt-in: rope.dimension_count < head_size rotates rope_dim dims
+    q_gated : bool = false             // attn_q is 2x-wide — per head [q | gate]; out ⊙ σ(gate) before wo
+    recr_mask : uint64 = 0ul           // bit l: layer l is recurrent (deltanet) — no KV, no attn tensors
+    rope_dim : int64 = 0               // partial rotary width (qwen35: 64 of 256); 0 = rope the full head
+    ssm_d_conv : int64 = 0             // deltanet conv kernel width (4)
+    ssm_d_state : int64 = 0            // deltanet q/k/v head dim (128)
+    ssm_n_group : int64 = 0            // deltanet k-head count (16)
+    ssm_dt_rank : int64 = 0            // deltanet v-head count (0.8B: 16, 35B: 32)
+    ssm_d_inner : int64 = 0            // deltanet value width = ssm_dt_rank * ssm_d_state
 }
 
 // Swappable block kernels — one per (attention|ffn) × (decode|prefill). Decode is the fused
@@ -354,6 +366,17 @@ struct Model {
     bv : array<float>
     // attention output-projection bias (gpt-oss) — fp32, layers×dim; empty unless config.attn_out_bias
     bo : array<float>
+    // qwen35 deltanet per-layer weights: big-blob offsets on recurrent layers, -1 on attention layers
+    dnqkv_offs : array<int64>   // attn_qkv (fused [q ; k ; v] rows): dim x dn_conv_dim
+    dngate_offs : array<int64>  // attn_gate (the z gate): dim x ssm_d_inner
+    dnbeta_offs : array<int64>  // ssm_beta: dim x ssm_dt_rank
+    dnalpha_offs : array<int64> // ssm_alpha: dim x ssm_dt_rank
+    dnout_offs : array<int64>   // ssm_out: ssm_d_inner x dim
+    // ... and the fp32 smalls (fblob, flat per-layer strides; attention layers' slots stay zero)
+    dn_conv_off : int64         // ssm_conv1d: layers x (d_conv x conv_dim), taps contiguous per channel
+    dn_dt_off : int64           // ssm_dt.bias: layers x dt_rank
+    dn_a_off : int64            // ssm_a (= -exp(A_log), precomputed on disk): layers x dt_rank
+    dn_norm_off : int64         // ssm_norm (gated out-norm weight, shared across heads): layers x d_state
 }
 
 // ===== Arch registry: per-architecture blocks + chat template =====
@@ -527,6 +550,16 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         t.sinks_off = fo
         fo += layers * c.n_heads
     }
+    if (c.recr_mask != 0ul) {  // qwen35 deltanet fp32 smalls (flat strides; attention layers' slots unused)
+        t.dn_conv_off = fo
+        fo += layers * c.ssm_d_conv * dn_conv_dim(c)
+        t.dn_dt_off = fo
+        fo += layers * c.ssm_dt_rank
+        t.dn_a_off = fo
+        fo += layers * c.ssm_dt_rank
+        t.dn_norm_off = fo
+        fo += layers * c.ssm_d_state
+    }
     if (c.n_expert > 0l) {  // MoE: per-layer router matrices + shared-expert gate vectors, fp32
         t.router_off = fo
         fo += layers * c.n_expert * dim
@@ -598,13 +631,18 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     t.wq_offs |> clear()
     t.wq_offs |> reserve(layers)
     for (l in range64(layers)) {
-        t.wq_offs |> push(kq_take(cur, fmt_at(t.wq_fmt, l), dim * layer_qd(c, l)))
+        if (layer_is_recurrent(c, l)) {
+            t.wq_offs |> push(-1l)   // deltanet layer: no attention projections at all
+        } else {
+            // q_gated (qwen35): attn_q is 2x-wide — per head [q | gate]
+            t.wq_offs |> push(kq_take(cur, fmt_at(t.wq_fmt, l), dim * layer_qd(c, l) * (c.q_gated ? 2l : 1l)))
+        }
     }
     t.wk_offs |> clear()
     t.wk_offs |> reserve(layers)
     for (l in range64(layers)) {
-        if (t.kv_src[l] != l) {
-            t.wk_offs |> push(-1l)   // shared-KV layer (E-series): no attn_k of its own
+        if (t.kv_src[l] != l || layer_is_recurrent(c, l)) {
+            t.wk_offs |> push(-1l)   // shared-KV layer (E-series) or deltanet layer: no attn_k of its own
         } else {
             t.wk_offs |> push(kq_take(cur, fmt_at(t.wk_fmt, l), dim * layer_kv_dim(c, l)))
         }
@@ -612,8 +650,8 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     t.wv_offs |> clear()
     t.wv_offs |> reserve(layers)
     for (l in range64(layers)) {
-        // -1 marks either a V-from-K layer (gemma4 global) or a shared-KV layer (E-series, no attn_v)
-        if (t.kv_src[l] != l || ((c.v_from_k_mask >> uint64(l)) & 1ul) != 0ul) {
+        // -1 marks a V-from-K layer (gemma4 global), a shared-KV layer (E-series), or a deltanet layer
+        if (t.kv_src[l] != l || ((c.v_from_k_mask >> uint64(l)) & 1ul) != 0ul || layer_is_recurrent(c, l)) {
             t.wv_offs |> push(-1l)
         } else {
             t.wv_offs |> push(kq_take(cur, fmt_at(t.wv_fmt, l), dim * layer_kv_dim(c, l)))
@@ -622,7 +660,24 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     t.wo_offs |> clear()
     t.wo_offs |> reserve(layers)
     for (l in range64(layers)) {
-        t.wo_offs |> push(kq_take(cur, fmt_at(t.wo_fmt, l), layer_qd(c, l) * dim))
+        if (layer_is_recurrent(c, l)) {
+            t.wo_offs |> push(-1l)
+        } else {
+            t.wo_offs |> push(kq_take(cur, fmt_at(t.wo_fmt, l), layer_qd(c, l) * dim))
+        }
+    }
+    if (c.recr_mask != 0ul) {  // deltanet big weights (recurrent layers only; kind-major regions, q8 planes)
+        let cd = dn_conv_dim(c)
+        t.dnqkv_offs |> clear(); t.dnqkv_offs |> reserve(layers)
+        for (l in range64(layers)) { t.dnqkv_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * cd) : -1l) }
+        t.dngate_offs |> clear(); t.dngate_offs |> reserve(layers)
+        for (l in range64(layers)) { t.dngate_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * c.ssm_d_inner) : -1l) }
+        t.dnbeta_offs |> clear(); t.dnbeta_offs |> reserve(layers)
+        for (l in range64(layers)) { t.dnbeta_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
+        t.dnalpha_offs |> clear(); t.dnalpha_offs |> reserve(layers)
+        for (l in range64(layers)) { t.dnalpha_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, dim * c.ssm_dt_rank) : -1l) }
+        t.dnout_offs |> clear(); t.dnout_offs |> reserve(layers)
+        for (l in range64(layers)) { t.dnout_offs |> push(layer_is_recurrent(c, l) ? kq_take(cur, KqFmt.q8, c.ssm_d_inner * dim) : -1l) }
     }
     var mx = 0l
     if (c.n_expert > 0l) {
@@ -1043,9 +1098,11 @@ def private repack_q8_weights(var t : Model) {
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
         // K-quant-tagged weights live in the kq planes (disk order, never repacked) — their
-        // offsets are NOT qblob offsets, so repacking them here would permute foreign memory
-        if (fmt_at(t.wq_fmt, l) == KqFmt.q8) {
-            repack_q8q8_weight(t.qblob, t.qscales, t.wq_offs[l], dim, qd)
+        // offsets are NOT qblob offsets, so repacking them here would permute foreign memory.
+        // Recurrent (deltanet) layers carry no attention projections (offsets -1) — their own
+        // matrices repack below.
+        if (t.wq_offs[l] >= 0l && fmt_at(t.wq_fmt, l) == KqFmt.q8) {
+            repack_q8q8_weight(t.qblob, t.qscales, t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
         }
         if (t.wk_offs[l] >= 0l && fmt_at(t.wk_fmt, l) == KqFmt.q8) {   // absent on E-series shared-KV layers
             repack_q8q8_weight(t.qblob, t.qscales, t.wk_offs[l], dim, kv)
@@ -1053,8 +1110,16 @@ def private repack_q8_weights(var t : Model) {
         if (t.wv_offs[l] >= 0l && fmt_at(t.wv_fmt, l) == KqFmt.q8) {
             repack_q8q8_weight(t.qblob, t.qscales, t.wv_offs[l], dim, kv)
         }
-        if (fmt_at(t.wo_fmt, l) == KqFmt.q8) {
+        if (t.wo_offs[l] >= 0l && fmt_at(t.wo_fmt, l) == KqFmt.q8) {
             repack_q8q8_weight(t.qblob, t.qscales, t.wo_offs[l], qd, dim)
+        }
+        if (layer_is_recurrent(c, l)) {  // deltanet projections (all q8 in v1 — no kq tags)
+            let cd = dn_conv_dim(c)
+            repack_q8q8_weight(t.qblob, t.qscales, t.dnqkv_offs[l], dim, cd)
+            repack_q8q8_weight(t.qblob, t.qscales, t.dngate_offs[l], dim, c.ssm_d_inner)
+            repack_q8q8_weight(t.qblob, t.qscales, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
+            repack_q8q8_weight(t.qblob, t.qscales, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
+            repack_q8q8_weight(t.qblob, t.qscales, t.dnout_offs[l], c.ssm_d_inner, dim)
         }
         if (has_ple(c)) {  // gemma-4 E-series per-layer PLE gate/proj (the emb table stays linear, unpacked)
             let ple = c.n_embd_per_layer
@@ -1134,14 +1199,20 @@ def private repack_kq_weights(var t : Model) {
     for (l in range64(c.n_layers)) {
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
-        repack_kq_tensor(t, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd)
+        // recurrent (deltanet) layers carry no attention projections (offsets -1); their own
+        // matrices are untagged q8 in v1, so there is nothing kq to repack on them
+        if (t.wq_offs[l] >= 0l) {
+            repack_kq_tensor(t, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
+        }
         if (t.wk_offs[l] >= 0l) {
             repack_kq_tensor(t, fmt_at(t.wk_fmt, l), t.wk_offs[l], dim, kv)
         }
         if (t.wv_offs[l] >= 0l) {
             repack_kq_tensor(t, fmt_at(t.wv_fmt, l), t.wv_offs[l], dim, kv)
         }
-        repack_kq_tensor(t, fmt_at(t.wo_fmt, l), t.wo_offs[l], qd, dim)
+        if (t.wo_offs[l] >= 0l) {
+            repack_kq_tensor(t, fmt_at(t.wo_fmt, l), t.wo_offs[l], qd, dim)
+        }
         if (c.n_expert > 0l) {
             if (!t.experts_mx4) {   // each expert slice grp-repacks independently, like the Q8 loop
                 let ege = dim * c.n_ff_exp
@@ -1265,6 +1336,46 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 t.config.swa_pattern = gguf_int(m, bytes, "{arch}.attention.sliding_window_pattern")
             }
         }
+        // qwen35 hybrid: the per-layer recurrent (Gated-DeltaNet) mask + ssm geometry. Mask from the
+        // explicit bool array when present, else every layer except each full_attention_interval-th.
+        // Parsed BEFORE the kv-head classes below, whose walk skips recurrent layers.
+        if (t.config.hybrid_deltanet) {
+            if (layers > 64l) {
+                panic("dasLLAMA: the hybrid recurrent-layer mask needs n_layers <= 64 (got {layers})")
+            }
+            if (gguf_is_array(m, "{arch}.attention.recurrent_layers")) {
+                let rl <- gguf_int_array(m, bytes, "{arch}.attention.recurrent_layers")
+                for (l in range64(layers)) {
+                    if (rl[l] != 0l) {
+                        t.config.recr_mask |= 1ul << uint64(l)
+                    }
+                }
+            } else {
+                let interval = (gguf_has(m, "{arch}.full_attention_interval")
+                    ? gguf_int(m, bytes, "{arch}.full_attention_interval") : 4l)
+                for (l in range64(layers)) {
+                    if ((l + 1l) % interval != 0l) {
+                        t.config.recr_mask |= 1ul << uint64(l)
+                    }
+                }
+            }
+            t.config.ssm_d_conv = gguf_int(m, bytes, "{arch}.ssm.conv_kernel")
+            t.config.ssm_d_state = gguf_int(m, bytes, "{arch}.ssm.state_size")
+            t.config.ssm_n_group = gguf_int(m, bytes, "{arch}.ssm.group_count")
+            t.config.ssm_dt_rank = gguf_int(m, bytes, "{arch}.ssm.time_step_rank")
+            t.config.ssm_d_inner = gguf_int(m, bytes, "{arch}.ssm.inner_size")
+            if (t.config.ssm_d_inner != t.config.ssm_dt_rank * t.config.ssm_d_state) {
+                panic("dasLLAMA: deltanet inner_size {t.config.ssm_d_inner} != time_step_rank {t.config.ssm_dt_rank} * state_size {t.config.ssm_d_state}")
+            }
+            if (t.config.ssm_d_conv < 2l || t.config.ssm_dt_rank % t.config.ssm_n_group != 0l) {
+                panic("dasLLAMA: unsupported deltanet geometry (conv_kernel {t.config.ssm_d_conv}, v-heads {t.config.ssm_dt_rank}, k-heads {t.config.ssm_n_group})")
+            }
+            // MTP/NextN decoder blocks are not modeled — refuse files that ship the tensors
+            // (regular GGUFs strip them; the metadata key alone is tolerated and ignored)
+            if (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") >= 0) {
+                panic("dasLLAMA: MTP/NextN layers are not supported — use a non-MTP GGUF")
+            }
+        }
         // KV-head count: scalar (uniform), or gemma4's per-layer array — which must collapse to the
         // TWO layer classes (one value on sliding layers, one on global) the engine models
         if (gguf_is_array(m, "{arch}.attention.head_count_kv")) {
@@ -1272,6 +1383,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             var full_v = -1l
             var swa_v = -1l
             for (l in range64(layers)) {
+                if (layer_is_recurrent(t.config, l)) {  // deltanet layers have no KV heads (0 or absent)
+                    continue
+                }
                 if (layer_is_sliding(t.config, l)) {
                     if (swa_v < 0l) {
                         swa_v = kvh[l]
@@ -1303,10 +1417,19 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
         }
         t.config.kv_dim = t.config.n_kv_heads * t.config.head_size
-        // the engine ropes over the full head — refuse partial-rotary GGUFs instead of mis-running them
+        // the engine ropes over the full head unless the arch opted into partial rotary (qwen35:
+        // rotate the first rope_dim of head_size dims; text-only M-RoPE sections degenerate to
+        // this, see the qwen3vl precedent) — anything else refuses instead of mis-running
         if (gguf_has(m, "{arch}.rope.dimension_count")
                 && gguf_int(m, bytes, "{arch}.rope.dimension_count") != t.config.head_size) {
-            panic("dasLLAMA: partial rotary (rope.dimension_count != head_size) is not supported")
+            if (t.config.partial_rope) {
+                t.config.rope_dim = gguf_int(m, bytes, "{arch}.rope.dimension_count")
+                if (t.config.rope_dim <= 0l || t.config.rope_dim % 2l != 0l || t.config.rope_dim > t.config.head_size) {
+                    panic("dasLLAMA: bad partial rotary width {t.config.rope_dim} (head_size {t.config.head_size})")
+                }
+            } else {
+                panic("dasLLAMA: partial rotary (rope.dimension_count != head_size) is not supported")
+            }
         }
         if (gguf_has(m, "{arch}.rope.dimension_count_swa")) {
             let swa_hs = t.config.head_size_swa > 0l ? t.config.head_size_swa : t.config.head_size
@@ -1561,12 +1684,20 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.post_attention_norm.weight", t.fblob, t.rms_post_att_off + l * dim, dim)
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.post_ffw_norm.weight", t.fblob, t.rms_post_ffn_off + l * dim, dim)
             }
-            if (t.config.qk_norm) {  // Qwen3/gemma4: per-head Q/K norms (head_size(l) each)
+            if (t.config.qk_norm && !layer_is_recurrent(t.config, l)) {  // Qwen3/gemma4: per-head Q/K norms (head_size(l) each)
                 let hs = layer_head_size(t.config, l)
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.attn_q_norm.weight", t.fblob, t.rms_q_offs[l], hs)
                 if (t.wk_offs[l] >= 0l) {   // shared-KV layers (E-series) never project/norm their own K
                     gguf_read_tensor_f32(m, bytes, "blk.{l}.attn_k_norm.weight", t.fblob, t.rms_k_offs[l], hs)
                 }
+            }
+            if (layer_is_recurrent(t.config, l)) {  // qwen35 deltanet fp32 smalls
+                let cd = dn_conv_dim(t.config)
+                let nvh = t.config.ssm_dt_rank
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * t.config.ssm_d_conv * cd, t.config.ssm_d_conv * cd)
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_dt.bias", t.fblob, t.dn_dt_off + l * nvh, nvh)
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_a", t.fblob, t.dn_a_off + l * nvh, nvh)
+                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_norm.weight", t.fblob, t.dn_norm_off + l * t.config.ssm_d_state, t.config.ssm_d_state)
             }
             if (t.config.layer_out_scale) {  // gemma4: one output scalar per layer
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.layer_output_scale.weight", t.fblob, t.out_scale_off + l, 1l)
@@ -1606,7 +1737,15 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
         for (l in range64(layers)) {
             let kv_l = layer_kv_dim(t.config, l)
             let qd_l = layer_qd(t.config, l)
-            if (t.config.fused_qkv) {
+            if (layer_is_recurrent(t.config, l)) {
+                // qwen35 deltanet projections: fused [q;k;v] + z gate + per-v-head beta/alpha + out
+                let cd = dn_conv_dim(t.config)
+                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch)
+                load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch)
+                load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch)
+            } elif (t.config.fused_qkv) {
                 // Phi3: attn_qkv rows are [q (qd) ; k (kv) ; v (kv)], ffn_up rows are [gate ; up] (hidden each).
                 // src_off slices the fused tensor, preserving its Q8 blocks (no fp32 requantize); K-quant
                 // slices stay superblock-aligned (offsets are dim-multiples, dim % 256 gated in detect).
@@ -1614,7 +1753,8 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wk_offs[l], dim * kv_l, scratch, dim * qd_l, fmt_at(t.wk_fmt, l))
                 load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.wv_offs[l], dim * kv_l, scratch, dim * qd_l + dim * kv_l, fmt_at(t.wv_fmt, l))
             } else {
-                load_big(m, bytes, "blk.{l}.attn_q.weight", t, t.wq_offs[l], dim * qd_l, scratch, 0l, fmt_at(t.wq_fmt, l))
+                // q_gated (qwen35): attn_q ships 2x-wide — per head [q | gate]
+                load_big(m, bytes, "blk.{l}.attn_q.weight", t, t.wq_offs[l], dim * qd_l * (t.config.q_gated ? 2l : 1l), scratch, 0l, fmt_at(t.wq_fmt, l))
                 if (t.wk_offs[l] >= 0l) {   // absent on E-series shared-KV layers (reuse the source layer's K)
                     load_big(m, bytes, "blk.{l}.attn_k.weight", t, t.wk_offs[l], dim * kv_l, scratch, 0l, fmt_at(t.wk_fmt, l))
                 }
@@ -1622,7 +1762,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                     load_big(m, bytes, "blk.{l}.attn_v.weight", t, t.wv_offs[l], dim * kv_l, scratch, 0l, fmt_at(t.wv_fmt, l))
                 }
             }
-            load_big(m, bytes, "blk.{l}.attn_output.weight", t, t.wo_offs[l], qd_l * dim, scratch, 0l, fmt_at(t.wo_fmt, l))
+            if (t.wo_offs[l] >= 0l) {   // absent on deltanet layers (ssm_out is their out projection)
+                load_big(m, bytes, "blk.{l}.attn_output.weight", t, t.wo_offs[l], qd_l * dim, scratch, 0l, fmt_at(t.wo_fmt, l))
+            }
             if (t.config.n_expert > 0l) {
                 // MoE: fp32 router (+ shared-expert gate vector) -> fblob; the 3D expert stacks are
                 // expert-major on disk, so ONE contiguous load lands every expert's 2D matrix at its
@@ -1987,6 +2129,31 @@ struct Session {
     ple_inp : array<float>      // the built per-(position, layer) side input (npos x n_layers x ple)
     ple_proj : array<float>     // model-proj scratch for the pre-step (npos x n_layers x ple)
     ple_gate : array<float>     // per-(position) gate vector for the layer block (npos x ple)
+    // qwen35 deltanet recurrent state (persists across tokens; zeroed at position 0) + scratch.
+    // Empty unless config.recr_mask != 0. State is forward-only — dn_pos guards against rewind.
+    dn_pos : int64                 // the next position the deltanet stack expects
+    dn_conv_state : array<float>   // per recurrent layer: (d_conv-1) history taps per channel, channel-major
+    dn_state : array<float>        // per recurrent layer: S — dt_rank heads x (d_state x d_state) f32
+    dn_conv_prefix : array<int64>  // per-layer element offsets into the two above; -1 = attention layer
+    dn_state_prefix : array<int64>
+    dn_qkv : array<float>          // fused [q;k;v] projection out (conv_dim)
+    dn_z : array<float>            // z gate projection (d_inner)
+    dn_beta : array<float>         // per-v-head β (dt_rank)
+    dn_g : array<float>            // per-v-head log-decay g (dt_rank)
+    dn_conv_out : array<float>     // conv + SiLU output (conv_dim)
+    dn_o : array<float>            // delta-rule output (d_inner)
+    dn_sk : array<float>           // per-head kᵀS readout / delta scratch (dt_rank x d_state)
+    // gated attention (config.q_gated): fused [q | gate] projection + the deinterleaved gate half
+    dn_qg : array<float>           // decode: 2 x qd
+    dn_qgate : array<float>        // decode: qd
+    // prefill twins (sized per prefill by forward_prefill_alloc)
+    dn_qkv_b : array<float>
+    dn_z_b : array<float>
+    dn_beta_b : array<float>
+    dn_g_b : array<float>
+    dn_o_b : array<float>
+    dn_qg_b : array<float>
+    dn_qgate_b : array<float>
 }
 
 // q8_0 KV needs whole 32-blocks everywhere the cache is sliced: rows (kv_dim) and head slots
@@ -2054,6 +2221,37 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
         s.ple_inp |> resize(all)
         s.ple_proj |> resize(all)
         s.ple_gate |> resize(c.n_embd_per_layer)
+    }
+    if (c.recr_mask != 0ul) {   // qwen35 deltanet: per-recurrent-layer conv history + S state (zeroed by resize)
+        let cd = dn_conv_dim(c)
+        s.dn_conv_prefix |> reserve(int(c.n_layers))
+        s.dn_state_prefix |> reserve(int(c.n_layers))
+        var co = 0l
+        var so = 0l
+        for (l in range64(c.n_layers)) {
+            if (layer_is_recurrent(c, l)) {
+                s.dn_conv_prefix |> push(co)
+                s.dn_state_prefix |> push(so)
+                co += (c.ssm_d_conv - 1l) * cd
+                so += c.ssm_dt_rank * c.ssm_d_state * c.ssm_d_state
+            } else {
+                s.dn_conv_prefix |> push(-1l)
+                s.dn_state_prefix |> push(-1l)
+            }
+        }
+        s.dn_conv_state |> resize(co)
+        s.dn_state |> resize(so)
+        s.dn_qkv |> resize(cd)
+        s.dn_z |> resize(c.ssm_d_inner)
+        s.dn_beta |> resize(c.ssm_dt_rank)
+        s.dn_g |> resize(c.ssm_dt_rank)
+        s.dn_conv_out |> resize(cd)
+        s.dn_o |> resize(c.ssm_d_inner)
+        s.dn_sk |> resize(c.ssm_dt_rank * c.ssm_d_state)
+    }
+    if (c.q_gated) {   // gated attention: fused [q | gate] projection scratch
+        s.dn_qg |> resize(2l * qd)
+        s.dn_qgate |> resize(qd)
     }
     s.ffn_offs |> resize(4)
     s.ffn_gu |> resize(2l * ffw)
@@ -3513,6 +3711,15 @@ def layer_is_sliding(c : Config; l : int64) : bool => (c.sliding_window > 0l
 //! Does this model carry per-layer embeddings (gemma-4 E-series)?
 def has_ple(c : Config) : bool => c.n_embd_per_layer > 0l
 
+//! Layer `l` runs the Gated-DeltaNet recurrent block instead of attention (qwen35 hybrid).
+def layer_is_recurrent(c : Config; l : int64) : bool => ((c.recr_mask >> uint64(l)) & 1ul) != 0ul
+
+//! deltanet q/k projection width (n_group heads of d_state each).
+def dn_key_dim(c : Config) : int64 => c.ssm_n_group * c.ssm_d_state
+
+//! deltanet fused-projection / conv channel count: [q (key_dim) ; k (key_dim) ; v (d_inner)].
+def dn_conv_dim(c : Config) : int64 => 2l * dn_key_dim(c) + c.ssm_d_inner
+
 //! Layer `l`'s dense FFN width. Uniform config.hidden_dim unless the model varies it per layer
 //! (gemma-4 E2B: 6144 for layers 0-14, 12288 for 15-34).
 def layer_hidden(t : Model; l : int64) : int64 => (empty(t.ffn_w) ? t.config.hidden_dim : t.ffn_w[l])
@@ -3532,9 +3739,10 @@ def layer_kv_source(c : Config; l : int64) : int64 {
 def layer_head_size(c : Config; l : int64) : int64 => (layer_is_sliding(c, l) && c.head_size_swa > 0l
     ? c.head_size_swa : c.head_size)
 
-//! Layer `l`'s KV-head count.
-def layer_n_kv_heads(c : Config; l : int64) : int64 => (layer_is_sliding(c, l) && c.n_kv_heads_swa > 0l
-    ? c.n_kv_heads_swa : c.n_kv_heads)
+//! Layer `l`'s KV-head count. Recurrent (deltanet) layers have NO KV — their 0 makes every
+//! KV-cache prefix walk (session slabs, pool blobs, q8 validation) allocate zero bytes for them.
+def layer_n_kv_heads(c : Config; l : int64) : int64 => (layer_is_recurrent(c, l) ? 0l
+    : (layer_is_sliding(c, l) && c.n_kv_heads_swa > 0l ? c.n_kv_heads_swa : c.n_kv_heads))
 
 //! Layer `l`'s KV width (kv heads × head size).
 def layer_kv_dim(c : Config; l : int64) : int64 => layer_n_kv_heads(c, l) * layer_head_size(c, l)
@@ -4417,6 +4625,292 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     prof_add("act_resid", ts_resid0)
 }
 
+// ===== qwen35 hybrid blocks: Gated DeltaNet (recurrent) + gated attention =====
+// The qwen35 stack alternates Gated-DeltaNet linear-attention layers (recr_mask; no KV, O(1) f32
+// state per layer) with full-attention layers whose 2x-wide Q carries a per-head sigmoid output
+// gate and whose rope is partial (rope_dim of head_size). Oracle: llama.cpp
+// src/models/qwen35.cpp + delta-net-base.cpp — every float op below mirrors that graph's order.
+
+// Causal depthwise conv1d, one token step: per channel, dot the (taps = d_conv-1)-deep history
+// plus the current input against that channel's taps (oldest first, ggml_ssm_conv order), then
+// shift the history. Float accumulation matches ggml's sumf.
+def private dn_conv_step(var outp : float?; var st : float?; inp : float const?; w : float const?; channels, taps : int64) {
+    unsafe {
+        for (ch in range64(channels)) {
+            let sb = ch * taps
+            let wb = ch * (taps + 1l)
+            var acc = 0.0
+            for (k in range64(taps)) {
+                acc += st[sb + k] * w[wb + k]
+            }
+            let cur = inp[ch]
+            acc += cur * w[wb + taps]
+            for (k in range64(taps - 1l)) {
+                st[sb + k] = st[sb + k + 1l]
+            }
+            st[sb + taps - 1l] = cur
+            outp[ch] = acc
+        }
+    }
+}
+
+// One delta-rule step for one v-head (llama.cpp build_delta_net_autoregressive): S (d_state x
+// d_state, k-index rows x v-index columns) decays by exp(g); sk = kᵀS; d = (v − sk)·β;
+// S += k⊗d; o = qᵀS. q arrives pre-scaled by 1/sqrt(d_state). Row-by-row accumulation over the
+// k index reproduces ggml's sum order per output element.
+def private dn_delta_head(var st : float?; q, k, v : float const?; var o : float?; var skd : float?; g, beta : float; ds : int64) {
+    unsafe {
+        let decay = exp(g)
+        for (j in range64(ds)) {
+            skd[j] = 0.0
+        }
+        for (i in range64(ds)) {
+            var row = st + i * ds
+            let ki = k[i]
+            for (j in range64(ds)) {
+                let sv = row[j] * decay
+                row[j] = sv
+                skd[j] += ki * sv
+            }
+        }
+        for (j in range64(ds)) {
+            skd[j] = (v[j] - skd[j]) * beta
+            o[j] = 0.0
+        }
+        for (i in range64(ds)) {
+            var row = st + i * ds
+            let ki = k[i]
+            let qi = q[i]
+            for (j in range64(ds)) {
+                let sv = row[j] + ki * skd[j]
+                row[j] = sv
+                o[j] += qi * sv
+            }
+        }
+    }
+}
+
+// The per-token deltanet core, shared by decode and (per position) prefill: β/g transforms, the
+// causal conv + SiLU, q/k L2-norm + q pre-scale, the per-v-head delta rule, and the z-gated
+// out-norm — everything between the batched input projections and the ssm_out projection.
+// `qkv` is this token's fused [q;k;v] projection row; z/beta/g its other projections (consumed
+// in place); the gated output lands in `o` (d_inner).
+def private dn_token_core(t : Model; var s : Session; l : int64; qkv : float const?; var z : float?; var beta : float?; var g : float?; var o : float?) {
+    let c = t.config
+    let cd = dn_conv_dim(c)
+    let kd = dn_key_dim(c)
+    let nvh = c.ssm_dt_rank
+    let nkh = c.ssm_n_group
+    let ds = c.ssm_d_state
+    let taps = c.ssm_d_conv - 1l
+    unsafe {
+        // β = σ(raw); g = ssm_a ⊙ softplus(raw + dt_bias) — ssm_a stores −exp(A_log) precomputed
+        for (h in range64(nvh)) {
+            beta[h] = 1.0 / (1.0 + exp(-beta[h]))
+            g[h] = t.fblob[t.dn_a_off + l * nvh + h] * softplus(g[h] + t.fblob[t.dn_dt_off + l * nvh + h])
+        }
+        // causal conv over the fused [q;k;v] row (persistent per-layer history), then SiLU
+        var cop = addr(s.dn_conv_out[0])
+        dn_conv_step(cop, addr(s.dn_conv_state[s.dn_conv_prefix[l]]), qkv,
+            reinterpret<float const?>(addr(t.fblob[t.dn_conv_off + l * c.ssm_d_conv * cd])), cd, taps)
+        silu(cop, cd)
+        // L2-normalize the q and k heads (v passes through), then pre-scale q by 1/sqrt(ds)
+        l2_norm_rows(cop, nkh, ds, c.norm_eps)
+        l2_norm_rows(cop + kd, nkh, ds, c.norm_eps)
+        scale_inplace(cop, 1.0 / sqrt(float(ds)), kd)
+        // per-v-head delta rule; k-heads repeat cyclically onto v-heads (ggml_repeat: h % nkh)
+        let qp = reinterpret<float const?>(cop)
+        let kp = reinterpret<float const?>(cop + kd)
+        let vp = reinterpret<float const?>(cop + 2l * kd)
+        var stp = addr(s.dn_state[s.dn_state_prefix[l]])
+        var skp = addr(s.dn_sk[0])
+        for (h in range64(nvh)) {
+            let kh = h % nkh
+            dn_delta_head(stp + h * ds * ds, qp + kh * ds, kp + kh * ds, vp + h * ds,
+                o + h * ds, skp + h * ds, g[h], beta[h], ds)
+        }
+        // gated out-norm: per head RMSNorm(o; ssm_norm, shared weights) ⊙ SiLU(z)
+        let wnorm = reinterpret<float const?>(addr(t.fblob[t.dn_norm_off + l * ds]))
+        for (h in range64(nvh)) {
+            rmsnorm(o + h * ds, reinterpret<float const?>(o + h * ds), wnorm, ds, c.norm_eps)
+        }
+        silu(z, c.ssm_d_inner)
+        mul_inplace(o, reinterpret<float const?>(z), c.ssm_d_inner)
+    }
+}
+
+// attn-norm → fused qkv/z/β/α projections → per-token deltanet core → ssm_out projection → residual.
+def private deltanet_decode(t : Model; var s : Session; l : int64) {
+    let c = t.config
+    let dim = c.dim
+    let cd = dn_conv_dim(c)
+    let di = c.ssm_d_inner
+    let nvh = c.ssm_dt_rank
+    let ts_norm0 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
+    prof_add("norm", ts_norm0)
+    let ts_qkv = ref_time_ticks()
+    mm_f(s.dn_qkv, t, KqFmt.q8, t.dnqkv_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, cd)
+    mm_f(s.dn_z, t, KqFmt.q8, t.dngate_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, di)
+    mm_f(s.dn_beta, t, KqFmt.q8, t.dnbeta_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+    mm_f(s.dn_g, t, KqFmt.q8, t.dnalpha_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, nvh)
+    prof_add("mm_qkv", ts_qkv)
+    let ts_attn = ref_time_ticks()
+    unsafe {
+        dn_token_core(t, s, l, reinterpret<float const?>(addr(s.dn_qkv[0])), addr(s.dn_z[0]),
+            addr(s.dn_beta[0]), addr(s.dn_g[0]), addr(s.dn_o[0]))
+    }
+    prof_add("attn", ts_attn)
+    let ts_wo = ref_time_ticks()
+    mm_f(s.xb2, t, KqFmt.q8, t.dnout_offs[l], s.dn_o, s.xq, s.xs, s.xbs, di, dim)
+    prof_add("mm_wo", ts_wo)
+    let ts_resid = ref_time_ticks()
+    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
+    prof_add("act_resid", ts_resid)
+}
+
+// attn-norm → 2x-wide [q|gate] + k/v → QK-norm → partial rope → KV-store → GQA attention →
+// out ⊙ σ(gate) → out-proj → residual. The gated-attention twin of attention_std_decode.
+def private attention_qwen35_gated_decode(t : Model; var s : Session; l : int64; pos : int64) {
+    trace_tag(TRACE_TAG_ATTN_STD)
+    let c = t.config
+    let dim = c.dim
+    let kv_dim = layer_kv_dim(c, l)
+    let head_size = layer_head_size(c, l)
+    let n_heads = c.n_heads
+    let n_kv_heads = layer_n_kv_heads(c, l)
+    let qd = n_heads * head_size
+    let kv_mul = n_heads / n_kv_heads
+    let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
+    let rot = c.rope_dim > 0l ? c.rope_dim : head_size
+    var kcl = kv_layer_kbase(s, l, c.seq_len)
+    var vcl = kv_layer_vbase(s, l, c.seq_len)
+    let kstart = 0l
+    let cnt = pos + 1l
+    let ts_norm0 = ref_time_ticks()
+    rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
+    prof_add("norm", ts_norm0)
+    let ts_qkv = ref_time_ticks()
+    mm_f(s.dn_qg, t, fmt_at(t.wq_fmt, l), t.wq_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, 2l * qd)
+    mm_f(s.k, t, fmt_at(t.wk_fmt, l), t.wk_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, kv_dim)
+    mm_f(s.v, t, fmt_at(t.wv_fmt, l), t.wv_offs[l], s.xb, s.xq, s.xs, s.xbs, dim, kv_dim)
+    // deinterleave: head h's q lives at 2h·hs, its gate at (2h+1)·hs
+    unsafe {
+        let qgp = reinterpret<float const?>(addr(s.dn_qg[0]))
+        var qp = addr(s.q[0])
+        var gp = addr(s.dn_qgate[0])
+        for (h in range64(n_heads)) {
+            let sb = h * 2l * head_size
+            let db = h * head_size
+            for (i in range64(head_size)) {
+                qp[db + i] = qgp[sb + i]
+                gp[db + i] = qgp[sb + head_size + i]
+            }
+        }
+    }
+    prof_add("mm_qkv", ts_qkv)
+    let ts_qknorm = ref_time_ticks()
+    rms_batch(s.q, s.q, t, t.rms_q_offs[l], head_size, n_heads)
+    rms_batch(s.k, s.k, t, t.rms_k_offs[l], head_size, n_kv_heads)
+    prof_add("norm", ts_qknorm)
+    let ts_rope = ref_time_ticks()
+    if (g_use_rope_table) {
+        unsafe {
+            let crow = reinterpret<float const?>(addr(s.rope_cos[0]))
+            let srow = reinterpret<float const?>(addr(s.rope_sin[0]))
+            rope_scaled_neox_tab_part(addr(s.q[0]), head_size, rot, qd, crow, srow)
+            rope_scaled_neox_tab_part(addr(s.k[0]), head_size, rot, kv_dim, crow, srow)
+        }
+    } else {
+        unsafe {
+            rope_scaled_neox_part(addr(s.q[0]), pos, head_size, rot, qd, c.rope_freq_base, c.rope_freq_scale, false, null, c.rope_mscale)
+            rope_scaled_neox_part(addr(s.k[0]), pos, head_size, rot, kv_dim, c.rope_freq_base, c.rope_freq_scale, false, null, c.rope_mscale)
+        }
+    }
+    prof_add("rope", ts_rope)
+    if (s.kv_dtype_k == KVDtype.q8_0) {
+        quantize_q8_0_into(s.q, qd, s.attq, s.atts, 0l, 0l)
+    }
+    let ts_kv = ref_time_ticks()
+    unsafe {
+        kv_store_row(kcl, s.kv_dtype_k, kv_dim, kv_phys_row(s, pos), 0l, kv_dim,
+            reinterpret<float const?>(addr(s.k[0])))
+        kv_store_row(vcl, s.kv_dtype_v, kv_dim, kv_phys_row(s, pos), 0l, kv_dim,
+            reinterpret<float const?>(addr(s.v[0])))
+    }
+    prof_add("kv_store", ts_kv)
+    let ts_attn = ref_time_ticks()
+    let seq_len = c.seq_len
+    let attn_softcap = c.attn_logit_softcap
+    let attn_lanes = min(int(n_heads), lanes_for_work(2l * cnt * head_size * n_heads, g_gemv_lane_cap))
+    let kdt = s.kv_dtype_k
+    let vdt = s.kv_dtype_v
+    let nrun = kv_runs(s, kstart, pos + 1l, s.kv_runs)
+    unsafe {
+        let qp = reinterpret<float const?>(addr(s.q[0]))
+        let qqp = kdt == KVDtype.q8_0 ? reinterpret<int8 const?>(addr(s.attq[0])) : null
+        let qsp = kdt == KVDtype.q8_0 ? reinterpret<float const?>(addr(s.atts[0])) : null
+        let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))
+        var xbp = addr(s.xb[0])
+        var attp = addr(s.att[0])
+        maybe_parallel_for(0, int(n_heads), attn_lanes) $(rb, re) {
+            unsafe {
+                for (h in range(rb, re)) {
+                    let hh = int64(h)
+                    let qoff = hh * head_size
+                    let kvhoff = (hh / kv_mul) * head_size
+                    attn_head_decode_d(attp + hh * seq_len, xbp, qp, qqp, qsp, kcl, vcl, kdt, vdt, runsp,
+                        nrun, qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, null)
+                }
+            }
+        }
+    }
+    prof_add("attn", ts_attn)
+    // per-head sigmoid output gate on the attention output, before the out projection
+    let ts_wo = ref_time_ticks()
+    unsafe {
+        var xbp2 = addr(s.xb[0])
+        let gp2 = reinterpret<float const?>(addr(s.dn_qgate[0]))
+        for (i in range64(qd)) {
+            xbp2[i] *= 1.0 / (1.0 + exp(-gp2[i]))
+        }
+    }
+    mm_f(s.xb2, t, fmt_at(t.wo_fmt, l), t.wo_offs[l], s.xb, s.xq, s.xs, s.xbs, qd, dim)
+    prof_add("mm_wo", ts_wo)
+    let ts_resid = ref_time_ticks()
+    add_inplace(unsafe(addr(s.x[0])), unsafe(addr(s.xb2[0])), dim)
+    prof_add("act_resid", ts_resid)
+}
+
+// Zero the recurrent state for a fresh conversation (position 0).
+def private dn_reset(var s : Session) {
+    for (i in range64(int64(length(s.dn_conv_state)))) {
+        s.dn_conv_state[i] = 0.0
+    }
+    for (i in range64(int64(length(s.dn_state)))) {
+        s.dn_state[i] = 0.0
+    }
+}
+
+// The qwen35 decode attention block: forward-only state guard, then deltanet or gated attention
+// per the layer mask.
+def private attention_qwen35_decode(t : Model; var s : Session; l : int64; pos : int64) {
+    if (l == 0l) {   // recurrent state is forward-only: full reset at 0, no rewind
+        if (pos == 0l) {
+            dn_reset(s)
+        } elif (pos != s.dn_pos) {
+            panic("dasLLAMA: deltanet state is forward-only — cannot eval position {pos} (session is at {s.dn_pos}); rewinding needs a fresh session")
+        }
+        s.dn_pos = pos + 1l
+    }
+    if (layer_is_recurrent(t.config, l)) {
+        trace_tag(TRACE_TAG_ATTN_STD)
+        deltanet_decode(t, s, l)
+    } else {
+        attention_qwen35_gated_decode(t, s, l, pos)
+    }
+}
+
 // ffn-norm → gated FFN (act(W1·x) * (W3·x)) → down-proj(+post-norm) → residual.
 // Dense gated FFN kernel, in place: reads the pre-normed activation in s.xb, writes act(W1·xb)·(W3·xb)
 // projected through W2 back into s.xb. Weights at the per-layer w1/w2/w3 offsets (hidden = c.hidden_dim).
@@ -5215,7 +5709,9 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     // values, trig deduplicated). Dual-rope arches get the sliding class's row alongside.
     if (g_use_rope_table) {
         let ts_rope_build = ref_time_ticks()
-        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l, c.head_size, true)
+        // partial rotary (qwen35): the table spans rope_dim — frequencies run over the rotated span
+        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l,
+                         c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
         if (has_dual_rope(c)) {
             let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
             build_rope_table(s.rope_cos_swa, s.rope_sin_swa, t, c.rope_freq_base_swa, c.rope_freq_scale_swa,
@@ -6145,6 +6641,145 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
                       is_sliding, c.sliding_window, c.attn_logit_softcap, sinksp)
     prof_add("attn", ts_attn)
     attn_out_suffix(t, s, l, npos)
+}
+
+// qwen35 deltanet prefill: batched projections, then the inherently sequential per-token core
+// (state carried across positions), then one batched ssm_out projection + residual.
+def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let cd = dn_conv_dim(c)
+    let di = c.ssm_d_inner
+    let nvh = c.ssm_dt_rank
+    let ts_norm0 = ref_time_ticks()
+    rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
+    prof_add("norm", ts_norm0)
+    let ts_qkv = ref_time_ticks()
+    mm_b_f(s, s.dn_qkv_b, t, KqFmt.q8, t.dnqkv_offs[l], s.xb_b, dim, cd, npos)
+    mm_b_f(s, s.dn_z_b, t, KqFmt.q8, t.dngate_offs[l], s.xb_b, dim, di, npos)
+    mm_b_f(s, s.dn_beta_b, t, KqFmt.q8, t.dnbeta_offs[l], s.xb_b, dim, nvh, npos)
+    mm_b_f(s, s.dn_g_b, t, KqFmt.q8, t.dnalpha_offs[l], s.xb_b, dim, nvh, npos)
+    prof_add("mm_qkv", ts_qkv)
+    let ts_attn = ref_time_ticks()
+    unsafe {
+        let qkvp = reinterpret<float const?>(addr(s.dn_qkv_b[0]))
+        var zp = addr(s.dn_z_b[0])
+        var bp = addr(s.dn_beta_b[0])
+        var gp = addr(s.dn_g_b[0])
+        var op = addr(s.dn_o_b[0])
+        for (p in range64(npos)) {
+            dn_token_core(t, s, l, qkvp + p * cd, zp + p * di, bp + p * nvh, gp + p * nvh, op + p * di)
+        }
+    }
+    prof_add("attn", ts_attn)
+    let ts_wo = ref_time_ticks()
+    mm_b_f(s, s.xb2_b, t, KqFmt.q8, t.dnout_offs[l], s.dn_o_b, di, dim, npos)
+    prof_add("mm_wo", ts_wo)
+    let ts_resid = ref_time_ticks()
+    add_inplace(unsafe(addr(s.x_b[0])), unsafe(addr(s.xb2_b[0])), npos * dim)
+    prof_add("act_resid", ts_resid)
+}
+
+// The batched gated-attention twin of attention_std_prefill: 2x-wide [q|gate], partial rope,
+// sigmoid out-gate before the shared out-proj suffix.
+def private attention_qwen35_gated_prefill(t : Model; var s : Session; l : int64; npos : int64; start_pos : int64) {
+    let c = t.config
+    let dim = c.dim
+    let kv_dim = layer_kv_dim(c, l)
+    let head_size = layer_head_size(c, l)
+    let n_heads = c.n_heads
+    let n_kv_heads = layer_n_kv_heads(c, l)
+    let qd = n_heads * head_size
+    let kv_mul = n_heads / n_kv_heads
+    let scale = c.attn_scale > 0.0 ? c.attn_scale : 1.0 / sqrt(float(head_size))
+    let rot = c.rope_dim > 0l ? c.rope_dim : head_size
+    var kcl = kv_layer_kbase(s, l, c.seq_len)
+    var vcl = kv_layer_vbase(s, l, c.seq_len)
+    let ts_norm0 = ref_time_ticks()
+    rms_batch(s.xb_b, s.x_b, t, t.rms_att_off + l * dim, dim, npos)
+    prof_add("norm", ts_norm0)
+    let ts_qkv = ref_time_ticks()
+    mm_b_f(s, s.dn_qg_b, t, fmt_at(t.wq_fmt, l), t.wq_offs[l], s.xb_b, dim, 2l * qd, npos)
+    mm_b_f(s, s.k_b, t, fmt_at(t.wk_fmt, l), t.wk_offs[l], s.xb_b, dim, kv_dim, npos)
+    mm_b_f(s, s.v_b, t, fmt_at(t.wv_fmt, l), t.wv_offs[l], s.xb_b, dim, kv_dim, npos)
+    // deinterleave per position: head h's q at 2h·hs, its gate at (2h+1)·hs
+    unsafe {
+        let qgp = reinterpret<float const?>(addr(s.dn_qg_b[0]))
+        var qp = addr(s.q_b[0])
+        var gp = addr(s.dn_qgate_b[0])
+        for (p in range64(npos)) {
+            for (h in range64(n_heads)) {
+                let sb = p * 2l * qd + h * 2l * head_size
+                let db = p * qd + h * head_size
+                for (i in range64(head_size)) {
+                    qp[db + i] = qgp[sb + i]
+                    gp[db + i] = qgp[sb + head_size + i]
+                }
+            }
+        }
+    }
+    prof_add("mm_qkv", ts_qkv)
+    let ts_qknorm = ref_time_ticks()
+    rms_batch(s.q_b, s.q_b, t, t.rms_q_offs[l], head_size, npos * n_heads)
+    rms_batch(s.k_b, s.k_b, t, t.rms_k_offs[l], head_size, npos * n_kv_heads)
+    prof_add("norm", ts_qknorm)
+    let ts_rope = ref_time_ticks()
+    unsafe {
+        let half = rot / 2l
+        var qbp = addr(s.q_b[0])
+        var kbp = addr(s.k_b[0])
+        if (g_use_rope_table) {
+            let cp = reinterpret<float const?>(addr(s.rope_cos[0]))
+            let sp2 = reinterpret<float const?>(addr(s.rope_sin[0]))
+            for (p in range64(npos)) {
+                rope_scaled_neox_tab_part(qbp + p * qd, head_size, rot, qd, cp + p * half, sp2 + p * half)
+                rope_scaled_neox_tab_part(kbp + p * kv_dim, head_size, rot, kv_dim, cp + p * half, sp2 + p * half)
+            }
+        } else {
+            for (p in range64(npos)) {
+                rope_scaled_neox_part(qbp + p * qd, start_pos + p, head_size, rot, qd, c.rope_freq_base, c.rope_freq_scale, false, null, c.rope_mscale)
+                rope_scaled_neox_part(kbp + p * kv_dim, start_pos + p, head_size, rot, kv_dim, c.rope_freq_base, c.rope_freq_scale, false, null, c.rope_mscale)
+            }
+        }
+    }
+    prof_add("rope", ts_rope)
+    let ts_kv = ref_time_ticks()
+    let store_nrun = kv_runs(s, start_pos, start_pos + npos, s.kv_runs)
+    unsafe {
+        kv_store_batch(kcl, vcl, s.kv_dtype_k, s.kv_dtype_v, s.k_b, s.v_b,
+            reinterpret<KVRun const?>(addr(s.kv_runs[0])), store_nrun, start_pos, npos, kv_dim)
+    }
+    prof_add("kv_store", ts_kv)
+    let ts_attn = ref_time_ticks()
+    prefill_attention(s, kcl, vcl, npos, start_pos, head_size, qd, kv_dim, n_heads, kv_mul, scale,
+                      false, 0l, c.attn_logit_softcap, null)
+    prof_add("attn", ts_attn)
+    // per-head sigmoid output gate on every position's attention output, before the out projection
+    unsafe {
+        var xbp = addr(s.xb_b[0])
+        let gbp = reinterpret<float const?>(addr(s.dn_qgate_b[0]))
+        for (i in range64(npos * qd)) {
+            xbp[i] *= 1.0 / (1.0 + exp(-gbp[i]))
+        }
+    }
+    attn_out_suffix(t, s, l, npos)
+}
+
+// The qwen35 prefill attention block: forward-only state guard, then deltanet or gated attention.
+def private attention_qwen35_prefill(t : Model; var s : Session; l : int64; npos : int64; start_pos : int64) {
+    if (l == 0l) {   // recurrent state is forward-only: full reset at 0, no rewind
+        if (start_pos == 0l) {
+            dn_reset(s)
+        } elif (start_pos != s.dn_pos) {
+            panic("dasLLAMA: deltanet state is forward-only — cannot prefill from position {start_pos} (session is at {s.dn_pos}); rewinding needs a fresh session")
+        }
+        s.dn_pos = start_pos + npos
+    }
+    if (layer_is_recurrent(t.config, l)) {
+        deltanet_prefill(t, s, l, npos)
+    } else {
+        attention_qwen35_gated_prefill(t, s, l, npos, start_pos)
+    }
 }
 
 // ffn-norm → batched gated FFN → down-proj(+post-norm) → residual.
@@ -7109,6 +7744,18 @@ def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : 
         s.ple_proj |> resize(npos * all)
         s.ple_gate |> resize(npos * c.n_embd_per_layer)
     }
+    if (c.recr_mask != 0ul) {   // qwen35 deltanet batched projections (the recurrence itself is per-token)
+        let cd = dn_conv_dim(c)
+        s.dn_qkv_b |> resize(npos * cd)
+        s.dn_z_b |> resize(npos * c.ssm_d_inner)
+        s.dn_beta_b |> resize(npos * c.ssm_dt_rank)
+        s.dn_g_b |> resize(npos * c.ssm_dt_rank)
+        s.dn_o_b |> resize(npos * c.ssm_d_inner)
+    }
+    if (c.q_gated) {   // gated attention: batched fused [q | gate] projection + gate halves
+        s.dn_qg_b |> resize(npos * 2l * qd)
+        s.dn_qgate_b |> resize(npos * qd)
+    }
     // per-head attention scratch, per the selected algorithm. classic uses one (start_pos+npos)-wide
     // score row per head; blocked needs ATTN_BLOCK_Q such rows per head (one per query in the block) —
     // size for blocked, classic indexes the first row of each head's block, so the wider allocation is
@@ -7140,8 +7787,10 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     let ts_rope_build = ref_time_ticks()
     if (use_rope_tab) {
         // global-class table (c.head_size, factors on); the swa table gets the sliding class's head
-        // size and drops the factors on p-RoPE arches (gemma4: factors are global-layers-only)
-        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, start_pos, npos, c.head_size, true)
+        // size and drops the factors on p-RoPE arches (gemma4: factors are global-layers-only).
+        // Partial rotary (qwen35): the table spans rope_dim instead.
+        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, start_pos, npos,
+                         c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
         if (has_dual_rope(c)) {
             let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
             build_rope_table(s.rope_cos_swa, s.rope_sin_swa, t, c.rope_freq_base_swa, c.rope_freq_scale_swa,
@@ -7785,4 +8434,21 @@ def moe_blocks() : ArchBlocks {
 def gemma4_blocks() : ArchBlocks {
     return ArchBlocks(attn_decode = @@attention_std_decode, ffn_decode = @@ffn_gemma4_decode,
                       attn_prefill = @@attention_std_prefill, ffn_prefill = @@ffn_gemma4_prefill)
+}
+
+//! qwen35's block set: the hybrid Gated-DeltaNet / gated-attention dispatch + the dense FFN.
+//! attn_is_std = false — batched decode falls back to per-row forward() (recurrent state is
+//! per-session and strictly sequential).
+def qwen35_blocks() : ArchBlocks {
+    return ArchBlocks(attn_decode = @@attention_qwen35_decode, ffn_decode = @@ffn_dense_decode,
+                      attn_prefill = @@attention_qwen35_prefill, ffn_prefill = @@ffn_dense_prefill,
+                      attn_is_std = false)
+}
+
+//! qwen35moe's block set: the same hybrid attention dispatch + the routed-experts FFN
+//! (softmax top-k with renorm + the qwen2moe-style sigmoid-gated shared expert).
+def qwen35moe_blocks() : ArchBlocks {
+    return ArchBlocks(attn_decode = @@attention_qwen35_decode, ffn_decode = @@ffn_moe_decode,
+                      attn_prefill = @@attention_qwen35_prefill, ffn_prefill = @@ffn_moe_prefill,
+                      attn_is_std = false)
 }

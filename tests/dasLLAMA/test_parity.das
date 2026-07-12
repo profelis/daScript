@@ -301,6 +301,23 @@ def test_parity_qwen3_4b(t : T?) {
     }
 }
 
+// Qwen3.5-0.8B Q8 — the qwen35 hybrid: 18 Gated-DeltaNet recurrent layers + 6 gated-attention
+// layers (2x-wide Q with sigmoid out-gate, partial NEOX rope 64/256, QK-norm). Same Qwen BPE
+// counting continuation ids as the dense Qwen fixtures (verified against the live oracle), so
+// the arrays are shared.
+[test]
+def test_parity_qwen35_08b(t : T?) {
+    t |> run("qwen35 forward (Qwen3.5-0.8B Q8, deltanet hybrid)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Qwen3.5-0.8B-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_ok(path, QuantMode.q8, QWEN3_PROMPT, QWEN3_GEN), "qwen3.5-0.8b token-for-token")
+    }
+}
+
 // Qwen1.5-MoE-A2.7B-Chat Q8 — the routed-experts arch (softmax router -> top-4 of 60 with
 // un-renormalized weights + a sigmoid-gated shared expert; QKV bias, NEOX rope). Same Qwen BPE
 // vocab and counting continuation as the dense Qwen fixtures, so the id arrays are shared.
