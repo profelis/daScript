@@ -463,6 +463,8 @@ class MathCalls {
     @ssbo @binding = 9 ua : array<uint>
     @ssbo @binding = 10 ub : array<uint>
     @ssbo @binding = 11 uc : array<uint>
+    @ssbo @binding = 12 qa : array<int8>
+    @ssbo @binding = 13 qc : array<int8>
 
     [metal_kernel(name="mathcalls_msl"), marker(no_coverage)]
     def mathcalls {
@@ -471,12 +473,15 @@ class MathCalls {
         let y = b[i]
         c[i] = (((exp(min(x, 4.0)) + sqrt(abs(x))) + (rsqrt(abs(y) + 1.0) + tanh(x))) +
             ((sin(x) + cos(y)) + (saturate(x) + max(x, y))))
+        c[i] += float(qa[i])
         let u = va[i]
         let v = vb[i]
         vc[i] = (((exp(min(u, float4(4.0))) + sqrt(abs(u))) + (rsqrt(abs(v) + float4(1.0)) + tanh(u))) +
             ((sin(u) + cos(v)) + (saturate(u) + max(u, v))))
+        vc[i] = vc[i] + round(v)
         ic[i] = min(abs(ia[i]), ib[i]) + max(ia[i], ib[i])
         uc[i] = min(ua[i], ub[i]) + max(ua[i], ub[i])
+        qc[i] = int8(round(b[i] * 12.5))
     }
 }
 
@@ -706,6 +711,10 @@ def public declared_msl_census : table<string> {
         "call.math.max.i32",
         "call.math.min.u32",
         "call.math.max.u32",
+        "call.math.round.f32",
+        "call.math.round.f32v",
+        "cvt.f32.i8",
+        "cvt.i8.f32",
         // statements
         "stmt.let",
         "stmt.var",

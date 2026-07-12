@@ -28,6 +28,8 @@ class MathCalls {
     @ssbo @binding = 9 ua : array<uint>
     @ssbo @binding = 10 ub : array<uint>
     @ssbo @binding = 11 uc : array<uint>
+    @ssbo @binding = 12 qa : array<int8>
+    @ssbo @binding = 13 qc : array<int8>
 
     [metal_kernel(name="mathcalls_gpu_msl", fastmath=false), marker(no_coverage)]
     def mathcalls {
@@ -36,12 +38,15 @@ class MathCalls {
         let y = b[i]
         c[i] = (((exp(min(x, 4.0)) + sqrt(abs(x))) + (rsqrt(abs(y) + 1.0) + tanh(x))) +
             ((sin(x) + cos(y)) + (saturate(x) + max(x, y))))
+        c[i] += float(qa[i])
         let u = va[i]
         let v = vb[i]
         vc[i] = (((exp(min(u, float4(4.0))) + sqrt(abs(u))) + (rsqrt(abs(v) + float4(1.0)) + tanh(u))) +
             ((sin(u) + cos(v)) + (saturate(u) + max(u, v))))
+        vc[i] = vc[i] + round(v)
         ic[i] = min(abs(ia[i]), ib[i]) + max(ia[i], ib[i])
         uc[i] = min(ua[i], ub[i]) + max(ua[i], ub[i])
+        qc[i] = int8(round(b[i] * 12.5))
     }
 }
 
@@ -61,6 +66,8 @@ def test_math_gpu_vs_cpu(t : T?) {
         oracle.ua |> resize(N)
         oracle.ub |> resize(N)
         oracle.uc |> resize(N)
+        oracle.qa |> resize(N)
+        oracle.qc |> resize(N)
         for (k in range(N)) {
             oracle.a[k] = float(k % 23) - 11.0
             oracle.b[k] = float(k % 17) * 0.5 - 4.0
@@ -70,14 +77,16 @@ def test_math_gpu_vs_cpu(t : T?) {
             oracle.ib[k] = k % 7 - 3
             oracle.ua[k] = uint((k * 3) % 31)
             oracle.ub[k] = uint(k % 11)
+            oracle.qa[k] = int8(k % 251 - 125)
         }
         for (k in range(N)) {
             gl_GlobalInvocationID = uint3(uint(k), 0u, 0u)
             oracle->mathcalls()
         }
-        // k=0: x=-11, y=-4: exp(-11)+sqrt(11)+rsqrt(5)+tanh(-11)+sin(-11)+cos(-4)+saturate(-11)+max(-11,-4)
+        // k=0: x=-11, y=-4: exp(-11)+sqrt(11)+rsqrt(5)+tanh(-11)+sin(-11)+cos(-4)+saturate(-11)+max(-11,-4),
+        // then += float(qa[0]) = -125
         t |> success(fapprox(oracle.c[0], exp(-11.0) + sqrt(11.0) + rsqrt(5.0) + tanh(-11.0) +
-            sin(-11.0) + cos(-4.0) + 0.0 + (-4.0)), "the oracle itself computed")
+            sin(-11.0) + cos(-4.0) + 0.0 + (-4.0) - 125.0), "the oracle itself computed")
         t |> equal(oracle.ic[0], min(9, -3) + max(-9, -3))
         static_if (typeinfo builtin_module_exists(das_metal)) {
             var gpu_bad = -1
@@ -105,13 +114,16 @@ def test_math_gpu_vs_cpu(t : T?) {
                 var bua = buf_upload(dev, oracle.ua)
                 var bub = buf_upload(dev, oracle.ub)
                 var buc = buf_fill(dev, N, 0u)
-                var bufs <- [ba, bb, bc, bva, bvb, bvc, bia, bib, bic, bua, bub, buc]
+                var bqa = buf_upload(dev, oracle.qa)
+                var bqc = buf_fill(dev, N, int8(0))
+                var bufs <- [ba, bb, bc, bva, bvb, bvc, bia, bib, bic, bua, bub, buc, bqa, bqc]
                 var rerr : string
                 let ran = run_compute_1d(queue, pso, bufs, uint(N), TPG, rerr)
                 t |> success(ran, "run_compute_1d: {rerr}")
                 if (ran) {
-                    gpu_bad = ((buf_mismatch_approx(bc, oracle.c) + buf_mismatch_approx4(bvc, oracle.vc)) +
-                        (buf_mismatch_exact(bic, oracle.ic) + buf_mismatch_exact(buc, oracle.uc)))
+                    gpu_bad = (((buf_mismatch_approx(bc, oracle.c) + buf_mismatch_approx4(bvc, oracle.vc)) +
+                        (buf_mismatch_exact(bic, oracle.ic) + buf_mismatch_exact(buc, oracle.uc))) +
+                        buf_mismatch_exact(bqc, oracle.qc))
                 }
                 bufs |> clear()             // non-owning handles — clear() skips pointee finalize
                 unsafe {
@@ -129,6 +141,8 @@ def test_math_gpu_vs_cpu(t : T?) {
                 metal_release(bua)
                 metal_release(bub)
                 metal_release(buc)
+                metal_release(bqa)
+                metal_release(bqc)
                 metal_release(pso)
                 metal_release(queue)
             }

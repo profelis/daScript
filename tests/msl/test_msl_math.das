@@ -23,16 +23,21 @@ kernel void mathcalls(device const float* a [[buffer(0)]],
         device const uint* ua [[buffer(9)]],
         device const uint* ub [[buffer(10)]],
         device uint* uc [[buffer(11)]],
+        device const char* qa [[buffer(12)]],
+        device char* qc [[buffer(13)]],
         uint3 gl_GlobalInvocationID [[thread_position_in_grid]]) \{
     uint i = gl_GlobalInvocationID.x;
     float x = a[i];
     float y = b[i];
     c[i] = (((exp(min(x, 4.0f)) + sqrt(abs(x))) + (rsqrt((abs(y) + 1.0f)) + tanh(x))) + ((sin(x) + cos(y)) + (saturate(x) + max(x, y))));
+    c[i] += float(qa[i]);
     float4 u = va[i];
     float4 v = vb[i];
     vc[i] = (((exp(min(u, float4(4.0f, 4.0f, 4.0f, 4.0f))) + sqrt(abs(u))) + (rsqrt((abs(v) + float4(1.0f, 1.0f, 1.0f, 1.0f))) + tanh(u))) + ((sin(u) + cos(v)) + (saturate(u) + max(u, v))));
+    vc[i] = (vc[i] + round(v));
     ic[i] = (min(abs(ia[i]), ib[i]) + max(ia[i], ib[i]));
     uc[i] = (min(ua[i], ub[i]) + max(ua[i], ub[i]));
+    qc[i] = char(round((b[i] * 12.5f)));
 \}
 "
 
@@ -52,6 +57,11 @@ def test_mathcalls_shape(t : T?) {
         t |> success(contains(mathcalls_msl, "saturate(u)") && contains(mathcalls_msl, "max(u, v)"), "float4 saturate/max")
         t |> success(contains(mathcalls_msl, "min(abs(ia[i]), ib[i])"), "signed-int abs + min")
         t |> success(contains(mathcalls_msl, "min(ua[i], ub[i])") && contains(mathcalls_msl, "max(ua[i], ub[i])"), "uint min/max")
+    }
+    t |> run("mathcalls: round + f32/i8 converts (the quantize-kernel trio)") <| @(t : T?) {
+        t |> success(contains(mathcalls_msl, "round(v)"), "float4 round (das half-away == MSL round)")
+        t |> success(contains(mathcalls_msl, "qc[i] = char(round((b[i] * 12.5f)));"), "int8(round(f)) -> char(round(f))")
+        t |> success(contains(mathcalls_msl, "c[i] += float(qa[i]);"), "int8 -> float dequant convert")
     }
     t |> run("mathcalls: golden snapshot") <| @(t : T?) {
         t |> equal(mathcalls_msl, GOLDEN_MATHCALLS)
