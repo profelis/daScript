@@ -7,25 +7,36 @@ reference: `doc/source/reference/tune.rst`. Worked application: `modules/dasLLAM
 ## What it is
 
 Turns one reference function into a tuned `[llvm_code]` kernel family: a grid of generator
-permutations, a per-box manifest recording which one wins, and a policy rail. Winners are
-**compile-time stamps** — the front end reads the manifest and stamps the winning perm onto the
+permutations, a PER-APP sidecar recording which one wins, and a policy rail. Winners are
+**compile-time stamps** — the front end reads the sidecar and stamps the winning perm onto the
 function before codegen. The generator only fires under the LLVM JIT (`-jit`); every other tier
 runs the reference body.
+
+**The sidecar** is `<app>.tune.json` beside the app — the root script the process runs (first
+`.das` on argv before `--`), else the binary itself (standalone exe / embedded host).
+`DAS_TUNE_MANIFEST` env overrides the location. Sectioned: `"kernels"` (perm winners, flat
+fname→suffix), `"runtime"` (library knobs — dasLLAMA's), `"provenance"` (refreshed each write).
+**Staleness:** a sidecar older (mtime) than the running binary reads as ABSENT everywhere and
+`tune_manifest_set` resets it — measurements never outlive the binary (kills the worktree
+hand-copy trap). Several libraries share one file: tuners UPSERT their own keys
+(`tune_manifest_set` preserves the rest); "is scope X tuned" = per-key completeness
+(`tune_sidecar_entries_complete`), never file existence.
 
 ## The annotation set
 
 - `[tune_perm(<gen args>)]` — one grid row; args pass to the generator + fold into the JIT DLL key. `suffix=` renames; `requires=` is a fallback-eligibility hint.
 - `[tune(gen="key", fallback="suffix;chain")]` — closes the perm bracket (applies run in declaration order). Needs an explicit return type. `fallback=` is a `;`-chain, first `requires=`-passing perm wins; `reference` forces the original body.
 - `[tune_companion(fn="sibling", gen="key")]` — between the perms and `tune()`; stamps a sibling with the SAME perm from the same entry (two-function coherence).
-- `[tune_scope(name="lib", tuner="rel/path.das")]` — on a dummy struct in the **library** module owning the kernels; manifest at `<das_root>/<name>.tune.json`, shared by every app requiring the lib, no app declaration needed. `tuner=` resolves against the declaring file.
+- `[tune_scope(name="lib", tuner="rel/path.das")]` — on a dummy struct in the **library** module owning the kernels; names the tuner unit that regenerates this library's keys in the app sidecar. `tuner=` resolves against the declaring file. Reading winners needs no scope — every `[tune]` reads the app sidecar.
 - `[tune_policy(missing = fallback|warn|error|auto|restart)]` — on the app's `main`. `error` = dev mode (fail compile, print tuner cmd). `auto` = tune at runtime + re-exec. `DAS_TUNE_POLICY` env overrides.
-- `[tune_manifest(name=, dir=)]` — per-app manifest override (isolation escape hatch).
 - `tune_status()` — runtime rows (fname, suffix, source manifest/fallback/reference, scope, path); populated when `[tune_policy]` is present. Log at startup.
+- `[tune_manifest]` is GONE (2026-07-12) — the per-app sidecar made it redundant; its root-module-only restamp rail died with it.
 
 ## The load-bearing facts (learned the hard way)
 
 - **Tuning cannot run mid-compile.** The tuner is a separate daslang process; you cannot spawn it during a macro apply and adopt its winners in the same compile. `auto`/`--tune` therefore tune at **runtime** (a guard prepended to `main`) then **re-exec** the process — the fresh compile stamps the winners at `[tune]` time. This is why `auto` needs `main` to return void or int and re-launches via `popen_argv`.
-- **Cross-module restamp is broken.** Mutating a *required* library's already-compiled `[tune]` function from the root apply (strip+restamp `[llvm_code]`) trips the re-infer pass (`Function::visit` AV). So `restamp_program` (the `[tune_manifest]` rail) is proven only **same-module**. Library kernels must take winners at `[tune]` time via `[tune_scope]`/`DAS_TUNE_MANIFEST`, NOT via a post-hoc restamp. The re-exec model exists precisely to avoid this.
+- **Cross-module restamp is broken.** Mutating a *required* library's already-compiled `[tune]` function from the root apply (strip+restamp `[llvm_code]`) trips the re-infer pass (`Function::visit` AV). Library kernels take winners at `[tune]` time from the app sidecar, NOT via a post-hoc restamp; the re-exec model exists precisely to avoid this. (The `[tune_manifest]` restamp rail was deleted with the sidecar rework.)
+- **The app identity comes from PROCESS argv, not the AST.** Each module compiles as its own Program (`compiling_program().thisModuleName` = the library, not the root), so a library `[tune]` apply cannot see the root file — `tune_app_script()` parses the process command line instead. Hosts that compile other programs in-process (dastest, MCP) resolve to THEIR own sidecar; dastest pins `DAS_TUNE_POLICY=fallback` so that never tunes.
 - **`find_module(name)` resolves against `this_program()`** — the *runtime* program, NULL in macro context → null-`Program` AV. In a macro use `compiling_program()` (walk it) or `find_compiling_module(name)`, never `find_module(name)`.
 - **`get_command_line_arguments()` aliases a process-global locked Array** — never `delete` it.
 - **`--tune` is read at macro time** from the compiler argv (after `--`), and stripped from the re-exec so the child converges instead of looping.
@@ -43,6 +54,9 @@ runs the reference body.
 
 `tests/jit_tests/llvm_tune_scope.das` is the end-to-end pattern: spawn the app as child daslang
 processes across the policy flavors, use the `llvm_code_selftest::add_plus_k` generator (emits
-`a+b+k`) so the RESULT is a fingerprint of the stamped perm. The tuner is a seconds-fast fake that
-just `fwrite`s the manifest. Two scopes with a poisoned cross-scope entry prove isolation. Runs
-with `-jit`; the `[test]` short-circuits to pass when `!jit_enabled()`.
+`a+b+k`) so the RESULT is a fingerprint of the stamped perm. The tuner is a seconds-fast fake
+that upserts via `tune_manifest_set`. Two scopes sharing the one sidecar prove the upsert
+preserves the other's keys and that per-scope tuned-ness is key completeness.
+`llvm_tune_manifest.das` covers the write→stamp round-trip plus the staleness rail (back-dates
+the sidecar with `set_mtime` + `mktime`). Runs with `-jit`; the `[test]` short-circuits to pass
+when `!jit_enabled()`.

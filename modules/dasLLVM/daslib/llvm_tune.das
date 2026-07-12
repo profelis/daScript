@@ -11,6 +11,7 @@ require daslib/templates_boost
 require daslib/fio
 require daslib/strings_boost
 require daslib/command_line
+require daslib/json_boost
 require strings
 require llvm/daslib/llvm_code public
 
@@ -30,13 +31,19 @@ require llvm/daslib/llvm_code public
 //!    registry; a harness benches them (tune, then `tune_manifest_set` the winner) or
 //!    bit-exact-gates every variant against the reference row (test).
 //!
-//! Per-box sharing + UX rail: a library declares `[tune_scope(name=, tuner=)]` (manifest at
-//! `<das_root>/<name>.tune.json`, shared by every app that requires it); an app declares
-//! `[tune_policy(missing = fallback|warn|error|auto|restart)]`; `--tune` after `--` on the
-//! app's command line forces a fresh tuner run. AOT builds are fully tune-free
-//! (`tune_aot_gate`); `-exe` builds stamp normally but run no policy (`tune_exe_gate`) — an
-//! exe built WITH a manifest is a local-use artifact shipping those winners, one built
-//! without ships the generic per-ISA `fallback=` stamps.
+//! Winners live in the PER-APP sidecar `<app>.tune.json` beside the app — the root script
+//! this process runs (the first `.das` on the command line), or the binary itself when
+//! there is none. One sectioned file per app: `"kernels"` (this module's stamps and the
+//! loop-hint perms), `"runtime"` (library runtime knobs), `"provenance"` (who wrote it).
+//! A sidecar OLDER than the running binary is stale and reads as absent everywhere — a
+//! rebuilt binary invalidates every measured winner. `DAS_TUNE_MANIFEST` env overrides the
+//! location outright. A library declares `[tune_scope(name=, tuner=)]` to wire the harness
+//! that regenerates its kernels; an app declares `[tune_policy(missing = fallback|warn|
+//! error|auto|restart)]`; `--tune` after `--` on the app's command line forces a fresh
+//! tuner run. AOT builds are fully tune-free (`tune_aot_gate`); `-exe` builds stamp
+//! normally but run no policy (`tune_exe_gate`) — an exe built WITH a sidecar is a
+//! local-use artifact shipping those winners, one built without ships the generic per-ISA
+//! `fallback=` stamps.
 
 // ===== manifest + mode =====
 
@@ -68,33 +75,95 @@ def tune_exe_gate() : bool {
     return compiling_program().policies.jit_exe_mode
 }
 
-// runtime copy of the program's manifest declaration, set by the injected [init]s — a
-// library [tune_scope] first, then (root module inits run last) an app [tune_manifest]
+// ===== the per-app sidecar =====
+
+//! The app this process runs: the first `.das` argument on the command line before `--`.
+//! Macro time and runtime read the same argv, so compile-time stamps and the runtime write
+//! API agree on the file. "" in a standalone exe or an embedded host — the binary itself is
+//! the app then (see `tune_manifest_path`).
+def tune_app_script() : string {
+    // aliases a process-global Array header (locked) — do not delete
+    var argv <- get_command_line_arguments()
+    var first = true
+    for (a in argv) {
+        if (!first) {
+            break if (a == "--")
+            if (a |> ends_with(".das")) {
+                return "{a}"
+            }
+        }
+        first = false
+    }
+    return ""
+}
+
+// `<stem>.tune.json` — foo/app.das, foo/app.exe and foo/app all map to foo/app.tune.json
+def private sidecar_for(app : string) : string {
+    var stem = app
+    if (stem |> ends_with(".das") || stem |> ends_with(".exe")) {
+        stem = slice(stem, 0, length(stem) - 4)
+    }
+    return "{stem}.tune.json"
+}
+
+// manual override for harnesses that manage their own sidecar location
 var private g_runtime_manifest = ""
 
-//! Runtime hook the `[tune_manifest]`/`[tune_scope]`-injected [init]s call; harnesses that
-//! manage their own manifest location can also call it directly before using the get/set APIs.
+//! Point the get/set APIs (and nothing else — compile-time stamps read argv/env only) at an
+//! explicit sidecar; harnesses that manage their own location call it before get/set.
 def set_tune_manifest_runtime_path(p : string) {
     g_runtime_manifest = p
 }
 
-//! The tune manifest location: `DAS_TUNE_MANIFEST` env override, else the app's
-//! `[tune_manifest]` declaration, else the library's `[tune_scope]` per-box file, else "" —
-//! no manifest.
+//! The tune sidecar location: `DAS_TUNE_MANIFEST` env override, else a harness override
+//! (`set_tune_manifest_runtime_path`), else `<app>.tune.json` beside the app — the root
+//! script this process runs, or the binary itself (standalone exe, embedded host) when
+//! there is none. Never "" — every app has a sidecar location.
 def tune_manifest_path() : string {
     let env = get_env_variable("DAS_TUNE_MANIFEST")
     if (!empty(env)) return env
-    return g_runtime_manifest
+    if (!empty(g_runtime_manifest)) return g_runtime_manifest
+    let app = tune_app_script()
+    return sidecar_for(empty(app) ? get_das_exe() : app)
 }
 
-// flat { "function name" : "perm suffix" } map; found = the file existed and parsed
+//! True when the sidecar predates the binary that runs (or builds) the app — a rebuilt
+//! binary invalidates every measured winner, so a stale sidecar reads as ABSENT everywhere
+//! (compile-time stamps, the policy rail, the auto guard) and gets regenerated. This kills
+//! the copy-a-stale-file trap: measurements never outlive the binary that made them.
+def tune_sidecar_stale(path : string) : bool {
+    var sfs : FStat
+    return false if (!stat(path, sfs))   // absent is "missing", not "stale"
+    var bfs : FStat
+    return false if (!stat(get_das_exe(), bfs))
+    return sfs.mtime < bfs.mtime
+}
+
+// the sidecar's "kernels" section as a flat { function name : perm suffix } map;
+// found = the file existed, parsed to an object, and is NOT stale vs the running binary
+// (a "kernels"-less but fresh sidecar counts as found-empty: runtime-knob-only files)
 def private read_manifest(path : string; var found : bool&) : table<string; string> {
     found = false
     var tab : table<string; string>
-    if (!empty(path)) {
-        let text = fread(path)
-        if (!empty(text)) {
-            found = sscan_json(text, tab)
+    if (empty(path) || tune_sidecar_stale(path)) {
+        return <- tab
+    }
+    let text = fread(path)
+    if (empty(text)) {
+        return <- tab
+    }
+    var err = ""
+    let doc = read_json(text, err)
+    if (doc == null || !(doc is _object)) {
+        return <- tab
+    }
+    found = true
+    let kv = doc?["kernels"]
+    if (kv != null && kv is _object) {
+        for (k, v in keys(kv as _object), values(kv as _object)) {
+            if (v != null && v is _string) {
+                tab[k] = v as _string
+            }
         }
     }
     return <- tab
@@ -110,20 +179,45 @@ def tune_manifest_get(fname : string) : string {
     return r
 }
 
-//! Upsert `fname -> suffix` into the manifest and save it — the set-a-value API the tune
-//! harness calls after picking a winner. Returns false when no manifest location is
-//! configured (env or `[tune_manifest]`) or the file can't be written.
+//! Upsert `fname -> suffix` into the sidecar's `"kernels"` section and save it — the
+//! set-a-value API the tune harness calls after picking a winner. Every other section
+//! (`"runtime"`, keys of other scopes' tuners) is preserved — upsert semantics are what let
+//! several libraries' tuners share the one per-app file. A STALE sidecar (older than the
+//! running binary) is reset to a fresh document first: its measurements are invalid, and
+//! the first write makes the file newer than the binary so the rest of the run appends.
+//! Refreshes `"provenance"` on every write. Returns false when the file can't be written.
 def tune_manifest_set(fname : string; suffix : string) : bool {
     let path = tune_manifest_path()
     if (empty(path)) {
         return false
     }
-    var found = false
-    var tab <- read_manifest(path, found)
-    tab[fname] = suffix
-    let ok = fwrite(path, sprint_json(tab, true))
-    delete tab
-    return ok
+    var doc : JsonValue?
+    if (!tune_sidecar_stale(path)) {
+        let text = fread(path)
+        if (!empty(text)) {
+            var err = ""
+            doc = read_json(text, err)
+        }
+    }
+    if (doc == null || !(doc.value is _object)) {
+        var fresh : table<string; JsonValue?>
+        doc = JV(fresh)
+    }
+    var root & = unsafe(doc.value as _object)
+    var kernels : JsonValue?
+    if (root |> key_exists("kernels")) {
+        kernels = root["kernels"]
+    }
+    if (kernels == null || !(kernels.value is _object)) {
+        root["kernels"] = JV({ fname => JV(suffix) })
+    } else {
+        // kern aliases the pointee behind the kernels JsonValue? — stable across root rehashes
+        var kern & = unsafe(kernels.value as _object)
+        kern[fname] = JV(suffix)
+    }
+    root["provenance"] = JV((binary = get_das_exe(), platform = get_platform_name(),
+        arch = get_architecture_name()))
+    return fwrite(path, write_json(doc))
 }
 
 // ===== tune status (runtime) =====
@@ -175,25 +269,55 @@ def log_tune_status(appName : string) {
     delete st
 }
 
-// ===== [tune_scope] data — library-owned per-box scope =====
+// ===== [tune_scope] data — library-owned tuner wiring =====
 
-// one registered scope: a per-box manifest at <das_root>/<name>.tune.json plus the harness
-// that produces it
+// one registered scope: the harness that regenerates this library's kernels, plus the
+// sidecar it writes into (the per-app file, resolved at scope-apply time)
 struct private TuneScope {
     scopeName : string
+    modName : string     // the declaring module — keys the scope's [tune] fname bank
     manifestPath : string
     tunerPath : string   // resolved against the declaring file; "" = no tuner declared
 }
 
-// declaring module name -> scope. [tune] applies in that module resolve their manifest here
-// when no DAS_TUNE_MANIFEST env is set; [tune_policy] drives tuner runs off the same bank.
+// declaring module name -> scope. [tune_policy] drives tuner runs off this bank; the [tune]
+// read path itself is scope-independent (every module reads the app sidecar).
 var private g_scopes : table<string; TuneScope>
 
-def private scope_manifest_for(modName : string) : string {
-    if (g_scopes |> key_exists(modName)) {
-        return g_scopes[modName].manifestPath
+// declaring module name -> the [tune] function names it registered. With ONE shared sidecar,
+// "is this scope tuned" cannot be file existence (another scope's tuner may have written it
+// first) — it is "does the sidecar carry an entry for every one of MY kernels". Set-valued:
+// shared-module macro state persists across compiles, insert is idempotent.
+var private g_scope_fnames : table<string; table<string>>
+
+// the ';'-joined [tune] fname list of `modName` — the literal the policy guard injection
+// carries into runtime, where the macro-side bank no longer exists
+def private scope_fnames_joined(modName : string) : string {
+    if (!(g_scope_fnames |> key_exists(modName))) {
+        return ""
     }
-    return ""
+    let names <- [for (fname in keys(g_scope_fnames[modName])); fname]
+    return join(names, ";")
+}
+
+//! Every kernel in the ';'-joined `fnames` list has a `"kernels"` entry in the sidecar at
+//! `path` (companions ride their main entry; an explicit "reference" entry counts). A
+//! missing, stale, or unparsable sidecar has no entries. An empty list is trivially
+//! complete. This is the "is this scope tuned" predicate — with one shared per-app sidecar,
+//! file existence proves nothing (another library's tuner may have written it first).
+def tune_sidecar_entries_complete(path : string; fnames : string) : bool {
+    var found = false
+    var manifest <- read_manifest(path, found)
+    var complete = found || empty(fnames)
+    if (found) {
+        for (fname in split(fnames, ";")) {
+            if (!empty(fname)) {
+                complete &&= manifest |> key_exists(fname)
+            }
+        }
+    }
+    delete manifest
+    return complete
 }
 
 // ===== the perm grid =====
@@ -507,6 +631,8 @@ class private TuneAnnotation : AstFunctionAnnotation {
             return false
         }
         let genKey = gv as tString
+        // register for the policy rail's per-scope completeness check (one shared sidecar)
+        g_scope_fnames["{compiling_module().name}"] |> insert("{func.name}")
         var perms <- take_perms(func, errors)
         if (empty(errors) && empty(perms)) {
             errors := "[tune] on {func.name}: no [tune_perm(...)] rows — list them BEFORE tune(...) in the same annotation bracket"
@@ -554,20 +680,15 @@ class private TuneAnnotation : AstFunctionAnnotation {
             delete comps
             return false
         }
-        // normal: manifest entry > fallback= > reference. The manifest is the env override
-        // when set, else the declaring module's [tune_scope] per-box file. A manifest with
-        // no entry for this function falls back to the declared fallback= (a manifest written
-        // before a kernel family landed must not silently drop that family to the reference
-        // tier); an explicit "reference" entry forces the original body. An app's
-        // [tune_manifest] declaration lives in the root module, which compiles after every
-        // library [tune] — its apply re-stamps the tuned functions from the declared manifest
-        // (see TuneManifestAnnotation below).
+        // normal: sidecar entry > fallback= > reference. The sidecar is the per-app file
+        // (env override folded in — see tune_manifest_path); a fresh sidecar with no entry
+        // for this function falls back to the declared fallback= (a sidecar written before
+        // a kernel family landed must not silently drop that family to the reference tier);
+        // an explicit "reference" entry forces the original body; a STALE sidecar (older
+        // than the binary) reads as absent.
         let fname = "{func.name}"
         var manifestFound = false
-        var mpath = get_env_variable("DAS_TUNE_MANIFEST")
-        if (empty(mpath)) {
-            mpath = scope_manifest_for("{compiling_module().name}")
-        }
+        let mpath = tune_manifest_path()
         var manifest <- read_manifest(mpath, manifestFound)
         var suffix = ""
         if (manifestFound) {
@@ -638,180 +759,19 @@ class private TuneAnnotation : AstFunctionAnnotation {
     }
 }
 
-// ===== [tune_manifest] — the app's per-app manifest declaration =====
-
-// [init] in the declaring module so the runtime write API targets the declared file; shared
-// by [tune_manifest] (root module) and [tune_scope] (library module) — one per module
-def private inject_runtime_path_init(mpath : string; var errors : das_string) : bool {
-    var fn = qmacro_function("`tune`manifest`runtime`init") $() : void {
-        set_tune_manifest_runtime_path($v(mpath))
-    }
-    fn |> append_annotation("$", "init")
-    fn.flags.generated = true
-    if (!(compiling_module() |> add_function(fn))) {
-        errors := "[tune_manifest]/[tune_scope]: duplicate declaration (one per module)"
-        return false
-    }
-    return true
-}
-
-def private strip_llvm_code(var fn : FunctionPtr) {
-    var i = length(fn.annotations) - 1
-    while (i >= 0) {
-        if (fn.annotations[i].annotation.name == "llvm_code") {
-            fn.annotations |> erase(i)
-        }
-        i--
-    }
-}
-
-// re-stamp one tuned function from the declared manifest: the grid, generator key and
-// companions are re-read from its attached [tune]/[tune_perm]/[tune_companion] declarations,
-// the fallback [llvm_code] stamps are dropped (companions included), and the manifest entry
-// is stamped onto the function and its companions. NO entry keeps the [tune]-time stamps
-// (fallback= or reference) untouched — a manifest written before this kernel family landed
-// must not silently drop it to the reference tier; an explicit "reference" entry forces the
-// original body.
-def private restamp_fn(var fn : FunctionPtr; mod : Module?; manifest : table<string; string>; mpath : string; var errors : das_string) {
-    let fname = "{fn.name}"
-    let suffix = manifest?[fname] ?? ""
-    if (empty(suffix)) {
-        return
-    }
-    var genKey = ""
-    var rows : array<TunePerm>
-    var comps : array<TuneCompanion>
-    for (ann in fn.annotations) {
-        if (ann.annotation.name == "tune") {
-            let gv = find_arg(ann.arguments, "gen")
-            if (gv is tString) { genKey = gv as tString }
-        } elif (ann.annotation.name == "tune_perm") {
-            rows |> emplace(build_perm_row(ann.arguments))
-        } elif (ann.annotation.name == "tune_companion") {
-            var c : TuneCompanion
-            let fv = find_arg(ann.arguments, "fn")
-            if (fv is tString) { c.fnname = fv as tString }
-            let gv = find_arg(ann.arguments, "gen")
-            if (gv is tString) { c.genkey = gv as tString }
-            c.fn = mod |> find_unique_function(c.fnname, true)  // validated at the [tune] apply
-            if (c.fn != null) {
-                comps |> emplace(c)
-            }
-        }
-    }
-    strip_llvm_code(fn)
-    for (c in comps) {
-        strip_llvm_code(c.fn)
-    }
-    if (suffix != "reference") {
-        var stamped = false
-        for (p in rows) {
-            if (p.suffix == suffix) {
-                stamp_llvm_code(fn, genKey, p, mpath)
-                for (c in comps) {
-                    stamp_llvm_code(c.fn, c.genkey, p, mpath)
-                }
-                print("llvm_tune: {fname} <- {suffix} ({mpath})\n")
-                stamped = true
-                break
-            }
-        }
-        if (!stamped) {
-            errors := "[tune_manifest]: perm '{suffix}' for {fname} is not in its [tune_perm] grid"
-        }
-    }
-    delete rows
-    delete comps
-}
-
-def private restamp_module(var mod : Module?; manifest : table<string; string>; mpath : string; var errors : das_string) {
-    var tuned : array<FunctionPtr>
-    for_each_function(mod, "") $(fn) {
-        for (ann in fn.annotations) {
-            if (ann.annotation.name == "tune") {
-                tuned |> push(fn)
-                break
-            }
-        }
-    }
-    for (fn in tuned) {
-        restamp_fn(fn, mod, manifest, mpath, errors)
-    }
-}
-
-// The [tune_manifest] re-stamp. Restricted to the DECLARING (root) module ON PURPOSE: mutating
-// a REQUIRED module's already-compiled [tune] function is a cross-module mutation that trips the
-// re-infer pass (see restamp_fn), so walking the whole program here would let an app-manifest
-// entry for a library kernel crash the compile. Library kernels take their manifest winners at
-// [tune] time instead (DAS_TUNE_MANIFEST env / [tune_scope]), which is cross-module-safe; policy
-// auto/--tune re-exec into a fresh compile for the same reason. So [tune_manifest] overrides
-// only the app's OWN [tune] functions; entries naming a required module's kernel are inert.
-def private restamp_root_module(manifest : table<string; string>; mpath : string; var errors : das_string) {
-    restamp_module(compiling_module(), manifest, mpath, errors)
-}
-
-//! `[tune_manifest(name = "myapp", dir = "...")]` on the app's `main` (any function in the
-//! root file): opts the app into a tune manifest at `<dir>/<name>.tune.json`. `dir` resolves
-//! against the declaring file's directory (absolute dirs pass through; omitted dir = the
-//! declaring file's directory), so two apps sharing a folder pick distinct names. In normal
-//! mode this apply re-stamps the app's OWN `[tune]` functions from the declared manifest — only
-//! the root module, since re-stamping a required library's compiled `[tune]` is cross-module
-//! and unsafe (see `restamp_root_module`); a manifest entry naming a library kernel is inert
-//! (override those via `DAS_TUNE_MANIFEST` env or `[tune_scope]`). No entry for a function keeps
-//! its `[tune]`-time stamp (fallback= or reference) — a stale manifest must not drop a new
-//! kernel family to the reference tier; an explicit "reference" entry forces the original body.
-//! Without the file the `fallback=` stamps stand. `DAS_TUNE_MANIFEST` overrides the declaration
-//! entirely. Also injects an [init] pointing the runtime write API (`tune_manifest_set`) at the
-//! same file.
-[function_macro(name = "tune_manifest")]
-class private TuneManifestAnnotation : AstFunctionAnnotation {
-    def override apply(var func : FunctionPtr; var group : ModuleGroup;
-                       args : AnnotationArgumentList; var errors : das_string) : bool {
-        // AOT is tune-free by contract — no init injection, no restamp
-        if (tune_aot_gate()) return true
-        let nv = find_arg(args, "name")
-        if (!(nv is tString) || empty(nv as tString)) {
-            errors := "[tune_manifest] on {func.name}: name=\"<app name>\" is required"
-            return false
-        }
-        let declDir = dir_name(string(func.at.fileInfo.name))
-        var dir = declDir
-        let dv = find_arg(args, "dir")
-        if (dv is tString) {
-            let d = dv as tString
-            dir = is_absolute(d) ? d : path_join(declDir, d)
-        }
-        let mpath = path_join(dir, "{nv as tString}.tune.json")
-        if (!inject_runtime_path_init(mpath, errors)) {
-            return false
-        }
-        // env override: every [tune] already stamped from it; grid modes stamp every perm
-        if (!empty(get_env_variable("DAS_TUNE_MANIFEST")) || tune_mode() != "normal") return true
-        var found = false
-        var manifest <- read_manifest(mpath, found)
-        if (found) {
-            restamp_root_module(manifest, mpath, errors)
-        }
-        delete manifest
-        return empty(errors)
-    }
-}
-
-// ===== [tune_scope] / [tune_policy] — the per-box UX rail =====
+// ===== [tune_scope] / [tune_policy] — the tuner-wiring UX rail =====
 
 def private resolve_decl_path(declFile : string; p : string) : string {
     return is_absolute(p) ? p : path_join(dir_name(declFile), p)
 }
 
 //! `[tune_scope(name = "mylib", tuner = "harness.das")]` on a (dummy) struct in the library
-//! module that owns the `[tune]` functions, declared ABOVE them: opts that module's kernels
-//! into a per-box shared manifest at `<das_root>/<name>.tune.json` — every app requiring the
-//! library shares the same winners with no app-side declaration. `tuner=` (optional) names
-//! the harness that produces the manifest, resolved against the declaring file;
-//! `[tune_policy]` and `--tune` run it. `DAS_TUNE_MANIFEST` still overrides everything; an
-//! app `[tune_manifest]` still re-stamps on top (its entries win, missing entries keep the
-//! scope winners). Also points the runtime write API (`tune_manifest_set`) at the scope file,
-//! so a manual `DAS_TUNE_MODE=tune` harness run lands winners in the right place by default.
+//! module that owns the `[tune]` functions, declared ABOVE them: names the library's tuner
+//! unit. `tuner=` (optional) is the harness that regenerates this library's winners in the
+//! app sidecar, resolved against the declaring file; `[tune_policy]` and `--tune` run it
+//! (with `DAS_TUNE_MANIFEST` pointed at the sidecar — the harness upserts its own keys and
+//! leaves other scopes' keys alone). The winners themselves live in the ONE per-app sidecar
+//! (see the module docstring) — there is no per-scope file.
 [structure_macro(name = "tune_scope")]
 class private TuneScopeAnnotation : AstStructureAnnotation {
     def override apply(var st : StructurePtr; var group : ModuleGroup;
@@ -828,10 +788,11 @@ class private TuneScopeAnnotation : AstStructureAnnotation {
         if (tv is tString) {
             tuner = resolve_decl_path(string(st.at.fileInfo.name), tv as tString)
         }
-        let mpath = path_join(get_das_root(), "{sname}.tune.json")
         // overwrite, not error: shared-module macro state persists across compiles in one process
-        g_scopes["{compiling_module().name}"] = TuneScope(scopeName = sname, manifestPath = mpath, tunerPath = tuner)
-        return inject_runtime_path_init(mpath, errors)
+        g_scopes["{compiling_module().name}"] = TuneScope(scopeName = sname,
+            modName = "{compiling_module().name}", manifestPath = tune_manifest_path(),
+            tunerPath = tuner)
+        return true
     }
 }
 
@@ -883,32 +844,24 @@ def private run_scope_tuner(scope : TuneScope) : bool {
 var private g_tuned_scopes = 0
 var private g_reexec_code = 0
 
-// "tuned" for the runtime guards means the SAME thing the compile-time [tune] gate means: a
-// manifest that exists AND parses (read_manifest's `found`). A stray empty / half-written /
-// corrupt file must NOT read as tuned — otherwise the guard no-ops while the compile fell back
-// to fallback stamps, and the app can never self-heal.
-def private manifest_present(path : string) : bool {
-    var found = false
-    var m <- read_manifest(path, found)
-    delete m
-    return found
-}
-
 //! Runtime half of `[tune_policy(missing = "auto")]` / `--tune` — injected at the top of the
 //! app's `main`, one call per scope, followed by `tune_auto_reexec()`. Runs the scope's tuner
-//! when the manifest is missing (unconditionally under `--tune`); tuning happens at RUNTIME
-//! because the winners are compile-time stamps — this process compiled without them, and the
-//! re-exec that follows picks them up in a fresh compile.
-def tune_auto_prepare(scopeName : string; manifestPath : string; tunerPath : string; force : bool) {
-    if (!force && manifest_present(manifestPath)) {
+//! when any of the scope's kernels (`fnames`, ';'-joined — the compile-time list baked into
+//! the guard) lacks a sidecar entry, or the sidecar is stale (unconditionally under
+//! `--tune`); tuning happens at RUNTIME because the winners are compile-time stamps — this
+//! process compiled without them, and the re-exec that follows picks them up in a fresh
+//! compile. A stray empty / half-written / corrupt sidecar reads as untuned — otherwise the
+//! guard would no-op while the compile fell back to fallback stamps, never self-healing.
+def tune_auto_prepare(scopeName : string; manifestPath : string; tunerPath : string; force : bool; fnames : string) {
+    if (!force && tune_sidecar_entries_complete(manifestPath, fnames)) {
         return
     }
     print("llvm_tune: scope '{scopeName}' {force ? "re-tuning (--tune)" : "is untuned on this box — tuning now"}\n")
     run_scope_tuner(TuneScope(scopeName = scopeName, manifestPath = manifestPath, tunerPath = tunerPath))
-    if (manifest_present(manifestPath)) {
+    if (tune_sidecar_entries_complete(manifestPath, fnames)) {
         g_tuned_scopes++
     } else {
-        print("llvm_tune: tuner produced no manifest at {manifestPath}\n")
+        print("llvm_tune: tuner left scope '{scopeName}' incomplete in {manifestPath}\n")
     }
 }
 
@@ -952,12 +905,12 @@ def tune_reexec_code() : int {
 }
 
 //! Runtime half of `[tune_policy(missing = "restart")]` — injected as a guard at the top of
-//! the app's `main`. When the scope manifest is missing: runs the tuner NOW, prints the
-//! restart banner, and returns true so main returns immediately (the winners are
-//! compile-time stamps — this process compiled without them). False = manifest present,
-//! carry on.
-def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : string) : bool {
-    if (manifest_present(manifestPath)) {
+//! the app's `main`. When any of the scope's kernels (`fnames`, ';'-joined) lacks a sidecar
+//! entry: runs the tuner NOW, prints the restart banner, and returns true so main returns
+//! immediately (the winners are compile-time stamps — this process compiled without them).
+//! False = scope complete, carry on.
+def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : string; fnames : string) : bool {
+    if (tune_sidecar_entries_complete(manifestPath, fnames)) {
         return false
     }
     print("llvm_tune: scope '{scopeName}' is untuned on this box\n")
@@ -966,10 +919,10 @@ def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : s
         return true
     }
     run_scope_tuner(TuneScope(scopeName = scopeName, manifestPath = manifestPath, tunerPath = tunerPath))
-    if (manifest_present(manifestPath)) {
+    if (tune_sidecar_entries_complete(manifestPath, fnames)) {
         print("llvm_tune: scope '{scopeName}' tuned -> {manifestPath}\nllvm_tune: restart to apply the winners\n")
     } else {
-        print("llvm_tune: tuner produced no manifest at {manifestPath}\n")
+        print("llvm_tune: tuner left scope '{scopeName}' incomplete in {manifestPath}\n")
     }
     return true
 }
@@ -979,14 +932,12 @@ def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : s
 // can't pollute it
 def private collect_status() : array<TuneStatus> {
     var rows : array<TuneStatus>
-    let env = get_env_variable("DAS_TUNE_MANIFEST")
+    let sidecar = tune_manifest_path()
     program_for_each_module(compiling_program()) $(mod) {
         let modName = "{mod.name}"
         var scopeName = ""
-        var scopePath = ""
         if (g_scopes |> key_exists(modName)) {
             scopeName = g_scopes[modName].scopeName
-            scopePath = g_scopes[modName].manifestPath
         }
         for_each_function(mod, "") $(fn) {
             var isTuned = false
@@ -1004,7 +955,7 @@ def private collect_status() : array<TuneStatus> {
             }
             if (isTuned) {
                 let source = empty(suffix) ? "reference" : (empty(from) ? "fallback" : "manifest")
-                let mpath = !empty(from) ? from : (!empty(env) ? env : scopePath)
+                let mpath = !empty(from) ? from : sidecar
                 rows |> push(TuneStatus(fname = "{fn.name}", scope = scopeName,
                     suffix = suffix, source = source, manifestPath = mpath))
             }
@@ -1067,10 +1018,8 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
         for (scope in scopes) {
             continue if (seen |> key_exists(scope.scopeName))
             seen |> insert(scope.scopeName)
-            var found = false
-            var manifest <- read_manifest(scope.manifestPath, found)
-            delete manifest
-            continue if (found && !force)
+            // per-scope KEY completeness, not file existence — the sidecar is shared
+            continue if (!force && tune_sidecar_entries_complete(scope.manifestPath, scope_fnames_joined(scope.modName)))
             if (force || policy == "auto") {
                 // NO tuner run and NO restamp at compile time: the tuner is a daslang child
                 // (can't run mid-compile), and restamping a REQUIRED module's compiled
@@ -1096,16 +1045,17 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
                     // autoinfer = undeclared result, void by convention for main
                     errors := "[tune_policy]: restart — {func.name} must return void or int"
                 } else {
+                    let fnames = scope_fnames_joined(scope.modName)
                     var guard : ExpressionPtr
                     if (func.result.baseType == Type.tInt) {
                         guard = qmacro_expr() {
-                            if (tune_restart_needed($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath))) {
+                            if (tune_restart_needed($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath), $v(fnames))) {
                                 return 3
                             }
                         }
                     } else {
                         guard = qmacro_expr() {
-                            if (tune_restart_needed($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath))) {
+                            if (tune_restart_needed($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath), $v(fnames))) {
                                 return
                             }
                         }
@@ -1131,8 +1081,9 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
                 var guards : array<ExpressionPtr>
                 guards |> reserve(length(autoScopes) + 1)
                 for (scope in autoScopes) {
+                    let fnames = scope_fnames_joined(scope.modName)
                     guards |> push <| qmacro_expr() {
-                        tune_auto_prepare($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath), $v(force))
+                        tune_auto_prepare($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath), $v(force), $v(fnames))
                     }
                 }
                 if (func.result.baseType == Type.tInt) {

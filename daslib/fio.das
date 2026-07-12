@@ -556,7 +556,7 @@ def copy_file_result(src : string; dst : string; overwrite : bool) : fs_result_b
 }
 
 [generic]
-def set_mtime_result(path : string; time : Time) : fs_result_bool {
+def set_mtime_result(path : string; time : clock) : fs_result_bool {  // clock = the builtin Time handled type ("Time" resolves to nothing — this overload was uncallable)
     var error : string
     let res = set_mtime(path, time, error)
     if (!empty(error)) return fs_result_bool(error = error)
