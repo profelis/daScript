@@ -449,6 +449,51 @@ matches the das CPU replay (promote-to-f32-round-back == per-op RNE) bit-exactly
 `-jit` + static binary on both suites; MCP lint + CI lint clean. New emitter surface as a side
 effect: classic 32-bit vector lane/splat/convert ctors now lower too (Phase 2 had none).
 
+**2026-07-11 — Phase 5 landed: simdgroup_matrix + host plumbing + the dasLLAMA offload
+experiment.** Three legs. **(5a) simdgroup_matrix through the emitter** — the first STRUCT-typed
+builtins: `simdgroup_float8x8`/`simdgroup_half8x8` in `metal_builtins.das` hold a row-major 8x8
+reference tile; every op (`make_filled_*`, `simdgroup_load`/`_store` with runtime offset+stride,
+`simdgroup_multiply`, `simdgroup_multiply_accumulate` — all-f32, all-f16, and the MIXED
+f32-acc/f16-operand ggml combo, Metal-frontend-probe-verified on M1) is the FULL cooperative tile
+op per call, so width-1 CPU replay stays idempotent and the same-body oracle works. Emitter:
+sgmat locals lower with `make_filled` zero fills (`= {}` does not construct the opaque type);
+loads/stores lower as member-pointer + offset (@ssbo device both ways, @workgroup threadgroup as
+load source); the load/store das overloads take an untyped buffer param, so their call names
+arrive as GENERIC instances (`` __::module`name`hash ``) — new `call_base_name` strips the
+qualifier + hash at every call-name site; `simdgroup_store` marks its buffer written in the
+write-set pre-scan. Fail-closed: `.data` access in a kernel, @ssbo of tiles, non-member load
+source, threadgroup store. Census 178→192. tests/msl 65/65 (SgMatTile + SgMatTiled fixtures);
+tests/metal 32/32 on M1 Max — single-tile f32+f16 vs sequential replay AND the
+threadgroup-staged mixed-mac tiled GEMM vs a direct CPU matmul, all BIT-EXACT
+(exact-by-construction integer values). **(5b) host plumbing, zero new externs** —
+`MetalPipelineCache` (hit allocates nothing), `MetalBufferPool` (pow2 buckets; re-acquire reuses),
+`with_compute_encoder` (N dispatches, one commit+wait; default hazard tracking orders them) —
+all proven through the live-object counter in `test_metal_plumbing.das`. MTLSharedEvent +
+MTLBinaryArchive DEFERRED by measurement: prefill offload is ~112 synchronous dispatches per
+multi-second prefill (~30 ms round-trip tax) and the das-side cache covers the kernel count.
+**(5c) the dasLLAMA offload experiment** — `dasllama/dasllama_math_metal.das` (guarded
+`require ?das_metal`, non-Apple lanes never see it): a 32x32-C-block kernel (128 threads = 4
+simdgroups, per-32-k in-kernel dequant of Q8 weights+activations into f16 threadgroup tiles with
+scales folded, mixed 8x8 macs, f32 out) + a self-contained lazy driver (weight regions upload
+once keyed by base address; pooled padded activation/output buffers — the kernel has no edge
+masking, pads are zeroed) registered as a BATCH-ONLY `KernelBackend("metal")` at priority -1
+(reachable only via `select_batch_backend`; small-ntok/odd shapes delegate to the portable CPU
+kernel through new `kernel_backend_batch_fn`). Recipe: `DASLLAMA_PIN_BACKEND=arm64-sdot` (the
+donor needs the row-major world) + `DASLLAMA_WSCALE_F16=0` (the override swaps only the f32
+batch slot) + `DASLLAMA_PIN_BATCH_BACKEND=metal`. Gates: `tests/dasLLAMA/test_metal_gemm.das`
+(pow2 scales = BIT-EXACT vs portable — int8 quants and pow2 products are exact in half; arbitrary
+scales = the f16-dequant envelope, bounded 2e-3 × the dot-magnitude sum, NOT |y| — cancellation
+makes |y|-relative bounds dishonest); dasLLAMA suite 368 tests dormant-green; 40/40 greedy
+token parity vs the CPU control with the GPU engaged (informational — tolerance path).
+**First numbers (M1 Max, Parsec ON — plumbing signal only, clean round pending the window):**
+iso ntok=512 llama1b shapes 1034–1971 GMAC/s vs the tuned arm64-gen CPU tier's 566–797 in the
+same window (2–2.5x on the big shapes); end-to-end `prefill_perf` 1B Q8: N=512 728 tok/s vs
+unpinned-CPU 567 (+28%), N=256 +19%, N=64 loses (absorbs the one-time pipeline compile + weight
+upload). das-side findings recorded: `select_batch_backend("")` clears the pin but the slot
+restores only at the next whole-backend activation (tests must pin "portable" explicitly for
+oracle runs); the pointer-keyed weight cache assumes load-once-stable weights (refilling the
+same arrays needs `metal_gemm_shutdown` — the documented cache contract).
+
 **2026-07-11 — pipeline: fixup-set global inits now infer; dasSpirv blob fill patch→fixup**
 (rides this branch — surfaced reviewing dasMetal's apply/fixup model). Boris called dasSpirv's
 patch+astChanged blob fill a workaround for a compiler gap; confirmed and fixed. Diagnosis
