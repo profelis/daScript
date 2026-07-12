@@ -30,6 +30,14 @@ add_custom_target(test_aot_daslib_modules)
 SET(DASLIB_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_DASLIB_MODULE_FILES}" DASLIB_MODULES_AOT_GENERATED_SRC test_aot_daslib_modules daslang)
 
+# Module .das sources are AOT-generation inputs too: an edit to a required module file (macro
+# or runtime) changes dependents' semantic hashes, and a stale generated TU then fails the AOT
+# link (error[50101]). DAS_AOT_EXTRA_DEPENDS wires the module globs into the affected dirs'
+# regen commands (daslib/*.das is already a global dependency inside DAS_AOT_EXT).
+FILE(GLOB DAS_AOT_DASSPIRV_MODULE_DEPENDS CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/modules/dasSpirv/spirv/*.das")
+FILE(GLOB DAS_AOT_DASMETAL_MODULE_DEPENDS CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/modules/dasMetal/metal/*.das")
+FILE(GLOB DAS_AOT_DASLLAMA_MODULE_DEPENDS CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/modules/dasLLAMA/dasllama/*.das")
+
 # AOT for individual test files
 FILE(GLOB AOT_TEST_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/aot/*.das")
 # Exclude _-prefixed helper modules (required transitively, not standalone test entry points)
@@ -133,6 +141,13 @@ SET(AOT_DASLLAMA_MODULE_FILES
     modules/dasLLAMA/dasllama/dasllama_chat.das
     modules/dasLLAMA/dasllama/dasllama.das
 )
+IF(APPLE)
+    # the Metal GPU offload modules hard-require the APPLE-gated das_metal C++ module; the
+    # tests reach them behind `require ?das_metal`, so off-Apple no stubs are needed
+    LIST(APPEND AOT_DASLLAMA_MODULE_FILES
+        modules/dasLLAMA/dasllama/dasllama_math_metal.das
+        modules/dasLLAMA/dasllama/dasllama_metal_prefill.das)
+ENDIF()
 
 # AOT for decs test files
 FILE(GLOB AOT_DECS_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/decs/*.das")
@@ -503,6 +518,7 @@ SET(AOT_SPIRV_MODULE_FILES
 FILE(GLOB AOT_MSL_FILES RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS "tests/msl/*.das")
 list(FILTER AOT_MSL_FILES EXCLUDE REGEX "/_")
 SET(AOT_MSL_MODULE_FILES
+    modules/dasMetal/metal/metal_builtins.das
     tests/msl/_msl_common.das
 )
 
@@ -515,6 +531,11 @@ list(FILTER AOT_METAL_FILES EXCLUDE REGEX "/_")
 SET(AOT_METAL_MODULE_FILES
     tests/metal/_metal_common.das
 )
+IF(APPLE)
+    # das_metal_boost hard-requires the APPLE-gated das_metal C++ module; the GPU-behavioral
+    # halves only exist on Apple (`require ?das_metal` + static_if feints elsewhere)
+    LIST(APPEND AOT_METAL_MODULE_FILES modules/dasMetal/metal/das_metal_boost.das)
+ENDIF()
 
 # AOT for daslib test files
 SET(AOT_DASLIB_TEST_FILES
@@ -680,6 +701,9 @@ add_custom_target(test_aot_dasgltf)
 SET(DASGLTF_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_DASGLTF_FILES}" DASGLTF_AOT_GENERATED_SRC test_aot_dasgltf daslang)
 
+# dasLLAMA tests require the dasllama module stack, and dasllama_math_metal pulls in the
+# dasMetal macro modules — both are regen inputs
+SET(DAS_AOT_EXTRA_DEPENDS ${DAS_AOT_DASLLAMA_MODULE_DEPENDS} ${DAS_AOT_DASMETAL_MODULE_DEPENDS})
 add_custom_target(test_aot_dasllama)
 SET(DASLLAMA_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_DASLLAMA_FILES}" DASLLAMA_AOT_GENERATED_SRC test_aot_dasllama daslang)
@@ -687,6 +711,7 @@ DAS_AOT("${AOT_DASLLAMA_FILES}" DASLLAMA_AOT_GENERATED_SRC test_aot_dasllama das
 add_custom_target(test_aot_dasllama_modules)
 SET(DASLLAMA_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_DASLLAMA_MODULE_FILES}" DASLLAMA_MODULES_AOT_GENERATED_SRC test_aot_dasllama_modules daslang)
+SET(DAS_AOT_EXTRA_DEPENDS "")
 
 add_custom_target(test_aot_decs)
 SET(DECS_AOT_GENERATED_SRC)
@@ -944,6 +969,7 @@ add_custom_target(test_aot_glsl)
 SET(GLSL_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_GLSL_FILES}" GLSL_AOT_GENERATED_SRC test_aot_glsl daslang)
 
+SET(DAS_AOT_EXTRA_DEPENDS ${DAS_AOT_DASSPIRV_MODULE_DEPENDS})
 add_custom_target(test_aot_spirv)
 SET(SPIRV_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_SPIRV_FILES}" SPIRV_AOT_GENERATED_SRC test_aot_spirv daslang)
@@ -952,6 +978,7 @@ add_custom_target(test_aot_spirv_modules)
 SET(SPIRV_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_SPIRV_MODULE_FILES}" SPIRV_MODULES_AOT_GENERATED_SRC test_aot_spirv_modules daslang)
 
+SET(DAS_AOT_EXTRA_DEPENDS ${DAS_AOT_DASMETAL_MODULE_DEPENDS})
 add_custom_target(test_aot_msl)
 SET(MSL_AOT_GENERATED_SRC)
 DAS_AOT("${AOT_MSL_FILES}" MSL_AOT_GENERATED_SRC test_aot_msl daslang)
@@ -967,6 +994,7 @@ DAS_AOT("${AOT_METAL_FILES}" METAL_AOT_GENERATED_SRC test_aot_metal daslang)
 add_custom_target(test_aot_metal_modules)
 SET(METAL_MODULES_AOT_GENERATED_SRC)
 DAS_AOT_LIB("${AOT_METAL_MODULE_FILES}" METAL_MODULES_AOT_GENERATED_SRC test_aot_metal_modules daslang)
+SET(DAS_AOT_EXTRA_DEPENDS "")
 
 add_custom_target(test_aot_fixed_array)
 SET(FIXED_ARRAY_AOT_GENERATED_SRC)
