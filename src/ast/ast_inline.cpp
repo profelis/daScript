@@ -218,7 +218,16 @@ namespace das {
             Module * mod;
             Module * dest;
             void checkFunc ( Function * fn ) {
-                if ( !fn || !privateSymbol.empty() ) return;
+                if ( !fn ) return;
+                // the compiled form of handle indexing under jit is a resolved `.[]`/`?[]`
+                // call (infer's visit(ExprAt) rewrites the At away) - flag it the same as
+                // the raw At below: its re-resolution consults the destination module's
+                // visible-function set and can dead-end (see checkHandleIndex)
+                if ( contextSensitive.empty()
+                    && (fn->name==".[]" || fn->name=="?[]" || fn->name==".?[]" || fn->name=="[]") ) {
+                    contextSensitive = fn->name;
+                }
+                if ( !privateSymbol.empty() ) return;
                 auto origin = fn->fromGeneric ? fn->fromGeneric : fn;
                 // instances are stamped private by instantiation, which keeps this gate
                 // deliberately conservative: a body calling ANY generic instance stays
@@ -292,6 +301,30 @@ namespace das {
                     privateSymbol = expr->variable->name;
                 }
             }
+            // handled-type indexing re-infers through name-based probes that consult the
+            // DESTINATION module's visible-function set (inferGenericOperator("[]") and,
+            // under jit, the native `.[]` probe - ast_infer_type.cpp visit(ExprAt)) BEFORE
+            // the module-insensitive annotation path. The same body can therefore infer
+            // differently after a cross-module splice (proven: ast_boost's
+            // add_annotation_argument spliced into daslib/flatten rewrote its At into an
+            // unresolvable `.[]` call under -jit). Best-effort sites decline; MUST keeps
+            // master semantics
+            void checkHandleIndex ( Expression * sub ) {
+                if ( !contextSensitive.empty() || !sub || !sub->type ) return;
+                if ( sub->type->isHandle() && sub->type->annotation ) {
+                    contextSensitive = sub->type->annotation->name;
+                }
+            }
+            virtual void preVisit ( ExprAt * expr ) override {
+                Visitor::preVisit(expr);
+                checkHandleIndex(expr->subexpr);
+            }
+            virtual void preVisit ( ExprSafeAt * expr ) override {
+                Visitor::preVisit(expr);
+                checkHandleIndex(expr->subexpr);
+            }
+        public:
+            string contextSensitive;
         };
 
         // ----- cloned-body fixup: rename locals, substitute parameter reads -----
@@ -471,8 +504,9 @@ namespace das {
         // ----- worthiness metric (heuristic plain-call candidacy) -----
 
         struct BodyCost {
-            int  nodes = 0;
-            bool hasLoop = false;
+            int     nodes = 0;
+            bool    hasLoop = false;
+            int64_t stackBytes = 0;     // sum of local let sizes - the frame the body owns
         };
 
         BodyCost bodyCost ( Expression * body ) {
@@ -480,9 +514,27 @@ namespace das {
             lookupExpressions(body, [&](Expression * e) {
                 bc.nodes ++;
                 if ( e->rtti_isFor() || e->rtti_isWhile() ) bc.hasLoop = true;
+                if ( e->rtti_isLet() ) {
+                    auto let = static_cast<ExprLet *>(e);
+                    for ( auto & v : let->variables ) {
+                        if ( v->type && !v->type->isAutoOrAlias() ) bc.stackBytes += v->type->getSizeOf64();
+                    }
+                }
             });
             return bc;
         }
+
+        // splicing rehomes callee locals into the caller frame PERMANENTLY (spliced
+        // slots are not reused across sites), so unbounded splicing inflates frames
+        // past documented `options stack` contracts (proven: dasLLAMA's respond()
+        // chain overflowed its documented 64K under default-on). three bounds:
+        // a callee owning more than CALLEE_STACK bytes of locals is not worth a
+        // heuristic splice; a caller whose frame already holds more than
+        // CALLER_FRAME bytes gets no heuristic sites; and one round may add at
+        // most CALLER_GROWTH bytes to any single caller
+        constexpr int64_t AUTO_INLINE_CALLEE_STACK_BYTES  = 512;
+        constexpr int64_t AUTO_INLINE_CALLER_FRAME_BYTES  = 4096;
+        constexpr int64_t AUTO_INLINE_CALLER_GROWTH_BYTES = 2048;
 
         // best-effort candidacy configuration for one patch round. blockLiterals is the
         // pre-existing auto tier (block-literal call sites + devirt); functions is the
@@ -508,7 +560,8 @@ namespace das {
             auto it = cfg.worthCache->find(fn);
             if ( it != cfg.worthCache->end() ) return it->second;
             BodyCost bc = bodyCost(fn->body);
-            bool ok = !bc.hasLoop && bc.nodes <= cfg.budget;
+            bool ok = !bc.hasLoop && bc.nodes <= cfg.budget
+                && bc.stackBytes <= AUTO_INLINE_CALLEE_STACK_BYTES;
             (*cfg.worthCache)[fn] = ok;
             return ok;
         }
@@ -1229,7 +1282,7 @@ namespace das {
             das_hash_map<Function *, bool> shapeCache;
             das_hash_map<Function *, pair<bool,string>> autoOkCache;
             das_hash_map<ExprMakeBlock *, pair<bool,string>> devirtShapeCache;
-            das_hash_map<Function *, string> privateUseCache;
+            das_hash_map<Function *, pair<string,string>> privateUseCache;   // {privateSymbol, contextSensitive}
 
             bool calleeShapeOk ( Function * fn ) {
                 auto it = shapeCache.find(fn);
@@ -1312,12 +1365,12 @@ namespace das {
                 return st;
             }
 
-            const string & privateUse ( Function * fn, Module * originModule ) {
+            const pair<string,string> & privateUse ( Function * fn, Module * originModule ) {
                 auto it = privateUseCache.find(fn);
                 if ( it != privateUseCache.end() ) return it->second;
                 PrivateUseScan scan(originModule, program->thisModule.get());
                 fn->body->visit(scan);
-                return privateUseCache[fn] = scan.privateSymbol;
+                return privateUseCache[fn] = make_pair(scan.privateSymbol, scan.contextSensitive);
             }
 
             // next free __inl counter across a subtree; names are function-scoped and
@@ -1403,6 +1456,11 @@ namespace das {
                     // _migrate_inner instance) stop resolving. cross-origin instances
                     // keep their bodies untouched
                     fnCfg.functions = false;
+                } else if ( bodyCost(fn->body).stackBytes > AUTO_INLINE_CALLER_FRAME_BYTES ) {
+                    // a frame already this large is one deep-chain hop away from an
+                    // `options stack` overflow - stop growing it (recomputed per round,
+                    // so accumulated splices shut the door behind themselves)
+                    fnCfg.functions = false;
                 }
             }
             InlineCollect collect(fnCfg);
@@ -1418,6 +1476,9 @@ namespace das {
                 }
             }
             int inlineId = nextInlineId(fn);
+            // per-round frame-growth budget (see AUTO_INLINE_CALLER_GROWTH_BYTES);
+            // conservatively charged at the gate, so later-declined sites still count
+            int64_t grownBytes = 0;
             // a splice shifts the indices of later statements in the same block
             das_hash_map<ExprBlock *, int> indexShift;
             for ( auto & site : collect.sites ) {
@@ -1482,6 +1543,14 @@ namespace das {
                     decline(site, "the statement has a potential table lookup collision (error 30250 preserved for lint)", callLike->at);
                     continue;
                 }
+                if ( site.kind==SiteKind::AutoCall && calleeFn ) {
+                    int64_t calleeBytes = bodyCost(calleeFn->body).stackBytes;
+                    if ( grownBytes + calleeBytes > AUTO_INLINE_CALLER_GROWTH_BYTES ) {
+                        decline(site, "caller frame growth budget exhausted this round", callLike->at);
+                        continue;
+                    }
+                    grownBytes += calleeBytes;
+                }
                 // ----- subject shape gates -----
                 ExprBlock * body = nullptr;
                 TypeDecl * subjResult = nullptr;    // null = void result
@@ -1532,8 +1601,12 @@ namespace das {
                         ? calleeFn->fromGeneric->module : calleeFn->module;
                     if ( originModule != program->thisModule.get() ) {
                         auto & priv = privateUse(calleeFn, originModule);
-                        if ( !priv.empty() ) {
-                            siteFail(site, "can't inline " + subjName + " across modules: body uses private symbol '" + priv + "'", callLike->at);
+                        if ( !priv.first.empty() ) {
+                            siteFail(site, "can't inline " + subjName + " across modules: body uses private symbol '" + priv.first + "'", callLike->at);
+                            continue;
+                        }
+                        if ( site.kind!=SiteKind::MustCall && !priv.second.empty() ) {
+                            decline(site, "cross-module body indexes handled type '" + priv.second + "' - re-infer is module-context-sensitive", callLike->at);
                             continue;
                         }
                     }
