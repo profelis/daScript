@@ -10,6 +10,7 @@ options indenting = 4
 module _msl_common shared public
 
 require metal/msl_shader public
+require math
 
 class MulAB {
     @ssbo @binding = 0 a : array<float>
@@ -447,6 +448,38 @@ class SgMatTiled {
     }
 }
 
+// Phase-6 math builtins: the value-call whitelist with 1:1 MSL spellings — float scalar +
+// vector classes throughout (abs also signed int; min/max any numeric class)
+class MathCalls {
+    @ssbo @binding = 0 a : array<float>
+    @ssbo @binding = 1 b : array<float>
+    @ssbo @binding = 2 c : array<float>
+    @ssbo @binding = 3 va : array<float4>
+    @ssbo @binding = 4 vb : array<float4>
+    @ssbo @binding = 5 vc : array<float4>
+    @ssbo @binding = 6 ia : array<int>
+    @ssbo @binding = 7 ib : array<int>
+    @ssbo @binding = 8 ic : array<int>
+    @ssbo @binding = 9 ua : array<uint>
+    @ssbo @binding = 10 ub : array<uint>
+    @ssbo @binding = 11 uc : array<uint>
+
+    [metal_kernel(name="mathcalls_msl"), marker(no_coverage)]
+    def mathcalls {
+        let i = gl_GlobalInvocationID.x
+        let x = a[i]
+        let y = b[i]
+        c[i] = (((exp(min(x, 4.0)) + sqrt(abs(x))) + (rsqrt(abs(y) + 1.0) + tanh(x))) +
+            ((sin(x) + cos(y)) + (saturate(x) + max(x, y))))
+        let u = va[i]
+        let v = vb[i]
+        vc[i] = (((exp(min(u, float4(4.0))) + sqrt(abs(u))) + (rsqrt(abs(v) + float4(1.0)) + tanh(u))) +
+            ((sin(u) + cos(v)) + (saturate(u) + max(u, v))))
+        ic[i] = min(abs(ia[i]), ib[i]) + max(ia[i], ib[i])
+        uc[i] = min(ua[i], ub[i]) + max(ua[i], ub[i])
+    }
+}
+
 //! Gate B: exactly the construct kinds the fixture set must emit — the census meta-test
 //! asserts equality with the observed union in both directions.
 def public declared_msl_census : table<string> {
@@ -646,6 +679,33 @@ def public declared_msl_census : table<string> {
         "call.sgmat_mac.f32",
         "call.sgmat_mac.f16",
         "call.sgmat_mac.mixed",
+        // math builtins (Phase 6): 1:1 MSL spellings — float scalar + vector classes
+        // (abs also signed int; min/max any numeric class)
+        "call.math.exp.f32",
+        "call.math.sqrt.f32",
+        "call.math.rsqrt.f32",
+        "call.math.sin.f32",
+        "call.math.cos.f32",
+        "call.math.tanh.f32",
+        "call.math.abs.f32",
+        "call.math.saturate.f32",
+        "call.math.min.f32",
+        "call.math.max.f32",
+        "call.math.exp.f32v",
+        "call.math.sqrt.f32v",
+        "call.math.rsqrt.f32v",
+        "call.math.sin.f32v",
+        "call.math.cos.f32v",
+        "call.math.tanh.f32v",
+        "call.math.abs.f32v",
+        "call.math.saturate.f32v",
+        "call.math.min.f32v",
+        "call.math.max.f32v",
+        "call.math.abs.i32",
+        "call.math.min.i32",
+        "call.math.max.i32",
+        "call.math.min.u32",
+        "call.math.max.u32",
         // statements
         "stmt.let",
         "stmt.var",
@@ -667,5 +727,5 @@ def public all_msl_censuses : array<string> {
     return <- [mul_ab_msl_census, uarith_msl_census, iarith_msl_census, farith_msl_census,
         vecarith_msl_census, control_msl_census, loops_msl_census, reduce_msl_census, simd_msl_census,
         halfarith_msl_census, latconv_msl_census, packed3_msl_census, sgmat_msl_census,
-        sgmat_tiled_msl_census]
+        sgmat_tiled_msl_census, mathcalls_msl_census]
 }

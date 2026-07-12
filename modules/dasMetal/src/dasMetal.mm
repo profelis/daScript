@@ -242,6 +242,16 @@ namespace das {
         }
     }
 
+    double metal_command_buffer_gpu_start_time ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at ) {
+        if ( !cb ) ctx->throw_error_at(at, "metal_command_buffer_gpu_start_time: null command buffer");
+        return [(__bridge id<MTLCommandBuffer>)(void *) cb GPUStartTime];
+    }
+
+    double metal_command_buffer_gpu_end_time ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at ) {
+        if ( !cb ) ctx->throw_error_at(at, "metal_command_buffer_gpu_end_time: null command buffer");
+        return [(__bridge id<MTLCommandBuffer>)(void *) cb GPUEndTime];
+    }
+
     // ===== lifetime =====
 
     void metal_release_device ( MetalDevice * h ) { release_handle(h); }
@@ -332,6 +342,12 @@ namespace das {
                     ->args({"command_buffer", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_command_buffer_error)>(*this, lib, "metal_command_buffer_error",
                 SideEffects::modifyExternal, "metal_command_buffer_error")
+                    ->args({"command_buffer", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_command_buffer_gpu_start_time)>(*this, lib, "metal_command_buffer_gpu_start_time",
+                SideEffects::modifyExternal, "metal_command_buffer_gpu_start_time")
+                    ->args({"command_buffer", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_command_buffer_gpu_end_time)>(*this, lib, "metal_command_buffer_gpu_end_time",
+                SideEffects::modifyExternal, "metal_command_buffer_gpu_end_time")
                     ->args({"command_buffer", "context", "at"});
 
             addExtern<DAS_BIND_FUN(metal_release_device)>(*this, lib, "metal_release",

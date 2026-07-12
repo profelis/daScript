@@ -226,6 +226,38 @@ Three behavioral layers + enforcement gates:
   per prefill via `with_compute_encoder`, unified memory hands the KV cache back to the CPU
   decode path), integration above the batch-slot seam (the per-arch prefill blocks —
   `ArchBlocks` — or a whole-prefill override behind the same env-pin discipline).
+  **Sizing (2026-07-11 session start, from the forward-path map).** The 7 per-layer q8 GEMMs
+  (Q/K/V/O/W1/W3/W2) already route through the batch slot; the CPU remainder is `rms_batch`,
+  `rope_batch_tab` (TABLE-driven — cos/sin precomputed per prefill, so the GPU rope kernel
+  needs no trig), the per-GEMM activation requant, `prefill_attention`, `gate_batch`
+  (swiglu), `add_inplace`, `kv_store_batch`; final norm + classifier is last-row-only GEMV
+  and stays CPU. Legs, in order:
+  - **6.0 — detector first.** `metal_command_buffer_gpu_start_time/_end_time` externs
+    (`GPUStartTime`/`GPUEndTime`) + structured per-stage host timing in the driver — the
+    GPU-busy vs wall vs upload/readback split steers every later leg.
+  - **6a — emitter math builtins.** Value-call whitelist exp/sqrt/rsqrt/min/max/abs/
+    saturate/tanh/sin/cos (das math-module names ARE the MSL spellings; float scalar +
+    vector classes); census + msl goldens + a metal behavioral fixture.
+  - **6b — kernels** (each: msl golden + census + CPU-reference metal test): `quantize_q8`
+    (f32 → int8 + scale per 32-group, writing the padded-M layout the GEMM reads), `rmsnorm`
+    (simd_sum + threadgroup reduction, rsqrt), `rope` (reads the uploaded cos/sin tables),
+    `swiglu`, residual `add`, and the attention pair — `attn_scores` (scaled q·kT + causal
+    mask + row softmax) and `attn_av` (P·V), GQA kv_mul=4, f32. Naive attention first:
+    ~17 GMAC vs ~630 GMAC of projections at N=512 — flash fusion only if the detector says
+    so. Scores scratch (heads x N x N f32 ≈ 32 MB) reused across layers.
+  - **6c — resident driver.** dasllama_math_metal.das grows a whole-prefill path: weights
+    already lazily resident (+ the small per-layer norm-weight vectors); pooled resident
+    activation set (x/xb/xb2/q/k/v/hb/hb2/xq/xs/scores + per-layer K/V outs); ONE command
+    buffer per prefill (~10 dispatches x 16 layers, default hazard tracking orders). Host:
+    embed rows (CPU) → upload x_b + rope tables → encode → one wait → per-layer K/V
+    readback → `kv_store_batch` (session KV codec stays CPU — any KV dtype works) →
+    last-row readback → CPU final norm + classifier.
+  - **6d — integration + parity + measurement.** Whole-prefill override seam (chosen over
+    per-block ArchBlocks twins: one seam owns encode→wait→readback): fn-ptr slot +
+    select-by-name + `DASLLAMA_PIN_PREFILL` env in the harnesses, same pin discipline;
+    fall back to the hybrid/CPU path for non-q8, start_pos>0, small npos, or non-std arch
+    shapes. Gates: kernel unit parity tests, 40/40 greedy parity (tolerance path), then the
+    clean round (Parsec OFF — Boris window): CPU vs hybrid vs resident vs lcpp `-ngl 99`.
 
 ## Cross-backend parity (deferred — not a gate)
 

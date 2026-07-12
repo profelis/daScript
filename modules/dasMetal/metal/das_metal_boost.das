@@ -153,6 +153,14 @@ def public pool_drain(var pool : MetalBufferPool) {
 //! orders same-buffer dispatches within the encoder. Returns false with `error` filled when the
 //! command buffer reports a GPU-side failure.
 def public with_compute_encoder(queue : MetalCommandQueue?; var error : string&; blk : block<(enc : MetalComputeEncoder?) : void>) : bool {
+    var gpu_ms = 0.0lf
+    return with_compute_encoder_timed(queue, error, gpu_ms, blk)
+}
+
+//! The timed twin: `gpu_ms` gets the command buffer's GPU execution time (GPUEndTime −
+//! GPUStartTime, milliseconds) — the honest GPU-busy number, as opposed to the host wall time
+//! around commit+wait which folds in scheduling and readback.
+def public with_compute_encoder_timed(queue : MetalCommandQueue?; var error : string&; var gpu_ms : double&; blk : block<(enc : MetalComputeEncoder?) : void>) : bool {
     let cb = metal_new_command_buffer(queue)
     let enc = metal_new_compute_encoder(cb)
     invoke(blk, enc)
@@ -160,6 +168,7 @@ def public with_compute_encoder(queue : MetalCommandQueue?; var error : string&;
     metal_commit(cb)
     metal_wait_until_completed(cb)
     error = metal_command_buffer_error(cb)
+    gpu_ms = (metal_command_buffer_gpu_end_time(cb) - metal_command_buffer_gpu_start_time(cb)) * 1000.0lf
     metal_release(enc)
     metal_release(cb)
     return empty(error)

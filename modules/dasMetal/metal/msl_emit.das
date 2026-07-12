@@ -722,12 +722,55 @@ def private sgmat_zero_fill(sgname : string) : string {
     return "make_filled_simdgroup_matrix<{sgmat_elem_name(sgname)}, 8, 8>({zero})"
 }
 
-// simdgroup intrinsics + the ctor/convert/saturating-narrow family are the only calls with a
-// VALUE lowering (metal_builtins declares the simd set for float/int/uint; the identity stub
-// bodies never matter here — only the call AST is read)
+// scalar/vector math builtins with a 1:1 MSL spelling (das math-module names). Unary set is
+// float-family (abs also signed-int); min/max take any numeric class. Fastmath is a kernel-level
+// property; single ops stay correctly rounded under MTLMathModeSafe (Phase-4 measured fact).
+let private MSL_MATH_UNARY : table<string> <- {
+    "exp", "sqrt", "rsqrt", "sin", "cos", "tanh", "abs", "saturate"
+}
+
+// simdgroup intrinsics, the math whitelist, + the ctor/convert/saturating-narrow family are the
+// only calls with a VALUE lowering (metal_builtins declares the simd set for float/int/uint; the
+// identity stub bodies never matter here — only the call AST is read)
 def private emit_call_value(var ctx : MslCtx; ec : ExprCall?) : string {
     let cname = call_base_name("{ec.name}")
     let na = length(ec.arguments)
+    if (key_exists(MSL_MATH_UNARY, cname)) {
+        if (na != 1) {
+            err(ctx, ec.at, "{cname} takes exactly one argument")
+            return "/*call {cname}*/"
+        }
+        if (reject_cpu_only_width(ctx, ec.at, ec.arguments[0]._type)) {
+            return "/*call {cname}*/"
+        }
+        let acls = census_class(ec.arguments[0]._type)
+        let ok = (acls |> starts_with("f")) || (cname == "abs" && (acls |> starts_with("i")))
+        if (!ok) {
+            err(ctx, ec.at, "{cname} lowers for float{cname == "abs" ? "/signed-int" : ""} classes only — argument is {acls}")
+            return "/*call {cname}*/"
+        }
+        let v = emit_value(ctx, ec.arguments[0])
+        note(ctx, "call.math.{cname}.{acls}")
+        return "{cname}({v})"
+    }
+    if (cname == "min" || cname == "max") {
+        if (na != 2) {
+            err(ctx, ec.at, "{cname} takes exactly two arguments")
+            return "/*call {cname}*/"
+        }
+        if (reject_cpu_only_width(ctx, ec.at, ec.arguments[0]._type)) {
+            return "/*call {cname}*/"
+        }
+        let acls = census_class(ec.arguments[0]._type)
+        if (!(acls |> starts_with("f")) && !(acls |> starts_with("i")) && !(acls |> starts_with("u"))) {
+            err(ctx, ec.at, "{cname} lowers for numeric classes only — argument is {acls}")
+            return "/*call {cname}*/"
+        }
+        let a = emit_value(ctx, ec.arguments[0])
+        let b = emit_value(ctx, ec.arguments[1])
+        note(ctx, "call.math.{cname}.{acls}")
+        return "{cname}({a}, {b})"
+    }
     if (cname == "simd_sum") {
         if (na != 1) {
             err(ctx, ec.at, "simd_sum takes exactly one argument")

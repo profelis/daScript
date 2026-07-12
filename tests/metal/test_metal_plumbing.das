@@ -63,14 +63,16 @@ def test_host_plumbing(t : T?) {
                 }
                 var queue = metal_new_command_queue(dev)
                 var derr : string
-                let ran = with_compute_encoder(queue, derr) <| $(enc : MetalComputeEncoder?) {
+                var gpu_ms = 0.0lf
+                let ran = with_compute_encoder_timed(queue, derr, gpu_ms) <| $(enc : MetalComputeEncoder?) {
                     metal_set_pipeline(enc, pso1)
                     metal_set_buffer(enc, ba, 0ul, 0)
                     metal_dispatch_threadgroups(enc, uint3(uint(N) / TPG, 1u, 1u), uint3(TPG, 1u, 1u))
                     metal_dispatch_threadgroups(enc, uint3(uint(N) / TPG, 1u, 1u), uint3(TPG, 1u, 1u))
                     metal_dispatch_threadgroups(enc, uint3(uint(N) / TPG, 1u, 1u), uint3(TPG, 1u, 1u))
                 }
-                t |> success(ran, "with_compute_encoder: {derr}")
+                t |> success(ran, "with_compute_encoder_timed: {derr}")
+                t |> success(gpu_ms > 0.0lf, "GPUStartTime/GPUEndTime bracket the completed work")
                 var bad = 0
                 for (k in range(N)) {
                     if (unsafe(pu[k]) != uint(k) + 3u) {
