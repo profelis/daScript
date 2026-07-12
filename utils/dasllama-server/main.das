@@ -25,6 +25,7 @@ require daslib/clargs
 require daslib/toml
 require daslib/json_boost
 require daslib/module_path
+require daslib/logger
 require daslib/fio
 require math
 
@@ -242,6 +243,9 @@ def main : int {
     set_dispatch_worker_limit(threads)
     let lanes_desc = threads > 0 ? "{threads}" : "all"
     print("dispatch: {lanes_desc} worker lanes\n")
+    // tee every to_log/print to logs/dasllama-server.log (timestamped ndjson) AND the console
+    logger_init_tee("dasllama-server")
+    to_log(LOG_INFO, "dasllama-server: logging to {get_das_root()}/logs/dasllama-server.log\n")
 
     log_tune_status("dasllama-server")
     print("loading {cfg.model} ...\n")
