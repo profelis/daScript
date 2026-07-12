@@ -66,6 +66,8 @@ def test_metal_prefill_parity(t : T?) {
             if (!model_available(t, path)) {
                 return
             }
+            let prior_wscale = get_wscale_f16()             // process-wide knobs — restored below
+            let prior_backend = active_kernel_backend()     // (both exit paths run through the restore)
             set_wscale_f16(false)       // the resident path reads the f32 scale plane (declines on s16)
             pin_kernel_backend("portable")  // ...and ROW-MAJOR weights — a repack backend's layout is unreadable (5c donor contract)
             var tr <- load_model(path, QuantMode.q8)
@@ -82,6 +84,9 @@ def test_metal_prefill_parity(t : T?) {
             let served = metal_prefill_stats().prefills - before
             select_prefill_override("")
             set_metal_prefill_min_npos(64l)
+            clear_kernel_backend_pin()
+            select_kernel_backend(prior_backend)
+            set_wscale_f16(prior_wscale)
             if (served == 0l) {
                 metal_prefill_shutdown()
                 delete tr
