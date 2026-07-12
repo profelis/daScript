@@ -216,6 +216,16 @@ Three behavioral layers + enforcement gates:
 - **Phase 5 — `simdgroup_matrix` + host perf plumbing.** `simdgroup_float8x8` et al. (the
   dasLLAMA prize), buffer pooling, `MTLSharedEvent` sync, `MTLBinaryArchive` pipeline
   cache. Sized when we get there; a dasLLAMA offload experiment is the driver.
+- **Phase 6 — full-GPU-resident prefill for ONE model (Llama-3.2-1B), chase the 3960.**
+  Mandate (Boris, 2026-07-11, after the Phase-5 clean round): cover the one model end to end
+  and see how close we get to llama.cpp full-Metal (pp512 3960 t/s vs our hybrid's 1055 —
+  the gap is residency: per-GEMM sync submits + activation/output memcpys + CPU attention).
+  Sized at session start; expected legs: emitter math-builtin whitelist growth (exp/sqrt/
+  rsqrt/min/max — rmsnorm + softmax kernels need them), attention/norm/rope kernels over the
+  Phase-3/5 constructs, activations resident in MTLBuffers across the layer loop (one encoder
+  per prefill via `with_compute_encoder`, unified memory hands the KV cache back to the CPU
+  decode path), integration above the batch-slot seam (the per-arch prefill blocks —
+  `ArchBlocks` — or a whole-prefill override behind the same env-pin discipline).
 
 ## Cross-backend parity (deferred — not a gate)
 
