@@ -1402,8 +1402,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             if (t.config.ssm_d_inner != t.config.ssm_dt_rank * t.config.ssm_d_state) {
                 panic("dasLLAMA: deltanet inner_size {t.config.ssm_d_inner} != time_step_rank {t.config.ssm_dt_rank} * state_size {t.config.ssm_d_state}")
             }
-            if (t.config.ssm_d_conv < 2l || t.config.ssm_dt_rank % t.config.ssm_n_group != 0l) {
-                panic("dasLLAMA: unsupported deltanet geometry (conv_kernel {t.config.ssm_d_conv}, v-heads {t.config.ssm_dt_rank}, k-heads {t.config.ssm_n_group})")
+            if (t.config.ssm_d_state <= 0l || t.config.ssm_n_group <= 0l || t.config.ssm_dt_rank <= 0l
+                    || t.config.ssm_d_conv < 2l || t.config.ssm_dt_rank % t.config.ssm_n_group != 0l) {
+                panic("dasLLAMA: unsupported deltanet geometry (conv_kernel {t.config.ssm_d_conv}, state {t.config.ssm_d_state}, v-heads {t.config.ssm_dt_rank}, k-heads {t.config.ssm_n_group})")
             }
             if (dn_conv_dim(t.config) % 4l != 0l) {   // the batched conv reads float4 rows (validate-at-load, kv_validate_q8 precedent)
                 panic("dasLLAMA: deltanet conv_dim {dn_conv_dim(t.config)} must be a multiple of 4")
