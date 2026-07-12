@@ -98,8 +98,13 @@ namespace das {
 #else
             opts.fastMathEnabled = fastmath ? YES : NO;
 #endif
+            NSString * nsSrc = [NSString stringWithUTF8String:src];
+            if ( nsSrc == nil ) {   // invalid UTF-8 — a nil source would raise an ObjC exception below
+                error = ctx->allocateString("metal_new_library_from_source: MSL source is not valid UTF-8", at);
+                return nullptr;
+            }
             NSError * err = nil;
-            id<MTLLibrary> lib = [d newLibraryWithSource:[NSString stringWithUTF8String:src]
+            id<MTLLibrary> lib = [d newLibraryWithSource:nsSrc
                                                  options:opts
                                                    error:&err];
             if ( lib == nil ) {
@@ -115,7 +120,9 @@ namespace das {
         if ( !name || !*name ) ctx->throw_error_at(at, "metal_new_function: empty function name");
         @autoreleasepool {
             id<MTLLibrary> l = (__bridge id<MTLLibrary>)(void *) lib;
-            return retain_handle<MetalFunction>([l newFunctionWithName:[NSString stringWithUTF8String:name]]);
+            NSString * nsName = [NSString stringWithUTF8String:name];
+            if ( nsName == nil ) ctx->throw_error_at(at, "metal_new_function: entry name is not valid UTF-8");
+            return retain_handle<MetalFunction>([l newFunctionWithName:nsName]);
         }
     }
 
