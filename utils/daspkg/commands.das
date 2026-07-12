@@ -1887,8 +1887,9 @@ def private clean_previous_release(bundle_dir : string) {
     }
     for (line in split(body, "\n")) {
         let rel = strip(line)
-        // skip blanks; stay inside the bundle even on a corrupt or hostile manifest
-        if (empty(rel) || find(rel, "..") >= 0 || starts_with(rel, "/") || find(rel, ":") >= 0) {
+        // skip blanks; stay inside the bundle even on a corrupt or hostile manifest —
+        // reject `..`, drive colons, and both absolute spellings (`/x`, `\x` = drive root)
+        if (empty(rel) || find(rel, "..") >= 0 || starts_with(rel, "/") || starts_with(rel, "\\") || find(rel, ":") >= 0) {
             continue
         }
         let p = path_join(bundle_dir, rel)
