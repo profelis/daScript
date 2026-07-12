@@ -21,7 +21,7 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 
 | Flag | Short | Default | Meaning |
 |---|---|---|---|
-| `--config` | `-c` | — | TOML config file; keys mirror the long flag names, explicit CLI flags override |
+| `--config` | `-c` | *auto* | TOML config file; keys mirror the long flag names, explicit CLI flags override. Without the flag, a `dasllama-server.toml` in the cwd or next to the program loads automatically |
 | `--model` | `-m` | *(required)* | GGUF model to serve (here or in `--config`) |
 | `--port` | `-p` | `8080` | Listen port |
 | `--quant` | `-q` | `q8` | Weight quantization: `fp32` \| `q8` \| `q4` |
@@ -30,14 +30,16 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--mmproj` | — | — | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
 | `--ctx` | — | `4096` | Context-length cap in tokens |
 | `--streams` | `-s` | `4` | Max concurrent generation streams |
+| `--threads` | `-t` | `16` | Worker-lane cap for the matmul dispatch (`-1` = all cores) — decode is bandwidth-bound, so an uncapped dispatch just fights the rest of the box |
 | `--chunk` | — | `64` | Prefill quantum in tokens — decode stalls at most this per tick |
 | `--page-rows` | — | `64` | KV page size in positions for paged serving |
 | `--prefix` | — | *auto* | Prefix-cache retention cap in pages (auto: one full context per stream; `-1` = unbounded) |
 | `--flat` | — | — | Flat preallocated KV sessions — disables paged serving and the prefix cache |
 | `--help` | `-?` | — | Show help and exit |
 
-A config file replaces long command lines (`--config server.toml`); keys are the long flag
-names with underscores:
+A config file replaces long command lines; keys are the long flag names with underscores.
+A `dasllama-server.toml` in the cwd (or next to the program — the exe dir in a release
+bundle) loads automatically; `--config other.toml` picks a different one.
 
 ```toml
 model = "D:/models/SmolLM2-135M-Instruct-Q8_0.gguf"
@@ -46,6 +48,7 @@ quant = "q8"
 kv_dtype = "tq4"   # rotated 4-bit KV — half the q8_0 cache bytes
 ctx = 4096
 streams = 4
+threads = 16       # matmul dispatch lane cap; -1 = all cores
 ```
 
 Chat and completion requests **batch continuously** (`llm_scheduler.das`): up to `--streams`

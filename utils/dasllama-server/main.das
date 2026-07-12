@@ -19,10 +19,12 @@ options stack = 262144   // the forward chain runs deep under the HTTP tick + C+
 
 require openai_server           // the server + route handlers (this directory)
 require dasllama/dasllama       // load_model / QuantMode / load_asr_model
+require dasllama/dasllama_math  // set_dispatch_worker_limit (engine-level knob, not re-exported)
 require llvm/daslib/llvm_tune   // [tune_policy] + tune_status (the injected guard resolves here)
 require daslib/clargs
 require daslib/toml
 require daslib/json_boost
+require daslib/module_path
 require daslib/fio
 require math
 
@@ -60,6 +62,10 @@ struct ServerArgs {
     @clarg_short = "s"
     @clarg_doc = "Max concurrent generation streams (default 4)"
     streams : int
+
+    @clarg_short = "t"
+    @clarg_doc = "Worker-lane cap for the matmul dispatch (default 16; -1 = all cores)"
+    threads : int
 
     @clarg_doc = "Prefill chunk in tokens: decode stalls at most this many per tick (default 64)"
     chunk : int
@@ -152,6 +158,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     if (cfg.page_rows <= 0) {
         cfg.page_rows = int(root?["page_rows"] ?? 0l)
     }
+    if (cfg.threads == 0 && !cli_has_flag("--threads")) {
+        cfg.threads = int(root?["threads"] ?? 0l)
+    }
     // --prefix is the one flag where 0 is a meaningful EXPLICIT value (auto-sizing), so the
     // zero-sentinel isn't enough: only fill from TOML when the flag is truly absent from argv
     if (cfg.prefix == 0 && !cli_has_flag("--prefix")) {
@@ -198,6 +207,20 @@ def main : int {
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
         return 0
     }
+    if (empty(cfg.config)) {
+        // dictation-bot convention: a same-name config next to the program (or in cwd) loads
+        // automatically, so a release bundle configures itself with no flags at all
+        let here = "dasllama-server.toml"
+        let beside = path_join(get_this_module_dir(), "dasllama-server.toml")
+        if (stat(here).is_valid) {
+            cfg.config = here
+        } elif (stat(beside).is_valid) {
+            cfg.config = beside
+        }
+        if (!empty(cfg.config)) {
+            print("using config {cfg.config}\n")
+        }
+    }
     if (!empty(cfg.config) && !apply_config(cfg)) {
         return 1
     }
@@ -213,6 +236,12 @@ def main : int {
     let chunk = cfg.chunk > 0 ? int64(cfg.chunk) : 64l
     let page_rows = cfg.flat ? 0l : (cfg.page_rows > 0 ? int64(cfg.page_rows) : 64l)
     let prefix = int64(cfg.prefix)   // 0 = auto (run_server sizes it), < 0 = unbounded
+    // matmul dispatch lane cap: LLM decode saturates memory bandwidth long before big core
+    // counts, and an uncapped dispatch fights every other process on the box. -1 = all cores.
+    let threads = cfg.threads > 0 ? cfg.threads : (cfg.threads < 0 ? 0 : 16)
+    set_dispatch_worker_limit(threads)
+    let lanes_desc = threads > 0 ? "{threads}" : "all"
+    print("dispatch: {lanes_desc} worker lanes\n")
 
     log_tune_status("dasllama-server")
     print("loading {cfg.model} ...\n")
