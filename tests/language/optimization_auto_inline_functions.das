@@ -6,9 +6,11 @@ options auto_inline_functions = true
 require daslib/ast
 require daslib/rtti
 require daslib/ast_boost
+require daslib/defer
 require dastest/testing_boost public
 require strings
 require daslib/strings_boost
+require _inline_generic_helper
 
 // structural FIRED proof + behavioral safety net for heuristic auto inlining of plain
 // calls (src/ast/ast_inline.cpp, `options auto_inline_functions`): a call to a small
@@ -299,6 +301,48 @@ def target_impure_args(a, b : int) : int {
     return small_mul(side("a", a), side("b", b))
 }
 
+// ----- macro-code fence targets (default-on arc) -----
+
+struct FinOwner {
+    arr : array<int>
+}
+
+[export]
+def target_generated_finalizer(n : int) : int {
+    // `delete f` lowers to a plain call of the GENERATED private finalize(FinOwner) -
+    // small, loop-free, called once: prime splice bait, fenced because generated
+    // functions carry bespoke resolution and shape invariants
+    var f : FinOwner
+    f.arr |> push(n)
+    let r = length(f.arr)
+    delete f
+    return r
+}
+
+[sideeffects]
+def target_annotated_caller(a : int) : int {
+    // any call-site-semantic annotation on the CALLER ([template] & co; [export] and
+    // [unused_argument] excepted) turns heuristic sites off inside it
+    return small_mul(a, 3)
+}
+
+def deferred_inc(a : int) : int {
+    // top-level defer = function-level finally: the splicer pops the trailing return
+    // out of the top block, which would reorder against the finalList
+    defer() {
+        g_log += "D"
+    }
+    return a + 1
+}
+
+[export]
+def target_fn_finally(a : int) : int => deferred_inc(a)
+
+[export]
+def target_cross_origin_generic(a, k : int) : int {
+    return gscale(a, k)
+}
+
 def has(s, sub : string) : bool {
     return find(s, sub, 0) >= 0
 }
@@ -399,6 +443,32 @@ def test_auto_inline_functions_declines(t : T?) {
 }
 
 [test]
+def test_auto_inline_macro_fences(t : T?) {
+    ast_gc_guard() {
+        t |> run("generated callee (struct finalizer) stays a call") @(t : T?) {
+            let b = body_of(t, "target_generated_finalizer")
+            t |> success(has(b, "finalize("), "finalizer call stays regular: {b}")
+        }
+        t |> run("annotated caller keeps its heuristic sites as calls") @(t : T?) {
+            let b = body_of(t, "target_annotated_caller")
+            t |> success(has(b, "small_mul("), "call stays regular: {b}")
+        }
+        t |> run("function-level finally callee stays a call") @(t : T?) {
+            let b = body_of(t, "target_fn_finally")
+            t |> success(has(b, "deferred_inc("), "call stays regular: {b}")
+        }
+        t |> run("cross-origin generic instance pattern compiles and runs") @(t : T?) {
+            // pattern regression for the cross-origin instance fence (a splice
+            // re-infers the whole instance under this module's visibility). the
+            // miniature can't reproduce the sqlite_boost name-late-binding failure
+            // (calls here are already bound by re-infer time) - the authoritative
+            // coverage is the dasSQLITE suite; this pins the shape compiling+running
+            t |> equal(target_cross_origin_generic(4, 5), (4 + 1 + 3) * 5)
+        }
+    }
+}
+
+[test]
 def test_auto_inline_functions_behavior(t : T?) {
     t |> run("spliced results match") @(t : T?) {
         t |> equal(target_expr_body(3, 4), 3 * 4 + 4 * 4)
@@ -427,6 +497,14 @@ def test_auto_inline_functions_behavior(t : T?) {
         t |> equal(target_mixed_ternary_graft(false, 7), -1)
         t |> equal(target_mixed_ternary_stmts(true, 7), 8)
         t |> equal(target_mixed_ternary_stmts(false, 7), -1)
+    }
+    t |> run("fence results match") @(t : T?) {
+        t |> equal(target_generated_finalizer(9), 1)
+        t |> equal(target_annotated_caller(5), 15)
+        g_log = ""
+        t |> equal(target_fn_finally(4), 5)
+        t |> equal(g_log, "D")
+        t |> equal(target_cross_origin_generic(4, 5), 40)
     }
     t |> run("const empty-array argument results match") @(t : T?) {
         t |> equal(target_const_empty_array(5), 5)

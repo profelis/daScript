@@ -299,12 +299,12 @@ Optimization and AOT
 
     Separately from the ``[inline]`` contract, optimized builds also inline best-effort
     (silent declines, never errors): calls passing a block literal argument splice
-    automatically, and with ``options auto_inline_functions`` (or the host-side
-    ``CodeOfPolicies::auto_inline_functions``) so do plain calls and operator sites of
-    small non-generic callees - loop-free bodies within the ``auto_inline_cost`` node
-    budget (default 32), or private functions referenced exactly once, whose body moves
-    rather than duplicates. ``options disable_auto_inline`` turns all best-effort
-    splicing off.
+    automatically, and so do plain calls and operator sites of small non-generic
+    callees - loop-free bodies within the ``auto_inline_cost`` node budget (default 32),
+    or private functions referenced exactly once, whose body moves rather than
+    duplicates. The plain-call tier is on by default; ``options auto_inline_functions =
+    false`` (or the host-side ``CodeOfPolicies::auto_inline_functions``) turns just that
+    tier off, and ``options disable_auto_inline`` turns all best-effort splicing off.
 
 ``[never_inline]``
     Keeps the function out of best-effort (automatic) inlining - block-literal call-site
