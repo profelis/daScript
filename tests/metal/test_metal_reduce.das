@@ -10,7 +10,7 @@ options indenting = 4
 
 require dastest/testing_boost public
 require metal/msl_shader
-require _metal_common
+require _metal_common  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 
 let N = 4096            // exact grid: 64 threadgroups of 64
 let TPG = 64u

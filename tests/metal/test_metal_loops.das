@@ -11,7 +11,7 @@ options indenting = 4
 
 require dastest/testing_boost public
 require metal/msl_shader
-require _metal_common
+require _metal_common  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 
 let NREAL = 1000        // guarded thread count (the uniform n)
 let PAD = 1024          // ceil(1000/64)*64 — what the GPU actually launches

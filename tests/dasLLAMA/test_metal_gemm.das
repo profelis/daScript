@@ -5,7 +5,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_math_default        // registers the "portable" backend at [init] (the oracle + fallback)
 require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — registers the "metal" batch donor on Apple builds
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — metal_live_object_count for the leak gate
-require math
+require math  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 
 // The Metal GPU prefill-GEMM donor (Phase-5 dasMetal offload) vs the portable CPU kernel on
 // synthetic Q8 data. Two comparisons: power-of-two scales make the GPU's dequant-to-half EXACT

@@ -7,7 +7,7 @@ require dasllama/dasllama_math   // set_wscale_f16 — the resident path reads t
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — min-npos setter + stats + the shutdown/leak rail
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — metal_live_object_count for the leak gate
 require daslib/jobque_boost
-require daslib/fio
+require daslib/fio  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 require strings
 require _model_tier
 

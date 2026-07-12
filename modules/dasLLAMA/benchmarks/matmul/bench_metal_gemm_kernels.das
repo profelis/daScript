@@ -6,7 +6,7 @@ require metal/msl_shader
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — GPU driver half, Apple builds only
 require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — the production kernel MSL (v0 baseline)
 require daslib/fio
-require math
+require math  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 require strings
 
 // The Metal Q8 GEMM kernel lab: candidate kernel variants head-to-head against the PRODUCTION
