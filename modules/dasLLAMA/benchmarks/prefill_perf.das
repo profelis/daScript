@@ -42,9 +42,10 @@ def main {
     }
     // A/B the deltanet prefill algorithm on hybrid (qwen35) models: recurrent vs chunked (default)
     if (has_env_variable("DASLLAMA_DN_PREFILL")) {
-        let dnm = get_env_variable("DASLLAMA_DN_PREFILL")
-        set_deltanet_prefill_mode(dnm == "recurrent" ? DnPrefillMode.recurrent : DnPrefillMode.chunked)
-        print("deltanet prefill mode override: {dnm}\n")
+        let dnm = (get_env_variable("DASLLAMA_DN_PREFILL") == "recurrent"
+            ? DnPrefillMode.recurrent : DnPrefillMode.chunked)
+        set_deltanet_prefill_mode(dnm)
+        print("deltanet prefill mode override: {dnm}\n")   // the EFFECTIVE mode, not the raw env value
     }
     print("loading {path}\n")
     var t <- load_gguf(path, QuantMode.q8)
