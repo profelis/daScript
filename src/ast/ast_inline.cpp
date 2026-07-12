@@ -218,16 +218,7 @@ namespace das {
             Module * mod;
             Module * dest;
             void checkFunc ( Function * fn ) {
-                if ( !fn ) return;
-                // the compiled form of handle indexing under jit is a resolved `.[]`/`?[]`
-                // call (infer's visit(ExprAt) rewrites the At away) - flag it the same as
-                // the raw At below: its re-resolution consults the destination module's
-                // visible-function set and can dead-end (see checkHandleIndex)
-                if ( contextSensitive.empty()
-                    && (fn->name==".[]" || fn->name=="?[]" || fn->name==".?[]" || fn->name=="[]") ) {
-                    contextSensitive = fn->name;
-                }
-                if ( !privateSymbol.empty() ) return;
+                if ( !fn || !privateSymbol.empty() ) return;
                 auto origin = fn->fromGeneric ? fn->fromGeneric : fn;
                 // instances are stamped private by instantiation, which keeps this gate
                 // deliberately conservative: a body calling ANY generic instance stays
@@ -301,30 +292,6 @@ namespace das {
                     privateSymbol = expr->variable->name;
                 }
             }
-            // handled-type indexing re-infers through name-based probes that consult the
-            // DESTINATION module's visible-function set (inferGenericOperator("[]") and,
-            // under jit, the native `.[]` probe - ast_infer_type.cpp visit(ExprAt)) BEFORE
-            // the module-insensitive annotation path. The same body can therefore infer
-            // differently after a cross-module splice (proven: ast_boost's
-            // add_annotation_argument spliced into daslib/flatten rewrote its At into an
-            // unresolvable `.[]` call under -jit). Best-effort sites decline; MUST keeps
-            // master semantics
-            void checkHandleIndex ( Expression * sub ) {
-                if ( !contextSensitive.empty() || !sub || !sub->type ) return;
-                if ( sub->type->isHandle() && sub->type->annotation ) {
-                    contextSensitive = sub->type->annotation->name;
-                }
-            }
-            virtual void preVisit ( ExprAt * expr ) override {
-                Visitor::preVisit(expr);
-                checkHandleIndex(expr->subexpr);
-            }
-            virtual void preVisit ( ExprSafeAt * expr ) override {
-                Visitor::preVisit(expr);
-                checkHandleIndex(expr->subexpr);
-            }
-        public:
-            string contextSensitive;
         };
 
         // ----- cloned-body fixup: rename locals, substitute parameter reads -----
@@ -545,6 +512,7 @@ namespace das {
             bool blockLiterals = false;
             bool functions = false;
             int  budget = 32;
+            Module * thisModule = nullptr;              // heuristic tier is same-module-only
             das_hash_map<Function *, bool> * worthCache = nullptr;
             das_hash_set<Function *> * budgetExempt = nullptr;  // private, referenced exactly once
         };
@@ -583,6 +551,13 @@ namespace das {
             // also mark manufactured functions [never_inline] explicitly
             if ( fn->generated ) return false;
             if ( !cfg.functions || fn->fromGeneric ) return false;
+            // same-module only: a transplanted body is NOT context-free by language
+            // design - `_::` dispatch (clone/finalize, every `:=`/`delete`) resolves in
+            // the calling module deliberately, and infer's name-based probes (generic
+            // operators, the jit `.[]` handle-index probe) consult the destination
+            // module's visible-function set. Cross-module inlining is the author's
+            // explicit [inline] contract, not a heuristic's call
+            if ( fn->module != cfg.thisModule ) return false;
             return worthAutoInline(fn, cfg);
         }
 
@@ -1282,7 +1257,7 @@ namespace das {
             das_hash_map<Function *, bool> shapeCache;
             das_hash_map<Function *, pair<bool,string>> autoOkCache;
             das_hash_map<ExprMakeBlock *, pair<bool,string>> devirtShapeCache;
-            das_hash_map<Function *, pair<string,string>> privateUseCache;   // {privateSymbol, contextSensitive}
+            das_hash_map<Function *, string> privateUseCache;
 
             bool calleeShapeOk ( Function * fn ) {
                 auto it = shapeCache.find(fn);
@@ -1365,12 +1340,12 @@ namespace das {
                 return st;
             }
 
-            const pair<string,string> & privateUse ( Function * fn, Module * originModule ) {
+            const string & privateUse ( Function * fn, Module * originModule ) {
                 auto it = privateUseCache.find(fn);
                 if ( it != privateUseCache.end() ) return it->second;
                 PrivateUseScan scan(originModule, program->thisModule.get());
                 fn->body->visit(scan);
-                return privateUseCache[fn] = make_pair(scan.privateSymbol, scan.contextSensitive);
+                return privateUseCache[fn] = scan.privateSymbol;
             }
 
             // next free __inl counter across a subtree; names are function-scoped and
@@ -1601,12 +1576,8 @@ namespace das {
                         ? calleeFn->fromGeneric->module : calleeFn->module;
                     if ( originModule != program->thisModule.get() ) {
                         auto & priv = privateUse(calleeFn, originModule);
-                        if ( !priv.first.empty() ) {
-                            siteFail(site, "can't inline " + subjName + " across modules: body uses private symbol '" + priv.first + "'", callLike->at);
-                            continue;
-                        }
-                        if ( site.kind!=SiteKind::MustCall && !priv.second.empty() ) {
-                            decline(site, "cross-module body indexes handled type '" + priv.second + "' - re-infer is module-context-sensitive", callLike->at);
+                        if ( !priv.empty() ) {
+                            siteFail(site, "can't inline " + subjName + " across modules: body uses private symbol '" + priv + "'", callLike->at);
                             continue;
                         }
                     }
@@ -2343,6 +2314,7 @@ namespace das {
         autoCfg.blockLiterals = autoEnabled;
         autoCfg.functions = autoFns;
         autoCfg.budget = options.getIntOption("auto_inline_cost", policies.auto_inline_cost);
+        autoCfg.thisModule = thisModule.get();
         autoCfg.worthCache = &worthCache;
         autoCfg.budgetExempt = &budgetExempt;
         // private functions referenced exactly once - by a plain call in a function
