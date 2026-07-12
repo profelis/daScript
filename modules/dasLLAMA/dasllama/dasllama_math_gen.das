@@ -1605,6 +1605,13 @@ def dasllama_math_gen_register() {
             mm_s16 = @@q8q8_kernel_s16_gen, batch_s16 = @@q8q8_batch_kernel_s16_gen,
             group3_s16 = @@q8q8_group3_s16_gen, groupn_s16 = @@q8q8_groupn_s16_gen,
             mm_rows_s16 = @@q8q8_gemv_s16_gen,
+            // kq family: the emitters are generic-IR unpacks over kq_dot_lane, which rides the
+            // NEON sdot lattice here — decline lockstep with the q8 family (same perm rails), so
+            // the no-witness stance above covers kq too
+            mm_kq = @@kq_kernel_gen, repack_kq = @@repack_kq_gen,
+            kq_rows_k4 = @@k4q8_gemv_gen, kq_rows_k5 = @@k5q8_gemv_gen,
+            kq_rows_k6 = @@k6q8_gemv_gen, kq_batch = @@kq_batch_kernel_gen,
+            kq_groupn = @@kq_groupn_gen, kq_batch_groupn = @@kq_batch_groupn_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
             q8_kgroup = @@q8q8_kgroup_gen))
