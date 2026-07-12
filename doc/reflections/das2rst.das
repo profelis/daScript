@@ -1,5 +1,8 @@
 options gen2
 options rtti = true
+// docs describe the SOURCE API: splices legitimately rewrite ctor bodies, method
+// shapes, and describe() output, which would rename hash-keyed doc files per run
+options auto_inline_functions = false
 
 require daslib/fio
 require daslib/rtti
