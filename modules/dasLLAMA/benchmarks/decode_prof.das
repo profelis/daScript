@@ -103,6 +103,23 @@ def private wbytes(q : QuantMode; wscale16 : bool = false) : double {
     return 4.0lf
 }
 
+// Bytes read per weight for one tensor: its native K-quant plane pair (quant + scale planes per
+// 256-weight superblock) when kq-tagged, else the model-wide q8 figure.
+def private kq_wbytes(f : KqFmt; q8wb : double) : double {
+    if (f == KqFmt.k4) {
+        return (128.0lf + 32.0lf) / 256.0lf   // nibbles + f16 (d*sc, dmin*m) pairs per 32
+    }
+    if (f == KqFmt.k5) {
+        return (160.0lf + 32.0lf) / 256.0lf   // nibbles + high-bit plane + scale pairs
+    }
+    if (f == KqFmt.k6) {
+        return (192.0lf + 18.0lf) / 256.0lf   // ql + qh + native int8 sub-scales + f16 d
+    }
+    return q8wb
+}
+
+def private fmt_or_q8(a : array<KqFmt>; l : int64) : KqFmt => empty(a) ? KqFmt.q8 : a[l]
+
 def private mb(v : double) : double => v / (1024.0lf * 1024.0lf)
 
 // Config-derived weight + KV bytes READ per decoded token, split by section, evaluated at context
@@ -116,8 +133,12 @@ def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     for (l in range64(c.n_layers)) {
         let qd = layer_qd(c, l)
         let kvd = layer_kv_dim(c, l)
-        let wv = t.wv_offs[l] >= 0l ? double(dim * kvd) : 0.0lf
-        attn += (double(dim * qd) + double(dim * kvd) + wv + double(qd * dim)) * wb
+        attn += double(dim * qd) * kq_wbytes(fmt_or_q8(t.wq_fmt, l), wb)
+        attn += double(dim * kvd) * kq_wbytes(fmt_or_q8(t.wk_fmt, l), wb)
+        if (t.wv_offs[l] >= 0l) {
+            attn += double(dim * kvd) * kq_wbytes(fmt_or_q8(t.wv_fmt, l), wb)
+        }
+        attn += double(qd * dim) * kq_wbytes(fmt_or_q8(t.wo_fmt, l), wb)
         let cnt = layer_is_sliding(c, l) ? min(pos, c.sliding_window) : pos
         kv_read += double(cnt * kv_row_bytes(kvdt, kvd)) * 2.0lf   // row bytes: codec-exact (q8_0 incl. block scales)
     }
@@ -127,18 +148,43 @@ def private print_traffic_table(t : Model; pos : int64; kvdt : KVDtype) {
     var shexp = 0.0lf
     if (c.moe) {
         router = double(c.n_layers * dim * c.n_expert) * 4.0lf   // router weights stay fp32
-        // native-MXFP4 experts read 17 bytes per 32 weights (nibbles + E8M0); else the active quant
-        let ewb = t.experts_mx4 ? 17.0lf / 32.0lf : wb
-        moe = double(c.n_layers * c.n_expert_used * 3l * dim * c.n_ff_exp) * ewb
+        for (l in range64(c.n_layers)) {
+            let epk = double(c.n_expert_used * dim * c.n_ff_exp)   // elements per (kind, token)
+            if (t.experts_mx4) {
+                moe += epk * 3.0lf * (17.0lf / 32.0lf)   // native MXFP4: nibbles + E8M0 per 32
+            } else {
+                moe += epk * (kq_wbytes(fmt_or_q8(t.we1_fmt, l), wb)
+                    + kq_wbytes(fmt_or_q8(t.we2_fmt, l), wb)
+                    + kq_wbytes(fmt_or_q8(t.we3_fmt, l), wb))
+            }
+        }
         if (c.n_ff_shexp > 0l) {
-            shexp = double(c.n_layers * 3l * dim * c.n_ff_shexp) * wb
+            shexp = double(c.n_layers * 3l * dim * c.n_ff_shexp) * wb   // wsh* stay on the q8 rail
+        }
+        if (c.moe_dense_shexp) {   // gemma4 dense parallel shared expert rides w1/w2/w3
+            for (l in range64(c.n_layers)) {
+                shexp += double(dim * layer_hidden(t, l)) * (kq_wbytes(fmt_or_q8(t.w1_fmt, l), wb)
+                    + kq_wbytes(fmt_or_q8(t.w2_fmt, l), wb)
+                    + kq_wbytes(fmt_or_q8(t.w3_fmt, l), wb))
+            }
         }
     } else {
-        ffn = double(c.n_layers * 3l * dim * c.hidden_dim) * wb
+        for (l in range64(c.n_layers)) {
+            ffn += double(dim * layer_hidden(t, l)) * (kq_wbytes(fmt_or_q8(t.w1_fmt, l), wb)
+                + kq_wbytes(fmt_or_q8(t.w2_fmt, l), wb)
+                + kq_wbytes(fmt_or_q8(t.w3_fmt, l), wb))
+        }
     }
-    let cls_fp32 = c.shared_weights && !t.cls_q8
-    let cls = double(dim * c.vocab_size) * (cls_fp32 ? 4.0lf : wb)
-    let embed = double(dim) * (t.cls_q8 ? wbytes(QuantMode.q8, t.wscale_f16) : 4.0lf)
+    var clsb = wb   // untied q8 default
+    if (cls_kq(t)) {
+        clsb = kq_wbytes(t.emb_fmt, wb)
+    } elif (c.shared_weights) {
+        clsb = t.cls_q8 ? wb : 4.0lf
+    } elif (t.wcls_fmt != KqFmt.q8) {
+        clsb = kq_wbytes(t.wcls_fmt, wb)
+    }
+    let cls = double(dim * c.vocab_size) * clsb
+    let embed = double(dim) * (t.cls_q8 ? wbytes(QuantMode.q8, t.wscale_f16) : (cls_kq(t) ? kq_wbytes(t.emb_fmt, wb) : 4.0lf))
     let total = attn + kv_read + ffn + moe + router + shexp + cls + embed
     print("--- per-token traffic at ctx depth {pos} (config-derived, MB read/token) ---\n")
     print("  attn weights: {mb(attn)} ({100.0lf * attn / total}%)\n")
@@ -202,7 +248,7 @@ def private run_profile(var t : Model; p, n, p2 : int64; team : bool; kvdt : KVD
         forward_prefill(t, s, prompt, p, 0l)
         var tok = greedy_top(s, c.vocab_size)
         if (!empty(trace)) {
-            jobque_trace_start(1 << 17)
+            jobque_trace_start(1 << 21)   // decode makes ~30k chunk events/token — size for a ~32-token window
             set_trace_tags(true)
         }
         tok = profile_window(t, s, p, n, tok)

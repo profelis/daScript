@@ -4732,6 +4732,7 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     let c = t.config
     let dim = c.dim
     let ne = c.n_expert
+    trace_tag(TRACE_TAG_ROUTE)   // decode router GEMV — without this it rides the stale attn tag in traces
     let ts_route = ref_time_ticks()
     mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb, dim, ne)
     if (c.moe_router_bias) {
@@ -4895,6 +4896,7 @@ def private gemma4_moe_ffn(t : Model; var s : Session; l : int64) {
     let k = c.n_expert_used
     // routed branch — input, custom router, select, per-expert down scale, experts, post-norm
     rms_at(s.xb, t, t.rms_pre_ffn2_off + l * dim, s.moe_ao, dim)
+    trace_tag(TRACE_TAG_ROUTE)   // decode router GEMV — without this it rides the stale attn tag in traces
     let ts_route = ref_time_ticks()
     gemma4_router_tmp(t, s, l)
     mm_fblob(s.moe_logits, t, t.router_off + l * ne * dim, s.xb2, dim, ne)
