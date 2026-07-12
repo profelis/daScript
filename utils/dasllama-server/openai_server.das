@@ -511,6 +511,11 @@ def private flush_events(srv : WebSocketServer) {
         if (e.finish == "evicted") {
             release_writer(srv, w.writer)
         } elif (w.streaming) {
+            if (!empty(w.utf8_tail)) {
+                // generation ended mid-character (max-tokens cut): the held bytes can never
+                // complete, and emitting them would put invalid UTF-8 on the wire — drop loudly
+                to_log(LOG_WARNING, "dasllama-server: stream {w.id} ended mid-UTF-8-sequence; dropped {length(w.utf8_tail)} byte(s)\n")
+            }
             if (w.is_chat) {
                 send_chat_chunk(srv, w.writer, w.id, w.created, "", "", e.finish)
             } else {
