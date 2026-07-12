@@ -1234,6 +1234,56 @@ def private kq_batch_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; 
     }
 }
 
+// kq_batch_groupn slot: the fused MoE prefill form — ONE dispatch runs every touched expert's
+// batched GEMM (triple offs (woff, row0, cnt); y token-major over the gathered whole image).
+// Region-contiguous group spans through the SAME batch cell walk the per-expert tile uses
+// (kq_batch_cell_gen with the region's token range), so it is bit-exact vs a per-region loop
+// of kq_batch_kernel_gen; row tails (d % mr) disk-order per (region, token).
+def private kq_batch_groupn_gen(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
+    let nsb = n / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+    let nb32 = n / 32l
+    let nb16 = n / 16l
+    var myp = yp
+    let TB = effective_token_block(g_q8_token_block, n)
+    maybe_parallel_for(0, int(nregions * ng), matmul_chunks_gemv(int(nregions * ng * mr), get_q8_batch_chunks_per_job(), n * d * nregions)) $(gb, ge) {
+        unsafe {
+            var gg = int64(gb)
+            while (gg < int64(ge)) {
+                let r = gg / ng
+                let gLocal = gg % ng
+                let gEnd = min(int64(ge) - r * ng, ng)
+                let sb = offs[r * 3l] / 256l
+                let row0 = offs[r * 3l + 1l]
+                let cnt = offs[r * 3l + 2l]
+                kq_batch_cell_gen(fmt, myp, kqp + sb * qsb, ksp + sb * ssb, xqp, xsp, xbsp, n, d, mr, TB, int(gLocal), int(gEnd), row0, row0 + cnt)
+                gg = r * ng + gEnd
+            }
+        }
+    }
+    unsafe {
+        for (r in range64(nregions)) {   // row tails (d % mr): disk-order per (region, token)
+            let sb = offs[r * 3l] / 256l
+            let row0 = offs[r * 3l + 1l]
+            let cnt = offs[r * 3l + 2l]
+            for (tk in range64(row0, row0 + cnt)) {
+                for (i in range64(ng * mr, d)) {
+                    if (fmt == 4) {
+                        myp[tk * d + i] = dot_k4q8(kqp + (sb + i * nsb) * qsb, ksp + (sb + i * nsb) * ssb, xqp + tk * n, xsp + tk * nb32, xbsp + tk * nb16, n)
+                    } elif (fmt == 5) {
+                        myp[tk * d + i] = dot_k5q8(kqp + (sb + i * nsb) * qsb, ksp + (sb + i * nsb) * ssb, xqp + tk * n, xsp + tk * nb32, xbsp + tk * nb16, n)
+                    } else {
+                        myp[tk * d + i] = dot_k6q8(kqp + (sb + i * nsb) * qsb, ksp + (sb + i * nsb) * ssb, xqp + tk * n, xsp + tk * nb32, xbsp + tk * nb16, n)
+                    }
+                }
+            }
+        }
+    }
+}
+
 // kq_groupn slot: region-list kq GEMV — the kq twin of q8q8_groupn_gen. Region-contiguous
 // group spans through the fmt's rows core (each region offsets the plane bases by its own
 // superblock), row tails (d % mr) disk-order per region like kq_kernel_gen's. Not `private`:
@@ -1578,7 +1628,7 @@ def dasllama_math_gen_register() {
             mm_kq = @@kq_kernel_gen, repack_kq = @@repack_kq_gen,
             kq_rows_k4 = @@k4q8_gemv_gen, kq_rows_k5 = @@k5q8_gemv_gen,
             kq_rows_k6 = @@k6q8_gemv_gen, kq_batch = @@kq_batch_kernel_gen,
-            kq_groupn = @@kq_groupn_gen,
+            kq_groupn = @@kq_groupn_gen, kq_batch_groupn = @@kq_batch_groupn_gen,
             needs_repack = true, mx4_expand_interleaved = true, priority = 25,
             q8_layout = @@q8q8_layout_gen, q8_wbias = @@q8q8_wbias_gen,
             q8_kgroup = @@q8q8_kgroup_gen,

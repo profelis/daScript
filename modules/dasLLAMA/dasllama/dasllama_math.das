@@ -1077,6 +1077,12 @@ typedef RepackKqFn = function<(fmt : int; var kq : uint8?; var ks : uint8?; n : 
 // scale (n/32) and bsum (n/16) rows; Y token-major [ntok x d]. Bit-for-bit ntok x the fmt's
 // per-position GEMV over the same repacked planes.
 typedef MatmulKqBatchFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64; ntok : int64) : void>
+// Batched region-list K-quant GEMM (the kq batch groupn — the fused MoE prefill, llama.cpp's
+// mul_mat_id shape): `offs` packs TRIPLES like MatmulMx4Q8BatchGroupNFn — [3r] = region r's
+// weight element offset, [3r+1] = row0, [3r+2] = cnt; region r consumes activation rows
+// row0..row0+cnt and produces y rows row0..row0+cnt (token-major, y[(row0+tk)*d + row]).
+// Plane bases pass whole; one fmt per list; no bias form (biased-experts arches are mx4).
+typedef MatmulKqBatchGroupNFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64) : void>
 // Region-list K-quant GEMV (the kq groupn — MoE routed-expert decode dispatch): `offs` packs
 // (weight, activation) element-offset PAIRS like MatmulQ8Q8GroupNFn, region r's rows land at
 // y[r*d .. r*d+d). kqp/ksp are the fmt's PLANE BASES — each region computes its own superblock
@@ -1127,6 +1133,7 @@ struct KernelBackend {
     kq_rows_k6 : MatmulKqRowsFn = @@kq_unset_rows
     kq_batch : MatmulKqBatchFn = @@kq_unset_batch
     kq_groupn : MatmulKqGroupNFn = @@kq_unset_groupn
+    kq_batch_groupn : MatmulKqBatchGroupNFn = @@kq_unset_batch_groupn
     repack_kq : RepackKqFn = @@repack_kq_identity
     needs_repack : bool
     // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the interleaved
@@ -1184,9 +1191,11 @@ var g_kq_rows_k5 = @@kq_unset_rows
 var g_kq_rows_k6 = @@kq_unset_rows
 var g_mm_kq_batch = @@kq_unset_batch
 var g_mm_kq_groupn = @@kq_unset_groupn
+var g_mm_kq_batch_groupn = @@kq_unset_batch_groupn
 var g_active_has_kq = false         // does the active backend carry the native K-quant slots?
 var g_active_has_kq_batch = false   // ... including the batched kq GEMM (the prefill tile)?
 var g_active_has_kq_groupn = false  // ... and the region-list kq GEMV (MoE expert dispatch)?
+var g_active_has_kq_batch_groupn = false   // ... and the fused batched region-list GEMM (MoE prefill)?
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
 var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend is selected
@@ -1300,6 +1309,10 @@ def private kq_unset_rows(var yp : float?; kqp : uint8 const?; ksp : uint8 const
 def private kq_unset_groupn(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
     panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant region-list kernel (kq_groupn)")
 }
+[unused_argument(fmt, yp, kqp, ksp, offs, nregions, xqp, xsp, xbsp, n, d)]
+def private kq_unset_batch_groupn(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant batched region-list kernel (kq_batch_groupn)")
+}
 [unused_argument(fmt, yp, kqp, ksp, xqp, xsp, xbsp, n, d, ntok)]
 def private kq_unset_batch(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, ntok : int64) {
     panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant batch kernel (kq_batch)")
@@ -1329,9 +1342,11 @@ def private activate(be : KernelBackend) {
     g_kq_rows_k6 = be.kq_rows_k6
     g_mm_kq_batch = be.kq_batch
     g_mm_kq_groupn = be.kq_groupn
+    g_mm_kq_batch_groupn = be.kq_batch_groupn
     g_active_has_kq = !(be.mm_kq == @@kq_unset_kernel)
     g_active_has_kq_batch = !(be.kq_batch == @@kq_unset_batch)
     g_active_has_kq_groupn = !(be.kq_groupn == @@kq_unset_groupn)
+    g_active_has_kq_batch_groupn = !(be.kq_batch_groupn == @@kq_unset_batch_groupn)
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
     g_repack_kq = be.repack_kq
@@ -1517,6 +1532,24 @@ def kernel_backend_has_kq_batch() : bool {
 //! The MoE dispatch gates on it and falls back to per-region GEMVs when down.
 def kernel_backend_has_kq_groupn() : bool {
     return g_active_has_kq_groupn
+}
+
+//! Does the active backend carry the fused batched region-list kq GEMM (kq_batch_groupn — the
+//! fused MoE prefill)? The grouped prefill gates on it and keeps per-expert tiles when down.
+def kernel_backend_has_kq_batch_groupn() : bool {
+    return g_active_has_kq_batch_groupn
+}
+
+//! Batched region-list K-quant GEMM over REPACKED planes (triple offs — see the typedef).
+//! Callers guard with kq_repacked && kernel_backend_has_kq_batch_groupn().
+def matmul_kq_batch_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; offs : array<int64> | #; nregions : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64) {
+    unsafe {
+        invoke(g_mm_kq_batch_groupn, fmt, addr(y[0]),
+            reinterpret<uint8 const?>(addr(kq[0])), reinterpret<uint8 const?>(addr(ks[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<int const?>(addr(xbs[0])), n, d)
+    }
 }
 
 //! Region-list K-quant GEMV over REPACKED planes (blob form — the kq twin of mm_at_q8_groupn's

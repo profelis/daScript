@@ -3293,6 +3293,19 @@ def private mm_at_kq_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs :
     }
 }
 
+// Fused batched region-list kq GEMM (the fused MoE prefill's kq twin of the mx4 batch groupn;
+// triple offs). Callers guard with kq_repacked && kernel_backend_has_kq_batch_groupn().
+def private mm_b_kq_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; n, d : int64) {
+    let fi = fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : 6)
+    if (fmt == KqFmt.k4) {
+        matmul_kq_batch_groupn(fi, y, t.k4q, t.k4s, offs, nregions, xq, xs, xbs, n, d)
+    } elif (fmt == KqFmt.k5) {
+        matmul_kq_batch_groupn(fi, y, t.k5q, t.k5s, offs, nregions, xq, xs, xbs, n, d)
+    } else {
+        matmul_kq_batch_groupn(fi, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
+    }
+}
+
 // Batched kq GEMM off PRE-quantized activation rows (the grouped MoE prefill's kq twin of
 // mm_b_q8_pre). Callers guard with kq_repacked && kernel_backend_has_kq_batch() — the prefill
 // gate routes kq-expert layers to the per-position reference path otherwise.
@@ -6295,13 +6308,17 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     let nk = npos * k
     // fused expert GEMMs (native mx4-batch backends): the gather / hidden / output images span
     // every routed row at once (nk rows, bucket-ordered) instead of one expert's bucket at a time
-    let fused = t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms
-    let grows = fused ? nk : npos
     // per-layer expert stack formats (kq layers: the gate routed us here only with the batch tile up)
     let kq_layer = moe_layer_kq(t, l)
     let f1 = fmt_at(t.we1_fmt, l)
     let f2 = fmt_at(t.we2_fmt, l)
     let f3 = fmt_at(t.we3_fmt, l)
+    // fused single-dispatch expert GEMMs (the mul_mat_id shape): native mx4-batch backends, and
+    // kq layers whose three stacks are ALL K-quant (a mixed q8 kind keeps the per-expert loop)
+    let fused_kq = (kq_layer && f1 != KqFmt.q8 && f2 != KqFmt.q8 && f3 != KqFmt.q8
+        && t.kq_repacked && kernel_backend_has_kq_batch_groupn() && g_moe_fused_expert_gemms)
+    let fused = (t.experts_mx4 && g_active_mx4_native_batch && g_moe_fused_expert_gemms) || fused_kq
+    let grows = fused ? nk : npos
     s.moe_rlog |> resize(npos * ne)
     s.moe_idx_b |> resize(nk)
     s.moe_w_b |> resize(nk)
@@ -6374,7 +6391,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     //     the scheduling changes.
     if (fused) {
         let ts_gather = ref_time_ticks()
-        moe_gather_rows(s, 0l, nk, dim, k)
+        moe_gather_rows(s, 0l, nk, dim, k, kq_layer)
         prof_add("moe_gather", ts_gather)
         // region triples (woff, row0, cnt) per touched expert; the three planes share row0/cnt
         var offs1 : array<int64>
@@ -6417,7 +6434,10 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             nreg++
         }
         let ts_g1 = ref_time_ticks()
-        if (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
+        if (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
+            mm_b_kq_groupn(s.moe_ghb, t, f1, offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+            mm_b_kq_groupn(s.moe_ghb2, t, f3, offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+        } elif (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
             matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, offs1, nreg, s.moe_gxq, s.moe_gxs, t.fblob, boffs1, dim, nfe)
             matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, offs3, nreg, s.moe_gxq, s.moe_gxs, t.fblob, boffs3, dim, nfe)
         } else {
@@ -6428,9 +6448,15 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let ts_act = ref_time_ticks()
         gate_batch(s.moe_ghb, s.moe_ghb2, c.ffn_act, nfe, nk)
         prof_add("act", ts_act)
-        requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
+        if (fused_kq) {   // bit-identical rows + the per-16 sums the kq down GEMM consumes
+            requant_rows_q8_bs(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs, s.moe_hbs)
+        } else {
+            requant_rows_q8(s.moe_ghb, nfe, nk, s.moe_hq, s.moe_hs)
+        }
         let ts_g3 = ref_time_ticks()
-        if (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
+        if (fused_kq) {
+            mm_b_kq_groupn(s.moe_gout, t, f2, offs2, nreg, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim)
+        } elif (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
             matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, boffs2, nfe, dim)
         } else {
             matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
