@@ -222,6 +222,13 @@ other models. This is the kernel scoreboard; `prefill_perf.das` is the end-to-en
 - Fairness: end-to-end comparisons run ours with `options _jit_fast_math = true` (ggml
   hand-codes equivalent FP laxity; strict-IEEE-us vs fast-ggml understates us ~8-10%).
   Tests and oracle gates stay bit-exact — never put fast-math on a test.
+- **Steady-state, not best-of (M1/Apple Silicon; trace-diagnosed 2026-07-12):** a
+  first-run-after-idle prefill rides a ~3 s P-cluster boost window (+11% — one DVFS step,
+  uniform per-chunk, all lanes; NOT E-core placement, NOT jobque — lane traces show 98–99%
+  utilization in both modes). Back-to-back reps sit at the sustained clock at llama-bench
+  stability (±0.6%), and llama-bench numbers ARE steady-state. Report the MEDIAN of ≥3
+  back-to-back reps and discard the first-after-idle rep — best-of-N systematically picks
+  the boost outlier.
 
 ---
 

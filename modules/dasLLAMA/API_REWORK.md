@@ -486,9 +486,20 @@ what it costs today and what the fix would change.
   everywhere for the same reason. Residual headroom, ledgered: (a) k6 tile 76 vs k4 95 —
   the per-16 SIGNED sub-scale fold pays 2 scale-row sexts + 4 muls per block vs k4/k5's 1;
   (b) k5 unpack still ~6% of production tile (the broadcast+carry deposit — a generated
-  NEON tbl/cmtst unpack kernel would close it); (c) the das prefill run-to-run bimodality
-  (Q5 150↔168 this round, Q4 155↔166 while llama-bench holds ±0.3% — suspect E-core lane
-  placement; lcpp pins/QoS-hints its threads).
+  NEON tbl/cmtst unpack kernel would close it).
+- **✅ RESOLVED (2026-07-12 PM², trace-diagnosed): the das prefill "bimodality" is M1
+  package DVFS, not code.** Lane-timeline traces of a fast (168 t/s) vs slow (150) Q5
+  pp512 run: all 8 lanes 98–99% utilized in BOTH, identical chunk counts, and a UNIFORM
+  ×1.113 per-chunk slowdown flat across run-deciles — one P-cluster clock step
+  (3228→2904-class), run-scoped. First-run-after-idle rides a ~3 s boost window (168);
+  back-to-back runs sit at the sustained clock (150–152, ±0.6% — exactly llama-bench's
+  stability, because llama-bench's reps are always steady-state). 45 s cool-downs recover
+  only partially (155–162); pmset shows no thermal warnings (ordinary sustained-load DVFS).
+  E-core lane placement is EXONERATED — nothing to pin. **METHOD RULE: report the
+  steady-state MEDIAN of ≥3 back-to-back reps and discard the first-after-idle rep;
+  best-of-N systematically picks the boost outlier.** Steady-state scoreboard (M1 Max,
+  Qwen3-4B vs lcpp steady): Q5 ~150 vs 131 = 1.15×, Q6 ~141 vs 138.5 = 1.02×, Q4_K_M
+  ~155-158 vs 172 = 0.90×.
 - **kq v2 on zen2/SPR — the x64 lattice race (k5/k6 v2 landed 2026-07-12 — unblocked).** The v2 emitter folds are
   lattice-generic (maddubs/vpdpbusd kq grid rows emit the same integer scheme, bias128+kq
   dropped as untested); zen2's lcpp lead was its AVX2 Q4_K 8x8 repack GEMM, and lcpp has NO
