@@ -15,14 +15,16 @@ require math
 // exp/exp4 — all inside 1e-4 relative); the residual add is bit-exact (one fadd both sides).
 // Off-Apple (or with no Metal device) everything feints cleanly.
 
-// attention shape: GQA with 4 queries per kv head, small enough to hand-oracle
+// attention shape: GQA with 2 queries per kv head, small enough to hand-oracle; NPOS is
+// deliberately NOT a 32-multiple (np32 = 64) so the padded-slab rails are exercised
 let NPOS = 48
-let HEAD_SIZE = 16
-let N_HEADS = 8
+let NP32 = 64                           // ceil32(NPOS) — the padded slab / buffer row count
+let HEAD_SIZE = 32
+let N_HEADS = 4
 let N_KV_HEADS = 2
 let KV_MUL = N_HEADS / N_KV_HEADS
 let QD = N_HEADS * HEAD_SIZE            // 128
-let KV_DIM = N_KV_HEADS * HEAD_SIZE     // 32
+let KV_DIM = N_KV_HEADS * HEAD_SIZE     // 64
 
 // rmsnorm / swiglu / add shapes
 let NROWS = 6
@@ -201,9 +203,13 @@ def test_metal_prefill_kernels(t : T?) {
                 metal_release(brnp)
                 metal_release(pso_rope)
 
-                // ===== attention: scores+softmax then P.V, vs a direct causal-GQA oracle =====
-                var pso_sc = pipeline_from_source(dev, metal_attn_scores_msl, metal_attn_scores_msl_entry, metal_attn_scores_msl_fastmath, err)
-                t |> success(pso_sc != null, "scores pipeline: {err}")
+                // ===== attention: the tiled sgmat trio (QK^T -> softmax -> P.V) vs a direct
+                // causal-GQA oracle. Buffers carry NP32 rows like the driver's (whole-tile sgmat
+                // stores + staging reads walk the padded rows); rows >= NPOS are pad.
+                var pso_sc = pipeline_from_source(dev, metal_attn_qk_msl, metal_attn_qk_msl_entry, metal_attn_qk_msl_fastmath, err)
+                t |> success(pso_sc != null, "qk pipeline: {err}")
+                var pso_sm = pipeline_from_source(dev, metal_attn_softmax_msl, metal_attn_softmax_msl_entry, metal_attn_softmax_msl_fastmath, err)
+                t |> success(pso_sm != null, "softmax pipeline: {err}")
                 var pso_av = pipeline_from_source(dev, metal_attn_av_msl, metal_attn_av_msl_entry, metal_attn_av_msl_fastmath, err)
                 t |> success(pso_av != null, "av pipeline: {err}")
                 let scale = 1.0 / sqrt(float(HEAD_SIZE))
@@ -211,9 +217,9 @@ def test_metal_prefill_kernels(t : T?) {
                 var ak : array<float>
                 var av : array<float>
                 var axb_want : array<float>
-                aq |> resize(NPOS * QD)
-                ak |> resize(NPOS * KV_DIM)
-                av |> resize(NPOS * KV_DIM)
+                aq |> resize(NP32 * QD)
+                ak |> resize(NP32 * KV_DIM)
+                av |> resize(NP32 * KV_DIM)
                 axb_want |> resize(NPOS * QD)
                 for (k in range(NPOS * QD)) {
                     aq[k] = 0.13 * float(k % 31) - 1.9
@@ -254,13 +260,14 @@ def test_metal_prefill_kernels(t : T?) {
                 var baq = buf_upload(dev, aq)
                 var bak = buf_upload(dev, ak)
                 var bav = buf_upload(dev, av)
-                var batt = buf_fill(dev, N_HEADS * NPOS * NPOS, 0.0)
-                var bxb = buf_fill(dev, NPOS * QD, 0.0)
+                var batt = buf_fill(dev, N_HEADS * NP32 * NP32, 0.0)
+                var bxb = buf_fill(dev, NP32 * QD, 0.0)
                 var bqd = buf_u32(dev, uint(QD))
                 var bkvd = buf_u32(dev, uint(KV_DIM))
                 var bhs = buf_u32(dev, uint(HEAD_SIZE))
                 var bkvm = buf_u32(dev, uint(KV_MUL))
                 var bnp = buf_u32(dev, uint(NPOS))
+                var bnp32 = buf_u32(dev, uint(NP32))
                 var bscale = buf_f32(dev, scale)
                 let aran = with_compute_encoder(queue, err) <| $(enc : MetalComputeEncoder?) {
                     metal_set_pipeline(enc, pso_sc)
@@ -272,7 +279,12 @@ def test_metal_prefill_kernels(t : T?) {
                     metal_set_buffer(enc, bhs, 0ul, 5)
                     metal_set_buffer(enc, bkvm, 0ul, 6)
                     metal_set_buffer(enc, bnp, 0ul, 7)
-                    metal_set_buffer(enc, bscale, 0ul, 8)
+                    metal_set_buffer(enc, bnp32, 0ul, 8)
+                    metal_set_buffer(enc, bscale, 0ul, 9)
+                    metal_dispatch_threadgroups(enc, uint3(uint(NP32 / 32), uint(NP32 / 32), uint(N_HEADS)), uint3(128u, 1u, 1u))
+                    metal_set_pipeline(enc, pso_sm)
+                    metal_set_buffer(enc, batt, 0ul, 0)
+                    metal_set_buffer(enc, bnp32, 0ul, 1)
                     metal_dispatch_threadgroups(enc, uint3(uint(NPOS), uint(N_HEADS), 1u), uint3(128u, 1u, 1u))
                     metal_set_pipeline(enc, pso_av)
                     metal_set_buffer(enc, batt, 0ul, 0)
@@ -283,7 +295,8 @@ def test_metal_prefill_kernels(t : T?) {
                     metal_set_buffer(enc, bhs, 0ul, 5)
                     metal_set_buffer(enc, bkvm, 0ul, 6)
                     metal_set_buffer(enc, bnp, 0ul, 7)
-                    metal_dispatch_threadgroups(enc, uint3(uint(NPOS), uint(N_HEADS), 1u), uint3(uint(HEAD_SIZE), 1u, 1u))
+                    metal_set_buffer(enc, bnp32, 0ul, 8)
+                    metal_dispatch_threadgroups(enc, uint3(uint(NP32 / 32), uint(HEAD_SIZE / 32), uint(N_HEADS)), uint3(128u, 1u, 1u))
                 }
                 t |> success(aran, "attention dispatches: {err}")
                 t |> equal(buf_mismatch_approx(bxb, axb_want), 0)
@@ -297,8 +310,10 @@ def test_metal_prefill_kernels(t : T?) {
                 metal_release(bhs)
                 metal_release(bkvm)
                 metal_release(bnp)
+                metal_release(bnp32)
                 metal_release(bscale)
                 metal_release(pso_sc)
+                metal_release(pso_sm)
                 metal_release(pso_av)
 
                 // ===== swiglu + residual add =====
