@@ -485,11 +485,21 @@ batch slot) + `DASLLAMA_PIN_BATCH_BACKEND=metal`. Gates: `tests/dasLLAMA/test_me
 scales = the f16-dequant envelope, bounded 2e-3 × the dot-magnitude sum, NOT |y| — cancellation
 makes |y|-relative bounds dishonest); dasLLAMA suite 368 tests dormant-green; 40/40 greedy
 token parity vs the CPU control with the GPU engaged (informational — tolerance path).
-**First numbers (M1 Max, Parsec ON — plumbing signal only, clean round pending the window):**
-iso ntok=512 llama1b shapes 1034–1971 GMAC/s vs the tuned arm64-gen CPU tier's 566–797 in the
-same window (2–2.5x on the big shapes); end-to-end `prefill_perf` 1B Q8: N=512 728 tok/s vs
-unpinned-CPU 567 (+28%), N=256 +19%, N=64 loses (absorbs the one-time pipeline compile + weight
-upload). das-side findings recorded: `select_batch_backend("")` clears the pin but the slot
+**Clean measurement round (M1 Max, Parsec OFF, interleaved 3-rep A/B, 2026-07-11):** iso
+ntok=512 llama1b shapes — GPU 1481–1992 GMAC/s (q 1505 / w13 1817 / w2 1784 / cls 1992 ≈ 4
+TFLOPS f16-effective) vs the tuned arm64-gen CPU tier's 884–1001 = **1.5–2.0x on every big
+shape** (small kv 2048x512 at parity — per-region upload amortization). End-to-end
+`prefill_perf` 1B Q8: **N=512 1054–1055 vs CPU 757–768 tok/s (+37% best-vs-best, 2 of 3 reps
+within 0.1%)**; N=256 parity (792 vs 786 — the e2e crossover sits between 256 and 512 on 1B);
+N=64 is a harness artifact (the one-time pipeline compile + full lazy weight upload lands in
+each process's first measurement). Anchors: llama.cpp CPU pp512 813 t/s (das CPU 768 ✓ sane
+window); **llama.cpp full-Metal pp512 3960 t/s** — 3.75x our hybrid, and the honest headroom
+map: their forward is fully GPU-resident (attention + norms + no per-GEMM round-trips) near the
+M1 Max roofline, while this experiment pays a synchronous submit + activation/output memcpy per
+projection GEMM and runs attention on the CPU. Ledger from the round: per-layer encoder batching
+/ GPU-resident activations (the residency gap is the big lever), kernel iteration
+(double-buffered staging, tile shapes — ~2x kernel-level headroom to roofline), min_ntok
+threshold per box/model (crossover ~256–512 on 1B). das-side findings recorded: `select_batch_backend("")` clears the pin but the slot
 restores only at the next whole-backend activation (tests must pin "portable" explicitly for
 oracle runs); the pointer-keyed weight cache assumes load-once-stable weights (refilling the
 same arrays needs `metal_gemm_shutdown` — the documented cache contract).
