@@ -189,6 +189,11 @@ def cpt_is_number(cpt : int) : bool {
     return (range_flags(cpt) & 2) != 0
 }
 
+//! True if codepoint is a unicode combining mark (regex \p{M}, llama.cpp is_accent_mark).
+def cpt_is_mark(cpt : int) : bool {
+    return (range_flags(cpt) & 16) != 0
+}
+
 //! True if codepoint is whitespace (regex \s), per llama.cpp's whitespace set.
 def cpt_is_whitespace(cpt : int) : bool {
     for (w in WS) {
