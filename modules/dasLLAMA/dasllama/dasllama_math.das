@@ -740,7 +740,7 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
 // stores, the same dot per (row, token) — bit-identical either way.
 def private matmul_batch_core(var yp : float?; wp : float const?; xp : float const?; n, d, ntok : int64) {
     var myp = yp
-    let rch = matmul_chunks(int(d), 1, n * d * ntok)
+    let rch = matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)
     let L = lanes_for_work(n * d * ntok, g_batch_lane_cap)
     let tb = (rch < L && ntok >= 128l) ? min(int64((2 * L + rch - 1) / rch), ntok / 64l) : 1l
     if (tb <= 1l) {
@@ -792,7 +792,7 @@ def matmul_bf16_batch(var y : array<float>; w : array<uint16>; woff : int64; x :
         var yp = addr(y[0])
         let wp = reinterpret<uint16 const?>(addr(w[woff]))
         let xp = reinterpret<float const?>(addr(x[0]))
-        let nch = ntok == 1l ? matmul_chunks_gemv(int(d), 1, n * d) : matmul_chunks(int(d), 1, n * d * ntok)
+        let nch = ntok == 1l ? matmul_chunks_gemv(int(d), 1, n * d) : matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)
         maybe_parallel_for(0, int(d), nch) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {

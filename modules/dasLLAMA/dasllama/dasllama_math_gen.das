@@ -1216,7 +1216,10 @@ def private kq_batch_kernel_gen(fmt : int; var yp : float?; kqp : uint8 const?; 
     let ng = d / mr
     var myp = yp
     let TB = effective_token_block(g_q8_token_block, n)
-    maybe_parallel_for(0, int(ng), matmul_chunks_gemv(int(ng * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(ub, ue) {
+    // GEMM shaper, not the GEMV one: a batch row-unit is ntok dots of work, and the GEMV wave
+    // formula (rows/(64·L) waves × L) cancels L out — the 4B w2 GEMM issued a fixed 32 chunks
+    // at BOTH 16 and 32 lanes (1/lane at 32L, zero self-serve slack)
+    maybe_parallel_for(0, int(ng), matmul_chunks(int(ng * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(ub, ue) {
         kq_batch_cell_gen(fmt, myp, kqp, ksp, xqp, xsp, xbsp, n, d, mr, TB, ub, ue, 0l, ntok)
     }
     unsafe {

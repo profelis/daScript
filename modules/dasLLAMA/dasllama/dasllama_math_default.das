@@ -121,7 +121,7 @@ def private q8q8_batch_kernel(var yp : float?; wp : int8 const?; sp : float cons
         let pf0 = ref_time_ticks()
         unsafe {
             let wsbase = addr(g_pf_ws[0])
-            parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re, wg) {
+            parallel_for(0, int(d), matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re, wg) {
                 unsafe {
                     var wsw = reinterpret<int64?>(wsbase)
                     wsw[rb] = ref_time_ticks() - pf0
@@ -152,7 +152,7 @@ def private q8q8_batch_kernel(var yp : float?; wp : int8 const?; sp : float cons
         g_pf_n ++
         return
     }
-    maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+    maybe_parallel_for(0, int(d), matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n
@@ -220,7 +220,7 @@ def private q8q8_kernel_s16(var yp : float?; wp : int8 const?; sp : uint16 const
 def private q8q8_batch_kernel_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+    maybe_parallel_for(0, int(d), matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n
@@ -615,7 +615,7 @@ def mx4q8_batch_kernel(var yp : float?; wn : uint8 const?; we : uint8 const?; xq
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+        maybe_parallel_for(0, int(d), matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wn + int64(i) * (n / 2l)
@@ -638,7 +638,7 @@ def mx4q8_batch_groupn_kernel(var yp : float?; wn : uint8 const?; we : uint8 con
     mxfp4_fill_lut(lut)
     unsafe {
         let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
-        maybe_parallel_for(0, int(nregions * d), matmul_chunks(int(nregions * d), 1, n * d * nregions)) $(rb, re) {
+        maybe_parallel_for(0, int(nregions * d), matmul_chunks(int(nregions * d), get_q8_batch_chunks_per_job(), n * d * nregions)) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let ii = int64(i)

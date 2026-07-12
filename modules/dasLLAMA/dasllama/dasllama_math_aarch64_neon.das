@@ -83,7 +83,7 @@ def private q8q8_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : flo
 def private q8q8_batch_kernel_neon_sdot4x4(var yp : float?; wp : int8 const?; sp : float const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+    maybe_parallel_for(0, int(d), matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n
@@ -476,7 +476,7 @@ def private q8q8_kernel_neon_sdot4x4_s16(var yp : float?; wp : int8 const?; sp :
 def private q8q8_batch_kernel_neon_sdot4x4_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
     let nb = n / 32l
     var myp = yp
-    maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+    maybe_parallel_for(0, int(d), matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)) $(rb, re) {
         unsafe {
             for (i in range(rb, re)) {
                 let wrow = wp + int64(i) * n

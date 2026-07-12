@@ -50,16 +50,10 @@ def private build_prompt(n, salt : int64) : array<int64> {
     return <- [for (i in range64(n)); 1000l + ((i * 7l + salt * 131l) % 5000l)]
 }
 
+// team-scanned argmax (bit-identical to a serial first-wins scan) — the serial loop was a
+// ~0.75ms all-lane hole PER STREAM between eval_batch steps (B=8: 6.1ms holes, 18% of the run)
 def private greedy_top(lg : array<float>; vocab : int64) : int64 {
-    var best = 0l
-    var bestv = lg[0]
-    for (i in range64(vocab)) {
-        if (lg[i] > bestv) {
-            bestv = lg[i]
-            best = i
-        }
-    }
-    return best
+    return parallel_argmax(lg, vocab)
 }
 
 // nb fresh sessions, each prefilled to depth p with its own (salted) prompt
