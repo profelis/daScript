@@ -3769,32 +3769,8 @@ def private requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<i
     prof_add("mm_requant", ts_rq)
 }
 
-// The bs twin of requant_rows_q8: quants + scales byte-identical, plus the per-16 sums the kq
-// batch tile's offset term consumes (row p's sums at xbsb[p * n/16 ..)).
-def private requant_rows_q8_bs(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>; var xbsb : array<int>) {
-    let nb = n / 32l
-    let nh = n / 16l
-    let ts_rq = ref_time_ticks()
-    unsafe {
-        let xp = reinterpret<float const?>(addr(x[0]))
-        var qp = addr(xqb[0])
-        var sp = addr(xsb[0])
-        var bp = addr(xbsb[0])
-        let rq_par = n * npos >= g_requant_par_threshold
-        maybe_parallel_for(rq_par, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
-            unsafe {
-                for (p in range(rb, re)) {
-                    let pp = int64(p)
-                    quantize_q8_0_bs_into_ptr(xp + pp * n, n, qp, sp, bp, pp * n, pp * nb, pp * nh)
-                }
-            }
-        }
-    }
-    prof_add("mm_requant", ts_rq)
-}
-
-// The Q8_K-form twin of requant_rows_q8_bs (kq v2): per-256 scales + per-16 sums of the
-// per-256-scaled quants. k4-weight batch matmuls and MoE gathers consume these rows.
+// Q8_K-form batch requant (kq v2): per-256 scales + per-16 sums of the per-256-scaled
+// quants. k4-weight batch matmuls and MoE gathers consume these rows.
 def private requant_rows_q8k_bs(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>; var xbsb : array<int>) {
     let nsb = n / 256l
     let nh = n / 16l
@@ -3986,19 +3962,26 @@ let FLASH_DECODE_MAX_SLICES = 32l   // 4 chunks/lane at 16L: Qwen2.5-1.5B d4k at
 // residual add and the caller runs the serial post-norm + add after the rendezvous.
 def private fused_attn_ok(t : Model; l : int64) : bool {
     let c = t.config
+    let fq = fmt_at(t.wq_fmt, l)
+    let fk = fmt_at(t.wk_fmt, l)
+    let fv = fmt_at(t.wv_fmt, l)
+    let fo = fmt_at(t.wo_fmt, l)
+    let any_kq = fq != KqFmt.q8 || fk != KqFmt.q8 || fv != KqFmt.q8 || fo != KqFmt.q8
+    let head_size = layer_head_size(c, l)
+    let qd = layer_qd(c, l)
     // head_size % 32: the per-head epilogues slice on head boundaries, and the wo-input requant
     // needs whole 32-quant groups per head (real targets are 64/128/256; stories15M's 48 falls back)
     return (g_fused_decode && t.quant == QuantMode.q8 && g_use_rope_table
-        && t.wv_offs[l] >= 0l && layer_head_size(c, l) % 32l == 0l
-        && kq_servable(t, fmt_at(t.wq_fmt, l)) && kq_servable(t, fmt_at(t.wk_fmt, l))
-        && kq_servable(t, fmt_at(t.wv_fmt, l)) && kq_servable(t, fmt_at(t.wo_fmt, l))
-        // kq v2: the chain's wo-input requant slices per head (32-grain) — Q8_K needs whole
-        // 256-superblocks, so kq layers take the per-op path until the chain regrains
-        && fmt_at(t.wq_fmt, l) == KqFmt.q8 && fmt_at(t.wk_fmt, l) == KqFmt.q8
-        && fmt_at(t.wv_fmt, l) == KqFmt.q8 && fmt_at(t.wo_fmt, l) == KqFmt.q8
+        && t.wv_offs[l] >= 0l && head_size % 32l == 0l
+        && kq_servable(t, fq) && kq_servable(t, fk) && kq_servable(t, fv) && kq_servable(t, fo)
+        // kq v2 regrain: Q8_K quantizes whole 256-superblocks — the layer-input quantize needs
+        // dim % 256, and a kq wo requants the attention output per HEAD GROUP of 256/head_size
+        // heads (head_size 128 = the head-PAIR chunks), so qd and the grouping must divide out
+        && (!any_kq || c.dim % 256l == 0l)
+        && (fo == KqFmt.q8 || (qd % 256l == 0l && (head_size >= 256l ? head_size % 256l == 0l : 256l % head_size == 0l)))
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && (!t.wscale_f16 || kernel_backend_has_rows16())
-        && lanes_for_work(c.dim * (layer_qd(c, l) + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
+        && lanes_for_work(c.dim * (qd + 2l * layer_kv_dim(c, l)), g_gemv_lane_cap) > 1)
 }
 
 // Fused attention block: ONE team rendezvous runs [qkv rows + bias] → [per-head-slot
@@ -4013,8 +3996,11 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
 // to the un-fused path. Stage geometry: stage 0 splits the qkv rows over 32-row groups (row
 // dots + bias are row-local, so ALL lanes serve — one chunk per whole head left 10 of 16 lanes
 // idle on a 4-head model); stage 1 runs the head-local epilogue over HEAD slots (q heads, then
-// k heads, then v heads — norm/rope/store need the whole head); stage 2 over query heads (or
-// kv-head x slice units), then [combine +] 32-row output groups.
+// k heads, then v heads — norm/rope/store need the whole head); stage 2 over query-head GROUPS
+// (hpu heads per unit — 1 unless a kq wo needs its Q8_K requant to span whole 256-superblocks;
+// or kv-head x slice units), then [combine +] 32-row output groups. kq layers (kq v2 regrain):
+// kq projections read the Q8_K input image (kxq/kxs/kxbs), q8 ones the Q8_0 image, and the
+// wo-input requant takes the consumer's form — both chains bit-match their per-op paths.
 def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : int64) {
     let c = t.config
     let dim = c.dim
@@ -4036,14 +4022,16 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let fv = fmt_at(t.wv_fmt, l)
     let fo = fmt_at(t.wo_fmt, l)
     let any_kq = fq != KqFmt.q8 || fk != KqFmt.q8 || fv != KqFmt.q8 || fo != KqFmt.q8
-    // attention rmsnorm + input quantize (serial — dim-sized, microseconds); kq layers use the
-    // bs quantizer (same quants/scales byte-for-byte, plus the per-16 sums the offset term needs)
+    // attention rmsnorm + input quantize (serial — dim-sized, microseconds): one image per
+    // consumed form (the per-op contract) — q8 projections read the Q8_0 image, kq projections
+    // the Q8_K image (kxq/kxs/kxbs — kq v2, all three formats)
     let ts_norm0 = ref_time_ticks()
     rms_at(s.xb, t, t.rms_att_off + l * dim, s.x, dim)
-    if (any_kq) {
-        quantize_q8_0_bs_into(s.xb, dim, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
-    } else {
+    if (fq == KqFmt.q8 || fk == KqFmt.q8 || fv == KqFmt.q8) {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+    }
+    if (fq != KqFmt.q8 || fk != KqFmt.q8 || fv != KqFmt.q8) {
+        quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
     }
     prof_add("norm", ts_norm0)
     let ts_chain = ref_time_ticks()
@@ -4055,6 +4043,10 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
     let n1 = get_dispatch_lanes()
     let ngrp = int(dim / 32l)
     let n2 = chain_stage_chunks(ngrp, int(dim), qd * dim)
+    // attn-stage unit: a kq wo requants the output per HEAD GROUP spanning whole 256-superblocks
+    // (head_size 128 = head pairs; >= 256 stays per-head — divisibility by the fuse gate)
+    let hpu = (fo != KqFmt.q8 && head_size < 256l) ? 256l / head_size : 1l
+    let nhu = int(n_heads / hpu)
     // flash-decode slicing: FLASH_DECODE_SLICE_LEN-position slices once cnt crosses
     // FLASH_DECODE_SLICE (ctx-derived ONLY — deterministic, box/T-independent); nsl == 1 keeps
     // the exact single-pass body and the 4-stage shape. Sliced shape inserts a per-head combine
@@ -4075,16 +4067,16 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         s.chain_stages[0] = int3(0, ngq, n0)
         s.chain_stages[1] = int3(0, nslots, nslots)
         s.chain_stages[2] = int3(0, int(n_kv_heads) * nsl, int(n_kv_heads) * nsl)
-        s.chain_stages[3] = int3(0, int(n_heads), int(n_heads))
+        s.chain_stages[3] = int3(0, nhu, nhu)
         s.chain_stages[4] = int3(0, ngrp, n2)
-        count_parallel_dispatch(min(n0, ngq) + nslots + int(n_kv_heads) * nsl + int(n_heads) + min(n2, ngrp))
+        count_parallel_dispatch(min(n0, ngq) + nslots + int(n_kv_heads) * nsl + nhu + min(n2, ngrp))
     } else {
         s.chain_stages |> resize(4)
         s.chain_stages[0] = int3(0, ngq, n0)
         s.chain_stages[1] = int3(0, nslots, nslots)
-        s.chain_stages[2] = int3(0, int(n_heads), n1)
+        s.chain_stages[2] = int3(0, nhu, n1)
         s.chain_stages[3] = int3(0, ngrp, n2)
-        count_parallel_dispatch(min(n0, ngq) + nslots + min(n1, int(n_heads)) + min(n2, ngrp))
+        count_parallel_dispatch(min(n0, ngq) + nslots + min(n1, nhu) + min(n2, ngrp))
     }
     let mmrows = mm_q8q8_rows_fn()
     let neox = c.rope_neox
@@ -4151,8 +4143,10 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
         let wpv = wqb + t.wv_offs[l]
         let wpo = wqb + t.wo_offs[l]
         // kq-tagged weights: plane bases + the stamped rows core per format (nulls/unused on q8
-        // tags); xbsw = the shared per-16 activation-sum plane (the bs quantizer filled it)
-        var xbsw : int? = any_kq ? addr(s.xbs[0]) : null
+        // tags) + the Q8_K activation image (kq v2 — per-256 scales + per-16 sums)
+        var kxqp : int8? = any_kq ? addr(s.kxq[0]) : null
+        var kxsp : float? = any_kq ? addr(s.kxs[0]) : null
+        var kxbsp : int? = any_kq ? addr(s.kxbs[0]) : null
         let kqpq = kq_plane_q(t, fq, t.wq_offs[l])
         let kspq = kq_plane_s(t, fq, t.wq_offs[l])
         let rowsq = kq_rows_for(fq)
@@ -4199,7 +4193,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                         if (r < qd) {
                             let r1 = min(rend, qd)
                             if (fq != KqFmt.q8) {
-                                invoke(rowsq, qp, kqpq, kspq, xqp, xsp, xbsw, dim, r, r1)
+                                invoke(rowsq, qp, kqpq, kspq, kxqp, kxsp, kxbsp, dim, r, r1)
                             } elif (f16w) {
                                 invoke(mmrows16, qp, wpq, wsq16, xqp, xsp, dim, r, r1)
                             } else {
@@ -4213,7 +4207,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             let r0 = r - qd
                             let r1 = min(rend, qd + kv_dim) - qd
                             if (fk != KqFmt.q8) {
-                                invoke(rowsk, kp, kqpk, kspk, xqp, xsp, xbsw, dim, r0, r1)
+                                invoke(rowsk, kp, kqpk, kspk, kxqp, kxsp, kxbsp, dim, r0, r1)
                             } elif (f16w) {
                                 invoke(mmrows16, kp, wpk, wsk16, xqp, xsp, dim, r0, r1)
                             } else {
@@ -4227,7 +4221,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                             let r0 = r - qd - kv_dim
                             let r1 = min(rend, qd + 2l * kv_dim) - qd - kv_dim
                             if (fv != KqFmt.q8) {
-                                invoke(rowsv, vp, kqpv, kspv, xqp, xsp, xbsw, dim, r0, r1)
+                                invoke(rowsv, vp, kqpv, kspv, kxqp, kxsp, kxbsp, dim, r0, r1)
                             } elif (f16w) {
                                 invoke(mmrows16, vp, wpv, wsv16, xqp, xsp, dim, r0, r1)
                             } else {
@@ -4280,21 +4274,25 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                     }
                 }
             } elif (stage == 2 && nsl == 1) {
-                // multi-head attention (the attention_std_decode worker body) + per-head requant of
-                // the wo input — each head's xb slice is final here, and head_size % 32 == 0, so the
-                // quant groups are chunk-local. Overwrites xq/xs; stage 0 (the only reader of the
-                // input quants) is complete by the stage barrier.
+                // multi-head attention (the attention_std_decode worker body) + requant of the wo
+                // input — units are HEAD GROUPS (hpu heads; 1 unless kq wo): each unit's xb span is
+                // final here and covers whole quant granules (32-blocks per head for q8, 256-
+                // superblocks per group for Q8_K — the fuse gate's divisibility). Overwrites the
+                // input quants; stage 0 (their only reader) is complete by the stage barrier.
                 unsafe {
-                    for (h in range(jb, je)) {
-                        let hh = int64(h)
-                        let qoff = hh * head_size
-                        let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
-                        attn_head_decode_d(attp + hh * seq_len, xbp, qp, attqp, attsp, kcl, vcl, kdt, vdt, runsp,
-                            nrun, qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, sinksp)
-                        if (fo != KqFmt.q8) {   // kq wo: the offset term needs this head's per-16 sums too
-                            quantize_q8_0_bs_into_ptr(xbp + qoff, head_size, xqp, xsp, xbsw, qoff, qoff / 32l, qoff / 16l)
+                    for (u in range(jb, je)) {
+                        for (g in range64(hpu)) {
+                            let hh = int64(u) * hpu + g
+                            let qoff = hh * head_size
+                            let kvhoff = (hh / kv_mul) * head_size  // GQA: which kv head this query head reads
+                            attn_head_decode_d(attp + hh * seq_len, xbp, qp, attqp, attsp, kcl, vcl, kdt, vdt, runsp,
+                                nrun, qoff, kvhoff, kstart, cnt, kv_dim, head_size, hh, scale, attn_softcap, sinksp)
+                        }
+                        let u0 = int64(u) * hpu * head_size
+                        if (fo != KqFmt.q8) {   // kq wo: Q8_K over the unit's whole-superblock span
+                            quantize_q8_k_into_ptr(xbp + u0, hpu * head_size, kxqp, kxsp, kxbsp, u0, u0 / 256l, u0 / 16l)
                         } else {
-                            quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
+                            quantize_q8_0_into_ptr(xbp + u0, hpu * head_size, xqp, xsp, u0, u0 / 32l)
                         }
                     }
                 }
@@ -4364,52 +4362,56 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                 }
             } elif (stage == 3 && nsl > 1) {
                 // per-head combine (flash rescale; sink joins max + denominator, softmax_sink
-                // contract) + the wo-input requant that the single-pass body does in stage 2
+                // contract) + the wo-input requant the single-pass body does in stage 2 — units
+                // are the same HEAD GROUPS (hpu heads; 1 unless kq wo), requant per unit span
                 unsafe {
-                    for (h in range(jb, je)) {
-                        let hh = int64(h)
-                        let qoff = hh * head_size
-                        let fbase = hh * int64(nsl)
-                        var mg = hmax(unsafe(flmp + fbase), int64(nsl))
-                        if (sinksp != null) {
-                            mg = max(mg, sinksp[hh])
-                        }
-                        for (i in range64(head_size)) {
-                            xbp[qoff + i] = 0.0
-                        }
-                        var lg = 0.0
-                        {
-                            // exp4 over the slice scale factors (nsl <= 16), flash-fold clamp convention
-                            let mg4 = float4(mg, mg, mg, mg)
-                            var sl = 0l
-                            while (sl + 4l <= int64(nsl)) {
-                                let f = exp4(max(float4(flmp[fbase + sl], flmp[fbase + sl + 1l], flmp[fbase + sl + 2l], flmp[fbase + sl + 3l]) - mg4, EXP4_LO))
-                                lg += (fllp[fbase + sl] * f.x + fllp[fbase + sl + 1l] * f.y
-                                    + fllp[fbase + sl + 2l] * f.z + fllp[fbase + sl + 3l] * f.w)
-                                axpy(xbp + qoff, flop + (fbase + sl) * head_size, f.x, head_size)
-                                axpy(xbp + qoff, flop + (fbase + sl + 1l) * head_size, f.y, head_size)
-                                axpy(xbp + qoff, flop + (fbase + sl + 2l) * head_size, f.z, head_size)
-                                axpy(xbp + qoff, flop + (fbase + sl + 3l) * head_size, f.w, head_size)
-                                sl += 4l
+                    for (u in range(jb, je)) {
+                        for (g in range64(hpu)) {
+                            let hh = int64(u) * hpu + g
+                            let qoff = hh * head_size
+                            let fbase = hh * int64(nsl)
+                            var mg = hmax(unsafe(flmp + fbase), int64(nsl))
+                            if (sinksp != null) {
+                                mg = max(mg, sinksp[hh])
                             }
-                            while (sl < int64(nsl)) {
-                                let f = exp(max(flmp[fbase + sl] - mg, -80.0))
-                                lg += fllp[fbase + sl] * f
-                                axpy(xbp + qoff, flop + (fbase + sl) * head_size, f, head_size)
-                                sl++
+                            for (i in range64(head_size)) {
+                                xbp[qoff + i] = 0.0
+                            }
+                            var lg = 0.0
+                            {
+                                // exp4 over the slice scale factors (nsl <= 16), flash-fold clamp convention
+                                let mg4 = float4(mg, mg, mg, mg)
+                                var sl = 0l
+                                while (sl + 4l <= int64(nsl)) {
+                                    let f = exp4(max(float4(flmp[fbase + sl], flmp[fbase + sl + 1l], flmp[fbase + sl + 2l], flmp[fbase + sl + 3l]) - mg4, EXP4_LO))
+                                    lg += (fllp[fbase + sl] * f.x + fllp[fbase + sl + 1l] * f.y
+                                        + fllp[fbase + sl + 2l] * f.z + fllp[fbase + sl + 3l] * f.w)
+                                    axpy(xbp + qoff, flop + (fbase + sl) * head_size, f.x, head_size)
+                                    axpy(xbp + qoff, flop + (fbase + sl + 1l) * head_size, f.y, head_size)
+                                    axpy(xbp + qoff, flop + (fbase + sl + 2l) * head_size, f.z, head_size)
+                                    axpy(xbp + qoff, flop + (fbase + sl + 3l) * head_size, f.w, head_size)
+                                    sl += 4l
+                                }
+                                while (sl < int64(nsl)) {
+                                    let f = exp(max(flmp[fbase + sl] - mg, -80.0))
+                                    lg += fllp[fbase + sl] * f
+                                    axpy(xbp + qoff, flop + (fbase + sl) * head_size, f, head_size)
+                                    sl++
+                                }
+                            }
+                            if (sinksp != null) {
+                                lg += exp(max(sinksp[hh] - mg, -80.0))
+                            }
+                            let inv = 1.0 / lg
+                            for (i in range64(head_size)) {
+                                xbp[qoff + i] *= inv
                             }
                         }
-                        if (sinksp != null) {
-                            lg += exp(max(sinksp[hh] - mg, -80.0))
-                        }
-                        let inv = 1.0 / lg
-                        for (i in range64(head_size)) {
-                            xbp[qoff + i] *= inv
-                        }
-                        if (fo != KqFmt.q8) {   // kq wo: per-16 sums alongside (see the single-pass twin)
-                            quantize_q8_0_bs_into_ptr(xbp + qoff, head_size, xqp, xsp, xbsw, qoff, qoff / 32l, qoff / 16l)
+                        let u0 = int64(u) * hpu * head_size
+                        if (fo != KqFmt.q8) {   // kq wo: Q8_K over the unit's whole-superblock span
+                            quantize_q8_k_into_ptr(xbp + u0, hpu * head_size, kxqp, kxsp, kxbsp, u0, u0 / 256l, u0 / 16l)
                         } else {
-                            quantize_q8_0_into_ptr(xbp + qoff, head_size, xqp, xsp, qoff, qoff / 32l)
+                            quantize_q8_0_into_ptr(xbp + u0, hpu * head_size, xqp, xsp, u0, u0 / 32l)
                         }
                     }
                 }
@@ -4420,7 +4422,7 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
                     let r0 = int64(jb) * 32l
                     let r1 = int64(je) * 32l
                     if (fo != KqFmt.q8) {
-                        invoke(rowso, xb2p, kqpo, kspo, xqp, xsp, xbsw, qd, r0, r1)
+                        invoke(rowso, xb2p, kqpo, kspo, kxqp, kxsp, kxbsp, qd, r0, r1)
                     } elif (f16w) {
                         invoke(mmrows16, xb2p, wpo, wso16, xqp, xsp, qd, r0, r1)
                     } else {
@@ -4463,24 +4465,29 @@ def private attention_chain_decode(t : Model; var s : Session; l : int64; pos : 
 // serial tail runs post-norm and/or the fused add+scale after the rendezvous.
 def private fused_ffn_ok(t : Model; l : int64) : bool {
     let c = t.config
+    let f1 = fmt_at(t.w1_fmt, l)
+    let f2 = fmt_at(t.w2_fmt, l)
+    let f3 = fmt_at(t.w3_fmt, l)
+    let any_kq = f1 != KqFmt.q8 || f2 != KqFmt.q8 || f3 != KqFmt.q8
     return (g_fused_decode && t.quant == QuantMode.q8
-        && kq_servable(t, fmt_at(t.w1_fmt, l)) && kq_servable(t, fmt_at(t.w2_fmt, l))
-        && kq_servable(t, fmt_at(t.w3_fmt, l))
-        // kq v2: the chain's w2-input requant slices at 32-row grain — Q8_K needs whole
-        // 256-superblocks, so kq layers take the per-op path until the chain regrains
-        && fmt_at(t.w1_fmt, l) == KqFmt.q8 && fmt_at(t.w2_fmt, l) == KqFmt.q8
-        && fmt_at(t.w3_fmt, l) == KqFmt.q8
+        && kq_servable(t, f1) && kq_servable(t, f2) && kq_servable(t, f3)
+        // kq v2 regrain: Q8_K quantizes whole 256-superblocks — the layer-input quantize needs
+        // dim % 256, and a kq down-proj moves stage 0 to 256-row groups (the w2-input requant
+        // is chunk-local), so the hidden dim must divide out
+        && (!any_kq || c.dim % 256l == 0l)
+        && (f2 == KqFmt.q8 || layer_hidden(t, l) % 256l == 0l)
         && get_jobque_team_mode() && kernel_backend_has_rows()
         && (!t.wscale_f16 || kernel_backend_has_rows16())
         && lanes_for_work(c.dim * layer_hidden(t, l), g_gemv_lane_cap) > 1)
 }
 
 // Fused dense FFN block: ONE team rendezvous runs [w1+w3 rows + act + requant] → [w2 rows +
-// residual add] as two stages. Stage 0 splits over 32-row groups of the hidden dim with gate and
-// up rows PAIRED per chunk, so the act(g)*u epilogue and the w2-input requant are chunk-local;
-// the requant lands in xq2/xs2 (NOT xq/xs — other stage-0 chunks are still reading the input
-// quants). Bit-identical to ffn_dense_decode's Q8 path — same dots, same act formula, same
-// quant groups, same adds.
+// residual add] as two stages. Stage 0 splits over 32-row groups of the hidden dim (256-row
+// for a kq down-proj — its Q8_K requant covers whole superblocks) with gate and up rows PAIRED
+// per chunk, so the act(g)*u epilogue and the w2-input requant are chunk-local; the requant
+// lands in xq2/xs2 (NOT xq/xs — other stage-0 chunks are still reading the input quants).
+// Bit-identical to ffn_dense_decode — same dots, same act formula, same quant groups (Q8_0 or
+// Q8_K per the consumer's format — kq v2 regrain), same adds.
 def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
     let c = t.config
     let dim = c.dim
@@ -4492,10 +4499,13 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
     let any_kq = f1 != KqFmt.q8 || f2 != KqFmt.q8 || f3 != KqFmt.q8
     let ts_norm1 = ref_time_ticks()
     rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
-    if (f1 != KqFmt.q8 || f3 != KqFmt.q8) {   // kq gate/up read the per-16 sums of the input quants
-        quantize_q8_0_bs_into(s.xb, dim, s.xq, s.xs, s.xbs, 0l, 0l, 0l)
-    } else {
+    // one input quantize per consumed form (the per-op mm_pre_f contract): q8 gate/up read the
+    // Q8_0 image, kq gate/up the Q8_K image (kxq/kxs/kxbs — kq v2, all three formats)
+    if (f1 == KqFmt.q8 || f3 == KqFmt.q8) {
         quantize_q8_0_into(s.xb, dim, s.xq, s.xs, 0l, 0l)
+    }
+    if (f1 != KqFmt.q8 || f3 != KqFmt.q8) {
+        quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
     }
     prof_add("norm", ts_norm1)
     let ts_chain = ref_time_ticks()
@@ -4511,7 +4521,10 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
     let post_norm = c.pre_post_norm
     let out_scale_here = c.layer_out_scale && !has_ple(c)
     let defer_add = post_norm || out_scale_here
-    let ngrp0 = int(hidden / 32l)
+    // stage-0 grain: 32 rows for a q8 down-proj; 256 for a kq one (the w2-input requant is
+    // chunk-local and Q8_K quantizes whole 256-superblocks — hidden % 256 by the fuse gate)
+    let grain0 = f2 != KqFmt.q8 ? 256l : 32l
+    let ngrp0 = int(hidden / grain0)
     let ngrp1 = int(dim / 32l)
     let n0 = chain_stage_chunks(ngrp0, int(hidden), 2l * dim * hidden)
     let n1 = chain_stage_chunks(ngrp1, int(dim), hidden * dim)
@@ -4555,8 +4568,11 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         let wp1 = wqb + w1o
         let wp3 = wqb + w3o
         let wp2 = wqb + w2o
-        // kq-tagged weights: plane bases + rows cores + the per-16 sum planes (input / requant)
-        var xbsw : int? = any_kq ? addr(s.xbs[0]) : null
+        // kq-tagged weights: plane bases + rows cores + the Q8_K activation image (kq v2 —
+        // per-256 scales + per-16 sums; the q8 rows cores keep the Q8_0 image)
+        var kxqp : int8? = any_kq ? addr(s.kxq[0]) : null
+        var kxsp : float? = any_kq ? addr(s.kxs[0]) : null
+        var kxbsp : int? = any_kq ? addr(s.kxbs[0]) : null
         var xbs2w : int? = f2 != KqFmt.q8 ? addr(s.xbs2[0]) : null
         let kqp1 = kq_plane_q(t, f1, w1o)
         let ksp1 = kq_plane_s(t, f1, w1o)
@@ -4569,19 +4585,20 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
         let rows2 = kq_rows_for(f2)
         team_parallel_stages(s.chain_stages) <| @(stage : int; jb : int; je : int) {
             unsafe {
-                let r0 = int64(jb) * 32l
-                let r1 = int64(je) * 32l
+                let grain = stage == 0 ? grain0 : 32l
+                let r0 = int64(jb) * grain
+                let r1 = int64(je) * grain
                 if (stage == 0) {
                     // paired gate/up rows, then act + requant on exactly these rows
                     if (f1 != KqFmt.q8) {
-                        invoke(rows1, gup, kqp1, ksp1, xqp, xsp, xbsw, dim, r0, r1)
+                        invoke(rows1, gup, kqp1, ksp1, kxqp, kxsp, kxbsp, dim, r0, r1)
                     } elif (f16w) {
                         invoke(mmrows16, gup, wp1, ws116, xqp, xsp, dim, r0, r1)
                     } else {
                         invoke(mmrows, gup, wp1, ws1, xqp, xsp, dim, r0, r1)
                     }
                     if (f3 != KqFmt.q8) {
-                        invoke(rows3, gup + hidden, kqp3, ksp3, xqp, xsp, xbsw, dim, r0, r1)
+                        invoke(rows3, gup + hidden, kqp3, ksp3, kxqp, kxsp, kxbsp, dim, r0, r1)
                     } elif (f16w) {
                         invoke(mmrows16, gup + hidden, wp3, ws316, xqp, xsp, dim, r0, r1)
                     } else {
@@ -4604,8 +4621,8 @@ def private ffn_chain_decode(t : Model; var s : Session; l : int64) {
                             swiglu(gup + r0, gup + hidden + r0, r1 - r0)
                         }
                     }
-                    if (f2 != KqFmt.q8) {   // kq down-proj: per-16 sums of the hidden requant too
-                        quantize_q8_0_bs_into_ptr(gup + r0, r1 - r0, xq2p, xs2p, xbs2w, r0, r0 / 32l, r0 / 16l)
+                    if (f2 != KqFmt.q8) {   // kq down-proj: Q8_K requant, whole superblocks (grain 256)
+                        quantize_q8_k_into_ptr(gup + r0, r1 - r0, xq2p, xs2p, xbs2w, r0, r0 / 256l, r0 / 16l)
                     } else {
                         quantize_q8_0_into_ptr(gup + r0, r1 - r0, xq2p, xs2p, r0, r0 / 32l)
                     }

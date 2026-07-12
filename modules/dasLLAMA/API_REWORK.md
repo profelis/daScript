@@ -464,13 +464,18 @@ what it costs today and what the fix would change.
   loader; oracle = llama.cpp mtmd (GGUF pairs ship). ~1 modest arc; the encoder is SHARED
   infrastructure — the same implementation unlocks Ultravox (llama-3 decoder ✓ have it) and
   ~80% of a Whisper-proper port later.
-- **Fused decode chains regrain for kq v2 (spotted landing k4 v2, 2026-07-12; k5/k6 joined
-  with their v2 port).** The chains' mid-chain requants slice at 32-element/per-head grain —
-  Q8_K needs whole 256-superblocks — so ALL kq layers are gated OUT of both chains
-  (fused_attn_ok/fused_ffn_ok) and take the per-op decode path. tg still improved (v2 gemv
-  +15% covered the chain loss) but the chain win is on the table: regrain the w2-input
-  requant to 256-row chunks and the wo-input requant to head PAIRS (head_size 128 × 2 = one
-  superblock). Sized: a few % tg on kq models.
+- **✅ SHIPPED (kq chain regrain, 2026-07-12 PM²): kq layers re-admitted to both fused decode
+  chains.** The chains run one activation image per consumed form (the per-op mm_pre_f
+  contract): q8 projections read the Q8_0 image, kq projections the Q8_K image (kxq/kxs/kxbs);
+  the w2-input requant moves to 256-row stage-0 groups and the wo-input requant to HEAD GROUPS
+  of 256/head_size heads (Qwen3's 128 = head pairs) so every Q8_K quantize covers whole
+  superblocks. Gates: dim % 256 for any kq weight, hidden % 256 for a kq down-proj, qd % 256 +
+  head-size divisibility for a kq wo (all real kq models pass). Bit-exact vs the per-op path —
+  test_fused_decode grew a kq arm (Qwen3-4B Q5_K_M = k5+k6+head-pairs, gemma-2-2b Q4_K_M =
+  k4+k6+softcap/post-norm; ids + full logits EXACT). Measured (M1 Max steady-state): Q6 tg
+  30.5 → 31.1 (+2.1%), Q5 ~flat (33.8, within run wobble), Q4 control flat; decode_prof
+  confirms attn_chain 26% + ffn_chain 63% carry the whole kq decode. Dead requant_rows_q8_bs
+  deleted with the last Q8_0-bs chain arms.
 - **✅ SHIPPED (kq v3 panel-scratch, 2026-07-12 PM): the k5/k6 kernel unpack lever.** The
   tile now reads a BYTE-EXPANDED panel (one byte per weight — zero unpack ALU) that the
   batch cell unpacks from the packed grp planes once per (group, token-block)
