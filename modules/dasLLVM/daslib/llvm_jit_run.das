@@ -144,16 +144,26 @@ def private fold_llvm_code_hints(funcs : array<FunctionPtr>; seed : uint64) : ui
     return h
 }
 
-// True when the program emits any [llvm_code] generated kernel (a tuner-stamped or hand-written
-// generator body). Such kernels emit host-specific IR (e.g. AVX2 256-bit ops) that a generic
-// x86-64 exe target cannot legalize — so a -exe carrying them must target the current box.
-def private has_generated_kernel(funcs : array<FunctionPtr>) : bool {
-    for (fn in funcs) {
-        for (ann in fn.annotations) {
-            if (ann.annotation.name == "llvm_code") return true
+// True when the program will jit any [llvm_code] generated kernel (a tuner-stamped or
+// hand-written generator body). Such kernels emit host-specific IR (e.g. AVX2 256-bit ops)
+// that a generic x86-64 exe target cannot legalize — so a -exe carrying them must target the
+// current box. Scanned off the AST BEFORE the target flags are computed: the generators'
+// decline predicates consult the g_target_* gates, so a generic-CPU flag pass folds every
+// kernel to its reference body before any later machine choice could matter.
+def private has_generated_kernel(prog : Program?; jit_all_functions : bool) : bool {
+    var found = false
+    prog |> for_each_module() $(mod) {
+        mod |> for_each_function("") $(fun) {
+            if (fun.flags.used && (jit_all_functions || fun.moreFlags.requestJit) && !fun.moreFlags.requestNoJit) {
+                for (ann in fun.annotations) {
+                    if (ann.annotation.name == "llvm_code") {
+                        found = true
+                    }
+                }
+            }
         }
     }
-    return false
+    return found
 }
 
 def jit_dll_basename(funcs : array<FunctionPtr>; opt_level : int; size_level : int;
@@ -375,8 +385,17 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     // the disable pass consults target-gated intrinsic tables (has_intrinsic) — the
     // g_target_* truth must be set BEFORE it runs, not first at init_jit time below.
     // Standalone exes target a GENERIC CPU (write_exe use_host_cpu=false default), so
-    // host cpuid features must not leak into their emission (host_features=false).
-    init_jit_target_flags(target_triple, !gen_exe)
+    // host cpuid features must not leak into their emission (host_features=false) —
+    // EXCEPT a native exe carrying [llvm_code] kernels: a local-use artifact by
+    // definition, it targets the current box in BOTH the flags and the machine (the ONE
+    // truth, decided here — flags and machine must never diverge: host-F16C flags on a
+    // generic machine lower fp16 through libcalls msvcrt never links, and generic flags
+    // on a host machine decline every generated kernel to its reference body).
+    let exe_host_cpu = gen_exe && empty(target_triple) && has_generated_kernel(prog, jit_all_functions)
+    if (exe_host_cpu) {
+        to_log(LOG_INFO, "LLVM EXE: targeting the current box (CPU + features) — the build carries [llvm_code] kernels\n")
+    }
+    init_jit_target_flags(target_triple, !gen_exe || exe_host_cpu)
     make_visitor(*disableJitVisitor) $(disableJitVisitorAdapter) {
         prog |> for_each_module() $(mod) {
             mod |> for_each_function("") $(fun) {
@@ -418,7 +437,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
         // Pass target_triple so init_jit can pin the module data layout
             // BEFORE IR construction (wasm32 cross-compile needs 4-byte pointer
             // sizes baked into GEP folding from the very first IR instruction).
-            init_jit(opt_level |> uint, target_triple, !gen_exe)
+            init_jit(opt_level |> uint, target_triple, !gen_exe || exe_host_cpu)
 
         var jit_flags : LlvmJitFlags
         jit_flags.emit_prologue = emit_prologue
@@ -492,14 +511,9 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
             if (g_jit_fast_math) {
                 apply_fast_math_to_module(g_mod)   // EXPERIMENT: stamp all FP ops fast (non-bit-exact ceiling)
             }
-            // A -exe carrying tuner-generated ([llvm_code]) kernels is a local-use artifact: those
-            // kernels emit host-specific IR the generic exe target can't legalize, so target the
-            // current box (CPU + features). A -exe with only reference bodies stays generic/
-            // redistributable. (JIT always targets the host — its artifact runs here.)
-            let exe_host_cpu = gen_exe && has_generated_kernel(funcs)
-            if (exe_host_cpu) {
-                to_log(LOG_INFO, "LLVM EXE: targeting the current box (CPU + features) — the build carries tuner-generated kernels\n")
-            }
+            // exe_host_cpu was decided up top, before the flag pass — a -exe with only
+            // reference bodies stays generic/redistributable. (JIT always targets the
+            // host — its artifact runs here.)
             optimize_llvm_module(opt_level |> uint(), size_level |> uint(), LLVM_INLINE_THRESHOLD, !gen_exe || exe_host_cpu)
             if (dump_ir) {
                 // Let's remove unused attributes before we print IR.

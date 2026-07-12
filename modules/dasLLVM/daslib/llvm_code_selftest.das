@@ -5,6 +5,7 @@ module llvm_code_selftest shared private
 
 require llvm/daslib/llvm_boost
 require llvm/daslib/llvm_jit_code
+require llvm/daslib/llvm_jit_common
 require daslib/ast_boost
 
 //! Worked example of an `[llvm_code]` generator, and the self-test vehicle for the rail
@@ -62,6 +63,17 @@ def private k_value_gen(var gc : LlvmCodeCtx) : bool {
     return true
 }
 
+// bakes the resolved host_features truth (g_target_host_features) into a `() : int` stub as
+// a constant 1/0 — the artifact-side witness of which feature rail built it. The reference
+// body should return -1 so all three outcomes (host / generic / not-generated) are distinct.
+def private host_features_gen(var gc : LlvmCodeCtx) : bool {
+    if (!empty(gc.fn.arguments) || gc.fn.result.baseType != Type.tInt) return false
+    var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
+    LLVMPositionBuilderAtEnd(gc.jit.builder, entry)
+    LLVMBuildRet(gc.jit.builder, gc.jit.types->ConstI32(g_target_host_features ? 1ul : 0ul))
+    return true
+}
+
 // Called from llvm_user_modules::register_user_llvm_code_generators — the JIT invokes that
 // in the context that reads the registry, so the direct call lands in the right table copy.
 [macro_function]
@@ -69,4 +81,5 @@ def public register_selftest {
     register_llvm_code_generator("llvm_code_selftest::add_i32", @@add_i32_gen)
     register_llvm_code_generator("llvm_code_selftest::add_plus_k", @@add_plus_k_gen)
     register_llvm_code_generator("llvm_code_selftest::k_value", @@k_value_gen)
+    register_llvm_code_generator("llvm_code_selftest::host_features", @@host_features_gen)
 }

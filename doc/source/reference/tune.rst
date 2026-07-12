@@ -191,7 +191,11 @@ A frozen artifact must not demand or run tuning:
 * **Standalone exe** (``llvm-jit -exe``) still *stamps* — an exe built on a box
   with a manifest ships those winners (a local-use artifact by definition), and
   one built without ships the generic ``fallback=`` stamps — but the policy
-  rail is dead (no ``[tune_policy]``, no ``--tune``).
+  rail is dead (no ``[tune_policy]``, no ``--tune``). A native exe carrying any
+  ``[llvm_code]`` kernel also *targets the build box* (CPU **and** feature
+  gates, decided before the target-flag pass) so the stamped generators
+  actually emit instead of declining to their reference bodies on the
+  generic-CPU rail; a kernel-free exe stays generic/redistributable.
 
 Per-app override — ``[tune_manifest]``
 ======================================
