@@ -369,6 +369,8 @@ let public TRACE_TAG_CLS = 5
 let public TRACE_TAG_MOE = 6
 let public TRACE_TAG_SHEXP = 7
 let public TRACE_TAG_PLE = 8
+let public TRACE_TAG_ROUTE = 9   // MoE router GEMM + select/bucket (prefill section split)
+let public TRACE_TAG_PARK = 10   // MoE park/reduce bookkeeping around the expert GEMMs
 def public trace_tag(t : int) {
     if (g_trace_tags) {
         jobque_trace_tag(t)
@@ -695,15 +697,45 @@ def matmul(var y : array<float>; w : array<float>; woff : int64; x : array<float
 //! all ntok tokens, vs ntok× matmul re-reading W every call. Bit-for-bit ntok× matmul.
 def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n, d, ntok : int64) {
     unsafe {
-        var yp = addr(y[0])
-        let wp = reinterpret<float const?>(addr(w[0]))
-        let xp = reinterpret<float const?>(addr(x[0]))
-        maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+        matmul_batch_core(addr(y[0]), reinterpret<float const?>(addr(w[0])), reinterpret<float const?>(addr(x[0])), n, d, ntok)
+    }
+}
+
+// The fp32 batch GEMM core: 1-D row split, except ROW-STARVED shapes (row chunks can't fill the
+// admitted lanes — the MoE router: d = n_expert = 128, grain 16 ⇒ 8 chunks idling half a 16-lane
+// box, worse with more lanes) split tokens too: a flat (row-chunk × token-block) domain. Disjoint
+// stores, the same dot per (row, token) — bit-identical either way.
+def private matmul_batch_core(var yp : float?; wp : float const?; xp : float const?; n, d, ntok : int64) {
+    var myp = yp
+    let rch = matmul_chunks(int(d), 1, n * d * ntok)
+    let L = lanes_for_work(n * d * ntok, g_batch_lane_cap)
+    let tb = (rch < L && ntok >= 128l) ? min(int64((2 * L + rch - 1) / rch), ntok / 64l) : 1l
+    if (tb <= 1l) {
+        maybe_parallel_for(0, int(d), rch) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wp + int64(i) * n
                     for (tk in range64(ntok)) {
-                        yp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
+                        myp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
+                    }
+                }
+            }
+        }
+        return
+    }
+    let rows_per = (d + int64(rch) - 1l) / int64(rch)
+    let tok_per = (ntok + tb - 1l) / tb
+    maybe_parallel_for(0, int(int64(rch) * tb), int(int64(rch) * tb)) $(cb, ce) {
+        unsafe {
+            for (c in range(cb, ce)) {
+                let rc = int64(c) / tb
+                let tc = int64(c) % tb
+                let r1 = min(rc * rows_per + rows_per, d)
+                let t1 = min(tc * tok_per + tok_per, ntok)
+                for (i in range64(rc * rows_per, r1)) {
+                    let wrow = wp + i * n
+                    for (tk in range64(tc * tok_per, t1)) {
+                        myp[tk * d + i] = dot(wrow, xp + tk * n, n)
                     }
                 }
             }
@@ -714,19 +746,7 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
 //! Blob+offset form of matmul_batch (see the matmul woff overload).
 def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
     unsafe {
-        var yp = addr(y[0])
-        let wp = reinterpret<float const?>(addr(w[woff]))
-        let xp = reinterpret<float const?>(addr(x[0]))
-        maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
-            unsafe {
-                for (i in range(rb, re)) {
-                    let wrow = wp + int64(i) * n
-                    for (tk in range64(ntok)) {
-                        yp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
-                    }
-                }
-            }
-        }
+        matmul_batch_core(addr(y[0]), reinterpret<float const?>(addr(w[woff])), reinterpret<float const?>(addr(x[0])), n, d, ntok)
     }
 }
 

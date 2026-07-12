@@ -6342,6 +6342,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
 
     // 1. route every position: one batched router GEMM (bit-identical per row to decode's
     //    mm_fblob), then the shared select per row; the shexp gate dots ride along
+    trace_tag(TRACE_TAG_ROUTE)
     let ts_route = ref_time_ticks()
     mm_fblob_b(s.moe_rlog, t, t.router_off + l * ne * dim, s.xb_b, dim, ne, npos)
     for (p in range64(npos)) {
@@ -6390,6 +6391,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     //     vs the per-expert loop below: the same per-row dots / bias / act / requant per row, only
     //     the scheduling changes.
     if (fused) {
+        trace_tag(TRACE_TAG_MOE)
         let ts_gather = ref_time_ticks()
         moe_gather_rows(s, 0l, nk, dim, k, kq_layer)
         prof_add("moe_gather", ts_gather)
@@ -6462,9 +6464,23 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
         }
         prof_add("mm_gemm", ts_g3)
+        // bucket row j -> the (position, slot) grid row for the reduce. Threaded: this is a
+        // 2·nk·dim·4B scatter copy (~67MB of traffic at pp512 on the 30B) — serial it was an
+        // ~8ms ALL-LANE hole between the down GEMM and the reduce (per-lane trace, dataset W)
+        trace_tag(TRACE_TAG_PARK)
         let ts_park = ref_time_ticks()
-        for (j in range64(nk)) {   // bucket row j -> the (position, slot) grid row for the reduce
-            copy_floats(s.moe_gout, j * dim, s.moe_eout, s.moe_bkt[j] * dim, dim)
+        unsafe {
+            let gp = reinterpret<float const?>(addr(s.moe_gout[0]))
+            var ep = addr(s.moe_eout[0])
+            let bp = reinterpret<int64 const?>(addr(s.moe_bkt[0]))
+            maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(nk), get_dispatch_lanes()) $(rb, re) {
+                unsafe {
+                    for (j in range(rb, re)) {
+                        let jj = int64(j)
+                        copy_floats(ep + bp[jj] * dim, gp + jj * dim, dim)
+                    }
+                }
+            }
         }
         prof_add("moe_park", ts_park)
         delete offs1
@@ -6477,6 +6493,9 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
 
     // 3. one batched GEMM chain per touched expert over its gathered rows; raw down-projection
     //    rows park in the (position, slot) grid for the ordered reduce (skipped when fused ran)
+    if (!fused) {
+        trace_tag(TRACE_TAG_MOE)
+    }
     for (e in range64(fused ? 0l : ne)) {
         let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
         let cnt = s.moe_cnt[e] - b0
@@ -6562,6 +6581,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
 
     // 4. shared expert for ALL positions — a plain dense batched FFN off the whole-batch image
     if (nsh > 0l) {
+        trace_tag(TRACE_TAG_SHEXP)
         let she = dim * nsh
         mm_b_q8_pre(s.moe_ghb, t, t.wsh1_off + l * she, s.xqb, s.xsb, dim, nsh, npos)
         mm_b_q8_pre(s.moe_ghb2, t, t.wsh3_off + l * she, s.xqb, s.xsb, dim, nsh, npos)
@@ -6576,6 +6596,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     //    the shared expert — exactly the decode accumulation order, so the sum is bit-identical.
     //    Plain mul+add loops (NOT axpy — its fused-FMA kernel would perturb the low bits); rows are
     //    disjoint so threading never changes the result.
+    trace_tag(TRACE_TAG_PARK)
     let ts_red = ref_time_ticks()
     unsafe {
         var ap = addr(s.xb2_b[0])
@@ -6692,6 +6713,7 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
 
     // 1. route every position: custom double-RMS router input in xb2_b, one batched router GEMM,
     //    per-row select, then fold each selected expert's ffn_down_exps_s down scale into its weight
+    trace_tag(TRACE_TAG_ROUTE)
     let ts_route = ref_time_ticks()
     gemma4_router_batch(t, s.xb2_b, s.x_b, l, dim, npos)
     mm_fblob_b(s.moe_rlog, t, t.router_off + l * ne * dim, s.xb2_b, dim, ne, npos)
@@ -6733,6 +6755,7 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
 
     // 3. one batched GEMM chain per touched expert over its gathered rows; the raw down-projection
     //    rows park in the (position, slot) grid for the ordered reduce
+    trace_tag(TRACE_TAG_MOE)
     for (e in range64(ne)) {
         let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
         let cnt = s.moe_cnt[e] - b0
@@ -7074,7 +7097,9 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
 
     // per-layer transformer stack — batched attention then FFN, each through the arch's registered block
     for (l in range64(c.n_layers)) {
+        trace_tag(TRACE_TAG_ATTN_STD)   // per-lane trace: color the prefill attention section
         t.blocks.attn_prefill(t, s, l, npos, start_pos)
+        trace_tag(TRACE_TAG_FFN_STD)
         t.blocks.ffn_prefill(t, s, l, npos)
     }
 
