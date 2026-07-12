@@ -519,8 +519,15 @@ def public matmul_chunks(rows : int; oversplit : int; work : int64) : int {
         return want
     }
     let cap = clamp(rows / g_matmul_min_chunk_rows, 1, want)   // grain-limited ceiling (<= want = L × oversplit)
-    let waves = max(cap / L, 1)                                // whole L-waves within the cap
-    let chunks = min(waves * L, cap)                           // full waves; never exceed the grain cap
+    // the grain may only limit OVERSPLIT — never cut chunks below the admitted lanes (underfilling
+    // L idles lanes for the whole dispatch, always worse than sub-grain chunks; rows < L is the
+    // only natural floor)
+    if (cap < L) {
+        let chunks = clamp(rows, 1, L)
+        assert_wave_aligned(chunks, L)
+        return chunks
+    }
+    let chunks = (cap / L) * L                                 // whole L-waves within the grain cap
     assert_wave_aligned(chunks, L)
     return chunks
 }
@@ -559,16 +566,21 @@ def private gcd_int(a, b : int) : int {
 //! `tokq` is the tile token quantum — token cells stay whole-tile so no cell pays a systematic
 //! sub-tile tail (the range tail still rides the walk's per-token tail path).
 def public matmul_grid(units : int; unit_rows : int64; oversplit : int; work : int64; ntok : int64; tokq : int) : int2 {
-    let c1 = matmul_chunks(units * int(unit_rows), oversplit, work)
+    let rows = units * int(unit_rows)
+    let c1 = matmul_chunks(rows, oversplit, work)
     if (g_batch_grid_2d == 0 || c1 <= 1) {
         return int2(c1, 1)
     }
     let L = lanes_for_work(work, g_batch_lane_cap)
     let ntile = int(ntok / int64(tokq))
-    if (c1 >= L || ntile < 2) {   // not starved, or no token axis to split
+    // grain-starved = the 1-D count only reaches L by going sub-grain (matmul_chunks fills to L);
+    // the token axis supplies the missing parallelism at FULL row grain instead — weight rows
+    // stream in grain-sized spans, re-read once per token cell
+    let gcap = g_matmul_min_chunk_rows > 0 ? clamp(rows / g_matmul_min_chunk_rows, 1, c1) : c1
+    if (gcap >= L || ntile < 2) {   // not grain-starved, or no token axis to split
         return int2(c1, 1)
     }
-    let rc = clamp(c1, 1, max(units, 1))   // row cells finer than one unit are empty claims
+    let rc = clamp(gcap, 1, max(units, 1))   // row cells finer than one unit are empty claims
     var ntc = 1
     if (g_batch_grid_2d == 1) {
         ntc = min((int(ntok) + 15) / 16, ntile)
@@ -602,9 +614,11 @@ var g_gemv_chunks_per_lane = 8
 def public set_gemv_chunks_per_lane(v : int) { g_gemv_chunks_per_lane = max(v, 1) }
 def public get_gemv_chunks_per_lane() : int { return g_gemv_chunks_per_lane }
 
-// Wave fill: when the grain-derived count lands in [lanes/2, lanes), round UP to one full wave —
-// chunks shrink but stay >= grain/2 (the grain is chosen halvable), and no lane idles. Counts
-// below lanes/2 stay grain-limited (filling would shred chunks below the halvable bound).
+// Wave fill: when the grain-derived count lands below the admitted lanes, round UP to one full
+// wave — chunks go sub-grain, but underfilling admitted lanes idles them for the whole dispatch,
+// which always loses more (30B decode router: 128 rows / grain 64 = 2 chunks on 16 lanes, 14 idle,
+// ~3.3% of the token). rows < lanes is the only natural floor. false = the historical grain-limited
+// count (A/B rail).
 var g_gemv_wave_fill = true
 def public set_gemv_wave_fill(v : bool) { g_gemv_wave_fill = v }
 def public get_gemv_wave_fill() : bool { return g_gemv_wave_fill }
@@ -633,9 +647,18 @@ def public matmul_chunks_gemv(rows : int; oversplit : int; work : int64) : int {
         // fewer than one grain-sized chunk per lane — the grain-limited split below applies
     }
     let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, L)
-    let chunks = (g_gemv_wave_fill && n < L && 2 * n >= L) ? L : n
+    let chunks = (g_gemv_wave_fill && n < L) ? clamp(rows, 1, L) : n
     assert_wave_aligned(chunks, L)
     return chunks
+}
+
+//! LPT (longest-processing-time-first) claim order for a region-list dispatch whose regions have
+//! known unequal costs: sort (id, cost) pairs biggest-cost first (ties: lowest id — deterministic),
+//! so the self-serve chunk queue front-loads the expensive regions and the dispatch tail drains on
+//! cheap ones. Region order never changes results when each region writes rows keyed by its own
+//! range. Use in every region-list BUILDER where per-region cost is known at build time.
+def public lpt_order(var ord : array<int2>) {
+    ord |> sort() $(a, b) => a.y != b.y ? a.y > b.y : a.x < b.x
 }
 
 //! Chunk count for a fused-chain stage over `groups` 32-row quant groups: the GEMV shaper's

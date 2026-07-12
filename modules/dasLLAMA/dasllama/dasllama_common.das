@@ -6472,7 +6472,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
                 s.moe_ord |> push(int2(int(e), int(cnt)))
             }
         }
-        s.moe_ord |> sort() $(a, b) => a.y != b.y ? a.y > b.y : a.x < b.x
+        lpt_order(s.moe_ord)
         var nreg = 0l
         for (oe in s.moe_ord) {
             let e = int64(oe.x)
