@@ -1,4 +1,5 @@
 options gen2
+options auto_inline_functions = false   // lint fixtures assert SOURCE shapes; splices rewrite them
 // STYLE032: array<T> default-initialized then filled by a single `push_from` /
 // `push_clone_from` from another array<T> — that is a clone of the source, so
 // `var w := SRC` (clone-assign) expresses it in one line.

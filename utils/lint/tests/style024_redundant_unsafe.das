@@ -1,4 +1,5 @@
 options gen2
+options auto_inline_functions = false   // lint fixtures assert SOURCE shapes; splices rewrite them
 // STYLE024: redundant `unsafe` wrap; nothing inside requires unsafe
 //
 // Problem: writing `unsafe(expr)` or `unsafe { ... }` around code that

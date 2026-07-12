@@ -1,4 +1,5 @@
 options gen2
+options auto_inline_functions = false   // lint fixtures assert SOURCE shapes; splices rewrite them
 // LINT003: pass-mutable suppression (issue #3090)
 //
 // A var whose only "mutable" use is being passed to a mutable-ref parameter

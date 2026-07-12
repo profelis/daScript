@@ -1,4 +1,5 @@
 options gen2
+options auto_inline_functions = false   // lint fixtures assert SOURCE shapes; splices rewrite them
 // LINT007: Left and right operands of binary operator are identical
 //
 // Problem:

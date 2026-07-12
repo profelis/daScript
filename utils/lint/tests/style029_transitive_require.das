@@ -1,4 +1,5 @@
 options gen2
+options auto_inline_functions = false   // lint fixtures assert SOURCE shapes; splices rewrite them
 // STYLE029: 'require X' used only for ONE module X re-exports — require it
 // directly and drop X. Silent when >=2 re-exports are used (aggregation
 // facade, e.g. daslib/ast) or the single used re-export is builtin.

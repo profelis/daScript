@@ -1,4 +1,5 @@
 options gen2
+options auto_inline_functions = false   // lint fixtures assert SOURCE shapes; splices rewrite them
 // STYLE021: table<string; JsonValue?> built by repeated const-key insert —
 // use the named-tuple JV form `var v = JV((k1=..., k2=...))` (json_boost).
 //
