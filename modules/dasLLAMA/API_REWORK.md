@@ -471,6 +471,16 @@ what it costs today and what the fix would change.
   +15% covered the chain loss) but the chain win is on the table: regrain the w2-input
   requant to 256-row chunks and the wo-input requant to head PAIRS (head_size 128 × 2 = one
   superblock). Sized: a few % tg on kq models.
+- **k5/k6 tile unpack gap — the high-bit deposit costs us proportionally more than lcpp
+  (spotted racing the k5/k6 v2 port, M1 2026-07-12).** Post-v2 the k5/k6 folds are
+  byte-identical to k4's, yet Q5/Q6 pp sit at 0.83×/0.80× lcpp (das 110/111 vs 132/138)
+  while Q4 races at parity: our k5/k6 tiles run ~0.69 of our own k4 tile where lcpp's Q5/Q6
+  hold ~0.86 of their Q4. The suspect is the per-(blk, j) weight unpack: k5's
+  load_row_bytes_x4 byte-gather + or_bit_x10 (cmtst/bsl per half) and k6's two extra qh
+  vector loads + shift/and/shl per (j, qd). We OWN the repack layout — candidate fixes:
+  pre-expanded k5 high-bit rows (trade plane bytes for ALU), a tbl-based deposit, or k6 qh
+  pre-shift at repack. Needs an iso GMAC/s read of the k5/k6 tiles vs k4's 97.7 first.
+  Sized: up to +20% Q5/Q6 pp on M1 if the unpack fully amortizes; also lifts the zen2 race.
 - **kq v2 on zen2/SPR — the x64 lattice race (k5/k6 v2 landed 2026-07-12 — unblocked).** The v2 emitter folds are
   lattice-generic (maddubs/vpdpbusd kq grid rows emit the same integer scheme, bias128+kq
   dropped as untested); zen2's lcpp lead was its AVX2 Q4_K 8x8 repack GEMM, and lcpp has NO
