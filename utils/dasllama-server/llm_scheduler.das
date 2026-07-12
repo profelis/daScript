@@ -50,7 +50,7 @@ struct PendingReq {
     params : SamplingParams = SamplingParams()
     max_new : int64 = 256l                  // reply token budget (>= 1)
     seed : int = 0                          // != 0 => set_seed at admit (reproducible sampling)
-    t_submit : int64                        // ref_time_ticks at submit (queue-wait logging)
+    t_submit : int64 = 0l                   // ref_time_ticks at submit (queue-wait logging; 0 = unset)
 }
 
 //! One active generation stream: the owned KV session plus its request state. Managed wholly by
