@@ -318,7 +318,8 @@ def log_tune_status(appName : string) {
 // sidecar it writes into (the per-app file, resolved at scope-apply time)
 struct private TuneScope {
     scopeName : string
-    modName : string     // the declaring module — keys the scope's [tune] fname bank
+    modName : string     // the declaring module — anchors the demanded-kernel AST walk
+    covers : string      // ';'-joined extra modules whose [tune]/[tuned] kernels belong to this scope
     manifestPath : string
     tunerPath : string   // resolved against the declaring file; "" = no tuner declared
 }
@@ -327,20 +328,48 @@ struct private TuneScope {
 // read path itself is scope-independent (every module reads the app sidecar).
 var private g_scopes : table<string; TuneScope>
 
-// declaring module name -> the [tune] function names it registered. With ONE shared sidecar,
-// "is this scope tuned" cannot be file existence (another scope's tuner may have written it
-// first) — it is "does the sidecar carry an entry for every one of MY kernels". Set-valued:
-// shared-module macro state persists across compiles, insert is idempotent.
-var private g_scope_fnames : table<string; table<string>>
-
-// the ';'-joined [tune] fname list of `modName` — the literal the policy guard injection
-// carries into runtime, where the macro-side bank no longer exists
-def private scope_fnames_joined(modName : string) : string {
-    if (!(g_scope_fnames |> key_exists(modName))) {
-        return ""
+// the kernels `mod` demands sidecar entries for, read OFF THE AST: every [tune] function
+// plus every non-perm-pinned [tuned] function (the loop-hint kernels; a perm= pin is a
+// profiler variant stub, not a tunable). AST-derived on purpose — shared macro-module
+// globals are per-requiring-context copies, so a bank would read empty across modules.
+def private module_kernel_fnames(mod : Module?; var fnames : array<string>) {
+    for_each_function(mod, "") $(fn) {
+        var demand = false
+        for (ann in fn.annotations) {
+            if (ann.annotation.name == "tune") {
+                demand = true
+            } elif (ann.annotation.name == "tuned") {
+                let pv = find_arg(ann.arguments, "perm")
+                demand = !(pv is tString)
+            }
+        }
+        if (demand) {
+            fnames |> push("{fn.name}")
+        }
     }
-    let names <- [for (fname in keys(g_scope_fnames[modName])); fname]
-    return join(names, ";")
+}
+
+// the ';'-joined demanded-kernel list of a scope: its declaring module plus every covers=
+// module present in the compiling program — the literal the policy guard injection carries
+// into runtime, where the AST no longer exists
+def private scope_fnames_joined(scope : TuneScope) : string {
+    var wanted : table<string>
+    wanted |> insert(scope.modName)
+    for (m in split(scope.covers, ";")) {
+        if (!empty(m)) {
+            wanted |> insert(m)
+        }
+    }
+    var fnames : array<string>
+    program_for_each_module(compiling_program()) $(mod) {
+        if (wanted |> key_exists("{mod.name}")) {
+            module_kernel_fnames(mod, fnames)
+        }
+    }
+    let joined = join(fnames, ";")
+    delete wanted
+    delete fnames
+    return joined
 }
 
 //! One `[tune_scope]`'s identity + completeness, as reported by `tune_scopes_status()` —
@@ -359,42 +388,72 @@ struct TuneScopeStatus {
 //! per-requiring-context copies, so a caller in another macro module (llvm_exe writing the
 //! release-deps JSON) would read an empty bank. Deduped by scope name.
 def tune_scopes_status(prog : Program?) : array<TuneScopeStatus> {
-    var rows : array<TuneScopeStatus>
+    // pass 1: the declared scopes (name, tuner, covers) off the [tune_scope] annotations
+    var found : array<TuneScope>
     var seen : table<string>
     prog |> for_each_module() $(mod) {
-        var sname = ""
-        var tuner = ""
-        var declFile = ""
         mod |> for_each_structure() $(st) {
             for (ann in st.annotations) {
                 if (ann.annotation.name == "tune_scope") {
+                    var sc = TuneScope(modName = "{mod.name}")
                     let nv = find_arg(ann.arguments, "name")
-                    if (nv is tString) { sname = nv as tString }
+                    if (nv is tString) { sc.scopeName = nv as tString }
                     let tv = find_arg(ann.arguments, "tuner")
-                    if (tv is tString) { tuner = tv as tString }
-                    declFile = "{st.at.fileInfo.name}"
-                }
-            }
-        }
-        if (!empty(sname) && !(seen |> key_exists(sname))) {
-            seen |> insert(sname)
-            var fnames : array<string>
-            for_each_function(mod, "") $(fn) {
-                for (ann in fn.annotations) {
-                    if (ann.annotation.name == "tune") {
-                        fnames |> push("{fn.name}")
+                    if (tv is tString) {
+                        sc.tunerPath = resolve_decl_path("{st.at.fileInfo.name}", tv as tString)
+                    }
+                    let cv = find_arg(ann.arguments, "covers")
+                    if (cv is tString) { sc.covers = cv as tString }
+                    if (!empty(sc.scopeName) && !(seen |> key_exists(sc.scopeName))) {
+                        seen |> insert(sc.scopeName)
+                        found |> push(sc)
                     }
                 }
             }
-            let mpath = tune_manifest_path()
-            rows |> push(TuneScopeStatus(name = sname, manifest = mpath,
-                tuner = empty(tuner) ? "" : resolve_decl_path(declFile, tuner),
-                complete = tune_sidecar_entries_complete(mpath, join(fnames, ";"))))
-            delete fnames
         }
     }
+    // pass 2: each scope's demanded kernels across its declaring + covers= modules
+    var rows : array<TuneScopeStatus>
+    rows |> reserve(length(found))
+    let mpath = tune_manifest_path()
+    for (sc in found) {
+        var wanted : table<string>
+        wanted |> insert(sc.modName)
+        for (m in split(sc.covers, ";")) {
+            if (!empty(m)) {
+                wanted |> insert(m)
+            }
+        }
+        var fnames : array<string>
+        prog |> for_each_module() $(mod) {
+            if (wanted |> key_exists("{mod.name}")) {
+                module_kernel_fnames(mod, fnames)
+            }
+        }
+        rows |> push(TuneScopeStatus(name = sc.scopeName, manifest = mpath,
+            tuner = sc.tunerPath,
+            complete = tune_sidecar_entries_complete(mpath, join(fnames, ";"))))
+        delete wanted
+        delete fnames
+    }
+    delete found
     delete seen
     return <- rows
+}
+
+//! The demanded kernels in the ';'-joined `fnames` that LACK a sidecar entry — "" when
+//! complete. The loud half of the completeness check: a tuner that doesn't record a kernel
+//! it should re-tunes every start, and this names the drift so it's fixed in one glance.
+def tune_sidecar_missing_entries(path : string; fnames : string) : string {
+    var found = false
+    var manifest <- read_manifest(path, found)
+    var missing <- [for (fname in split(fnames, ";"));
+        fname;
+        where !empty(fname) && !(found && manifest |> key_exists(fname))]
+    delete manifest
+    let r = join(missing, ";")
+    delete missing
+    return r
 }
 
 //! Every kernel in the ';'-joined `fnames` list has a `"kernels"` entry in the sidecar at
@@ -728,8 +787,6 @@ class private TuneAnnotation : AstFunctionAnnotation {
             return false
         }
         let genKey = gv as tString
-        // register for the policy rail's per-scope completeness check (one shared sidecar)
-        g_scope_fnames["{compiling_module().name}"] |> insert("{func.name}")
         var perms <- take_perms(func, errors)
         if (empty(errors) && empty(perms)) {
             errors := "[tune] on {func.name}: no [tune_perm(...)] rows — list them BEFORE tune(...) in the same annotation bracket"
@@ -885,10 +942,15 @@ class private TuneScopeAnnotation : AstStructureAnnotation {
         if (tv is tString) {
             tuner = resolve_decl_path(string(st.at.fileInfo.name), tv as tString)
         }
+        var covers = ""
+        let cv = find_arg(args, "covers")
+        if (cv is tString) {
+            covers = cv as tString
+        }
         // overwrite, not error: shared-module macro state persists across compiles in one process
         g_scopes["{compiling_module().name}"] = TuneScope(scopeName = sname,
-            modName = "{compiling_module().name}", manifestPath = tune_manifest_path(),
-            tunerPath = tuner)
+            modName = "{compiling_module().name}", covers = covers,
+            manifestPath = tune_manifest_path(), tunerPath = tuner)
         return true
     }
 }
@@ -958,7 +1020,7 @@ def tune_auto_prepare(scopeName : string; manifestPath : string; tunerPath : str
     if (tune_sidecar_entries_complete(manifestPath, fnames)) {
         g_tuned_scopes++
     } else {
-        print("llvm_tune: tuner left scope '{scopeName}' incomplete in {manifestPath}\n")
+        print("llvm_tune: tuner left scope '{scopeName}' incomplete in {manifestPath} — missing: {tune_sidecar_missing_entries(manifestPath, fnames)}\n")
     }
 }
 
@@ -1019,7 +1081,7 @@ def tune_restart_needed(scopeName : string; manifestPath : string; tunerPath : s
     if (tune_sidecar_entries_complete(manifestPath, fnames)) {
         print("llvm_tune: scope '{scopeName}' tuned -> {manifestPath}\nllvm_tune: restart to apply the winners\n")
     } else {
-        print("llvm_tune: tuner left scope '{scopeName}' incomplete in {manifestPath}\n")
+        print("llvm_tune: tuner left scope '{scopeName}' incomplete in {manifestPath} — missing: {tune_sidecar_missing_entries(manifestPath, fnames)}\n")
     }
     return true
 }
@@ -1125,7 +1187,7 @@ def private apply_tune_policy(var func : FunctionPtr; declared : string; var err
             continue if (seen |> key_exists(scope.scopeName))
             seen |> insert(scope.scopeName)
             // per-scope KEY completeness, not file existence — the sidecar is shared
-            continue if (!force && tune_sidecar_entries_complete(scope.manifestPath, scope_fnames_joined(scope.modName)))
+            continue if (!force && tune_sidecar_entries_complete(scope.manifestPath, scope_fnames_joined(scope)))
             if (force || policy == "auto") {
                 // NO tuner run and NO restamp at compile time: the tuner is a daslang child
                 // (can't run mid-compile), and restamping a REQUIRED module's compiled
@@ -1151,7 +1213,7 @@ def private apply_tune_policy(var func : FunctionPtr; declared : string; var err
                     // autoinfer = undeclared result, void by convention for main
                     errors := "[tune_policy]: restart — {func.name} must return void or int"
                 } else {
-                    let fnames = scope_fnames_joined(scope.modName)
+                    let fnames = scope_fnames_joined(scope)
                     var guard : ExpressionPtr
                     if (func.result.baseType == Type.tInt) {
                         guard = qmacro_expr() {
@@ -1187,7 +1249,7 @@ def private apply_tune_policy(var func : FunctionPtr; declared : string; var err
                 var guards : array<ExpressionPtr>
                 guards |> reserve(length(autoScopes) + 1)
                 for (scope in autoScopes) {
-                    let fnames = scope_fnames_joined(scope.modName)
+                    let fnames = scope_fnames_joined(scope)
                     guards |> push <| qmacro_expr() {
                         tune_auto_prepare($v(scope.scopeName), $v(scope.manifestPath), $v(scope.tunerPath), $v(force), $v(fnames))
                     }
@@ -1267,29 +1329,42 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
     }
 }
 
+// inert once-only marker the TuneDefaultPolicy pass stamps onto main — appending an
+// annotation RUNS its apply (add_function_annotation), so the marker must not be
+// [tune_policy] itself (that would re-enter the policy with whatever env is set)
+[function_macro(name = "tune_policy_default_applied")]
+class private TunePolicyDefaultMarker : AstFunctionAnnotation {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup;
+                       args : AnnotationArgumentList; var errors : das_string) : bool {
+        return true
+    }
+}
+
 //! The "untuned does not start" default: when the PROGRAM ROOT (the anonymous main module)
 //! has a `main`, any `[tune_scope]` is in play, and no `[tune_policy]` was declared, behave
 //! as `[tune_policy(missing = "auto")]` — an incomplete/stale sidecar tunes at startup and
 //! re-execs. Escapes: `DAS_TUNE_POLICY=fallback` (the CI kill switch), the standing gates
 //! (AOT / -exe / grid modes / `DAS_TUNE_MANIFEST`), and structurally any root without a
 //! `main` (dastest-driven test files never tune — dastest runs `[test]` functions, not
-//! `main`). Fires as an infer pass on the root module; the appended `tune_policy` marker
-//! annotation makes it once-only and defers to a declared policy.
+//! `main`). Fires as an infer pass on the root module; the appended inert marker
+//! annotation makes it once-only and a declared `[tune_policy]` wins.
 [infer_macro]
 class private TuneDefaultPolicy : AstPassMacro {
     def override apply(prog : ProgramPtr; _mod : Module?) : bool {
-        // libraries compile under their module name; the app root module is anonymous
+        // libraries compile under their module name; the app root module is anonymous.
+        // NOTE the pass only fires for roots that SEE llvm_tune — a library owning tune
+        // scopes must re-export it (`require llvm/daslib/llvm_tune public`), or its apps
+        // silently get no default policy (dasllama_math_gen / dasllama_common do).
         return false if (is_in_completion() || !empty("{compiling_module().name}")
             || empty(g_scopes) || tune_policy_gated())
         var main_fn = compiling_module() |> find_unique_function("main", false)
         return false if (main_fn == null)
         for (ann in main_fn.annotations) {
-            return false if (ann.annotation.name == "tune_policy")   // declared, or this pass already ran
+            // declared policy wins; the marker means this pass already ran
+            return false if (ann.annotation.name == "tune_policy"
+                || ann.annotation.name == "tune_policy_default_applied")
         }
-        var aargs : array<tuple<argname : string; argvalue : RttiValue>>
-        aargs |> push((argname = "missing", argvalue = RttiValue(tString = "auto")))
-        main_fn |> append_annotation("llvm_tune", "tune_policy", aargs)   // the once-only marker (macro-appended applies don't run)
-        delete aargs
+        main_fn |> append_annotation("llvm_tune", "tune_policy_default_applied")
         var errs = ""
         var ok = true
         if (tune_exe_gate()) {
@@ -1299,8 +1374,10 @@ class private TuneDefaultPolicy : AstPassMacro {
             ok = apply_tune_policy(main_fn, "auto", errs)
         }
         if (!ok || !empty(errs)) {
-            macro_error(prog, main_fn.at, errs)
-            return false
+            // macro_error reported mid-infer-pass is silently dropped by the retry loop —
+            // print + panic instead, so the error flavor actually stops the compile
+            print("llvm_tune: {errs}\n")
+            panic("llvm_tune default policy: {errs}")
         }
         return true   // modified — re-run infer over the injected status/guard
     }

@@ -1844,7 +1844,15 @@ def main {
         "dot_q8kv" => dq8kvw, "dot_q8q8kv" => dq8q8kvw, "axpy_q8kv" => axq8kvw,
         "cvt_q8kv_to_f32" => cvtq8kvw, "quantize_q8kv_row" => quantq8kvw,
         "dot_mx4q8" => dmx4w, "quantize_q8_0_into_ptr" => quantw, "quantize_q8_0_bs_into_ptr" => quantbsw,
-        "rope_scaled_neox_tab" => ropew, "gemm_f32_uk_4x16" => gemmw, "dot_q8q8_laneq4x4" => laneqw
+        "rope_scaled_neox_tab" => ropew, "gemm_f32_uk_4x16" => gemmw, "dot_q8q8_laneq4x4" => laneqw,
+        // recorded-not-measured: [tuned] kernels this harness doesn't sweep yet keep their
+        // SHIPPED fallback as an explicit entry — the scope completeness check demands every
+        // non-pinned [tuned] kernel, and a missing key would re-tune on every start. Adding a
+        // sweep for one of these replaces its literal with the measured winner.
+        "dot_bf16" => "vec8_u2", "add_scale_inplace" => "vec8_u2",
+        "axpy_tq4kv" => "vec8_u2", "cvt_tq4kv_to_f32" => "vec8_u2",
+        "dot_q8tq4kv" => "vec16", "quantize_tq4kv_row" => "plain",
+        "dot_q8q8_f16s" => "vec16"
     }
     // upsert into the app sidecar (same resolution [tuned] reads from): the loop-hint winners
     // join the "kernels" section next to the [tune] generator perms, "runtime" is replaced —
