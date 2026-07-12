@@ -239,13 +239,23 @@ def _default_launcher() -> list[str]:
 
 
 def _python_launcher() -> str:
-    """The launcher Claude Code should spawn the supervisor with: python3 first
-    (a bare `python` can be Python 2 on legacy boxes, and this script is Python
-    3), then python (python.org Windows installs ship no python3 alias), else
-    the absolute path of the interpreter running this emit."""
+    """The launcher Claude Code should spawn the supervisor with: python3 first,
+    then python IF it is actually Python 3 (a bare `python` can be Python 2 on
+    legacy boxes, and this script is Python 3; python.org Windows installs ship
+    no python3 alias), else the absolute path of the interpreter running this
+    emit — always a working Python 3."""
     for name in ("python3", "python"):
-        if shutil.which(name):
-            return name
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        try:
+            probe = subprocess.run(
+                [exe, "-c", "import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)"],
+                capture_output=True, timeout=10)
+            if probe.returncode == 0:
+                return name
+        except Exception:
+            continue
     return sys.executable
 
 
