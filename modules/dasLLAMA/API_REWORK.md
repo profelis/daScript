@@ -471,16 +471,20 @@ what it costs today and what the fix would change.
   +15% covered the chain loss) but the chain win is on the table: regrain the w2-input
   requant to 256-row chunks and the wo-input requant to head PAIRS (head_size 128 × 2 = one
   superblock). Sized: a few % tg on kq models.
-- **k5/k6 tile unpack gap — the high-bit deposit costs us proportionally more than lcpp
-  (spotted racing the k5/k6 v2 port, M1 2026-07-12).** Post-v2 the k5/k6 folds are
-  byte-identical to k4's, yet Q5/Q6 pp sit at 0.83×/0.80× lcpp (das 110/111 vs 132/138)
-  while Q4 races at parity: our k5/k6 tiles run ~0.69 of our own k4 tile where lcpp's Q5/Q6
-  hold ~0.86 of their Q4. The suspect is the per-(blk, j) weight unpack: k5's
-  load_row_bytes_x4 byte-gather + or_bit_x10 (cmtst/bsl per half) and k6's two extra qh
-  vector loads + shift/and/shl per (j, qd). We OWN the repack layout — candidate fixes:
-  pre-expanded k5 high-bit rows (trade plane bytes for ALU), a tbl-based deposit, or k6 qh
-  pre-shift at repack. Needs an iso GMAC/s read of the k5/k6 tiles vs k4's 97.7 first.
-  Sized: up to +20% Q5/Q6 pp on M1 if the unpack fully amortizes; also lifts the zen2 race.
+- **k5/k6 kernel unpack gap — CONFIRMED by iso (M1, 2026-07-12 clean-box read).** Tile
+  GMAC/s: k4 97.0, k5 65.2 (0.67 of k4), k6 57.6 (0.59); gemv: k4 64.3, k5 27.5 (0.43 of
+  k4 — ALU-strangled at 19.4 GB/s weight stream vs k4's 37.2), k6 34.5. The e2e clean race
+  (warm cache, quiet box): lcpp 172/131/138.5 pp512 on Q4/Q5/Q6, das 151–163 (bimodal) /
+  110 / 111 → 0.88–0.95× / 0.84× / 0.80×. NOTE the recalibration: the session-2 "k4 parity"
+  (158.0 vs 158.2) was two load-depressed numbers coinciding — lcpp's true clean Q4 is
+  ~172, its effective tile ~107, so even k4 trails ~9% at the kernel. The unpack is the
+  lever for all three: k5's load_row_bytes_x4 byte-gather + or_bit_x10 (cmtst/bsl per
+  half), k6's two extra qh vector loads + shift/and/shl per (j, qd). We OWN the repack —
+  candidates: pre-expanded k5 high-bit rows (trade plane bytes for ALU), a tbl-based
+  deposit, k6 qh pre-shift at repack. The k5 GEMV (decode) is its own sub-item — 27.5
+  GMAC/s means Q5 decode leans on lcpp's Q5 being equally slow. Also on the table: the das
+  prefill run-to-run bimodality (150↔163 on Q4 while llama-bench holds ±0.3% — suspect
+  E-core lane placement; lcpp pins/QoS-hints its threads).
 - **kq v2 on zen2/SPR — the x64 lattice race (k5/k6 v2 landed 2026-07-12 — unblocked).** The v2 emitter folds are
   lattice-generic (maddubs/vpdpbusd kq grid rows emit the same integer scheme, bias128+kq
   dropped as untested); zen2's lcpp lead was its AVX2 Q4_K 8x8 repack GEMM, and lcpp has NO
