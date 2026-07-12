@@ -94,6 +94,15 @@ class SpirvShader : AstFunctionAnnotation {
         return true
     }
     def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
+        // GPU compilers do their own inlining — the CPU auto-inliner (patchInline, which shares
+        // this patch slot and runs once annotation patches go quiet) must not reshape the shader
+        // tree the emitter reads at fixup. Callee-side neverInline pins every reachable function;
+        // flag writes need no re-infer, so astChanged stays untouched.
+        collect_dependencies(func) $(vfun, _vvar) {
+            for (dfn in vfun) {
+                dfn.moreFlags.neverInline = true
+            }
+        }
         // Backend body-fill: the dummy bind_uniform / push_constants functions were reserved in apply();
         // their bodies stay empty (still `exports = true`) until the backend's generate_* override
         // populates them here. astChanged on the first fill triggers re-infer so the bodies resolve.

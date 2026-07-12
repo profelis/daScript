@@ -56,6 +56,20 @@ class MetalKernel : AstFunctionAnnotation {
             add_typed_global("{argName}_fastmath", Type.tBool, func.at, errors) &&
             add_typed_global("{argName}_census", Type.tString, func.at, errors))
     }
+    def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
+        // Metal's runtime compiler does its own inlining — the CPU auto-inliner (patchInline,
+        // which shares this patch slot and runs once annotation patches go quiet) must not
+        // reshape the kernel tree the emitter reads at fixup (today that's helper-into-helper
+        // splices; the inliner already declines the annotated method itself). Callee-side
+        // neverInline pins every reachable function; flag writes need no re-infer, so
+        // astChanged stays untouched. Same fence as SpirvShader.patch.
+        collect_dependencies(func) $(vfun, _vvar) {
+            for (dfn in vfun) {
+                dfn.moreFlags.neverInline = true
+            }
+        }
+        return true
+    }
     def override fixup(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
         let argName = args |> find_arg("name") ?as tString ?? "{func.name}`msl"
         let fastmath = args |> find_arg("fastmath") ?as tBool ?? true
