@@ -50,5 +50,8 @@ def test_fail_closed_rejections(t : T?) {
         check_rejects(t, "_fc_call", "call `helper` is not a supported MSL builtin")
         check_rejects(t, "_fc_wg_binding", "threadgroup memory is not a bindable buffer")
         check_rejects(t, "_fc_wg_type", "@workgroup member `tile` must be a scalar, vector, or single-dimension fixed array")
+        check_rejects(t, "_fc_lattice_wide", "is CPU-only (8/16-lane lattice forms do not exist in shaders")
+        check_rejects(t, "_fc_lattice_wide_local", "is CPU-only (8/16-lane lattice forms do not exist in shaders")
+        check_rejects(t, "_fc_packed_partial", "component or swizzle writes into a packed 3-lane buffer element")
     }
 }

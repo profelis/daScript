@@ -287,6 +287,95 @@ class Simd {
     }
 }
 
+// Phase-4 fp16 arithmetic: closed half-vector/scalar-float16 operators, the f16 broadcast,
+// half literals (h suffix), lattice zero-init, lane ctor, swizzle, and das's scalar-bool
+// vector ==/!= on half vectors
+class HalfArith {
+    @ssbo @binding = 0 ha : array<half4>
+    @ssbo @binding = 1 hb : array<half4>
+    @ssbo @binding = 2 hc : array<half4>
+    @ssbo @binding = 3 hs : array<float16>
+    @ssbo @binding = 4 hd : array<half2>
+    @ssbo @binding = 5 hflags : array<int>
+
+    [metal_kernel(name="halfarith_msl"), marker(no_coverage)]
+    def halfarith {
+        let i = gl_GlobalInvocationID.x
+        let a = ha[i]
+        let b = hb[i] * 0.5h
+        var acc : half4
+        let s = hs[i]
+        acc = ((a + b) - (a * b)) + ((a / b) + (-a))
+        hc[i] = acc
+        let t = (s * 2.0h) + 0.25h
+        hd[i] = half2(t, s)
+        hflags[i] = (a == b) ? 1 : ((a.wzyx != b) ? 2 : ((s < t) ? 3 : 4))
+    }
+}
+
+// Phase-4 int-lattice storage + converts: widen to 32-bit, widen within the lattice, truncating
+// and saturating narrows, scalar 8/16-bit converts — das's storage-only int families compute in
+// 32-bit and narrow back, exactly MSL's own conversion-ctor semantics
+class LatticeConvert {
+    @ssbo @binding = 0 bi : array<byte4>
+    @ssbo @binding = 1 io : array<int4>
+    @ssbo @binding = 2 bo : array<byte4>
+    @ssbo @binding = 3 bs : array<byte4>
+    @ssbo @binding = 4 st : array<short4>
+    @ssbo @binding = 5 ui : array<ubyte2>
+    @ssbo @binding = 6 uso : array<ushort2>
+    @ssbo @binding = 7 uo : array<uint2>
+    @ssbo @binding = 8 usat : array<ushort2>
+    @ssbo @binding = 9 hi : array<half2>
+    @ssbo @binding = 10 fo : array<float2>
+    @ssbo @binding = 11 ho : array<half2>
+    @ssbo @binding = 12 so : array<int>
+
+    [metal_kernel(name="latconv_msl"), marker(no_coverage)]
+    def latconv {
+        let i = gl_GlobalInvocationID.x
+        let w = int4(bi[i])
+        io[i] = (w * w) + w
+        bo[i] = byte4((w * 3) - int4(100))
+        bs[i] = byte4_sat((w * 40) + w)
+        st[i] = short4(bi[i])
+        let uw = uint2(ui[i])
+        uso[i] = ushort2(ui[i])
+        uo[i] = ((uw * 3u) + uw) + uint2(7u, 9u)
+        usat[i] = ushort2_sat(uw * 1000u)
+        let f = float2(hi[i])
+        fo[i] = f * 2.0
+        ho[i] = half2(f + float2(0.25, 0.5))
+        let sc = int16(w.x)
+        so[i] = int(sc) + int(bi[i].s0)
+    }
+}
+
+// Phase-4 packed 3-lane elements: das packs vectors tightly (float3 = 12B, half3 = 6B,
+// byte3 = 3B) and unified memory makes the das array the buffer, so 3-lane buffer/uniform
+// elements lower to MSL packed_T3 — loads wrap back into the plain type, stores assign whole
+// elements
+class PackedVec3 {
+    @ssbo @binding = 0 pf : array<float3>
+    @ssbo @binding = 1 pfo : array<float3>
+    @ssbo @binding = 2 ph : array<half3>
+    @ssbo @binding = 3 pho : array<half3>
+    @ssbo @binding = 4 pb : array<byte3>
+    @ssbo @binding = 5 pio : array<int3>
+    @uniform @binding = 6 scale : float16
+    @uniform @binding = 7 off : float3
+
+    [metal_kernel(name="packed3_msl"), marker(no_coverage)]
+    def packed3 {
+        let i = gl_GlobalInvocationID.x
+        let v = pf[i]
+        pfo[i] = (v * 2.0) + off
+        let h = ph[i]
+        pho[i] = (h + h) * half3(scale)
+        pio[i] = int3(pb[i]) * 3
+    }
+}
+
 //! Gate B: exactly the construct kinds the fixture set must emit — the census meta-test
 //! asserts equality with the observed union in both directions.
 def public declared_msl_census : table<string> {
@@ -297,6 +386,9 @@ def public declared_msl_census : table<string> {
         "param.buffer",
         "param.buffer_const",
         "param.uniform",
+        "param.buffer_packed",
+        "param.buffer_const_packed",
+        "param.uniform_packed",
         "param.builtin.thread_position_in_grid",
         "param.builtin.thread_position_in_threadgroup",
         "param.builtin.threadgroup_position_in_grid",
@@ -341,12 +433,19 @@ def public declared_msl_census : table<string> {
         "expr.builtin.simdgroup_index_in_threadgroup",
         "expr.var",
         "expr.member",
+        "expr.member.packed",
         "expr.index",
+        "expr.index.packed",
         "expr.swizzle",
+        "store.packed",
         "const.int",
         "const.uint",
         "const.float",
+        "const.float16",
         "const.bool",
+        "const.i32v",
+        "const.u32v",
+        "const.f32v",
         // uint scalar arithmetic + bitwise
         "op.add.u32",
         "op.sub.u32",
@@ -390,6 +489,34 @@ def public declared_msl_census : table<string> {
         "op.mul.i32v",
         "op.eq.i32v",
         "op.ne.i32v",
+        "op.add.u32v",
+        "op.mul.u32v",
+        // fp16 closed arithmetic (scalar float16 + half vectors)
+        "op.add.f16",
+        "op.mul.f16",
+        "op.lt.f16",
+        "op.add.f16v",
+        "op.sub.f16v",
+        "op.mul.f16v",
+        "op.div.f16v",
+        "op.neg.f16v",
+        "op.eq.f16v",
+        "op.ne.f16v",
+        // ctors + lattice converts (widen / truncating narrow / clamp-based saturating narrow)
+        "ctor.f16v",
+        "ctor.splat.f16v",
+        "cvt.f16v.f32v",
+        "cvt.f32v.f16v",
+        "cvt.i8v.i32v",
+        "cvt.i8v.i16v",
+        "cvt.i32v.i8v",
+        "cvt.u8v.u32v",
+        "cvt.u8v.u16v",
+        "cvt.i32.i16",
+        "cvt.i16.i32",
+        "cvt.i8.i32",
+        "cvt_sat.i32v.i8v",
+        "cvt_sat.u32v.u16v",
         // comparisons
         "op.eq.u32",
         "op.ne.u32",
@@ -451,5 +578,6 @@ def public declared_msl_census : table<string> {
 //! Every fixture kernel's census companion, for the census meta-test's union.
 def public all_msl_censuses : array<string> {
     return <- [mul_ab_msl_census, uarith_msl_census, iarith_msl_census, farith_msl_census,
-        vecarith_msl_census, control_msl_census, loops_msl_census, reduce_msl_census, simd_msl_census]
+        vecarith_msl_census, control_msl_census, loops_msl_census, reduce_msl_census, simd_msl_census,
+        halfarith_msl_census, latconv_msl_census, packed3_msl_census]
 }

@@ -1,13 +1,16 @@
 options gen2
 options indenting = 4
 
-// MSL text emitter (Phase-3 subset: full scalar/vector arithmetic, comparisons, logical, control
-// flow, threadgroup memory + barriers + simdgroup intrinsics). generate_msl lowers one
-// [metal_kernel] class method to a Metal compute kernel: @ssbo class members become device-pointer
-// parameters (const when no statement writes them), @uniform members become constant-address-space
-// reference parameters, @workgroup members become threadgroup declarations at the top of the kernel
-// body, referenced builtin globals become attributed parameters, the body lowers by manual
-// recursion. Every construct records a census kind at its emit site (gate B: the union across all
+// MSL text emitter (Phase-4 subset: full scalar/vector arithmetic incl. the 16/8-bit lattice,
+// comparisons, logical, control flow, threadgroup memory + barriers + simdgroup intrinsics,
+// ctor/convert/saturating-narrow calls). generate_msl lowers one [metal_kernel] class method to a
+// Metal compute kernel: @ssbo class members become device-pointer parameters (const when no
+// statement writes them), @uniform members become constant-address-space reference parameters,
+// @workgroup members become threadgroup declarations at the top of the kernel body, referenced
+// builtin globals become attributed parameters, the body lowers by manual recursion. 3-lane
+// buffer/uniform elements take MSL's packed_T3 spelling (das packs tightly; unified memory means
+// the das array IS the buffer) — loads wrap in the plain-type ctor, stores must assign the whole
+// element. Every construct records a census kind at its emit site (gate B: the union across all
 // test fixtures must equal declared_msl_census, both directions — text has no disassembler, so the
 // census IS the emitter's coverage proxy).
 
@@ -26,11 +29,13 @@ struct public MslEmitConfig {
 
 struct private MslMember {
     msl_name : string
-    elem : string
+    elem : string           // layout-bearing spelling (packed_T3 for 3-lane buffer/uniform elements)
+    value_elem : string     // plain value spelling — wraps packed loads back into operable form
     binding : int
     written : bool
     uniform : bool
     workgroup : bool
+    packed : bool           // elem != value_elem: 3-lane element behind a packed_T3 param
     wg_dim : int            // @workgroup fixed-array count; -1 = scalar/vector
 }
 
@@ -58,6 +63,16 @@ def private msl_safe_name(name : string) : string {
 
 def private err(var ctx : MslCtx; at : LineInfo; msg : string) {
     ctx.errors |> push("{msg} at line {int(at.line)}")
+}
+
+// the dedicated 8/16-lane diagnostic every shader emitter shares (dasGlsl wording): these lattice
+// forms exist on the CPU only — shader vectors cap at 4 lanes on every target
+def private reject_cpu_only_width(var ctx : MslCtx; at : LineInfo; t : TypeDecl?) : bool {
+    if (t != null && cpu_only_lattice_width(t.baseType)) {
+        err(ctx, at, "type {t.baseType} is CPU-only (8/16-lane lattice forms do not exist in shaders — vectors cap at 4 lanes)")
+        return true
+    }
+    return false
 }
 
 // ===== builtin globals (name-keyed, mirroring spirv_emit's classifier) =====
@@ -133,9 +148,15 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
             var wgDim = -1
             if (fld._type != null && fld._type.baseType == Type.tFixedArray && fld._type.firstType != null &&
                     fld._type.firstType.baseType != Type.tFixedArray) {
+                if (reject_cpu_only_width(ctx, fld.at, fld._type.firstType)) {
+                    continue
+                }
                 wgElem = msl_type_name(fld._type.firstType)
                 wgDim = fld._type.fixedDim
             } else {
+                if (reject_cpu_only_width(ctx, fld.at, fld._type)) {
+                    continue
+                }
                 wgElem = msl_type_name(fld._type)
             }
             if (empty(wgElem) || (wgDim == 0)) {
@@ -144,8 +165,8 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
             }
             let wgName = string(fld.name)
             ctx.renames[wgName] = msl_safe_name(wgName)
-            ctx.members[wgName] = MslMember(msl_name = msl_safe_name(wgName), elem = wgElem, binding = -1,
-                written = false, uniform = false, workgroup = true, wg_dim = wgDim)
+            ctx.members[wgName] = MslMember(msl_name = msl_safe_name(wgName), elem = wgElem, value_elem = wgElem,
+                binding = -1, written = false, uniform = false, workgroup = true, packed = false, wg_dim = wgDim)
             continue
         }
         if (binding < 0) {
@@ -153,14 +174,19 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
             continue
         }
         var elem = ""
+        var valueElem = ""
         if (isSsbo) {
             if (fld._type == null || fld._type.baseType != Type.tArray) {
                 err(ctx, fld.at, "@ssbo member `{fld.name}` must be array<T>; got {fld._type == null ? "?" : describe(fld._type)}")
                 continue
             }
-            elem = msl_type_name(fld._type.firstType)
+            if (reject_cpu_only_width(ctx, fld.at, fld._type.firstType)) {
+                continue
+            }
+            elem = msl_buffer_elem_name(fld._type.firstType)
+            valueElem = msl_type_name(fld._type.firstType)
             if (empty(elem)) {
-                err(ctx, fld.at, "@ssbo member `{fld.name}` element type {describe(fld._type.firstType)} has no MSL form (32-bit scalars + 2/3/4 vectors)")
+                err(ctx, fld.at, "@ssbo member `{fld.name}` element type {describe(fld._type.firstType)} has no MSL form (int/uint/float scalars, the 16/8-bit lattice, their 2/3/4 vectors)")
                 continue
             }
         } else {
@@ -168,9 +194,13 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
                 err(ctx, fld.at, "@uniform member `{fld.name}` must be a scalar or vector value — array members are @ssbo buffers")
                 continue
             }
-            elem = msl_type_name(fld._type)
+            if (reject_cpu_only_width(ctx, fld.at, fld._type)) {
+                continue
+            }
+            elem = msl_buffer_elem_name(fld._type)
+            valueElem = msl_type_name(fld._type)
             if (empty(elem)) {
-                err(ctx, fld.at, "@uniform member `{fld.name}` type {fld._type == null ? "?" : describe(fld._type)} has no MSL form (32-bit scalars + 2/3/4 vectors)")
+                err(ctx, fld.at, "@uniform member `{fld.name}` type {fld._type == null ? "?" : describe(fld._type)} has no MSL form (int/uint/float scalars, the 16/8-bit lattice, their 2/3/4 vectors)")
                 continue
             }
         }
@@ -181,8 +211,9 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
             }
         }
         ctx.renames[fldName] = msl_safe_name(fldName)
-        ctx.members[fldName] = MslMember(msl_name = msl_safe_name(fldName), elem = elem, binding = binding,
-            written = false, uniform = isUniform, workgroup = false, wg_dim = -1)
+        ctx.members[fldName] = MslMember(msl_name = msl_safe_name(fldName), elem = elem, value_elem = valueElem,
+            binding = binding, written = false, uniform = isUniform, workgroup = false,
+            packed = elem != valueElem, wg_dim = -1)
     }
     var ssboCount = 0
     for (m in values(ctx.members)) {
@@ -298,33 +329,28 @@ def private note(var ctx : MslCtx; kind : string) {
     ctx.census |> insert(kind)
 }
 
-// scalar class of a type for census keys: f32/i32/u32/bool scalars, f32v/i32v/u32v vectors
-// (lane count does not change the emitted text, so the census is lane-agnostic)
+// scalar class of a type for census keys: {f,i,u}{32,16,8} scalars (+ bool), the same with a `v`
+// suffix for their 2/3/4 vectors (lane count does not change the emitted text, so the census is
+// lane-agnostic). Classification rides the shared shader_block_layout rails.
 def private census_class(t : TypeDecl?) : string {
     if (t == null) {
         return "?"
     }
     let bt = t.baseType
-    if (bt == Type.tFloat) {
-        return "f32"
-    } elif (bt == Type.tInt) {
-        return "i32"
-    } elif (bt == Type.tUInt) {
-        return "u32"
-    } elif (bt == Type.tBool) {
+    if (bt == Type.tBool) {
         return "bool"
-    } elif (bt == Type.tFloat2 || bt == Type.tFloat3 || bt == Type.tFloat4) {
-        return "f32v"
-    } elif (bt == Type.tInt2 || bt == Type.tInt3 || bt == Type.tInt4) {
-        return "i32v"
-    } elif (bt == Type.tUInt2 || bt == Type.tUInt3 || bt == Type.tUInt4) {
-        return "u32v"
     }
-    return "?"
+    let cls = scalar_class(bt)
+    if (cls < 0) {
+        return "?"
+    }
+    let prefix = cls == 0 ? "i" : (cls == 1 ? "u" : "f")
+    let suffix = component_count(bt) > 1 ? "v" : ""
+    return "{prefix}{scalar_width(bt)}{suffix}"
 }
 
 def private is_vec_class(cls : string) : bool {
-    return cls == "f32v" || cls == "i32v" || cls == "u32v"
+    return cls |> ends_with("v")
 }
 
 def private op2_census_name(op : string) : string {
@@ -394,17 +420,23 @@ def private compound_base(op : string) : string {
     return ""
 }
 
-// das prints integral floats bare ("{2f}" is "2"), and bare-int + "f" is not a valid MSL literal
-def private msl_float_literal(var ctx : MslCtx; at : LineInfo; v : float) : string {
+// das interpolates uint as hex ("{1u}" is "0x1"); go through int64 for a decimal MSL literal
+def private msl_uint_literal(v : uint) : string {
+    return "{int64(uint64(v))}u"
+}
+
+// das prints integral floats bare ("{2f}" is "2"), and bare-int + suffix is not a valid MSL
+// literal; `suffix` is "f" for float and "h" for half (the das float16 literal's MSL spelling)
+def private msl_float_literal(var ctx : MslCtx; at : LineInfo; v : float; suffix : string) : string {
     let s = "{v}"
     if (s == "inf" || s == "-inf" || s == "nan") {
         err(ctx, at, "non-finite float literal has no MSL form")
-        return "0.0f"
+        return "0.0{suffix}"
     }
     if ((s |> find(".")) < 0 && (s |> find("e")) < 0) {
-        return "{s}.0f"
+        return "{s}.0{suffix}"
     }
-    return "{s}f"
+    return "{s}{suffix}"
 }
 
 def private emit_value(var ctx : MslCtx; e : Expression?) : string {
@@ -419,14 +451,52 @@ def private emit_value(var ctx : MslCtx; e : Expression?) : string {
         return "{(e as ExprConstInt).value}"
     } elif (e is ExprConstUInt) {
         note(ctx, "const.uint")
-        // das interpolates uint as hex ("{1u}" is "0x1"); go through int64 for a decimal literal
-        return "{int64(uint64((e as ExprConstUInt).value))}u"
+        return msl_uint_literal((e as ExprConstUInt).value)
     } elif (e is ExprConstFloat) {
         note(ctx, "const.float")
-        return msl_float_literal(ctx, e.at, (e as ExprConstFloat).value)
+        return msl_float_literal(ctx, e.at, (e as ExprConstFloat).value, "f")
+    } elif (e is ExprConstFloat16) {
+        note(ctx, "const.float16")
+        return msl_float_literal(ctx, e.at, float((e as ExprConstFloat16).value), "h")
     } elif (e is ExprConstBool) {
         note(ctx, "const.bool")
         return (e as ExprConstBool).value ? "true" : "false"
+    } elif (e is ExprConstInt2) {
+        note(ctx, "const.i32v")
+        let v = (e as ExprConstInt2).value
+        return "int2({v.x}, {v.y})"
+    } elif (e is ExprConstInt3) {
+        note(ctx, "const.i32v")
+        let v = (e as ExprConstInt3).value
+        return "int3({v.x}, {v.y}, {v.z})"
+    } elif (e is ExprConstInt4) {
+        note(ctx, "const.i32v")
+        let v = (e as ExprConstInt4).value
+        return "int4({v.x}, {v.y}, {v.z}, {v.w})"
+    } elif (e is ExprConstUInt2) {
+        note(ctx, "const.u32v")
+        let v = (e as ExprConstUInt2).value
+        return "uint2({msl_uint_literal(v.x)}, {msl_uint_literal(v.y)})"
+    } elif (e is ExprConstUInt3) {
+        note(ctx, "const.u32v")
+        let v = (e as ExprConstUInt3).value
+        return "uint3({msl_uint_literal(v.x)}, {msl_uint_literal(v.y)}, {msl_uint_literal(v.z)})"
+    } elif (e is ExprConstUInt4) {
+        note(ctx, "const.u32v")
+        let v = (e as ExprConstUInt4).value
+        return "uint4({msl_uint_literal(v.x)}, {msl_uint_literal(v.y)}, {msl_uint_literal(v.z)}, {msl_uint_literal(v.w)})"
+    } elif (e is ExprConstFloat2) {
+        note(ctx, "const.f32v")
+        let v = (e as ExprConstFloat2).value
+        return "float2({msl_float_literal(ctx, e.at, v.x, "f")}, {msl_float_literal(ctx, e.at, v.y, "f")})"
+    } elif (e is ExprConstFloat3) {
+        note(ctx, "const.f32v")
+        let v = (e as ExprConstFloat3).value
+        return "float3({msl_float_literal(ctx, e.at, v.x, "f")}, {msl_float_literal(ctx, e.at, v.y, "f")}, {msl_float_literal(ctx, e.at, v.z, "f")})"
+    } elif (e is ExprConstFloat4) {
+        note(ctx, "const.f32v")
+        let v = (e as ExprConstFloat4).value
+        return "float4({msl_float_literal(ctx, e.at, v.x, "f")}, {msl_float_literal(ctx, e.at, v.y, "f")}, {msl_float_literal(ctx, e.at, v.z, "f")}, {msl_float_literal(ctx, e.at, v.w, "f")})"
     } elif (e is ExprVar) {
         let ev = e as ExprVar
         let name = string(ev.name)
@@ -450,8 +520,14 @@ def private emit_value(var ctx : MslCtx; e : Expression?) : string {
         let ef = e as ExprField
         let fieldName = string(ef.name)
         if (base_is_self(ctx, ef.value) && key_exists(ctx.members, fieldName)) {
+            let m = ctx.members[fieldName]
+            if (m.packed && m.uniform) {
+                // a packed 3-lane uniform reads back into its plain-type value form
+                note(ctx, "expr.member.packed")
+                return "{m.value_elem}({m.msl_name})"
+            }
             note(ctx, "expr.member")
-            return ctx.members[fieldName].msl_name
+            return m.msl_name
         }
         err(ctx, ef.at, "field access `.{fieldName}` is not a kernel-class member access — only self.<@ssbo/@uniform member> lowers to MSL")
         return "/*.{fieldName}*/"
@@ -459,6 +535,13 @@ def private emit_value(var ctx : MslCtx; e : Expression?) : string {
         let ea = e as ExprAt
         let sub = emit_value(ctx, ea.subexpr)
         let idx = emit_value(ctx, ea.index)
+        let pm = member_lookup(ctx, ea.subexpr)
+        if (!empty(pm) && ctx.members[pm].packed) {
+            // a packed 3-lane element loads back into its plain-type value form (packed types
+            // have no arithmetic operators of their own)
+            note(ctx, "expr.index.packed")
+            return "{ctx.members[pm].value_elem}({sub}[{idx}])"
+        }
         note(ctx, "expr.index")
         return "{sub}[{idx}]"
     } elif (e is ExprSwizzle) {
@@ -575,8 +658,29 @@ def private emit_value(var ctx : MslCtx; e : Expression?) : string {
     return "/*{e.__rtti}*/"
 }
 
-// simdgroup intrinsics are the only calls with a VALUE lowering (metal_builtins declares them for
-// float/int/uint; the identity stub bodies never matter here — only the call AST is read)
+// das spelling of a scalar/vector type — ctor/convert calls carry it as the call name
+// (float4, half2, byte4, int16, ...); "" for types with no ctor surface here
+def private das_type_spelling(bt : Type) : string {
+    let cls = scalar_class(bt)
+    if (cls < 0) {
+        return ""
+    }
+    let w = scalar_width(bt)
+    let cc = component_count(bt)
+    var base = ""
+    if (cls == 2) {
+        base = w == 32 ? "float" : (cc > 1 ? "half" : "float16")
+    } elif (cls == 0) {
+        base = w == 32 ? "int" : (w == 16 ? (cc > 1 ? "short" : "int16") : (cc > 1 ? "byte" : "int8"))
+    } else {
+        base = w == 32 ? "uint" : (w == 16 ? (cc > 1 ? "ushort" : "uint16") : (cc > 1 ? "ubyte" : "uint8"))
+    }
+    return cc > 1 ? "{base}{cc}" : base
+}
+
+// simdgroup intrinsics + the ctor/convert/saturating-narrow family are the only calls with a
+// VALUE lowering (metal_builtins declares the simd set for float/int/uint; the identity stub
+// bodies never matter here — only the call AST is read)
 def private emit_call_value(var ctx : MslCtx; ec : ExprCall?) : string {
     let cname = "{ec.name}"
     let na = length(ec.arguments)
@@ -599,6 +703,51 @@ def private emit_call_value(var ctx : MslCtx; ec : ExprCall?) : string {
         note(ctx, "call.{cname}.{census_class(ec._type)}")
         return "{cname}({v}, {l})"
     }
+    // ctor / convert / saturating-narrow calls: the call name IS the das spelling of the result
+    // type, optionally + "_sat" for the clamping narrows. A CPU-only-width ctor (half8(...),
+    // byte16(...)) gets the dedicated 8/16-lane diagnostic.
+    if (ec._type != null && reject_cpu_only_width(ctx, ec.at, ec._type)) {
+        return "/*call {cname}*/"
+    }
+    let spell = ec._type != null ? das_type_spelling(ec._type.baseType) : ""
+    if (!empty(spell) && na >= 1 && (cname == spell || (cname == "half" && spell == "float16"))) {
+        // lanes / splat / lane-wise convert — MSL's own conversion-ctor semantics (C-truncation
+        // on integer narrowing, RNE on float->half) match das
+        var args : array<string>
+        args |> reserve(na)
+        for (arg in ec.arguments) {
+            args |> push(emit_value(ctx, arg))
+        }
+        let dst = census_class(ec._type)
+        if (na > 1) {
+            note(ctx, "ctor.{dst}")
+        } else {
+            let src = census_class(ec.arguments[0]._type)
+            if ("{src}v" == dst) {
+                note(ctx, "ctor.splat.{dst}")
+            } elif (src == dst) {
+                note(ctx, "ctor.{dst}")
+            } else {
+                note(ctx, "cvt.{src}.{dst}")
+            }
+        }
+        return "{msl_type_name(ec._type)}({join(args, ", ")})"
+    }
+    if (!empty(spell) && na == 1 && cname == "{spell}_sat") {
+        let cls = scalar_class(ec._type.baseType)
+        let w = scalar_width(ec._type.baseType)
+        if ((cls == 0 || cls == 1) && w < 32) {     // fp16 never saturates by design
+            let v = emit_value(ctx, ec.arguments[0])
+            var lo = "0u"
+            var hi = w == 16 ? "65535u" : "255u"
+            if (cls == 0) {
+                lo = w == 16 ? "-32768" : "-128"
+                hi = w == 16 ? "32767" : "127"
+            }
+            note(ctx, "cvt_sat.{census_class(ec.arguments[0]._type)}.{census_class(ec._type)}")
+            return "{msl_type_name(ec._type)}(clamp({v}, {lo}, {hi}))"
+        }
+    }
     err(ctx, ec.at, "call `{cname}` is not a supported MSL builtin — user function calls do not lower (a kernel is a single function)")
     return "/*call {cname}*/"
 }
@@ -612,6 +761,77 @@ def private base_is_self(ctx : MslCtx; e : Expression?) : bool {
     }
     let ev = e ?as ExprVar
     return ev != null && ev.name == ctx.self_name
+}
+
+// das field name when `e` is a self.<member> access, else ""
+def private member_lookup(ctx : MslCtx; e : Expression?) : string {
+    if (e == null) {
+        return ""
+    }
+    if (e is ExprRef2Value) {
+        return member_lookup(ctx, (e as ExprRef2Value).subexpr)
+    }
+    let ef = e ?as ExprField
+    if (ef == null || !base_is_self(ctx, ef.value)) {
+        return ""
+    }
+    let name = string(ef.name)
+    return key_exists(ctx.members, name) ? name : ""
+}
+
+// true when `e` (Ref2Value-peeled) indexes a packed 3-lane buffer member
+def private is_packed_elem_at(ctx : MslCtx; e : Expression?) : bool {
+    if (e == null) {
+        return false
+    }
+    if (e is ExprRef2Value) {
+        return is_packed_elem_at(ctx, (e as ExprRef2Value).subexpr)
+    }
+    if (!(e is ExprAt)) {
+        return false
+    }
+    let pm = member_lookup(ctx, (e as ExprAt).subexpr)
+    return ctx.members?[pm]?.packed ?? false
+}
+
+// true when a store target reaches INTO a packed 3-lane element (swizzle / component / nested
+// index) — those have no sound MSL lowering through a packed_T3 lvalue, so they fail closed
+def private lvalue_touches_packed(ctx : MslCtx; e : Expression?) : bool {
+    if (e == null) {
+        return false
+    }
+    if (e is ExprRef2Value) {
+        return lvalue_touches_packed(ctx, (e as ExprRef2Value).subexpr)
+    }
+    if (e is ExprSwizzle) {
+        return lvalue_touches_packed(ctx, (e as ExprSwizzle).value)
+    }
+    if (e is ExprAt) {
+        return is_packed_elem_at(ctx, e) || lvalue_touches_packed(ctx, (e as ExprAt).subexpr)
+    }
+    return false
+}
+
+// Store-target emission: a WHOLE packed element is assignable (packed_T3 = T3 converts
+// implicitly), so it emits raw — without this the value path would wrap the load in a plain-type
+// ctor and the store would silently hit a temporary. Anything reaching INTO a packed element
+// fails closed; everything else is the ordinary value path.
+def private emit_store_target(var ctx : MslCtx; e : Expression?) : string {
+    if (e != null && e is ExprRef2Value) {
+        return emit_store_target(ctx, (e as ExprRef2Value).subexpr)
+    }
+    if (e != null && e is ExprAt && is_packed_elem_at(ctx, e)) {
+        let ea = e as ExprAt
+        let sub = emit_value(ctx, ea.subexpr)
+        let idx = emit_value(ctx, ea.index)
+        note(ctx, "store.packed")
+        return "{sub}[{idx}]"
+    }
+    if (lvalue_touches_packed(ctx, e)) {
+        err(ctx, e.at, "component or swizzle writes into a packed 3-lane buffer element are not supported — assign the whole element")
+        return "/*packed store*/"
+    }
+    return emit_value(ctx, e)
 }
 
 // ===== statement emission =====
@@ -631,6 +851,9 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
         emit_stmt(ctx, (e as ExprWith).body, indent, lines)
     } elif (e is ExprLet) {
         for (v in (e as ExprLet).variables) {
+            if (reject_cpu_only_width(ctx, v.at, v._type)) {
+                continue
+            }
             let tname = msl_type_name(v._type)
             if (empty(tname)) {
                 err(ctx, v.at, "local `{v.name}` type {describe(v._type)} has no MSL form")
@@ -650,7 +873,7 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
         }
     } elif (e is ExprCopy) {
         let ec = e as ExprCopy
-        let l = emit_value(ctx, ec.left)
+        let l = emit_store_target(ctx, ec.left)
         let r = emit_value(ctx, ec.right)
         note(ctx, "stmt.assign")
         lines |> push("{indent}{l} = {r};")
@@ -660,6 +883,10 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
         let base = compound_base(op)
         if (op2._type == null || op2._type.baseType != Type.tVoid || empty(base)) {
             err(ctx, op2.at, "operator `{op}` as a statement is not an assignment")
+            return
+        }
+        if (is_packed_elem_at(ctx, op2.left) || lvalue_touches_packed(ctx, op2.left)) {
+            err(ctx, op2.at, "compound assignment into a packed 3-lane buffer element is not supported — load into a local, compute, then assign the whole element")
             return
         }
         let l = emit_value(ctx, op2.left)
@@ -880,13 +1107,13 @@ def public generate_msl(fn : FunctionPtr; var errors : array<string>; cfg : MslE
                 err(ctx, fn.at, "@uniform member `{name}` is written — uniforms are read-only; outputs are @ssbo buffers")
                 continue
             }
-            note(ctx, "param.uniform")
+            note(ctx, m.packed ? "param.uniform_packed" : "param.uniform")
             params |> push("constant {m.elem}& {m.msl_name} [[buffer({m.binding})]]")
         } elif (m.written) {
-            note(ctx, "param.buffer")
+            note(ctx, m.packed ? "param.buffer_packed" : "param.buffer")
             params |> push("device {m.elem}* {m.msl_name} [[buffer({m.binding})]]")
         } else {
-            note(ctx, "param.buffer_const")
+            note(ctx, m.packed ? "param.buffer_const_packed" : "param.buffer_const")
             params |> push("device const {m.elem}* {m.msl_name} [[buffer({m.binding})]]")
         }
     }

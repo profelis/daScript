@@ -77,7 +77,7 @@ dasSpirv and is reused as-is.
 | File | Gen/Hand | Purpose |
 |---|---|---|
 | `src/dasMetal.mm` | hand | `Module("das_metal")` — Obj-C++ shim over Metal.framework. Opaque annotated handles (device, queue, command buffer, compute encoder, pipeline state, library, function, buffer) + the extern surface below. Compiled with ARC; handles cross to das as `__bridge_retained void*`; `metal_release` = `__bridge_transfer`. Shim-side live-object counter for the leak gate. APPLE-only; links `-framework Metal -framework Foundation`. |
-| `metal/msl_types.das` | hand | daslang `TypeDecl` → MSL type name (uint/int/float/bool, 2/3/4-vectors; later the 16/8-bit lattice — MSL has native `half`). |
+| `metal/msl_types.das` | hand | daslang `TypeDecl` → MSL type name (32-bit scalars/bool + the 16/8-bit lattice — MSL has native `half`/`short`/`char` — and their 2/3/4 vectors, classified via the shared `daslib/shader_block_layout` rails). `msl_buffer_elem_name` gives the layout-bearing spelling: 3-lane elements take MSL's `packed_T3` (das packs tightly; unified memory means the das array IS the buffer). |
 | `metal/metal_builtins.das` | hand | Metal-only builtin surface over the shared lingua franca (the spirv_builtins pattern): re-exports `daslib/shader_lingua_franca`, adds `gl_WorkGroupSize` + the four simdgroup IDs (GLSL subgroup spellings) and the `simd_sum`/`simd_shuffle*` intrinsics (Metal spellings, float/int/uint). Identity stub bodies = width-1 simdgroup CPU semantics. |
 | `metal/msl_emit.das` | hand | The text emitter: `[macro_function] generate_msl(fn, var errors, cfg, var census) : string`. Manual recursion (`emit_value`/`emit_stmt`, mirroring `spirv_emit`). Kernel-signature synthesis from `@ssbo` globals (the one structural novelty — below). Records the construct census at every emit site. |
 | `metal/msl_shader.das` | hand | `[metal_kernel]` function-macro (`MetalKernel : AstFunctionAnnotation`, modeled on `SpirvShader`), applied to a **class method**; args: `name`, `fastmath` (default **true**, surfaced to the host via a companion ``{name}`msl_fastmath : bool`` global feeding the pipeline-compile options). `apply` declares the public ``{name}`msl : string`` global; **`fixup` fills `glob.init = new ExprConstString(...)`** — string capture is call-free, so fixup suffices (dasGlsl precedent; the patch/astChanged dance dasSpirv needed for `array<uint>` does not apply). Does `require spirv/spirv_builtins public`. |
@@ -408,6 +408,46 @@ lanes). Green: interp + `-jit` + static binary; MCP lint + CI lint clean. das go
 witness param (`witness : auto(TT)`) binds TT WITH the parameter's appended const (yields
 `array<T const>`) — even via `type<auto(TT)>`; the fix is `-const` at every use site
 (`array<TT -const>`, `_metal_common.das` `buf_download`).
+
+**2026-07-11 — Phase 4 landed: the 16/8-bit lattice.** `msl_types` rewritten on the shared
+`daslib/shader_block_layout` classifiers (`scalar_class`/`scalar_width`/`component_count`) — one
+stroke covers all 20 shader-legal lattice types (`float16`→`half`, `int8`→`char`, `uint8`→`uchar`,
+`int16`→`short`, `uint16`→`ushort`, + their 2/3/4 vectors; das `byte` is SIGNED int8 = MSL `char`).
+The 8/16-lane CPU-only forms get the dedicated dasGlsl-worded diagnostic
+(`cpu_only_lattice_width`) at every type-bearing site: @ssbo element, @uniform, @workgroup, local
+declaration, and ctor calls. **The packed 3-lane rail** (the one layout novelty): das packs
+vectors tightly (`float3` = 12B, `half3` = 6B, `byte3` = 3B) while non-packed MSL 3-vectors
+stride padded (16B/8B/4B) — and with unified memory the das array IS the buffer, so 3-lane
+buffer/uniform elements lower to MSL's byte-identical `packed_T3` spelling
+(`msl_buffer_elem_name`). This also fixes the latent Phase-1 `array<float3>`/`array<int3>` stride
+bug (never exercised — no fixture used a 3-lane buffer). Deliberate divergence from dasSpirv,
+which strides vec3 SSBO elements at std430's 16: Metal's contract here is "das layout, exactly".
+Loads wrap back into the plain type (`float3(pf[i])` — packed types have no arithmetic of their
+own), whole-element stores emit raw (packed = plain assignment is implicit), and anything
+reaching INTO a packed element (component/swizzle/compound-assign) fails closed. Emitter breadth:
+`ExprConstFloat16` → `h`-suffix literals; **folded 32-bit vector constants** (`int4(100)` with
+const args folds to `ExprConstInt4` at infer — a Phase-2 blind spot no fixture had hit) emit as
+ctor spellings; the ctor/convert/saturating-narrow call family (call name == das spelling of the
+result type) — widen `int4(byte4)`, truncating narrow `byte4(int4)` (MSL conversion-ctor
+C-truncation matches das), splat `half3(scalar)`, fp16 converts `half2(float2)`/`float2(half2)`,
+and `*_sat` → `char4(clamp(v, -128, 127))`-style clamp+convert; fp16 closed arithmetic and the
+f16 broadcast ride the existing operator paths via lattice-aware census classes
+({f,i,u}{32,16,8}[v]). Census 143 → 178 kinds. Tests: `tests/msl` 48 → 57 (three fixtures —
+HalfArith / LatticeConvert / PackedVec3 — shape asserts + goldens + census both directions;
+fail-closed grew `_fc_lattice_wide` (@ssbo half8) + `_fc_lattice_wide_local` (short8 local) +
+`_fc_packed_partial` (component store into packed)); `tests/metal` 20 → 26 on M1 Max, all
+BIT-EXACT (no tolerance anywhere): latconv (int-lattice widen/narrow/sat + fp16↔f32 converts,
+default fastmath — conversions and single ops are deterministic) and packed3 (byte3/half3/
+float3/int3 das-stride round-trips + packed uniform + `constant half&` scalar-f16 uniform, with
+float ops chosen exact — ×2.0 power-of-two scale — so even fma contraction cannot diverge).
+**Measured Metal fact that shaped the fp16 gate:** with `fastmath=false` (MTLMathModeSafe), Metal
+still keeps fp-contraction/mixed-precision freedom across multi-op chains — a 4-op half4 chain
+drifted 1–64 ULP off per-op RNE on M1 Max — but SINGLE ops are correctly rounded,
+**including half division**. So the halfarith GPU kernel stores one op per buffer (add/sub/mul/
+div + an exact-by-construction scalar chain + compare flags), pinning every rounding point, and
+matches the das CPU replay (promote-to-f32-round-back == per-op RNE) bit-exactly. Green: interp +
+`-jit` + static binary on both suites; MCP lint + CI lint clean. New emitter surface as a side
+effect: classic 32-bit vector lane/splat/convert ctors now lower too (Phase 2 had none).
 
 **2026-07-11 — pipeline: fixup-set global inits now infer; dasSpirv blob fill patch→fixup**
 (rides this branch — surfaced reviewing dasMetal's apply/fixup model). Boris called dasSpirv's
