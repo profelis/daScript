@@ -161,8 +161,9 @@ namespace das {
     // the que-creating (dispatch caller) thread, workers take slots 1..N. Without this the OS
     // placement is a lottery: 32 busy lanes on a 32c/64t box sometimes land on 16 cores' SMT
     // pairs — measured pp512 bimodal 306 vs 199 tok/s on the 3990X. Modes (DAS_JOBQUE_AFFINITY):
-    // 0 = off, 1 = ideal-processor hint (default; scheduler can still migrate under contention),
-    // 2 = hard mask (opt-in — pins survive ambient load but also can't dodge it).
+    // 0 = off (default — placement belongs to the OS unless a box opts in), 1 = ideal-processor
+    // hint (scheduler can still migrate under contention), 2 = hard mask (pins survive ambient
+    // load but also can't dodge it).
     static void jobque_apply_affinity_slot ( int slot, int mode ) {
         if ( mode <= 0 ) return;
         int hw = static_cast<int>(thread::hardware_concurrency());
@@ -189,8 +190,8 @@ namespace das {
         mTeamRankGate = (rankGateEnv != nullptr && atoi(rankGateEnv) != 0) ? 1 : 0;
         const char * eagerExitEnv = getenv("DAS_JOBQUE_TEAM_EAGER_EXIT");   // =0 re-enables the final-barrier spin (see setTeamEagerExit)
         mTeamEagerExit = (eagerExitEnv != nullptr) ? ((atoi(eagerExitEnv) != 0) ? 1 : 0) : 1;
-        const char * affinityEnv = getenv("DAS_JOBQUE_AFFINITY");   // 0 off / 1 ideal-CPU hint (default) / 2 hard mask
-        int affinityMode = affinityEnv ? atoi(affinityEnv) : 1;
+        const char * affinityEnv = getenv("DAS_JOBQUE_AFFINITY");   // 0 off (default) / 1 ideal-CPU hint / 2 hard mask
+        int affinityMode = affinityEnv ? atoi(affinityEnv) : 0;
         SetCurrentThreadPriority(JobPriority::High);
         jobque_apply_affinity_slot(0, affinityMode);   // the que creator = the dispatch caller
         for (int j = 0, js = mThreadCount; j < js; j++) {
