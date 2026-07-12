@@ -70,3 +70,97 @@ def public assert_no_metal_leaks {
         panic("metal_live_object_count() == {live} — every handle must be metal_release()d")
     }
 }
+
+// ===== host perf plumbing (Phase 5) =====
+
+//! Pipeline cache: source-text compiles are the dominant per-pipeline cost, so a driver that
+//! dispatches the same kernels every call keeps them here. Keyed by entry + fastmath + source
+//! (the source participates so two kernels sharing an entry name cannot collide). Drain releases
+//! everything — the cache owns its pipelines.
+struct public MetalPipelineCache {
+    cache : table<string; MetalComputePipeline?>
+}
+
+def public pipeline_cached(var pc : MetalPipelineCache; dev : MetalDevice?; source, entry : string; fastmath : bool; var error : string&) : MetalComputePipeline? {
+    let key = "{entry}|{fastmath}|{source}"
+    if (key_exists(pc.cache, key)) {
+        return pc.cache[key]
+    }
+    var pso = pipeline_from_source(dev, source, entry, fastmath, error)
+    if (pso != null) {
+        pc.cache[key] = pso
+    }
+    return pso
+}
+
+def public cache_drain(var pc : MetalPipelineCache) {
+    for (pso in values(pc.cache)) {
+        if (pso != null) {
+            metal_release(pso)
+        }
+        pso = null                  // handle values must not be finalized by the table delete
+    }
+    unsafe {
+        delete pc.cache
+    }
+}
+
+//! Buffer pool: size-bucketed free lists over metal_new_buffer (buckets are the next power of
+//! two, so `bytes` at release must equal `bytes` at acquire for the buffer to re-file into its
+//! bucket — deterministic for fixed-shape drivers). Acquired buffers stay owned by the caller
+//! until released back; drain frees the free lists only.
+struct public MetalBufferPool {
+    free_bufs : table<uint64; array<MetalBuffer?>>
+}
+
+def private pool_bucket(bytes : uint64) : uint64 {
+    var b = 256ul                   // floor keeps tiny uniforms from fragmenting buckets
+    while (b < bytes) {
+        b *= 2ul
+    }
+    return b
+}
+
+def public pool_acquire(var pool : MetalBufferPool; dev : MetalDevice?; bytes : uint64) : MetalBuffer? {
+    let bucket = pool_bucket(bytes)
+    var lst & = unsafe(pool.free_bufs[bucket])
+    if (!empty(lst)) {
+        var buf = lst[length(lst) - 1]
+        lst |> pop()
+        return buf
+    }
+    return metal_new_buffer(dev, bucket)
+}
+
+def public pool_release(var pool : MetalBufferPool; var buf : MetalBuffer?; bytes : uint64) {
+    pool.free_bufs[pool_bucket(bytes)] |> push(buf)
+}
+
+def public pool_drain(var pool : MetalBufferPool) {
+    for (lst in values(pool.free_bufs)) {
+        for (buf in lst) {
+            metal_release(buf)
+        }
+        lst |> clear()              // handles were released above — empty lists finalize safely
+    }
+    unsafe {
+        delete pool.free_bufs
+    }
+}
+
+//! One command buffer + one compute encoder around `blk`: encode any number of set_pipeline /
+//! set_buffer / dispatch calls, then end + commit + wait once. Metal's default hazard tracking
+//! orders same-buffer dispatches within the encoder. Returns false with `error` filled when the
+//! command buffer reports a GPU-side failure.
+def public with_compute_encoder(queue : MetalCommandQueue?; var error : string&; blk : block<(enc : MetalComputeEncoder?) : void>) : bool {
+    let cb = metal_new_command_buffer(queue)
+    let enc = metal_new_compute_encoder(cb)
+    invoke(blk, enc)
+    metal_end_encoding(enc)
+    metal_commit(cb)
+    metal_wait_until_completed(cb)
+    error = metal_command_buffer_error(cb)
+    metal_release(enc)
+    metal_release(cb)
+    return empty(error)
+}
