@@ -257,7 +257,9 @@ class Reduce {
         }
         if (gl_LocalInvocationIndex == 0u) {
             total = tile[0] + (gl_NumWorkGroups.x * 0u)
-            memoryBarrierShared()
+        }
+        memoryBarrierShared()   // uniform control flow — a threadgroup_barrier under a lane test is MSL UB
+        if (gl_LocalInvocationIndex == 0u) {
             dst[gl_WorkGroupID.x] = total
         }
     }

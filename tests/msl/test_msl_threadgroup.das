@@ -37,7 +37,9 @@ kernel void reduce(device const uint* src [[buffer(0)]],
     \}
     if ((gl_LocalInvocationIndex == 0u)) \{
         total = (tile[0] + (gl_NumWorkGroups.x * 0u));
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if ((gl_LocalInvocationIndex == 0u)) \{
         dst[gl_WorkGroupID.x] = total;
     \}
 \}
