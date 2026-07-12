@@ -289,10 +289,31 @@ Optimization and AOT
 
     Leaf arguments (constants and variables) substitute textually; pure single-use
     arguments substitute in place; everything else binds a temporary at the call site,
-    preserving call-order evaluation of side effects. ``options disable_inline`` (or the
+    preserving call-order evaluation of side effects. Operator overloads (``+``, ``==``,
+    ``+=``, unary ``-``, ...) take ``[inline]`` too - their operator sites splice exactly
+    like calls; punctuation functions dispatched through other node kinds (``[]``,
+    ``??``, properties) are refused. ``options disable_inline`` (or the
     host-side ``CodeOfPolicies::disable_inline``) turns splicing off - calls stay regular
     calls - while the declaration-level contract checks (body shape, recursion, ``@@``)
     still run; call-site splice checks do not apply, since nothing splices.
+
+    Separately from the ``[inline]`` contract, optimized builds also inline best-effort
+    (silent declines, never errors): calls passing a block literal argument splice
+    automatically, and so do plain calls and operator sites of small SAME-MODULE
+    non-generic callees - loop-free bodies within the ``auto_inline_cost`` node budget
+    (default 32), or private functions referenced exactly once, whose body moves rather
+    than duplicates. The heuristic tier never crosses modules: a transplanted body is
+    not context-free by language design (``_::`` dispatch and generic-operator
+    resolution consult the calling module), so cross-module inlining stays the
+    author's explicit ``[inline]`` contract. The plain-call tier is on by default;
+    ``options auto_inline_functions = false`` (or the host-side
+    ``CodeOfPolicies::auto_inline_functions``) turns just that tier off, and
+    ``options disable_auto_inline`` turns all best-effort splicing off.
+
+``[never_inline]``
+    Keeps the function out of best-effort (automatic) inlining - block-literal call-site
+    splicing and the heuristic ``auto_inline_functions`` tier both skip it. Combining it
+    with ``[inline]`` is a compile-time error: the two contracts are contradictory.
 
 ``[hybrid]``
     Marks a function as an AOT hybrid — it can call interpreted code from AOT context.

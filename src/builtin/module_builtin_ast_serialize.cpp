@@ -2648,6 +2648,8 @@ namespace das {
               << value.disable_cse
               << value.disable_inline
               << value.disable_auto_inline
+              << value.auto_inline_functions
+              << value.auto_inline_cost
               << value.disable_run
               << value.no_infer_time_folding
               << value.fail_on_no_aot

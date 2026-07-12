@@ -1,4 +1,5 @@
 options gen2
+options auto_inline_functions = false   // lint fixtures assert SOURCE shapes; splices rewrite them
 options rtti
 // PERF024: redundant pre-clone before a [clone(...)]-annotated function
 //

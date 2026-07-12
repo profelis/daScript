@@ -579,6 +579,7 @@ SET(AOT_LANGUAGE_MODULE_FILES
     tests/language/_distinct_fixture.das
     tests/language/_glob.das
     tests/language/_helper_foo.das
+    tests/language/_inline_generic_helper.das
     tests/language/_inline_unsafe_helper.das
     tests/language/_lambda_vis_inner.das
     tests/language/_lambda_vis_mid.das

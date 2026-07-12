@@ -24,6 +24,14 @@ namespace das {
     //    callee shape, [unsafe_operation]/[unsafe_deref], recursion through the splice
     //    graph, private symbols, call position - declines SILENTLY (counted, logged under
     //    log_optimization). `options disable_auto_inline` (or the policy) turns it off.
+    //    With `options auto_inline_functions` (opt-in, same policy family) the AUTO
+    //    tier also takes UNSIGNALED plain calls and operator sites whose callee is
+    //    worth splicing: loop-free and within the `auto_inline_cost` node budget, or
+    //    private and referenced exactly once (the body moves, it cannot grow the
+    //    program). Generic instances stay out of this tier (explicit flavors and
+    //    inferer-manufactured argument shapes are splice hazards - see
+    //    autoEligibleCall). [never_inline] opts a function out of every best-effort
+    //    tier; combining it with [inline] is an error.
     //    A plain unsafe body (hasUnsafe) splices: compiled callees lost their `unsafe { }`
     //    wrappers to foldUnsafe and would re-error on the caller's re-infer, so the spliced
     //    body rides the result-temp path under a generated statement-position ExprUnsafe -
@@ -142,6 +150,25 @@ namespace das {
         bool isPlainIdentifier ( const string & name ) {
             if ( name.empty() ) return false;
             return isalpha(uint8_t(name[0])) || name[0]=='_';
+        }
+
+        // operator names whose call sites dispatch through ExprOp1/2/3 - the node kinds
+        // the splicer plans. punctuation functions dispatched elsewhere ([] via ExprAt,
+        // ?? via null-coalescing, . via properties, clone/finalize via their own nodes)
+        // cannot honor the [inline] contract and stay refused
+        bool exprOpDispatchedName ( const string & name ) {
+            static const das_hash_set<string> ops = {
+                // unary (ExprOp1); ++/-- pre, +++/--- post
+                "!", "~", "++", "--", "+++", "---",
+                // binary (ExprOp2); +/-/* /% shared with unary by arity
+                "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", "<<<", ">>>",
+                "&&", "||", "^^", "==", "!=", ">", "<", ">=", "<=",
+                "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+                "<<=", ">>=", "<<<=", ">>>=", "&&=", "||=", "^^=",
+                // ternary (ExprOp3)
+                "?"
+            };
+            return ops.find(name) != ops.end();
         }
 
         // ----- callee param read statistics (for tier B) -----
@@ -441,13 +468,122 @@ namespace das {
             return false;
         }
 
-        bool autoEligibleCall ( ExprCall * call ) {
+        // ----- worthiness metric (heuristic plain-call candidacy) -----
+
+        struct BodyCost {
+            int     nodes = 0;
+            bool    hasLoop = false;
+            int64_t stackBytes = 0;     // sum of local let sizes - the frame the body owns
+        };
+
+        BodyCost bodyCost ( Expression * body ) {
+            BodyCost bc;
+            lookupExpressions(body, [&](Expression * e) {
+                bc.nodes ++;
+                if ( e->rtti_isFor() || e->rtti_isWhile() ) bc.hasLoop = true;
+                if ( e->rtti_isLet() ) {
+                    auto let = static_cast<ExprLet *>(e);
+                    for ( auto & v : let->variables ) {
+                        if ( v->type && !v->type->isAutoOrAlias() ) bc.stackBytes += v->type->getSizeOf64();
+                    }
+                }
+            });
+            return bc;
+        }
+
+        // splicing rehomes callee locals into the caller frame PERMANENTLY (spliced
+        // slots are not reused across sites), so unbounded splicing inflates frames
+        // past documented `options stack` contracts (proven: dasLLAMA's respond()
+        // chain overflowed its documented 64K under default-on). three bounds:
+        // a callee owning more than CALLEE_STACK bytes of locals is not worth a
+        // heuristic splice; a caller whose frame already holds more than
+        // CALLER_FRAME bytes gets no heuristic sites; and one round may add at
+        // most CALLER_GROWTH bytes to any single caller
+        constexpr int64_t AUTO_INLINE_CALLEE_STACK_BYTES  = 512;
+        constexpr int64_t AUTO_INLINE_CALLER_FRAME_BYTES  = 4096;
+        constexpr int64_t AUTO_INLINE_CALLER_GROWTH_BYTES = 2048;
+
+        // best-effort candidacy configuration for one patch round. blockLiterals is the
+        // pre-existing auto tier (block-literal call sites + devirt); functions is the
+        // opt-in heuristic tier over plain calls (auto_inline_functions), bounded by the
+        // node budget (auto_inline_cost). both caches live for one round - splices
+        // change bodies, so nothing carries across rounds
+        struct AutoInlineCfg {
+            bool blockLiterals = false;
+            bool functions = false;
+            int  budget = 32;
+            Module * thisModule = nullptr;              // heuristic tier is same-module-only
+            das_hash_map<Function *, bool> * worthCache = nullptr;
+            das_hash_set<Function *> * budgetExempt = nullptr;  // private, referenced exactly once
+        };
+
+        // worth splicing unsignaled: small enough that per-site growth stays bounded,
+        // and loop-free - a loop body's runtime dwarfs the call overhead while the
+        // splice inflates code. a private called-exactly-once callee is exempt from
+        // both: its body MOVES rather than duplicates (removeUnusedSymbols reaps the
+        // husk), so size cannot grow no matter what it holds
+        bool worthAutoInline ( Function * fn, const AutoInlineCfg & cfg ) {
+            if ( cfg.budgetExempt && cfg.budgetExempt->find(fn)!=cfg.budgetExempt->end() ) return true;
+            if ( !cfg.worthCache ) return false;
+            auto it = cfg.worthCache->find(fn);
+            if ( it != cfg.worthCache->end() ) return it->second;
+            BodyCost bc = bodyCost(fn->body);
+            bool ok = !bc.hasLoop && bc.nodes <= cfg.budget
+                && bc.stackBytes <= AUTO_INLINE_CALLEE_STACK_BYTES;
+            (*cfg.worthCache)[fn] = ok;
+            return ok;
+        }
+
+        // the unsignaled heuristic tier, per callee. generic INSTANCES stay out (the
+        // signaled block-literal tier keeps them, behind its proven flavor gates):
+        // instances carry splice hazards plain functions can't have - explicit
+        // const/ref-locked parameter flavors, and inferer-manufactured argument
+        // shapes: to_array_move's heap-mode array literal spliced into a generated
+        // `let <-` re-infers under the in-place make-local protocol and corrupts
+        // the array header (probe-verified: garbage sums, SIGSEGV)
+        bool autoEligibleFn ( Function * fn, const AutoInlineCfg & cfg ) {
+            if ( !fn || fn->mustInline || fn->builtIn ) return false;
+            if ( !fn->body || fn->isTemplate ) return false;
+            if ( fn->neverInline ) return false;    // explicit opt-out, both tiers
+            // macro-MANUFACTURED functions (qmacro products, helper factories,
+            // generated finalizers) carry bespoke resolution and shape invariants
+            // the splicer can't see - they never splice into callers. macros can
+            // also mark manufactured functions [never_inline] explicitly
+            if ( fn->generated ) return false;
+            if ( !cfg.functions || fn->fromGeneric ) return false;
+            // same-module only: a transplanted body is NOT context-free by language
+            // design - `_::` dispatch (clone/finalize, every `:=`/`delete`) resolves in
+            // the calling module deliberately, and infer's name-based probes (generic
+            // operators, the jit `.[]` handle-index probe) consult the destination
+            // module's visible-function set. Cross-module inlining is the author's
+            // explicit [inline] contract, not a heuristic's call
+            if ( fn->module != cfg.thisModule ) return false;
+            return worthAutoInline(fn, cfg);
+        }
+
+        bool autoEligibleCall ( ExprCall * call, const AutoInlineCfg & cfg ) {
             if ( !call->func || call->func->mustInline || call->func->builtIn ) return false;
             if ( !call->func->body || call->func->isTemplate ) return false;
-            for ( auto & a : call->arguments ) {
-                if ( a->rtti_isMakeBlock() ) return true;
+            if ( call->func->neverInline ) return false;    // explicit opt-out, both tiers
+            if ( cfg.blockLiterals ) {
+                for ( auto & a : call->arguments ) {
+                    if ( a->rtti_isMakeBlock() ) return true;
+                }
             }
-            return false;
+            return autoEligibleFn(call->func, cfg);
+        }
+
+        // a call-like splice edge: a direct call, or an operator-overload site. eligibility
+        // for the auto tier differs by node kind (block-literal candidacy is per-call), so
+        // the walkers test with autoEligibleCall for calls and autoEligibleFn for ops.
+        // rtti_isOp2 is true for copy/move/clone too - their func, when set at all, never
+        // passes the eligibility gates, so the over-approximation is harmless
+        Function * callLikeFunc ( Expression * expr ) {
+            if ( expr->rtti_isCall() ) return static_cast<ExprCall *>(expr)->func;
+            if ( expr->rtti_isOp1() || expr->rtti_isOp2() || expr->rtti_isOp3() ) {
+                return static_cast<ExprCallFunc *>(expr)->func;
+            }
+            return nullptr;
         }
 
         // one walk per function: for every statement its (block, index) anchor, and
@@ -456,10 +592,10 @@ namespace das {
         // splice step lowers those constructs first when statements are needed.
         class InlineCollect : public Visitor {
         public:
-            InlineCollect ( bool autoOn ) : autoEnabled(autoOn) {}
+            InlineCollect ( const AutoInlineCfg & cfg ) : autoCfg(cfg) {}
             vector<PlannedSite> sites;      // in visit order: within a block, increasing index
         protected:
-            bool autoEnabled;
+            const AutoInlineCfg & autoCfg;
             vector<StmtAnchor> blockStack;
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             virtual void preVisit ( ExprBlock * blk ) override {
@@ -492,13 +628,25 @@ namespace das {
                 Visitor::preVisit(expr);
                 if ( expr->func && expr->func->mustInline ) {
                     plan(expr, SiteKind::MustCall);
-                } else if ( autoEnabled && autoEligibleCall(expr) ) {
+                } else if ( autoEligibleCall(expr, autoCfg) ) {
                     plan(expr, SiteKind::AutoCall);
                 }
             }
+            // operator-overload sites. dispatch is exact-typed, so these never fire
+            // for ExprCopy/ExprMove/ExprClone (which derive from ExprOp2)
+            void planOp ( ExprCallFunc * expr ) {
+                if ( expr->func && expr->func->mustInline ) {
+                    plan(expr, SiteKind::MustCall);
+                } else if ( autoEligibleFn(expr->func, autoCfg) ) {
+                    plan(expr, SiteKind::AutoCall);
+                }
+            }
+            virtual void preVisit ( ExprOp1 * expr ) override { Visitor::preVisit(expr); planOp(expr); }
+            virtual void preVisit ( ExprOp2 * expr ) override { Visitor::preVisit(expr); planOp(expr); }
+            virtual void preVisit ( ExprOp3 * expr ) override { Visitor::preVisit(expr); planOp(expr); }
             virtual void preVisit ( ExprInvoke * expr ) override {
                 Visitor::preVisit(expr);
-                if ( !autoEnabled || expr->isInvokeMethod || expr->arguments.empty() ) return;
+                if ( !autoCfg.blockLiterals || expr->isInvokeMethod || expr->arguments.empty() ) return;
                 Expression * a0 = expr->arguments[0];
                 if ( a0->rtti_isR2V() ) a0 = static_cast<ExprRef2Value *>(a0)->subexpr;
                 if ( a0->rtti_isMakeBlock() || a0->rtti_isVar() ) plan(expr, SiteKind::Devirt);
@@ -547,14 +695,21 @@ namespace das {
         void childrenInEvalOrder ( Expression * e, vector<pair<Expression *,int>> & out ) {
             out.clear();
             if ( e->rtti_isOp3() ) {
+                // a user-overloaded op3 evaluates as a call - every operand eager;
+                // only the builtin form selects its arms lazily
                 auto op3 = static_cast<ExprOp3 *>(e);
+                int lazyArm = (!op3->func || op3->func->builtIn) ? 1 : 0;
                 out.emplace_back(op3->subexpr, 0);
-                out.emplace_back(op3->left, 1);
-                out.emplace_back(op3->right, 1);
+                out.emplace_back(op3->left, lazyArm);
+                out.emplace_back(op3->right, lazyArm);
             } else if ( e->rtti_isOp2() ) {
-                // covers copy/move/clone too: destination address first, then the value
+                // covers copy/move/clone too: destination address first, then the value.
+                // &&/|| (and their &&=/||= assignment forms) short-circuit only in
+                // builtin form - a user overload is a call
                 auto op2 = static_cast<ExprOp2 *>(e);
-                bool lazyRight = op2->op=="&&" || op2->op=="||";
+                bool lazyRight = (op2->op=="&&" || op2->op=="||"
+                        || op2->op=="&&=" || op2->op=="||=")
+                    && (!op2->func || op2->func->builtIn);
                 out.emplace_back(op2->left, 0);
                 out.emplace_back(op2->right, lazyRight ? 1 : 0);
             } else if ( e->rtti_isNullCoalescing() ) {
@@ -606,6 +761,32 @@ namespace das {
             } else if ( e->rtti_isUnsafe() ) {
                 out.emplace_back(static_cast<ExprUnsafe *>(e)->body, 0);
             }
+        }
+
+        // mirrors lint's 30250 detection (ast_lint.cpp preVisit(ExprAt)): two non-deref
+        // ref lookups into the same table - by textual identity - within one statement.
+        // lint runs AFTER the patch slot, so splicing a call out of such a statement
+        // would erase the diagnostic while keeping the UB; those sites decline instead.
+        // scope matches lint's: same-statement expressions only (childrenInEvalOrder),
+        // nested block statements are their own lint scope
+        void scanStatementTableAts ( Expression * e, das_hash_set<uint64_t> & seen, bool & collides ) {
+            if ( !e || collides ) return;
+            if ( e->rtti_isAt() ) {
+                auto at = static_cast<ExprAt *>(e);
+                if ( !at->underDeref && at->subexpr->type && at->subexpr->type->isGoodTableType() ) {
+                    auto h = hash64z(at->subexpr->describe().c_str());
+                    if ( !seen.insert(h).second ) { collides = true; return; }
+                }
+            }
+            vector<pair<Expression *,int>> kids;
+            childrenInEvalOrder(e, kids);
+            for ( auto & k : kids ) scanStatementTableAts(k.first, seen, collides);
+        }
+        bool statementHasTableLookupCollision ( Expression * stmt ) {
+            das_hash_set<uint64_t> seen;
+            bool collides = false;
+            scanStatementTableAts(stmt, seen, collides);
+            return collides;
         }
 
         // conservative purity for tier-B substitution and prefix hoisting. the
@@ -811,7 +992,7 @@ namespace das {
 
         // manufactured `let/var name [&] = init` (or an uninitialized declaration)
         ExprLet * makeTemp ( const LineInfo & at, const string & name, Expression * init,
-                             bool isConst, bool isRef, bool viaMove ) {
+                             bool isConst, bool isRef, bool viaMove, bool viaClone = false ) {
             auto var = new Variable();
             var->name = name;
             var->at = at;
@@ -824,6 +1005,7 @@ namespace das {
             var->type->ref = isRef;
             var->init = init;
             var->init_via_move = viaMove;
+            var->init_via_clone = viaClone;
             auto let = new ExprLet();
             let->at = at;
             let->atInit = init ? init->at : at;
@@ -859,10 +1041,13 @@ namespace das {
         if ( fn->isClassMethod || fn->classParent ) { err = "[inline] does not support class methods"; return false; }
         if ( fn->isCustomProperty || fn->propertyFunction ) { err = "[inline] does not support property functions"; return false; }
         // a generic instance is named `origin`<hash> - judge by the origin's name.
-        // operator overloads (punctuation names) are called through ExprOp nodes,
-        // which the splicer does not visit, so they can't honor the contract
+        // ExprOp-dispatched operator overloads splice; punctuation functions whose
+        // call sites are other node kinds ([], ??, properties) can't honor the contract
         const string & plainName = fn->fromGeneric ? fn->fromGeneric->name : fn->name;
-        if ( !isPlainIdentifier(plainName) ) { err = "[inline] does not support operator overloads ('" + plainName + "')"; return false; }
+        if ( !isPlainIdentifier(plainName) && !exprOpDispatchedName(plainName) ) {
+            err = "[inline] does not support operator '" + plainName + "' - its call sites do not splice";
+            return false;
+        }
         if ( fn->result && !fn->result->isVoid() ) {
             if ( fn->result->ref ) {
                 err = "[inline] result must be by-value (or void)";
@@ -886,6 +1071,11 @@ namespace das {
         }
         if ( fn->result && fn->result->smartPtr ) { err = "[inline] does not support a smart-pointer result"; return false; }
         auto body = static_cast<ExprBlock *>(fn->body);
+        // the splicer pops the trailing return out of the top block and appends the
+        // result store in its place - a function-level finally on that block would
+        // run against reordered statements (probe: glob_count drifted). block-level
+        // finally INSIDE the body keeps its own block and splices fine
+        if ( !body->finalList.empty() ) { err = "[inline] does not support a function-level finally"; return false; }
         InlineShapeScan scan;
         scan.lastTopLevelStmt = body->list.empty() ? nullptr : body->list.back();
         fn->body->visit(scan);
@@ -902,18 +1092,18 @@ namespace das {
         return true;
     }
 
-    // true when `fn` is reachable from its own body through direct calls to [inline]
-    // functions - splicing such a cycle would never terminate
+    // true when `fn` is reachable from its own body through direct calls (or operator
+    // sites) to [inline] functions - splicing such a cycle would never terminate
     static bool inlineGraphReaches ( Function * target, Function * cur, das_hash_set<Function *> & visited ) {
         if ( !cur->body ) return false;
         bool found = false;
         lookupExpressions(cur->body, [&](Expression * expr) {
-            if ( found || !expr->rtti_isCall() ) return;
-            auto call = static_cast<ExprCall *>(expr);
-            if ( !call->func || !call->func->mustInline ) return;
-            if ( call->func==target ) { found = true; return; }
-            if ( visited.insert(call->func).second ) {
-                if ( inlineGraphReaches(target, call->func, visited) ) found = true;
+            if ( found ) return;
+            Function * fn = callLikeFunc(expr);
+            if ( !fn || !fn->mustInline ) return;
+            if ( fn==target ) { found = true; return; }
+            if ( visited.insert(fn).second ) {
+                if ( inlineGraphReaches(target, fn, visited) ) found = true;
             }
         });
         return found;
@@ -932,6 +1122,20 @@ namespace das {
     // ----- best-effort shape gates (auto inlining and devirtualization decline, never error) -----
 
     namespace {
+
+        // any local declared as a reference (`let & =` / `var & =`), including the
+        // manufactured argument references of an earlier splice round
+        bool bindsLocalRef ( Expression * root ) {
+            bool found = false;
+            lookupExpressions(root, [&](Expression * e) {
+                if ( found || !e->rtti_isLet() ) return;
+                auto let = static_cast<ExprLet *>(e);
+                for ( auto & v : let->variables ) {
+                    if ( v->type && v->type->ref ) { found = true; return; }
+                }
+            });
+            return found;
+        }
 
         // a call (or invoke) passing a `#` argument where the resolved target's parameter
         // is neither `#` nor implicit. the binding is tolerated on the original node (the
@@ -1008,19 +1212,25 @@ namespace das {
             return true;
         }
 
-        // recursion over the whole splice graph - [inline] calls and auto-eligible
-        // block-literal calls alike - would re-manufacture eligible sites every round
-        bool spliceGraphReaches ( Function * target, Function * cur, das_hash_set<Function *> & visited ) {
+        // recursion over the whole splice graph - [inline] calls, auto-eligible calls,
+        // and operator sites alike - would re-manufacture eligible sites every round
+        bool spliceGraphReaches ( Function * target, Function * cur, const AutoInlineCfg & cfg,
+                das_hash_set<Function *> & visited ) {
             if ( !cur->body ) return false;
             bool found = false;
             lookupExpressions(cur->body, [&](Expression * expr) {
-                if ( found || !expr->rtti_isCall() ) return;
-                auto call = static_cast<ExprCall *>(expr);
-                if ( !call->func ) return;
-                if ( !call->func->mustInline && !autoEligibleCall(call) ) return;
-                if ( call->func==target ) { found = true; return; }
-                if ( visited.insert(call->func).second ) {
-                    if ( spliceGraphReaches(target, call->func, visited) ) found = true;
+                if ( found ) return;
+                Function * fn = callLikeFunc(expr);
+                if ( !fn ) return;
+                if ( !fn->mustInline ) {
+                    bool eligible = expr->rtti_isCall()
+                        ? autoEligibleCall(static_cast<ExprCall *>(expr), cfg)
+                        : autoEligibleFn(fn, cfg);
+                    if ( !eligible ) return;
+                }
+                if ( fn==target ) { found = true; return; }
+                if ( visited.insert(fn).second ) {
+                    if ( spliceGraphReaches(target, fn, cfg, visited) ) found = true;
                 }
             });
             return found;
@@ -1037,7 +1247,7 @@ namespace das {
             TextWriter * logs = nullptr;
             bool logOpt = false;
             bool mustEnabled = true;
-            bool autoEnabled = false;
+            AutoInlineCfg autoCfg;
             bool changed = false;
             int inlined = 0;        // [inline] sites
             int inlinedAuto = 0;    // auto block-literal call sites
@@ -1076,6 +1286,16 @@ namespace das {
                 } else if ( reinferFragile(fn->body) ) {
                     ok = false;
                     why = "body carries a temporary-flavored call";
+                } else if ( bindsLocalRef(fn->body) ) {
+                    // a `let & =` in the body re-binds its initializer under the caller's
+                    // scope, and a CHAINED splice can substitute the initializer's leaf
+                    // with a non-addressable expression (proven: decs' req_hash ->
+                    // compile_request -> lookup_request chain, where a previously
+                    // manufactured arg reference ended up bound to a temporary - 31019).
+                    // note this also catches this pass's own manufactured references,
+                    // stopping re-splice chains at the first reference-binding body
+                    ok = false;
+                    why = "body binds a local reference";
                 } else if ( annotatedCallee(fn, why) ) {
                     ok = false;     // an annotation may carry call-site semantics
                                     // (verifyCall & co) that a splice would bypass
@@ -1093,7 +1313,7 @@ namespace das {
                         why = "body carries a generic type witness";
                     } else {
                         das_hash_set<Function *> visited;
-                        if ( spliceGraphReaches(fn, fn, visited) ) {
+                        if ( spliceGraphReaches(fn, fn, autoCfg, visited) ) {
                             ok = false;
                             why = "recursive through the inline graph";
                         }
@@ -1192,12 +1412,38 @@ namespace das {
         };
 
         void InlinePatch::processFunction ( Function * fn ) {
-            InlineCollect collect(autoEnabled);
+            // a caller with call-site-semantic annotations ([template] & co) may be
+            // CLONED per call site by its macro - a spliced body loses its
+            // instantiation-site resolution (proven: sqlite_boost's [template]
+            // try_create_table lost the user module's generated
+            // _sql_create_table_sql after a splice). heuristic sites stay off
+            // inside such bodies; the block-literal tier keeps shipping behavior
+            AutoInlineCfg fnCfg = autoCfg;
+            if ( fnCfg.functions ) {
+                string why;
+                if ( annotatedCallee(fn, why) ) {
+                    fnCfg.functions = false;
+                } else if ( fn->fromGeneric && fn->fromGeneric->module
+                    && fn->fromGeneric->module != program->thisModule.get() ) {
+                    // a generic INSTANCE from another module re-infers its whole body
+                    // under THIS module's visibility after a splice - references legal
+                    // at the origin (sqlite_boost::try_exec inside sql_migrate's
+                    // _migrate_inner instance) stop resolving. cross-origin instances
+                    // keep their bodies untouched
+                    fnCfg.functions = false;
+                } else if ( bodyCost(fn->body).stackBytes > AUTO_INLINE_CALLER_FRAME_BYTES ) {
+                    // a frame already this large is one deep-chain hop away from an
+                    // `options stack` overflow - stop growing it (recomputed per round,
+                    // so accumulated splices shut the door behind themselves)
+                    fnCfg.functions = false;
+                }
+            }
+            InlineCollect collect(fnCfg);
             fn->body->visit(collect);
             if ( collect.sites.empty() ) return;
             // let-bound block literals this function's invokes may resolve to
             das_hash_map<Variable *, ExprMakeBlock *> bindings;
-            if ( autoEnabled ) {
+            if ( autoCfg.blockLiterals ) {
                 BlockBindingScan bscan;
                 fn->body->visit(bscan);
                 for ( auto & kv : bscan.binding ) {
@@ -1205,6 +1451,9 @@ namespace das {
                 }
             }
             int inlineId = nextInlineId(fn);
+            // per-round frame-growth budget (see AUTO_INLINE_CALLER_GROWTH_BYTES);
+            // conservatively charged at the gate, so later-declined sites still count
+            int64_t grownBytes = 0;
             // a splice shifts the indices of later statements in the same block
             das_hash_map<ExprBlock *, int> indexShift;
             for ( auto & site : collect.sites ) {
@@ -1230,7 +1479,7 @@ namespace das {
                     if ( !literal ) continue;   // not a traceable block literal
                     subjName = "block";
                 } else {
-                    calleeFn = static_cast<ExprCall *>(callLike)->func;
+                    calleeFn = static_cast<ExprCallFunc *>(callLike)->func;  // ExprCall or ExprOp1/2/3
                     subjName = calleeFn->name;
                 }
                 if ( !site.stmt || !site.anchor.block ) {
@@ -1262,10 +1511,26 @@ namespace das {
                     }
                 }
                 if ( !siteLive ) continue;
+                // a statement lint will reject as 30250 (same-table lookup collision)
+                // must reach lint intact - splicing would erase the error, not the UB.
+                // MUST sites keep the [inline] contract (master semantics)
+                if ( site.kind!=SiteKind::MustCall && statementHasTableLookupCollision(site.stmt) ) {
+                    decline(site, "the statement has a potential table lookup collision (error 30250 preserved for lint)", callLike->at);
+                    continue;
+                }
+                if ( site.kind==SiteKind::AutoCall && calleeFn ) {
+                    int64_t calleeBytes = bodyCost(calleeFn->body).stackBytes;
+                    if ( grownBytes + calleeBytes > AUTO_INLINE_CALLER_GROWTH_BYTES ) {
+                        decline(site, "caller frame growth budget exhausted this round", callLike->at);
+                        continue;
+                    }
+                    grownBytes += calleeBytes;
+                }
                 // ----- subject shape gates -----
                 ExprBlock * body = nullptr;
                 TypeDecl * subjResult = nullptr;    // null = void result
                 SiteArgs sa;
+                vector<ExpressionPtr> opArgs;   // operator sites: operands as an argument vector
                 if ( site.kind==SiteKind::Devirt ) {
                     string why;
                     if ( !devirtShapeOk(literal, why) ) { decline(site, why, callLike->at); continue; }
@@ -1276,14 +1541,35 @@ namespace das {
                     if ( blk->returnType && !blk->returnType->isVoid() ) subjResult = blk->returnType;
                     sa.args = &inv->arguments; sa.ofs = 1; sa.params = &blk->arguments;
                 } else {
-                    auto call = static_cast<ExprCall *>(callLike);
                     if ( site.kind==SiteKind::MustCall ) {
                         if ( !calleeShapeOk(calleeFn) ) continue;   // lint reports at the declaration
                     } else {
                         string why;
                         if ( !autoCalleeOk(calleeFn, why) ) { decline(site, subjName + ": " + why, callLike->at); continue; }
                     }
-                    if ( call->arguments.size() != calleeFn->arguments.size() ) continue; // not fully inferred - defensive
+                    if ( callLike->rtti_isCall() ) {
+                        auto call = static_cast<ExprCall *>(callLike);
+                        if ( call->arguments.size() != calleeFn->arguments.size() ) continue; // not fully inferred - defensive
+                        sa.args = &call->arguments;
+                    } else {
+                        // an operator site: view the operands as an argument vector. read-only
+                        // by construction - args are cloned into temps or substitution plans,
+                        // and the op node itself is replaced wholesale at the end
+                        if ( callLike->rtti_isOp1() ) {
+                            opArgs.push_back(static_cast<ExprOp1 *>(callLike)->subexpr);
+                        } else if ( callLike->rtti_isOp2() ) {
+                            auto op2 = static_cast<ExprOp2 *>(callLike);
+                            opArgs.push_back(op2->left);
+                            opArgs.push_back(op2->right);
+                        } else {
+                            auto op3 = static_cast<ExprOp3 *>(callLike);
+                            opArgs.push_back(op3->subexpr);
+                            opArgs.push_back(op3->left);
+                            opArgs.push_back(op3->right);
+                        }
+                        if ( opArgs.size() != calleeFn->arguments.size() ) continue; // defensive
+                        sa.args = &opArgs;
+                    }
                     // a generic instance lives in the CALLER's module - judge its home
                     // (and the reachability of its references) by the generic's origin
                     Module * originModule = calleeFn->fromGeneric
@@ -1297,7 +1583,7 @@ namespace das {
                     }
                     body = static_cast<ExprBlock *>(calleeFn->body);
                     if ( calleeFn->result && !calleeFn->result->isVoid() ) subjResult = calleeFn->result;
-                    sa.args = &call->arguments; sa.ofs = 0; sa.params = &calleeFn->arguments;
+                    sa.ofs = 0; sa.params = &calleeFn->arguments;
                 }
                 // a callee body may itself contain manufactured __inl locals (interiors
                 // splice before their callers within a round, and the counter is
@@ -1336,9 +1622,12 @@ namespace das {
                     if ( leafA->rtti_isR2V() ) leafA = static_cast<ExprRef2Value *>(leafA)->subexpr;
                     bool leafConst = leafA->rtti_isConstant();
                     bool leafVar = leafA->rtti_isVar();
+                    // a non-copyable CONST source cannot move into its temp (30940) - the
+                    // original call only ever BOUND it; the temp clone-initializes instead
                     auto makeArgTemp = [&]( Expression * init, bool cnst, bool ref, bool viaMove ) {
                         string tname = "__inl" + to_string(inlineId) + "_arg_" + P->name;
-                        temps.push_back(makeTemp(callLike->at, tname, init, cnst, ref, viaMove));
+                        bool viaClone = viaMove && init->type && init->type->constant;
+                        temps.push_back(makeTemp(callLike->at, tname, init, cnst, ref, viaMove && !viaClone, viaClone));
                         sub.tempName = tname;
                     };
                     if ( leafA->rtti_isTypeDecl() ) {
@@ -1571,6 +1860,49 @@ namespace das {
                 }
                 if ( pos==SitePosition::Lazy ) {
                     auto lazy = path.lazyOps.back();    // outermost lazy op on the path
+                    // `a &&= call()` / `a ||= call()` evaluate the RHS conditionally and
+                    // produce no value, so the temp-hoist path below cannot apply; lower
+                    // the statement itself to if-form: `if (a) a = call()` (negated for
+                    // ||=). the LHS is then read twice, so only a plain variable
+                    // qualifies - anything else declines and keeps the call
+                    if ( lazy->rtti_isOp2() ) {
+                        auto sop = static_cast<ExprOp2 *>(lazy);
+                        if ( sop->op=="&&=" || sop->op=="||=" ) {
+                            if ( site.stmt!=lazy || !sop->left->rtti_isVar() ) {
+                                siteFail(site, "can't inline " + subjName + " in the right side of " + sop->op + " - hoist the call into its own statement", callLike->at);
+                                continue;
+                            }
+                            auto & list = site.anchor.block->list;
+                            auto thenBlk = new ExprBlock();
+                            thenBlk->at = sop->at;
+                            thenBlk->list.push_back(new ExprCopy(sop->at, sop->left->clone(), sop->right));
+                            ExpressionPtr cond = sop->left->clone();
+                            if ( sop->op=="||=" ) cond = new ExprOp1(sop->at, "!", cond);
+                            list[anchorIndex] = new ExprIfThenElse(sop->at, cond, thenBlk, nullptr);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                    // a ternary lowers by SPLITTING into bare arm stores (the fresh hoist
+                    // rides the same var+if path a round later), and a bare store loses
+                    // the per-arm coercion the ternary provided - a void? panic arm into
+                    // a typed pointer (the macro-generated `as` guard being the canonical
+                    // case), null literals, derived views - and copies a ref result by
+                    // value. only same-typed, by-value arms survive the split; anything
+                    // else keeps the call
+                    if ( lazy->rtti_isOp3() ) {
+                        auto op3 = static_cast<ExprOp3 *>(lazy);
+                        auto & lt = op3->left->type;
+                        auto & rt = op3->right->type;
+                        bool armsMatch = lt && rt && lazy->type && !lazy->type->ref
+                            && !lt->isVoid() && !rt->isVoid()
+                            && !lt->isVoidPointer() && !rt->isVoidPointer()
+                            && lt->isSameType(*rt, RefMatters::no, ConstMatters::no, TemporaryMatters::yes);
+                        if ( !armsMatch ) {
+                            siteFail(site, "can't inline " + subjName + " inside a mixed-type ternary - hoist the call into its own statement", callLike->at);
+                            continue;
+                        }
+                    }
                     // when the lazy op is the whole init of a single GENERATED temp (a
                     // hoist from a previous round), rewrite it to var + if form in place.
                     // a USER declaration never takes this branch - replacing it would drop
@@ -1592,7 +1924,8 @@ namespace das {
                         // rejects initialization from a const reference. a non-copyable
                         // lazy result (ternary of arrays) must move into the hoist
                         bool viaMove = lazy->type && !lazy->type->canCopy();
-                        auto hoist = makeTemp(callLike->at, tname, lazy, false, false, viaMove);
+                        bool viaClone = viaMove && lazy->type->constant;   // move-from-const is 30940
+                        auto hoist = makeTemp(callLike->at, tname, lazy, false, false, viaMove && !viaClone, viaClone);
                         ReplaceNode rn;
                         rn.what = lazy;
                         rn.with = new ExprVar(callLike->at, tname);
@@ -1670,7 +2003,9 @@ namespace das {
                         pe->alwaysSafe = true;          // generated binding to real storage
                         splice.push_back(makeTemp(pe->at, tname, pe, pe->type->constant, true, false));
                     } else if ( pe->type && !pe->type->canCopy() ) {
-                        splice.push_back(makeTemp(pe->at, tname, pe, false, false, true));  // move the rvalue
+                        // move the rvalue; a CONST non-copyable rvalue clone-initializes (30940)
+                        bool viaClone = pe->type->constant;
+                        splice.push_back(makeTemp(pe->at, tname, pe, false, false, !viaClone, viaClone));
                     } else {
                         splice.push_back(makeTemp(pe->at, tname, pe, false, false, false));
                     }
@@ -1730,8 +2065,18 @@ namespace das {
                         string resName = "__inl" + to_string(inlineId) + "_res";
                         splice.push_back(makeUninitDecl(callLike->at, resName, subjResult));
                         auto ret = static_cast<ExprReturn *>(trailing);
-                        // `return <- x` becomes a move into the result temp, `return x` a copy
-                        Expression * store = ret->moveSemantics
+                        // `return <- x` becomes a move into the result temp, `return x` a copy.
+                        // a move store is illegal from a copyable rvalue - `return <- g(...)`
+                        // of a pointer result must store as a COPY (identical semantics for
+                        // an rvalue; ExprMove rejects it, 30941). only a PROVEN copyable
+                        // rvalue demotes: an untyped subexpr (a same-round chained splice's
+                        // manufactured result-temp read) keeps the move - those reads are
+                        // references, and demoting a non-copyable to a copy is 30950
+                        bool storeAsCopy = ret->moveSemantics
+                            && ret->subexpr && ret->subexpr->type
+                            && !ret->subexpr->type->ref
+                            && ret->subexpr->type->canCopy();
+                        Expression * store = (ret->moveSemantics && !storeAsCopy)
                             ? static_cast<Expression *>(new ExprMove(ret->at,
                                 new ExprVar(ret->at, resName), ret->subexpr))
                             : static_cast<Expression *>(new ExprCopy(ret->at,
@@ -1781,18 +2126,19 @@ namespace das {
 
         // DFS postorder over the splice graph inside this module, [inline] functions
         // first: a chain f -> g -> h splices already-inlined bodies in a single round
-        void orderInlineFunctions ( Module * thisMod, Function * fn, bool autoOn,
+        void orderInlineFunctions ( Module * thisMod, Function * fn, const AutoInlineCfg & cfg,
                 vector<Function *> & order, das_hash_set<Function *> & seen ) {
             if ( !fn->body || fn->isTemplate || fn->stub ) return;
             if ( fn->module != thisMod ) return;
             if ( !seen.insert(fn).second ) return;
             lookupExpressions(fn->body, [&](Expression * expr) {
-                if ( expr->rtti_isCall() ) {
-                    auto call = static_cast<ExprCall *>(expr);
-                    if ( !call->func ) return;
-                    if ( call->func->mustInline || (autoOn && autoEligibleCall(call)) ) {
-                        orderInlineFunctions(thisMod, call->func, autoOn, order, seen);
-                    }
+                Function * callee = callLikeFunc(expr);
+                if ( !callee ) return;
+                bool eligible = callee->mustInline || (expr->rtti_isCall()
+                    ? autoEligibleCall(static_cast<ExprCall *>(expr), cfg)
+                    : autoEligibleFn(callee, cfg));
+                if ( eligible ) {
+                    orderInlineFunctions(thisMod, callee, cfg, order, seen);
                 }
             });
             order.push_back(fn);
@@ -1906,20 +2252,31 @@ namespace das {
             }
         };
 
-        bool canonicalizeReturns ( Function * fn ) {
+        bool canonicalizeReturns ( Function * fn, const AutoInlineCfg & cfg ) {
             if ( !fn->body || !fn->body->rtti_isBlock() ) return false;
             if ( fn->generator || fn->isTemplate ) return false;
             // [inline] bodies stay untouched: their shape contract is fail-closed, and a
             // multi-exit [inline] callee must be the same compile error at every -O level
             if ( fn->mustInline ) return false;
-            // only a function with a block parameter can ever be an auto splice callee
-            // (candidacy requires a block LITERAL argument), so canonicalizing anything
-            // else buys no splice and costs a re-infer round on every module that has one
+            if ( fn->neverInline ) return false;    // never a candidate - don't reshape
+            // the rewrite costs a re-infer round on every module that has one, so only
+            // functions that can plausibly become splice candidates qualify: a block
+            // parameter (block-literal-arg candidacy), or - heuristic tier on - a body
+            // that pre-screens close to the worthiness budget (25% slack: folding can
+            // shrink a body into budget) or a budget-exempt private single-call callee
             bool hasBlockParam = false;
             for ( auto & arg : fn->arguments ) {
                 if ( arg->type && arg->type->baseType==Type::tBlock ) { hasBlockParam = true; break; }
             }
-            if ( !hasBlockParam ) return false;
+            if ( !hasBlockParam ) {
+                if ( !cfg.functions ) return false;
+                bool exempt = cfg.budgetExempt
+                    && cfg.budgetExempt->find(fn)!=cfg.budgetExempt->end();
+                if ( !exempt ) {
+                    BodyCost bc = bodyCost(fn->body);
+                    if ( bc.hasLoop || bc.nodes > cfg.budget + cfg.budget/4 ) return false;
+                }
+            }
             // goto can target a label in a tail this pass would move into an else arm; the
             // feature is rare enough that any use opts the whole function out
             bool hasGotoOrLabel = false;
@@ -1944,6 +2301,69 @@ namespace das {
         // best-effort inlining is an optimization: it stays out of unoptimized builds
         bool autoEnabled = getOptimize()
             && !options.getBoolOption("disable_auto_inline", policies.disable_auto_inline);
+        // the heuristic tier over plain calls is opt-in on top of the block-literal tier.
+        // strict aliasing mode (`options no_aliasing`) reports call-result aliasing as
+        // errors; splicing those calls away would change which programs compile, so the
+        // heuristic tier stands down there - diagnostics must not depend on a perf knob
+        bool autoFns = autoEnabled
+            && options.getBoolOption("auto_inline_functions", policies.auto_inline_functions)
+            && !options.getBoolOption("no_aliasing", policies.no_aliasing);
+        das_hash_map<Function *, bool> worthCache;
+        das_hash_set<Function *> budgetExempt;
+        AutoInlineCfg autoCfg;
+        autoCfg.blockLiterals = autoEnabled;
+        autoCfg.functions = autoFns;
+        autoCfg.budget = options.getIntOption("auto_inline_cost", policies.auto_inline_cost);
+        autoCfg.thisModule = thisModule.get();
+        autoCfg.worthCache = &worthCache;
+        autoCfg.budgetExempt = &budgetExempt;
+        // private functions referenced exactly once - by a plain call in a function
+        // body - are budget-exempt: the splice moves the body rather than duplicating
+        // it (removeUnusedSymbols reaps the husk). private is what makes the count
+        // sound: every possible reference is inside this module, in front of us now.
+        // any other reference kind (operator call, @@, an initializer) disqualifies
+        if ( autoFns && !failed() ) {
+            das_hash_map<Function *, int> refs;         // every reference, anywhere
+            das_hash_map<Function *, int> callSites;    // plain-call sites in function bodies
+            auto interesting = [&](Function * f) -> bool {
+                // fromGeneric excluded: instances are STAMPED private by instantiation,
+                // which would sweep library generics into the exemption - the heuristic
+                // tier keeps instances out entirely (see autoEligibleCall)
+                return f && f->privateFunction && !f->fromGeneric && f->module==thisModule.get()
+                    && f->body && !f->builtIn && !f->isTemplate
+                    && !f->addr && !f->addressTaken && !f->mustInline && !f->neverInline
+                    && !f->exports && !f->init && !f->shutdown && !f->lateInit
+                    && !f->macroFunction;
+            };
+            auto scanRefs = [&](Expression * root, bool inBody) {
+                lookupExpressions(root, [&](Expression * e) {
+                    Function * f = nullptr;
+                    bool plainCall = false;
+                    if ( e->rtti_isCall() ) { f = static_cast<ExprCall *>(e)->func; plainCall = true; }
+                    else if ( e->rtti_isOp1() ) f = static_cast<ExprOp1 *>(e)->func;
+                    else if ( e->rtti_isOp2() ) f = static_cast<ExprOp2 *>(e)->func;
+                    else if ( e->rtti_isOp3() ) f = static_cast<ExprOp3 *>(e)->func;
+                    else if ( e->rtti_isAddr() ) f = static_cast<ExprAddr *>(e)->func;
+                    if ( !f || !interesting(f) ) return;
+                    refs[f] ++;
+                    if ( inBody && plainCall ) callSites[f] ++;
+                });
+            };
+            thisModule->functions.foreach([&](auto fn) {
+                if ( fn->body ) scanRefs(fn->body, true);
+            });
+            for ( auto & var : thisModule->globals.each() ) {
+                if ( var->init ) scanRefs(var->init, false);
+            }
+            for ( auto & st : thisModule->structures.each() ) {
+                for ( auto & fld : st->fields ) {
+                    if ( fld.init ) scanRefs(fld.init, false);
+                }
+            }
+            for ( auto & kv : refs ) {
+                if ( kv.second==1 && callSites[kv.first]==1 ) budgetExempt.insert(kv.first);
+            }
+        }
         // canonicalize early-exit shapes ahead of candidacy: single exit is an inline shape
         // requirement, and the rewrite must settle (re-infer) before anything splices on
         // top of it. gated with auto inlining rather than bare optimization:
@@ -1952,7 +2372,7 @@ namespace das {
         if ( autoEnabled && !failed() ) {
             bool canon = false;
             thisModule->functions.foreach([&](auto fn) {
-                canon |= canonicalizeReturns(fn);
+                canon |= canonicalizeReturns(fn, autoCfg);
             });
             if ( canon ) return true;
         }
@@ -1975,14 +2395,14 @@ namespace das {
         patch.logs = daScriptEnvironment::getBound()->g_compilerLog;
         patch.logOpt = options.getBoolOption("log_optimization", policies.log_optimization);
         patch.mustEnabled = mustEnabled && anyInline;
-        patch.autoEnabled = autoEnabled;
+        patch.autoCfg = autoCfg;
         vector<Function *> order;
         das_hash_set<Function *> seen;
         thisModule->functions.foreach([&](auto fn) {
-            if ( fn->mustInline ) orderInlineFunctions(thisModule.get(), fn, autoEnabled, order, seen);
+            if ( fn->mustInline ) orderInlineFunctions(thisModule.get(), fn, autoCfg, order, seen);
         });
         thisModule->functions.foreach([&](auto fn) {
-            orderInlineFunctions(thisModule.get(), fn, autoEnabled, order, seen);
+            orderInlineFunctions(thisModule.get(), fn, autoCfg, order, seen);
         });
         for ( auto fn : order ) {
             patch.processFunction(fn);

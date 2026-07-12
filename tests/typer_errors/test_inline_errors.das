@@ -52,12 +52,24 @@ def test_inline_contract_errors(t : T?) {
         t |> expect_issue("_inline_field_init.das",
             "in a field initializer")
     }
-    t |> run("[inline] on an operator overload") @(t : T?) {
+    t |> run("[inline] on a non-ExprOp punctuation function") @(t : T?) {
         t |> expect_issue("_inline_operator.das",
-            "[inline] does not support operator overloads")
+            "[inline] does not support operator '[]'")
+    }
+    t |> run("recursion through an operator site") @(t : T?) {
+        t |> expect_issue("_inline_operator_recursion.das",
+            "[inline] function is recursive through the inline graph")
     }
     t |> run("statement-needing call in a ?? default") @(t : T?) {
         t |> expect_issue("_inline_coalesce.das",
             "inside ?? or a safe-navigation suffix")
+    }
+    t |> run("[inline] combined with [never_inline]") @(t : T?) {
+        t |> expect_issue("_inline_never_inline_conflict.das",
+            "[never_inline] conflicts with [inline]")
+    }
+    t |> run("[inline] call in a mixed-type ternary arm") @(t : T?) {
+        t |> expect_issue("_inline_mixed_ternary.das",
+            "inside a mixed-type ternary")
     }
 }

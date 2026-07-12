@@ -618,6 +618,7 @@ int das_policies_set_bool ( das_policies * policies, das_bool_policy flag, int v
         case DAS_POLICY_LOG_OPTIMIZATION:       p->log_optimization = v; break;
         case DAS_POLICY_LOG_OPTIMIZATION_PASSES: p->log_optimization_passes = v; break;
         case DAS_POLICY_FUSION:                 p->fusion = v; break;
+        case DAS_POLICY_AUTO_INLINE_FUNCTIONS:  p->auto_inline_functions = v; break;
         default: return 0;
     }
     return 1;
@@ -631,6 +632,7 @@ int das_policies_set_int ( das_policies * policies, das_int_policy field, int64_
         case DAS_POLICY_MAX_STRING_HEAP_ALLOCATED:  p->max_string_heap_allocated = (uint64_t) value; break;
         case DAS_POLICY_HEAP_SIZE_HINT:             p->heap_size_hint = (uint32_t) value; break;
         case DAS_POLICY_STRING_HEAP_SIZE_HINT:      p->string_heap_size_hint = (uint32_t) value; break;
+        case DAS_POLICY_AUTO_INLINE_COST:           p->auto_inline_cost = (int32_t) value; break;
         default: return 0;
     }
     return 1;

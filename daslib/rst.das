@@ -1357,7 +1357,9 @@ def document_classes(doc_file : file; mods : array<Module?>) {
             var first = true
             var annT = new TypeDecl(baseType = Type.tStructure, structType = value)
             for_each_function(mod, "") $(func) {
-                if (func.flags.isClassMethod && func.classParent == value && func.name == value.name && !is_trivial_ctor(func)) {
+                // a compiler-generated ctor is never user-authored - optimization can
+                // legitimately un-trivialize its body, which must not mint doc stubs
+                if (func.flags.isClassMethod && !func.flags.generated && func.classParent == value && func.name == value.name && !is_trivial_ctor(func)) {
                     // ctor
                     document_function(doc_file, mod, func, /*drop first arg*/0, "{value.name}-", "das:function")
                     return
@@ -1498,7 +1500,7 @@ def document_structure(doc_file : file; mod : Module?; var value : StructurePtr)
     var annT = new TypeDecl(baseType = Type.tStructure, structType = value)
     var first = true
     for_each_function(mod, "") $(func) {
-        if (func.flags.isClassMethod && func.classParent == value && func.name == value.name && !is_trivial_ctor(func)) {// ctor
+        if (func.flags.isClassMethod && !func.flags.generated && func.classParent == value && func.name == value.name && !is_trivial_ctor(func)) {// ctor
             document_function(doc_file, mod, func, /*drop first arg*/0, "{value.name}-", "das:function")
             return
         }

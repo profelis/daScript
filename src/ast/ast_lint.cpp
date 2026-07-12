@@ -419,19 +419,23 @@ namespace das {
         return false;
     }
 
-    // [inline] calls are spliced by the patch pass, which only reaches function bodies.
-    // global-variable and structure-field initializers evaluate outside any patched
-    // body, so a call there would silently stay a call - the contract errors instead
-    static ExprCall * findMustInlineCall ( Expression * root ) {
+    // [inline] calls (and operator sites) are spliced by the patch pass, which only
+    // reaches function bodies. global-variable and structure-field initializers evaluate
+    // outside any patched body, so a call there would silently stay a call - the
+    // contract errors instead
+    static ExprCallFunc * findMustInlineCall ( Expression * root ) {
         class Scan : public Visitor {
         public:
-            ExprCall * found = nullptr;
+            ExprCallFunc * found = nullptr;
         protected:
-            virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
-            virtual void preVisit ( ExprCall * expr ) override {
-                Visitor::preVisit(expr);
+            void check ( ExprCallFunc * expr ) {
                 if ( !found && expr->func && expr->func->mustInline ) found = expr;
             }
+            virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
+            virtual void preVisit ( ExprCall * expr ) override { Visitor::preVisit(expr); check(expr); }
+            virtual void preVisit ( ExprOp1 * expr ) override { Visitor::preVisit(expr); check(expr); }
+            virtual void preVisit ( ExprOp2 * expr ) override { Visitor::preVisit(expr); check(expr); }
+            virtual void preVisit ( ExprOp3 * expr ) override { Visitor::preVisit(expr); check(expr); }
         };
         Scan scan;
         root->visit(scan);

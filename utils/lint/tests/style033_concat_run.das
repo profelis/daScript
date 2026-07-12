@@ -1,4 +1,5 @@
 options gen2
+options auto_inline_functions = false   // lint fixtures assert SOURCE shapes; splices rewrite them
 // STYLE033: a run of >=2 bulk `push_from` / `push_clone_from` from arrays.
 //
 //   * into a FRESH-EMPTY array<T> (empty `var c : array<T>` then the run) it is a

@@ -996,6 +996,8 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(disable_cse)>("disable_cse");
             addField<DAS_BIND_MANAGED_FIELD(disable_inline)>("disable_inline");
             addField<DAS_BIND_MANAGED_FIELD(disable_auto_inline)>("disable_auto_inline");
+            addField<DAS_BIND_MANAGED_FIELD(auto_inline_functions)>("auto_inline_functions");
+            addField<DAS_BIND_MANAGED_FIELD(auto_inline_cost)>("auto_inline_cost");
             addField<DAS_BIND_MANAGED_FIELD(disable_run)>("disable_run");
             addField<DAS_BIND_MANAGED_FIELD(no_infer_time_folding)>("no_infer_time_folding");
             addField<DAS_BIND_MANAGED_FIELD(fail_on_no_aot)>("fail_on_no_aot");

@@ -206,6 +206,7 @@ def compile_and_simulate_ctx(file : string; project : string = ""; blk : block<(
         using() $(var cop : CodeOfPolicies) {
             cop.threadlock_context = true
             cop.ignore_shared_modules = true
+            cop.auto_inline_functions = false   // introspection describes the SOURCE - splices rewrite bodies/references
             compile_file(file, access, unsafe(addr(mg)), cop) $(ok; program; issues) {
                 if (!ok) {
                     result = "Compilation failed:\n{issues}"
@@ -240,6 +241,7 @@ def compile_program(file : string; _export_all : bool; _no_opt : bool; project :
         using() $(var cop : CodeOfPolicies) {
             cop.threadlock_context = true
             cop.ignore_shared_modules = true
+            cop.auto_inline_functions = false   // introspection describes the SOURCE - splices rewrite bodies/references
             if (_export_all) {
                 cop.export_all = true
             }
@@ -281,6 +283,7 @@ def compile_only(file : string; _export_all : bool; _no_opt : bool; project : st
         using() $(var cop : CodeOfPolicies) {
             cop.threadlock_context = true
             cop.ignore_shared_modules = true
+            cop.auto_inline_functions = false   // introspection describes the SOURCE - splices rewrite bodies/references
             if (_export_all) {
                 cop.export_all = true
             }

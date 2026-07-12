@@ -993,6 +993,7 @@ namespace das
                 bool    hasUnsafe : 1;               // has unsafe { }
                 bool    isConstClassMethod : 1;      // method is const
                 bool    isCustomProperty : 1;        // this is a user function which looks like a property ("`name")
+                bool    neverInline : 1;             // [never_inline] - excluded from best-effort (auto) inlining; conflicts with [inline]
             };
             uint32_t moreFlags = 0;
         };
@@ -1604,6 +1605,8 @@ namespace das
         /*option*/ bool disable_cse = false;                       // disable the common-subexpression-elimination pass
         /*option*/ bool disable_inline = false;                    // disable the [inline] function inliner (calls stay regular calls; declaration-level contract checks - shape, recursion, @@ - still lint)
         /*option*/ bool disable_auto_inline = false;               // disable automatic inlining of block-literal call sites and invoke-of-literal devirtualization ([inline] splicing is unaffected)
+        /*option*/ bool auto_inline_functions = true;              // heuristic best-effort inlining of plain calls and operator sites of small same-module [inline]-shaped functions (default ON; silent declines; optimized builds only; disable_auto_inline overrides)
+        /*option*/ int32_t auto_inline_cost = 32;                  // auto_inline_functions budget: a callee body up to this many AST nodes is worth splicing (private single-call callees are exempt)
         /*option*/ bool disable_run = false;                       // disable compile-time function evaluation (RunFolding of pure calls over constants)
         /*option*/ bool no_infer_time_folding = false;             // disable infer-time constant folding
         bool fail_on_no_aot = true;                     // AOT link failure is error

@@ -194,20 +194,27 @@ def stage_jit_backend(root : string) {
 
 // Point .mcp.json at the stdio supervisor (mcp_supervisor.py). The supervisor
 // owns the .mcp.json merge (preserving other servers like github), so setup
-// just invokes it. Requires python on PATH — Claude Code spawns the supervisor
-// as `python utils/mcp/mcp_supervisor.py`.
+// just invokes it. Probes `python3` first (a bare `python` can be Python 2 on
+// legacy boxes, and the supervisor is Python 3), then `python` (python.org
+// Windows installs ship no python3 alias); the supervisor emits whichever
+// launcher resolves into .mcp.json.
 def emit_mcp_config(root : string) : bool {
     let script = path_join(root, "utils/mcp/mcp_supervisor.py")
     if (!fexist(script)) {
         print("ERROR: {script} not found\n")
         return false
     }
-    let rc = run_visible("python \"{script}\" --emit-config --repo-root \"{root}\"")
-    if (rc != 0) {
-        print("ERROR: emit-config failed (exit {rc}); is python on PATH?\n")
-        return false
+    for (py in ["python3", "python"]) {
+        continue if (run_visible("{py} --version") != 0)
+        let rc = run_visible("{py} \"{script}\" --emit-config --repo-root \"{root}\"")
+        if (rc != 0) {
+            print("ERROR: emit-config failed (exit {rc})\n")
+            return false
+        }
+        return true
     }
-    return true
+    print("ERROR: neither python3 nor python found on PATH\n")
+    return false
 }
 
 [export]

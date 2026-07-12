@@ -190,6 +190,13 @@ def lint_file(file : string; run_paranoid, run_perf, run_style, comment_hygiene 
         result.skip_reason = "(intentional compile errors via `expect`)"
         return <- result
     }
+    // the lint tool's own rule fixtures violate rules BY DESIGN (warning-expectation
+    // files carry no `expect` directive, so the content skip above misses them).
+    // normalize() emits the platform's preferred separator - fold to forward slashes
+    if (normalize(file) |> replace("\\", "/") |> find("utils/lint/tests/") >= 0) {
+        result.skip_reason = "(lint rule fixture)"
+        return <- result
+    }
     var inscope access <- make_file_access("")
     using() $(var mg : ModuleGroup) {
         using() $(var cop : CodeOfPolicies) {
