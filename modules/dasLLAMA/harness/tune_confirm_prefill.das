@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
 options persistent_heap
 options _jit_fast_math = true   // production prefill config (prefill_perf parity)
 

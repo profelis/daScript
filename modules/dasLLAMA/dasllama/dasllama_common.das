@@ -1939,6 +1939,15 @@ struct Session {
     moe_gxs : array<float>      // one bucket's gathered activation scales (npos x dim/32)
     moe_gxbs : array<int>       // ... and their per-16 sums (npos x dim/16; kq-expert layers only)
     moe_hbs : array<int>        // bucket hidden requant per-16 sums (npos x nfx/16; kq-expert layers only)
+    moe_ord : array<int2>       // fused-prefill LPT region order (x = expert, y = bucket cnt; capacity ne)
+    // fused-prefill region triples (woff, row0, cnt) + per-expert bias offsets, one set per
+    // projection — cleared and refilled per layer, capacity persists (no per-layer alloc)
+    moe_offs1 : array<int64>    // gate regions (3 per touched expert)
+    moe_offs3 : array<int64>    // up regions
+    moe_offs2 : array<int64>    // down regions
+    moe_boffs1 : array<int64>   // gate bias offsets (moe_exps_bias arches)
+    moe_boffs3 : array<int64>   // up bias offsets
+    moe_boffs2 : array<int64>   // down bias offsets
     moe_ghb : array<float>      // bucket gate outputs (npos x max(n_ff_exp, n_ff_shexp))
     moe_ghb2 : array<float>     // bucket up outputs (same shape)
     moe_hq : array<int8>        // bucket hidden requant quants (npos x max(n_ff_exp, n_ff_shexp))
@@ -6396,55 +6405,61 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         moe_gather_rows(s, 0l, nk, dim, k, kq_layer)
         prof_add("moe_gather", ts_gather)
         // region triples (woff, row0, cnt) per touched expert; the three planes share row0/cnt
-        var offs1 : array<int64>
-        var offs3 : array<int64>
-        var offs2 : array<int64>
-        var boffs1 : array<int64>
-        var boffs3 : array<int64>
-        var boffs2 : array<int64>
-        offs1 |> reserve(ne * 3l)
-        offs3 |> reserve(ne * 3l)
-        offs2 |> reserve(ne * 3l)
+        s.moe_offs1 |> clear(); s.moe_offs1 |> reserve(ne * 3l)
+        s.moe_offs3 |> clear(); s.moe_offs3 |> reserve(ne * 3l)
+        s.moe_offs2 |> clear(); s.moe_offs2 |> reserve(ne * 3l)
         if (c.moe_exps_bias) {
-            boffs1 |> reserve(ne)
-            boffs3 |> reserve(ne)
-            boffs2 |> reserve(ne)
+            s.moe_boffs1 |> clear(); s.moe_boffs1 |> reserve(ne)
+            s.moe_boffs3 |> clear(); s.moe_boffs3 |> reserve(ne)
+            s.moe_boffs2 |> clear(); s.moe_boffs2 |> reserve(ne)
         }
-        var nreg = 0l
+        // LPT region order: biggest buckets FIRST, so the self-serve chunk queue front-loads the
+        // expensive spans and the dispatch tail drains on cheap ones (expert-order regions left
+        // 32% of the GEMM windows idle in last-wave raggedness — idle-by-tag census, dataset X).
+        // Region order can't change results: each region's y rows are keyed by its own row0.
+        s.moe_ord |> clear()
+        s.moe_ord |> reserve(int(ne))   // capacity persists across layers — no per-layer alloc
         for (e in range64(ne)) {
             let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
             let cnt = s.moe_cnt[e] - b0
-            if (cnt == 0l) {
-                continue
+            if (cnt > 0l) {
+                s.moe_ord |> push(int2(int(e), int(cnt)))
             }
+        }
+        s.moe_ord |> sort() $(a, b) => a.y != b.y ? a.y > b.y : a.x < b.x
+        var nreg = 0l
+        for (oe in s.moe_ord) {
+            let e = int64(oe.x)
+            let cnt = int64(oe.y)
+            let b0 = e == 0l ? 0l : s.moe_cnt[e - 1l]
             let eg = l * ne + e
             let base = e * dim * nfe
-            offs1 |> push(t.we1_offs[l] + base)
-            offs1 |> push(b0)
-            offs1 |> push(cnt)
-            offs3 |> push(t.we3_offs[l] + base)
-            offs3 |> push(b0)
-            offs3 |> push(cnt)
-            offs2 |> push(t.we2_offs[l] + base)
-            offs2 |> push(b0)
-            offs2 |> push(cnt)
+            s.moe_offs1 |> push(t.we1_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+            s.moe_offs1 |> push(b0)
+            s.moe_offs1 |> push(cnt)
+            s.moe_offs3 |> push(t.we3_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+            s.moe_offs3 |> push(b0)
+            s.moe_offs3 |> push(cnt)
+            s.moe_offs2 |> push(t.we2_offs[l] + base)   // nolint:STYLE012 — loop-append into reused scratch
+            s.moe_offs2 |> push(b0)
+            s.moe_offs2 |> push(cnt)
             if (c.moe_exps_bias) {
-                boffs1 |> push(t.web1_off + eg * nfe)
-                boffs3 |> push(t.web3_off + eg * nfe)
-                boffs2 |> push(t.web2_off + eg * dim)
+                s.moe_boffs1 |> push(t.web1_off + eg * nfe)
+                s.moe_boffs3 |> push(t.web3_off + eg * nfe)
+                s.moe_boffs2 |> push(t.web2_off + eg * dim)
             }
             nreg++
         }
         let ts_g1 = ref_time_ticks()
         if (fused_kq) {   // native kq: one batched region-list GEMM per projection (never biased)
-            mm_b_kq_groupn(s.moe_ghb, t, f1, offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
-            mm_b_kq_groupn(s.moe_ghb2, t, f3, offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+            mm_b_kq_groupn(s.moe_ghb, t, f1, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
+            mm_b_kq_groupn(s.moe_ghb2, t, f3, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, s.moe_gxbs, dim, nfe)
         } elif (c.moe_exps_bias) {   // gpt-oss: gate/up biases fold into the stores, before the act
-            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, offs1, nreg, s.moe_gxq, s.moe_gxs, t.fblob, boffs1, dim, nfe)
-            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, offs3, nreg, s.moe_gxq, s.moe_gxs, t.fblob, boffs3, dim, nfe)
+            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, t.fblob, s.moe_boffs1, dim, nfe)
+            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, t.fblob, s.moe_boffs3, dim, nfe)
         } else {
-            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, offs1, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
-            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+            matmul_mx4q8_batch_groupn(s.moe_ghb, t.mxq, t.mxs, s.moe_offs1, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
+            matmul_mx4q8_batch_groupn(s.moe_ghb2, t.mxq, t.mxs, s.moe_offs3, nreg, s.moe_gxq, s.moe_gxs, dim, nfe)
         }
         prof_add("mm_gemm", ts_g1)
         let ts_act = ref_time_ticks()
@@ -6457,11 +6472,11 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         }
         let ts_g3 = ref_time_ticks()
         if (fused_kq) {
-            mm_b_kq_groupn(s.moe_gout, t, f2, offs2, nreg, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim)
+            mm_b_kq_groupn(s.moe_gout, t, f2, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, s.moe_hbs, nfe, dim)
         } elif (c.moe_exps_bias) {   // ... and the down biases, inside the routed weight (ggml_add_id order)
-            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, boffs2, nfe, dim)
+            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, t.fblob, s.moe_boffs2, nfe, dim)
         } else {
-            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
+            matmul_mx4q8_batch_groupn(s.moe_gout, t.mxq, t.mxs, s.moe_offs2, nreg, s.moe_hq, s.moe_hs, nfe, dim)
         }
         prof_add("mm_gemm", ts_g3)
         // bucket row j -> the (position, slot) grid row for the reduce. Threaded: this is a
@@ -6483,12 +6498,6 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
             }
         }
         prof_add("moe_park", ts_park)
-        delete offs1
-        delete offs3
-        delete offs2
-        delete boffs1
-        delete boffs3
-        delete boffs2
     }
 
     // 3. one batched GEMM chain per touched expert over its gathered rows; raw down-projection
