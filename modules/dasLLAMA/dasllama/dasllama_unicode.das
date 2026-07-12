@@ -9,7 +9,8 @@ require strings
 // (unicode_ranges_flags + unicode_set_whitespace) so cpt_is_letter / cpt_is_number /
 // cpt_is_whitespace match llama.cpp's unicode_cpt_flags_from_cpt exactly.
 //   RANGES: sorted (codepoint_start << 8 | category_flags); bits 0x02=number (\p{N}),
-//           0x04=letter (\p{L}). Lookup = largest start <= cpt (binary search).
+//           0x04=letter (\p{L}), 0x10=combining mark (\p{M}). Lookup = largest start <= cpt
+//           (binary search).
 //   WS:     explicit whitespace codepoints (\s) — llama.cpp keeps these apart from the
 //           \p{Z} SEPARATOR category, so whitespace is a separate set, not a range bit.
 

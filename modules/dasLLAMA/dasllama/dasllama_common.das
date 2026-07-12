@@ -1374,6 +1374,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
             if (gguf_is_array(m, "{arch}.attention.recurrent_layers")) {
                 let rl <- gguf_int_array(m, bytes, "{arch}.attention.recurrent_layers")
+                if (int64(length(rl)) != layers) {
+                    panic("dasLLAMA: recurrent_layers array has {length(rl)} entries, expected {layers}")
+                }
                 for (l in range64(layers)) {
                     if (rl[l] != 0l) {
                         t.config.recr_mask |= 1ul << uint64(l)
@@ -1382,6 +1385,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             } else {
                 let interval = (gguf_has(m, "{arch}.full_attention_interval")
                     ? gguf_int(m, bytes, "{arch}.full_attention_interval") : 4l)
+                if (interval <= 0l) {
+                    panic("dasLLAMA: full_attention_interval must be positive (got {interval})")
+                }
                 for (l in range64(layers)) {
                     if ((l + 1l) % interval != 0l) {
                         t.config.recr_mask |= 1ul << uint64(l)
@@ -1398,6 +1404,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
             if (t.config.ssm_d_conv < 2l || t.config.ssm_dt_rank % t.config.ssm_n_group != 0l) {
                 panic("dasLLAMA: unsupported deltanet geometry (conv_kernel {t.config.ssm_d_conv}, v-heads {t.config.ssm_dt_rank}, k-heads {t.config.ssm_n_group})")
+            }
+            if (dn_conv_dim(t.config) % 4l != 0l) {   // the batched conv reads float4 rows (validate-at-load, kv_validate_q8 precedent)
+                panic("dasLLAMA: deltanet conv_dim {dn_conv_dim(t.config)} must be a multiple of 4")
             }
             // MTP/NextN decoder blocks are not modeled — refuse files that ship the tensors
             // (regular GGUFs strip them; the metadata key alone is tolerated and ignored)
