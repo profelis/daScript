@@ -628,7 +628,8 @@ class OpenAiServer : HvWebServer {
 //! cache reuses completed streams' pages, so repeated prompts (system prompts, multi-turn chats)
 //! skip their prefill; ``prefix_groups`` caps the cache (0 = auto: one full context per stream
 //! slot, < 0 = unbounded). ``page_rows`` = 0 restores flat preallocated sessions (each the full
-//! ``--ctx`` slab). Call after ``set_model``.
+//! ``--ctx`` slab). ``kv_dtype`` picks the KV-cache codec for every stream (pool-wide when paged;
+//! see ``KVDtype`` — ``tq4`` needs a power-of-two head_size). Call after ``set_model``.
 def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16) {
     g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once

@@ -95,6 +95,18 @@ def pick_kv_dtype(s : string) : KVDtype {
     return KVDtype.f16
 }
 
+def private cli_has_flag(flag : string) : bool {
+    var args <- get_cli_arguments()
+    for (a in args) {
+        if (a == flag) {
+            delete args
+            return true
+        }
+    }
+    delete args
+    return false
+}
+
 // fill CLI-unset fields (zero / empty / false — the same sentinels the guards below use) from the
 // TOML config, so precedence is defaults < config file < explicit flags
 def apply_config(var cfg : ServerArgs) : bool {
@@ -139,7 +151,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     if (cfg.page_rows <= 0) {
         cfg.page_rows = int(root?["page_rows"] ?? 0l)
     }
-    if (cfg.prefix == 0) {
+    // --prefix is the one flag where 0 is a meaningful EXPLICIT value (auto-sizing), so the
+    // zero-sentinel isn't enough: only fill from TOML when the flag is truly absent from argv
+    if (cfg.prefix == 0 && !cli_has_flag("--prefix")) {
         cfg.prefix = int(root?["prefix"] ?? 0l)
     }
     if (!cfg.flat) {
