@@ -546,6 +546,43 @@ restores only at the next whole-backend activation (tests must pin "portable" ex
 oracle runs); the pointer-keyed weight cache assumes load-once-stable weights (refilling the
 same arrays needs `metal_gemm_shutdown` — the documented cache contract).
 
+**2026-07-11 — Phase 6 landed (6.0–6d): full-GPU-resident 1B prefill.** Four legs in three
+commits (`f9c849107` 6.0+6a, `7664e6e6c` 6b, `df01a9366` 6c+6d + tiled attention).
+**(6.0 detector)** `metal_command_buffer_gpu_start_time/_end_time` externs + `with_compute_
+encoder_timed` — the GPU-busy vs host-wall split that steered everything below. **(6a emitter
+math)** value-call whitelist exp/sqrt/rsqrt/sin/cos/tanh/abs/saturate/round (float classes; abs
+also signed-int) + min/max (numeric) — das math-module names ARE the MSL spellings (`round` is
+half-away on both sides, probe-verified); + the quantize-kernel converts cvt.f32.i8/cvt.i8.f32.
+Census 192→221; msl 70/70, metal 34/34 (math fixture pins fastmath=false — fast::sin/cos's
+~2^-11 ABSOLUTE envelope swamps the 1e-4 oracle). **(6b kernels)** `dasllama_metal_prefill.das`:
+metal_q8_quant / metal_rmsnorm (simd_sum + tg partials) / metal_rope (table-driven NORM pairs —
+build_rope_table already hoists all trig) / metal_swiglu / metal_add + attention; unit tests vs
+the dasLLAMA CPU twins on-device (quantize bit-exact under planted ±127 amax). **(6c driver)**
+ONE command buffer per prefill — 21 dispatches/layer, default hazard tracking orders, one
+commit+wait; weights ride the 5c lazy region cache; pooled resident activations (+ per-layer
+K/V outs, np32-padded per-head score slabs); readback hands x_b + roped-K/raw-V to
+`kv_store_batch` (KV codec stays CPU — any dtype). **(6d seam + gates)** whole-prefill override
+registry in dasllama_common (`PrefillOverrideFn` + `select_prefill_override`, dormant default;
+hook in forward_prefill_body's layer loop; registration rides the dasllama_transformer umbrella
+— a direct common require would cycle); `DASLLAMA_PIN_PREFILL` env rail; end-to-end parity test
+(40-token greedy continuation GPU vs CPU control on the real 1B, token-for-token) + leak gate.
+🔑 **The parity failure that mattered: ROW-MAJOR weights are the donor contract** — the default
+M1 load picks a repack backend whose interleaved qblob the GPU kernel reads as garbage
+(stage-probe-bisected: rmsnorm/quant exact, GEMM rel~2); the driver now declines via
+`kernel_backend_needs_repack(active_kernel_backend())`, recipe pins arm64-sdot/portable.
+**Attention iterated once by the detector's verdict:** knockout attribution
+(`DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew|nongemm`) showed the naive fused per-row pair at
+~80 GMAC/s owning 44% of GPU time → replaced with a tiled sgmat trio (QK^T 32x32 C-blocks,
+causal early-out → in-row softmax, tails zeroed → P·V whole-block GEMM) — attention now ~19 ms.
+**Numbers (M1 Max, DIRTY, same-window interleaved): pp512 1594 tok/s** (hybrid clean 1054; lcpp
+full-Metal 3960 = 2.5x away), N=256 1421. Honest GPU budget at N=512: 289 ms = GEMM chain 252
+(497 GMAC — 0.97 GMAC/tok — at ~1970 GMAC/s, i.e. ALREADY at the Phase-5 iso kernel rate;
+gemm-only knockout == full-chain delta, so inter-dispatch drains cost ~nothing) + attention 19
++ elementwise 18. **The remaining lever is the Q8 GEMM kernel itself** (~4 TFLOPS-f16-eff vs
+the ~2x-to-roofline headroom the clean round mapped): double-buffered staging, bigger C tiles
+per threadgroup, wider k-steps — iterate via bench_gemm_iso, not full prefills. Secondary
+(measured small): concurrent-dispatch encoder + explicit barriers for q/k/v + w1/w3 overlap.
+
 **2026-07-11 — pipeline: fixup-set global inits now infer; dasSpirv blob fill patch→fixup**
 (rides this branch — surfaced reviewing dasMetal's apply/fixup model). Boris called dasSpirv's
 patch+astChanged blob fill a workaround for a compiler gap; confirmed and fixed. Diagnosis

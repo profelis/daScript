@@ -434,8 +434,9 @@ var private g_pso_softmax : MetalComputePipeline?
 var private g_pso_av : MetalComputePipeline?
 var private g_pso_swiglu : MetalComputePipeline?
 var private g_pso_add : MetalComputePipeline?
-// timing-attribution knockout (DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew): skips encoding that
-// stage family — output is GARBAGE, gpu-time deltas attribute the budget. Debug rail only.
+// timing-attribution knockout (DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew|nongemm): skips encoding
+// that stage family (nongemm = attn AND ew, leaving the pure GEMM chain) — output is GARBAGE,
+// gpu-time deltas attribute the budget. Debug rail only.
 var private g_skip = ""
 
 //! Prefills below this npos decline to the CPU path (submit+readback overhead outweighs the win).
@@ -803,7 +804,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 var bw2 = upload_region(reinterpret<void?>(addr(t.qblob[t.w2_offs[l]])), uint64(dim * hidden))
                 var bw2_s = upload_region(reinterpret<void?>(addr(t.qscales[t.w2_offs[l] / 32l])), uint64(dim * (hidden / 32l) * 4l))
                 // attention: norm -> requant -> Q/K/V -> rope -> scores+softmax -> P.V -> out-proj -> residual
-                if (g_skip != "ew") {
+                if (g_skip != "ew" && g_skip != "nongemm") {
                     enc_rms(enc, bx, bw_att, bxb, u_dim, u_eps, npos)
                     enc_quant(enc, bxb, bxq, bxs, u_dim, u_nblk_dim, npos * (dim / 32l))
                 }
@@ -812,23 +813,23 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     enc_gemm(enc, bwk, bwk_s, bxq, bxs, bks[l], u_dim, u_kvd, mp, kv_dim)
                     enc_gemm(enc, bwv, bwv_s, bxq, bxs, bvs[l], u_dim, u_kvd, mp, kv_dim)
                 }
-                if (g_skip != "ew") {
+                if (g_skip != "ew" && g_skip != "nongemm") {
                     enc_rope(enc, bq, bcos, bsin, u_qd, u_hs, u_npairs_q, npos * qd / 2l)
                     enc_rope(enc, bks[l], bcos, bsin, u_kvd, u_hs, u_npairs_k, npos * kv_dim / 2l)
                 }
-                if (g_skip != "attn") {
+                if (g_skip != "attn" && g_skip != "nongemm") {
                     enc_qk(enc, bq, bks[l], batt, u_qd, u_kvd, u_hs, u_kvm, u_np, u_np32, u_scale, mp, n_heads)
                     enc_softmax(enc, batt, u_np32, npos, n_heads)
                     enc_av(enc, batt, bvs[l], bxb, u_qd, u_kvd, u_hs, u_kvm, u_np, u_np32, mp, n_heads, head_size)
                 }
-                if (g_skip != "ew") {
+                if (g_skip != "ew" && g_skip != "nongemm") {
                     enc_quant(enc, bxb, bxq, bxs, u_qd, u_nblk_qd, npos * (qd / 32l))
                 }
                 if (g_skip != "gemm") {
                     enc_gemm(enc, bwo, bwo_s, bxq, bxs, bxb2, u_qd, u_dim, mp, dim)
                 }
                 // ffn: norm -> requant -> W1/W3 -> swiglu -> requant -> W2 -> residual
-                if (g_skip != "ew") {
+                if (g_skip != "ew" && g_skip != "nongemm") {
                     enc_ew2(enc, g_pso_add, bx, bxb2, u_total_dim, npos * dim)
                     enc_rms(enc, bx, bw_ffn, bxb, u_dim, u_eps, npos)
                     enc_quant(enc, bxb, bxq, bxs, u_dim, u_nblk_dim, npos * (dim / 32l))
@@ -837,14 +838,14 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                     enc_gemm(enc, bw1, bw1_s, bxq, bxs, bhb, u_dim, u_hidden, mp, hidden)
                     enc_gemm(enc, bw3, bw3_s, bxq, bxs, bhb2, u_dim, u_hidden, mp, hidden)
                 }
-                if (g_skip != "ew") {
+                if (g_skip != "ew" && g_skip != "nongemm") {
                     enc_ew2(enc, g_pso_swiglu, bhb, bhb2, u_total_h, npos * hidden)
                     enc_quant(enc, bhb, bxq, bxs, u_hidden, u_nblk_h, npos * (hidden / 32l))
                 }
                 if (g_skip != "gemm") {
                     enc_gemm(enc, bw2, bw2_s, bxq, bxs, bxb, u_hidden, u_dim, mp, dim)
                 }
-                if (g_skip != "ew") {
+                if (g_skip != "ew" && g_skip != "nongemm") {
                     enc_ew2(enc, g_pso_add, bx, bxb, u_total_dim, npos * dim)
                 }
             }
