@@ -273,6 +273,8 @@ A generic that should accept `array<T>`, `array<array<T>>`, … (any nesting) �
 ### Common gotchas
 
 - Lambda params can shadow function params — use distinct names
+- **`label` and `expect` are reserved words** (lexer keywords `DAS_LABEL`/`DAS_EXPECT`) — using either as a parameter/variable name is a syntax error; rename (`tag`, `want`)
+- **Literal `{`/`}` in string literals must be escaped `\{`/`\}`** — unescaped `{...}` is interpolation. Bites when embedding shader/C source as inline strings. String literals may span multiple lines (raw newlines are legal); probe-verified 2026-07-11
 - String builder requires `unsafe` or `options persistent_heap` if returned
 - **DANGER — silent JIT miscompile:** a comprehension used **inline** as a `<-` move-init argument inside a struct constructor (`Foo(a <- [for (x in src); expr], b <- local)`) yields an **empty array under `-jit`** (interp is fine; a plain-local `<-` field beside it is unaffected). No diagnostic. **Hoist the comprehension to a `var` local first**, then `Foo(a <- local_comp, b <- local)`. (This is exactly the fix applied in `modules/dasLLAMA/performance/gen_asr_profile.das`.)
 - Tuple field access: `t._0`, `t._1`, `t._2`

@@ -1666,6 +1666,17 @@ def kernel_backend_names() : array<string> {
     return <- [for (k in keys(g_kernel_backends)); k]
 }
 
+//! Backend `name`'s f32 batch kernel (a batch-only donor's small-ntok / unsupported-shape
+//! fallback rail — the metal backend delegates to "portable" through this). The panic stub
+//! when unknown.
+def kernel_backend_batch_fn(name : string) : MatmulQ8Q8BatchFn {
+    var r = @@q8q8_unset_batch
+    g_kernel_backends |> get(name) $(be) {
+        r = be.batch
+    }
+    return r
+}
+
 //! Repack one Q8 weight tensor (region at element offset woff in qblob, shape [d rows x n cols]) into
 //! the active backend's layout, IN PLACE. No-op unless the laneq backend is enabled. n % 32 == 0.
 def repack_q8q8_weight(var qblob : array<int8>; var qscales : array<float>; woff, n, d : int64) {

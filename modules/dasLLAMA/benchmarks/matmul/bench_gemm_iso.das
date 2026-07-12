@@ -6,6 +6,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_math_default
 require dasllama/dasllama_math_aarch64_neon
 require dasllama/dasllama_math_gen  // registers the arm64-gen/x64-gen repack tier — without it the repack half runs portable
+require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — registers the "metal" GPU batch donor (DASLLAMA_PIN_BATCH_BACKEND=metal) on Apple builds
 require dasllama/dasllama_quant
 require daslib/jobque_boost
 require daslib/fio
@@ -177,6 +178,9 @@ def bench_gemm_iso(b : B?) {
         // env contract as llama3_perf; the repack half below still switches to the repack tier
         if (has_env_variable("DASLLAMA_PIN_BACKEND")) {
             pin_kernel_backend(get_env_variable("DASLLAMA_PIN_BACKEND"))
+        }
+        if (has_env_variable("DASLLAMA_PIN_BATCH_BACKEND")) {
+            select_batch_backend(get_env_variable("DASLLAMA_PIN_BATCH_BACKEND"))
         }
         if (has_env_variable("DASLLAMA_BENCH_NTOK")) {
             NTOK = int64(to_int(get_env_variable("DASLLAMA_BENCH_NTOK")))

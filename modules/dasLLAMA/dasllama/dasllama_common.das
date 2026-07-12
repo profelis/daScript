@@ -8,6 +8,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_math_default  // registers the portable Q8·Q8 backend at [init] (the fallback everywhere)
 require dasllama/dasllama_math_aarch64_neon  // registers the arm64 SDOT Q8·Q8 backend at [init]; no-op off-ARM
 require ?llvm/daslib/llvm_tune dasllama/dasllama_math_gen  // nolint:STYLE030 — [init]-only: registers "arm64-gen" (the generated GEMM family, arm64 load-select tier). PATH guard: the module hard-requires llvm_tune, so it loads exactly when dasLLVM is mounted
+require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
 require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
@@ -188,6 +189,43 @@ typedef AttnDecodeFn  = function<(t : Model; var s : Session; l : int64; pos : i
 typedef FfnDecodeFn   = function<(t : Model; var s : Session; l : int64) : void>
 typedef AttnPrefillFn = function<(t : Model; var s : Session; l : int64; npos : int64; start_pos : int64) : void>
 typedef FfnPrefillFn  = function<(t : Model; var s : Session; l : int64; npos : int64) : void>
+
+//! A whole-prefill override (e.g. the dasMetal GPU-resident path): claims the ENTIRE per-layer
+//! stack of one prefill — rope tables are already built, x_b holds the embedded rows; on true the
+//! KV cache is filled for every position and x_b holds the final residual stream (the final norm +
+//! classifier stay with the caller). false = declined (unsupported shape/config) — the caller runs
+//! the ordinary per-layer CPU loop. Same pin discipline as the batch-slot donors: registered by
+//! name at [init], activated only via select_prefill_override (env rail: DASLLAMA_PIN_PREFILL).
+typedef PrefillOverrideFn = function<(t : Model; var s : Session; npos : int64; start_pos : int64) : bool>
+
+// The prefill-override registry (see PrefillOverrideFn). Name-keyed like the kernel backends;
+// nothing activates by default — an empty active name keeps the CPU layer loop.
+var private g_prefill_overrides : table<string; PrefillOverrideFn>
+var private g_prefill_override : PrefillOverrideFn
+var private g_prefill_override_name = ""
+
+def register_prefill_override(name : string; fn : PrefillOverrideFn) {
+    g_prefill_overrides[name] = fn
+}
+
+//! Activate a registered whole-prefill override by name ("" deactivates). false = unknown name.
+def select_prefill_override(name : string) : bool {
+    if (empty(name)) {
+        g_prefill_override_name = ""
+        return true
+    }
+    if (!key_exists(g_prefill_overrides, name)) {
+        to_log(LOG_ERROR, "dasLLAMA: unknown prefill override `{name}`\n")
+        return false
+    }
+    g_prefill_override = g_prefill_overrides[name]
+    g_prefill_override_name = name
+    return true
+}
+
+def active_prefill_override : string {
+    return g_prefill_override_name
+}
 
 //! The copyable hot-path block pointers, resolved onto the Model at load and called per layer.
 struct ArchBlocks {
@@ -3312,9 +3350,9 @@ def private flash_decode_check_d(qp : float const?; qq : int8 const?; qsp : floa
 // run, making the chunk ONE multi-row call exactly as before. Threaded over positions (workers own
 // disjoint cache slices; runs partition positions). Self-gates on g_kv_store_par_threshold.
 // kcp/vcp = the layer's base byte pointers (kv_layer_kbase); runs cover [start_pos, start_pos + npos).
-def private kv_store_batch(var kcp : uint8?; var vcp : uint8?;
-                           kdt, vdt : KVDtype; k_b : array<float>; v_b : array<float>;
-                           runs : KVRun const?; nrun, start_pos, npos, kv_dim : int64) {
+def kv_store_batch(var kcp : uint8?; var vcp : uint8?;
+                   kdt, vdt : KVDtype; k_b : array<float>; v_b : array<float>;
+                   runs : KVRun const?; nrun, start_pos, npos, kv_dim : int64) {
     unsafe {
         let kbp = reinterpret<float const?>(addr(k_b[0]))
         let vbp = reinterpret<float const?>(addr(v_b[0]))
@@ -8168,12 +8206,20 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     }
     prof_add("rope_build", ts_rope_build)   // one-time cos/sin table build (separate bucket)
 
-    // per-layer transformer stack — batched attention then FFN, each through the arch's registered block
-    for (l in range64(c.n_layers)) {
-        trace_tag(TRACE_TAG_ATTN_STD)   // per-lane trace: color the prefill attention section
-        t.blocks.attn_prefill(t, s, l, npos, start_pos)
-        trace_tag(TRACE_TAG_FFN_STD)
-        t.blocks.ffn_prefill(t, s, l, npos)
+    // per-layer transformer stack — batched attention then FFN, each through the arch's registered
+    // block. An active whole-prefill override (select_prefill_override) may claim the entire stack;
+    // it returns false to decline (unsupported shape/config), which falls back to the CPU loop.
+    var stack_done = false
+    if (!empty(g_prefill_override_name)) {
+        stack_done = invoke(g_prefill_override, t, s, npos, start_pos)
+    }
+    if (!stack_done) {
+        for (l in range64(c.n_layers)) {
+            trace_tag(TRACE_TAG_ATTN_STD)   // per-lane trace: color the prefill attention section
+            t.blocks.attn_prefill(t, s, l, npos, start_pos)
+            trace_tag(TRACE_TAG_FFN_STD)
+            t.blocks.ffn_prefill(t, s, l, npos)
+        }
     }
 
     // final rmsnorm + classifier on the LAST position only (that's what we sample next)

@@ -875,15 +875,18 @@ namespace das {
         }
     };
 
-    // lattice swizzles — element-typed, up to 16 lanes; a scalar ResT lands in the low bytes
+    // lattice swizzles — element-typed, up to 16 lanes; a scalar ResT lands in the low bytes.
+    // ResT/ET arrive const-qualified when the source vector handle is const (das const flows
+    // onto the swizzle result) — strip for the local accumulator
     template <typename ResT, typename ET, int... f>
     struct das_swizzle_small {
         template <typename VT>
         static __forceinline ResT swizzle ( const VT & val ) {
-            ResT res;
+            using ETNC = typename remove_const<ET>::type;
+            typename remove_const<ResT>::type res;
             memset(&res, 0, sizeof(res));
-            const ET * s = (const ET *) &val;
-            ET * d = (ET *) &res;
+            const ETNC * s = (const ETNC *) &val;
+            ETNC * d = (ETNC *) &res;
             constexpr int idx[] = { f... };
             for ( size_t i = 0; i != sizeof...(f); ++i ) d[i] = s[idx[i]];
             return res;

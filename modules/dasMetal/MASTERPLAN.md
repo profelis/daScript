@@ -1,0 +1,652 @@
+# dasMetal — native Metal compute: platform-gated binding + pure-daslang MSL backend
+
+> **This file is the durable masterplan and implementation history for dasMetal.**
+> It is the canonical, reviewable record — not Claude memory, not a scratch plan.
+> Each phase appends a dated entry to the **Implementation log** at the bottom as it lands.
+
+## Why
+
+dasVulkan owns graphics on every platform (including macOS via MoltenVK). What it cannot
+give on Apple Silicon is the **native compute fast path**: no Vulkan-emulation layer under
+every dispatch, unified-memory `MTLBuffer`s that are plain pointers on both CPU and GPU,
+and Metal-only features (simdgroup reductions, `simdgroup_matrix`). The target profile is
+dasLLAMA-class GPU compute offload on the M-boxes. Scope is **compute only** — graphics
+stays dasVulkan's job.
+
+The shader-language facts that shape the design: **LLVM cannot emit MSL** (no backend; AIR,
+Metal's binary form, is a private version-unstable LLVM-IR dialect) and **Metal does not
+ingest SPIR-V** — its sanctioned inputs are MSL source and DXIL. Translation libraries
+exist (SPIRV-Cross is MoltenVK's own shader stage), but vendoring one is a third-party C++
+dependency that contradicts this module's thesis: *Metal.framework is just there*.
+
+So dasMetal uses the house pattern, already proven three times: dasGlsl emits **GLSL text**
+from the daslang AST (`GlslExport`), dasSpirv emits **SPIR-V words**, and `daslib/aot_cpp.das`
+emits **C++ for the entire language**. MSL is a C++14 dialect; a compute-only MSL text
+emitter is squarely inside the established pattern. Just as `[compute_shader]` lowers
+daslang→SPIR-V→Vulkan, `[metal_kernel]` lowers daslang→MSL→Metal.
+
+What makes it cheap: Metal's in-process runtime compiler (`newLibraryWithSource`) does all
+GPU optimization; text is the easiest backend to emit and debug; and the authoring frontend
+(module globals + `@ssbo`/`@binding` field annotations + builtin globals) already exists in
+dasSpirv and is reused as-is.
+
+## Settled decisions
+
+1. **Lives in the main tree as `modules/dasMetal`.** The C++ binding is APPLE-gated; the
+   `metal/` daslang files (emitter + annotation) are **pure das and registered on ALL
+   platforms** — emitter/text tests run on every CI lane; only GPU execution is Apple-only.
+2. **Compute only.** No render pipelines, no drawables, no CAMetalLayer. Graphics = dasVulkan.
+3. **Zero third-party code.** No metal-cpp, no SPIRV-Cross, no MoltenVK, no committed
+   `.msl`/`.metallib`, no external SDK. The binding is a hand-written Obj-C++ shim
+   (`src/dasMetal.mm`) over the system Metal.framework — ~18 externs for the compute subset.
+   (metal-cpp + dasClangBind rejected: vendored headers and binder churn for an ~18-extern
+   surface; revisit only if the surface outgrows hand maintenance.)
+4. **Class-based authoring: kernels are class methods, resources are class members.** A
+   compute pass is a `class` whose `@ssbo @binding = N` members declare the buffers and
+   whose `[metal_kernel]` methods are the kernels — no module-scope resource globals (they
+   pollute the namespace and don't scale to two kernels with different buffer sets in one
+   file), and members→kernel-parameters is exactly MSL's own model. Multiple kernels over
+   one buffer set = multiple methods in one class. Builtin globals
+   (`gl_GlobalInvocationID`, …) are still reused via `require spirv/spirv_builtins public`
+   (dasSpirv is unconditional in-tree pure das — always resolves). Because the body is
+   ordinary daslang, the same method also executes on the CPU — the primary correctness
+   oracle (Test architecture). **Zero edits to shipped dasSpirv/dasGlsl.**
+5. **Naming.** C++ module `das_metal` (`Module("das_metal")`, class `Module_DasMetal`). das
+   files under `metal/`: `require metal/msl_shader`, `require metal/das_metal_boost`.
+   Consumers guard: `require ?das_metal metal/das_metal_boost` +
+   `static_if (typeinfo builtin_module_exists(das_metal))` (the sql_boost provider pattern).
+   If a top-level registration proves workable in Phase 0, the spelling may shorten to a
+   bare `das_metal_boost`; the two-segment guarded form is the safe default.
+6. **Test-per-construct is a hard requirement**, enforced by a construct census (gate B) +
+   the real-frontend compile gate. LCOV covers runtime files only — the emitter runs at
+   compile time, invisible to line coverage (dasSpirv finding; census is the proxy).
+7. **PoC before breadth.** The earliest milestone is `c[i] = a[i]*b[i]` through the REAL
+   emitter on a real M-series GPU. The only hand-written MSL ever permitted is the Phase-0
+   dev-scaffold **inline string** proving the binding, deleted when Phase 1 lands (the
+   `_handbuild_square.das` pattern). **No `.msl` file is ever committed.**
+8. **`fastmath` is a `[metal_kernel]` property, ON by default.** daslang's own posture is
+   fastmath-on, so we are not chasing bit-exact float parity; Metal's runtime compiler also
+   defaults fast-math ON and we keep it. Float oracles compare with tolerance (ints
+   bit-exact). `[metal_kernel(fastmath=false)]` per kernel when isolating a divergence
+   needs strict IEEE.
+
+## Architecture
+
+`modules/dasMetal` = one APPLE-gated Obj-C++ shim + pure-daslang emitter files:
+
+| File | Gen/Hand | Purpose |
+|---|---|---|
+| `src/dasMetal.mm` | hand | `Module("das_metal")` — Obj-C++ shim over Metal.framework. Opaque annotated handles (device, queue, command buffer, compute encoder, pipeline state, library, function, buffer) + the extern surface below. Compiled with ARC; handles cross to das as `__bridge_retained void*`; `metal_release` = `__bridge_transfer`. Shim-side live-object counter for the leak gate. APPLE-only; links `-framework Metal -framework Foundation`. |
+| `metal/msl_types.das` | hand | daslang `TypeDecl` → MSL type name (32-bit scalars/bool + the 16/8-bit lattice — MSL has native `half`/`short`/`char` — and their 2/3/4 vectors, classified via the shared `daslib/shader_block_layout` rails). `msl_buffer_elem_name` gives the layout-bearing spelling: 3-lane elements take MSL's `packed_T3` (das packs tightly; unified memory means the das array IS the buffer). |
+| `metal/metal_builtins.das` | hand | Metal-only builtin surface over the shared lingua franca (the spirv_builtins pattern): re-exports `daslib/shader_lingua_franca`, adds `gl_WorkGroupSize` + the four simdgroup IDs (GLSL subgroup spellings) and the `simd_sum`/`simd_shuffle*` intrinsics (Metal spellings, float/int/uint). Identity stub bodies = width-1 simdgroup CPU semantics. |
+| `metal/msl_emit.das` | hand | The text emitter: `[macro_function] generate_msl(fn, var errors, cfg, var census) : string`. Manual recursion (`emit_value`/`emit_stmt`, mirroring `spirv_emit`). Kernel-signature synthesis from `@ssbo` globals (the one structural novelty — below). Records the construct census at every emit site. |
+| `metal/msl_shader.das` | hand | `[metal_kernel]` function-macro (`MetalKernel : AstFunctionAnnotation`, modeled on `SpirvShader`), applied to a **class method**; args: `name`, `fastmath` (default **true**, surfaced to the host via a companion ``{name}`msl_fastmath : bool`` global feeding the pipeline-compile options). `apply` declares the public ``{name}`msl : string`` global; **`fixup` fills `glob.init = new ExprConstString(...)`** — string capture is call-free, so fixup suffices (dasGlsl precedent; the patch/astChanged dance dasSpirv needed for `array<uint>` does not apply). Does `require spirv/spirv_builtins public`. |
+| `metal/das_metal_boost.das` | hand | Host sugar over `das_metal`: `with_metal_device`, `pipeline_from_kernel` (compile + error surfacing), unified-memory buffer helpers, `run_compute_1d` one-liner, live-object leak assert. `require das_metal` → usable only where the C++ module exists. |
+| `CMakeLists.txt` | hand | `ADD_MODULE_DAS(metal metal …)` unconditional (emitter everywhere); `IF(APPLE)`: `ADD_MODULE_CPP(DasMetal)` + `ADD_MODULE_LIB` + frameworks. Install rule mirrors dasSpirv's. |
+
+**Extern surface (PoC-complete).** `metal_create_system_default_device`; device name +
+unified-memory query; `metal_new_command_queue`; `metal_new_library_from_source(dev, src,
+fastmath; var error)`; `metal_new_function(lib, name)`; `metal_new_compute_pipeline(dev,
+fn; var error)`; `metal_new_buffer(dev, bytes)` (storageModeShared);
+`metal_buffer_contents(buf) : void?` (the unified-memory pointer — host reads/writes it
+directly, no map/unmap); `metal_new_command_buffer(q)`; `metal_new_compute_encoder(cb)`;
+`metal_set_pipeline`; `metal_set_buffer(enc, buf, offset, index)`;
+`metal_dispatch_threadgroups(enc, groups, threads_per_group)` (+`metal_dispatch_threads`
+as the Apple-silicon exact-grid fast path); `metal_end_encoding`; `metal_commit`;
+`metal_wait_until_completed`; `metal_command_buffer_error`; `metal_release`;
+`metal_live_object_count`.
+
+**Kernel-signature lowering (the one structural novelty).** MSL has no module-scope device
+globals — and the authoring class's members map onto its model exactly: each `@ssbo`
+member lowers to a kernel parameter `device T* name [[buffer(N)]]` (`device const T*` when
+no kernel body writes it; member write-set collected in a pre-scan), and each referenced
+builtin global lowers to a builtin-attributed parameter (`gl_GlobalInvocationID` →
+`uint3 gl_GlobalInvocationID [[thread_position_in_grid]]`). Member access in the method
+body (bare `a` / `self.a`) emits as the bare parameter name, so the body needs no other
+rewriting. `@binding` = the flat `[[buffer(N)]]` index; `@set` must be absent or 0 (clean
+error — Metal has no descriptor sets); duplicate bindings within one class are a clean
+error. Identifiers colliding with MSL keywords (`kernel`, `device`, `constant`, `thread`,
+`half`, …) are mangled. The exact AST shape of method-member access (`ExprField` over
+`self`, constness, `ExprRef2Value` wrapping at fixup time) is dumped and recorded as the
+first Phase-1 step — the same discipline as dasSpirv's square AST dump.
+
+**Capture + cache.** Capture mirrors dasGlsl exactly (`ExprConstString` in fixup). A
+companion reflection global is deferred until the boost needs auto-binding (mirror
+`spirv_reflect` then). Text emission is fast enough to run every compile; if pipeline
+compilation latency ever matters, an `MTLBinaryArchive` cache keyed by
+`MSL_CODEGEN_VERSION` + `get_function_aot_hash(fn)` is the llvm_jit-pattern answer.
+
+## PoC feature set (Phase-1 milestone)
+
+The a*b kernel, authored:
+
+```das
+require metal/msl_shader
+
+class MulAB {
+    @ssbo @binding = 0 a : array<float>
+    @ssbo @binding = 1 b : array<float>
+    @ssbo @binding = 2 c : array<float>
+
+    [metal_kernel]
+    def mul_ab { let i = gl_GlobalInvocationID.x; c[i] = a[i] * b[i] }
+}
+// host reads mul_ab`msl : string → pipeline_from_kernel → run_compute_1d
+```
+
+Expected emission (the construct inventory that seeds the test matrix):
+
+```
+#include <metal_stdlib>
+using namespace metal;
+kernel void mul_ab(device const float* a [[buffer(0)]],
+                   device const float* b [[buffer(1)]],
+                   device float* c [[buffer(2)]],
+                   uint3 gl_GlobalInvocationID [[thread_position_in_grid]]) {
+    uint i = gl_GlobalInvocationID.x;
+    c[i] = a[i] * b[i];
+}
+```
+
+Constructs: preamble; kernel signature (device-pointer param, const-ness inference,
+`[[buffer(N)]]`, builtin param); value-`let`; single-component swizzle; array index →
+pointer index; `ExprOp2 *` (float); `ExprCopy` → assignment.
+
+## Test architecture — "every emitted construct has a test"
+
+Three behavioral layers + enforcement gates:
+
+1. **Text-assertion units** (`tests/msl/`, ALL platforms). Each test compiles a tiny
+   `[metal_kernel]` fixture, calls `generate_msl`, asserts structural facts (signature
+   shape, attribute per binding, const-ness, statement forms), plus a golden snapshot of
+   *our own* emitted text as a forward regression guard (dasSpirv's byte-snapshot amendment).
+2. **Compile gate** (the spirv-val analog). Every emitted MSL must compile through the
+   **real Metal frontend**: in-process `metal_new_library_from_source` where `das_metal`
+   exists (no Xcode required — the OS MTLCompilerService), soft-skip elsewhere,
+   hard-required on the macOS CI lane. (`xcrun metal` offline compile is a secondary local
+   oracle only — it needs full Xcode, not CLT.)
+3. **Real-GPU behavioral gate vs the CPU-reference oracle — as early as Phase 1**
+   (`tests/metal/`, Apple-only). The kernel body is ordinary daslang, so the **same method
+   runs on the CPU**: a driver loop sets `gl_GlobalInvocationID` and calls the method on a
+   class instance whose members are plain arrays — that CPU run (interp/JIT) produces the
+   expected buffer contents with zero second-source effort. GPU results compare against
+   it: ints bit-exact, floats with tolerance (fastmath on both sides — settled decision 8;
+   the PoC's `a[i]*b[i]` on small ints is exact regardless). Files are `require ?das_metal`
+   + `static_if builtin_module_exists` guarded, so they compile and no-op cleanly on
+   non-Apple lanes. Primary gate = **local M-boxes**; CI = the macOS lane's paravirtual
+   device (Phase-0 probe decides behavioral vs compile-only).
+
+- **Gate A — LCOV** on runtime-reached files (`das_metal_boost`, `msl_types` where runtime
+  code exists). The emitter is compile-time → census is its coverage proxy.
+- **Gate B — construct census.** `generate_msl` records every construct kind it emits
+  (`table<string>` set: `"kernel_sig"`, `"param.buffer"`,
+  `"param.builtin.thread_position_in_grid"`, `"op.mul.f32"`, …). A meta-test unions the
+  census across all fixtures and asserts equality with the declared supported set, both
+  directions. Census-record and emit are fused in one helper so they cannot drift; the
+  golden-snapshot layer catches emissions that bypass it.
+- **Leak gate.** Every `tests/metal/` file asserts `metal_live_object_count() == 0` at
+  exit — Metal objects are invisible to all six das leak detectors, so the shim counts.
+
+## Phasing (independently verifiable; no sizing)
+
+- **Phase 0 — binding bring-up + probes.** This file; `src/dasMetal.mm` (module +
+  externs); the CMake APPLE gate; `_handrolled_mul.das` dev scaffold with an **inline** MSL
+  string (never a committed `.msl`; deleted at Phase 1) proving
+  device→queue→pipeline→dispatch→readback + error surfacing on an M-box. Probes:
+  (a) **macOS CI lane** — does the paravirtual device execute the scaffold? decides CI
+  behavioral vs compile-only; (b) bad MSL surfaces the compiler log as a clean das error;
+  (c) live-object counter round-trips to zero.
+- **Phase 1 — a*b through the emitter (the PoC milestone).** `msl_types` + `msl_emit` PoC
+  subset + `[metal_kernel]` + string capture + `das_metal_boost` v1 + census + compile gate
+  + behavioral gate green on an M-box (+CI per the Phase-0 probe). Delete the Phase-0
+  scaffold string. Register `tests/msl` in `tests/aot/CMakeLists.txt` (5-site pattern).
+- **Phase 2 — arithmetic + control-flow breadth.** Mirror dasSpirv Phase 2's inventory:
+  full scalar/vector arithmetic, comparisons, logical ops, mutable locals, if/else, while,
+  range-for, break/continue, compound assignment. MSL is C-family — mostly emitter
+  table-fill + tests; no structured-CFG hazard. The in-kernel bounds guard
+  (`if (i >= n) return` for non-exact grids) lands here. Every fixture regresses against
+  its CPU-reference run.
+- **Phase 3 — threadgroup memory + barriers + simdgroup ops.** `threadgroup` address
+  space, `threadgroup_barrier(mem_flags)`, `simd_sum`/`simd_shuffle*`, the remaining
+  builtin attributes (`thread_position_in_threadgroup`, `threadgroup_position_in_grid`,
+  `threads_per_threadgroup`). The Metal value-add real kernels need.
+- **Phase 4 — 16/8-bit lattice.** `half` (native in MSL), short/ushort/uchar vectors —
+  extend `msl_types`, conformance fixtures parity vs the CPU lattice and the
+  dasSpirv/dasGlsl shader-lattice rails (`tests/type_lattice` discipline).
+- **Phase 5 — `simdgroup_matrix` + host perf plumbing.** `simdgroup_float8x8` et al. (the
+  dasLLAMA prize), buffer pooling, `MTLSharedEvent` sync, `MTLBinaryArchive` pipeline
+  cache. Sized when we get there; a dasLLAMA offload experiment is the driver.
+- **Phase 6 — full-GPU-resident prefill for ONE model (Llama-3.2-1B), chase the 3960.**
+  Mandate (Boris, 2026-07-11, after the Phase-5 clean round): cover the one model end to end
+  and see how close we get to llama.cpp full-Metal (pp512 3960 t/s vs our hybrid's 1055 —
+  the gap is residency: per-GEMM sync submits + activation/output memcpys + CPU attention).
+  Sized at session start; expected legs: emitter math-builtin whitelist growth (exp/sqrt/
+  rsqrt/min/max — rmsnorm + softmax kernels need them), attention/norm/rope kernels over the
+  Phase-3/5 constructs, activations resident in MTLBuffers across the layer loop (one encoder
+  per prefill via `with_compute_encoder`, unified memory hands the KV cache back to the CPU
+  decode path), integration above the batch-slot seam (the per-arch prefill blocks —
+  `ArchBlocks` — or a whole-prefill override behind the same env-pin discipline).
+  **Sizing (2026-07-11 session start, from the forward-path map).** The 7 per-layer q8 GEMMs
+  (Q/K/V/O/W1/W3/W2) already route through the batch slot; the CPU remainder is `rms_batch`,
+  `rope_batch_tab` (TABLE-driven — cos/sin precomputed per prefill, so the GPU rope kernel
+  needs no trig), the per-GEMM activation requant, `prefill_attention`, `gate_batch`
+  (swiglu), `add_inplace`, `kv_store_batch`; final norm + classifier is last-row-only GEMV
+  and stays CPU. Legs, in order:
+  - **6.0 — detector first.** `metal_command_buffer_gpu_start_time/_end_time` externs
+    (`GPUStartTime`/`GPUEndTime`) + structured per-stage host timing in the driver — the
+    GPU-busy vs wall vs upload/readback split steers every later leg.
+  - **6a — emitter math builtins.** Value-call whitelist exp/sqrt/rsqrt/min/max/abs/
+    saturate/tanh/sin/cos (das math-module names ARE the MSL spellings; float scalar +
+    vector classes); census + msl goldens + a metal behavioral fixture.
+  - **6b — kernels** (each: msl golden + census + CPU-reference metal test): `quantize_q8`
+    (f32 → int8 + scale per 32-group, writing the padded-M layout the GEMM reads), `rmsnorm`
+    (simd_sum + threadgroup reduction, rsqrt), `rope` (reads the uploaded cos/sin tables),
+    `swiglu`, residual `add`, and the attention pair — `attn_scores` (scaled q·kT + causal
+    mask + row softmax) and `attn_av` (P·V), GQA kv_mul=4, f32. Naive attention first:
+    ~17 GMAC vs ~630 GMAC of projections at N=512 — flash fusion only if the detector says
+    so. Scores scratch (heads x N x N f32 ≈ 32 MB) reused across layers.
+  - **6c — resident driver.** dasllama_math_metal.das grows a whole-prefill path: weights
+    already lazily resident (+ the small per-layer norm-weight vectors); pooled resident
+    activation set (x/xb/xb2/q/k/v/hb/hb2/xq/xs/scores + per-layer K/V outs); ONE command
+    buffer per prefill (~10 dispatches x 16 layers, default hazard tracking orders). Host:
+    embed rows (CPU) → upload x_b + rope tables → encode → one wait → per-layer K/V
+    readback → `kv_store_batch` (session KV codec stays CPU — any KV dtype works) →
+    last-row readback → CPU final norm + classifier.
+  - **6d — integration + parity + measurement.** Whole-prefill override seam (chosen over
+    per-block ArchBlocks twins: one seam owns encode→wait→readback): fn-ptr slot +
+    select-by-name + `DASLLAMA_PIN_PREFILL` env in the harnesses, same pin discipline;
+    fall back to the hybrid/CPU path for non-q8, start_pos>0, small npos, or non-std arch
+    shapes. Gates: kernel unit parity tests, 40/40 greedy parity (tolerance path), then the
+    clean round (Parsec OFF — Boris window): CPU vs hybrid vs resident vs lcpp `-ngl 99`.
+
+## Cross-backend parity (deferred — not a gate)
+
+Stacking `[compute_shader, metal_kernel]` on one function was the original parity idea;
+class-member authoring defers it — dasSpirv's frontend reads module globals, not class
+members. The primary correctness oracle is the CPU-reference run of the same das body
+(Test architecture, layer 3), which is cheaper and stricter than a second GPU. Cross-GPU
+parity (zen2 Vulkan vs M-box Metal) returns as a nice-to-have if/when dasSpirv gains the
+same class-member authoring — an in-tree follow-up, ours to make, not a dasMetal
+prerequisite.
+
+## Top risks
+
+1. **macOS CI paravirtual Metal.** GitHub's macOS runners expose an "Apple Paravirtual
+   device"; whether it executes our compute reliably is unproven → Phase-0 probe. Fallback:
+   CI = compile gate only (still the real Metal frontend), behavioral = local M-boxes with
+   a run book (the `tests/opengl_gpu/_lattice_gpu_parity.das` precedent).
+2. **Obj-C lifetime discipline.** Retained-handle convention + explicit `metal_release`,
+   enforced by the live-object leak gate; the boost's `with_`/finally wrappers are the
+   user-facing rail so bare handles rarely cross user code.
+3. **Kernel-arg lowering completeness.** Const-ness inference (write-set pre-scan), MSL
+   keyword mangling, duplicate `@binding` = clean error, `@set` rejection. Fail-closed rule
+   inherited from dasSpirv review hardening: every dispatch validates its input and errors
+   cleanly — never a silent bad kernel, never a panic.
+4. **Class-method annotation plumbing.** `[metal_kernel]` must fire on a class method
+   (function_macro apply/fixup on methods; `@ssbo` field annotations on class members) —
+   unproven; probed first thing in Phase 1 before any emitter work. Fallback if it fights:
+   the struct-param form (`[metal_kernel] def mul_ab(var k : MulAB)` — free function,
+   resources still grouped in one type), same emitter, only the frontend scan differs.
+5. **Runtime-compile latency.** Per-pipeline `newLibraryWithSource` at startup is fine for
+   tests/PoC; `MTLBinaryArchive` + codegen-version key is the escape hatch (Phase 5).
+6. **Census honesty for a text emitter.** No disassembler exists to recount text (dasSpirv
+   could re-derive opcodes from the blob). Mitigations in Test architecture (fused
+   record+emit helper; golden snapshots).
+7. **Dispatch model.** `dispatch_threads` (exact grid) needs Apple-family GPUs — fine on
+   M-boxes, unproven on paravirtual. PoC uses exact-multiple sizes +
+   `dispatch_threadgroups`; the guarded form arrives with Phase 2's bounds-guard construct.
+
+## Verification (end to end)
+
+- **Phase 0:** scaffold green on an M-box (readback exact, live objects 0, bad-MSL error
+  surfaced with the compiler log); CI-probe result recorded in the log below.
+- **Per phase (main tree):**
+  `daslang dastest/dastest.das -- --test tests/msl --isolated-mode` green on every
+  platform; `tests/metal` green on Apple; census == declared set both directions; every
+  emitted kernel compile-gate clean; no `GC APP LEAK`; `metal_live_object_count()` 0.
+- **M-box run book (behavioral + parity):** `bin/daslang tests/metal/...` on M1/M3 Air;
+  the zen2 side runs the same parity fixtures through dasVulkan.
+- **Lint/format:** MCP `format_file` + `lint` on every new `.das`; `cpp_format_file` on the
+  `.mm`. PR-mode throughout.
+
+---
+
+# Implementation log
+
+**2026-07-11 — masterplan.** Authored; revised same day per review: class-based authoring
+(kernels = methods, resources = `@ssbo` members — no module-scope resource globals),
+`fastmath` a `[metal_kernel]` property defaulting ON, CPU-reference oracle promoted to the
+primary correctness gate, cross-backend GPU parity demoted to a deferred nice-to-have.
+
+**2026-07-11 — Phase 0 landed: binding bring-up + probes.** `src/dasMetal.mm`
+(`Module("das_metal")`, class `Module_DasMetal`, ARC-compiled, 8 `DummyTypeAnnotation`
+opaque handles, the full PoC extern surface incl. 8 `metal_release` overloads +
+`metal_live_object_count`) + `src/dasMetal.h` (pure-C++ decls for `aotRequire`);
+`CMakeLists.txt` APPLE-gated (`ADD_MODULE_CPP(DasMetal)` + `ADD_MODULE_LIB`, `-fobjc-arc`
+on the `.mm`, Metal+Foundation frameworks); `.das_module` descriptor (silent 2-arg
+`register_dynamic_module` — skips cleanly on non-Apple); root `DAS_METAL_DISABLED` option
+(default OFF). Scaffold `_handrolled_mul.das` green on M1 Max (macOS 26.4, arm64):
+- **Readback exact** — a*b over 256 floats via BOTH `metal_dispatch_threadgroups` and
+  `metal_dispatch_threads` (exact-grid fast path confirmed working on Apple-family GPU —
+  risk 7 half-resolved; paravirtual still unknown).
+- **Bad-MSL probe** — `undeclared_identifier` fixture surfaces the real Metal compiler
+  log (with source line + caret) as a clean das error string; no crash, no nil deref.
+- **Leak probe** — live-object counter round-trips to 0 after releasing all 12 handles.
+- **Fail-closed probe** (beyond plan) — null handle into any extern throws a clean,
+  `recover`-able das error via `throw_error_at` (every extern null-guards its handles).
+Implementation notes: `char *&` error out-params follow the fio pattern
+(`SideEffects::modifyArgumentAndExternal`); handles cross as `__bridge_retained void*`,
+`metal_release` = `__bridge_transfer`, counted by a shim-side atomic;
+`MTLCompileOptions.mathMode` (macOS 15+ SDK) with `fastMathEnabled` fallback. das-side
+gotcha for the Phase-1 emitter: `label` and `expect` are reserved words; literal `{`/`}`
+in MSL strings must be escaped `\{`/`\}` (string interpolation).
+**Probe (a) — macOS CI paravirtual execute — PENDING:** `build.yml` runs on
+PR/master-push/dispatch only and the branch is local; the macOS lanes are `macos-15` /
+`macos-26` Apple-Silicon (M2) runners with the Apple Paravirtual device. Resolve when the
+arc branch first goes to CI; until then CI posture = compile gate, behavioral = M-boxes.
+
+**2026-07-11 — Phase 1 landed: a*b through the REAL emitter (the PoC milestone).**
+`metal/msl_types.das` (32-bit scalar + 2/3/4-vector map), `metal/msl_emit.das`
+(`generate_msl` — member scan with duplicate-binding/`@set`/non-`@ssbo` fail-closed errors,
+write-set pre-scan for `device` vs `device const`, builtin classifier, manual-recursion
+statement/expression emit with fused census recording, MSL keyword mangling),
+`metal/msl_shader.das` (`[metal_kernel]` — apply declares 4 companion globals
+`N`/`N_entry`/`N_fastmath`/`N_census`, fixup fills all as constant nodes),
+`metal/das_metal_boost.das` v1 (`with_metal_device`, `pipeline_from_source`,
+`run_compute_1d`, `assert_no_metal_leaks`). Emitted text matches this file's expected
+emission byte-for-byte (modulo param-wrap indent + defensive parens). Gates green on M1 Max:
+`tests/msl` (shape asserts + golden snapshot + census == declared set both directions, 8/8)
+and `tests/metal` (emitted MSL on GPU == CPU-reference run of the same method — the driver
+loop feeds `gl_GlobalInvocationID` — plus leak gate, 2/2); both suites pass through the
+dynamic AND static binaries. Phase-0 scaffold deleted on schedule. Wiring: unconditional
+`ADD_MODULE_DAS` + dasSpirv-style install rule; `.das_module` `register_native_path` for
+the four metal files; `tests/msl` + `tests/metal` registered in `tests/aot/CMakeLists.txt`
+(fixture `_msl_common` AOT_LIB'd per the `_spirv_common` precedent; macro-only metal
+modules deliberately not AOT'd, per the spirv_emit precedent).
+Probe results (annotation plumbing — risk 4 CLOSED, no struct-param fallback needed):
+`[function_macro]` fires on class methods. The apply/fixup division is dasGlsl's, strictly:
+`apply` is pre-infer (types unresolved — aliases still aliases), so it does ONLY the two
+type-independent actions: `exports = true` (the method is otherwise culled before `fixup`
+runs — probe-verified) and declaring the fixed-type (`tString`/`tBool`) companion globals so
+consumers resolve in the first inference pass. ALL type-dependent work — member scan,
+write-set, emission — runs in `fixup`, post-infer, where `fld._type` is resolved;
+`@ssbo`/`@binding` field annotations read via `field.annotation |> find_arg`; the member
+scan skips `__rtti`/`__finalize` + function-typed fields (classes store methods as fields);
+by fixup time the `with(self)` wrapper is optimizer-dropped and access is
+`ExprAt(ExprField(ExprVar(self), name), index)` — but under `no_optimizations` compiles
+(lint/LSP) the wrapper + non-folded shapes survive, so the emitter treats `ExprWith` as
+transparent (census-silent, or the gate would depend on optimization level).
+Plan deviations, both deliberate: builtins come from `require daslib/shader_lingua_franca
+public` (where the compute IDs actually live — `spirv/spirv_builtins` merely re-exports
+them and adds VK-specific surface dasMetal doesn't want); the declared census lives in the
+test fixture `_msl_common.das`, not the emitter (the emitter modules are macro-only and
+never AOT'd — a runtime `declared_msl_census()` there would 50101 under `test_aot`).
+das gotcha for kernel authors: emitter-facing das reserved words `label`/`expect` (now in
+CLAUDE.md gotchas). CI paravirtual probe still pending first push.
+
+**2026-07-11 — Phase 2 landed: arithmetic + control-flow breadth.** The emitter now covers the
+full dasSpirv-Phase-2-equivalent inventory: scalar arithmetic + bitwise + shifts for
+uint/int/float (float `%` → `fmod` — MSL `%` is integral-only), componentwise vector arithmetic
+incl. `vec*scalar` broadcast and vector negate, comparisons per scalar class, das's scalar-bool
+vector `==`/`!=` (→ `all(...)`/`any(...)` — MSL's own vector compare yields `boolN`), logical
+`&&`/`||`/`!` (short-circuit matches C on both sides), ternary, pre/post `++`/`--` (statement-level
+das postfix arrives as prefix in the AST; value-level postfix survives), compound assignment
+(arithmetic + bitwise), mutable locals + das zero-init locals (`var x : T` → `T x = {};`),
+if/elif/else chains (emitted flat as `} else if`), `while`, `break`/`continue`, void `return`, and
+`for (i in range/urange(...))` — with the das-semantics subtlety that range endpoints evaluate
+ONCE: a non-constant end is hoisted into a loop-scoped comma-declared local
+(`for (int k = lo, k_end = expr; ...)`), proven behaviorally by a fixture that mutates the end's
+source variable inside the body. New frontend surface: **`@uniform @binding = N` scalar/vector
+members** → `constant T& name [[buffer(N)]]` (read-only — a written uniform is a clean error;
+arrays stay `@ssbo`), which is what the **in-kernel bounds guard** (`if (i >= n) return`) reads.
+Literal fixes: das prints integral floats bare ("2" + `f` is invalid MSL → `.0` appended,
+non-finite = error) and uints as hex (decimal via int64 detour). Census grew 13 → 106 kinds.
+Tests: `tests/msl` 37/37 — per-class shape asserts + goldens (uarith/iarith/farith/vecarith/
+control/loops), census union == declared both directions, and a fail-closed suite
+(`_fail_closed/` + compile_issues, mirroring tests/spirv): written `@uniform`, array `@uniform`,
+value `return`, unsupported call. `tests/metal` 14/14 on M1 Max — every fixture regresses GPU vs
+the CPU-reference oracle (ints bit-exact incl. wrap/truncation, floats fastmath-tolerance), with
+the loops kernel dispatched on a deliberately NON-exact grid (1000 threads @ 64/tg → 1024
+launched) over sentinel-filled buffers compared across the FULL padded range — a broken guard
+shows as clobbered sentinels. Shared GPU helpers live in `tests/metal/_metal_common.das` as
+GENERIC functions (untyped `dev`/`buf` params): generics only instantiate at call sites inside
+`static_if (builtin_module_exists(das_metal))`, so the fixture compiles on every platform;
+AOT-wired as `test_aot_metal_modules` (msl-modules pattern; the metal glob gained the `/_` filter).
+Green: interp + `-jit` + static binary, MCP lint + CI lint clean. das gotchas hit: `expect` is
+reserved (fixture param renamed `want`); `float4 + float` does NOT broadcast in das (only `*`/`/`).
+
+**2026-07-11 — Phase 3 landed: threadgroup memory + barriers + simdgroup ops.** New frontend
+surface, dasSpirv-aligned where the construct is shared: **`@workgroup` class members**
+(scalar/vector or single-dimension fixed array, e.g. `@workgroup tile : uint[64]`) lower to
+`threadgroup T name[N];` declarations at the top of the kernel body (MSL has no module-scope
+threadgroup variables; name-sorted, never parameters, @binding on one is a clean error, dynamic
+`array<T>` is a clean error); **`barrier()` / `memoryBarrierShared()`** (lingua franca) both lower
+to `threadgroup_barrier(mem_flags::mem_threadgroup)` — MSL has no execution-free threadgroup fence
+pre-MSL-3.2, so the memory-only form strengthens to the full rendezvous, the same lowering
+SPIRV-Cross ships under MoltenVK. New module **`metal/metal_builtins.das`** (pure das, ALL
+platforms — the spirv_builtins pattern: re-export lingua franca + add the Metal-only surface):
+`gl_WorkGroupSize : uint3` (a layout CONSTANT in GLSL, a real `[[threads_per_threadgroup]]` param
+in Metal), the four simdgroup IDs under their GLSL subgroup spellings (`gl_SubgroupInvocationID`/
+`gl_SubgroupSize`/`gl_NumSubgroups`/`gl_SubgroupID`), and the simd intrinsics under their Metal
+spellings — `simd_sum` + `simd_shuffle`/`_up`/`_down`/`_xor` × float/int/uint (15 overloads;
+identity stub bodies = the degenerate-but-valid width-1 simdgroup semantics for CPU replay). The
+builtin classifier now spans 10 attributes (`thread_position_in_threadgroup`,
+`threadgroup_position_in_grid`, `threadgroups_per_grid`, `thread_index_in_threadgroup`,
+`threads_per_threadgroup`, `thread_index_in_simdgroup`, `threads_per_simdgroup`,
+`simdgroups_per_threadgroup`, `simdgroup_index_in_threadgroup` + Phase-1's grid ID). Census
+106 → 143 kinds. Tests: `tests/msl` 48/48 — threadgroup + simd shape/golden fixtures, census both
+directions, fail-closed grew `_fc_wg_binding` (bound @workgroup) + `_fc_wg_type` (dynamic-array
+@workgroup) and the user-call needle moved to the new whitelist error. `tests/metal` 20/20 on
+M1 Max — **the CPU-reference oracle splits three ways by construct**: (a) `grid_ids` kernel (no
+barrier/simd) keeps the same-body sequential replay, driver sets all six builtin globals per
+thread, bit-exact; (b) the barrier tree-reduction kernels (uint wrap-exact + float
+fastmath-tolerance) compare against DIRECTLY COMPUTED per-group sums — a barrier kernel cannot be
+sequentially replayed (thread 0 would reduce before the other lanes load), so the honest oracle is
+the arithmetic itself; (c) the simd kernel uses a READBACK-DRIVEN oracle — the kernel reports each
+thread's simdgroup width/lane/id, the CPU recomputes every expected value from reported
+membership, layout-agnostic (M1 Max reports width 32; shuffles execute in simdgroup-uniform flow
+with undefined edge lanes selected away on the VALUE — a shuffle under divergence reads inactive
+lanes). Green: interp + `-jit` + static binary; MCP lint + CI lint clean. das gotcha hit: a value
+witness param (`witness : auto(TT)`) binds TT WITH the parameter's appended const (yields
+`array<T const>`) — even via `type<auto(TT)>`; the fix is `-const` at every use site
+(`array<TT -const>`, `_metal_common.das` `buf_download`).
+
+**2026-07-11 — Phase 4 landed: the 16/8-bit lattice.** `msl_types` rewritten on the shared
+`daslib/shader_block_layout` classifiers (`scalar_class`/`scalar_width`/`component_count`) — one
+stroke covers all 20 shader-legal lattice types (`float16`→`half`, `int8`→`char`, `uint8`→`uchar`,
+`int16`→`short`, `uint16`→`ushort`, + their 2/3/4 vectors; das `byte` is SIGNED int8 = MSL `char`).
+The 8/16-lane CPU-only forms get the dedicated dasGlsl-worded diagnostic
+(`cpu_only_lattice_width`) at every type-bearing site: @ssbo element, @uniform, @workgroup, local
+declaration, and ctor calls. **The packed 3-lane rail** (the one layout novelty): das packs
+vectors tightly (`float3` = 12B, `half3` = 6B, `byte3` = 3B) while non-packed MSL 3-vectors
+stride padded (16B/8B/4B) — and with unified memory the das array IS the buffer, so 3-lane
+buffer/uniform elements lower to MSL's byte-identical `packed_T3` spelling
+(`msl_buffer_elem_name`). This also fixes the latent Phase-1 `array<float3>`/`array<int3>` stride
+bug (never exercised — no fixture used a 3-lane buffer). Deliberate divergence from dasSpirv,
+which strides vec3 SSBO elements at std430's 16: Metal's contract here is "das layout, exactly".
+Loads wrap back into the plain type (`float3(pf[i])` — packed types have no arithmetic of their
+own), whole-element stores emit raw (packed = plain assignment is implicit), and anything
+reaching INTO a packed element (component/swizzle/compound-assign) fails closed. Emitter breadth:
+`ExprConstFloat16` → `h`-suffix literals; **folded 32-bit vector constants** (`int4(100)` with
+const args folds to `ExprConstInt4` at infer — a Phase-2 blind spot no fixture had hit) emit as
+ctor spellings; the ctor/convert/saturating-narrow call family (call name == das spelling of the
+result type) — widen `int4(byte4)`, truncating narrow `byte4(int4)` (MSL conversion-ctor
+C-truncation matches das), splat `half3(scalar)`, fp16 converts `half2(float2)`/`float2(half2)`,
+and `*_sat` → `char4(clamp(v, -128, 127))`-style clamp+convert; fp16 closed arithmetic and the
+f16 broadcast ride the existing operator paths via lattice-aware census classes
+({f,i,u}{32,16,8}[v]). Census 143 → 178 kinds. Tests: `tests/msl` 48 → 57 (three fixtures —
+HalfArith / LatticeConvert / PackedVec3 — shape asserts + goldens + census both directions;
+fail-closed grew `_fc_lattice_wide` (@ssbo half8) + `_fc_lattice_wide_local` (short8 local) +
+`_fc_packed_partial` (component store into packed)); `tests/metal` 20 → 26 on M1 Max, all
+BIT-EXACT (no tolerance anywhere): latconv (int-lattice widen/narrow/sat + fp16↔f32 converts,
+default fastmath — conversions and single ops are deterministic) and packed3 (byte3/half3/
+float3/int3 das-stride round-trips + packed uniform + `constant half&` scalar-f16 uniform, with
+float ops chosen exact — ×2.0 power-of-two scale — so even fma contraction cannot diverge).
+**Measured Metal fact that shaped the fp16 gate:** with `fastmath=false` (MTLMathModeSafe), Metal
+still keeps fp-contraction/mixed-precision freedom across multi-op chains — a 4-op half4 chain
+drifted 1–64 ULP off per-op RNE on M1 Max — but SINGLE ops are correctly rounded,
+**including half division**. So the halfarith GPU kernel stores one op per buffer (add/sub/mul/
+div + an exact-by-construction scalar chain + compare flags), pinning every rounding point, and
+matches the das CPU replay (promote-to-f32-round-back == per-op RNE) bit-exactly. Green: interp +
+`-jit` + static binary on both suites; MCP lint + CI lint clean. New emitter surface as a side
+effect: classic 32-bit vector lane/splat/convert ctors now lower too (Phase 2 had none).
+
+**2026-07-11 — Phase 5 landed: simdgroup_matrix + host plumbing + the dasLLAMA offload
+experiment.** Three legs. **(5a) simdgroup_matrix through the emitter** — the first STRUCT-typed
+builtins: `simdgroup_float8x8`/`simdgroup_half8x8` in `metal_builtins.das` hold a row-major 8x8
+reference tile; every op (`make_filled_*`, `simdgroup_load`/`_store` with runtime offset+stride,
+`simdgroup_multiply`, `simdgroup_multiply_accumulate` — all-f32, all-f16, and the MIXED
+f32-acc/f16-operand ggml combo, Metal-frontend-probe-verified on M1) is the FULL cooperative tile
+op per call, so width-1 CPU replay stays idempotent and the same-body oracle works. Emitter:
+sgmat locals lower with `make_filled` zero fills (`= {}` does not construct the opaque type);
+loads/stores lower as member-pointer + offset (@ssbo device both ways, @workgroup threadgroup as
+load source); the load/store das overloads take an untyped buffer param, so their call names
+arrive as GENERIC instances (`` __::module`name`hash ``) — new `call_base_name` strips the
+qualifier + hash at every call-name site; `simdgroup_store` marks its buffer written in the
+write-set pre-scan. Fail-closed: `.data` access in a kernel, @ssbo of tiles, non-member load
+source, threadgroup store. Census 178→192. tests/msl 65/65 (SgMatTile + SgMatTiled fixtures);
+tests/metal 32/32 on M1 Max — single-tile f32+f16 vs sequential replay AND the
+threadgroup-staged mixed-mac tiled GEMM vs a direct CPU matmul, all BIT-EXACT
+(exact-by-construction integer values). **(5b) host plumbing, zero new externs** —
+`MetalPipelineCache` (hit allocates nothing), `MetalBufferPool` (pow2 buckets; re-acquire reuses),
+`with_compute_encoder` (N dispatches, one commit+wait; default hazard tracking orders them) —
+all proven through the live-object counter in `test_metal_plumbing.das`. MTLSharedEvent +
+MTLBinaryArchive DEFERRED by measurement: prefill offload is ~112 synchronous dispatches per
+multi-second prefill (~30 ms round-trip tax) and the das-side cache covers the kernel count.
+**(5c) the dasLLAMA offload experiment** — `dasllama/dasllama_math_metal.das` (guarded
+`require ?das_metal`, non-Apple lanes never see it): a 32x32-C-block kernel (128 threads = 4
+simdgroups, per-32-k in-kernel dequant of Q8 weights+activations into f16 threadgroup tiles with
+scales folded, mixed 8x8 macs, f32 out) + a self-contained lazy driver (weight regions upload
+once keyed by base address; pooled padded activation/output buffers — the kernel has no edge
+masking, pads are zeroed) registered as a BATCH-ONLY `KernelBackend("metal")` at priority -1
+(reachable only via `select_batch_backend`; small-ntok/odd shapes delegate to the portable CPU
+kernel through new `kernel_backend_batch_fn`). Recipe: `DASLLAMA_PIN_BACKEND=arm64-sdot` (the
+donor needs the row-major world) + `DASLLAMA_WSCALE_F16=0` (the override swaps only the f32
+batch slot) + `DASLLAMA_PIN_BATCH_BACKEND=metal`. Gates: `tests/dasLLAMA/test_metal_gemm.das`
+(pow2 scales = BIT-EXACT vs portable — int8 quants and pow2 products are exact in half; arbitrary
+scales = the f16-dequant envelope, bounded 2e-3 × the dot-magnitude sum, NOT |y| — cancellation
+makes |y|-relative bounds dishonest); dasLLAMA suite 368 tests dormant-green; 40/40 greedy
+token parity vs the CPU control with the GPU engaged (informational — tolerance path).
+**Clean measurement round (M1 Max, Parsec OFF, interleaved 3-rep A/B, 2026-07-11):** iso
+ntok=512 llama1b shapes — GPU 1481–1992 GMAC/s (q 1505 / w13 1817 / w2 1784 / cls 1992 ≈ 4
+TFLOPS f16-effective) vs the tuned arm64-gen CPU tier's 884–1001 = **1.5–2.0x on every big
+shape** (small kv 2048x512 at parity — per-region upload amortization). End-to-end
+`prefill_perf` 1B Q8: **N=512 1054–1055 vs CPU 757–768 tok/s (+37% best-vs-best, 2 of 3 reps
+within 0.1%)**; N=256 parity (792 vs 786 — the e2e crossover sits between 256 and 512 on 1B);
+N=64 is a harness artifact (the one-time pipeline compile + full lazy weight upload lands in
+each process's first measurement). Anchors: llama.cpp CPU pp512 813 t/s (das CPU 768 ✓ sane
+window); **llama.cpp full-Metal pp512 3960 t/s** — 3.75x our hybrid, and the honest headroom
+map: their forward is fully GPU-resident (attention + norms + no per-GEMM round-trips) near the
+M1 Max roofline, while this experiment pays a synchronous submit + activation/output memcpy per
+projection GEMM and runs attention on the CPU. Ledger from the round: per-layer encoder batching
+/ GPU-resident activations (the residency gap is the big lever), kernel iteration
+(double-buffered staging, tile shapes — ~2x kernel-level headroom to roofline), min_ntok
+threshold per box/model (crossover ~256–512 on 1B). das-side findings recorded: `select_batch_backend("")` clears the pin but the slot
+restores only at the next whole-backend activation (tests must pin "portable" explicitly for
+oracle runs); the pointer-keyed weight cache assumes load-once-stable weights (refilling the
+same arrays needs `metal_gemm_shutdown` — the documented cache contract).
+
+**2026-07-11 — Phase 6 landed (6.0–6d): full-GPU-resident 1B prefill.** Four legs in three
+commits (`f9c849107` 6.0+6a, `7664e6e6c` 6b, `df01a9366` 6c+6d + tiled attention).
+**(6.0 detector)** `metal_command_buffer_gpu_start_time/_end_time` externs + `with_compute_
+encoder_timed` — the GPU-busy vs host-wall split that steered everything below. **(6a emitter
+math)** value-call whitelist exp/sqrt/rsqrt/sin/cos/tanh/abs/saturate/round (float classes; abs
+also signed-int) + min/max (numeric) — das math-module names ARE the MSL spellings (`round` is
+half-away on both sides, probe-verified); + the quantize-kernel converts cvt.f32.i8/cvt.i8.f32.
+Census 192→221; msl 70/70, metal 34/34 (math fixture pins fastmath=false — fast::sin/cos's
+~2^-11 ABSOLUTE envelope swamps the 1e-4 oracle). **(6b kernels)** `dasllama_metal_prefill.das`:
+metal_q8_quant / metal_rmsnorm (simd_sum + tg partials) / metal_rope (table-driven NORM pairs —
+build_rope_table already hoists all trig) / metal_swiglu / metal_add + attention; unit tests vs
+the dasLLAMA CPU twins on-device (quantize bit-exact under planted ±127 amax). **(6c driver)**
+ONE command buffer per prefill — 21 dispatches/layer, default hazard tracking orders, one
+commit+wait; weights ride the 5c lazy region cache; pooled resident activations (+ per-layer
+K/V outs, np32-padded per-head score slabs); readback hands x_b + roped-K/raw-V to
+`kv_store_batch` (KV codec stays CPU — any dtype). **(6d seam + gates)** whole-prefill override
+registry in dasllama_common (`PrefillOverrideFn` + `select_prefill_override`, dormant default;
+hook in forward_prefill_body's layer loop; registration rides the dasllama_transformer umbrella
+— a direct common require would cycle); `DASLLAMA_PIN_PREFILL` env rail; end-to-end parity test
+(40-token greedy continuation GPU vs CPU control on the real 1B, token-for-token) + leak gate.
+🔑 **The parity failure that mattered: ROW-MAJOR weights are the donor contract** — the default
+M1 load picks a repack backend whose interleaved qblob the GPU kernel reads as garbage
+(stage-probe-bisected: rmsnorm/quant exact, GEMM rel~2); the driver now declines via
+`kernel_backend_needs_repack(active_kernel_backend())`, recipe pins arm64-sdot/portable.
+**Attention iterated once by the detector's verdict:** knockout attribution
+(`DASLLAMA_METAL_PREFILL_SKIP=attn|gemm|ew|nongemm`) showed the naive fused per-row pair at
+~80 GMAC/s owning 44% of GPU time → replaced with a tiled sgmat trio (QK^T 32x32 C-blocks,
+causal early-out → in-row softmax, tails zeroed → P·V whole-block GEMM) — attention now ~19 ms.
+**Numbers (M1 Max, DIRTY, same-window interleaved): pp512 1594 tok/s** (hybrid clean 1054; lcpp
+full-Metal 3960 = 2.5x away), N=256 1421. Honest GPU budget at N=512: 289 ms = GEMM chain 252
+(497 GMAC — 0.97 GMAC/tok — at ~1970 GMAC/s, i.e. ALREADY at the Phase-5 iso kernel rate;
+gemm-only knockout == full-chain delta, so inter-dispatch drains cost ~nothing) + attention 19
++ elementwise 18. **The remaining lever is the Q8 GEMM kernel itself** (~4 TFLOPS-f16-eff vs
+the ~2x-to-roofline headroom the clean round mapped): double-buffered staging, bigger C tiles
+per threadgroup, wider k-steps — iterate via bench_gemm_iso, not full prefills. Secondary
+(measured small): concurrent-dispatch encoder + explicit barriers for q/k/v + w1/w3 overlap.
+*(Done — see the 2026-07-12 Phase 6e entry: the winning levers turned out to be run-staging +
+64x64, and the intuition list above all lost individually.)*
+
+**2026-07-11 — pipeline: fixup-set global inits now infer; dasSpirv blob fill patch→fixup**
+(rides this branch — surfaced reviewing dasMetal's apply/fixup model). Boris called dasSpirv's
+patch+astChanged blob fill a workaround for a compiler gap; confirmed and fixed. Diagnosis
+(both repro'd): `fixupAnnotations()` ran post-optimize and nothing inferred what fixup created —
+a call-shaped init (`to_array_move` from the `array<uint>` literal) died with 50607; and a naive
+re-infer at that old position re-tripped already-folded unsafe (31013 in daslib generics) because
+`foldUnsafe` strips the wrappers — the exact ordering constraint the scope_free comment documents.
+Fix (ast_parse.cpp): `fixupAnnotations()` moved to right after infer converges — BEFORE
+lint/foldUnsafe/optimize — followed by a dirty re-infer gated on any global init left uninferred;
+fixup output now flows through the whole back half like ordinary code. dasSpirv's blob+reflection
+fill moved patch→fixup, astChanged dance deleted (also deletes one full-program re-infer restart
+per shader-bearing module — those restarts marked EVERY function notInferred). The dasVulkan
+backend body-fill hooks stay in patch (function bodies genuinely need the in-loop re-infer).
+Consequence for annotation authors: fixup now sees PRE-optimize AST (dasMetal's emitter already
+handles both shapes; dasGlsl goldens unchanged — 98/98). Regression test independent of dasSpirv:
+`tests/language/test_fixup_global_init.das` + `_fixup_init_macro.das`. Green: tests/spirv 238/238
+(generation in fixup), glsl, msl, metal, language — dynamic + static binaries.
+
+**2026-07-12 — Phase 6e: Q8 GEMM kernel iteration — pp512 1594 → 2398 tok/s (DIRTY).** The
+promised kernel round, run entirely in a new in-process lab
+(`modules/dasLLAMA/benchmarks/matmul/bench_metal_gemm_kernels.das`): candidate `[metal_kernel]`
+variants head-to-head against the production MSL in ONE process, GPU-timestamped
+(`with_compute_encoder_timed`), interleaved best-of-N rounds, bit-exact-by-construction data
+(quants in [-8,7], pow2 scales ⇒ every f32 partial sum exact ⇒ any accumulation order gives
+identical bits; each variant compares bit-exact vs v0, v0 vs a CPU reference). **The knockout
+pair re-aimed the whole round:** staging-removed vs math-removed timing attributed **55% of
+kernel time to dequant staging** (per-element scale reloads + scalar loads), NOT to tile loads
+(tile-major and pad-36 layouts ≈ neutral ⇒ no meaningful bank-conflict tax) and NOT to barriers
+(~2%). Every intuition variant tried FIRST lost: bigger C tiles (0.75–0.95x), double buffering
+(0.86–0.99x), k=64 (0.51x), int4-shift-unpack (worse than byte4), register prefetch (worse),
+256 threads (worse) — on M1 Max occupancy is brutally sensitive to threadgroup-memory growth
+*while staging is expensive*. The two changes that compose into the win: **run-staging** (one
+thread = one contiguous 16-element run = ONE scale load + four `byte4` device loads, +40%) and
+THEN the **64x64 C block** (halves both device re-read directions, 16 macs per 8 tile loads —
+the tile-size rematch only wins once staging is cheap: +64% total, 3390–3650 GMAC/s vs the old
+kernel's 2090–2200; math-only ceiling ~4900). **Shipped as a two-kernel dispatch** in
+dasllama_math_metal: `metal_q8_gemm` (32x32, run-staged vec4) + `metal_q8_gemm64` (64x64),
+`gemm_use64(mp, d)` picks 64 when `d % 64 == 0` and the grid is ≥128 threadgroups (below that
+the 32-kernel's occupancy wins — the kv 2048x512 shape); both drivers (5c batch donor + 6c
+resident prefill) pad M to 64 (prefill's mp doubles as attention np32 — its kernels only assume
+%32; pad rows stay garbage-by-design, contained by GEMM row independence). Quant buffers are
+`array<byte4>` VIEWS in the kernel classes only — host buffers unchanged. **End-to-end (M1 Max,
+DIRTY): pp512 2398 tok/s (was 1594; lcpp full-Metal 3960 = 1.65x away, was 2.5x), N=256 2229
+(was 1421); N=512 GPU-busy 289 → 188 ms** — matches the iso ratio, GEMM chain ~151 ms of it.
+Donor-path iso (through the synchronous submit+memcpy tax): big shapes 2072–3112 GMAC/s
+(+40–56%); kv stays donor-tax-bound at ~1000. Gates green: test_metal_gemm (extended with a
+D=8192 case so BOTH dispatch paths get the bit-exact compare), prefill kernel units, 40-token
+greedy 1B parity, leak gates, full dasLLAMA suite. das gotcha hit: the MSL emitter flattens
+bare `{ }` blocks (locals collide in one MSL scope — rename or use a real `if` scope).
+Emitter-extension ideas the lab priced but did not take (ledger): `half4` threadgroup stores +
+a `simdgroup_load` transpose-flag overload (each ~<10% at high risk). Remaining from here:
+the clean measurement round (Parsec OFF) + concurrent-dispatch encoder (secondary, measured
+small), then PR.
+
+**2026-07-12 — Phase 6e clean measurement round (M1 Max, Parsec OFF, interleaved 3-rep A/B).**
+Kernel-level (lab, 5 interleaved rounds, bit-exact): 32-kernel kv 2737 / q 2928 / w13 3003 /
+w2 2958 / cls 3024 GMAC/s; 64-kernel q 3344 / w13 3594 / w2 3393 / cls 3646 (kv correctly stays
+on the 32-kernel per gemm_use64). End-to-end prefill_perf 1B Q8, GPU-resident vs the box-tuned
+CPU control (arm64-gen), best-of-3: **N=512 2395 vs 823 tok/s = 2.91x; N=256 2003 vs 849 =
+2.36x**; N=64 336 vs 798 — CPU keeps small batches (each fresh process pays the one-time PSO
+compile + lazy weight upload there; min_npos=64 default unchanged since a served process pays
+it once). Anchors (stored from the 2026-07-11 clean window, per the no-baseline-reprofiling
+rule): llama.cpp CPU pp512 813 (das CPU 823 ✓ sane window); **llama.cpp full-Metal pp512 3960 —
+das GPU-resident is now 1.65x away** (hybrid clean was 3.75x, resident-with-old-kernel dirty
+2.5x). Clean best == the dirty single-shot (2395 vs 2398) — the box was quiet.
