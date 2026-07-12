@@ -1490,7 +1490,7 @@ def private build_info_plist(name, exe, bundle_id : string) : string {
 // Run release() on a dep package and copy its release_include files into the
 // bundle at `<bundle>/modules/<DepName>/<rel>`. Returns 0 on success, non-zero
 // on copy failure (missing release() is NOT an error — dep just contributes nothing).
-def private ship_dep_assets(pkg_dir, bundle_modules_dir : string) : int {
+def private ship_dep_assets(pkg_dir, bundle_modules_dir : string; var shipped : array<string>) : int {
     let dep_pkg_file = "{pkg_dir}/.das_package"
     if (!fexist(dep_pkg_file)) return 0
     var dep_spec : PackageReleaseInfo
@@ -1504,6 +1504,7 @@ def private ship_dep_assets(pkg_dir, bundle_modules_dir : string) : int {
             dep_files |> push_clone(rel_path)
         }
     }
+    shipped |> reserve(length(shipped) + length(dep_files))
     for (rel in dep_files) {
         let src = path_join(pkg_dir, rel)
         let dst = path_join(dep_dst_dir, rel)
@@ -1513,12 +1514,13 @@ def private ship_dep_assets(pkg_dir, bundle_modules_dir : string) : int {
             to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
             return 1
         }
+        shipped |> push("modules/{dep_name}/{rel}")
     }
     if (!empty(dep_files)) {
         log("  ship dep `{dep_name}`: {length(dep_files)} file(s)\n")
     }
     if (!empty(dep_spec.native_dlls)) {
-        let rc = ship_native_dlls(dep_name, dep_dst_dir, dep_spec.native_dlls)
+        let rc = ship_native_dlls(dep_name, dep_dst_dir, dep_spec.native_dlls, shipped, "modules/{dep_name}/")
         if (rc != 0) return rc
     }
     return 0
@@ -1819,12 +1821,14 @@ def private finalize_shipped_binary(src, dst : string) {
 //   2. Build-tree config dirs in fixed preference: Release > RelWithDebInfo >
 //      MinSizeRel > Debug, e.g. `<search_root>/Release/<name>`.
 //   3. Fall through to `**/<name>` and pick the first match.
-def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<string>) : int {
+def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<string>;
+                             var shipped : array<string>; rel_prefix : string) : int {
     let platform = get_platform_name()
     let search_root = (platform == "windows"
         ? "{get_das_root()}/bin"
         : "{get_das_root()}/lib")
     mkdir_rec(dst_dir)
+    shipped |> reserve(length(shipped) + length(native_dlls))
     for (name in native_dlls) {
         var found_src = ""
         // 1. exact path under search_root
@@ -1865,8 +1869,34 @@ def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<str
         }
         log("  ship dep `{dep_name}` native: {name}\n")
         finalize_shipped_binary(found_src, dst)
+        shipped |> push("{rel_prefix}{name}")
     }
     return 0
+}
+
+// Every release writes this manifest (each shipped file, bundle-relative) so the NEXT release
+// deletes exactly what it produced. The bundle dir also holds USER files — the auto-loaded
+// <name>.toml config, logs — that the old whole-dir wipe destroyed on every re-release.
+let RELEASE_MANIFEST = ".daspkg_release.manifest"
+
+def private clean_previous_release(bundle_dir : string) {
+    let mpath = path_join(bundle_dir, RELEASE_MANIFEST)
+    let body = fread(mpath)
+    if (empty(body)) {
+        return
+    }
+    for (line in split(body, "\n")) {
+        let rel = strip(line)
+        // skip blanks; stay inside the bundle even on a corrupt or hostile manifest
+        if (empty(rel) || find(rel, "..") >= 0 || starts_with(rel, "/") || find(rel, ":") >= 0) {
+            continue
+        }
+        let p = path_join(bundle_dir, rel)
+        if (fexist(p)) {
+            remove(p)
+        }
+    }
+    remove(mpath)
 }
 
 // Copy of `daslib/command_line.get_das_exe()`. We can't require command_line
@@ -1934,11 +1964,18 @@ def cmd_release(root : string; out_dir : string) : int {
     let is_mac_app = get_platform_name() == "darwin"
     let app_root = is_mac_app ? path_join(out_dir, "{bundle_name}.app") : ""
     let bundle_dir = is_mac_app ? path_join(app_root, "Contents/MacOS") : path_join(out_dir, bundle_name)
-    let cleanup_target = is_mac_app ? app_root : bundle_dir
-    if (fexist(cleanup_target)) {
-        force_rmdir(cleanup_target)
+    // The macOS .app is wholly daspkg-owned: full wipe. A flat bundle dir is NOT — it
+    // accumulates user files next to daspkg's output — so it cleans via the previous
+    // release's manifest instead (empty dirs from removed deps may linger; harmless).
+    if (is_mac_app) {
+        if (fexist(app_root)) {
+            force_rmdir(app_root)
+        }
+    } elif (fexist(bundle_dir)) {
+        clean_previous_release(bundle_dir)
     }
     mkdir_rec(bundle_dir)
+    var shipped : array<string>   // bundle-relative paths -> RELEASE_MANIFEST at the end
 
     // 1. Build the standalone exe; `--list-shared-modules` writes the deps JSON
     //    (auto-detected dylibs + transitive .das_package list) as a side effect.
@@ -1973,6 +2010,10 @@ def cmd_release(root : string; out_dir : string) : int {
     let obj_path = "{exe_path}.o"
     if (fexist(obj_path)) {
         remove(obj_path)
+    }
+    shipped |> push(is_mac_app ? bundle_name : "{bundle_name}.exe")
+    if (fexist("{exe_path}.lib")) {   // MSVC linker side artifact lands next to the exe
+        shipped |> push("{bundle_name}.lib")
     }
     // macOS .app: drop the .exe extension (Mac convention). Info.plist's
     // CFBundleExecutable matches the renamed binary.
@@ -2014,6 +2055,7 @@ def cmd_release(root : string; out_dir : string) : int {
         }
         log("  ship: {e.rel}\n")
         finalize_shipped_binary(e.abs, dst)
+        shipped |> push_clone(e.rel)
     }
 
     // 2.5 Ship daslang runtime dylibs next to the exe. Without these the bundle
@@ -2053,6 +2095,7 @@ def cmd_release(root : string; out_dir : string) : int {
         runtime_copies++
         log("  ship runtime: {base_name(rel_path)}\n")
         finalize_shipped_binary(src, dst)
+        shipped |> push(base_name(rel_path))
     }
     if (runtime_copy_failed) return 1
     if (runtime_copies == 0) {
@@ -2071,7 +2114,7 @@ def cmd_release(root : string; out_dir : string) : int {
         let pkg_abs = get_full_file_name(dm.package_dir)
         if (key_exists(seen_pkg_dirs, pkg_abs)) continue
         seen_pkg_dirs[pkg_abs] = true
-        let rc2 = ship_dep_assets(pkg_abs, bundle_modules_dir)
+        let rc2 = ship_dep_assets(pkg_abs, bundle_modules_dir, shipped)
         if (rc2 != 0) return rc2
     }
 
@@ -2082,6 +2125,7 @@ def cmd_release(root : string; out_dir : string) : int {
             asset_files |> push_clone(rel_path)
         }
     }
+    shipped |> reserve(length(shipped) + length(asset_files))
     for (rel_path in asset_files) {
         let src = path_join(root, rel_path)
         let dst = path_join(bundle_dir, rel_path)
@@ -2091,6 +2135,7 @@ def cmd_release(root : string; out_dir : string) : int {
             to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
             return 1
         }
+        shipped |> push_clone(rel_path)
     }
     if (!empty(asset_files)) {
         log("  shipped {length(asset_files)} project asset file(s)\n")
@@ -2098,7 +2143,7 @@ def cmd_release(root : string; out_dir : string) : int {
     // Project-declared native deps land next to the exe (the project has no
     // .shared_module to colocate with — its deps are loaded directly by the exe).
     if (!empty(spec.native_dlls)) {
-        let rc3 = ship_native_dlls(bundle_name, bundle_dir, spec.native_dlls)
+        let rc3 = ship_native_dlls(bundle_name, bundle_dir, spec.native_dlls, shipped, "")
         if (rc3 != 0) return rc3
     }
 
@@ -2121,6 +2166,16 @@ def cmd_release(root : string; out_dir : string) : int {
         log("  wrote: Contents/Info.plist (CFBundleIdentifier={bundle_id})\n")
         log("Released to: {app_root}\n")
     } else {
+        let mbody = build_string() $(var writer) {
+            for (s in shipped) {
+                writer |> write(s)
+                writer |> write("\n")
+            }
+        }
+        if (!fwrite(path_join(bundle_dir, RELEASE_MANIFEST), mbody)) {
+            to_log(LOG_ERROR, "release: cannot write {RELEASE_MANIFEST}\n")
+            return 1
+        }
         log("Released to: {bundle_dir}\n")
     }
     return 0
