@@ -1229,6 +1229,17 @@ namespace das {
         JobQue::set_default_threads_cap(cap);
     }
 
+    // Affinity mode of a future JobQue: 0 off / 1 ideal-CPU hint / 2 hard mask (-1 = unset).
+    // Applied at worker spawn — call BEFORE with_job_que / create_job_que. The
+    // DAS_JOBQUE_AFFINITY env still overrides it (the A/B rail).
+    void setJobqueAffinity ( int32_t mode ) {
+        JobQue::set_default_affinity(mode);
+    }
+
+    int32_t getJobqueAffinity () {
+        return JobQue::get_default_affinity();
+    }
+
     class Module_JobQue : public Module {
     public:
         Module_JobQue() : Module("jobque") {
@@ -1528,6 +1539,11 @@ namespace das {
             addExtern<DAS_BIND_FUN(setJobqueThreadsCap)>(*this, lib,  "set_jobque_threads_cap",
                 SideEffects::modifyExternal, "setJobqueThreadsCap")
                     ->args({"cap"});
+            addExtern<DAS_BIND_FUN(setJobqueAffinity)>(*this, lib,  "set_jobque_affinity",
+                SideEffects::modifyExternal, "setJobqueAffinity")
+                    ->args({"mode"});
+            addExtern<DAS_BIND_FUN(getJobqueAffinity)>(*this, lib,  "get_jobque_affinity",
+                SideEffects::accessExternal, "getJobqueAffinity");
             addExtern<DAS_BIND_FUN(new_thread_invoke)>(*this, lib,  "new_thread_invoke",
                 SideEffects::modifyExternal, "new_thread_invoke")
                     ->args({"lambda","function","lambdaSize","context","line"});

@@ -104,6 +104,8 @@ namespace das {
         static int get_num_physical_cores();            // physical cores (SMT siblings collapsed); logical count where topology is unknown
         static void set_default_threads_cap(int cap);   // cap the DEFAULT worker count of a future JobQue (min with the stock rule); 0 = off. DAS_JOBQUE_THREADS still overrides
         static int get_default_threads_cap();
+        static void set_default_affinity(int mode);     // affinity mode of a future JobQue: 0 off / 1 ideal-CPU hint / 2 hard mask (-1 = unset). DAS_JOBQUE_AFFINITY still overrides
+        static int get_default_affinity();
         void EvalOnMainThread(Job && expr);
         void EvalMainThreadJobs();
         void wait();

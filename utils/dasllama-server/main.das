@@ -68,6 +68,9 @@ struct ServerArgs {
     @clarg_doc = "Worker-lane cap for the matmul dispatch (default 16; -1 = all cores)"
     threads : int
 
+    @clarg_doc = "Worker CPU affinity: 0 = off (default), 1 = ideal-CPU hint, 2 = hard mask (DAS_JOBQUE_AFFINITY env overrides)"
+    affinity : int
+
     @clarg_doc = "Prefill chunk in tokens: decode stalls at most this many per tick (default 64)"
     chunk : int
 
@@ -162,6 +165,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     if (cfg.threads == 0 && !cli_has_flag("--threads")) {
         cfg.threads = int(root?["threads"] ?? 0l)
     }
+    if (cfg.affinity == 0 && !cli_has_flag("--affinity")) {
+        cfg.affinity = int(root?["affinity"] ?? 0l)
+    }
     // --prefix is the one flag where 0 is a meaningful EXPLICIT value (auto-sizing), so the
     // zero-sentinel isn't enough: only fill from TOML when the flag is truly absent from argv
     if (cfg.prefix == 0 && !cli_has_flag("--prefix")) {
@@ -241,8 +247,10 @@ def main : int {
     // counts, and an uncapped dispatch fights every other process on the box. -1 = all cores.
     let threads = cfg.threads > 0 ? cfg.threads : (cfg.threads < 0 ? 0 : 16)
     set_dispatch_worker_limit(threads)
+    // worker CPU affinity — must land before the jobque exists (applied at worker spawn)
+    set_jobque_affinity(cfg.affinity)
     let lanes_desc = threads > 0 ? "{threads}" : "all"
-    print("dispatch: {lanes_desc} worker lanes\n")
+    print("dispatch: {lanes_desc} worker lanes, affinity {cfg.affinity}\n")
     // tee every to_log/print to logs/dasllama-server.log (timestamped ndjson) AND the console
     logger_init_tee("dasllama-server")
     to_log(LOG_INFO, "dasllama-server: logging to {get_das_root()}/logs/dasllama-server.log\n")

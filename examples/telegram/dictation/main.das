@@ -14,9 +14,10 @@ options _jit_fast_math = true // inference tool, not the bit-exact test suite
 
 require telegram/tbot                 // dasTelegram (daspkg): getUpdates / getFile / download / sendMessage
 require dasllama/dasllama             // load_model / load_asr_model / transcribe / create_chat / respond
+require dasllama/dasllama_math        // set_dispatch_worker_limit (engine-level knob, not re-exported)
 require dasllama/dasllama_audio_io    // load_audio_16k_mono
 require llvm/daslib/llvm_tune         // [tune_policy] + log_tune_status
-require daslib/jobque_boost           // with_job_que + set_jobque_threads_cap
+require daslib/jobque_boost           // with_job_que + set_jobque_affinity
 require daslib/toml                   // read_toml (re-exports daslib/json: read_json + JsonValue)
 require daslib/json_boost             // operator ?? over JsonValue
 require daslib/clargs                 // --config
@@ -46,7 +47,8 @@ struct DictationConfig {
     whisper_model : string            // path to the whisper ggml .bin (ASR)
     llm_model : string                // path to the instruct LLM GGUF (cleanup/reformat)
     bot_token : string                // Telegram bot token (TELEGRAM_BOT_TOKEN env overrides)
-    threads : int = 7                 // dasLLAMA worker cap; 7 workers + main = 8 compute lanes
+    threads : int = 8                 // matmul dispatch lane cap, same semantics as dasllama-server (-1 = all cores)
+    affinity : int = 0                // worker CPU affinity: 0 off / 1 ideal-CPU hint / 2 hard mask (DAS_JOBQUE_AFFINITY env overrides)
     language : string = "auto"        // whisper language hint ("auto" detects per message)
     max_tokens : int = 2048           // reply-token budget for the LLM cleanup
     temp : float = 0.0                // LLM sampling temperature (0 = greedy, faithful)
@@ -127,6 +129,7 @@ def load_config(path : string; var err : string&) : DictationConfig {
     cfg.llm_model     = js?["llm_model"] ?? cfg.llm_model
     cfg.bot_token     = js?["bot_token"] ?? cfg.bot_token
     cfg.threads       = js?["threads"] ?? cfg.threads
+    cfg.affinity      = js?["affinity"] ?? cfg.affinity
     cfg.language      = js?["language"] ?? cfg.language
     cfg.max_tokens    = js?["max_tokens"] ?? cfg.max_tokens
     cfg.temp          = js?["temp"] ?? cfg.temp
@@ -445,7 +448,12 @@ def init(var out_rc : int&) : bool {
     }
 
     log_tune_status("dictation")
-    set_jobque_threads_cap(g_cfg.threads)   // cap dasLLAMA to cfg.threads workers (DAS_JOBQUE_THREADS still overrides)
+    // matmul dispatch lane cap + worker affinity — SAME semantics as dasllama-server
+    // (threads = lane cap, -1 = all cores; affinity applied at worker spawn, so it must
+    // land before with_job_que; DAS_JOBQUE_* envs still override both)
+    let lanes = g_cfg.threads > 0 ? g_cfg.threads : (g_cfg.threads < 0 ? 0 : 8)
+    set_dispatch_worker_limit(lanes)
+    set_jobque_affinity(g_cfg.affinity)
 
     // The files exist, but a corrupt or unsupported model still panics deep in the loader.
     // Recover it so startup fails with a logged message rather than a silent abort. NOTE: a
@@ -464,7 +472,7 @@ def init(var out_rc : int&) : bool {
         return false
     }
     telegram_set_configuration(configuration(token = g_cfg.bot_token))
-    logger_info("dictation", "bot started (whisper={g_cfg.whisper_model}, llm={g_cfg.llm_model}, threads={g_cfg.threads})")
+    logger_info("dictation", "bot started (whisper={g_cfg.whisper_model}, llm={g_cfg.llm_model}, threads={g_cfg.threads}, affinity={g_cfg.affinity})")
     logger_flush()
     return true
 }

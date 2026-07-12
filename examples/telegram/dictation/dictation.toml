@@ -14,9 +14,13 @@ llm_model = ""
 # Telegram bot token from @BotFather. Leave empty to read TELEGRAM_BOT_TOKEN from the environment.
 bot_token = ""
 
-# dasLLAMA worker cap: workers + the computing main thread = compute lanes. 7 -> 8 lanes.
-# DAS_JOBQUE_THREADS in the environment still overrides this.
-threads = 7
+# Matmul dispatch lane cap — same semantics as dasllama-server: 8 = 8 compute lanes
+# (-1 = all cores). DAS_JOBQUE_THREADS in the environment still overrides this.
+threads = 8
+
+# Worker CPU affinity: 0 = off (default), 1 = ideal-CPU hint, 2 = hard mask.
+# DAS_JOBQUE_AFFINITY in the environment still overrides this.
+affinity = 0
 
 # Whisper language hint. "auto" detects the language of each message (recommended for RU+EN).
 language = "auto"

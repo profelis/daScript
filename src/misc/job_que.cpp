@@ -105,6 +105,13 @@ namespace das {
     void JobQue::set_default_threads_cap(int cap) { g_jobqueDefaultThreadsCap = max(cap, 0); }
     int JobQue::get_default_threads_cap() { return g_jobqueDefaultThreadsCap.load(); }
 
+    // App-declared affinity mode of a future JobQue (das set_jobque_affinity — apps expose it in
+    // their config next to threads). -1 = unset (off). Applied at thread spawn, so it must be set
+    // BEFORE the que exists; the DAS_JOBQUE_AFFINITY env still overrides it (the A/B rail).
+    static atomic<int> g_jobqueDefaultAffinity{-1};
+    void JobQue::set_default_affinity(int mode) { g_jobqueDefaultAffinity = mode; }
+    int JobQue::get_default_affinity() { return g_jobqueDefaultAffinity.load(); }
+
 #if defined(_WIN32) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
     int GetPhysicalCoreCountInWindows();   // defined in sysos.cpp under the same _WIN32 gate (incl. mingw)
 #endif
@@ -190,8 +197,8 @@ namespace das {
         mTeamRankGate = (rankGateEnv != nullptr && atoi(rankGateEnv) != 0) ? 1 : 0;
         const char * eagerExitEnv = getenv("DAS_JOBQUE_TEAM_EAGER_EXIT");   // =0 re-enables the final-barrier spin (see setTeamEagerExit)
         mTeamEagerExit = (eagerExitEnv != nullptr) ? ((atoi(eagerExitEnv) != 0) ? 1 : 0) : 1;
-        const char * affinityEnv = getenv("DAS_JOBQUE_AFFINITY");   // 0 off (default) / 1 ideal-CPU hint / 2 hard mask
-        int affinityMode = affinityEnv ? atoi(affinityEnv) : 0;
+        const char * affinityEnv = getenv("DAS_JOBQUE_AFFINITY");   // 0 off (default) / 1 ideal-CPU hint / 2 hard mask; overrides the app's set_default_affinity
+        int affinityMode = affinityEnv ? atoi(affinityEnv) : (max)(0, get_default_affinity());
         SetCurrentThreadPriority(JobPriority::High);
         jobque_apply_affinity_slot(0, affinityMode);   // the que creator = the dispatch caller
         for (int j = 0, js = mThreadCount; j < js; j++) {
