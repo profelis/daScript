@@ -238,7 +238,7 @@ namespace das {
             if ( c.status == MTLCommandBufferStatusError ) {
                 return alloc_error_string(c.error, "unknown command buffer error", ctx, at);
             }
-            return nullptr;     // empty string — no error
+            return nullptr;     // no error — null IS the canonical daslang empty string
         }
     }
 
