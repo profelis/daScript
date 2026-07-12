@@ -239,8 +239,9 @@ def tune_status_add(fname, scope, suffix, source, manifestPath : string) {
         source = source, manifestPath = manifestPath))
 }
 
-//! The program's tune decisions — one row per `[tune]` function. Populated when the app
-//! declares `[tune_policy]` (its injected [init] fills the table); empty otherwise.
+//! The program's tune decisions — one row per `[tune]` function. Populated whenever the
+//! policy rail ran (a declared `[tune_policy]` or the auto default on any app with tune
+//! scopes); empty under the gates (AOT, `-exe`, grid modes, `DAS_TUNE_MANIFEST`).
 def tune_status() : array<TuneStatus> {
     return clone_to_move(g_tune_status)
 }
@@ -964,40 +965,21 @@ def private collect_status() : array<TuneStatus> {
     return <- rows
 }
 
-//! `[tune_policy(missing = "...")]` on the app's `main` (must be `main` for auto/restart —
-//! they prepend a guard to its body): what to do about `[tune_scope]`s whose per-box
-//! manifest is missing at compile time —
-//!   fallback: stamp `fallback=` silently (the default everywhere, also without this annotation)
-//!   warn:    loud compile-time banner with the exact tuner command
-//!   error:   fail the compile with the same message — the dev mode
-//!   auto:    tune at startup (injected guard runs each missing scope's tuner), then RE-EXEC
-//!            the process — the fresh compile stamps the winners; one launch, then it serves.
-//!            (Tuning cannot happen mid-compile: the tuner is a daslang child, and adopting
-//!            its winners means new compile-time stamps anyway.)
-//!   restart: like auto but no re-exec — tune at startup, then exit asking for a manual
-//!            restart (one missing scope per start)
-//! `--tune` after `--` on the app's command line forces the auto path even when the manifests
-//! exist (re-tune; the flag is stripped from the re-exec). `DAS_TUNE_POLICY` env overrides
-//! the declared value (CI kill switch: `DAS_TUNE_POLICY=fallback`). Grid modes
-//! (`DAS_TUNE_MODE=tune`/`test` — also the recursion guard for the spawned tuner), a
-//! `DAS_TUNE_MANIFEST` env override, and standalone builds (`-exe`, AOT) skip policy entirely.
-[function_macro(name = "tune_policy")]
-class private TunePolicyAnnotation : AstFunctionAnnotation {
-    def override apply(var func : FunctionPtr; var group : ModuleGroup;
-                       args : AnnotationArgumentList; var errors : das_string) : bool {
-        // AOT and -exe builds run no policy (a frozen artifact must not demand or run
-        // tuning); grid-mode children manage their own manifest (and the spawned tuner
-        // compiles in tune mode — the recursion guard); a DAS_TUNE_MANIFEST env override
-        // means the user drives manually
-        if (tune_aot_gate() || tune_exe_gate() || tune_mode() != "normal"
-                || !empty(get_env_variable("DAS_TUNE_MANIFEST"))) {
-            return true
-        }
-        var policy = "warn"
-        let mv = find_arg(args, "missing")
-        if (mv is tString) {
-            policy = mv as tString
-        }
+// AOT and -exe builds run no policy (a frozen artifact must not demand or run tuning);
+// grid-mode children manage their own manifest (and the spawned tuner compiles in tune
+// mode — the recursion guard); a DAS_TUNE_MANIFEST env override means the user drives
+// manually
+def private tune_policy_gated() : bool {
+    return (tune_aot_gate() || tune_exe_gate() || tune_mode() != "normal"
+        || !empty(get_env_variable("DAS_TUNE_MANIFEST")))
+}
+
+// the policy core, shared by the declared annotation and the auto default (the infer pass
+// below): resolve the policy (env > declared), then per incomplete scope warn / error /
+// inject the auto or restart guard into `func` (the app's main)
+def private apply_tune_policy(var func : FunctionPtr; declared : string; var errors : string&) : bool {
+    var policy = declared
+    {
         let penv = get_env_variable("DAS_TUNE_POLICY")
         if (!empty(penv)) {
             policy = penv
@@ -1132,6 +1114,78 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
             }
             delete rows
         }
-        return empty(errors)
+    }
+    return empty(errors)
+}
+
+//! `[tune_policy(missing = "...")]` on the app's `main` (must be `main` for auto/restart —
+//! they prepend a guard to its body): what to do about scopes whose sidecar entries are
+//! missing (or stale) at compile time —
+//!   fallback: stamp `fallback=` silently
+//!   warn:    loud compile-time banner with the exact tuner command
+//!   error:   fail the compile with the same message — the dev mode
+//!   auto:    THE DEFAULT (declared or not — see TuneDefaultPolicy below): tune at startup
+//!            (injected guard runs each incomplete scope's tuner), then RE-EXEC the process —
+//!            the fresh compile stamps the winners; one launch, then it serves. (Tuning
+//!            cannot happen mid-compile: the tuner is a daslang child, and adopting its
+//!            winners means new compile-time stamps anyway.)
+//!   restart: like auto but no re-exec — tune at startup, then exit asking for a manual
+//!            restart (one incomplete scope per start)
+//! `--tune` after `--` on the app's command line forces the auto path even when the sidecar
+//! is complete (re-tune; the flag is stripped from the re-exec). `DAS_TUNE_POLICY` env
+//! overrides the declared value (CI kill switch: `DAS_TUNE_POLICY=fallback`). Grid modes
+//! (`DAS_TUNE_MODE=tune`/`test` — also the recursion guard for the spawned tuner), a
+//! `DAS_TUNE_MANIFEST` env override, and standalone builds (`-exe`, AOT) skip policy entirely.
+[function_macro(name = "tune_policy")]
+class private TunePolicyAnnotation : AstFunctionAnnotation {
+    def override apply(var func : FunctionPtr; var group : ModuleGroup;
+                       args : AnnotationArgumentList; var errors : das_string) : bool {
+        if (tune_policy_gated()) {
+            return true
+        }
+        var policy = "auto"
+        let mv = find_arg(args, "missing")
+        if (mv is tString) {
+            policy = mv as tString
+        }
+        var errs = ""
+        let ok = apply_tune_policy(func, policy, errs)
+        if (!empty(errs)) {
+            errors := errs
+        }
+        return ok
+    }
+}
+
+//! The "untuned does not start" default: when the PROGRAM ROOT (the anonymous main module)
+//! has a `main`, any `[tune_scope]` is in play, and no `[tune_policy]` was declared, behave
+//! as `[tune_policy(missing = "auto")]` — an incomplete/stale sidecar tunes at startup and
+//! re-execs. Escapes: `DAS_TUNE_POLICY=fallback` (the CI kill switch), the standing gates
+//! (AOT / -exe / grid modes / `DAS_TUNE_MANIFEST`), and structurally any root without a
+//! `main` (dastest-driven test files never tune — dastest runs `[test]` functions, not
+//! `main`). Fires as an infer pass on the root module; the appended `tune_policy` marker
+//! annotation makes it once-only and defers to a declared policy.
+[infer_macro]
+class private TuneDefaultPolicy : AstPassMacro {
+    def override apply(prog : ProgramPtr; _mod : Module?) : bool {
+        // libraries compile under their module name; the app root module is anonymous
+        return false if (is_in_completion() || !empty("{compiling_module().name}")
+            || empty(g_scopes) || tune_policy_gated())
+        var main_fn = compiling_module() |> find_unique_function("main", false)
+        return false if (main_fn == null)
+        for (ann in main_fn.annotations) {
+            return false if (ann.annotation.name == "tune_policy")   // declared, or this pass already ran
+        }
+        var aargs : array<tuple<argname : string; argvalue : RttiValue>>
+        aargs |> push((argname = "missing", argvalue = RttiValue(tString = "auto")))
+        main_fn |> append_annotation("llvm_tune", "tune_policy", aargs)   // the once-only marker (macro-appended applies don't run)
+        delete aargs
+        var errs = ""
+        let ok = apply_tune_policy(main_fn, "auto", errs)
+        if (!ok || !empty(errs)) {
+            macro_error(prog, main_fn.at, errs)
+            return false
+        }
+        return true   // modified — re-run infer over the injected guard
     }
 }

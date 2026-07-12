@@ -137,14 +137,16 @@ needs no scope at all — every ``[tune]`` resolves against the app sidecar.
 Application policy — ``[tune_policy]`` and ``--tune``
 =====================================================
 
-An application declares what to do when a scope's kernels are missing from the
-sidecar at compile time (a stale sidecar counts as missing). The annotation
-goes on ``main`` (the ``auto`` / ``restart`` flavors prepend a runtime guard
-to its body):
+**Untuned does not start.** Any application whose program root has a ``main``
+and whose libraries declare tune scopes gets the ``auto`` policy **by
+default** — no annotation needed: an incomplete or stale sidecar tunes at
+startup and re-execs, so one launch already serves tuned kernels. The
+``[tune_policy]`` annotation on ``main`` overrides the flavor (the ``auto`` /
+``restart`` flavors prepend a runtime guard to its body):
 
 .. code-block:: das
 
-    [export, tune_policy(missing = "auto")]
+    [export, tune_policy(missing = "error")]   // dev mode: fail the compile instead
     def main {
         // ...
     }
@@ -156,17 +158,22 @@ to its body):
    * - ``missing``
      - behavior when a scope's sidecar entries are absent or stale
    * - ``fallback``
-     - stamp ``fallback=`` silently (the default everywhere, also with no annotation)
+     - stamp ``fallback=`` silently (also what ``DAS_TUNE_POLICY=fallback`` — the
+       CI kill switch — forces everywhere)
    * - ``warn``
      - loud compile-time banner with the exact tuner command
    * - ``error``
      - fail the compile with the same message — the dev mode
    * - ``auto``
-     - tune at startup (a guard runs each missing scope's tuner), then **re-exec**
-       the process; the fresh compile stamps the winners. One launch, then it runs.
+     - **the default, declared or not**: tune at startup (a guard runs each
+       incomplete scope's tuner), then **re-exec** the process; the fresh compile
+       stamps the winners. One launch, then it runs.
    * - ``restart``
      - like ``auto`` but no re-exec — tune at startup, then exit asking for a
        manual restart.
+
+Programs whose root has no ``main`` never get the default — dastest-driven
+test files run ``[test]`` functions, so the test suite never tunes-on-start.
 
 ``--tune`` after ``--`` on the application's command line forces the tune path
 even when the sidecar is complete (a re-tune; the flag is stripped from the

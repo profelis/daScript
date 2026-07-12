@@ -137,7 +137,33 @@ def test_llvm_tune_scope_policy(t : T?) {
     t |> success(l8 |> has("scope_add <- k1 (fallback)"))
     t |> success(!(l8 |> has("untuned")))
 
+    // 9. NO [tune_policy] declared: the auto DEFAULT — "untuned does not start". The first
+    //    start tunes both scopes and re-execs, so ONE launch already runs the tuned tier;
+    //    the second start converges (no tuner runs)
+    let autoClient = "{get_this_module_dir()}/llvm_tune_scope_client_auto.das"
+    let autoSidecar = "{get_this_module_dir()}/llvm_tune_scope_client_auto.tune.json"
+    remove(autoSidecar)
+    var l9 : array<string>
+    t |> equal(spawn_child("{tune_env("")}\"{bin}\" -jit \"{autoClient}\"", l9), 0)
+    t |> success(l9 |> has("FAKE TUNER ->"))
+    t |> success(l9 |> has("FAKE TUNER2 ->"))
+    t |> success(l9 |> has("RESULT 7"))
+    t |> success(l9 |> has("STATUS scope_add|llvm_tune_scope_probe|k2|manifest"))
+    var l9b : array<string>
+    t |> equal(spawn_child("{tune_env("")}\"{bin}\" -jit \"{autoClient}\"", l9b), 0)
+    t |> success(!(l9b |> has("FAKE TUNER")))
+    t |> success(l9b |> has("RESULT 7"))
+
+    // 10. DAS_TUNE_POLICY=fallback is the kill switch for the default: no tuning, fallback
+    //     stamps (RESULT 6 = 2+3+k1)
+    remove(autoSidecar)
+    var l10 : array<string>
+    t |> equal(spawn_child("{tune_env("fallback")}\"{bin}\" -jit \"{autoClient}\"", l10), 0)
+    t |> success(!(l10 |> has("FAKE TUNER")))
+    t |> success(l10 |> has("RESULT 6"))
+
     remove(sidecar)
+    remove(autoSidecar)
     remove(aotOut)
     delete l1
     delete l2
@@ -149,4 +175,7 @@ def test_llvm_tune_scope_policy(t : T?) {
     delete l6c
     delete l7
     delete l8
+    delete l9
+    delete l9b
+    delete l10
 }
