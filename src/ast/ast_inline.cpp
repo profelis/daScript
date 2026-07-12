@@ -524,6 +524,11 @@ namespace das {
             if ( !fn || fn->mustInline || fn->builtIn ) return false;
             if ( !fn->body || fn->isTemplate ) return false;
             if ( fn->neverInline ) return false;    // explicit opt-out, both tiers
+            // macro-MANUFACTURED functions (qmacro products, helper factories,
+            // generated finalizers) carry bespoke resolution and shape invariants
+            // the splicer can't see - they never splice into callers. macros can
+            // also mark manufactured functions [never_inline] explicitly
+            if ( fn->generated ) return false;
             if ( !cfg.functions || fn->fromGeneric ) return false;
             return worthAutoInline(fn, cfg);
         }
@@ -1010,6 +1015,11 @@ namespace das {
         }
         if ( fn->result && fn->result->smartPtr ) { err = "[inline] does not support a smart-pointer result"; return false; }
         auto body = static_cast<ExprBlock *>(fn->body);
+        // the splicer pops the trailing return out of the top block and appends the
+        // result store in its place - a function-level finally on that block would
+        // run against reordered statements (probe: glob_count drifted). block-level
+        // finally INSIDE the body keeps its own block and splices fine
+        if ( !body->finalList.empty() ) { err = "[inline] does not support a function-level finally"; return false; }
         InlineShapeScan scan;
         scan.lastTopLevelStmt = body->list.empty() ? nullptr : body->list.back();
         fn->body->visit(scan);
@@ -1346,7 +1356,28 @@ namespace das {
         };
 
         void InlinePatch::processFunction ( Function * fn ) {
-            InlineCollect collect(autoCfg);
+            // a caller with call-site-semantic annotations ([template] & co) may be
+            // CLONED per call site by its macro - a spliced body loses its
+            // instantiation-site resolution (proven: sqlite_boost's [template]
+            // try_create_table lost the user module's generated
+            // _sql_create_table_sql after a splice). heuristic sites stay off
+            // inside such bodies; the block-literal tier keeps shipping behavior
+            AutoInlineCfg fnCfg = autoCfg;
+            if ( fnCfg.functions ) {
+                string why;
+                if ( annotatedCallee(fn, why) ) {
+                    fnCfg.functions = false;
+                } else if ( fn->fromGeneric && fn->fromGeneric->module
+                    && fn->fromGeneric->module != program->thisModule.get() ) {
+                    // a generic INSTANCE from another module re-infers its whole body
+                    // under THIS module's visibility after a splice - references legal
+                    // at the origin (sqlite_boost::try_exec inside sql_migrate's
+                    // _migrate_inner instance) stop resolving. cross-origin instances
+                    // keep their bodies untouched
+                    fnCfg.functions = false;
+                }
+            }
+            InlineCollect collect(fnCfg);
             fn->body->visit(collect);
             if ( collect.sites.empty() ) return;
             // let-bound block literals this function's invokes may resolve to
