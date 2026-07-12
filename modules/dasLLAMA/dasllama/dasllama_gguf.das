@@ -36,6 +36,9 @@ let GGML_TYPE_F32 = 0
 let GGML_TYPE_F16 = 1
 let GGML_TYPE_Q4_0 = 2
 let GGML_TYPE_Q8_0 = 8
+let GGML_TYPE_Q4_K = 12
+let GGML_TYPE_Q5_K = 13
+let GGML_TYPE_Q6_K = 14
 let GGML_TYPE_BF16 = 30
 let GGML_TYPE_MXFP4 = 39
 
@@ -399,6 +402,309 @@ def gguf_find_tensor(m : GGUFMeta; name : string) : int {
     return -1
 }
 
+// ===== K-quant superblock dequant (256-weight superblocks, ggml Q4_K / Q6_K) =====
+
+// int8 read (K-quant sub-scales are signed bytes)
+def private rd_i8(b : array<uint8> | #; o : int64) : int {
+    let u = int(b[o])
+    return u < 128 ? u : u - 256
+}
+
+// 6-bit sub-scale/min unpack for Q4_K/Q5_K superblocks (ggml get_scale_min_k4). The 12 scale
+// bytes hold 8 scales + 8 mins: j<4 live in the low 6 bits of bytes j / j+4; j>=4 split as
+// low-4 in byte j+4 (scale = low nibble, min = high) + top-2 of bytes j-4 / j.
+def private q4k_scale_min(b : array<uint8> | #; so, j : int64) : int2 {
+    if (j < 4l) {
+        return int2(int(b[so + j]) & 63, int(b[so + j + 4l]) & 63)
+    }
+    let sc = (int(b[so + j + 4l]) & 15) | ((int(b[so + j - 4l]) >> 6) << 4)
+    let mn = (int(b[so + j + 4l]) >> 4) | ((int(b[so + j]) >> 6) << 4)
+    return int2(sc, mn)
+}
+
+//! Dequantize one Q4_K superblock (144 bytes at `bo`: fp16 d, fp16 dmin, 12 bytes of 6-bit
+//! sub-scales/mins for 8 sub-blocks of 32, 128 nibble bytes) into dst[doff .. doff+256).
+//! w = (d*sc)*q - (dmin*m) with q the RAW nibble — the min term absorbs the offset. Per 64-weight
+//! chunk the 32 quant bytes carry weights 0..31 in low nibbles, 32..63 in high (ggml order).
+//! Matches llama.cpp dequantize_row_q4_K op-for-op, so the expansion is bit-exact.
+def dequant_q4k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array<float>; doff : int64) {
+    let d = f16_to_f32(rd_u16(bytes, bo))
+    let dmin = f16_to_f32(rd_u16(bytes, bo + 2l))
+    let so = bo + 4l    // 12 scale/min bytes
+    var qo = bo + 16l   // 128 quant bytes
+    var dsto = doff
+    for (js in range64(4l)) {   // 4 chunks of 64 weights = sub-blocks 2js, 2js+1
+        let s0 = q4k_scale_min(bytes, so, 2l * js)
+        let s1 = q4k_scale_min(bytes, so, 2l * js + 1l)
+        let d1 = d * float(s0.x)
+        let m1 = dmin * float(s0.y)
+        let d2 = d * float(s1.x)
+        let m2 = dmin * float(s1.y)
+        for (l in range64(32l)) {
+            let b = int(bytes[qo + l])
+            dst[dsto + l] = d1 * float(b & 15) - m1
+            dst[dsto + 32l + l] = d2 * float(b >> 4) - m2
+        }
+        qo += 32l
+        dsto += 64l
+    }
+}
+
+//! Dequantize one Q5_K superblock (176 bytes at `bo`: fp16 d, fp16 dmin, 12 bytes of 6-bit
+//! sub-scales/mins, 32 high-bit bytes qh, 128 nibble bytes qs) into dst[doff .. doff+256).
+//! w = (d*sc)*q - (dmin*m) with q = nibble | (high bit << 4) in 0..31; the high bit for chunk
+//! js lives in bit 2js (low nibbles) / 2js+1 (high nibbles) of qh[l], qh base fixed per
+//! superblock. Matches llama.cpp dequantize_row_q5_K op-for-op.
+def dequant_q5k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array<float>; doff : int64) {
+    let d = f16_to_f32(rd_u16(bytes, bo))
+    let dmin = f16_to_f32(rd_u16(bytes, bo + 2l))
+    let so = bo + 4l     // 12 scale/min bytes
+    let qho = bo + 16l   // 32 high-bit bytes (fixed base for the whole superblock)
+    var qo = bo + 48l    // 128 nibble bytes
+    var dsto = doff
+    for (js in range64(4l)) {
+        let s0 = q4k_scale_min(bytes, so, 2l * js)
+        let s1 = q4k_scale_min(bytes, so, 2l * js + 1l)
+        let d1 = d * float(s0.x)
+        let m1 = dmin * float(s0.y)
+        let d2 = d * float(s1.x)
+        let m2 = dmin * float(s1.y)
+        let u1 = 1 << (int(js) * 2)
+        let u2 = 2 << (int(js) * 2)
+        for (l in range64(32l)) {
+            let b = int(bytes[qo + l])
+            let h = int(bytes[qho + l])
+            dst[dsto + l] = d1 * float((b & 15) + ((h & u1) != 0 ? 16 : 0)) - m1
+            dst[dsto + 32l + l] = d2 * float((b >> 4) + ((h & u2) != 0 ? 16 : 0)) - m2
+        }
+        qo += 32l
+        dsto += 64l
+    }
+}
+
+//! Dequantize one Q6_K superblock (210 bytes at `bo`: 128 low-nibble bytes ql, 64 high-2-bit
+//! bytes qh, 16 int8 sub-scales for 16 sub-blocks of 16, fp16 d) into dst[doff .. doff+256).
+//! w = (d*sc)*q with q = (ql | qh<<4) - 32. Matches llama.cpp dequantize_row_q6_K op-for-op.
+def dequant_q6k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array<float>; doff : int64) {
+    let d = f16_to_f32(rd_u16(bytes, bo + 208l))
+    var qlo = bo          // ql cursor (64 bytes per 128-weight half)
+    var qho = bo + 128l   // qh cursor (32 bytes per half)
+    var sco = bo + 192l   // sub-scale cursor (8 per half)
+    var dsto = doff
+    for (_half in range(2)) {
+        for (l in range64(32l)) {
+            let si = l / 16l
+            let hl = int(bytes[qho + l])
+            let q1 = ((int(bytes[qlo + l]) & 15) | (((hl >> 0) & 3) << 4)) - 32
+            let q2 = ((int(bytes[qlo + 32l + l]) & 15) | (((hl >> 2) & 3) << 4)) - 32
+            let q3 = ((int(bytes[qlo + l]) >> 4) | (((hl >> 4) & 3) << 4)) - 32
+            let q4 = ((int(bytes[qlo + 32l + l]) >> 4) | (((hl >> 6) & 3) << 4)) - 32
+            dst[dsto + l] = d * float(rd_i8(bytes, sco + si)) * float(q1)
+            dst[dsto + 32l + l] = d * float(rd_i8(bytes, sco + si + 2l)) * float(q2)
+            dst[dsto + 64l + l] = d * float(rd_i8(bytes, sco + si + 4l)) * float(q3)
+            dst[dsto + 96l + l] = d * float(rd_i8(bytes, sco + si + 6l)) * float(q4)
+        }
+        qlo += 64l
+        qho += 32l
+        sco += 8l
+        dsto += 128l
+    }
+}
+
+// ===== K-quant native-plane transcode (superblock payloads -> split quant/scale planes) =====
+// Plane layouts (per 256-weight superblock; element offsets are plane-local and superblock-aligned):
+//   k4 quant: 128B nibbles verbatim            k4 scale: 8 x (f16 d*sc, f16 dmin*m) = 32B
+//   k5 quant: [128B nibbles][32B high-bits]    k5 scale: same 32B pair form
+//   k6 quant: [128B ql][64B qh]                k6 scale: [16 x int8 sub-scales][f16 d] = 18B
+// The f16 (s, o) pairs are the load-time unpack of the 6-bit packed sub-scales — the hot loop
+// reads them directly instead of re-deriving per dot (llama.cpp's ALU bill). f16 rounding of
+// d*sc / dmin*m is <= 2^-12 relative — far below the 4/5-bit quant noise; the plane-dequant
+// reference below applies the SAME rounding, so kernels gate bit-exactly against it.
+
+def private wr_f16(var p : array<uint8>; o : int64; v : float) {
+    let h = f32_to_f16(v)
+    p[o] = uint8(h & 0xFF)
+    p[o + 1l] = uint8(h >> 8u)
+}
+
+//! Transcode one Q4_K superblock (144 bytes at `bo`) into the k4 planes: nibbles verbatim to
+//! kq[kqo..+128), f16 (d*sc, dmin*m) pairs to ks[kso..+32).
+def transcode_q4k_superblock(bytes : array<uint8> | #; bo : int64; var kq : array<uint8>; kqo : int64; var ks : array<uint8>; kso : int64) {
+    let d = f16_to_f32(rd_u16(bytes, bo))
+    let dmin = f16_to_f32(rd_u16(bytes, bo + 2l))
+    for (j in range64(8l)) {
+        let sm = q4k_scale_min(bytes, bo + 4l, j)
+        wr_f16(ks, kso + j * 4l, d * float(sm.x))
+        wr_f16(ks, kso + j * 4l + 2l, dmin * float(sm.y))
+    }
+    for (i in range64(128l)) {
+        kq[kqo + i] = bytes[bo + 16l + i]
+    }
+}
+
+//! Transcode one Q5_K superblock (176 bytes at `bo`) into the k5 planes: [nibbles][high-bits]
+//! to kq[kqo..+160), f16 (d*sc, dmin*m) pairs to ks[kso..+32).
+def transcode_q5k_superblock(bytes : array<uint8> | #; bo : int64; var kq : array<uint8>; kqo : int64; var ks : array<uint8>; kso : int64) {
+    let d = f16_to_f32(rd_u16(bytes, bo))
+    let dmin = f16_to_f32(rd_u16(bytes, bo + 2l))
+    for (j in range64(8l)) {
+        let sm = q4k_scale_min(bytes, bo + 4l, j)
+        wr_f16(ks, kso + j * 4l, d * float(sm.x))
+        wr_f16(ks, kso + j * 4l + 2l, dmin * float(sm.y))
+    }
+    for (i in range64(128l)) {
+        kq[kqo + i] = bytes[bo + 48l + i]   // qs
+    }
+    for (i in range64(32l)) {
+        kq[kqo + 128l + i] = bytes[bo + 16l + i]   // qh
+    }
+}
+
+//! Transcode one Q6_K superblock (210 bytes at `bo`) into the k6 planes: [ql][qh] to
+//! kq[kqo..+192), the native int8 sub-scales + f16 d to ks[kso..+18) — all verbatim (exact).
+def transcode_q6k_superblock(bytes : array<uint8> | #; bo : int64; var kq : array<uint8>; kqo : int64; var ks : array<uint8>; kso : int64) {
+    for (i in range64(192l)) {
+        kq[kqo + i] = bytes[bo + i]   // ql (128) then qh (64) — disk order
+    }
+    for (i in range64(18l)) {
+        ks[kso + i] = bytes[bo + 192l + i]   // 16 int8 sub-scales + f16 d halfword
+    }
+}
+
+// f16 (s, o) pair read for the k4/k5 plane-dequant references
+def private rd_pair(ks : array<uint8> | #; o : int64) : float2 {
+    return float2(f16_to_f32(rd_u16(ks, o)), f16_to_f32(rd_u16(ks, o + 2l)))
+}
+
+//! Reference dequant of one k4-plane superblock (the exact math the k4 kernels must reproduce):
+//! w = s*q - o with the plane's f16-rounded (s, o) pairs.
+def dequant_k4_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
+    var dsto = doff
+    for (js in range64(4l)) {
+        let p0 = rd_pair(ks, kso + 2l * js * 4l)
+        let p1 = rd_pair(ks, kso + (2l * js + 1l) * 4l)
+        for (l in range64(32l)) {
+            let b = int(kq[kqo + 32l * js + l])
+            dst[dsto + l] = p0.x * float(b & 15) - p0.y
+            dst[dsto + 32l + l] = p1.x * float(b >> 4) - p1.y
+        }
+        dsto += 64l
+    }
+}
+
+//! Reference dequant of one k5-plane superblock: w = s*q - o, q = nibble | (high bit << 4).
+def dequant_k5_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
+    var dsto = doff
+    for (js in range64(4l)) {
+        let p0 = rd_pair(ks, kso + 2l * js * 4l)
+        let p1 = rd_pair(ks, kso + (2l * js + 1l) * 4l)
+        let u1 = 1 << (int(js) * 2)
+        let u2 = 2 << (int(js) * 2)
+        for (l in range64(32l)) {
+            let b = int(kq[kqo + 32l * js + l])
+            let h = int(kq[kqo + 128l + l])
+            dst[dsto + l] = p0.x * float((b & 15) + ((h & u1) != 0 ? 16 : 0)) - p0.y
+            dst[dsto + 32l + l] = p1.x * float((b >> 4) + ((h & u2) != 0 ? 16 : 0)) - p1.y
+        }
+        dsto += 64l
+    }
+}
+
+//! Reference dequant of one k6-plane superblock: w = (d*sc16)*(q - 32) — bit-identical to the
+//! disk dequant (the k6 planes are verbatim).
+def dequant_k6_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
+    let d = f16_to_f32(rd_u16(ks, kso + 16l))
+    var qlo = kqo
+    var qho = kqo + 128l
+    var sco = kso
+    var dsto = doff
+    for (_half in range(2)) {
+        for (l in range64(32l)) {
+            let si = l / 16l
+            let hl = int(kq[qho + l])
+            let q1 = ((int(kq[qlo + l]) & 15) | (((hl >> 0) & 3) << 4)) - 32
+            let q2 = ((int(kq[qlo + 32l + l]) & 15) | (((hl >> 2) & 3) << 4)) - 32
+            let q3 = ((int(kq[qlo + l]) >> 4) | (((hl >> 4) & 3) << 4)) - 32
+            let q4 = ((int(kq[qlo + 32l + l]) >> 4) | (((hl >> 6) & 3) << 4)) - 32
+            dst[dsto + l] = d * float(rd_i8(ks, sco + si)) * float(q1)
+            dst[dsto + 32l + l] = d * float(rd_i8(ks, sco + si + 2l)) * float(q2)
+            dst[dsto + 64l + l] = d * float(rd_i8(ks, sco + si + 4l)) * float(q3)
+            dst[dsto + 96l + l] = d * float(rd_i8(ks, sco + si + 6l)) * float(q4)
+        }
+        qlo += 64l
+        qho += 32l
+        sco += 8l
+        dsto += 128l
+    }
+}
+
+// K-quant plane strides (bytes per 256-weight superblock)
+let K4_QSB = 128l
+let K4_SSB = 32l
+let K5_QSB = 160l
+let K5_SSB = 32l
+let K6_QSB = 192l
+let K6_SSB = 18l
+
+// Shared header for the three file-level transcodes: locate + type-check + bounds-check, return
+// the superblock-aligned disk cursor.
+def private kq_transcode_base(m : GGUFMeta; name : string; want_type : int; type_name : string; src_off, expect_n, disk_sb : int64) : int64 {
+    let ti = gguf_find_tensor(m, name)
+    if (ti < 0) {
+        panic("gguf: tensor '{name}' not found")
+    }
+    if (m.tensors[ti].ggml_type != want_type) {
+        panic("gguf: tensor '{name}' is not {type_name} (type {m.tensors[ti].ggml_type})")
+    }
+    if (src_off % 256l != 0l || expect_n % 256l != 0l) {
+        panic("gguf: tensor '{name}' {type_name} slice [{src_off}, +{expect_n}) is not superblock-aligned")
+    }
+    if (src_off + expect_n > m.tensors[ti].n_elem) {
+        panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {m.tensors[ti].n_elem} elems")
+    }
+    return m.data_offset + m.tensors[ti].offset + (src_off / 256l) * disk_sb
+}
+
+//! Transcode a Q4_K tensor into the k4 planes at plane-local element offset `eloff` (from the
+//! layout's k4 cursor): quant bytes at (eloff/256)*128, scale pairs at (eloff/256)*32.
+def gguf_transcode_q4k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    var bo = kq_transcode_base(m, name, GGML_TYPE_Q4_K, "Q4_K", src_off, expect_n, 144l)
+    var kqo = (eloff / 256l) * K4_QSB
+    var kso = (eloff / 256l) * K4_SSB
+    for (_blk in range64(expect_n / 256l)) {
+        transcode_q4k_superblock(bytes, bo, kq, kqo, ks, kso)
+        bo += 144l
+        kqo += K4_QSB
+        kso += K4_SSB
+    }
+}
+
+//! Transcode a Q5_K tensor into the k5 planes (see gguf_transcode_q4k; strides 160/32).
+def gguf_transcode_q5k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    var bo = kq_transcode_base(m, name, GGML_TYPE_Q5_K, "Q5_K", src_off, expect_n, 176l)
+    var kqo = (eloff / 256l) * K5_QSB
+    var kso = (eloff / 256l) * K5_SSB
+    for (_blk in range64(expect_n / 256l)) {
+        transcode_q5k_superblock(bytes, bo, kq, kqo, ks, kso)
+        bo += 176l
+        kqo += K5_QSB
+        kso += K5_SSB
+    }
+}
+
+//! Transcode a Q6_K tensor into the k6 planes (see gguf_transcode_q4k; strides 192/18, exact).
+def gguf_transcode_q6k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    var bo = kq_transcode_base(m, name, GGML_TYPE_Q6_K, "Q6_K", src_off, expect_n, 210l)
+    var kqo = (eloff / 256l) * K6_QSB
+    var kso = (eloff / 256l) * K6_SSB
+    for (_blk in range64(expect_n / 256l)) {
+        transcode_q6k_superblock(bytes, bo, kq, kqo, ks, kso)
+        bo += 210l
+        kqo += K6_QSB
+        kso += K6_SSB
+    }
+}
+
 //! Decode tensor `name` (F32 or F16 on disk) into dst[dst_off ..] as fp32. Panics if the
 //! tensor is missing, has a different element count than expected, or uses a type we don't
 //! yet read (quantized types are wired in a later step).
@@ -409,7 +715,8 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
     }
     let nelem = m.tensors[ti].n_elem
     // src_off (element offset into the tensor) reads a sub-range — used to split fused qkv / gate_up
-    // tensors (Phi3). For quantized types it must be 32-aligned so it lands on a block boundary.
+    // tensors (Phi3). For quantized types it must be 32-aligned so it lands on a block boundary
+    // (256-aligned for the K-quant superblock types — those arms check).
     if (src_off + expect_n > nelem) {
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {nelem} elems")
     }
@@ -465,6 +772,36 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             }
             bo += 16l
         }
+    } elif (gtype == GGML_TYPE_Q4_K) {
+        if (src_off % 256l != 0l || expect_n % 256l != 0l) {
+            panic("gguf: tensor '{name}' Q4_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
+        }
+        let nb = expect_n / 256l
+        var bo = base + (src_off / 256l) * 144l
+        for (blk in range64(nb)) {
+            dequant_q4k_superblock(bytes, bo, dst, dst_off + blk * 256l)
+            bo += 144l
+        }
+    } elif (gtype == GGML_TYPE_Q5_K) {
+        if (src_off % 256l != 0l || expect_n % 256l != 0l) {
+            panic("gguf: tensor '{name}' Q5_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
+        }
+        let nb = expect_n / 256l
+        var bo = base + (src_off / 256l) * 176l
+        for (blk in range64(nb)) {
+            dequant_q5k_superblock(bytes, bo, dst, dst_off + blk * 256l)
+            bo += 176l
+        }
+    } elif (gtype == GGML_TYPE_Q6_K) {
+        if (src_off % 256l != 0l || expect_n % 256l != 0l) {
+            panic("gguf: tensor '{name}' Q6_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
+        }
+        let nb = expect_n / 256l
+        var bo = base + (src_off / 256l) * 210l
+        for (blk in range64(nb)) {
+            dequant_q6k_superblock(bytes, bo, dst, dst_off + blk * 256l)
+            bo += 210l
+        }
     } elif (gtype == GGML_TYPE_MXFP4) {
         // block of 32: 1 E8M0 scale byte + 16 nibble bytes (low nibbles = elems 0..15, high = 16..31);
         // x = e2m1[nibble] * scale — both sides carry the ×2/÷2 ggml convention (see MXFP4_KVALUES)
@@ -481,7 +818,7 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             bo += 16l
         }
     } else {
-        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/Q8_0/Q4_0/MXFP4)")
+        panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K/MXFP4)")
     }
 }
 

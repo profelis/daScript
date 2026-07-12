@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); tests stay bit-exact
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
@@ -57,6 +58,11 @@ def main {
             print("join spin override: level {join_spin}\n")
         }
         // A/B the matmul min-grains (rows per chunk floor); 0 = clamp off (pre-grain behavior)
+        if (has_env_variable("DASLLAMA_BATCH_CHUNKS")) {   // batch-GEMM oversplit (chunks per hw job)
+            let bc = to_int(get_env_variable("DASLLAMA_BATCH_CHUNKS"))
+            set_q8_batch_chunks_per_job(bc)
+            print("q8_batch_chunks_per_job override: {bc}\n")
+        }
         if (has_env_variable("DASLLAMA_MIN_CHUNK_ROWS")) {
             let mg = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS"))
             set_matmul_min_chunk_rows(mg)
@@ -66,6 +72,12 @@ def main {
             let mgv = to_int(get_env_variable("DASLLAMA_MIN_CHUNK_ROWS_GEMV"))
             set_matmul_min_chunk_rows_gemv(mgv)
             print("gemv min chunk rows override: {mgv}\n")
+        }
+        // A/B fused (region-list, default) vs per-expert expert GEMMs in the grouped MoE prefill
+        if (has_env_variable("DASLLAMA_MOE_FUSED")) {
+            let mf = to_int(get_env_variable("DASLLAMA_MOE_FUSED"))
+            set_moe_fused_expert_gemms(mf != 0)
+            print("moe_fused_expert_gemms override: {mf}\n")
         }
         // A/B the 2-D batch chunk grid (0 = 1-D, 1 = fine grid, 2 = wave-aligned)
         if (has_env_variable("DASLLAMA_BATCH_GRID_2D")) {
@@ -96,9 +108,26 @@ def main {
                 set_jobque_team_prof(true)
                 reset_jobque_team_prof()
             }
+            // DASLLAMA_PREFILL_TRACE=<path> saves a per-lane jobque trace of the N=512 batched
+            // prefill (the lane-timeline viewer's input; same rig as decode_prof --trace)
+            let doTrace = n == 512l && has_env_variable("DASLLAMA_PREFILL_TRACE")
+            if (doTrace) {
+                jobque_trace_start(1 << 20)   // prefill windows are ~50x a decode token — bigger ring
+                set_trace_tags(true)
+            }
             let t1 = ref_time_ticks()
             forward_prefill(t, s, prompt, n, 0l)
             let us_new = get_time_usec(t1)
+            if (doTrace) {
+                set_trace_tags(false)
+                jobque_trace_stop()
+                let tpath = get_env_variable("DASLLAMA_PREFILL_TRACE")
+                if (jobque_trace_save(tpath)) {
+                    print("jobque trace saved: {tpath}\n")
+                } else {
+                    print("jobque trace: nothing recorded\n")
+                }
+            }
             if (teamProf) {
                 let prof = get_jobque_team_prof()
                 let counts = get_jobque_team_prof_counts()

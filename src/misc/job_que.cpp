@@ -156,6 +156,25 @@ namespace das {
 
 #endif
 
+    // Slot -> logical-CPU affinity: fill DISTINCT physical cores first (even logical ids — SMT
+    // siblings are adjacent logical CPUs on Windows/Linux x86), then the odd siblings. Slot 0 is
+    // the que-creating (dispatch caller) thread, workers take slots 1..N. Without this the OS
+    // placement is a lottery: 32 busy lanes on a 32c/64t box sometimes land on 16 cores' SMT
+    // pairs — measured pp512 bimodal 306 vs 199 tok/s on the 3990X. Modes (DAS_JOBQUE_AFFINITY):
+    // 0 = off, 1 = ideal-processor hint (default; scheduler can still migrate under contention),
+    // 2 = hard mask (opt-in — pins survive ambient load but also can't dodge it).
+    static void jobque_apply_affinity_slot ( int slot, int mode ) {
+        if ( mode <= 0 ) return;
+        int hw = static_cast<int>(thread::hardware_concurrency());
+        if ( hw <= 1 ) return;
+        int half = hw / 2;
+        int cpu;
+        if ( half > 0 && slot < half ) cpu = slot * 2;               // distinct cores first
+        else if ( half > 0 && slot < hw ) cpu = (slot - half) * 2 + 1;   // then SMT siblings
+        else cpu = slot % hw;
+        SetCurrentThreadAffinityCpu(cpu, mode >= 2);
+    }
+
     JobQue::JobQue()
         : mSleepMs(1)
         , mShutdown(false)
@@ -170,11 +189,15 @@ namespace das {
         mTeamRankGate = (rankGateEnv != nullptr && atoi(rankGateEnv) != 0) ? 1 : 0;
         const char * eagerExitEnv = getenv("DAS_JOBQUE_TEAM_EAGER_EXIT");   // =0 re-enables the final-barrier spin (see setTeamEagerExit)
         mTeamEagerExit = (eagerExitEnv != nullptr) ? ((atoi(eagerExitEnv) != 0) ? 1 : 0) : 1;
+        const char * affinityEnv = getenv("DAS_JOBQUE_AFFINITY");   // 0 off / 1 ideal-CPU hint (default) / 2 hard mask
+        int affinityMode = affinityEnv ? atoi(affinityEnv) : 1;
         SetCurrentThreadPriority(JobPriority::High);
+        jobque_apply_affinity_slot(0, affinityMode);   // the que creator = the dispatch caller
         for (int j = 0, js = mThreadCount; j < js; j++) {
-            mThreads.emplace_back(make_unique<thread>([this, j]() {
+            mThreads.emplace_back(make_unique<thread>([this, j, affinityMode]() {
                 string thread_name = "JobQue_Job_" + to_string(j);
                 SetCurrentThreadName(thread_name);
+                jobque_apply_affinity_slot(j + 1, affinityMode);
                 job(j);
             }));
         }
@@ -1134,6 +1157,8 @@ namespace das {
         sched_param.sched_priority = platformPriority;
         pthread_setschedparam(pthread_self(), SCHED_OTHER, &sched_param);
     }
+
+    void SetCurrentThreadAffinityCpu ( int, bool ) {}   // no public thread-affinity API on macOS
 }
 
 #elif defined(_MSC_VER)
@@ -1179,6 +1204,12 @@ namespace das {
         }
         SetThreadPriority(GetCurrentThread(), winPriority);
     }
+
+    void SetCurrentThreadAffinityCpu ( int cpu, bool hard ) {
+        if ( cpu < 0 || cpu >= 64 ) return;   // single-group boxes only; >64-CPU groups need PROCESSOR_NUMBER plumbing
+        if ( hard ) SetThreadAffinityMask(GetCurrentThread(), 1ull << cpu);
+        else SetThreadIdealProcessor(GetCurrentThread(), DWORD(cpu));
+    }
 }
 
 #elif defined(__linux__) || defined __HAIKU__
@@ -1201,6 +1232,18 @@ namespace das
         sched_param.sched_priority = platformPriority;
         pthread_setschedparam(pthread_self(), SCHED_OTHER, &sched_param);
     }
+
+#if defined(__HAIKU__)
+    void SetCurrentThreadAffinityCpu ( int, bool ) {}
+#else
+    void SetCurrentThreadAffinityCpu ( int cpu, bool hard ) {
+        if ( !hard ) return;   // linux has no soft "ideal CPU" hint — only the hard-mask mode pins
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        CPU_SET(cpu, &cs);
+        pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+    }
+#endif
 }
 
 #else
@@ -1209,6 +1252,7 @@ namespace das
 {
     void SetCurrentThreadName ( const string & ) {}
     void SetCurrentThreadPriority ( JobPriority ) {}
+    void SetCurrentThreadAffinityCpu ( int, bool ) {}
 }
 
 #endif

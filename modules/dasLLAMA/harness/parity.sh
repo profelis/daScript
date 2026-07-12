@@ -38,8 +38,11 @@ PROMPT_IDS="$(printf '%s\n' "$REF" | sed -n 's/^PROMPT_IDS: //p')"
 REF_GEN="$(printf '%s\n' "$REF" | sed -n 's/^GEN_IDS: //p')"
 IDS_CSV="$(printf '%s' "$PROMPT_IDS" | tr ' ' ',')"
 
-# 2. dasLLAMA: same prompt ids -> greedy generated ids
-DAS="$("$DASLANG" -jit "$PARITY" -- -m "$MODEL" -n "$N" --quant "$QUANT" --kv "$KV" --ids "$IDS_CSV" 2>/dev/null)"
+# 2. dasLLAMA: same prompt ids -> greedy generated ids. KQ_NATIVE=1/0 (env) A/Bs the native
+# K-quant planes; unset keeps the engine default.
+KQ_FLAG=""
+[ -n "${KQ_NATIVE:-}" ] && KQ_FLAG="--kquant-native $KQ_NATIVE"
+DAS="$("$DASLANG" -jit "$PARITY" -- -m "$MODEL" -n "$N" --quant "$QUANT" --kv "$KV" $KQ_FLAG --ids "$IDS_CSV" 2>/dev/null)"
 DAS_GEN="$(printf '%s\n' "$DAS" | sed -n 's/^GEN_IDS: //p')"
 
 # 3. token-for-token diff

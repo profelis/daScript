@@ -199,6 +199,7 @@ namespace das {
     DAS_API void jobque_trace_stop ( Context * context, LineInfoArg * at );
     DAS_API bool jobque_trace_save ( const char * path, Context * context, LineInfoArg * at );
     DAS_API void jobque_trace_tag ( int32_t tag, Context * context, LineInfoArg * at );
+    DAS_API void jobque_set_thread_priority ( int32_t level, Context * context, LineInfoArg * at );
     DAS_API void team_parallel_for_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );
     DAS_API void team_parallel_for_indexed_invoke ( int32_t rangeBegin, int32_t rangeEnd, int32_t numChunks, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );
     DAS_API void team_parallel_stages_invoke ( const TArray<int3> & stages, Lambda lambda, Func fn, int32_t lambdaSize, Context * context, LineInfoArg * lineinfo );

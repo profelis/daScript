@@ -3,6 +3,7 @@ options gen2
 module dasllama_math shared public
 
 require math
+require strings  // to_int: DASLLAMA_CALLER_PRIO env override in setup_dasllama_jobque_
 require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses the profile's team_rank_gate knob
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
@@ -369,6 +370,8 @@ let public TRACE_TAG_CLS = 5
 let public TRACE_TAG_MOE = 6
 let public TRACE_TAG_SHEXP = 7
 let public TRACE_TAG_PLE = 8
+let public TRACE_TAG_ROUTE = 9   // MoE router GEMM + select/bucket (prefill section split)
+let public TRACE_TAG_PARK = 10   // MoE park/reduce bookkeeping around the expert GEMMs
 def public trace_tag(t : int) {
     if (g_trace_tags) {
         jobque_trace_tag(t)
@@ -395,6 +398,15 @@ def setup_dasllama_jobque_() {
     if (g_team_rank_gate >= 0 && !has_env_variable("DAS_JOBQUE_TEAM_RANK_GATE")) {
         set_jobque_team_rank_gate(g_team_rank_gate != 0)
     }
+    // the dispatch caller is load-bearing in team mode — only it publishes chains, so a
+    // descheduled caller idles every lane (4B Q4 32L trace: 13 all-lane holes/token, worst
+    // 329us = 1.7%). Que creation ran this thread at High (+1); claim the top notch.
+    // DASLLAMA_CALLER_PRIO=<-2..2> is the A/B rail (1 = the old High).
+    var prio = 2
+    if (has_env_variable("DASLLAMA_CALLER_PRIO")) {
+        prio = to_int(get_env_variable("DASLLAMA_CALLER_PRIO"))
+    }
+    set_current_thread_priority(clamp(prio, -2, 2))
 }
 
 // dasLLAMA matmuls are lockstep linear algebra: SMT siblings share the FMA/load ports, so the
@@ -517,8 +529,15 @@ def public matmul_chunks(rows : int; oversplit : int; work : int64) : int {
         return want
     }
     let cap = clamp(rows / g_matmul_min_chunk_rows, 1, want)   // grain-limited ceiling (<= want = L × oversplit)
-    let waves = max(cap / L, 1)                                // whole L-waves within the cap
-    let chunks = min(waves * L, cap)                           // full waves; never exceed the grain cap
+    // the grain may only limit OVERSPLIT — never cut chunks below the admitted lanes (underfilling
+    // L idles lanes for the whole dispatch, always worse than sub-grain chunks; rows < L is the
+    // only natural floor)
+    if (cap < L) {
+        let chunks = clamp(rows, 1, L)
+        assert_wave_aligned(chunks, L)
+        return chunks
+    }
+    let chunks = (cap / L) * L                                 // whole L-waves within the grain cap
     assert_wave_aligned(chunks, L)
     return chunks
 }
@@ -557,16 +576,21 @@ def private gcd_int(a, b : int) : int {
 //! `tokq` is the tile token quantum — token cells stay whole-tile so no cell pays a systematic
 //! sub-tile tail (the range tail still rides the walk's per-token tail path).
 def public matmul_grid(units : int; unit_rows : int64; oversplit : int; work : int64; ntok : int64; tokq : int) : int2 {
-    let c1 = matmul_chunks(units * int(unit_rows), oversplit, work)
+    let rows = units * int(unit_rows)
+    let c1 = matmul_chunks(rows, oversplit, work)
     if (g_batch_grid_2d == 0 || c1 <= 1) {
         return int2(c1, 1)
     }
     let L = lanes_for_work(work, g_batch_lane_cap)
     let ntile = int(ntok / int64(tokq))
-    if (c1 >= L || ntile < 2) {   // not starved, or no token axis to split
+    // grain-starved = the 1-D count only reaches L by going sub-grain (matmul_chunks fills to L);
+    // the token axis supplies the missing parallelism at FULL row grain instead — weight rows
+    // stream in grain-sized spans, re-read once per token cell
+    let gcap = g_matmul_min_chunk_rows > 0 ? clamp(rows / g_matmul_min_chunk_rows, 1, c1) : c1
+    if (gcap >= L || ntile < 2) {   // not grain-starved, or no token axis to split
         return int2(c1, 1)
     }
-    let rc = clamp(c1, 1, max(units, 1))   // row cells finer than one unit are empty claims
+    let rc = clamp(gcap, 1, max(units, 1))   // row cells finer than one unit are empty claims
     var ntc = 1
     if (g_batch_grid_2d == 1) {
         ntc = min((int(ntok) + 15) / 16, ntile)
@@ -600,9 +624,11 @@ var g_gemv_chunks_per_lane = 8
 def public set_gemv_chunks_per_lane(v : int) { g_gemv_chunks_per_lane = max(v, 1) }
 def public get_gemv_chunks_per_lane() : int { return g_gemv_chunks_per_lane }
 
-// Wave fill: when the grain-derived count lands in [lanes/2, lanes), round UP to one full wave —
-// chunks shrink but stay >= grain/2 (the grain is chosen halvable), and no lane idles. Counts
-// below lanes/2 stay grain-limited (filling would shred chunks below the halvable bound).
+// Wave fill: when the grain-derived count lands below the admitted lanes, round UP to one full
+// wave — chunks go sub-grain, but underfilling admitted lanes idles them for the whole dispatch,
+// which always loses more (30B decode router: 128 rows / grain 64 = 2 chunks on 16 lanes, 14 idle,
+// ~3.3% of the token). rows < lanes is the only natural floor. false = the historical grain-limited
+// count (A/B rail).
 var g_gemv_wave_fill = true
 def public set_gemv_wave_fill(v : bool) { g_gemv_wave_fill = v }
 def public get_gemv_wave_fill() : bool { return g_gemv_wave_fill }
@@ -631,9 +657,18 @@ def public matmul_chunks_gemv(rows : int; oversplit : int; work : int64) : int {
         // fewer than one grain-sized chunk per lane — the grain-limited split below applies
     }
     let n = clamp(rows / g_matmul_min_chunk_rows_gemv, 1, L)
-    let chunks = (g_gemv_wave_fill && n < L && 2 * n >= L) ? L : n
+    let chunks = (g_gemv_wave_fill && n < L) ? clamp(rows, 1, L) : n
     assert_wave_aligned(chunks, L)
     return chunks
+}
+
+//! LPT (longest-processing-time-first) claim order for a region-list dispatch whose regions have
+//! known unequal costs: sort (id, cost) pairs biggest-cost first (ties: lowest id — deterministic),
+//! so the self-serve chunk queue front-loads the expensive regions and the dispatch tail drains on
+//! cheap ones. Region order never changes results when each region writes rows keyed by its own
+//! range. Use in every region-list BUILDER where per-region cost is known at build time.
+def public lpt_order(var ord : array<int2>) {
+    ord |> sort() $(a, b) => a.y != b.y ? a.y > b.y : a.x < b.x
 }
 
 //! Chunk count for a fused-chain stage over `groups` 32-row quant groups: the GEMV shaper's
@@ -695,15 +730,45 @@ def matmul(var y : array<float>; w : array<float>; woff : int64; x : array<float
 //! all ntok tokens, vs ntok× matmul re-reading W every call. Bit-for-bit ntok× matmul.
 def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n, d, ntok : int64) {
     unsafe {
-        var yp = addr(y[0])
-        let wp = reinterpret<float const?>(addr(w[0]))
-        let xp = reinterpret<float const?>(addr(x[0]))
-        maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
+        matmul_batch_core(addr(y[0]), reinterpret<float const?>(addr(w[0])), reinterpret<float const?>(addr(x[0])), n, d, ntok)
+    }
+}
+
+// The fp32 batch GEMM core: 1-D row split, except ROW-STARVED shapes (row chunks can't fill the
+// admitted lanes — the MoE router: d = n_expert = 128, grain 16 ⇒ 8 chunks idling half a 16-lane
+// box, worse with more lanes) split tokens too: a flat (row-chunk × token-block) domain. Disjoint
+// stores, the same dot per (row, token) — bit-identical either way.
+def private matmul_batch_core(var yp : float?; wp : float const?; xp : float const?; n, d, ntok : int64) {
+    var myp = yp
+    let rch = matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)
+    let L = lanes_for_work(n * d * ntok, g_batch_lane_cap)
+    let tb = (rch < L && ntok >= 128l) ? min(int64((2 * L + rch - 1) / rch), ntok / 64l) : 1l
+    if (tb <= 1l) {
+        maybe_parallel_for(0, int(d), rch) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
                     let wrow = wp + int64(i) * n
                     for (tk in range64(ntok)) {
-                        yp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
+                        myp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
+                    }
+                }
+            }
+        }
+        return
+    }
+    let rows_per = (d + int64(rch) - 1l) / int64(rch)
+    let tok_per = (ntok + tb - 1l) / tb
+    maybe_parallel_for(0, int(int64(rch) * tb), int(int64(rch) * tb)) $(cb, ce) {
+        unsafe {
+            for (c in range(cb, ce)) {
+                let rc = int64(c) / tb
+                let tc = int64(c) % tb
+                let r1 = min(rc * rows_per + rows_per, d)
+                let t1 = min(tc * tok_per + tok_per, ntok)
+                for (i in range64(rc * rows_per, r1)) {
+                    let wrow = wp + i * n
+                    for (tk in range64(tc * tok_per, t1)) {
+                        myp[tk * d + i] = dot(wrow, xp + tk * n, n)
                     }
                 }
             }
@@ -714,19 +779,7 @@ def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n
 //! Blob+offset form of matmul_batch (see the matmul woff overload).
 def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
     unsafe {
-        var yp = addr(y[0])
-        let wp = reinterpret<float const?>(addr(w[woff]))
-        let xp = reinterpret<float const?>(addr(x[0]))
-        maybe_parallel_for(0, int(d), matmul_chunks(int(d), 1, n * d * ntok)) $(rb, re) {
-            unsafe {
-                for (i in range(rb, re)) {
-                    let wrow = wp + int64(i) * n
-                    for (tk in range64(ntok)) {
-                        yp[tk * d + int64(i)] = dot(wrow, xp + tk * n, n)
-                    }
-                }
-            }
-        }
+        matmul_batch_core(addr(y[0]), reinterpret<float const?>(addr(w[woff])), reinterpret<float const?>(addr(x[0])), n, d, ntok)
     }
 }
 
@@ -739,7 +792,7 @@ def matmul_bf16_batch(var y : array<float>; w : array<uint16>; woff : int64; x :
         var yp = addr(y[0])
         let wp = reinterpret<uint16 const?>(addr(w[woff]))
         let xp = reinterpret<float const?>(addr(x[0]))
-        let nch = ntok == 1l ? matmul_chunks_gemv(int(d), 1, n * d) : matmul_chunks(int(d), 1, n * d * ntok)
+        let nch = ntok == 1l ? matmul_chunks_gemv(int(d), 1, n * d) : matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)
         maybe_parallel_for(0, int(d), nch) $(rb, re) {
             unsafe {
                 for (i in range(rb, re)) {
@@ -1064,6 +1117,32 @@ typedef BackendAvailableFn = function<() : bool>
 // into every store of region r (per-expert bias vectors). Bit-exact vs a per-region loop of the
 // same backend's mx4 batch kernel — the same per-row dots, one fork instead of nregions.
 typedef MatmulMx4Q8BatchGroupNFn = function<(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n : int64; d : int64) : void>
+// Native K-quant rows-range GEMV core (kq stage 4): rows [rb, re) of one plane-region pair
+// (kqp/ksp = the format's quant/scale plane bases at the tensor's superblock), activation as
+// (xq, xs, xbs — the per-16 sums the offset term consumes). One typedef per the three formats;
+// a backend's cores read ITS repacked kq layout (repack_kq), so mixing backends across a load
+// is as illegal as for the Q8 plane. rb/re multiples of the backend's mr.
+typedef MatmulKqRowsFn = function<(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; rb : int64; re : int64) : void>
+// The fmt-branched full K-quant GEMV (fmt 4/5/6; internal fork over d rows) and plane repack.
+typedef MatmulKqFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64) : void>
+typedef RepackKqFn = function<(fmt : int; var kq : uint8?; var ks : uint8?; n : int64; d : int64) : void>
+// Batched K-quant GEMM (the kq prefill tile): activations an [ntok x n] image with per-token
+// scale (n/32) and bsum (n/16) rows; Y token-major [ntok x d]. Bit-for-bit ntok x the fmt's
+// per-position GEMV over the same repacked planes.
+typedef MatmulKqBatchFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64; ntok : int64) : void>
+// Batched region-list K-quant GEMM (the kq batch groupn — the fused MoE prefill, llama.cpp's
+// mul_mat_id shape): `offs` packs TRIPLES like MatmulMx4Q8BatchGroupNFn — [3r] = region r's
+// weight element offset, [3r+1] = row0, [3r+2] = cnt; region r consumes activation rows
+// row0..row0+cnt and produces y rows row0..row0+cnt (token-major, y[(row0+tk)*d + row]).
+// Plane bases pass whole; one fmt per list; no bias form (biased-experts arches are mx4).
+typedef MatmulKqBatchGroupNFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64) : void>
+// Region-list K-quant GEMV (the kq groupn — MoE routed-expert decode dispatch): `offs` packs
+// (weight, activation) element-offset PAIRS like MatmulQ8Q8GroupNFn, region r's rows land at
+// y[r*d .. r*d+d). kqp/ksp are the fmt's PLANE BASES — each region computes its own superblock
+// offset from offs[2r] (unlike mm_kq, whose caller pre-offsets the pointers). One fmt per list
+// (a MoE layer's expert stack is one tensor). No bias form: the only biased-experts arch
+// (gpt-oss) carries mx4 stacks, never K-quant.
+typedef MatmulKqGroupNFn = function<(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64; d : int64) : void>
 
 //! One kernel backend: the three Q8·Q8 matmul kernels + the weight repack, plus selection metadata.
 //! needs_repack = the kernels read an interleaved weight layout, so the loader must repack first
@@ -1097,6 +1176,18 @@ struct KernelBackend {
     group3_s16 : MatmulQ8Q8Group3FnS16 = @@q8q8_unset_group3_s16
     groupn_s16 : MatmulQ8Q8GroupNFnS16 = @@q8q8_unset_groupn_s16
     mm_rows_s16 : MatmulQ8Q8RowsFnS16 = @@q8q8_unset_rows_s16
+    // Optional native K-quant slots (kq stage 4). All-or-nothing per backend, keyed off mm_kq
+    // (kernel_backend_has_kq): the loader repacks the kq planes through repack_kq iff the
+    // gate is up, and from then on EVERY kq matmul must run these cores — the portable
+    // disk-order kernels would read garbage off the interleaved planes.
+    mm_kq : MatmulKqFn = @@kq_unset_kernel
+    kq_rows_k4 : MatmulKqRowsFn = @@kq_unset_rows
+    kq_rows_k5 : MatmulKqRowsFn = @@kq_unset_rows
+    kq_rows_k6 : MatmulKqRowsFn = @@kq_unset_rows
+    kq_batch : MatmulKqBatchFn = @@kq_unset_batch
+    kq_groupn : MatmulKqGroupNFn = @@kq_unset_groupn
+    kq_batch_groupn : MatmulKqBatchGroupNFn = @@kq_unset_batch_groupn
+    repack_kq : RepackKqFn = @@repack_kq_identity
     needs_repack : bool
     // The backend's repack_mx4 plane layout and repack Q8 layout satisfy the interleaved
     // byte-for-byte expand map (expand_mx4_region_q8's direct-interleave branch): nibble byte
@@ -1147,8 +1238,20 @@ var g_mm_q8q8_groupn_s16 = @@q8q8_unset_groupn_s16
 var g_mm_q8q8_rows_s16 = @@q8q8_unset_rows_s16
 var g_active_has_wscale16 = false   // does the active backend carry the f16-scale twins?
 var g_active_has_rows16 = false     // ... including the f16-scale row-range GEMV core?
+var g_mm_kq = @@kq_unset_kernel
+var g_kq_rows_k4 = @@kq_unset_rows
+var g_kq_rows_k5 = @@kq_unset_rows
+var g_kq_rows_k6 = @@kq_unset_rows
+var g_mm_kq_batch = @@kq_unset_batch
+var g_mm_kq_groupn = @@kq_unset_groupn
+var g_mm_kq_batch_groupn = @@kq_unset_batch_groupn
+var g_active_has_kq = false         // does the active backend carry the native K-quant slots?
+var g_active_has_kq_batch = false   // ... including the batched kq GEMM (the prefill tile)?
+var g_active_has_kq_groupn = false  // ... and the region-list kq GEMV (MoE expert dispatch)?
+var g_active_has_kq_batch_groupn = false   // ... and the fused batched region-list GEMM (MoE prefill)?
 var g_repack_q8q8 = @@repack_q8q8_identity   // no-op until a repack backend is selected
 var g_repack_mx4 = @@repack_mx4_identity     // no-op until a repack backend is selected
+var g_repack_kq = @@repack_kq_identity       // no-op until a kq-capable backend is selected
 
 var g_kernel_backends : table<string; KernelBackend>
 var g_active_backend = ""           // name of the active backend ("" = the unset stub)
@@ -1170,6 +1273,10 @@ def repack_q8q8_identity(var wp : int8?; var sp : float?; n, d : int64) {}
 //! Default MXFP4 repack: no-op — the planes stay row-major for the portable / row-major kernels.
 [unused_argument(np, ep, n, d)]
 def repack_mx4_identity(var np : uint8?; var ep : uint8?; n, d : int64) {}
+
+//! Default K-quant repack: no-op — the kq planes stay disk-order for the portable kernels.
+[unused_argument(fmt, kq, ks, n, d)]
+def repack_kq_identity(fmt : int; var kq : uint8?; var ks : uint8?; n, d : int64) {}
 
 def private no_backend() {
     panic("dasLLAMA: no Q8·Q8 kernel backend registered — require dasllama/dasllama_math_default")
@@ -1241,6 +1348,28 @@ def private q8q8_unset_groupn_s16(var yp : float?; wp : int8 const?; sp : uint16
 def private q8q8_unset_rows_s16(var yp : float?; wp : int8 const?; sp : uint16 const?; xqp : int8 const?; xsp : float const?; n, rb, re : int64) {
     panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no f16-scale row-range GEMV core (mm_rows_s16)")
 }
+// The kq stubs are reachable with a registered backend (the slots are optional) — dispatch
+// gates on kernel_backend_has_kq(); when it is down the disk-order portable kernels serve.
+[unused_argument(fmt, yp, kqp, ksp, xqp, xsp, xbsp, n, d)]
+def private kq_unset_kernel(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no native K-quant kernels (mm_kq)")
+}
+[unused_argument(yp, kqp, ksp, xqp, xsp, xbsp, n, rb, re)]
+def private kq_unset_rows(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant row-range GEMV cores (kq_rows_*)")
+}
+[unused_argument(fmt, yp, kqp, ksp, offs, nregions, xqp, xsp, xbsp, n, d)]
+def private kq_unset_groupn(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant region-list kernel (kq_groupn)")
+}
+[unused_argument(fmt, yp, kqp, ksp, offs, nregions, xqp, xsp, xbsp, n, d)]
+def private kq_unset_batch_groupn(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant batched region-list kernel (kq_batch_groupn)")
+}
+[unused_argument(fmt, yp, kqp, ksp, xqp, xsp, xbsp, n, d, ntok)]
+def private kq_unset_batch(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, ntok : int64) {
+    panic("dasLLAMA: the active kernel backend '{g_active_backend}' has no K-quant batch kernel (kq_batch)")
+}
 
 def private activate(be : KernelBackend) {
     g_mm_q8q8 = be.mm
@@ -1260,8 +1389,20 @@ def private activate(be : KernelBackend) {
     g_mm_q8q8_rows_s16 = be.mm_rows_s16
     g_active_has_wscale16 = !(be.mm_s16 == @@q8q8_unset_kernel_s16)
     g_active_has_rows16 = !(be.mm_rows_s16 == @@q8q8_unset_rows_s16)
+    g_mm_kq = be.mm_kq
+    g_kq_rows_k4 = be.kq_rows_k4
+    g_kq_rows_k5 = be.kq_rows_k5
+    g_kq_rows_k6 = be.kq_rows_k6
+    g_mm_kq_batch = be.kq_batch
+    g_mm_kq_groupn = be.kq_groupn
+    g_mm_kq_batch_groupn = be.kq_batch_groupn
+    g_active_has_kq = !(be.mm_kq == @@kq_unset_kernel)
+    g_active_has_kq_batch = !(be.kq_batch == @@kq_unset_batch)
+    g_active_has_kq_groupn = !(be.kq_groupn == @@kq_unset_groupn)
+    g_active_has_kq_batch_groupn = !(be.kq_batch_groupn == @@kq_unset_batch_groupn)
     g_repack_q8q8 = be.repack
     g_repack_mx4 = be.repack_mx4
+    g_repack_kq = be.repack_kq
     g_active_backend = be.name
     g_active_needs_repack = be.needs_repack
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
@@ -1417,6 +1558,107 @@ def mm_q8q8_rows16_fn() : MatmulQ8Q8RowsFnS16 {
 //! kernel_backend_has_rows — a wscale_f16 model's fused chains gate on it.
 def kernel_backend_has_rows16() : bool {
     return g_active_has_rows16
+}
+
+//! Does the active backend carry the native K-quant slots (mm_kq + kq_rows_* + repack_kq)?
+//! Decides at LOAD whether the kq planes get repacked; a Model records the answer
+//! (kq_repacked) and every later dispatch routes off that record, not this live query.
+def kernel_backend_has_kq() : bool {
+    return g_active_has_kq
+}
+
+//! The active backend's K-quant rows core for `fmt` (4/5/6) — the chains' kq twin of
+//! mm_q8q8_rows_fn. Same read-into-a-local-then-capture rule.
+def kq_rows_fn(fmt : int) : MatmulKqRowsFn {
+    if (fmt == 4) return g_kq_rows_k4
+    if (fmt == 5) return g_kq_rows_k5
+    return g_kq_rows_k6
+}
+
+//! Does the active backend carry the batched kq GEMM (kq_batch — the prefill tile)? The
+//! batched dispatch gates on it and falls back to serial per-position GEMVs when down.
+def kernel_backend_has_kq_batch() : bool {
+    return g_active_has_kq_batch
+}
+
+//! Does the active backend carry the region-list kq GEMV (kq_groupn — MoE expert dispatch)?
+//! The MoE dispatch gates on it and falls back to per-region GEMVs when down.
+def kernel_backend_has_kq_groupn() : bool {
+    return g_active_has_kq_groupn
+}
+
+//! Does the active backend carry the fused batched region-list kq GEMM (kq_batch_groupn — the
+//! fused MoE prefill)? The grouped prefill gates on it and keeps per-expert tiles when down.
+def kernel_backend_has_kq_batch_groupn() : bool {
+    return g_active_has_kq_batch_groupn
+}
+
+//! Batched region-list K-quant GEMM over REPACKED planes (triple offs — see the typedef).
+//! Callers guard with kq_repacked && kernel_backend_has_kq_batch_groupn().
+def matmul_kq_batch_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; offs : array<int64> | #; nregions : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64) {
+    unsafe {
+        invoke(g_mm_kq_batch_groupn, fmt, addr(y[0]),
+            reinterpret<uint8 const?>(addr(kq[0])), reinterpret<uint8 const?>(addr(ks[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<int const?>(addr(xbs[0])), n, d)
+    }
+}
+
+//! Region-list K-quant GEMV over REPACKED planes (blob form — the kq twin of mm_at_q8_groupn's
+//! kernels): `offs` packs (weight, activation) element-offset pairs, region r's rows land at
+//! y[r*d .. r*d+d). Plane bases pass whole — each region computes its own superblock offset.
+//! Callers guard with kq_repacked && kernel_backend_has_kq_groupn().
+def matmul_kq_groupn_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; offs : array<int64> | #; nregions : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64) {
+    unsafe {
+        invoke(g_mm_kq_groupn, fmt, addr(y[0]),
+            reinterpret<uint8 const?>(addr(kq[0])), reinterpret<uint8 const?>(addr(ks[0])),
+            reinterpret<int64 const?>(addr(offs[0])), nregions,
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<int const?>(addr(xbs[0])), n, d)
+    }
+}
+
+//! Batched K-quant GEMM over a REPACKED plane pair at plane-local element offset `woff`
+//! (blob+offset form): ntok activation rows -> token-major Y [ntok x d]. Bit-for-bit ntok x
+//! matmul_kq_active. Callers guard with kq_repacked && kernel_backend_has_kq_batch().
+def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d, ntok : int64) {
+    let sb = woff / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    unsafe {
+        invoke(g_mm_kq_batch, fmt, addr(y[0]),
+            reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<int const?>(addr(xbs[0])), n, d, ntok)
+    }
+}
+
+//! Native K-quant GEMV over a REPACKED plane pair at plane-local element offset `woff`
+//! (blob+offset form — the repacked twin of dasllama_math_default's matmul_kq). Dispatches
+//! to the active backend's mm_kq; callers guard with the model's kq_repacked record.
+def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
+    let sb = woff / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    unsafe {
+        invoke(g_mm_kq, fmt, addr(y[yoff]),
+            reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
+            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            reinterpret<int const?>(addr(xbs[0])), n, d)
+    }
+}
+
+//! Repack one K-quant weight tensor (region at element offset woff in the fmt's planes, shape
+//! [d rows x n cols]) into the active backend's kq layout, IN PLACE. No-op unless a kq-capable
+//! backend is active. n % 256 == 0 (the ggml K-quant row invariant).
+def repack_kq_weight(fmt : int; var kq : array<uint8>; var ks : array<uint8>; woff, n, d : int64) {
+    let sb = woff / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 32l
+    unsafe {
+        invoke(g_repack_kq, fmt, addr(kq[sb * qsb]), addr(ks[sb * ssb]), n, d)
+    }
 }
 
 //! Registered backend names (diagnostics / tests).

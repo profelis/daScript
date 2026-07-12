@@ -80,8 +80,9 @@ def test_matmul_chunks_batch(t : T?) {
             // roomy rows: the full oversplit want survives
             t |> equal(matmul_chunks(16 * lanes * 8, 4, huge), 4 * lanes, "want = L x oversplit when grain allows")
         }
-        t |> run("tiny rows floor at one chunk (a partial wave beats sub-grain shredding)") @(t : T?) {
-            t |> equal(matmul_chunks(8, 4, huge), 1)
+        t |> run("sub-grain rows still fill the admitted lanes (never underfill L)") @(t : T?) {
+            t |> equal(matmul_chunks(8, 4, huge), min(8, lanes), "1-row chunks; rows < L is the only natural floor")
+            t |> equal(matmul_chunks(16 * (lanes - 1), 4, huge), lanes, "grain-capped below L rounds up to one full wave")
         }
         t |> run("grain off = raw L x oversplit; batch cap bounds L") @(t : T?) {
             set_matmul_min_chunk_rows(0)
@@ -106,7 +107,7 @@ def test_matmul_grid(t : T?) {
         t |> run("knob off (default): 1-D always, x = matmul_chunks") @(t : T?) {
             if (lanes >= 3) {
                 let g = matmul_grid(sunits, 4l, 4, huge, 2048l, 4)
-                t |> equal(g.x, lanes - 1, "starved shape keeps the grain-capped 1-D count")
+                t |> equal(g.x, lanes, "grain-starved shape wave-fills the 1-D count")
                 t |> equal(g.y, 1)
             }
             t |> equal(matmul_grid(4 * lanes * 8, 4l, 4, huge, 2048l, 4).y, 1, "roomy shape 1-D")
@@ -165,12 +166,13 @@ def test_matmul_chunks_gemv(t : T?) {
             t |> equal(matmul_chunks_gemv(64 * lanes, 1, huge), lanes)
             t |> equal(matmul_chunks_gemv(64 * lanes * 4, 8, huge), lanes, "oversplit never exceeds one chunk per lane")
         }
-        t |> run("GEMV grain floors small row counts; wave fill rounds near-full up") @(t : T?) {
+        t |> run("wave fill: grain-capped counts below L round up to one full wave (never underfill)") @(t : T?) {
             if (lanes > 2) {
-                t |> equal(matmul_chunks_gemv(64, 1, huge), 1, "one grain of rows = one chunk")
+                t |> equal(matmul_chunks_gemv(64, 1, huge), min(64, lanes), "sub-grain chunks fill the admitted lanes")
             }
             if (lanes >= 2) {
-                t |> equal(matmul_chunks_gemv(64 * (lanes - 1), 1, huge), lanes, "within half a wave rounds up to a full wave")
+                t |> equal(matmul_chunks_gemv(64 * (lanes - 1), 1, huge), lanes, "one grain short of a wave rounds up to a full wave")
+                t |> equal(matmul_chunks_gemv(128, 1, huge), min(128, lanes), "the 30B decode router shape (128 rows) fills every lane")
             }
             set_gemv_wave_fill(false)
             if (lanes >= 2) {
@@ -193,7 +195,7 @@ def test_matmul_chunks_gemv(t : T?) {
                 t |> equal(matmul_chunks_gemv(64 * lanes * 100, 1, huge), lanes * 8, "wave count caps at gemv_chunks_per_lane")
             }
             if (lanes > 2) {
-                t |> equal(matmul_chunks_gemv(32, 1, huge), 1, "sub-wave rows fall through to the grain-limited split")
+                t |> equal(matmul_chunks_gemv(32, 1, huge), min(32, lanes), "sub-wave rows fall through to the wave-filled split")
             }
             pin_shaping_baseline()
         }

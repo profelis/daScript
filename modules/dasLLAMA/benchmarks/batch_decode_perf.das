@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
 options _jit_fast_math = true   // ggml-parity FP laxity — same rail as decode_prof / perf
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration
@@ -49,16 +50,10 @@ def private build_prompt(n, salt : int64) : array<int64> {
     return <- [for (i in range64(n)); 1000l + ((i * 7l + salt * 131l) % 5000l)]
 }
 
+// team-scanned argmax (bit-identical to a serial first-wins scan) — the serial loop was a
+// ~0.75ms all-lane hole PER STREAM between eval_batch steps (B=8: 6.1ms holes, 18% of the run)
 def private greedy_top(lg : array<float>; vocab : int64) : int64 {
-    var best = 0l
-    var bestv = lg[0]
-    for (i in range64(vocab)) {
-        if (lg[i] > bestv) {
-            bestv = lg[i]
-            best = i
-        }
-    }
-    return best
+    return parallel_argmax(lg, vocab)
 }
 
 // nb fresh sessions, each prefilled to depth p with its own (salted) prompt
@@ -161,10 +156,27 @@ def main() {
         // warm both code paths (JIT + kernel dispatch) before any timed window
         let _w1 = run_sequential(t, cfg.kv, 1l, 8l, 2l)
         let _w2 = run_batched(t, cfg.kv, 2l, 8l, 2l)
+        // DASLLAMA_BATCH_TRACE=<path> saves a per-lane jobque trace of the LARGEST-B batched run
+        // (the lane-timeline viewer's input; same rig as decode_prof --trace)
+        let trace = has_env_variable("DASLLAMA_BATCH_TRACE") ? get_env_variable("DASLLAMA_BATCH_TRACE") : ""
         var nb = 1l
         while (nb <= bmax) {
             let seq_tps = run_sequential(t, cfg.kv, nb, p, n)
+            let doTrace = nb == bmax && !empty(trace)
+            if (doTrace) {
+                jobque_trace_start(1 << 21)
+                set_trace_tags(true)
+            }
             let bat_tps = run_batched(t, cfg.kv, nb, p, n)
+            if (doTrace) {
+                set_trace_tags(false)
+                jobque_trace_stop()
+                if (jobque_trace_save(trace)) {
+                    print("jobque trace saved: {trace}\n")
+                } else {
+                    print("jobque trace: nothing recorded\n")
+                }
+            }
             let speedup = bat_tps / seq_tps
             let stream_tps = bat_tps / double(nb)
             print("B={nb}: sequential {seq_tps} tok/s | batched {bat_tps} tok/s ({speedup}x) | per-stream {stream_tps} tok/s\n")

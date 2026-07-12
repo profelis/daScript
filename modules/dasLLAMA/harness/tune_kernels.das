@@ -51,6 +51,8 @@ struct GridDotQ8Q8 {}
 struct GridDotMx4Q8 {}
 [dasllama_grid(src = "quantize_q8_0_into_ptr_template")]
 struct GridQuant {}
+[dasllama_grid(src = "quantize_q8_0_bs_into_ptr_template")]
+struct GridQuantBs {}
 [dasllama_grid(src = "rope_scaled_neox_tab_template")]
 struct GridRopeTab {}
 [dasllama_grid(src = "gemm_f32_uk_4x16_template")]
@@ -1371,6 +1373,89 @@ def bench_quantize() : string {
     return report("quantize_q8_0_into_ptr", names, best, ok, "plain")
 }
 
+// quantize + per-16 block sums (the K-quant activation pass): quants/scales must be byte-identical
+// to quantize_q8_0, sums exactly the integer sums of those quants.
+def bench_quantize_bs() : string {
+    let vs <- quantize_q8_0_bs_into_ptr_template_variants()
+    let nv = length(vs)
+    var src : array<float>
+    src |> resize(int(N))
+    for (i in range(int(N))) {
+        src[i] = 2.0f * sin(float(i) * 0.13f)
+    }
+    let want <- quantize_q8_0(src, N)
+    var wantbs : array<int>
+    wantbs |> resize(int(N / 16l))
+    for (h in range(int(N / 16l))) {
+        var bs = 0
+        for (i in range(16)) {
+            bs += int(want.q[h * 16 + i])
+        }
+        wantbs[h] = bs
+    }
+    var qdst : array<int8>
+    var sdst : array<float>
+    var bdst : array<int>
+    qdst |> resize(int(N))
+    sdst |> resize(int(N / 32l))
+    bdst |> resize(int(N / 16l))
+    let srcp = unsafe(addr(src[0]))
+    var qp = unsafe(addr(qdst[0]))
+    var sp = unsafe(addr(sdst[0]))
+    var bp = unsafe(addr(bdst[0]))
+
+    var names : array<string>
+    var ok : array<bool>
+    var best : array<double>
+    names |> resize(nv)
+    ok |> resize(nv)
+    best |> resize(nv)
+    for (i in range(nv)) {
+        names[i] = vs[i]._0
+        best[i] = 1.0e30lf
+        let f = vs[i]._1
+        invoke(f, srcp, N, qp, sp, bp, 0l, 0l, 0l)
+        var exact = true
+        for (j in range(int(N))) {
+            if (qdst[j] != want.q[j]) {
+                exact = false
+            }
+        }
+        for (b in range(int(N / 32l))) {
+            if (sdst[b] != want.scales[b]) {
+                exact = false
+            }
+        }
+        for (h in range(int(N / 16l))) {
+            if (bdst[h] != wantbs[h]) {
+                exact = false
+            }
+        }
+        ok[i] = exact
+    }
+
+    var sink = 0.0f
+    for (_round in range(ROUNDS)) {
+        for (i in range(nv)) {
+            if (!ok[i]) {
+                continue
+            }
+            let f = vs[i]._1
+            let t0 = ref_time_ticks()
+            for (_rep in range(REPS)) {
+                invoke(f, srcp, N, qp, sp, bp, 0l, 0l, 0l)
+            }
+            let us = double(get_time_usec(t0))
+            if (us < best[i]) {
+                best[i] = us
+            }
+        }
+        sink += sdst[0]
+    }
+    print("  checksum {sink}\n")
+    return report("quantize_q8_0_bs_into_ptr", names, best, ok, "plain")
+}
+
 // ===== rope_scaled_neox_tab: in-place rotation, norm-preserving — timing runs without reset.
 
 def bench_rope_tab() : string {
@@ -1693,6 +1778,7 @@ def main {
     let quantq8kvw = bench_quantize_q8kv_row()
     let dmx4w = bench_dot_mx4q8()
     let quantw = bench_quantize()
+    let quantbsw = bench_quantize_bs()
     let ropew = bench_rope_tab()
     let gemmw = bench_gemm_tile()
     let laneqw = bench_laneq4x4()   // last: it pins the repack backend (sticks until process exit)
@@ -1704,17 +1790,17 @@ def main {
         "add_inplace", "mul_inplace", "scale_inplace", "copy_floats",
         "softmax", "rmsnorm", "dot_q4", "dot_q8q8",
         "dot_q8kv", "dot_q8q8kv", "axpy_q8kv", "cvt_q8kv_to_f32", "quantize_q8kv_row",
-        "dot_mx4q8", "quantize_q8_0_into_ptr",
+        "dot_mx4q8", "quantize_q8_0_into_ptr", "quantize_q8_0_bs_into_ptr",
         "rope_scaled_neox_tab", "gemm_f32_uk_4x16", "dot_q8q8_laneq4x4")
     let kwin = fixed_array(dotw, axpyw, dotf16w, axpyf16w, cvt16w, cvt32w, addw, mulw, scalew, copyw,
         softmaxw, rmsw, dq4w, dq8w,
         dq8kvw, dq8q8kvw, axq8kvw, cvtq8kvw, quantq8kvw,
-        dmx4w, quantw, ropew, gemmw, laneqw)
+        dmx4w, quantw, quantbsw, ropew, gemmw, laneqw)
     let kfall = fixed_array(BASELINE, BASELINE, BASELINE, BASELINE, BASELINE, BASELINE,
         BASELINE, BASELINE, BASELINE, BASELINE,
         BASELINE, "plain", "vec4_u4", "vec16",
         BASELINE, "vec16", BASELINE, BASELINE, "plain",
-        "u2", "plain",
+        "u2", "plain", "plain",
         BASELINE, "u2", "u2")
     var changed = 0
     for (k, w, f in knames, kwin, kfall) {
@@ -1755,7 +1841,7 @@ def main {
         dot_q4 = dq4w, dot_q8q8 = dq8w,
         dot_q8kv = dq8kvw, dot_q8q8kv = dq8q8kvw, axpy_q8kv = axq8kvw,
         cvt_q8kv_to_f32 = cvtq8kvw, quantize_q8kv_row = quantq8kvw,
-        dot_mx4q8 = dmx4w, quantize_q8_0_into_ptr = quantw,
+        dot_mx4q8 = dmx4w, quantize_q8_0_into_ptr = quantw, quantize_q8_0_bs_into_ptr = quantbsw,
         rope_scaled_neox_tab = ropew, gemm_f32_uk_4x16 = gemmw, dot_q8q8_laneq4x4 = laneqw,
         runtime = runtime))
     let js = write_json(profile)

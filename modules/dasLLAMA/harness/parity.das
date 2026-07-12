@@ -1,4 +1,5 @@
 options gen2
+options stack = 65536   // dasLLAMA program-root convention (options stack does not unify up from libs)
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require daslib/jobque_boost
@@ -39,6 +40,9 @@ struct Args {
     @clarg_doc = "KV cache dtype (default: f32)"
     kv : KVDtype = KVDtype.f32
 
+    @clarg_doc = "Native K-quant planes A/B: 1 = keep Q4_K/Q5_K/Q6_K packed at load, 0 = q8-requant fallback, -1 = keep default"
+    kquant_native : int = -1
+
     @clarg_short = "?"
     @clarg_doc = "Show this help and exit"
     help : bool
@@ -69,6 +73,9 @@ def main {
         return
     }
 
+    if (cfg.kquant_native >= 0) {   // load-time layout decision, must precede load_gguf
+        set_kquant_native(cfg.kquant_native != 0)
+    }
     var t <- load_gguf(cfg.model, cfg.quant)
     // Cap the KV context: only ~(prompt + n_gen) positions are used, and native seq_len (Llama-3 /
     // Phi / gemma4: 131072) would waste multi-GB KV allocations. Same cap test_parity.das applies.

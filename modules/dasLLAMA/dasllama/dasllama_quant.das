@@ -94,6 +94,56 @@ def template quantize_q8_0_into_ptr_template(src : float const ?; n : int64; var
 [hint(noalias = src, noalias = qdst, noalias = sdst), tuned(fallback = "plain")]
 def quantize_q8_0_into_ptr(src : float const?; n : int64; var qdst : int8?; var sdst : float?; qoff, soff : int64) {}
 
+//! quantize_q8_0_into + per-16 block sums: bdst[boff + i/16] = sum of the 16 int8 quants.
+//! The K-quant dot's offset term is o*(sum of activation quants) per weight sub-block (16 for
+//! Q6_K, pairs of 16 for Q4_K/Q5_K), so the activation quantizer emits the sums in one pass.
+//! Quants and scales are bit-identical to quantize_q8_0_into. n must be a multiple of 32.
+def quantize_q8_0_bs_into(src : array<float> | #; n : int64; var qdst : array<int8>; var sdst : array<float>; var bdst : array<int>; qoff, soff, boff : int64) {
+    assert(n % QK8 == 0l, "quantize_q8_0_bs_into requires n to be a multiple of 32")
+    quantize_q8_0_bs_into_ptr(unsafe(addr(src[0])), n, unsafe(addr(qdst[0])), unsafe(addr(sdst[0])), unsafe(addr(bdst[0])), qoff, soff, boff)
+}
+
+[hint(noalias = src, noalias = qdst, noalias = sdst, noalias = bdst)]
+def template quantize_q8_0_bs_into_ptr_template(src : float const ?; n : int64; var qdst : int8 ?; var sdst : float ?; var bdst : int ?; qoff, soff, boff : int64) : void {
+    let nblocks = n / QK8
+    unsafe {
+        let p4 = reinterpret<float4 const?>(src)
+        for (b in range64(nblocks)) {
+            let base = b * QK8
+            // amax reduction: same hand-vectorized two-lane shape as quantize_q8_0_into_ptr_template
+            let f4 = base / 4l
+            var m0 = abs(p4[f4])
+            var m1 = abs(p4[f4 + 1l])
+            for (k in range64(1l, 4l)) {
+                m0 = max(m0, abs(p4[f4 + 2l * k]))
+                m1 = max(m1, abs(p4[f4 + 2l * k + 1l]))
+            }
+            let m = max(m0, m1)
+            let amax = max(max(m.x, m.y), max(m.z, m.w))
+            let d = amax / 127.0
+            let id = d != 0.0 ? 1.0 / d : 0.0
+            sdst[soff + b] = d
+            for [tune = 1] (i in range64(QK8)) {
+                qdst[qoff + base + i] = int8(round(src[base + i] * id))
+            }
+            // per-16 sums of the just-stored quants (L1-hot); plain loop — 16 int8 adds is not
+            // the kernel's cost, the fp32 read above is
+            for (h in range64(2l)) {
+                var bs = 0
+                let hb = qoff + base + h * 16l
+                for (i in range64(16l)) {
+                    bs += int(qdst[hb + i])
+                }
+                bdst[boff + b * 2l + h] = bs
+            }
+        }
+    }
+}
+
+//! Pointer core of quantize_q8_0_bs_into (see there); fork-context callers thread raw addresses.
+[hint(noalias = src, noalias = qdst, noalias = sdst, noalias = bdst), tuned(fallback = "plain")]
+def quantize_q8_0_bs_into_ptr(src : float const?; n : int64; var qdst : int8?; var sdst : float?; var bdst : int?; qoff, soff, boff : int64) {}
+
 //! Dequantize Q8_0 back to fp32 in place: dst[i] = q[i] * scales[i / 32]. The exact
 //! reference the dequant-in-dot kernel must reproduce, and the input to the fp32 forward
 //! when measuring end-to-end quantization loss. dst must be pre-sized to qt.n.
