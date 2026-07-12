@@ -117,14 +117,20 @@ def main {
         }
         forward_prefill(t, s, warm, 8l, 0l)
 
+        // DASLLAMA_PREFILL_ONLY=1 skips the per-token (decode-style) arm — the fast A/B loop
+        // for side-by-side runs against llama-bench -p N -n 0
+        let prefillOnly = has_env_variable("DASLLAMA_PREFILL_ONLY")
         let sizes <- [64l, 256l, 512l]
         for (n in sizes) {
             let prompt <- build_prompt(n)
-            let t0 = ref_time_ticks()
-            for (p in range64(n)) {
-                forward(t, s, prompt[p], p)
+            var us_old = 1
+            if (!prefillOnly) {
+                let t0 = ref_time_ticks()
+                for (p in range64(n)) {
+                    forward(t, s, prompt[p], p)
+                }
+                us_old = get_time_usec(t0)
             }
-            let us_old = get_time_usec(t0)
             forward_profile_reset()   // per-section table over the LAST batched prefill only
             if (teamProf) {
                 set_jobque_team_prof(true)
@@ -159,10 +165,14 @@ def main {
                 let soloShare = counts.x > 0 ? 100 * counts.w / counts.x : 0
                 print("team prof N={n}: avg ns/op publish {prof.x} serve {prof.y} join-tail {prof.z} total {prof.w} | ops {counts.x} chunks {counts.y} caller-share {callerShare}% solo {soloShare}% | claims first +{react.x}ns last +{react.y}ns\n")
             }
-            let tps_old = double(n) / (double(us_old) * 1.0e-6lf)
             let tps_new = double(n) / (double(us_new) * 1.0e-6lf)
-            let speedup = double(us_old) / double(us_new)
-            print("N={n}: per-token {us_old}us {tps_old} tok/s  |  prefill {us_new}us {tps_new} tok/s  |  {speedup}x\n")
+            if (prefillOnly) {
+                print("N={n}: prefill {us_new}us {tps_new} tok/s\n")
+            } else {
+                let tps_old = double(n) / (double(us_old) * 1.0e-6lf)
+                let speedup = double(us_old) / double(us_new)
+                print("N={n}: per-token {us_old}us {tps_old} tok/s  |  prefill {us_new}us {tps_new} tok/s  |  {speedup}x\n")
+            }
         }
         forward_profile_report()   // buckets for the N=512 batched prefill (set against GGML_OP_PROFILE pp512)
     }

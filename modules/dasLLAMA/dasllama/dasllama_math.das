@@ -372,6 +372,7 @@ let public TRACE_TAG_SHEXP = 7
 let public TRACE_TAG_PLE = 8
 let public TRACE_TAG_ROUTE = 9   // MoE router GEMM + select/bucket (prefill section split)
 let public TRACE_TAG_PARK = 10   // MoE park/reduce bookkeeping around the expert GEMMs
+let public TRACE_TAG_DN = 11   // Gated DeltaNet layers (qwen35 hybrid) — separates dn from gated attn
 def public trace_tag(t : int) {
     if (g_trace_tags) {
         jobque_trace_tag(t)
@@ -2504,6 +2505,54 @@ def silu4_batch(var x : array<float> | #; d, npos : int64) {
         var xp = addr(x[0])
         maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 16l, 0)) $(rb, re) {
             silu4(unsafe(xp + int64(rb) * d), int64(re - rb) * d)
+        }
+    }
+}
+
+//! Sigmoid gate: x[i] *= σ(g[i]) over the first `size` elements — the gated-attention out-gate
+//! shape (qwen35). Scalar reference form; the exp4 twin below is the production path.
+def sigmoid_gate(var x : float?; g : float const?; size : int64) {
+    unsafe {
+        for (i in range64(size)) {
+            x[i] *= 1.0 / (1.0 + exp(-g[i]))
+        }
+    }
+}
+
+//! Vectorized sigmoid gate: float4 with exp4, scalar tail. ~2 ulp, NOT bit-exact vs the scalar form.
+def sigmoid_gate4(var x : float?; g : float const?; size : int64) {
+    let one = float4(1.0, 1.0, 1.0, 1.0)
+    unsafe {
+        var x4 = reinterpret<float4?>(x)
+        let g4 = reinterpret<float4 const?>(g)
+        let n4 = size / 4l
+        for (k in range64(n4)) {
+            let arg = clamp(-g4[k], EXP4_LO, EXP4_HI)
+            x4[k] = x4[k] / (one + exp4(arg))
+        }
+        for (i in range64(n4 * 4l, size)) {
+            x[i] *= 1.0 / (1.0 + exp(-g[i]))
+        }
+    }
+}
+
+//! Fused SiLU gate into a destination: o[i] = a[i] · silu(z[i]), float4 with exp4, scalar tail.
+//! ~2 ulp, NOT bit-exact. The deltanet chunked z-gated out-norm shape (o must not alias a/z).
+def silu_mul4(var o : float?; a, z : float const?; size : int64) {
+    let one = float4(1.0, 1.0, 1.0, 1.0)
+    unsafe {
+        var o4 = reinterpret<float4?>(o)
+        let a4 = reinterpret<float4 const?>(a)
+        let z4 = reinterpret<float4 const?>(z)
+        let n4 = size / 4l
+        for (k in range64(n4)) {
+            let zv = z4[k]
+            let arg = clamp(-zv, EXP4_LO, EXP4_HI)
+            o4[k] = a4[k] * (zv / (one + exp4(arg)))
+        }
+        for (i in range64(n4 * 4l, size)) {
+            let zv = z[i]
+            o[i] = a[i] * (zv / (1.0 + exp(-zv)))
         }
     }
 }
