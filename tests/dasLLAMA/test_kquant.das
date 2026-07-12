@@ -294,6 +294,99 @@ def test_kq_dots(t : T?) {
     }
 }
 
+// Portable multi-row GEMV gate: matmul_kq (the disk-order kq_gemv_kernel rail — what a
+// kq-tagged model runs when the backend has no kq stamps) must bit-match the per-row disk
+// dots. Guards the k*_rows_kernel PER-ROW plane strides, which the single-superblock dot
+// gate above never exercises (a k4 scale-row stride miss shipped when K4_SSB went 32 -> 20:
+// row 0 dotted clean, every later row read the wrong scale rows).
+def private kq_gemv_rows_gate(t : T?; fmt : int) {
+    let n = 512l
+    let d = 8l
+    let nsb = n / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : (fmt == 4 ? 20l : 32l)
+    let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
+    var kq : array<uint8>
+    var ks : array<uint8>
+    kq |> resize(int(d * nsb * qsb))
+    ks |> resize(int(d * nsb * ssb))
+    for (r in range64(d)) {
+        for (s in range64(nsb)) {
+            if (fmt == 4) {
+                transcode_q4k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } elif (fmt == 5) {
+                transcode_q5k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } else {
+                transcode_q6k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            }
+        }
+        // per-row LCG over the quant payload only (scale planes stay valid f16/int8)
+        var st = 0x9E3779Bu + uint(r) * 0x85EBCA6Bu
+        for (i in range64(nsb * qsb)) {
+            st = st * 1664525u + 1013904223u
+            kq[r * nsb * qsb + i] = uint8(uint(kq[r * nsb * qsb + i]) ^ (st >> 16u))
+        }
+    }
+    var src : array<float>
+    src |> resize(n)
+    for (i in range64(n)) {
+        src[i] = 1.1 * sin(float(i) * 0.31) + 0.5 * cos(float(i) * 0.043)
+    }
+    var xq : array<int8>
+    var xs : array<float>
+    var xbs : array<int>
+    xq |> resize(n)
+    xs |> resize(n / 32l)
+    xbs |> resize(n / 16l)
+    if (fmt == 4) {   // kq v2: k4 reads Q8_K-form activations (per-256 scale)
+        quantize_q8_k_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    } else {
+        quantize_q8_0_bs_into(src, n, xq, xs, xbs, 0l, 0l, 0l)
+    }
+    var y : array<float>
+    y |> resize(int(d))
+    matmul_kq(fmt, y, kq, ks, 0l, xq, xs, xbs, n, d)
+    unsafe {
+        var bad = 0
+        for (r in range64(d)) {
+            let kqr = addr(kq[r * nsb * qsb])
+            let ksr = addr(ks[r * nsb * ssb])
+            var want = 0.0
+            if (fmt == 4) {
+                want = dot_k4q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+            } elif (fmt == 5) {
+                want = dot_k5q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+            } else {
+                want = dot_k6q8(kqr, ksr, addr(xq[0]), addr(xs[0]), addr(xbs[0]), n)
+            }
+            if (y[r] != want) {
+                bad++
+            }
+        }
+        t |> success(bad == 0, "portable multi-row GEMV bit-matches the per-row disk dots")
+    }
+    delete kq
+    delete ks
+    delete src
+    delete xq
+    delete xs
+    delete xbs
+    delete y
+}
+
+[test]
+def test_kq_gemv_rows(t : T?) {
+    t |> run("portable k4 GEMV rows bit-match per-row disk dots") @(t : T?) {
+        kq_gemv_rows_gate(t, 4)
+    }
+    t |> run("portable k5 GEMV rows bit-match per-row disk dots") @(t : T?) {
+        kq_gemv_rows_gate(t, 5)
+    }
+    t |> run("portable k6 GEMV rows bit-match per-row disk dots") @(t : T?) {
+        kq_gemv_rows_gate(t, 6)
+    }
+}
+
 // Stage-4 repack oracle core: build a d-row disk plane of `fmt` (transcoded synthetic
 // superblocks, per-row LCG-perturbed quant payloads — every quant bit pattern is valid),
 // capture the portable disk dots + row dequants, repack in place at `mr`, and require the

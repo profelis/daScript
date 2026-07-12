@@ -438,7 +438,7 @@ def k4_rows_kernel(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp 
     let nsb = n / 256l
     unsafe {
         for (i in range64(rb, re)) {
-            yp[i] = dot_k4q8(kqp + i * nsb * 128l, ksp + i * nsb * 32l, xqp, xsp, xbsp, n)
+            yp[i] = dot_k4q8(kqp + i * nsb * 128l, ksp + i * nsb * 20l, xqp, xsp, xbsp, n)
         }
     }
 }
