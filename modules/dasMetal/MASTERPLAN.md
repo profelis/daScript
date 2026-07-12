@@ -638,3 +638,15 @@ Emitter-extension ideas the lab priced but did not take (ledger): `half4` thread
 a `simdgroup_load` transpose-flag overload (each ~<10% at high risk). Remaining from here:
 the clean measurement round (Parsec OFF) + concurrent-dispatch encoder (secondary, measured
 small), then PR.
+
+**2026-07-12 — Phase 6e clean measurement round (M1 Max, Parsec OFF, interleaved 3-rep A/B).**
+Kernel-level (lab, 5 interleaved rounds, bit-exact): 32-kernel kv 2737 / q 2928 / w13 3003 /
+w2 2958 / cls 3024 GMAC/s; 64-kernel q 3344 / w13 3594 / w2 3393 / cls 3646 (kv correctly stays
+on the 32-kernel per gemm_use64). End-to-end prefill_perf 1B Q8, GPU-resident vs the box-tuned
+CPU control (arm64-gen), best-of-3: **N=512 2395 vs 823 tok/s = 2.91x; N=256 2003 vs 849 =
+2.36x**; N=64 336 vs 798 — CPU keeps small batches (each fresh process pays the one-time PSO
+compile + lazy weight upload there; min_npos=64 default unchanged since a served process pays
+it once). Anchors (stored from the 2026-07-11 clean window, per the no-baseline-reprofiling
+rule): llama.cpp CPU pp512 813 (das CPU 823 ✓ sane window); **llama.cpp full-Metal pp512 3960 —
+das GPU-resident is now 1.65x away** (hybrid clean was 3.75x, resident-with-old-kernel dirty
+2.5x). Clean best == the dirty single-shot (2395 vs 2398) — the box was quiet.
