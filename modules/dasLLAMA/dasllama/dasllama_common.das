@@ -12,7 +12,7 @@ require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
 require dasllama/dasllama_par  // maybe_parallel_for (+ get_total_hw_jobs): thread the prefill attention over heads
-require dasllama/dasllama_tune  // box_profile_path: the runtime half of the per-box profile applies at load_model
+require dasllama/dasllama_tune  // box_profile_path: the runtime half of the app tune sidecar applies at load_model
 require daslib/json_boost  // read_json / read_json_field for the box profile's "runtime" section
 require math
 require daslib/random  // int4 RNG state + random_float for token sampling
@@ -2167,7 +2167,7 @@ def eval_(t : Model; var s : Session; tokens : array<int64>) {
     s.n_past += npos
 }
 
-// ===== Per-box runtime profile (box_profile.json "runtime" section) =====
+// ===== Per-app runtime profile (the tune sidecar's "runtime" section) =====
 
 def private apply_i64_knob(rt : JsonValue const?; key : string; blk : block<(v : int64) : void>) {
     let v = read_json_field(rt, key, -1l)
@@ -2177,14 +2177,19 @@ def private apply_i64_knob(rt : JsonValue const?; key : string; blk : block<(v :
     }
 }
 
-//! Apply the per-box runtime knobs from box_profile.json's optional "runtime" section (written by
-//! the tuner harness; see tune_for_this_box.md): token block, L2 budget, threading thresholds,
-//! chunk multipliers, and an optional kernel-backend pin. The kernel-perm keys in the same file
-//! are consumed at COMPILE time by `[tuned]`; this is the runtime half. Missing file or section =
-//! no-op; every applied entry logs. load_model calls this before loading (a backend pin must land
-//! before the backend-for-load select); direct load_gguf users opt in by calling it themselves.
-//! `path` "" = the resolved default (DASLLAMA_BOX_PROFILE env, else <das_root>/box_profile.json).
+//! Apply the runtime knobs from the app tune sidecar's optional "runtime" section (written
+//! by the tuner harness; see tune_for_this_box.md): token block, L2 budget, threading
+//! thresholds, chunk multipliers, and an optional kernel-backend pin. The "kernels" section
+//! in the same file is consumed at COMPILE time by `[tuned]`/`[tune]`; this is the runtime
+//! half. Missing/STALE file or missing section = no-op; every applied entry logs.
+//! load_model calls this before loading (a backend pin must land before the
+//! backend-for-load select); direct load_gguf users opt in by calling it themselves.
+//! `path` "" = the app sidecar (see box_profile_path).
 def apply_box_profile_runtime(path : string = "") {
+    if (path == "" && box_profile_stale()) {
+        to_log(LOG_INFO, "dasLLAMA: tune sidecar is older than the binary — runtime knobs not applied (re-tune)\n")
+        return
+    }
     let ppath = path != "" ? path : box_profile_path()
     let text = fread(ppath)
     if (empty(text)) return
@@ -2246,7 +2251,7 @@ def apply_box_profile_runtime(path : string = "") {
 
 //! Load a model AND its tokenizer from a GGUF — the full user-facing entry point. Arch and
 //! tokenizer backend are both auto-selected from GGUF metadata; `mode` picks the weight quant.
-//! Applies box_profile.json's "runtime" knobs first (see apply_box_profile_runtime) — the runtime
+//! Applies the tune sidecar's "runtime" knobs first (see apply_box_profile_runtime) — the runtime
 //! half of per-box tuning; the compile-time half ([tuned] kernel perms) is already in the code.
 def load_model_(path : string; mode : QuantMode = QuantMode.fp32) : Model {
     apply_box_profile_runtime()   // before load: a backend pin must precede the backend-for-load select

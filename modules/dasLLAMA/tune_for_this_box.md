@@ -70,12 +70,15 @@ knobs, and the measurement discipline are still the manual, hands-on story — r
 Axes are ~independent (unroll ⊥ width ⊥ TB ⊥ threads) — sweep them separately
 (coordinate descent), never as a full cross-product.
 
-**One file carries all of it.** `box_profile.json` resolves as `DASLLAMA_BOX_PROFILE` env when
-set, else `<das_root>/box_profile.json` (per-install == per-box; `get_das_root()` — never the
-cwd). Flat keys = the compile-time kernel perms (`[tuned]` reads them, precedence
-`perm=` pin > profile > the kernel's `fallback=` > `vec8_u2`); the `"runtime"` object = the
-runtime knobs above, applied by `load_model` (logged per entry) or explicitly via
-`apply_box_profile_runtime(path)`. Direct `load_gguf` users opt in by calling the latter.
+**One file carries all of it — the PER-APP tune sidecar.** `box_profile_path()` now resolves
+to `<app>.tune.json` beside the app (the root script the process runs, else the binary;
+`DAS_TUNE_MANIFEST` env overrides) — shared with the `[tune]` generator winners. The
+`"kernels"` section = the compile-time kernel perms (`[tuned]` reads them, precedence
+`perm=` pin > sidecar > the kernel's `fallback=` > `vec8_u2`; the `[tune]` families' perms
+live in the same map); the `"runtime"` object = the runtime knobs above, applied by
+`load_model` (logged per entry) or explicitly via `apply_box_profile_runtime(path)`. Direct
+`load_gguf` users opt in by calling the latter. A sidecar OLDER than the running binary is
+stale — every reader treats it as absent, and the next tuner write resets it.
 
 ---
 
@@ -102,7 +105,7 @@ runtime knobs above, applied by `load_model` (logged per entry) or explicitly vi
 
 ---
 
-## Tool 1 — `harness/tune_kernels.das` (the box tuner → `box_profile.json`)
+## Tool 1 — `harness/tune_kernels.das` (the loop-hint tuner → the app sidecar)
 
 ```
 bin/daslang -jit modules/dasLLAMA/harness/tune_kernels.das
@@ -115,27 +118,31 @@ only, clean skip elsewhere — the laneq4x4 tile) across the 20-permutation grid
 (80 rounds × 2000 reps at N=4096), correctness gate per variant (f64 reference; EXACT
 quant/scale equality for the requant), reports each variant as %Δ vs that kernel's SHIPPED
 fallback perm (`vec8_u2` for most; dot_q8q8 ships `vec16`, dot_q4 `vec4_u4`, the tile k-loops
-`u2`, rmsnorm/requant `plain`), and writes the COMPLETE profile — flat kernel-perm keys plus a
-`"runtime"` section snapshotting the current runtime knobs (hand-editable afterwards;
+`u2`, rmsnorm/requant `plain`), and UPSERTS the winners into the app sidecar's `"kernels"`
+section plus a `"runtime"` section snapshotting the current runtime knobs (hand-editable
+afterwards; everything else in the sidecar — the `[tune]` generator winners — survives;
 `softmax_sink` mirrors `softmax`'s winner — same loop shape):
 
 ```json
-{"dot":"vec8_u2", "...":"...", "dot_q8q8":"vec16",
+{"kernels":{"dot":"vec8_u2", "...":"...", "dot_q8q8":"vec16"},
  "runtime":{"q8_token_block":128,"q8_l2_budget":4194304,"target_chunk_work":1000000,
             "attn_par_threshold":100000, "...":0, "q8_chunks_per_job":2,"threads":8}}
 ```
 
-**How the profile is consumed:** the flat keys are read at **compile time** by `[tuned]`
-(`dasllama_tune.das`), keyed by function name; precedence = explicit `perm=` pin > profile >
-the kernel's `fallback=` > `vec8_u2`. The `"runtime"` section is applied at **run time** by
-`load_model` (or `apply_box_profile_runtime(path)` for direct `load_gguf` users). Both sides
-resolve the same path: `DASLLAMA_BOX_PROFILE` env, else `<das_root>/box_profile.json` — and
-the tuner WRITES through that resolution too, failing loudly with env advice when das_root is
-read-only (installed SDK). Missing file or key = silent default, so an untuned box ships the
-hand-tuned M1 hints. The file is **gitignored** (per-box artifact) and any change **re-keys
-the JIT DLL cache automatically** (loop hints are folded into `jit_dll_basename` — no manual
-`.jitted_scripts` clearing). A consumer compile logs
-`dasllama_tune: dot <- vec16 (<resolved path>)` per applied flat entry, and `load_model` logs
+**How the sidecar is consumed:** the `"kernels"` entries are read at **compile time** by
+`[tuned]` (`dasllama_tune.das`), keyed by function name; precedence = explicit `perm=` pin >
+sidecar > the kernel's `fallback=` > `vec8_u2`. The `"runtime"` section is applied at
+**run time** by `load_model` (or `apply_box_profile_runtime(path)` for direct `load_gguf`
+users). Both sides resolve the same path — the app sidecar (`tune_manifest_path()`:
+`DAS_TUNE_MANIFEST` env, else `<app>.tune.json` beside the app) — and the tuner WRITES
+through that resolution too, failing loudly with env advice when the app dir is read-only.
+NOTE the per-app consequence: the tuner writes the sidecar of the app it RUNS AS
+(`tune_kernels.tune.json` beside the harness) — to tune another app, point
+`DAS_TUNE_MANIFEST` at that app's sidecar. Missing/stale file or key = silent default, so an
+untuned box ships the hand-tuned M1 hints. The file is **gitignored** (per-app, per-box
+artifact) and any change **re-keys the JIT DLL cache automatically** (loop hints are folded
+into `jit_dll_basename` — no manual `.jitted_scripts` clearing). A consumer compile logs
+`dasllama_tune: dot <- vec16 (<resolved path>)` per applied entry, and `load_model` logs
 `dasLLAMA: box profile runtime: <key> = <v>` per applied runtime entry — that's your proof it
 took.
 

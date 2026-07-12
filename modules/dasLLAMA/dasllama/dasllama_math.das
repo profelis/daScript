@@ -36,8 +36,8 @@ def dot(a, b : float const?; n : int64) : float {}
 
 // The elementwise kernels below share dot's tuning rig: each `<name>_template` holds the `[tune=1]`
 // hot loop (single source of truth) and `[tuned]` reconstitutes `<name>` with the per-box permutation
-// from box_profile.json — default `vec8_u2` = the original `[vectorize_width=8, unroll_count=2]`, so
-// each migrated kernel is bit-identical until the profiler picks a different perm for this box.
+// from the app tune sidecar — default `vec8_u2` = the original `[vectorize_width=8, unroll_count=2]`,
+// so each migrated kernel is bit-identical until the profiler picks a different perm for this box.
 
 //! AXPY: d[j] += scale * s[j] over n elements, auto-vectorized. Used single-threaded AND as the
 //! V-accumulate in threaded prefill attention — `d` (output) and `s` (value-cache) never overlap, so
@@ -541,7 +541,7 @@ def public trace_tag(t : int) {
 }
 
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
-//! batched dispatch, the spin-before-park window (box_profile.json "runtime" `jobque_spin_us`
+//! batched dispatch, the spin-before-park window (the tune sidecar's "runtime" `jobque_spin_us`
 //! overrides the shipped 30000us; 0 disables the spin), and the join-poll level ("jobque_join_poll",
 //! shipped 50 = ggml's default; 0 parks). Call INSIDE `with_job_que` (or after `create_job_que`) —
 //! the queue must exist, which is why apply_box_profile_runtime cannot apply these knobs itself

@@ -153,8 +153,9 @@ def private read_manifest(path : string; var found : bool&) : table<string; stri
         return <- tab
     }
     var err = ""
-    let doc = read_json(text, err)
+    var doc = read_json(text, err)
     if (doc == null || !(doc is _object)) {
+        delete_json(doc)
         return <- tab
     }
     found = true
@@ -162,10 +163,11 @@ def private read_manifest(path : string; var found : bool&) : table<string; stri
     if (kv != null && kv is _object) {
         for (k, v in keys(kv as _object), values(kv as _object)) {
             if (v != null && v is _string) {
-                tab[k] = v as _string
+                tab[k] = v as _string   // das strings survive the node delete below (string heap)
             }
         }
     }
+    delete_json(doc)
     return <- tab
 }
 
@@ -179,18 +181,10 @@ def tune_manifest_get(fname : string) : string {
     return r
 }
 
-//! Upsert `fname -> suffix` into the sidecar's `"kernels"` section and save it — the
-//! set-a-value API the tune harness calls after picking a winner. Every other section
-//! (`"runtime"`, keys of other scopes' tuners) is preserved — upsert semantics are what let
-//! several libraries' tuners share the one per-app file. A STALE sidecar (older than the
-//! running binary) is reset to a fresh document first: its measurements are invalid, and
-//! the first write makes the file newer than the binary so the rest of the run appends.
-//! Refreshes `"provenance"` on every write. Returns false when the file can't be written.
-def tune_manifest_set(fname : string; suffix : string) : bool {
-    let path = tune_manifest_path()
-    if (empty(path)) {
-        return false
-    }
+// the sidecar document for read-modify-write: parsed when fresh, a new empty object when
+// absent, unparsable, or STALE (stale measurements are invalid; the first save makes the
+// file newer than the binary so the rest of the run appends)
+def private load_sidecar_doc(path : string) : JsonValue? {
     var doc : JsonValue?
     if (!tune_sidecar_stale(path)) {
         let text = fread(path)
@@ -203,21 +197,69 @@ def tune_manifest_set(fname : string; suffix : string) : bool {
         var fresh : table<string; JsonValue?>
         doc = JV(fresh)
     }
-    var root & = unsafe(doc.value as _object)
-    var kernels : JsonValue?
-    if (root |> key_exists("kernels")) {
-        kernels = root["kernels"]
-    }
-    if (kernels == null || !(kernels.value is _object)) {
-        root["kernels"] = JV({ fname => JV(suffix) })
-    } else {
-        // kern aliases the pointee behind the kernels JsonValue? — stable across root rehashes
-        var kern & = unsafe(kernels.value as _object)
-        kern[fname] = JV(suffix)
-    }
-    root["provenance"] = JV((binary = get_das_exe(), platform = get_platform_name(),
-        arch = get_architecture_name()))
+    return doc
+}
+
+// refresh "provenance" and write the document back
+def private save_sidecar_doc(path : string; var doc : JsonValue?) : bool {
+    update(doc, "provenance", JV((binary = get_das_exe(), platform = get_platform_name(),
+        arch = get_architecture_name())))
     return fwrite(path, write_json(doc))
+}
+
+// upsert one "kernels" entry into an already-loaded document
+def private doc_kernels_set(var doc : JsonValue?; fname : string; suffix : string) {
+    var kernels = doc?["kernels"]
+    if (kernels == null || !(kernels.value is _object)) {
+        update(doc, "kernels", JV({ fname => JV(suffix) }))   // frees a non-object leftover
+        return
+    }
+    // kern aliases the pointee behind the kernels JsonValue? — stable across doc rehashes
+    var kern & = unsafe(kernels.value as _object)
+    if (kern |> key_exists(fname)) {
+        delete_json(kern[fname])
+    }
+    kern[fname] = JV(suffix)
+}
+
+//! Upsert `fname -> suffix` into the sidecar's `"kernels"` section and save it — the
+//! set-a-value API the tune harness calls after picking a winner. Every other section
+//! (`"runtime"`, keys of other scopes' tuners) is preserved — upsert semantics are what let
+//! several libraries' tuners share the one per-app file. A STALE sidecar (older than the
+//! running binary) is reset to a fresh document first. Refreshes `"provenance"` on every
+//! write. Returns false when the file can't be written.
+def tune_manifest_set(fname : string; suffix : string) : bool {
+    let path = tune_manifest_path()
+    if (empty(path)) {
+        return false
+    }
+    var doc = load_sidecar_doc(path)
+    doc_kernels_set(doc, fname, suffix)
+    let ok = save_sidecar_doc(path, doc)
+    delete_json(doc)
+    return ok
+}
+
+//! The bulk form for library tuners that record many kernels plus their runtime knobs in
+//! one write: upsert every `kernels` entry, and (when `runtime` is non-null) REPLACE the
+//! sidecar's `"runtime"` section with it — the tuner owns that section outright, and the
+//! document ADOPTS the passed tree (freed with it — don't reuse it after). Same
+//! preservation and stale-reset semantics as `tune_manifest_set`.
+def tune_sidecar_merge(kernels : table<string; string>; var runtime : JsonValue?) : bool {
+    let path = tune_manifest_path()
+    if (empty(path)) {
+        return false
+    }
+    var doc = load_sidecar_doc(path)
+    for (fname, suffix in keys(kernels), values(kernels)) {
+        doc_kernels_set(doc, fname, suffix)
+    }
+    if (runtime != null) {
+        update(doc, "runtime", runtime)   // frees the previous section; doc adopts the new one
+    }
+    let ok = save_sidecar_doc(path, doc)
+    delete_json(doc)
+    return ok
 }
 
 // ===== tune status (runtime) =====
@@ -299,6 +341,34 @@ def private scope_fnames_joined(modName : string) : string {
     }
     let names <- [for (fname in keys(g_scope_fnames[modName])); fname]
     return join(names, ";")
+}
+
+//! One registered `[tune_scope]`'s identity + completeness, as reported by
+//! `tune_scopes_status()` — the macro-time surface build orchestrators (the `-exe`
+//! release-deps JSON, daspkg) read to decide whether to run tuners before a rebuild.
+struct TuneScopeStatus {
+    name : string       //!< [tune_scope] name
+    manifest : string   //!< the app sidecar the winners live in
+    tuner : string      //!< tuner harness path ("" = none declared)
+    complete : bool     //!< every [tune] kernel of this scope has a fresh sidecar entry
+}
+
+//! Every registered scope with its per-key completeness against the app sidecar — call at
+//! MACRO time (the scope bank is compile-time state). Deduped by scope name.
+def tune_scopes_status() : array<TuneScopeStatus> {
+    var rows : array<TuneScopeStatus>
+    var seen : table<string>
+    var scopes <- [for (scope in values(g_scopes)); scope]
+    for (scope in scopes) {
+        continue if (seen |> key_exists(scope.scopeName))
+        seen |> insert(scope.scopeName)
+        rows |> push(TuneScopeStatus(name = scope.scopeName, manifest = scope.manifestPath,
+            tuner = scope.tunerPath,
+            complete = tune_sidecar_entries_complete(scope.manifestPath, scope_fnames_joined(scope.modName))))
+    }
+    delete scopes
+    delete seen
+    return <- rows
 }
 
 //! Every kernel in the ';'-joined `fnames` list has a `"kernels"` entry in the sidecar at
@@ -965,13 +1035,41 @@ def private collect_status() : array<TuneStatus> {
     return <- rows
 }
 
-// AOT and -exe builds run no policy (a frozen artifact must not demand or run tuning);
-// grid-mode children manage their own manifest (and the spawned tuner compiles in tune
-// mode — the recursion guard); a DAS_TUNE_MANIFEST env override means the user drives
-// manually
+// AOT builds run no policy at all; grid-mode children manage their own manifest (and the
+// spawned tuner compiles in tune mode — the recursion guard); a DAS_TUNE_MANIFEST env
+// override means the user drives manually. -exe is NOT in this gate: a standalone build
+// runs no policy either (a frozen artifact must not demand or run tuning), but it still
+// emits the status [init] so the artifact can self-report its baked stamps — the two call
+// sites below split on tune_exe_gate() explicitly.
 def private tune_policy_gated() : bool {
-    return (tune_aot_gate() || tune_exe_gate() || tune_mode() != "normal"
+    return (tune_aot_gate() || tune_mode() != "normal"
         || !empty(get_env_variable("DAS_TUNE_MANIFEST")))
+}
+
+// the runtime status table: one tune_status_add per [tune] function, off the stamped AST
+// truth — emitted by policy runs AND by -exe builds (an artifact must be able to report
+// which perms it carries: log_tune_status / tune_status work inside a standalone exe)
+def private emit_status_init(var errors : string&) {
+    var rows <- collect_status()
+    if (!empty(rows)) {
+        var body : array<ExpressionPtr>
+        body |> reserve(length(rows))
+        for (row in rows) {
+            body |> push <| qmacro_expr() {
+                tune_status_add($v(row.fname), $v(row.scope), $v(row.suffix),
+                    $v(row.source), $v(row.manifestPath))
+            }
+        }
+        var fn = qmacro_function("`tune`status`init") $() : void {
+            $b(body)
+        }
+        fn |> append_annotation("$", "init")
+        fn.flags.generated = true
+        if (!(compiling_module() |> add_function(fn))) {
+            errors := "[tune_policy]: duplicate declaration (one per program)"
+        }
+    }
+    delete rows
 }
 
 // the policy core, shared by the declared annotation and the auto default (the infer pass
@@ -1090,29 +1188,9 @@ def private apply_tune_policy(var func : FunctionPtr; declared : string; var err
             }
         }
         delete autoScopes
-        // the runtime status table: one tune_status_add per [tune] function — with auto now
-        // tuning at runtime the rows always reflect this compile's [tune]-time stamps
+        // with auto now tuning at runtime the rows always reflect this compile's stamps
         if (empty(errors)) {
-            var rows <- collect_status()
-            if (!empty(rows)) {
-                var body : array<ExpressionPtr>
-                body |> reserve(length(rows))
-                for (row in rows) {
-                    body |> push <| qmacro_expr() {
-                        tune_status_add($v(row.fname), $v(row.scope), $v(row.suffix),
-                            $v(row.source), $v(row.manifestPath))
-                    }
-                }
-                var fn = qmacro_function("`tune`status`init") $() : void {
-                    $b(body)
-                }
-                fn |> append_annotation("$", "init")
-                fn.flags.generated = true
-                if (!(compiling_module() |> add_function(fn))) {
-                    errors := "[tune_policy]: duplicate declaration (one per program)"
-                }
-            }
-            delete rows
+            emit_status_init(errors)
         }
     }
     return empty(errors)
@@ -1143,17 +1221,23 @@ class private TunePolicyAnnotation : AstFunctionAnnotation {
         if (tune_policy_gated()) {
             return true
         }
-        var policy = "auto"
-        let mv = find_arg(args, "missing")
-        if (mv is tString) {
-            policy = mv as tString
-        }
         var errs = ""
-        let ok = apply_tune_policy(func, policy, errs)
+        if (tune_exe_gate()) {
+            // standalone build: no policy, but the artifact self-reports its stamps
+            emit_status_init(errs)
+        } else {
+            var policy = "auto"
+            let mv = find_arg(args, "missing")
+            if (mv is tString) {
+                policy = mv as tString
+            }
+            apply_tune_policy(func, policy, errs)
+        }
         if (!empty(errs)) {
             errors := errs
+            return false
         }
-        return ok
+        return true
     }
 }
 
@@ -1181,11 +1265,17 @@ class private TuneDefaultPolicy : AstPassMacro {
         main_fn |> append_annotation("llvm_tune", "tune_policy", aargs)   // the once-only marker (macro-appended applies don't run)
         delete aargs
         var errs = ""
-        let ok = apply_tune_policy(main_fn, "auto", errs)
+        var ok = true
+        if (tune_exe_gate()) {
+            // standalone build: no policy, but the artifact self-reports its stamps
+            emit_status_init(errs)
+        } else {
+            ok = apply_tune_policy(main_fn, "auto", errs)
+        }
         if (!ok || !empty(errs)) {
             macro_error(prog, main_fn.at, errs)
             return false
         }
-        return true   // modified — re-run infer over the injected guard
+        return true   // modified — re-run infer over the injected status/guard
     }
 }

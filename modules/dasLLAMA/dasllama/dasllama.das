@@ -31,7 +31,7 @@ require dasllama/dasllama_math                 // setup_dasllama_jobque_ (engine
 
 def setup_dasllama_jobque() {
     //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
-    //! batched dispatch, and the worker spin-before-park window (``box_profile.json``'s runtime
+    //! batched dispatch, and the worker spin-before-park window (the tune sidecar's runtime
     //! ``jobque_spin_us`` tunes the window per box; 0 disables the spin). Call it INSIDE
     //! ``with_job_que()``, before the first ``generate``/``eval`` — see ``examples/dasLLAMA/run.das``.
     setup_dasllama_jobque_()
