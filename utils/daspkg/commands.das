@@ -1564,7 +1564,14 @@ def private have_patchelf() : bool {
 //
 // `equivalent()` follows symlinks transitively, so a sibling that links to
 // the leaf file through any number of hops will compare equal to it.
-def private preserve_dylib_symlinks(src_dir, dst_dir, src_name : string) {
+// bundle-relative sibling path of `filename` next to the shipped file at `rel_dst`
+def private sibling_rel(rel_dst, filename : string) : string {
+    let rd = dir_name(rel_dst)
+    return empty(rd) || rd == "." ? filename : "{rd}/{filename}"
+}
+
+def private preserve_dylib_symlinks(src_dir, dst_dir, src_name : string;
+                                    var shipped : array<string>; rel_dst : string) {
     if (get_platform_name() == "windows") return
     let src_abs = path_join(src_dir, src_name)
     dir(src_dir) $(filename) {
@@ -1581,6 +1588,7 @@ def private preserve_dylib_symlinks(src_dir, dst_dir, src_name : string) {
         let ln_rc = run_cmd("ln -s \"{src_name}\" \"{link_path}\"", ln_out)
         if (ln_rc == 0) {
             log("  ship symlink: {filename} -> {src_name}\n")
+            shipped |> push(sibling_rel(rel_dst, filename))
         } else {
             to_log(LOG_WARNING, "release: ln -s {src_name} -> {link_path} failed (rc={ln_rc}): {ln_out}\n")
         }
@@ -1776,7 +1784,7 @@ def private read_dylib_self_name(dst : string) : string {
 //
 // No-op when basename(self-name) == basename(dst), the alias already exists,
 // or (macOS) the install_name isn't @-relative.
-def private ensure_dylib_alias(dst : string) {
+def private ensure_dylib_alias(dst : string; var shipped : array<string>; rel_dst : string) {
     let platform = get_platform_name()
     if (platform != "darwin" && platform != "linux") return
     let self_name = read_dylib_self_name(dst)
@@ -1796,6 +1804,7 @@ def private ensure_dylib_alias(dst : string) {
     let ln_rc = run_cmd("ln -s \"{base_name(dst)}\" \"{link_path}\"", ln_out)
     if (ln_rc == 0) {
         log("  ship alias: {alias} -> {base_name(dst)}\n")
+        shipped |> push(sibling_rel(rel_dst, alias))
     } else {
         to_log(LOG_WARNING, "release: ln -s {base_name(dst)} -> {link_path} failed (rc={ln_rc}): {ln_out}\n")
     }
@@ -1803,10 +1812,12 @@ def private ensure_dylib_alias(dst : string) {
 
 // One-liner used at every ship site: preserve any sibling symlink chain from
 // the source, materialize the install_name alias if it's still missing
-// (macOS), then strip absolute rpath entries from the copy.
-def private finalize_shipped_binary(src, dst : string) {
-    preserve_dylib_symlinks(dir_name(src), dir_name(dst), base_name(src))
-    ensure_dylib_alias(dst)
+// (macOS), then strip absolute rpath entries from the copy. Symlinks/aliases
+// it creates are recorded in `shipped` (as siblings of `rel_dst`) so the
+// next release's manifest cleanup removes them too.
+def private finalize_shipped_binary(src, dst : string; var shipped : array<string>; rel_dst : string) {
+    preserve_dylib_symlinks(dir_name(src), dir_name(dst), base_name(src), shipped, rel_dst)
+    ensure_dylib_alias(dst, shipped, rel_dst)
     scrub_external_rpaths(dst)
 }
 
@@ -1868,7 +1879,7 @@ def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<str
             return 1
         }
         log("  ship dep `{dep_name}` native: {name}\n")
-        finalize_shipped_binary(found_src, dst)
+        finalize_shipped_binary(found_src, dst, shipped, "{rel_prefix}{name}")
         shipped |> push("{rel_prefix}{name}")
     }
     return 0
@@ -2059,7 +2070,7 @@ def cmd_release(root : string; out_dir : string) : int {
             return 1
         }
         log("  ship: {e.rel}\n")
-        finalize_shipped_binary(e.abs, dst)
+        finalize_shipped_binary(e.abs, dst, shipped, e.rel)
         shipped |> push_clone(e.rel)
     }
 
@@ -2099,7 +2110,7 @@ def cmd_release(root : string; out_dir : string) : int {
         }
         runtime_copies++
         log("  ship runtime: {base_name(rel_path)}\n")
-        finalize_shipped_binary(src, dst)
+        finalize_shipped_binary(src, dst, shipped, base_name(rel_path))
         shipped |> push(base_name(rel_path))
     }
     if (runtime_copy_failed) return 1
