@@ -1547,11 +1547,17 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             t.config.n_ff_exp = (gguf_has(m, "{arch}.expert_feed_forward_length")
                 ? gguf_int(m, bytes, "{arch}.expert_feed_forward_length")
                 : hidden / t.config.n_expert_used)   // llama.cpp's fallback for files without the key
+            if (t.config.n_ff_exp <= 0l) {   // pure-MoE files may omit feed_forward_length (hidden 0) — then the expert key is mandatory
+                panic("dasLLAMA: expert_feed_forward_length missing (and no dense feed_forward_length to derive it)")
+            }
             // shared expert: present iff its tensors are (qwen2moe always ships one)
             if (gguf_find_tensor(m, "blk.0.ffn_up_shexp.weight") >= 0) {
                 t.config.n_ff_shexp = (gguf_has(m, "{arch}.expert_shared_feed_forward_length")
                     ? gguf_int(m, bytes, "{arch}.expert_shared_feed_forward_length")
                     : hidden)
+                if (t.config.n_ff_shexp <= 0l) {
+                    panic("dasLLAMA: expert_shared_feed_forward_length missing (and no dense feed_forward_length to derive it)")
+                }
             }
             if (gguf_has(m, "{arch}.expert_weights_norm")) {
                 t.config.norm_topk_prob = gguf_int(m, bytes, "{arch}.expert_weights_norm") != 0l
