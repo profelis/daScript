@@ -75,6 +75,18 @@ enum AttnPrefillMode {
     flash
 }
 
+//! Deltanet prefill algorithm (qwen35 hybrid). `recurrent` runs the per-token delta rule — the
+//! bit-exact reference the parity fixtures pin (ggml's autoregressive float order). `chunked` is
+//! the 64-token blocked form (llama.cpp's prefill default): per chunk the inverse of the in-chunk
+//! delta interactions is solved as a unit-lower triangular system, the outputs and state update
+//! become register-tiled GEMMs, and the f32 state is touched once per chunk instead of per token —
+//! NOT bit-identical (chunk-parallel FP reassociation), validated logit-diff + token-for-token.
+//! Select via set_deltanet_prefill_mode (default chunked).
+enum DnPrefillMode {
+    recurrent
+    chunked
+}
+
 //! KV-cache storage codec, chosen per session at create time via ``create_session``/``create_chat``
 //! (llama.cpp -ctk/-ctv analog; K and V carry independent dtypes). f16 is the facade default
 //! (half the KV bytes, near-lossless); f32 is the bit-exact reference. q8_0 is the block codec
@@ -2187,6 +2199,10 @@ struct Session {
     dn_o_b : array<float>
     dn_qg_b : array<float>
     dn_qgate_b : array<float>
+    // chunked deltanet prefill scratch (DnPrefillMode.chunked only)
+    dn_conv_b : array<float>       // batched conv + SiLU output (npos x conv_dim)
+    dn_wtap : array<float>         // conv weights transposed tap-major for the batched form (d_conv x conv_dim)
+    dn_cws : array<float>          // per-v-head chunk workspace slabs (dt_rank x dn_cws_head_size)
 }
 
 // q8_0 KV needs whole 32-blocks everywhere the cache is sliced: rows (kv_dim) and head slots
@@ -3753,6 +3769,15 @@ def dn_key_dim(c : Config) : int64 => c.ssm_n_group * c.ssm_d_state
 //! deltanet fused-projection / conv channel count: [q (key_dim) ; k (key_dim) ; v (d_inner)].
 def dn_conv_dim(c : Config) : int64 => 2l * dn_key_dim(c) + c.ssm_d_inner
 
+// Chunk length for the blocked (chunked) deltanet prefill — llama.cpp's CS for gated deltanet.
+let DN_CHUNK = 64l
+
+// Per-v-head workspace floats for the chunked deltanet prefill: eight CS x d_state panels
+// (q / kT / k_beta / v_beta / w / v_new / o / kgT), two CS x CS triangles (T, KQ), and three
+// per-chunk scalar rows (g cumsum, e^{gcum}, e^{g_last - gcum}).
+def private dn_cws_head_size(c : Config) : int64 => (8l * DN_CHUNK * c.ssm_d_state
+    + 2l * DN_CHUNK * DN_CHUNK + 3l * DN_CHUNK)
+
 //! Layer `l`'s dense FFN width. Uniform config.hidden_dim unless the model varies it per layer
 //! (gemma-4 E2B: 6144 for layers 0-14, 12288 for 15-34).
 def layer_hidden(t : Model; l : int64) : int64 => (empty(t.ffn_w) ? t.config.hidden_dim : t.ffn_w[l])
@@ -4751,16 +4776,24 @@ def private dn_token_core(t : Model; var s : Session; l : int64; qkv : float con
         l2_norm_rows(cop, nkh, ds, c.norm_eps)
         l2_norm_rows(cop + kd, nkh, ds, c.norm_eps)
         scale_inplace(cop, 1.0 / sqrt(float(ds)), kd)
-        // per-v-head delta rule; k-heads repeat cyclically onto v-heads (ggml_repeat: h % nkh)
+        // per-v-head delta rule; k-heads repeat cyclically onto v-heads (ggml_repeat: h % nkh).
+        // Heads are independent (own S slab, own o/sk stripes) — work-proportional lanes over
+        // them; the two decay/update passes each touch the full ds x ds state (the 2x below).
         let qp = reinterpret<float const?>(cop)
         let kp = reinterpret<float const?>(cop + kd)
         let vp = reinterpret<float const?>(cop + 2l * kd)
         var stp = addr(s.dn_state[s.dn_state_prefix[l]])
         var skp = addr(s.dn_sk[0])
-        for (h in range64(nvh)) {
-            let kh = h % nkh
-            dn_delta_head(stp + h * ds * ds, qp + kh * ds, kp + kh * ds, vp + h * ds,
-                o + h * ds, skp + h * ds, g[h], beta[h], ds)
+        let dn_lanes = min(int(nvh), lanes_for_work(2l * nvh * ds * ds, g_gemv_lane_cap))
+        maybe_parallel_for(0, int(nvh), dn_lanes) $(rb, re) {
+            unsafe {
+                for (hh in range(rb, re)) {
+                    let h = int64(hh)
+                    let kh = h % nkh
+                    dn_delta_head(stp + h * ds * ds, qp + kh * ds, kp + kh * ds, vp + h * ds,
+                        o + h * ds, skp + h * ds, g[h], beta[h], ds)
+                }
+            }
         }
         // gated out-norm: per head RMSNorm(o; ssm_norm, shared weights) ⊙ SiLU(z)
         let wnorm = reinterpret<float const?>(addr(t.fblob[t.dn_norm_off + l * ds]))
@@ -5851,6 +5884,18 @@ def get_prefill_attn_mode() : AttnPrefillMode {
     return g_attn_prefill_mode
 }
 
+var g_dn_prefill_mode = DnPrefillMode.chunked   // A/B toggle; see DnPrefillMode (chunked is fastest)
+
+//! Select the deltanet prefill algorithm (default chunked). See DnPrefillMode.
+def set_deltanet_prefill_mode(m : DnPrefillMode) {
+    g_dn_prefill_mode = m
+}
+
+//! The deltanet prefill algorithm currently selected.
+def get_deltanet_prefill_mode() : DnPrefillMode {
+    return g_dn_prefill_mode
+}
+
 // Fused decode chains: ONE multi-stage team dispatch per attention block (qkv→attn→wo) and per
 // dense-FFN block (w1/w3→w2) instead of one per matmul — team_parallel_stages replaces the per-op
 // rendezvous with worker-side stage barriers, and the serial glue (rope, kv store, activation,
@@ -6681,6 +6726,268 @@ def private attention_std_prefill(t : Model; var s : Session; l : int64; npos : 
     attn_out_suffix(t, s, l, npos)
 }
 
+// Batched causal conv over the whole prefill window + the per-row epilogue (SiLU, q/k L2-norm,
+// q pre-scale): row p depends only on input rows p-taps..p (the first taps rows pull the
+// persistent per-layer history), so rows parallelize freely; the conv history then advances to
+// the last taps input rows. Weights transpose tap-major once per layer so the bulk row form is
+// d_conv vector fmas per channel block instead of a per-channel scalar tap walk.
+def private dn_conv_batch(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    let cd = dn_conv_dim(c)
+    let kd = dn_key_dim(c)
+    let nkh = c.ssm_n_group
+    let ds = c.ssm_d_state
+    let dconv = c.ssm_d_conv
+    let taps = dconv - 1l
+    let qscale = 1.0 / sqrt(float(ds))
+    unsafe {
+        let wsrc = reinterpret<float const?>(addr(t.fblob[t.dn_conv_off + l * dconv * cd]))
+        var wtp = addr(s.dn_wtap[0])
+        for (ch in range64(cd)) {
+            for (k in range64(dconv)) {
+                wtp[k * cd + ch] = wsrc[ch * dconv + k]
+            }
+        }
+    }
+    var inp0 : float const?
+    var wtap0 : float const?
+    var hist0 : float const?
+    var outp0 : float?
+    unsafe {
+        inp0 = reinterpret<float const?>(addr(s.dn_qkv_b[0]))
+        wtap0 = reinterpret<float const?>(addr(s.dn_wtap[0]))
+        hist0 = reinterpret<float const?>(addr(s.dn_conv_state[s.dn_conv_prefix[l]]))
+        outp0 = addr(s.dn_conv_b[0])
+    }
+    maybe_parallel_for(npos * cd >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
+        unsafe {
+            for (pp in range(rb, re)) {
+                let p = int64(pp)
+                var orow = outp0 + p * cd
+                if (p >= taps) {   // all taps in-batch: dconv row fmas over float4 channel blocks
+                    let irow = inp0 + (p - taps) * cd
+                    var ch = 0l
+                    while (ch < cd) {
+                        var acc = float4(0.0, 0.0, 0.0, 0.0)
+                        for (k in range64(dconv)) {
+                            acc += *reinterpret<float4 const?>(addr(irow[k * cd + ch])) * *reinterpret<float4 const?>(addr(wtap0[k * cd + ch]))
+                        }
+                        *reinterpret<float4?>(addr(orow[ch])) = acc
+                        ch += 4l
+                    }
+                } else {           // window straddles the batch start: missing taps from history
+                    for (ch in range64(cd)) {
+                        var acc = 0.0
+                        for (k in range64(dconv)) {
+                            let sp = p - taps + k
+                            acc += (sp >= 0l ? inp0[sp * cd + ch] : hist0[ch * taps + p + k]) * wtap0[k * cd + ch]
+                        }
+                        orow[ch] = acc
+                    }
+                }
+                silu(orow, cd)
+                l2_norm_rows(orow, nkh, ds, c.norm_eps)
+                l2_norm_rows(orow + kd, nkh, ds, c.norm_eps)
+                scale_inplace(orow, qscale, kd)
+            }
+        }
+    }
+    unsafe {   // advance the conv history to the last taps input rows (channel-major)
+        var st = addr(s.dn_conv_state[s.dn_conv_prefix[l]])
+        for (k in range64(taps)) {
+            let sp = npos - taps + k
+            if (sp >= 0l) {
+                for (ch in range64(cd)) {
+                    st[ch * taps + k] = inp0[sp * cd + ch]
+                }
+            } else {   // npos < taps: shift surviving old taps left (ascending k reads ahead of writes)
+                for (ch in range64(cd)) {
+                    st[ch * taps + k] = st[ch * taps + k + npos]
+                }
+            }
+        }
+    }
+}
+
+// One v-head's chunked delta rule over the whole prefill window, state carried chunk to chunk
+// (mirrors llama.cpp build_delta_net_chunking, the oracle's own prefill default; NOT bit-identical
+// to the recurrent form — chunk FP reassociation). Within a chunk of length cl the delta vectors d
+// solve the unit-lower system (I + A) d = V_beta - (K_beta ⊙ e^{gcum}) S with
+// A[i][j] = beta_i (k_i·k_j) e^{gcum_i - gcum_j} strictly lower; then
+// o = (q ⊙ e^{gcum}) S + (Q K^T ⊙ decay, diag kept) d and the f32 state advances ONCE per chunk:
+// S = e^{g_last} S + (k ⊙ e^{g_last - gcum})^T d — the per-token state traffic of the recurrent
+// form collapses into register-tiled GEMMs. q/k rows arrive L2-normed with q pre-scaled (conv
+// batch); beta/g arrive raw and transform at gather (beta = sigmoid, g = a·softplus(raw + dt)).
+def private dn_chunked_head(conv : float const?; qoff, koff, voff, cd : int64;
+                            bp, gp : float const?; bg_stride : int64;
+                            zp : float const?; var op : float?; o_stride : int64;
+                            var stp : float?; var ws : float?; wnorm : float const?;
+                            aa, dtb, eps : float; npos, ds : int64) {
+    let CS = DN_CHUNK
+    unsafe {
+        var qc = ws                         // CS x ds: q rows, scaled to q ⊙ e^{gcum} after the KQ GEMM
+        var kcT = ws + CS * ds              // ds x cl: raw k, transposed (the B side of A/KQ GEMMs)
+        var kb = ws + 2l * CS * ds          // CS x ds: k ⊙ beta, scaled to -(k_beta ⊙ e^{gcum}) after A
+        var vb = ws + 3l * CS * ds          // CS x ds: v ⊙ beta
+        var w = ws + 4l * CS * ds           // CS x ds: -T @ (k_beta ⊙ e^{gcum})
+        var vnew = ws + 5l * CS * ds        // CS x ds: the in-chunk delta vectors d
+        var och = ws + 6l * CS * ds         // CS x ds: this chunk's outputs
+        var kgT = ws + 7l * CS * ds         // ds x cl: (k ⊙ e^{g_last - gcum})^T for the state update
+        var tm = ws + 8l * CS * ds          // cl x cl: A, solved in place into T (unit diag)
+        var kq = ws + 8l * CS * ds + CS * CS   // cl x cl: Q K^T ⊙ decay (diagonal kept)
+        var gcum = ws + 8l * CS * ds + 2l * CS * CS   // CS: in-chunk cumsum of log-decay
+        var egc = gcum + CS                 // CS: e^{gcum}
+        var kgc = gcum + 2l * CS            // CS: e^{g_last - gcum}
+        var c0 = 0l
+        while (c0 < npos) {
+            let cl = min(CS, npos - c0)
+            // gather + per-token transforms (beta/g raw -> beta = sigmoid, g = a·softplus(raw+dt))
+            var gacc = 0.0
+            for (i in range64(cl)) {
+                let crow = conv + (c0 + i) * cd
+                let bv = 1.0 / (1.0 + exp(-bp[(c0 + i) * bg_stride]))
+                gacc += aa * softplus(gp[(c0 + i) * bg_stride] + dtb)
+                gcum[i] = gacc
+                egc[i] = exp(gacc)
+                for (j in range64(ds)) {
+                    let kv = crow[koff + j]
+                    qc[i * ds + j] = crow[qoff + j]
+                    kcT[j * cl + i] = kv
+                    kb[i * ds + j] = kv * bv
+                    vb[i * ds + j] = crow[voff + j] * bv
+                }
+            }
+            // A = (k_beta k^T) ⊙ decay, strictly lower, negated for the in-place solve; KQ keeps
+            // its diagonal (decay 1 there)
+            for (i in range64(cl * cl)) {
+                tm[i] = 0.0
+                kq[i] = 0.0
+            }
+            gemm_f32(tm, kb, kcT, cl, ds, cl)
+            gemm_f32(kq, qc, kcT, cl, ds, cl)
+            for (i in range64(cl)) {
+                let gi = gcum[i]
+                for (j in range64(cl)) {
+                    if (j < i) {
+                        let d = exp(gi - gcum[j])
+                        tm[i * cl + j] = -tm[i * cl + j] * d
+                        kq[i * cl + j] *= d
+                    } elif (j == i) {
+                        tm[i * cl + j] = 0.0
+                    } else {
+                        tm[i * cl + j] = 0.0
+                        kq[i * cl + j] = 0.0
+                    }
+                }
+            }
+            // forward substitution in place: T[i][j] = -A[i][j] - sum_t A[i][t] T[t][j]; row i
+            // reads only final rows t < i and its own untouched -A coefficients at t > j
+            for (i in range64(cl)) {
+                for (tt in range64(i)) {
+                    let coef = tm[i * cl + tt]
+                    for (j in range64(tt)) {
+                        tm[i * cl + j] += coef * tm[tt * cl + j]
+                    }
+                }
+                tm[i * cl + i] = 1.0
+            }
+            // d = T v_beta - (T (k_beta ⊙ e^{gcum})) S — kb scaled in place, minus folded into w
+            for (i in range64(cl)) {
+                scale_inplace(kb + i * ds, -egc[i], ds)
+            }
+            for (i in range64(cl * ds)) {
+                w[i] = 0.0
+                vnew[i] = 0.0
+            }
+            gemm_f32(w, tm, kb, cl, cl, ds)
+            gemm_f32(vnew, tm, vb, cl, cl, ds)
+            gemm_f32(vnew, w, stp, cl, ds, ds)
+            // o = (q ⊙ e^{gcum}) S + KQ d (qc scaled in place after its raw-q GEMM above)
+            for (i in range64(cl)) {
+                scale_inplace(qc + i * ds, egc[i], ds)
+            }
+            for (i in range64(cl * ds)) {
+                och[i] = 0.0
+            }
+            gemm_f32(och, qc, stp, cl, ds, ds)
+            gemm_f32(och, kq, vnew, cl, cl, ds)
+            // gated out-norm straight into the batched output rows
+            for (i in range64(cl)) {
+                rmsnorm(och + i * ds, reinterpret<float const?>(och + i * ds), wnorm, ds, eps)
+                var orow = op + (c0 + i) * o_stride
+                let zrow = zp + (c0 + i) * o_stride
+                for (j in range64(ds)) {
+                    let zv = zrow[j]
+                    orow[j] = och[i * ds + j] * (zv / (1.0 + exp(-zv)))
+                }
+            }
+            // state advance, once per chunk: S = e^{g_last} S + (k ⊙ e^{g_last - gcum})^T d
+            let glast = gcum[cl - 1l]
+            scale_inplace(stp, exp(glast), ds * ds)
+            for (i in range64(cl)) {
+                kgc[i] = exp(glast - gcum[i])
+            }
+            for (j in range64(ds)) {
+                var kr = kgT + j * cl
+                let ks = kcT + j * cl
+                for (i in range64(cl)) {
+                    kr[i] = ks[i] * kgc[i]
+                }
+            }
+            gemm_f32(stp, kgT, vnew, ds, cl, ds)
+            c0 += cl
+        }
+    }
+}
+
+// The chunked deltanet prefill core: batched conv rows, then the per-v-head chunk pass threaded
+// over heads (each head's state chain is independent; per-head slabs in dn_cws).
+def private deltanet_prefill_chunked(t : Model; var s : Session; l : int64; npos : int64) {
+    let c = t.config
+    let cd = dn_conv_dim(c)
+    let kd = dn_key_dim(c)
+    let di = c.ssm_d_inner
+    let nvh = c.ssm_dt_rank
+    let nkh = c.ssm_n_group
+    let ds = c.ssm_d_state
+    dn_conv_batch(t, s, l, npos)
+    var conv0 : float const?
+    var bp0 : float const?
+    var gp0 : float const?
+    var zp0 : float const?
+    var op0 : float?
+    var st0 : float?
+    var ws0 : float?
+    var wnorm0 : float const?
+    var ab0 : float const?
+    var dtb0 : float const?
+    unsafe {
+        conv0 = reinterpret<float const?>(addr(s.dn_conv_b[0]))
+        bp0 = reinterpret<float const?>(addr(s.dn_beta_b[0]))
+        gp0 = reinterpret<float const?>(addr(s.dn_g_b[0]))
+        zp0 = reinterpret<float const?>(addr(s.dn_z_b[0]))
+        op0 = addr(s.dn_o_b[0])
+        st0 = addr(s.dn_state[s.dn_state_prefix[l]])
+        ws0 = addr(s.dn_cws[0])
+        wnorm0 = reinterpret<float const?>(addr(t.fblob[t.dn_norm_off + l * ds]))
+        ab0 = reinterpret<float const?>(addr(t.fblob[t.dn_a_off + l * nvh]))
+        dtb0 = reinterpret<float const?>(addr(t.fblob[t.dn_dt_off + l * nvh]))
+    }
+    let wssz = dn_cws_head_size(c)
+    maybe_parallel_for(0, int(nvh), min(int(nvh), get_dispatch_lanes())) $(rb, re) {
+        unsafe {
+            for (hh in range(rb, re)) {
+                let h = int64(hh)
+                let kh = h % nkh   // k-heads repeat cyclically onto v-heads (ggml_repeat: h % nkh)
+                dn_chunked_head(conv0, kh * ds, kd + kh * ds, 2l * kd + h * ds, cd,
+                    bp0 + h, gp0 + h, nvh, zp0 + h * ds, op0 + h * ds, di,
+                    st0 + h * ds * ds, ws0 + h * wssz, wnorm0,
+                    ab0[h], dtb0[h], c.norm_eps, npos, ds)
+            }
+        }
+    }
+}
+
 // qwen35 deltanet prefill: batched projections, then the inherently sequential per-token core
 // (state carried across positions), then one batched ssm_out projection + residual.
 def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64) {
@@ -6704,14 +7011,18 @@ def private deltanet_prefill(t : Model; var s : Session; l : int64; npos : int64
     }
     prof_add("mm_qkv", ts_qkv)
     let ts_attn = ref_time_ticks()
-    unsafe {
-        let qkvp = reinterpret<float const?>(addr(s.dn_qkv_b[0]))
-        var zp = addr(s.dn_z_b[0])
-        var bp = addr(s.dn_beta_b[0])
-        var gp = addr(s.dn_g_b[0])
-        var op = addr(s.dn_o_b[0])
-        for (p in range64(npos)) {
-            dn_token_core(t, s, l, qkvp + p * cd, zp + p * di, bp + p * nvh, gp + p * nvh, op + p * di)
+    if (g_dn_prefill_mode == DnPrefillMode.chunked && npos > 1l) {   // single rows: recurrent is cheaper
+        deltanet_prefill_chunked(t, s, l, npos)
+    } else {
+        unsafe {
+            let qkvp = reinterpret<float const?>(addr(s.dn_qkv_b[0]))
+            var zp = addr(s.dn_z_b[0])
+            var bp = addr(s.dn_beta_b[0])
+            var gp = addr(s.dn_g_b[0])
+            var op = addr(s.dn_o_b[0])
+            for (p in range64(npos)) {
+                dn_token_core(t, s, l, qkvp + p * cd, zp + p * di, bp + p * nvh, gp + p * nvh, op + p * di)
+            }
         }
     }
     prof_add("attn", ts_attn)
@@ -7794,6 +8105,11 @@ def private forward_prefill_alloc(t : Model; var s : Session; npos, start_pos : 
         s.dn_beta_b |> resize(npos * c.ssm_dt_rank)
         s.dn_g_b |> resize(npos * c.ssm_dt_rank)
         s.dn_o_b |> resize(npos * c.ssm_d_inner)
+        if (g_dn_prefill_mode == DnPrefillMode.chunked) {   // batched conv rows + per-head chunk slabs
+            s.dn_conv_b |> resize(npos * cd)
+            s.dn_wtap |> resize(c.ssm_d_conv * cd)
+            s.dn_cws |> resize(c.ssm_dt_rank * dn_cws_head_size(c))
+        }
     }
     if (c.q_gated) {   // gated attention: batched fused [q | gate] projection + gate halves
         s.dn_qg_b |> resize(npos * 2l * qd)

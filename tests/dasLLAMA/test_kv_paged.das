@@ -1,6 +1,6 @@
 options gen2
 options persistent_heap   // the paged/flat A/Bs hold several Sessions (see test_forward.das)
-options stack = 65536
+options stack = 131072   // several Sessions per frame; the qwen35 dn_* Session fields tipped the eval_batch case over 64K
 
 require dastest/testing_boost public
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration

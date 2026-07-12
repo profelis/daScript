@@ -33,7 +33,7 @@ def private same(a, b : array<int64>) : bool {
 // The pinned-kernel generate-and-compare core: greedily continue `prompt` on a loaded model and
 // return whether the continuation matches `want` token-for-token. Kept free of T? so the [test]'s
 // run()-lambda captures no array by move.
-def private parity_gen_ok(tr : Model; prompt, want : array<int64>) : bool {
+def private parity_gen_ok(tr : Model; prompt, want : array<int64>; dn_chunked : bool = false) : bool {
     let n_gen = length(want)
     var ok = false
     // Token-exact oracle gate => run the BIT-EXACT classic prefill attention, not the (default) flash:
@@ -46,6 +46,10 @@ def private parity_gen_ok(tr : Model; prompt, want : array<int64>) : bool {
     // reasoning as the attention pin above. exp4 staying within tolerance is covered by test_silu.
     let prev_act = get_act_vec()
     set_act_vec(false)
+    // ...and the per-token recurrent deltanet prefill (the form the hybrid fixtures were frozen
+    // in), not the (default) chunked — same reasoning again; chunked gets its own explicit arms.
+    let prev_dn = get_deltanet_prefill_mode()
+    set_deltanet_prefill_mode(dn_chunked ? DnPrefillMode.chunked : DnPrefillMode.recurrent)
     with_job_que() {
         setup_dasllama_jobque()
         var s = make_run_state(tr.config)
@@ -59,6 +63,7 @@ def private parity_gen_ok(tr : Model; prompt, want : array<int64>) : bool {
     }
     set_prefill_attn_mode(prev_attn)
     set_act_vec(prev_act)
+    set_deltanet_prefill_mode(prev_dn)
     return ok
 }
 
@@ -314,7 +319,13 @@ def test_parity_qwen35_08b(t : T?) {
         }
         let path = path_join(models_dir(), "Qwen3.5-0.8B-Q8_0.gguf")
         if (!model_available(t, path)) return
-        t |> success(parity_ok(path, QuantMode.q8, QWEN3_PROMPT, QWEN3_GEN), "qwen3.5-0.8b token-for-token")
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3.5-0.8b token-for-token")
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN, [dn_chunked = true]), "qwen3.5-0.8b chunked-prefill token-for-token")
+        delete tr
     }
 }
 
@@ -339,6 +350,7 @@ def test_parity_qwen35moe_35b(t : T?) {
         set_moe_grouped_prefill(false)
         t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen35moe reference-prefill token-for-token")
         set_moe_grouped_prefill(true)
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN, [dn_chunked = true]), "qwen35moe chunked-prefill token-for-token")
         delete tr
     }
 }
