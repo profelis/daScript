@@ -46,6 +46,7 @@ struct private StreamWire {
     id : string                     // "chatcmpl-N" / "cmpl-N"
     created : int64
     reply_parts : array<string>     // non-streaming: pieces accumulate until the finished event
+    utf8_tail : string              // streaming: held-back bytes of a multi-byte char split across tokens
 }
 
 var g_wires : table<int64; StreamWire>
@@ -235,6 +236,31 @@ def private error_body(msg, kind : string) : string {
 def private bad_request(srv : WebSocketServer; var writer : HttpResponseWriter?; msg : string) {
     respond(srv, writer, int(http_status.BAD_REQUEST), "application/json",
             error_body(msg, "invalid_request_error"))
+}
+
+// Bytes of an INCOMPLETE trailing UTF-8 sequence (0 = the string ends on a character boundary).
+// A token piece can end mid-character (multi-byte chars span BPE tokens); every SSE delta must
+// be valid UTF-8 on its own or strict clients (the OpenAI python lib) abort the stream.
+def private utf8_hold_bytes(s : string) : int {
+    var hold = 0
+    peek_data(s) $(arr) {
+        let n = length(arr)
+        var back = 0
+        while (back < 4 && back < n) {
+            let b = uint(arr[n - 1 - back])
+            if ((b & 0xC0u) != 0x80u) {         // found a non-continuation byte
+                if (b >= 0xC0u) {               // multi-byte lead: expected sequence length
+                    let need = b >= 0xF0u ? 4 : (b >= 0xE0u ? 3 : 2)
+                    if (back + 1 < need) {
+                        hold = back + 1         // sequence is cut short — hold it back
+                    }
+                }
+                break                           // ascii / complete / invalid: nothing to hold
+            }
+            back++
+        }
+    }
+    return hold
 }
 
 // One chat.completion.chunk SSE event. role-only for the opening delta, content for each token,
@@ -464,10 +490,21 @@ def private flush_events(srv : WebSocketServer) {
         if (e.kind == SchedEventKind.piece) {
             if (!w.streaming) {
                 w.reply_parts |> push(e.text)
-            } elif (w.is_chat) {
-                send_chat_chunk(srv, w.writer, w.id, w.created, "", e.text, "")
             } else {
-                send_compl_chunk(srv, w.writer, w.id, w.created, e.text, "")
+                // re-join any held-back partial character, then hold the new incomplete tail
+                // so every delta on the wire is valid UTF-8 by itself
+                let whole = "{w.utf8_tail}{e.text}"
+                let hold = utf8_hold_bytes(whole)
+                let cut = length(whole) - hold
+                let emit_now = hold > 0 ? slice(whole, 0, cut) : whole
+                w.utf8_tail = hold > 0 ? slice(whole, cut) : ""
+                if (!empty(emit_now)) {
+                    if (w.is_chat) {
+                        send_chat_chunk(srv, w.writer, w.id, w.created, "", emit_now, "")
+                    } else {
+                        send_compl_chunk(srv, w.writer, w.id, w.created, emit_now, "")
+                    }
+                }
             }
             continue
         }
