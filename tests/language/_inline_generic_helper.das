@@ -1,5 +1,7 @@
 options gen2
 
+module _inline_generic_helper public
+
 // fixture for the cross-origin generic-instance fence (optimization_auto_inline_functions):
 // a generic defined HERE and instantiated from the test module produces an instance whose
 // fromGeneric->module differs from the compiling module. heuristic sites inside such an
