@@ -7213,6 +7213,7 @@ struct BatchWorkspace {
     // delete of a plain array<T?> CASCADES to the pointees, which would free the sessions' cache blobs
     @do_not_delete kbase : array<uint8?>
     @do_not_delete vbase : array<uint8?>
+    @do_not_delete lrow : array<float?>   // row i's sessions[i].logits base (the threaded scatter)
     runs_b : array<KVRun>     // per-row physical runs, flattened rows × max-runs (flat rows: 1 each)
     nrun_b : array<int64>     // per-row run count
 }
@@ -7489,17 +7490,31 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
     } else {
         mm_b(ws.logits_b, t, t.wcls_off, ws.scr.xb_b, ws.scr.xqb, ws.scr.xsb, dim, vocab, nrows)
     }
-    if (c.final_logit_softcap > 0.0) {  // Gemma2: soft-cap the output logits per row
-        unsafe {
-            var lbp = addr(ws.logits_b[0])
-            for (i in range64(nrows)) {
-                softcap4(lbp + i * vocab, vocab, c.final_logit_softcap)
+    // per-row softcap + scatter into each session's logits + suppress pins, ONE row-parallel
+    // dispatch — the serial tail here was most of a ~6ms all-lane hole every step at B=8
+    // (B x vocab ≈ 5MB of copy). Rows are disjoint (row i writes only sessions[i].logits).
+    ws.lrow |> resize(int(nrows))
+    unsafe {
+        for (i in range64(nrows)) {
+            ws.lrow[i] = addr(sessions[i].logits[0])
+        }
+        var lbp = addr(ws.logits_b[0])
+        var lrp = addr(ws.lrow[0])
+        let softcap = c.final_logit_softcap
+        maybe_parallel_for(0, int(nrows), min(int(nrows), get_dispatch_lanes())) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    var src = lbp + int64(i) * vocab
+                    if (softcap > 0.0) {  // Gemma2: soft-cap the output logits per row
+                        softcap4(src, vocab, softcap)
+                    }
+                    copy_floats(lrp[i], src, vocab)
+                }
             }
         }
     }
     for (i in range64(nrows)) {
         var sp = sessions[i]
-        copy_floats(ws.logits_b, i * vocab, sp.logits, 0l, vocab)
         for (id in t.suppress) {  // gemma4: pin the checkpoint's suppressed token ids to -inf
             sp.logits[id] = -1.0e30
         }
