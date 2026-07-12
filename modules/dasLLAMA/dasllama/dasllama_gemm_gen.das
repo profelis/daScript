@@ -779,6 +779,56 @@ def private kq_dot_lane(var te : TileEmit; var acc, qv, xv : LLVMOpaqueValue?; l
     return LLVMBuildCall2(b, te.dp_ty, te.dp_decl, dargs, "dot")
 }
 
+// activation dword BROADCAST FROM MEMORY at BYTE offset (x64 legs): the register-splat form
+// costs a shuffle uop per dot that competes with pmaddubsw on FP1 (Zen2); vpbroadcastd m32
+// folds the splat into the load port instead — llama.cpp's repacked-GEMM transport. Same
+// dword, same value: bit-identical results, only the port mix changes.
+def private bcast_dword(var te : TileEmit; var xp, off : LLVMOpaqueValue?; name : string) : LLVMOpaqueValue? {
+    let b = te.builder
+    var p = LLVMBuildGEP2(b, te.types.t_int8, xp, off, name)
+    var s = LLVMBuildLoad2Aligned(b, te.types.t_int32, p, 1u, name)
+    var one = LLVMBuildInsertElement(b, LLVMGetUndef(te.vni32), s, te.types->ConstI32(0ul), "")
+    let mask <- [for (_i in range(te.rv)); 0]
+    var xspl = LLVMBuildShuffleVector(b, te.types, one, one, mask, name)
+    return LLVMBuildBitCast(b, xspl, te.vwi8, "")
+}
+
+// one K-quant lane-dot over a memory-broadcast activation dword (the non-maddubs x64 legs —
+// vpdpbusd/bssd are already one dot uop per 32B; maddubs rides the i16 lattice below instead)
+def private kq_dot_mem(var te : TileEmit; var acc, qv, xb : LLVMOpaqueValue?) : LLVMOpaqueValue? {
+    let b = te.builder
+    if (te.dotKind == DOT_MADDUBS) {
+        var margs <- [qv, xb]
+        var pairs = LLVMBuildCall2(b, te.madd_ty, te.madd_decl, margs, "pairs")
+        var wargs <- [pairs, ones_i16(te)]
+        var quads = LLVMBuildCall2(b, te.maddwd_ty, te.maddwd_decl, wargs, "quads")
+        return LLVMBuildAdd(b, acc, quads, "dot")
+    }
+    var dargs <- [acc, qv, xb]
+    return LLVMBuildCall2(b, te.dp_ty, te.dp_decl, dargs, "dot")
+}
+
+// one pmaddubsw into an i16 pair-sum chain (null chain head = the first madd). The K-quant i16
+// lattice: with UNSIGNED quants the pair-sums are bounded (k4 ±3810, k5 ±7874, k6 ±16002), so
+// several 32B dots accumulate EXACTLY in i16 — k4 all 8 of a sub-block (±30480), k5 four
+// (±31496), k6 two (±32004) — before ONE pmaddwd widens the chain. Cuts the maddubs lattice
+// from 3 uops/32B to ~2.1 (k4). Integer totals are identical, so results stay bit-exact.
+def private madd16_acc(var te : TileEmit; var chain, qv, xb : LLVMOpaqueValue?) : LLVMOpaqueValue? {
+    let b = te.builder
+    var margs <- [qv, xb]
+    var pairs = LLVMBuildCall2(b, te.madd_ty, te.madd_decl, margs, "pairs")
+    if (chain == null) return pairs
+    return LLVMBuildAdd(b, chain, pairs, "p16")
+}
+
+// widen an i16 chain into the i32 accumulator (pmaddwd against ones) — the chain flush
+def private madd16_flush(var te : TileEmit; var acc, chain : LLVMOpaqueValue?) : LLVMOpaqueValue? {
+    let b = te.builder
+    var wargs <- [chain, ones_i16(te)]
+    var quads = LLVMBuildCall2(b, te.maddwd_ty, te.maddwd_decl, wargs, "quads")
+    return LLVMBuildAdd(b, acc, quads, "a32")
+}
+
 // one <rv x i8> row-byte load at BYTE offset, each byte splatted across its row's 4 lanes to
 // vwi8 (constant shufflevector — the backend picks tbl/pshufb itself; no intrinsic needed)
 def private load_row_bytes_x4(var te : TileEmit; var base, off : LLVMOpaqueValue?; name : string) : LLVMOpaqueValue? {
@@ -838,20 +888,35 @@ def private emit_block_kq(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f :
     var maskHiElems <- [for (i in range(w8)); LLVMConstInt(te.types.t_int8, uint64(16 << (i % 4)), 0)]
     var maskLo = LLVMConstVector(array_data_ptr(maskLoElems), uint(w8))
     var maskHi = LLVMConstVector(array_data_ptr(maskHiElems), uint(w8))
+    // x64 dot kinds take the activation dword straight from memory (vpbroadcastd — see
+    // kq_dot_lane_mem); the NEON sdot lattice keeps its chunk loads + indexed-lane splats
+    let memBcast = te.dotKind != DOT_SDOT && te.dotKind != DOT_SMMLA
     for (blk in range(8)) {
         var xoff0 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32)), "")
         var xoff1 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32 + 16)), "")
         var xv0 : LLVMOpaqueValue? [4]
         var xv1 : LLVMOpaqueValue? [4]
-        for (i in range(tokCount)) {
-            xv0[i] = load_v16i8(te, te.x[tokBase + i], xoff0, "x{tokBase + i}_{blk}lo")
-            xv1[i] = load_v16i8(te, te.x[tokBase + i], xoff1, "x{tokBase + i}_{blk}hi")
+        if (!memBcast) {
+            for (i in range(tokCount)) {
+                xv0[i] = load_v16i8(te, te.x[tokBase + i], xoff0, "x{tokBase + i}_{blk}lo")
+                xv1[i] = load_v16i8(te, te.x[tokBase + i], xoff1, "x{tokBase + i}_{blk}hi")
+            }
         }
         var a0 : LLVMOpaqueValue? [8]     // [token * rq + qd]; tokCount*rq <= 8 (nrsplit*vq rail)
         var a1 : LLVMOpaqueValue? [8]
         for (i in range(tokCount * rq)) {
             a0[i] = LLVMConstNull(te.vni32)
             a1[i] = LLVMConstNull(te.vni32)
+        }
+        // the maddubs i16 lattice (see madd16_acc): k4/k5 run ONE combined lo+hi chain per
+        // (token, qd) flushed per the format's overflow bound; k6 keeps lo/hi chains apart
+        // (its per-16 scales fold them separately)
+        let madd16 = memBcast && te.dotKind == DOT_MADDUBS
+        var p16lo : LLVMOpaqueValue? [8]
+        var p16hi : LLVMOpaqueValue? [8]
+        for (i in range(tokCount * rq)) {
+            p16lo[i] = null
+            p16hi[i] = null
         }
         for (j in range(4)) {
             for (qd in range(rq)) {
@@ -877,10 +942,49 @@ def private emit_block_kq(var te : TileEmit; var sbi : LLVMOpaqueValue?; var f :
                     wlo = LLVMBuildOr(b, wlo, LLVMBuildShl(b, dlo, splat_i8w(te, 4), ""), "wlo6{blk}_{j * rq + qd}")
                     whi = LLVMBuildOr(b, whi, LLVMBuildShl(b, dhi, splat_i8w(te, 4), ""), "whi6{blk}_{j * rq + qd}")
                 }
-                for (i in range(tokCount)) {
-                    a0[i * rq + qd] = kq_dot_lane(te, a0[i * rq + qd], wlo, xv0[i], j)
-                    a1[i * rq + qd] = kq_dot_lane(te, a1[i * rq + qd], whi, xv1[i], j)
+                if (memBcast) {
+                    var doff0 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32 + j * 4)), "")
+                    var doff1 = LLVMBuildAdd(b, xb, te.types->ConstI64(uint64(blk * 32 + 16 + j * 4)), "")
+                    for (i in range(tokCount)) {
+                        var xlo = bcast_dword(te, te.x[tokBase + i], doff0, "xd{tokBase + i}_{blk}_{j}a")
+                        var xhi = bcast_dword(te, te.x[tokBase + i], doff1, "xd{tokBase + i}_{blk}_{j}b")
+                        if (madd16) {
+                            let k = i * rq + qd
+                            if (te.kq == 6) {
+                                p16lo[k] = madd16_acc(te, p16lo[k], wlo, xlo)
+                                p16hi[k] = madd16_acc(te, p16hi[k], whi, xhi)
+                            } else {
+                                p16lo[k] = madd16_acc(te, madd16_acc(te, p16lo[k], wlo, xlo), whi, xhi)
+                            }
+                        } else {
+                            a0[i * rq + qd] = kq_dot_mem(te, a0[i * rq + qd], wlo, xlo)
+                            a1[i * rq + qd] = kq_dot_mem(te, a1[i * rq + qd], whi, xhi)
+                        }
+                    }
+                } else {
+                    for (i in range(tokCount)) {
+                        a0[i * rq + qd] = kq_dot_lane(te, a0[i * rq + qd], wlo, xv0[i], j)
+                        a1[i * rq + qd] = kq_dot_lane(te, a1[i * rq + qd], whi, xv1[i], j)
+                    }
                 }
+            }
+            // i16 chain flushes at the format's overflow bound: k5 after 4 madds (j 1/3),
+            // k6 after 2 madds per chain (j 1/3); k4 runs the full 8 to the post-loop flush
+            if (madd16 && (j == 1 || j == 3) && te.kq != 4) {
+                for (k in range(tokCount * rq)) {
+                    a0[k] = madd16_flush(te, a0[k], p16lo[k])
+                    p16lo[k] = null
+                    if (te.kq == 6) {
+                        a1[k] = madd16_flush(te, a1[k], p16hi[k])
+                        p16hi[k] = null
+                    }
+                }
+            }
+        }
+        if (madd16 && te.kq == 4) {   // k4: one widen per (token, qd) for the whole sub-block
+            for (k in range(tokCount * rq)) {
+                a0[k] = madd16_flush(te, a0[k], p16lo[k])
+                p16lo[k] = null
             }
         }
         // per-sub-block fold; bIdx = the global 32-block index (activation scale/bsum space).
