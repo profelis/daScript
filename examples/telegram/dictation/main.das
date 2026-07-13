@@ -1,31 +1,27 @@
 options gen2
 options rtti                  // dasTelegram's JSON (sscan_json/sprint_json) needs rtti
-options persistent_heap       // dasLLAMA's big weight arrays + the GC below
 options gc                    // periodic heap_collect between messages (long-running bot)
-options stack = 262144        // dasLLAMA's forward chain runs deep
-options _jit_fast_math = true // inference tool, not the bit-exact test suite
+options stack = 262144        // dasTelegram + dasHV client chains run comfortably deep
 
 // dictation — a Telegram bot that transcribes voice/audio messages into clean, easy-to-read text.
-// It watches direct messages and groups; for every voice note or audio file it downloads the audio,
-// transcodes it to 16 kHz mono WAV with ffmpeg, transcribes it with a local whisper model
-// (auto-detecting the language), then rewrites the raw transcript into paragraph-split prose with a
-// local instruct LLM (dasLLAMA) — all offline. Model paths and options come from a TOML/JSON config
-// (see dictation.toml / README.md). Requires the JIT — run under `daslang -jit` or a released -exe.
+// It watches direct messages and groups; for every voice note or audio file it downloads the
+// audio, transcodes it to 16 kHz mono WAV with ffmpeg, and talks to a running dasllama-server:
+// /v1/audio/transcriptions for the speech-to-text, then /v1/chat/completions to rewrite the raw
+// transcript into paragraph-split prose. The bot itself is Telegram-only — no models, no job
+// queue, no JIT requirement; the server owns all inference (see utils/dasllama-server/).
+// Config comes from a TOML/JSON file (see dictation.toml / README.md).
 
 require telegram/tbot                 // dasTelegram (daspkg): getUpdates / getFile / download / sendMessage
-require dasllama/dasllama             // load_model / load_asr_model / transcribe / create_chat / respond
-require dasllama/dasllama_math        // set_dispatch_worker_limit (engine-level knob, not re-exported)
-require dasllama/dasllama_audio_io    // load_audio_16k_mono
-require llvm/daslib/llvm_tune         // [tune_policy] + log_tune_status
-require daslib/jobque_boost           // with_job_que + set_jobque_affinity
+require dashv/dashv_boost             // HTTP client: GET / POST (multipart form) / with_http_request
 require daslib/toml                   // read_toml (re-exports daslib/json: read_json + JsonValue)
-require daslib/json_boost             // operator ?? over JsonValue
+require daslib/json_boost             // operator ?? over JsonValue + JV
 require daslib/clargs                 // --config
 require daslib/module_path            // get_this_module_dir (config next to the exe in a release bundle)
 require daslib/fio                    // fopen / fwrite / popen_argv / temp_directory / remove / path_join / sleep
 require strings
 require daslib/strings_boost          // join / strip
 require daslib/logger                 // proper file logging (levels + dotted categories)
+require math                          // min/max (the llm_timeout clamp)
 
 // ===== command line =====
 
@@ -44,14 +40,13 @@ struct DictationArgs {
 // ===== config =====
 
 struct DictationConfig {
-    whisper_model : string            // path to the whisper ggml .bin (ASR)
-    llm_model : string                // path to the instruct LLM GGUF (cleanup/reformat)
+    server : string = "http://127.0.0.1:8080"   // dasllama-server base URL (needs asr = in ITS config)
     bot_token : string                // Telegram bot token (TELEGRAM_BOT_TOKEN env overrides)
-    threads : int = 8                 // matmul dispatch lane cap, same semantics as dasllama-server (-1 = all cores)
-    affinity : int = 0                // worker CPU affinity: 0 off / 1 ideal-CPU hint / 2 hard mask (DAS_JOBQUE_AFFINITY env overrides)
-    language : string = "auto"        // whisper language hint ("auto" detects per message)
+    prompt : string = ""              // dictation system prompt ("" = built-in; "\{lang}" is replaced with the detected language)
+    language : string = "auto"        // ASR language hint ("auto" detects per message)
     max_tokens : int = 2048           // reply-token budget for the LLM cleanup
     temp : float = 0.0                // LLM sampling temperature (0 = greedy, faithful)
+    llm_timeout : int = 300           // seconds to wait for the LLM cleanup response
     ffmpeg : string = "ffmpeg"        // ffmpeg executable (on PATH or an absolute path)
     poll_timeout : int = 30           // getUpdates long-poll timeout, seconds
     log_file : string = ""            // log file path ("" = dictation.log next to the exe)
@@ -60,23 +55,18 @@ struct DictationConfig {
     keep_audio_dir : string = ""      // if set, archive each received audio here ("" = don't keep)
 }
 
-// Persistent state lives in GLOBALS, never on the poll loop's stack. Under the JIT the heap
-// collector cannot see JIT-stack locals, so a local holding the models/config across a
-// heap_collect would be swept out from under us (segfault). As globals they are GC roots, so
-// heap_collect(true, true) between messages is safe. Everything the loop touches is either a
-// global (here) or an ephemeral local inside process_message that is gone before the collect.
+// Persistent state lives in GLOBALS, never on the poll loop's stack — under the JIT the heap
+// collector cannot see JIT-stack locals, so anything held across heap_collect must be a GC root.
 var g_cfg = DictationConfig()
-var g_asr = AsrModel()
-var g_llm = Model()
 
-// The dictation system prompt (proven on the sample voice notes): rewrite the raw transcript into a
-// clean, easy-to-read message split into short paragraphs, in the source language. Not a verbatim
-// transcript — filler / false-starts / mumbling are dropped, obvious ASR mishearings fixed, and the
-// speaker's meaning, tone and register (including strong language) are preserved.
-def dictation_system_prompt(lang : string) : string {
+// The built-in dictation system prompt (proven on the sample voice notes) — the default when the
+// config declares no `prompt`. Rewrite the raw transcript into a clean, easy-to-read message
+// split into short paragraphs, in the source language; filler / false-starts / mumbling are
+// dropped, obvious ASR mishearings fixed, and the speaker's meaning, tone and register kept.
+def default_prompt() : string {
     return ("You are a dictation editor. You receive a raw speech-to-text transcript of a voice message. " +
             "It is full of filler words, false starts, repetitions, mumbling and recognition errors. Its " +
-            "main language is \"{lang}\", but the speaker may switch languages mid-message. Write in the " +
+            "main language is \"\{lang}\", but the speaker may switch languages mid-message. Write in the " +
             "SAME language(s) the speaker used — keep every part in its original language and NEVER translate " +
             "any part into another language.\n\n" +
             "Clean it up into an easy-to-read message. Rules:\n" +
@@ -92,6 +82,13 @@ def dictation_system_prompt(lang : string) : string {
             "- Keep the speaker's meaning, tone and register — including slang and strong language.\n" +
             "- Do not add a summary, a title, opinions, or facts the speaker did not express. Output only " +
             "the cleaned message text.")
+}
+
+// The system prompt for one message: the config's prompt (or the built-in), with the literal
+// "\{lang}" placeholder replaced by the detected/hinted language.
+def dictation_system_prompt(lang : string) : string {
+    let tmpl = empty(g_cfg.prompt) ? default_prompt() : g_cfg.prompt
+    return replace(tmpl, "\{lang}", lang)
 }
 
 def private resolve_config_path(cli_config : string) : string {
@@ -125,14 +122,13 @@ def load_config(path : string; var err : string&) : DictationConfig {
         err = "could not parse {path}: {perr}"
         return cfg
     }
-    cfg.whisper_model = js?["whisper_model"] ?? cfg.whisper_model
-    cfg.llm_model     = js?["llm_model"] ?? cfg.llm_model
+    cfg.server        = js?["server"] ?? cfg.server
     cfg.bot_token     = js?["bot_token"] ?? cfg.bot_token
-    cfg.threads       = js?["threads"] ?? cfg.threads
-    cfg.affinity      = js?["affinity"] ?? cfg.affinity
+    cfg.prompt        = js?["prompt"] ?? cfg.prompt
     cfg.language      = js?["language"] ?? cfg.language
     cfg.max_tokens    = js?["max_tokens"] ?? cfg.max_tokens
     cfg.temp          = js?["temp"] ?? cfg.temp
+    cfg.llm_timeout   = js?["llm_timeout"] ?? cfg.llm_timeout
     cfg.ffmpeg        = js?["ffmpeg"] ?? cfg.ffmpeg
     cfg.poll_timeout  = js?["poll_timeout"] ?? cfg.poll_timeout
     cfg.log_file      = js?["log_file"] ?? cfg.log_file
@@ -160,13 +156,93 @@ def private parse_log_level(s : string) : int {
 }
 
 // Report a fatal startup error to BOTH the console and the log file, then the caller returns
-// false so main() exits non-zero. A bare panic() in a standalone -exe aborts the process
-// silently (panic in a jitted frame), turning a bad model path into a mysterious exit with no
-// message — so startup failures are reported explicitly here. Call after logger_set_path().
+// false so main() exits non-zero. Call after logger_set_path().
 def private fatal(msg : string) {
     to_log(LOG_ERROR, "dictation: {msg}\n")   // console (stdout, level-tagged)
     logger_error("dictation", msg)            // log file
     logger_flush()
+}
+
+// ===== dasllama-server client =====
+
+// POST the WAV to /v1/audio/transcriptions (multipart, hv fills the file part from the path).
+// verbose_json so the response carries the DETECTED language alongside the text. Returns false
+// on transport/HTTP/parse failure with `err` set.
+def private server_transcribe(wav : string; var text : string&; var lang : string&; var err : string&) : bool {
+    var ok = false
+    var headers : table<string; string>
+    var form <- {
+        "file" => "@{wav}",
+        "language" => g_cfg.language,
+        "response_format" => "verbose_json"
+    }
+    POST("{g_cfg.server}/v1/audio/transcriptions", "", headers, form) $(resp) {
+        if (resp == null) {
+            err = "no response from {g_cfg.server} (server down?)"
+        } elif (resp.status_code != http_status.OK) {
+            err = "transcription HTTP {int(resp.status_code)}: {string(resp.body)}"
+        } else {
+            var perr = ""
+            var js = read_json(string(resp.body), perr)
+            if (js == null) {
+                err = "bad transcription JSON: {perr}"
+            } else {
+                text = js?["text"] ?? ""
+                lang = js?["language"] ?? ""
+                if (empty(lang)) {
+                    lang = g_cfg.language   // parakeet reports no language; whisper may too
+                }
+                ok = true
+                unsafe {
+                    delete js
+                }
+            }
+        }
+    }
+    delete form
+    return ok
+}
+
+// POST the transcript through /v1/chat/completions (buffered — the bot replies whole messages).
+// Generation of a long note can run minutes, so the request carries its own timeout.
+def private server_cleanup(transcript : string; lang : string; var reply : string&; var err : string&) : bool {
+    var msgs : array<JsonValue?>
+    msgs |> push(JV((role = "system", content = dictation_system_prompt(lang))))
+    msgs |> push(JV((role = "user", content = transcript)))
+    var body = JV((temperature = g_cfg.temp, max_tokens = g_cfg.max_tokens, messages <- msgs))
+    let body_json = write_json(body)
+    delete_json(body)
+    var ok = false
+    with_http_request() <| $(var req) {
+        req.method = http_method.POST
+        req.url := "{g_cfg.server}/v1/chat/completions"
+        req.timeout = uint16(max(1, min(g_cfg.llm_timeout, 65535)))
+        set_header(req, "Content-Type", "application/json")
+        req.body := body_json
+        request(req) <| $(resp) {
+            if (resp == null) {
+                err = "no response from {g_cfg.server} (server down?)"
+            } elif (resp.status_code != http_status.OK) {
+                err = "chat HTTP {int(resp.status_code)}: {string(resp.body)}"
+            } else {
+                var perr = ""
+                var js = read_json(string(resp.body), perr)
+                if (js == null) {
+                    err = "bad chat JSON: {perr}"
+                } else {
+                    reply = js?["choices"]?[0]?["message"]?["content"] ?? ""
+                    ok = !empty(reply)
+                    if (!ok) {
+                        err = "chat response carried no content"
+                    }
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+        }
+    }
+    return ok
 }
 
 // ===== audio helpers =====
@@ -265,10 +341,9 @@ def private send_reply(msg : message; text : string) {
 
 // ===== pipeline =====
 
-// Download → transcode → transcribe → clean → reply. Reads the global models/config; every heavy
-// allocation (bytes, samples, ASR session, chat session) is a local here and is `delete`d as soon
-// as it's done, to keep GC pressure low. Anything not deleted (on an error path) is out of scope on
-// return and reclaimed by main's heap_collect. Call inside with_job_que().
+// Download → transcode → server transcribe → server cleanup → reply. Every heavy allocation
+// (download bytes, JSON trees) is a local here and is freed as soon as it's done; anything not
+// deleted on an error path is out of scope on return and reclaimed by main's heap_collect.
 def process_message(msg : message) {
     var kind = ""
     let file_id = audio_of(msg, kind)
@@ -293,7 +368,7 @@ def process_message(msg : message) {
         return
     }
 
-    // stage to temp, transcode to wav, decode to samples
+    // stage to temp, transcode to wav
     let base = path_join(tmpdir(), "dictation_{finfo.file_unique_id}")
     let src = "{base}.audio"
     let wav = "{base}.wav"
@@ -324,23 +399,22 @@ def process_message(msg : message) {
         notify(msg, "Couldn't decode that audio format.")
         return
     }
-    var samples <- load_audio_16k_mono(wav)
+
+    // speech-to-text on the server (verbose_json carries the detected language)
+    var transcript = ""
+    var lang = g_cfg.language
+    var terr = ""
+    let tok = server_transcribe(wav, transcript, lang, terr)
     remove(wav)
-    if (empty(samples)) {
-        notify(msg, "Couldn't read the decoded audio.")
+    if (!tok) {
+        logger_error("dictation.msg", "transcription failed: {terr}")
+        notify(msg, "Transcription is unavailable right now, sorry.")
         return
     }
-
-    // transcribe (auto-detect) then rewrite into clean paragraphs, in the source language
-    var s <- create_session(g_asr, g_cfg.language)
-    let transcript = transcribe(g_asr, s, samples)
-    let lang = empty(s.detected_lang) ? g_cfg.language : s.detected_lang
-    delete samples   // decoded audio buffer no longer needed
-    delete s         // ASR session scratch
     // transcript in the full log, linked to its archived audio file (empty audio if archiving is off)
     logger_info("dictation.msg", "transcript: {transcript}", JV((lang = lang, audio = archived)))
 
-    // no usable speech -> don't waste the LLM. Empty always skips; min_chars also drops Whisper's
+    // no usable speech -> don't waste the LLM. Empty always skips; min_chars also drops the ASR's
     // short silence hallucinations. Stay quiet in groups; only tell the user in a DM.
     let stripped = strip(transcript)
     if (length(stripped) <= g_cfg.min_chars) {
@@ -349,14 +423,14 @@ def process_message(msg : message) {
         return
     }
 
-    var chat = create_chat(g_llm, dictation_system_prompt(lang), int64(g_cfg.max_tokens))
-    add_user(chat, transcript)
-    var params = SamplingParams()
-    params.temp = g_cfg.temp
-    let reply = respond(g_llm, chat, params) $(_piece) {
-        return true
+    // LLM cleanup on the server
+    var reply = ""
+    var cerr = ""
+    if (!server_cleanup(transcript, lang, reply, cerr)) {
+        logger_error("dictation.msg", "cleanup failed: {cerr}")
+        notify(msg, "The cleanup step is unavailable right now — raw transcript:\n\n{transcript}")
+        return
     }
-    delete chat   // heavy KV-cache / chat session
     logger_info("dictation.msg", "reply: {reply}")
 
     // attribute the reply: in groups, prefix the sender's name; always thread it to the voice note
@@ -371,8 +445,6 @@ def process_message(msg : message) {
 }
 
 // One long-poll round: fetch updates, process each message. offset is threaded back so we ack them.
-// Reads the global config/models; its own locals (updates + everything under process_message) are
-// ephemeral and gone by the time the caller runs heap_collect.
 def poll_once(var offset : int64&) {
     let updates <- telegram_getUpdates(get_updates(offset = offset, timeout = int64(g_cfg.poll_timeout), limit = 100l))
     let err = telegram_get_last_error()
@@ -389,9 +461,47 @@ def poll_once(var offset : int64&) {
     }
 }
 
-// One-time startup: parse args, load config into g_cfg, set up logging, load the models into the
-// globals, connect to Telegram. Kept OUT of main so none of its string/model locals ever sit on the
-// poll loop's JIT stack (where the collector can't see them). Returns false to exit with *out_rc.
+// The server must be up AND have an ASR model loaded (asr = in ITS config) — /v1/models lists a
+// "<model>-asr" entry when it does. A clear startup error beats a 404 on the first voice note.
+def private check_server(var out_llm : string&; var out_asr : bool&; var err : string&) : bool {
+    var ok = false
+    GET("{g_cfg.server}/v1/models") $(resp) {
+        if (resp == null) {
+            err = "dasllama-server unreachable at {g_cfg.server} — start it first"
+        } elif (resp.status_code != http_status.OK) {
+            err = "dasllama-server at {g_cfg.server} answered HTTP {int(resp.status_code)}"
+        } else {
+            var perr = ""
+            var js = read_json(string(resp.body), perr)
+            if (js == null) {
+                err = "bad /v1/models JSON: {perr}"
+            } else {
+                let data = js?["data"]
+                if (data != null && data is _array) {
+                    for (m in data as _array) {
+                        let mid : string = m?["id"] ?? ""
+                        if (ends_with(mid, "-asr")) {
+                            out_asr = true
+                        } elif (empty(out_llm)) {
+                            out_llm = mid
+                        }
+                    }
+                }
+                ok = !empty(out_llm)
+                if (!ok) {
+                    err = "dasllama-server at {g_cfg.server} lists no model"
+                }
+                unsafe {
+                    delete js
+                }
+            }
+        }
+    }
+    return ok
+}
+
+// One-time startup: parse args, load config into g_cfg, set up logging, check the server,
+// connect to Telegram. Returns false to exit with *out_rc.
 def init(var out_rc : int&) : bool {
     var r <- parse_args(type<DictationArgs>)
     if (r |> is_err) {
@@ -412,7 +522,7 @@ def init(var out_rc : int&) : bool {
 
     // Set up logging FIRST so every fatal startup error below is written to the log file as
     // well as the console — not silently dropped. On a config failure g_cfg is defaulted, so
-    // this still resolves to <exe_dir>/dictation.log. Engine (dasLLAMA/JIT) noise stays on stdout.
+    // this still resolves to <exe_dir>/dictation.log.
     let logpath = empty(g_cfg.log_file) ? path_join(get_this_module_dir(), "dictation.log") : g_cfg.log_file
     logger_set_path(logpath)
     logger_set_min_level(parse_log_level(g_cfg.log_level))
@@ -428,74 +538,36 @@ def init(var out_rc : int&) : bool {
         out_rc = 1
         return false
     }
-    if (empty(g_cfg.whisper_model) || empty(g_cfg.llm_model)) {
-        fatal("whisper_model and llm_model must be set in the config")
+    var llm_id = ""
+    var has_asr = false
+    var serr = ""
+    if (!check_server(llm_id, has_asr, serr)) {
+        fatal(serr)
         out_rc = 1
         return false
     }
-    // The model files must exist before we load them: in a standalone -exe the loader's
-    // panic() on a missing file aborts the process SILENTLY (panic in a jitted frame), so
-    // check here and report a clear, logged error instead of a mysterious exit code 127.
-    if (!fexist(g_cfg.whisper_model)) {
-        fatal("whisper model file not found: {g_cfg.whisper_model}")
-        out_rc = 1
-        return false
-    }
-    if (!fexist(g_cfg.llm_model)) {
-        fatal("LLM model file not found: {g_cfg.llm_model}")
-        out_rc = 1
-        return false
-    }
-
-    log_tune_status("dictation")
-    // matmul dispatch lane cap + worker affinity — SAME semantics as dasllama-server
-    // (threads = lane cap, -1 = all cores; affinity applied at worker spawn, so it must
-    // land before with_job_que; DAS_JOBQUE_* envs still override both)
-    let lanes = g_cfg.threads > 0 ? g_cfg.threads : (g_cfg.threads < 0 ? 0 : 8)
-    set_dispatch_worker_limit(lanes)
-    set_jobque_affinity(g_cfg.affinity)
-
-    // The files exist, but a corrupt or unsupported model still panics deep in the loader.
-    // Recover it so startup fails with a logged message rather than a silent abort. NOTE: a
-    // bare `return` from inside a recover block does not propagate in a jitted -exe (execution
-    // falls through) — so set a flag here and return AFTER the try/recover, in normal flow.
-    var load_failed = false
-    try {
-        g_asr <- load_asr_model(g_cfg.whisper_model)
-        g_llm <- load_model(g_cfg.llm_model, QuantMode.q8)
-    } recover {
-        fatal("failed to load models — check whisper_model / llm_model are valid model files: whisper='{g_cfg.whisper_model}' llm='{g_cfg.llm_model}'")
-        load_failed = true
-    }
-    if (load_failed) {
+    if (!has_asr) {
+        fatal("dasllama-server at {g_cfg.server} has no ASR model — add asr = <parakeet/whisper ggml> to ITS config and restart it")
         out_rc = 1
         return false
     }
     telegram_set_configuration(configuration(token = g_cfg.bot_token))
-    logger_info("dictation", "bot started (whisper={g_cfg.whisper_model}, llm={g_cfg.llm_model}, threads={g_cfg.threads}, affinity={g_cfg.affinity})")
+    logger_info("dictation", "bot started (server={g_cfg.server}, llm={llm_id}, asr=yes, prompt={empty(g_cfg.prompt) ? "built-in" : "config"})")
     logger_flush()
     return true
 }
 
-[export, tune_policy(missing = "auto")]
+[export]
 def main : int {
-    // dasLLAMA inference on the interpreter is uselessly slow — require the JIT (or a jit -exe build)
-    if (!jit_enabled() && !is_standalone_exe()) {
-        to_log(LOG_ERROR, "dictation: run under the JIT — daslang -jit main.das -- ...\n")
-        return 1
-    }
     var rc = 0
     if (!init(rc)) {
         return rc
     }
     // The loop holds NO collectable locals — only `offset` (an int) — so heap_collect is safe.
-    with_job_que() {
-        setup_dasllama_jobque()
-        var offset = 0l
-        while (true) {
-            poll_once(offset)
-            unsafe(heap_collect(true, true))   // reclaim this round's string + object garbage; globals survive
-        }
+    var offset = 0l
+    while (true) {
+        poll_once(offset)
+        unsafe(heap_collect(true, true))   // reclaim this round's string + object garbage; globals survive
     }
     return 0
 }
