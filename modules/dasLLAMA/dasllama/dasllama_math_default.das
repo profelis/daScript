@@ -296,23 +296,36 @@ def q8q8_groupn_kernel_s16(var yp : float?; wp : int8 const?; sp : uint16 const?
 // UNSIGNED quants — the offset term consumes the per-16 activation sums (xbs) the bs quantizer
 // emits. These read the planes in disk order (no repack), so they are backend-independent:
 // every backend runs them until a generated tier lands. Row strides: quant (n/256)*{128,160,192}
-// bytes, scale (n/256)*{32,32,18} bytes.
+// bytes, scale (n/256)*{20,20,18} bytes.
 
-def private kq_pair(ksrow : uint8 const?; o : int64) : float2 {
+//! 6-bit sub-scale/min j off a 12-byte packed Q4_K/Q5_K scale block at sp (ggml
+//! get_scale_min_k4, pointer form) — shared by the kq v2 dots, repack and dequants.
+def k4_sc_mn(sp : uint8 const?; j : int64) : int2 {
     unsafe {
-        let s = uint(ksrow[o]) | (uint(ksrow[o + 1l]) << 8u)
-        let m = uint(ksrow[o + 2l]) | (uint(ksrow[o + 3l]) << 8u)
-        return float2(f16_to_f32(s), f16_to_f32(m))
+        if (j < 4l) {
+            return int2(int(sp[j]) & 63, int(sp[j + 4l]) & 63)
+        }
+        let sc = (int(sp[j + 4l]) & 15) | ((int(sp[j - 4l]) >> 6) << 4)
+        let mn = (int(sp[j + 4l]) >> 4) | ((int(sp[j]) >> 6) << 4)
+        return int2(sc, mn)
     }
 }
 
+// kq v2 (all three formats): Q8_K-form activations — xsp is the PER-SUPERBLOCK scale plane
+// (n/256 per token); integer sub-scale / bsums-x-mins sums, ONE float fold per superblock
+// (the lcpp scheme). The int sums are exact, so this is bit-exact vs the grp walk regardless
+// of sub-block order.
 [hint(unsafe_range_check, noalias = kqrow, noalias = ksrow, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def dot_k4q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64) : float {
     var acc = 0.0
     unsafe {
         for (sb in range64(n / 256l)) {
             let kqo = sb * 128l
-            let kso = sb * 32l
+            let kso = sb * 20l
+            let dd = f16_to_f32(uint(ksrow[kso]) | (uint(ksrow[kso + 1l]) << 8u))
+            let dm = f16_to_f32(uint(ksrow[kso + 2l]) | (uint(ksrow[kso + 3l]) << 8u))
+            var isum = 0
+            var bsum = 0
             for (js in range64(4l)) {   // 32 quant bytes: low nibbles = sub-block 2js, high = 2js+1
                 let qb = kqo + 32l * js
                 let b0 = sb * 8l + 2l * js   // activation 32-block of the low-nibble sub-block
@@ -324,26 +337,34 @@ def dot_k4q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp 
                     ilo += (q & 15) * int(xqp[ab + l])
                     ihi += (q >> 4) * int(xqp[ab + 32l + l])
                 }
-                let p0 = kq_pair(ksrow, kso + 2l * js * 4l)
-                let p1 = kq_pair(ksrow, kso + (2l * js + 1l) * 4l)
-                let a0 = float(xbsp[b0 * 2l] + xbsp[b0 * 2l + 1l])
-                let a1 = float(xbsp[b0 * 2l + 2l] + xbsp[b0 * 2l + 3l])
-                acc += xsp[b0] * (p0.x * float(ilo) - p0.y * a0)
-                acc += xsp[b0 + 1l] * (p1.x * float(ihi) - p1.y * a1)
+                let s0 = k4_sc_mn(ksrow + kso + 4l, 2l * js)
+                let s1 = k4_sc_mn(ksrow + kso + 4l, 2l * js + 1l)
+                isum += s0.x * ilo + s1.x * ihi
+                bsum += s0.y * (xbsp[b0 * 2l] + xbsp[b0 * 2l + 1l])
+                bsum += s1.y * (xbsp[b0 * 2l + 2l] + xbsp[b0 * 2l + 3l])
             }
+            let d8 = xsp[sb]
+            acc += float(isum) * (dd * d8)
+            acc -= float(bsum) * (dm * d8)
         }
     }
     return acc
 }
 
+// kq v2: same Q8_K-form contract and integer folds as dot_k4q8 (k5 shares the Q4_K scale-block
+// form) — only the quant reconstruction differs (nibble | high-bit << 4).
 [hint(unsafe_range_check, noalias = kqrow, noalias = ksrow, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def dot_k5q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64) : float {
     var acc = 0.0
     unsafe {
         for (sb in range64(n / 256l)) {
             let kqo = sb * 160l
-            let kso = sb * 32l
+            let kso = sb * 20l
+            let dd = f16_to_f32(uint(ksrow[kso]) | (uint(ksrow[kso + 1l]) << 8u))
+            let dm = f16_to_f32(uint(ksrow[kso + 2l]) | (uint(ksrow[kso + 3l]) << 8u))
             let qhb = kqo + 128l   // 32 high-bit bytes; chunk js owns bits 2js (low nibbles) / 2js+1
+            var isum = 0
+            var bsum = 0
             for (js in range64(4l)) {
                 let qb = kqo + 32l * js
                 let b0 = sb * 8l + 2l * js
@@ -357,18 +378,23 @@ def dot_k5q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp 
                     ilo += ((q & 15) | ((h & 1) << 4)) * int(xqp[ab + l])
                     ihi += ((q >> 4) | ((h & 2) << 3)) * int(xqp[ab + 32l + l])
                 }
-                let p0 = kq_pair(ksrow, kso + 2l * js * 4l)
-                let p1 = kq_pair(ksrow, kso + (2l * js + 1l) * 4l)
-                let a0 = float(xbsp[b0 * 2l] + xbsp[b0 * 2l + 1l])
-                let a1 = float(xbsp[b0 * 2l + 2l] + xbsp[b0 * 2l + 3l])
-                acc += xsp[b0] * (p0.x * float(ilo) - p0.y * a0)
-                acc += xsp[b0 + 1l] * (p1.x * float(ihi) - p1.y * a1)
+                let s0 = k4_sc_mn(ksrow + kso + 4l, 2l * js)
+                let s1 = k4_sc_mn(ksrow + kso + 4l, 2l * js + 1l)
+                isum += s0.x * ilo + s1.x * ihi
+                bsum += s0.y * (xbsp[b0 * 2l] + xbsp[b0 * 2l + 1l])
+                bsum += s1.y * (xbsp[b0 * 2l + 2l] + xbsp[b0 * 2l + 3l])
             }
+            let d8 = xsp[sb]
+            acc += float(isum) * (dd * d8)
+            acc -= float(bsum) * (dm * d8)
         }
     }
     return acc
 }
 
+// kq v2: Q8_K-form activations; k6's per-16 SIGNED sub-scales fold as two superblock-wide int
+// accumulators — isum = Σ sc·dot, bsum = Σ sc·Σa16 (the -32 offset term) — combined exactly in
+// int32 (|isum| < 2^28, |32·bsum| < 2^28), then ONE d·d8 float fold per superblock.
 [hint(unsafe_range_check, noalias = kqrow, noalias = ksrow, noalias = xqp, noalias = xsp, noalias = xbsp)]
 def dot_k6q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64) : float {
     var acc = 0.0
@@ -377,6 +403,8 @@ def dot_k6q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp 
             let kqo = sb * 192l
             let kso = sb * 18l
             let d = f16_to_f32(uint(ksrow[kso + 16l]) | (uint(ksrow[kso + 17l]) << 8u))
+            var isum = 0
+            var bsum = 0
             for (half in range64(2l)) {
                 let qlb = kqo + 64l * half
                 let qhb = kqo + 128l + 32l * half
@@ -397,13 +425,13 @@ def dot_k6q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp 
                     let si = kso + half * 8l + g * 2l
                     let u0 = int(ksrow[si])
                     let u1 = int(ksrow[si + 1l])
-                    let s0 = d * float(u0 < 128 ? u0 : u0 - 256)
-                    let s1 = d * float(u1 < 128 ? u1 : u1 - 256)
-                    let a0 = float(xbsp[b * 2l])
-                    let a1 = float(xbsp[b * 2l + 1l])
-                    acc += xsp[b] * (s0 * (float(i0) - 32.0 * a0) + s1 * (float(i1) - 32.0 * a1))
+                    let s0 = u0 < 128 ? u0 : u0 - 256
+                    let s1 = u1 < 128 ? u1 : u1 - 256
+                    isum += s0 * i0 + s1 * i1
+                    bsum += s0 * xbsp[b * 2l] + s1 * xbsp[b * 2l + 1l]
                 }
             }
+            acc += float(isum - 32 * bsum) * (d * xsp[sb])
         }
     }
     return acc
@@ -415,7 +443,7 @@ def k4_rows_kernel(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp 
     let nsb = n / 256l
     unsafe {
         for (i in range64(rb, re)) {
-            yp[i] = dot_k4q8(kqp + i * nsb * 128l, ksp + i * nsb * 32l, xqp, xsp, xbsp, n)
+            yp[i] = dot_k4q8(kqp + i * nsb * 128l, ksp + i * nsb * 20l, xqp, xsp, xbsp, n)
         }
     }
 }
@@ -424,7 +452,7 @@ def k5_rows_kernel(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp 
     let nsb = n / 256l
     unsafe {
         for (i in range64(rb, re)) {
-            yp[i] = dot_k5q8(kqp + i * nsb * 160l, ksp + i * nsb * 32l, xqp, xsp, xbsp, n)
+            yp[i] = dot_k5q8(kqp + i * nsb * 160l, ksp + i * nsb * 20l, xqp, xsp, xbsp, n)
         }
     }
 }
@@ -458,12 +486,14 @@ def private kq_gemv_kernel(fmt : int; var yp : float?; kqp : uint8 const?; ksp :
 def dequant_kq_row_grp(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, mr, n : int64; var dst : float?) {
     let nsb = n / 256l
     let qsb = fmt == 4l ? 128l : (fmt == 5l ? 160l : 192l)
-    let ssb = fmt == 6l ? 18l : 32l
+    let ssb = fmt == 6l ? 18l : 20l
     unsafe {
         for (sbi in range64(nsb)) {
             let qb = sbi * qsb * mr
             let sb = sbi * ssb * mr
             let dk6 = fmt == 6l ? f16_to_f32(uint(ksg[sb + 16l * mr + 2l * r]) | (uint(ksg[sb + 16l * mr + 2l * r + 1l]) << 8u)) : 0.0
+            let dk4d = fmt != 6l ? f16_to_f32(uint(ksg[sb + 2l * r]) | (uint(ksg[sb + 2l * r + 1l]) << 8u)) : 0.0
+            let dk4m = fmt != 6l ? f16_to_f32(uint(ksg[sb + 2l * mr + 2l * r]) | (uint(ksg[sb + 2l * mr + 2l * r + 1l]) << 8u)) : 0.0
             for (blk in range64(8l)) {
                 let kb = sbi * 256l + blk * 32l
                 var s0 = 0.0
@@ -473,10 +503,10 @@ def dequant_kq_row_grp(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, m
                     s0 = dk6 * float(int(int8(ksg[sb + 2l * blk * mr + r])))
                     s1 = dk6 * float(int(int8(ksg[sb + (2l * blk + 1l) * mr + r])))
                 } else {
-                    let s4 = sb + blk * 4l * mr
-                    s0 = f16_to_f32(uint(ksg[s4 + 2l * r]) | (uint(ksg[s4 + 2l * r + 1l]) << 8u))
+                    // kq v2 (k4/k5): decoded u8 sc/mn planes — w = (d*sc)*q - (dmin*mn), disk-exact
+                    s0 = dk4d * float(int(ksg[sb + 4l * mr + blk * mr + r]))
                     s1 = s0
-                    o = f16_to_f32(uint(ksg[s4 + 2l * mr + 2l * r]) | (uint(ksg[s4 + 2l * mr + 2l * r + 1l]) << 8u))
+                    o = dk4m * float(int(ksg[sb + 12l * mr + blk * mr + r]))
                 }
                 for (j in range64(4l)) {
                     let hb = fmt == 5l ? int(kqg[qb + 128l * mr + (blk * 4l + j) * mr + r]) : 0
@@ -515,7 +545,7 @@ def dequant_kq_row_grp(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, m
 def matmul_kq(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         kq_gemv_kernel(fmt, addr(y[yoff]), addr(kq[sb * qsb]), addr(ks[sb * ssb]),
                        addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d)
@@ -529,7 +559,7 @@ def matmul_kq(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : a
 def matmul_kq_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; offs : array<int64> | #; nregions : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64) {
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         let kqp = reinterpret<uint8 const?>(addr(kq[0]))
         let ksp = reinterpret<uint8 const?>(addr(ks[0]))
@@ -547,11 +577,11 @@ def matmul_kq_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
                     let sb = offp[r * 2l] / 256l + row * nsb
                     let xoff = offp[r * 2l + 1l]
                     if (fmt == 4) {
-                        myp[ii] = dot_k4q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                        myp[ii] = dot_k4q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 256l, xbsp + xoff / 16l, n)
                     } elif (fmt == 5) {
-                        myp[ii] = dot_k5q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                        myp[ii] = dot_k5q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 256l, xbsp + xoff / 16l, n)
                     } else {
-                        myp[ii] = dot_k6q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 32l, xbsp + xoff / 16l, n)
+                        myp[ii] = dot_k6q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 256l, xbsp + xoff / 16l, n)
                     }
                 }
             }

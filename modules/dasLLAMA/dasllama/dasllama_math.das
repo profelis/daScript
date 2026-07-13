@@ -1371,6 +1371,9 @@ struct KernelBackend {
     // layout still answers with its reference tier there). The mx4 expand's positional map and
     // the probes read the cached value via active_q8_layout_mr().
     q8_layout : function<() : int> = @@q8_layout_grp4
+    // per-FORMAT kq plane interleave (kq v2: the k4/k5/k6 families tune separately, so their
+    // grp layouts can differ from the q8 family's and from each other)
+    kq_layout : function<(fmt : int) : int> = @@kq_layout_grp4_fmt
     // The additive bias the backend's repack bakes into GROUP-row weight bytes (128 for a
     // bias128 gen stamp, 0 everywhere else). Same activation-time contract as q8_layout;
     // the mx4->Q8 expand reads the cached value via active_q8_wbias().
@@ -1422,6 +1425,7 @@ var g_active_needs_repack = false   // does the active backend need repacked wei
 var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
 var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
 var g_active_q8_layout_mr = 4l                // see KernelBackend.q8_layout (activation-time cache)
+var g_active_kq_layout = @@kq_layout_grp4_fmt // see KernelBackend.kq_layout (activation-time cache)
 var g_active_q8_wbias = 0l                    // see KernelBackend.q8_wbias (activation-time cache)
 var g_active_q8_kgroup = 4l                   // see KernelBackend.q8_kgroup (activation-time cache)
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
@@ -1445,12 +1449,19 @@ def private no_backend() {
 }
 def private backend_always_available() : bool => true
 def private q8_layout_grp4() : int => 4
+
+[unused_argument(fmt)]
+def private kq_layout_grp4_fmt(fmt : int) : int => 4
 def private q8_wbias_zero() : int => 0
 def private q8_kgroup_four() : int => 4
 
 //! The Q8 interleave (mr) of the ACTIVE backend's weight layout — cached at activation from
 //! KernelBackend.q8_layout (4 for every hand tier; the stamped mr on the gen backend).
 def active_q8_layout_mr() : int64 => g_active_q8_layout_mr
+
+//! The active backend's kq plane interleave for `fmt` (4/5/6) — per-format since the kq v2
+//! family split; the loader freezes these onto the Model at repack time.
+def active_kq_layout_mr(fmt : int) : int64 => int64(invoke(g_active_kq_layout, fmt))
 
 //! The weight-plane bias of the ACTIVE backend's Q8 layout — cached at activation from
 //! KernelBackend.q8_wbias (0 for every hand tier; 128 on a bias128 gen stamp). The mx4->Q8
@@ -1570,6 +1581,7 @@ def private activate(be : KernelBackend) {
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
     g_active_mx4_native_batch = be.mx4_native_batch
     g_active_q8_layout_mr = int64(invoke(be.q8_layout))
+    g_active_kq_layout = be.kq_layout
     g_active_q8_wbias = int64(invoke(be.q8_wbias))
     g_active_q8_kgroup = int64(invoke(be.q8_kgroup))
     g_active_batch_backend = be.name
@@ -1787,7 +1799,7 @@ def matmul_kq_groupn_active(fmt : int; var y : array<float> | #; kq : array<uint
 def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d, ntok : int64) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq_batch, fmt, addr(y[0]),
             reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
@@ -1802,7 +1814,7 @@ def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; 
 def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq, fmt, addr(y[yoff]),
             reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
@@ -1817,7 +1829,7 @@ def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
 def repack_kq_weight(fmt : int; var kq : array<uint8>; var ks : array<uint8>; woff, n, d : int64) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_repack_kq, fmt, addr(kq[sb * qsb]), addr(ks[sb * ssb]), n, d)
     }
