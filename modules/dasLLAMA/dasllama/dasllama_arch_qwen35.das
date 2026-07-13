@@ -20,6 +20,8 @@ def private configure_qwen35(var c : Config) {
 // qwen35moe (Qwen3.6-35B-A3B, Qwen3.5-397B): the same hybrid attention + a routed-experts FFN —
 // softmax top-k with renorm (llama.cpp hardcodes norm_w for this arch; metadata overrides) and
 // the qwen2moe-style sigmoid-gated shared expert (loader-detected via ffn_up_shexp).
+// qwen3next (Qwen3-Next-80B, Qwen3-Coder-Next) is the parent hybrid — identical config, the
+// loader's {arch}. prefix picks up its geometry (48L, 512 experts top-10, plain partial rope).
 def private configure_qwen35moe(var c : Config) {
     configure_qwen35(c)
     c.moe = true
@@ -38,6 +40,10 @@ def register_arch_qwen35() {
     var dm = ArchDesc(name = "qwen35moe", configure = @@configure_qwen35moe)
     dm.blocks = qwen35moe_blocks()
     dm.chat := d.chat
+    var dn = ArchDesc(name = "qwen3next", configure = @@configure_qwen35moe)
+    dn.blocks = qwen35moe_blocks()
+    dn.chat := d.chat
     register_arch("qwen35", d)
     register_arch("qwen35moe", dm)
+    register_arch("qwen3next", dn)
 }

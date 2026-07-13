@@ -432,6 +432,9 @@ struct Model {
     dn_ba_f32 : bool = false
     dn_betaf_off : int64        // fblob: layers x (dim x dt_rank), valid when dn_ba_f32
     dn_alphaf_off : int64
+    // qwen3next-layout file (detected via fused ssm_ba): v-indexed tensors ship in HF GROUPED
+    // v-head order; the loader permutes them to the TILED order the kernels (and qwen35 files) use
+    dn_grouped : bool = false
 }
 
 // ===== Arch registry: per-architecture blocks + chat template =====
@@ -929,6 +932,59 @@ def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var 
         }
     } else {
         gguf_read_tensor_f32(m, bytes, name, t.wblob, woff, n, src_off)
+    }
+}
+
+// qwen3next-layout deltanet big weights: same planes as the qwen35 arm at the callsite, but the
+// file's v-indexed rows arrive GROUPED by k-head — sub-slice reads land each v-head chunk at its
+// TILED position (tiled j*nk+g <- grouped g*nvpk+j), ssm_ba splits into the beta/alpha planes, and
+// ssm_out (an INPUT-column permute, never block-aligned) round-trips through f32.
+def private load_dn_grouped(m : GGUFMeta; bytes : array<uint8> | #; var t : Model; l, dim : int64; var scratch : array<float>) {
+    let nk = t.config.ssm_n_group
+    let nvh = t.config.ssm_dt_rank
+    let nvpk = nvh / nk
+    let hv = t.config.ssm_d_inner / nvh
+    let qkr = 2l * nk * t.config.ssm_d_state    // fused qkv: the q+k rows stay put, v rows permute
+    load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * qkr, scratch)
+    for (g in range64(nk)) {
+        for (j in range64(nvpk)) {
+            let vg = g * nvpk + j
+            let vt = j * nk + g
+            load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l] + (qkr + vt * hv) * dim, hv * dim, scratch, (qkr + vg * hv) * dim)
+            load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l] + vt * hv * dim, hv * dim, scratch, vg * hv * dim)
+            if (!t.dn_ba_f32) {   // fused ba rows per k-head group: [beta j.. ; alpha j..]
+                load_big(m, bytes, "blk.{l}.ssm_ba.weight", t, t.dnbeta_offs[l] + vt * dim, dim, scratch, (g * 2l * nvpk + j) * dim)
+                load_big(m, bytes, "blk.{l}.ssm_ba.weight", t, t.dnalpha_offs[l] + vt * dim, dim, scratch, ((g * 2l + 1l) * nvpk + j) * dim)
+            }
+        }
+    }
+    let n = t.config.ssm_d_inner * dim
+    var raw : array<float>
+    raw |> resize(n)
+    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_out.weight", raw, 0l, n)
+    scratch |> resize(n)
+    let din = t.config.ssm_d_inner
+    for (r in range64(dim)) {
+        for (g in range64(nk)) {
+            for (j in range64(nvpk)) {
+                let src = r * din + (g * nvpk + j) * hv
+                let dst = r * din + (j * nk + g) * hv
+                for (x in range64(hv)) {
+                    scratch[dst + x] = raw[src + x]
+                }
+            }
+        }
+    }
+    delete raw
+    let woff = t.dnout_offs[l]
+    if (t.quant == QuantMode.q8) {
+        quantize_q8_0_into(scratch, n, t.qblob, t.qscales, woff, woff / 32l)
+    } elif (t.quant == QuantMode.q4) {
+        quantize_q4_0_into(scratch, n, t.q4blob, t.q4scales, woff / 2l, woff / 32l)
+    } else {
+        for (i in range64(n)) {
+            t.wblob[woff + i] = scratch[i]
+        }
     }
 }
 
@@ -1675,7 +1731,9 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             while (!layer_is_recurrent(t.config, frl)) {
                 frl++
             }
-            t.dn_ba_f32 = gguf_tensor_type(m, "blk.{frl}.ssm_beta.weight") == GGML_TYPE_F32
+            t.dn_grouped = gguf_find_tensor(m, "blk.{frl}.ssm_ba.weight") >= 0
+            let ba0 = t.dn_grouped ? "blk.{frl}.ssm_ba.weight" : "blk.{frl}.ssm_beta.weight"
+            t.dn_ba_f32 = gguf_tensor_type(m, ba0) == GGML_TYPE_F32
         }
         // logit soft-caps from metadata when present (gemma2: 50/30, gemma4: final 30 only);
         // configure()'s values stay as the fallback for files without the keys
@@ -1786,13 +1844,35 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             if (layer_is_recurrent(t.config, l)) {  // qwen35 deltanet fp32 smalls
                 let cd = dn_conv_dim(t.config)
                 let nvh = t.config.ssm_dt_rank
-                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * t.config.ssm_d_conv * cd, t.config.ssm_d_conv * cd)
-                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_dt.bias", t.fblob, t.dn_dt_off + l * nvh, nvh)
-                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_a", t.fblob, t.dn_a_off + l * nvh, nvh)
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_norm.weight", t.fblob, t.dn_norm_off + l * t.config.ssm_d_state, t.config.ssm_d_state)
-                if (t.dn_ba_f32) {  // F32-on-disk beta/alpha stay fp32
-                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_beta.weight", t.fblob, t.dn_betaf_off + l * dim * nvh, dim * nvh)
-                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_alpha.weight", t.fblob, t.dn_alphaf_off + l * dim * nvh, dim * nvh)
+                if (t.dn_grouped) {  // permute v-indexed smalls grouped->tiled (see load_dn_grouped)
+                    let nk = t.config.ssm_n_group
+                    let nvpk = nvh / nk
+                    let hv = t.config.ssm_d_inner / nvh
+                    let dc = t.config.ssm_d_conv
+                    let qkch = 2l * nk * t.config.ssm_d_state   // conv qk channels stay put
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * dc * cd, qkch * dc)
+                    for (g in range64(nk)) {
+                        for (j in range64(nvpk)) {
+                            let vg = g * nvpk + j
+                            let vt = j * nk + g
+                            gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * dc * cd + (qkch + vt * hv) * dc, hv * dc, (qkch + vg * hv) * dc)
+                            gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_dt.bias", t.fblob, t.dn_dt_off + l * nvh + vt, 1l, vg)
+                            gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_a", t.fblob, t.dn_a_off + l * nvh + vt, 1l, vg)
+                            if (t.dn_ba_f32) {
+                                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_ba.weight", t.fblob, t.dn_betaf_off + l * dim * nvh + vt * dim, dim, (g * 2l * nvpk + j) * dim)
+                                gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_ba.weight", t.fblob, t.dn_alphaf_off + l * dim * nvh + vt * dim, dim, ((g * 2l + 1l) * nvpk + j) * dim)
+                            }
+                        }
+                    }
+                } else {
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_conv1d.weight", t.fblob, t.dn_conv_off + l * t.config.ssm_d_conv * cd, t.config.ssm_d_conv * cd)
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_dt.bias", t.fblob, t.dn_dt_off + l * nvh, nvh)
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_a", t.fblob, t.dn_a_off + l * nvh, nvh)
+                    if (t.dn_ba_f32) {  // F32-on-disk beta/alpha stay fp32
+                        gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_beta.weight", t.fblob, t.dn_betaf_off + l * dim * nvh, dim * nvh)
+                        gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_alpha.weight", t.fblob, t.dn_alphaf_off + l * dim * nvh, dim * nvh)
+                    }
                 }
             }
             if (t.config.layer_out_scale) {  // gemma4: one output scalar per layer
@@ -1836,14 +1916,18 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             if (layer_is_recurrent(t.config, l)) {
                 // qwen35 deltanet projections: fused [q;k;v] + z gate + per-v-head beta/alpha + out
                 // (beta/alpha skip the big-weight path when they ship F32 — read into fblob above)
-                let cd = dn_conv_dim(t.config)
-                load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch)
-                load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch)
-                if (!t.dn_ba_f32) {
-                    load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
-                    load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                if (t.dn_grouped) {
+                    load_dn_grouped(m, bytes, t, l, dim, scratch)
+                } else {
+                    let cd = dn_conv_dim(t.config)
+                    load_big(m, bytes, "blk.{l}.attn_qkv.weight", t, t.dnqkv_offs[l], dim * cd, scratch)
+                    load_big(m, bytes, "blk.{l}.attn_gate.weight", t, t.dngate_offs[l], dim * t.config.ssm_d_inner, scratch)
+                    if (!t.dn_ba_f32) {
+                        load_big(m, bytes, "blk.{l}.ssm_beta.weight", t, t.dnbeta_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                        load_big(m, bytes, "blk.{l}.ssm_alpha.weight", t, t.dnalpha_offs[l], dim * t.config.ssm_dt_rank, scratch)
+                    }
+                    load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch)
                 }
-                load_big(m, bytes, "blk.{l}.ssm_out.weight", t, t.dnout_offs[l], t.config.ssm_d_inner * dim, scratch)
             } elif (t.config.fused_qkv) {
                 // Phi3: attn_qkv rows are [q (qd) ; k (kv) ; v (kv)], ffn_up rows are [gate ; up] (hidden each).
                 // src_off slices the fused tensor, preserving its Q8 blocks (no fp32 requantize); K-quant
