@@ -1,0 +1,1 @@
+Stamps an instant unit-boundary event (kind id from ``jobque_trace_marker_name``, plus a free-form ``arg`` such as the token index) on the caller lane. No-op when tracing is off — cheap enough for per-token/per-frame loops. Saved as a perfetto instant event, so unit boundaries render natively in Perfetto and unit-aware viewers can navigate trace windows by unit.

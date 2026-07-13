@@ -103,7 +103,8 @@ def private run_batched(t : Model; kvdt : KVDtype; nb, p, n : int64) : double {
         cur |> push(greedy_top(ss[i].logits, vocab))
     }
     let t0 = ref_time_ticks()
-    for (_st in range64(n)) {
+    for (st in range64(n)) {
+        trace_marker("step", int(st))   // unit boundary for the timeline viewer (no-op untraced)
         eval_batch_(t, ws, sess, cur)
         for (i in range64(nb)) {
             cur[i] = greedy_top(ss[i].logits, vocab)

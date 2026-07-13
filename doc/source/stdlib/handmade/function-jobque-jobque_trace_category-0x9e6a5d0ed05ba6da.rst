@@ -1,0 +1,1 @@
+Registers a named category for a trace op tag (the id stamped via ``jobque_trace_tag``), with a display color packed as 0xRRGGBB. Re-registering an id updates its name and color. The registry persists across trace sessions; ``jobque_trace_save`` writes it into the file's ``jobqueProfile`` header so viewers can label and color events without hardcoded knowledge.

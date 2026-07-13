@@ -8659,6 +8659,7 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     }
     if (!stack_done) {
         for (l in range64(c.n_layers)) {
+            trace_marker("layer", int(l))   // unit boundary for the timeline viewer (no-op untraced)
             trace_tag(TRACE_TAG_ATTN_STD)   // per-lane trace: color the prefill attention section
             t.blocks.attn_prefill(t, s, l, npos, start_pos)
             trace_tag(TRACE_TAG_FFN_STD)
