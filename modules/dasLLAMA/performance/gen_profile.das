@@ -25,8 +25,8 @@ struct Args {
     @clarg_doc = "Tier: small | large | all (default small)"
     tier : string = "small"
 
-    @clarg_doc = "Threads recorded in the platform block (default 8 — the perf-core count on both boxes)"
-    threads : int = 8
+    @clarg_doc = "Dispatch lanes: worker cap + computing main (0 = per-box default: 16, m1 8)"
+    threads : int = 0
 
     @clarg_doc = "Parsec was off for this run — recorded in the platform block (default true)"
     parsec_off : bool = true
@@ -137,6 +137,21 @@ def main() {
         return
     }
     let tier = parse_tier(cfg.tier)
+    let threads = cfg.threads > 0 ? cfg.threads : profile_threads()
+
+    // 16-cores-with-affinity is the standing methodology, enforced here rather than left to the
+    // environment: cap the future que's workers to threads-1 (the computing main is the last lane)
+    // and pin lanes to distinct physical cores. Explicit DAS_JOBQUE_THREADS / DAS_JOBQUE_AFFINITY
+    // envs still win (the A/B rail). Must run before any with_job_que — applied at worker spawn.
+    if (!has_env_variable("DAS_JOBQUE_THREADS")) {
+        set_jobque_threads_cap(max(threads - 1, 1))
+    }
+    if (affinity_on() && !has_env_variable("DAS_JOBQUE_AFFINITY")) {
+        // 2 = HARD mask, mirroring llama-bench --cpu-strict. Mode 1 (hint) re-rolls the placement
+        // lottery on every fresh que: lanes migrate onto SMT siblings and lockstep prefill goes
+        // bimodal (~halved) while memory-bound decode barely notices — measured on the 3990X.
+        set_jobque_affinity(2)
+    }
 
     // reference baselines (lcpp tok/s + commit) — established once per box, never re-run here
     let baselines <- read_llm_baselines()
@@ -152,29 +167,38 @@ def main() {
     var prof : LlmProfile
     read_llm_profile(prof)
     let date = format_time(get_clock(), "%Y-%m-%d")   // portable (no shell) — Windows cmd `date` prompts and hangs
-    prof.platform = gather_platform(cfg.threads, lcpp_commit, date, box_profile_tag(), cfg.parsec_off)
+    prof.platform = gather_platform(threads, lcpp_commit, date, box_profile_tag(), cfg.parsec_off)
 
     apply_box_profile_runtime()   // the tuned per-box stack (backend pin + dispatch knobs)
     log_tune_status("gen_profile")
 
     logger_set_name(prof_log_name())
-    // The das side runs on the jobque, NOT llama-bench's -t. On a many-core box you MUST set
-    // DAS_JOBQUE_THREADS=<threads> or das dispatches wide (~cores lanes) and the comparison is invalid.
-    // Probe the ACTUAL lane count, record it (not just the advisory flag), and warn hard on a mismatch.
+    // The das side runs on the jobque, NOT llama-bench's -t: the worker cap + affinity were declared
+    // above, but probe the ACTUAL lane count, record it (not the advisory flag), and warn on mismatch
+    // (an explicit DAS_JOBQUE_THREADS still redirects the run).
     var lanes = 0
     with_job_que() {
         setup_dasllama_jobque_()
         lanes = get_dispatch_lanes()
     }
     prof.platform.threads = lanes
-    logger_info("profile.llm.gen", "run start", JV({"box" => JV(box_name()), "tier" => JV(cfg.tier),
-        "requested_threads" => JV(cfg.threads), "dispatch_lanes" => JV(lanes), "lcpp" => JV(lcpp_commit)}))
-    if (lanes != cfg.threads) {
-        logger_warning("profile.llm.gen", "dispatch lanes != requested threads — set DAS_JOBQUE_THREADS",
-            JV({"dispatch_lanes" => JV(lanes), "requested_threads" => JV(cfg.threads)}))
-        print("WARNING: das dispatch lanes = {lanes}, requested {cfg.threads}. Set DAS_JOBQUE_THREADS={cfg.threads} to match.\n")
+    // effective das affinity mode (env rail wins over the declared default) — recorded in the profile
+    var aff = max(get_jobque_affinity(), 0)
+    if (has_env_variable("DAS_JOBQUE_AFFINITY")) {
+        aff = to_int(get_env_variable("DAS_JOBQUE_AFFINITY"))
     }
-    print("gen_profile: box={box_name()} tier={cfg.tier} threads={cfg.threads} das_lanes={lanes}\n")
+    if (aff > 0) {
+        let lcpp_aff = lcpp_affinity_args(threads)
+        prof.platform.affinity = empty(lcpp_aff) ? "das jobque mode {aff}" : "das jobque mode {aff}; llama-bench{lcpp_aff}"
+    }
+    logger_info("profile.llm.gen", "run start", JV({"box" => JV(box_name()), "tier" => JV(cfg.tier),
+        "requested_threads" => JV(threads), "dispatch_lanes" => JV(lanes), "affinity" => JV(aff), "lcpp" => JV(lcpp_commit)}))
+    if (lanes != threads) {
+        logger_warning("profile.llm.gen", "dispatch lanes != requested threads",
+            JV({"dispatch_lanes" => JV(lanes), "requested_threads" => JV(threads)}))
+        print("WARNING: das dispatch lanes = {lanes}, requested {threads}.\n")
+    }
+    print("gen_profile: box={box_name()} tier={cfg.tier} threads={threads} das_lanes={lanes} affinity={aff}\n")
     print("log: {logger_get_path()}  (tail for live, timestamped progress)\n")
     print("baselines: {length(baselines)} row(s) from {baseline_llm_path()} (lcpp {lcpp_commit})\n\n")
     for (m in llm_catalog()) {
@@ -197,7 +221,7 @@ def main() {
         let rec = LlmRec(
             model = m.display,
             arch = t.arch,
-            quant = quant_str(m.quant),
+            quant = model_quant_str(m),
             active_b = active_params_b(t),
             prefill = PhaseRec(context = m.prefill_ctx, das_tok_s = meas.prefill, llama_cpp_tok_s = pf_ref),
             emission = PhaseRec(context = m.emission_ctx, das_tok_s = meas.emission, llama_cpp_tok_s = em_ref))

@@ -8390,8 +8390,8 @@ def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64)
     // Native-MXFP4 experts pay a per-touched-expert Q8 expansion in the grouped path (~120MB of
     // traffic per expert incl. the repack), so it only wins once buckets average enough rows to
     // amortize it — under ~8 rows/expert (short chat turns) the per-position mx4 GEMVs are cheaper.
-    // A native mx4-batch backend (x64) has no expansion tax, so its crossover sits lower (per-fork
-    // overhead only) — the 8-rows/expert gate is kept until re-measured there.
+    // A native mx4-batch backend (the gen family) has no expansion tax, so its crossover sits
+    // lower (per-fork overhead only) — the 8-rows/expert gate is kept until re-measured there.
     let mx4_grouped_pays = !t.experts_mx4 || npos * c.n_expert_used >= 8l * c.n_expert
     // kq-expert layers ride the grouped buckets through the kq batch tile; without it (portable /
     // no-kq backend) they take the per-position reference path (the decode groupn serves them)

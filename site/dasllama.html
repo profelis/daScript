@@ -191,16 +191,17 @@
                     dasLLAMA is an LLM + speech-to-text stack written entirely in daslang and
                     JIT-compiled — no hand-written assembly. These are CPU-only comparisons. llama.cpp
                     is a broader, more mature engine with GPU backends we don't try to match; on the
-                    CPU path alone, das keeps pace on prompt processing and often edges ahead.
+                    CPU path alone, das is ahead on prompt processing across the board and trades
+                    blows on generation.
                 </p>
                 <div class="forge-hero__ctas">
                     <a class="forge-btn-primary" href="#llm">$ view the scoreboard →</a>
                     <a class="forge-btn-secondary" href="#method">methodology</a>
                 </div>
                 <div class="forge-stats">
-                    <div class="forge-stat"><div class="forge-stat__n">up to 1.75×</div><div class="forge-stat__l">LLM prefill vs llama.cpp · gemma-4 E2B, M1</div></div>
-                    <div class="forge-stat"><div class="forge-stat__n">30 / 32</div><div class="forge-stat__l">runs das ≥ llama.cpp · 16 models × 2 boxes</div></div>
-                    <div class="forge-stat"><div class="forge-stat__n">~5×</div><div class="forge-stat__l">Qwen3-Omni audio vs mtmd, CPU-only (M1)</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n" id="stat-prefill-n">up to 1.69×</div><div class="forge-stat__l" id="stat-prefill-l">LLM prefill vs llama.cpp · gemma-4 E4B, M1</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n" id="stat-wins-n">35 / 36</div><div class="forge-stat__l" id="stat-wins-l">runs das ≥ llama.cpp · 18 models × both phases, 3990X</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n" id="stat-audio-n">~5×</div><div class="forge-stat__l">Qwen3-Omni audio vs mtmd, CPU-only (M1)</div></div>
                 </div>
             </div>
 
@@ -231,10 +232,10 @@ def main() {
                 <div class="forge-output">
                     <div class="dl-run">
                         <div><span class="prompt">$</span> daslang -jit dasllama.das</div>
-                        <div class="dim">  loaded Llama-3.1-8B · q8 · 8.03B active · CPU / 8 threads</div>
-                        <div><span class="metric">prefill</span> <span class="amber">132.1 tok/s</span> <span class="dim">· das/llama.cpp 1.11×</span></div>
-                        <div><span class="metric">decode&nbsp;</span> <span class="amber">13.6 tok/s</span> <span class="dim">· das/llama.cpp 0.96×</span></div>
-                        <div class="ok">  ✓ no hand-written assembly · Apple M1 Max</div>
+                        <div class="dim">  loaded Llama-3.1-8B · q8 · 8.03B active · CPU / 16 threads, pinned</div>
+                        <div><span class="metric">prefill</span> <span class="amber">99.8 tok/s</span> <span class="dim">· das/llama.cpp 1.51×</span></div>
+                        <div><span class="metric">decode&nbsp;</span> <span class="amber">6.9 tok/s</span> <span class="dim">· das/llama.cpp 1.03×</span></div>
+                        <div class="ok">  ✓ no hand-written assembly · Threadripper 3990X</div>
                     </div>
                 </div>
             </div>
@@ -245,8 +246,8 @@ def main() {
     <section class="forge-section" id="llm">
         <div class="forge-container">
             <div class="forge-section-label"><span class="forge-section-label__num">§ 01</span><span class="forge-section-label__rule"></span><span>llm cpu scoreboard</span></div>
-            <h2 class="forge-h2">das ÷ llama.cpp, CPU only. <em>Right of the line, das is ahead on prefill.</em></h2>
-            <p class="forge-p">A like-for-like CPU comparison: llama.cpp built with no Accelerate/AMX BLAS, so this reflects scalar/SIMD kernels — not its GPU backends, which are out of scope here. pp512 = prefill over a 512-token prompt; tg128 = greedy generation of 128 tokens. All Q8.</p>
+            <h2 class="forge-h2">das ÷ llama.cpp, CPU only.</h2>
+            <p class="forge-p">A like-for-like CPU comparison: llama.cpp built with no Accelerate/AMX BLAS, so this reflects scalar/SIMD kernels — not its GPU backends, which are out of scope here. pp512 = prefill over a 512-token prompt; tg128 = greedy generation of 128 tokens. Weights are Q8_0 or Q4_K_M — the quant column says which.</p>
 
             <div class="dl-toggles">
                 <span class="dl-seg__caption">machine</span>
@@ -269,7 +270,7 @@ def main() {
                 <table class="dl-table">
                     <thead>
                         <tr>
-                            <th>model</th><th>active B</th>
+                            <th>model</th><th>active B</th><th>quant</th>
                             <th class="dl-grp">pp512 das</th><th>pp512 lcpp</th><th class="dl-grp">das/lcpp</th>
                             <th class="dl-grp">tg128 das</th><th>tg128 lcpp</th><th class="dl-grp">das/lcpp</th>
                         </tr>
@@ -316,18 +317,39 @@ def main() {
         </div>
     </section>
 
-    <!-- § 04 methodology -->
+    <!-- § 04 supported model families -->
+    <section class="forge-section" id="models">
+        <div class="forge-container">
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 04</span><span class="forge-section-label__rule"></span><span>supported model families</span></div>
+            <h2 class="forge-h2">One engine, twelve architectures.</h2>
+            <p class="forge-p">Everything below loads from stock GGUF (llama2.c <code>.bin</code> for the toy), auto-detected from metadata, and is verified token-for-token against its reference engine. Weights: F32 / F16 / Q8_0 / Q4_0 / MXFP4 read directly; K-quant files (Q4_K_M / Q5_K_M / Q6_K) run on native K-quant kernels; bf16 audio towers read exactly.</p>
+            <div class="dl-caveats">
+                <div class="dl-caveat"><div class="dl-caveat__k">Llama</div><div class="dl-caveat__v">Llama-2 / TinyLlama, Llama-3.1 / 3.2, Mistral-7B, SmolLM2 — plus llama2.c checkpoints.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">Qwen dense</div><div class="dl-caveat__v">Qwen2.5, Qwen3 (QK-norm), Qwen3.5 (hybrid Gated-DeltaNet attention).</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">Qwen MoE</div><div class="dl-caveat__v">Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B, Qwen3.6-35B-A3B (hybrid DeltaNet + routed experts).</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">Gemma</div><div class="dl-caveat__v">Gemma-2, Gemma-3, Gemma-4 — dense 12B / 31B, the 26B-A4B MoE, and the E2B / E4B edge series (per-layer embeddings, cross-layer KV sharing).</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">Phi</div><div class="dl-caveat__v">Phi-3.5-mini (LongRoPE).</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">gpt-oss</div><div class="dl-caveat__v">gpt-oss-20b — native MXFP4 experts, attention sinks, YaRN, Harmony chat format.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">speech-to-text</div><div class="dl-caveat__v">Whisper (tiny → large-v3-turbo), Parakeet-TDT v2 / v3, Canary-Qwen 2.5B, Qwen3-ASR 0.6B / 1.7B.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">audio chat</div><div class="dl-caveat__v">Qwen2-Audio, Qwen2.5-Omni 3B / 7B, Qwen3-Omni-30B, Ultravox v0.5, Voxtral-Mini-3B, Gemma-4 E-series audio.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">voice activity</div><div class="dl-caveat__v">Silero-VAD v6 — bit-exact vs onnxruntime; the 1.2 MB weights ship in-repo.</div></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- § 05 methodology -->
     <section class="forge-section forge-section--alt" id="method">
         <div class="forge-container">
-            <div class="forge-section-label"><span class="forge-section-label__num">§ 04</span><span class="forge-section-label__rule"></span><span>methodology &amp; honest caveats</span></div>
+            <div class="forge-section-label"><span class="forge-section-label__num">§ 05</span><span class="forge-section-label__rule"></span><span>methodology &amp; honest caveats</span></div>
             <h2 class="forge-h2" style="margin-bottom:36px">The framing, in full.</h2>
             <div class="dl-caveats">
                 <div class="dl-caveat"><div class="dl-caveat__k">what das is</div><div class="dl-caveat__v">An LLM + ASR inference engine written entirely in daslang and JIT-compiled — no hand-written SIMD/assembly. The point is narrow but real: a scripting language keeping pace with hand-tuned C++ on the CPU path.</div></div>
                 <div class="dl-caveat"><div class="dl-caveat__k">apples-to-apples</div><div class="dl-caveat__v">Everything here is CPU. The llama.cpp reference is built with no Accelerate/AMX BLAS on M1 (pure NEON/i8mm) for a like-for-like kernel comparison — not a comment on its GPU backends, which are broader and out of scope. Where a reference does get AMX (ASR *-cli on macOS), that's noted.</div></div>
-                <div class="dl-caveat"><div class="dl-caveat__k">prefill vs decode</div><div class="dl-caveat__v">das wins prompt-processing (compute-bound); it trails single-token generation (memory-bandwidth-bound). Neither is cherry-picked without the other — the toggle above shows both.</div></div>
-                <div class="dl-caveat"><div class="dl-caveat__k">quantization</div><div class="dl-caveat__v">LLM numbers are Q8. ASR is q8 encoder/decoder except audio-chat and Canary, which run fp32 for correctness. das output is verified token-for-token against each reference.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">prefill vs decode</div><div class="dl-caveat__v">das wins prompt-processing (compute-bound) across the board. Single-token generation (memory-bandwidth-bound) is a win-or-tie on the pinned x86 box and a near-tie on M1. The toggle above shows both.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">quantization</div><div class="dl-caveat__v">LLM numbers are Q8_0 or Q4_K_M (the quant column; K-quant files run on native K-quant kernels). ASR is q8 encoder/decoder except audio-chat and Canary, which run fp32 for correctness. das output is verified token-for-token against each reference.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">core pinning</div><div class="dl-caveat__v">On the Threadripper both sides pin 16 physical cores — das via the jobque's hard affinity mask, llama-bench via <code>--cpu-mask 0x55555555 --cpu-strict 1</code>. Unpinned, the OS placement lottery lands lanes on SMT siblings and halves lockstep prefill.</div></div>
                 <div class="dl-caveat"><div class="dl-caveat__k">two machines</div><div class="dl-caveat__v">An Arm laptop (Apple M1 Max) and an x86 workstation (Ryzen Threadripper 3990X) show the same pattern — that's the point; it's not one lucky box.</div></div>
-                <div class="dl-caveat"><div class="dl-caveat__k">dates &amp; versions</div><div class="dl-caveat__v">daslang 0.6.3; measured 2026-07-09, Parsec off. llama.cpp ebd048f (M1) / fdb1db877 (zen2). Raw data lives in the JSON these charts render from.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">dates &amp; versions</div><div class="dl-caveat__v">daslang 0.6.3, Parsec off. M1 measured 2026-07-13 (llama.cpp ebd048f); Threadripper 2026-07-13 (llama.cpp fdb1db877). Raw data lives in the JSON these charts render from.</div></div>
             </div>
         </div>
     </section>

@@ -101,6 +101,12 @@ def main {
             set_moe_fused_expert_gemms(mf != 0)
             print("moe_fused_expert_gemms override: {mf}\n")
         }
+        // A/B the grouped-MoE mx4 route: native mx4 batch GEMMs (backend default) vs expand-to-Q8
+        if (has_env_variable("DASLLAMA_MX4_NATIVE")) {
+            let mn = to_int(get_env_variable("DASLLAMA_MX4_NATIVE"))
+            set_mx4_native_batch(mn != 0)
+            print("mx4_native_batch override: {mn}\n")
+        }
         // A/B the 2-D batch chunk grid (0 = 1-D, 1 = fine grid, 2 = wave-aligned)
         if (has_env_variable("DASLLAMA_BATCH_GRID_2D")) {
             let bg2 = to_int(get_env_variable("DASLLAMA_BATCH_GRID_2D"))

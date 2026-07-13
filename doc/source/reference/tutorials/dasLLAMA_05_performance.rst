@@ -39,6 +39,11 @@ conservative) default. Re-run the tutorial with ``DAS_JOBQUE_THREADS=1`` to
 see what threading buys — the win grows with model size, since tiny models
 have tiny matmuls.
 
+On a big SMT box also set ``DAS_JOBQUE_AFFINITY`` (``1`` = ideal-CPU hint,
+``2`` = hard pin): unpinned, the OS placement lottery can land two compute
+lanes on one physical core's SMT pair, which roughly halves batched prefill
+while barely moving decode.
+
 Prefill vs generation
 =====================
 
@@ -63,7 +68,10 @@ Mode       Resident            Throughput
 
 Generation is bandwidth-bound, so between fp32 and q8 smaller weights are also
 faster. ``q4`` currently has no batched prefill kernel — it's the smallest
-footprint, not the fastest path.
+footprint, not the fastest path. For small *and* fast, prefer a K-quant GGUF
+(Q4_K_M / Q5_K_M / Q6_K): under ``QuantMode.q8`` those tensors keep their
+native K-quant format and run on dedicated kernels, so both phases stay at
+full speed with a q4-class footprint.
 
 Where to go deeper: ``modules/dasLLAMA/tune_for_this_box.md`` covers kernel
 tuning (token-block size, unrolls, the ``[dasllama_grid]`` tuner) when you

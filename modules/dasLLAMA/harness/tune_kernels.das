@@ -1723,7 +1723,9 @@ def bench_laneq4x4() : string {
     return report("dot_q8q8_laneq4x4", names, best, ok, "u2")
 }
 
-[export]
+// fallback: the tuner rail drives this half explicitly (DAS_TUNE_MODE=tune) — the auto
+// policy must not fire a nested tuner off this program's own missing per-app sidecar
+[export, tune_policy(missing = "fallback")]
 def main {
     create_job_que()   // the benches are single-thread, but the runtime snapshot reads get_total_hw_jobs()
     print("kernel tuner: N={N}, {ROUNDS} rounds x {REPS} reps, interleaved best-of\n\n")
