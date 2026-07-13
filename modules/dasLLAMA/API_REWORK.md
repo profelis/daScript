@@ -505,11 +505,23 @@ what it costs today and what the fix would change.
   best-of-N systematically picks the boost outlier.** Steady-state scoreboard (M1 Max,
   Qwen3-4B vs lcpp steady): Q5 ~150 vs 131 = 1.15×, Q6 ~141 vs 138.5 = 1.02×, Q4_K_M
   ~155-158 vs 172 = 0.90×.
-- **kq v2 on zen2/SPR — the x64 lattice race (k5/k6 v2 landed 2026-07-12 — unblocked).** The v2 emitter folds are
-  lattice-generic (maddubs/vpdpbusd kq grid rows emit the same integer scheme, bias128+kq
-  dropped as untested); zen2's lcpp lead was its AVX2 Q4_K 8x8 repack GEMM, and lcpp has NO
-  x64 repack for Q5_K/Q6_K — post-v2 zen2 should reach Q4_K parity and WIN Q5/Q6. Needs the
-  zen2 tune run + per-op race; SPR when a box respins.
+- **✅ RACED (zen2, 2026-07-12 PM², 16 affinity-pinned cores both sides, ABBA before=52a22a39b
+  after=3d78ca8ef, Qwen3-4B): das WINS Q5 pp 1.84× / Q6 1.32× vs lcpp; the kq v2+v3 arc itself
+  is ~NEUTRAL on the maddubs lattice.** pp512 das-after/lcpp: Q4 161–180 vs 168.3 (~parity —
+  their one AVX2 K-quant repack), Q5 158–161 vs 87.0 (**1.84×**), Q6 128–130 vs 98.0
+  (**1.32×**); tg64 ≈ lcpp parity all three (19.3/16.6/14.5 vs 19.25/16.87/14.69). ABBA
+  before→after: Q4/Q5 pp par-to-+3%, **Q6 pp −4.6%** (135.2→129.0 median), tg within noise
+  (Q4 −4%, Q5 +2%, Q6 −3%). Reading: the M1 unpack win was an sdot-lattice property — on
+  Zen2's maddubs lattice the v1 unpack was never the bottleneck, and the Q5/Q6 lcpp wins
+  pre-date the arc (their vec_dot rail is that slow). The Q6 −4.6% is the arc's one x64 cost;
+  suspects (not yet attributed — needs a mid-arc leg): the v2 signed per-16 fold's separate
+  lo/hi i16 chains (flush every 2 madds) vs v1's, or v3's second verbatim load per weight
+  vector on a load-port-bound lattice. Candidate fix if chased: gate kqBytes per-ISA (byte
+  panels NEON-only — needs a per-format panel-flag companion so the batch cell knows).
+  Sized: ~5% Q6 pp on zen2 only; zen2 stays 1.32× ahead of lcpp regardless. Also not yet run:
+  the zen2 kq tune sweep (families ran the maddubs-mr8 fallback rows; crowns could shift a
+  few %). SPR when a box respins — per Boris (2026-07-12): future profiling moves to an
+  AWS box, local boxes are a bottleneck.
 - **kq tune bench lacks a MoE-shaped cell row (spotted validating the mr4 crowns, 2026-07-12).**
   The mr4 tile crown gave dense pp +10-26% but gave back ~3% MoE prefill on qwen3moe-30B
   (fused expert cells average ~32 tokens per expert with d=768-class group spans — a regime
