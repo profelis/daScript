@@ -6,6 +6,7 @@ require math
 require strings  // to_int: DASLLAMA_CALLER_PRIO env override in setup_dasllama_jobque_
 require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses the profile's team_rank_gate knob
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
+require daslib/jobque_profile  // named trace categories + unit markers (set_trace_tags registers them)
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
 require dasllama/dasllama_tune  // [tuned]: reconstitute dot from dot_template with per-box loop hints
 require llvm/daslib/f16_cvt  // f16<->f32 converts: JIT half intrinsics on aarch64 / x64+F16C, exact bit-twiddle elsewhere
@@ -523,7 +524,12 @@ def public get_team_rank_gate() : int { return g_team_rank_gate }
 // by OP rather than stage-count. Gated — set_trace_tags(true) rides with jobque_trace_start in
 // the profiling harness; production dispatches never pay the extern call.
 var g_trace_tags = false
-def public set_trace_tags(on : bool) { g_trace_tags = on }
+def public set_trace_tags(on : bool) {
+    g_trace_tags = on
+    if (on && is_job_que_available()) {   // registries live on the que; stay que-independent like trace_tag
+        register_trace_categories()
+    }
+}
 let public TRACE_TAG_ATTN_CHAIN = 1
 let public TRACE_TAG_ATTN_STD = 2
 let public TRACE_TAG_FFN_CHAIN = 3
@@ -538,6 +544,26 @@ def public trace_tag(t : int) {
     if (g_trace_tags) {
         jobque_trace_tag(t)
     }
+}
+def public trace_marker(name : string; arg : int) {
+    // instant unit boundary ("token", "layer", "step") on the caller lane; same gate as trace_tag
+    if (g_trace_tags && is_job_que_available()) {
+        profile_marker(name, arg)
+    }
+}
+// names/colors match the lane-timeline viewer's dark-theme palette, so saved traces carry
+// the exact legend the artifact hardcoded
+def private register_trace_categories() {
+    profile_category(TRACE_TAG_ATTN_CHAIN, "attn chain", 0x5E96DEu)
+    profile_category(TRACE_TAG_ATTN_STD, "attn std", 0x5E96DEu)
+    profile_category(TRACE_TAG_FFN_CHAIN, "ffn chain", 0x43B08Au)
+    profile_category(TRACE_TAG_FFN_STD, "ffn per-op", 0x43B08Au)
+    profile_category(TRACE_TAG_CLS, "classifier", 0xAC82E4u)
+    profile_category(TRACE_TAG_MOE, "moe experts", 0xE08563u)
+    profile_category(TRACE_TAG_SHEXP, "shexp", 0xC39536u)
+    profile_category(TRACE_TAG_PLE, "ple", 0xC39536u)
+    profile_category(TRACE_TAG_ROUTE, "router", 0x4FC3D0u)
+    profile_category(TRACE_TAG_PARK, "park/reduce", 0xD678B4u)
 }
 
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,

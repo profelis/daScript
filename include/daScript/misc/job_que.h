@@ -197,6 +197,13 @@ namespace das {
         // small app-defined id before a dispatch; ChainPublish records numStages | (tag << 8) in
         // its stage field, and workers' chunk events join to it via the chain id.
         void traceSetTag ( int tag ) { mTraceTag.store(tag, std::memory_order_relaxed); }
+        // Self-describing traces: categories name the traceSetTag ids (viewer color/legend
+        // channel), markers stamp instant "unit" events (frame, token) on the caller lane so
+        // viewers navigate unit-to-unit. Registries persist across trace sessions; traceSave
+        // emits them in a "jobqueProfile" sibling key Perfetto ignores.
+        void traceCategory ( int id, const char * name, uint32_t rgb );    // rgb = 0xRRGGBB
+        int  traceMarkerName ( const char * name );                        // idempotent per name
+        void traceMarker ( int nameId, int arg );                          // no-op unless tracing
     protected:
         struct JobEntry {
             JobEntry( Job&& _function, JobCategory _category, JobPriority _priority) {
@@ -289,7 +296,7 @@ namespace das {
         uint64_t mTPreact = 0, mTPreactN = 0, mTPlastRel = 0, mTPlastN = 0;
         // per-lane trace rings (see traceStart). lane == worker threadIndex; the dispatching
         // caller records as lane getNumWorkers().
-        enum class TraceTag : uint32_t { ChainPublish, Chunk, StageWait, Wake, FifoJob };
+        enum class TraceTag : uint32_t { ChainPublish, Chunk, StageWait, Wake, FifoJob, Marker };
         struct TraceEvent {
             uint64_t t0, t1;        // ref_time_ticks (ns, one clock for every lane)
             uint32_t tag, stage;    // TraceTag; stage index (Chunk/StageWait) or stage count (ChainPublish)
@@ -304,6 +311,10 @@ namespace das {
         atomic<int32_t> mTraceTag{0};   // current op tag (traceSetTag) — folded into ChainPublish.stage's high bits
         uint64_t mTraceT0 = 0;          // session start tick — wake spans clamp their park-t0 to it
         vector<LaneTrace> mTrace;
+        struct TraceCategory { int id; string name; uint32_t rgb; };
+        mutex mTraceRegMutex;                    // guards both registries (cold path only)
+        vector<TraceCategory> mTraceCategories;
+        vector<string> mTraceMarkerNames;        // marker nameId = index
         __forceinline void traceEvent ( int lane, TraceTag tag, uint64_t t0, uint64_t t1,
                 uint32_t stage, uint32_t arg, uint32_t chain ) {
             if ( uint32_t(lane) >= uint32_t(mTrace.size()) ) return;

@@ -209,6 +209,7 @@ def private profile_window(t : Model; var s : Session; p, n : int64; tok0 : int6
     forward_profile_reset()
     let t0 = ref_time_ticks()
     for (i in range64(n)) {
+        trace_marker("token", int(i))   // unit boundary for the timeline viewer (no-op untraced)
         forward(t, s, tok, p + i)
         tok = greedy_top(s, t.config.vocab_size)
     }
