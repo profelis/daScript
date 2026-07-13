@@ -1105,7 +1105,10 @@ def private confirm_and_write(winner : string) : bool {
         return true
     }
     let tmpm = "{get_das_root()}/_tune_confirm_manifest.json"
-    if (!fwrite(tmpm, "\{\"q8q8_tile_gen\": \"{winner}\"\}")) {
+    // the stamps read the manifest's "kernels" SECTION (read_manifest) — a flat root object
+    // parses found-but-empty, the challenger arm stamps the fallback, and the confirm can
+    // never pass (both arms score 0 -> auto-reject)
+    if (!fwrite(tmpm, "\{\"kernels\": \{\"q8q8_tile_gen\": \"{winner}\"\}\}")) {
         print("confirm: cannot write {tmpm} — is das_root writable?\n")
         return false
     }

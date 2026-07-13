@@ -3,6 +3,8 @@ options gen2
 require daslib/module_path
 require daslib/command_line
 require daslib/fio
+require daslib/jobque_boost   // get_total_hw_cores: the measurement-regime lane count
+require math
 
 // The dasllama scope tuner — the wrapper the policy rail (auto default / --tune / daspkg
 // release) spawns. Runs BOTH halves as child daslang processes, each upserting the same
@@ -12,11 +14,31 @@ require daslib/fio
 // A child failure is reported but does not abort the other half — the completeness check
 // upstream names whatever ends up missing.
 
+// Both halves take real measurements (the confirm gate is a full prefill), so they must run
+// under the box measurement regime — 16 cores with affinity on the big-SMT x64 boxes, not the
+// fresh-que default (all cores): a crown confirmed at the wrong width ships the wrong kernel.
+// Explicit DAS_JOBQUE_* envs on the tuner itself still win — the children inherit them.
+def private regime_env_prefix() : string {
+    if (get_platform_name() != "windows") {
+        return ""
+    }
+    var pfx = ""
+    if (!has_env_variable("DAS_JOBQUE_THREADS")) {
+        let lanes = min(get_total_hw_cores(), 16)
+        pfx = "set DAS_JOBQUE_THREADS={lanes}&& "
+    }
+    if (!has_env_variable("DAS_JOBQUE_AFFINITY")) {
+        pfx = "{pfx}set DAS_JOBQUE_AFFINITY=2&& "   // hard mask — mode 1's hint re-rolls SMT placement per que
+    }
+    return pfx
+}
+
 def private run_half(name : string) : bool {
-    let cmd = "\"{get_das_exe()}\" -jit \"{path_join(get_this_module_dir(), name)}\" -dasroot \"{get_das_root()}\" 2>&1"
-    // cmd.exe strips the first and last quote of a line that starts with a quote —
-    // wrap in a sacrificial outer pair on windows (same trap as the daspkg popen incident)
-    let full = get_platform_name() == "windows" ? "\"{cmd}\"" : cmd
+    let pfx = regime_env_prefix()
+    let cmd = "{pfx}\"{get_das_exe()}\" -jit \"{path_join(get_this_module_dir(), name)}\" -dasroot \"{get_das_root()}\" 2>&1"
+    // cmd.exe strips the first and last quote of a line that starts with a quote — wrap in a
+    // sacrificial outer pair on windows UNLESS the env prefix already leads (the daspkg popen trap)
+    let full = get_platform_name() == "windows" && empty(pfx) ? "\"{cmd}\"" : cmd
     print("dasllama_tuner: {cmd}\n")
     var rc : int
     unsafe {
