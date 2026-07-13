@@ -1345,7 +1345,9 @@ def tune_mode_run : bool {
     return ok
 }
 
-[export]
+// fallback: the tuner rail drives this via DAS_TUNE_MODE=tune explicitly; the auto policy
+// must not fire when this runs as the compile-only fallback-discovery child (recursion)
+[export, tune_policy(missing = "fallback")]
 def main {
     if (!jit_enabled()) {
         print("run with -jit — the generator only fires under the LLVM JIT\n")
