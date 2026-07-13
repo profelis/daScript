@@ -349,7 +349,7 @@ def main() {
                 <div class="dl-caveat"><div class="dl-caveat__k">quantization</div><div class="dl-caveat__v">LLM numbers are Q8_0 or Q4_K_M (the quant column; K-quant files run on native K-quant kernels). ASR is q8 encoder/decoder except audio-chat and Canary, which run fp32 for correctness. das output is verified token-for-token against each reference.</div></div>
                 <div class="dl-caveat"><div class="dl-caveat__k">core pinning</div><div class="dl-caveat__v">On the Threadripper both sides pin 16 physical cores — das via the jobque's hard affinity mask, llama-bench via <code>--cpu-mask 0x55555555 --cpu-strict 1</code>. Unpinned, the OS placement lottery lands lanes on SMT siblings and halves lockstep prefill.</div></div>
                 <div class="dl-caveat"><div class="dl-caveat__k">two machines</div><div class="dl-caveat__v">An Arm laptop (Apple M1 Max) and an x86 workstation (Ryzen Threadripper 3990X) show the same pattern — that's the point; it's not one lucky box.</div></div>
-                <div class="dl-caveat"><div class="dl-caveat__k">dates &amp; versions</div><div class="dl-caveat__v">daslang 0.6.3, Parsec off. M1 measured 2026-07-09 (llama.cpp ebd048f); Threadripper 2026-07-13 (llama.cpp fdb1db877). Raw data lives in the JSON these charts render from.</div></div>
+                <div class="dl-caveat"><div class="dl-caveat__k">dates &amp; versions</div><div class="dl-caveat__v">daslang 0.6.3, Parsec off. M1 measured 2026-07-13 (llama.cpp ebd048f); Threadripper 2026-07-13 (llama.cpp fdb1db877). Raw data lives in the JSON these charts render from.</div></div>
             </div>
         </div>
     </section>
