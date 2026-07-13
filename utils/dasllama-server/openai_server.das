@@ -46,6 +46,7 @@ struct private StreamWire {
     id : string                     // "chatcmpl-N" / "cmpl-N"
     created : int64
     reply_parts : array<string>     // non-streaming: pieces accumulate until the finished event
+    utf8_tail : string              // streaming: held-back bytes of a multi-byte char split across tokens
 }
 
 var g_wires : table<int64; StreamWire>
@@ -233,8 +234,34 @@ def private error_body(msg, kind : string) : string {
 
 // Terminal error on a streaming route's writer (chat/completions run through the writer).
 def private bad_request(srv : WebSocketServer; var writer : HttpResponseWriter?; msg : string) {
+    to_log(LOG_WARNING, "dasllama-server: 400 rejected: {msg}\n")
     respond(srv, writer, int(http_status.BAD_REQUEST), "application/json",
             error_body(msg, "invalid_request_error"))
+}
+
+// Bytes of an INCOMPLETE trailing UTF-8 sequence (0 = the string ends on a character boundary).
+// A token piece can end mid-character (multi-byte chars span BPE tokens); every SSE delta must
+// be valid UTF-8 on its own or strict clients (the OpenAI python lib) abort the stream.
+def private utf8_hold_bytes(s : string) : int {
+    var hold = 0
+    peek_data(s) $(arr) {
+        let n = length(arr)
+        var back = 0
+        while (back < 4 && back < n) {
+            let b = uint(arr[n - 1 - back])
+            if ((b & 0xC0u) != 0x80u) {         // found a non-continuation byte
+                if (b >= 0xC0u) {               // multi-byte lead: expected sequence length
+                    let need = b >= 0xF0u ? 4 : (b >= 0xE0u ? 3 : 2)
+                    if (back + 1 < need) {
+                        hold = back + 1         // sequence is cut short — hold it back
+                    }
+                }
+                break                           // ascii / complete / invalid: nothing to hold
+            }
+            back++
+        }
+    }
+    return hold
 }
 
 // One chat.completion.chunk SSE event. role-only for the opening delta, content for each token,
@@ -345,10 +372,12 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
     preq.close_toks <- close_toks
     if (!submit(g_model, g_sched, preq)) {
         delete preq
+        to_log(LOG_WARNING, "dasllama-server: 503 queue full ({g_sched.max_queue}) — rejected {prefix} request ({np} tok)\n")
         respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
                 error_body("the server is at capacity ({g_sched.max_queue} requests queued) — retry shortly", "server_error"))
         return
     }
+    to_log(LOG_INFO, "[req {rid}] {prefix}: prompt={np} tok, stream={streaming}, max_new={max_new}\n")
     var wire <- StreamWire(writer = writer, streaming = streaming, is_chat = is_chat,
                            id = cid, created = created)
     g_wires[rid] <- wire
@@ -464,16 +493,32 @@ def private flush_events(srv : WebSocketServer) {
         if (e.kind == SchedEventKind.piece) {
             if (!w.streaming) {
                 w.reply_parts |> push(e.text)
-            } elif (w.is_chat) {
-                send_chat_chunk(srv, w.writer, w.id, w.created, "", e.text, "")
             } else {
-                send_compl_chunk(srv, w.writer, w.id, w.created, e.text, "")
+                // re-join any held-back partial character, then hold the new incomplete tail
+                // so every delta on the wire is valid UTF-8 by itself
+                let whole = "{w.utf8_tail}{e.text}"
+                let hold = utf8_hold_bytes(whole)
+                let cut = length(whole) - hold
+                let emit_now = hold > 0 ? slice(whole, 0, cut) : whole
+                w.utf8_tail = hold > 0 ? slice(whole, cut) : ""
+                if (!empty(emit_now)) {
+                    if (w.is_chat) {
+                        send_chat_chunk(srv, w.writer, w.id, w.created, "", emit_now, "")
+                    } else {
+                        send_compl_chunk(srv, w.writer, w.id, w.created, emit_now, "")
+                    }
+                }
             }
             continue
         }
         if (e.finish == "evicted") {
             release_writer(srv, w.writer)
         } elif (w.streaming) {
+            if (!empty(w.utf8_tail)) {
+                // generation ended mid-character (max-tokens cut): the held bytes can never
+                // complete, and emitting them would put invalid UTF-8 on the wire — drop loudly
+                to_log(LOG_WARNING, "dasllama-server: stream {w.id} ended mid-UTF-8-sequence; dropped {length(w.utf8_tail)} byte(s)\n")
+            }
             if (w.is_chat) {
                 send_chat_chunk(srv, w.writer, w.id, w.created, "", "", e.finish)
             } else {
@@ -628,9 +673,10 @@ class OpenAiServer : HvWebServer {
 //! cache reuses completed streams' pages, so repeated prompts (system prompts, multi-turn chats)
 //! skip their prefill; ``prefix_groups`` caps the cache (0 = auto: one full context per stream
 //! slot, < 0 = unbounded). ``page_rows`` = 0 restores flat preallocated sessions (each the full
-//! ``--ctx`` slab). Call after ``set_model``.
+//! ``--ctx`` slab). ``kv_dtype`` picks the KV-cache codec for every stream (pool-wide when paged;
+//! see ``KVDtype`` — ``tq4`` needs a power-of-two head_size). Call after ``set_model``.
 def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
-               page_rows : int64 = 64l; prefix_groups : int64 = 0l) {
+               page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16) {
     g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once
     with_job_que() {
         setup_dasllama_jobque()
@@ -641,7 +687,7 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
         if (pfx < 0l) {
             pfx = 0l   // explicit unbounded
         }
-        g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx)
+        g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype)
         var server = new OpenAiServer()
         server->init(port)
         let rc = server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
@@ -649,12 +695,19 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
             to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
         } else {
             let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
-            let kv_mode = page_rows > 0l ? "paged P={page_rows}, prefix cache {pfx_desc} pages" : "flat"
+            let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
             to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode})\n")
             while (!g_should_stop) {
                 server->tick()   // drains queued handlers: requests parse + render + submit here
                 reap_disconnected(server.server)
+                let t_step = ref_time_ticks()
                 let busy = scheduler_step(g_model, g_sched, g_events)
+                let step_ms = int64(get_time_usec(t_step)) / 1000l
+                if (step_ms > 3000l) {
+                    // the "why does it pause" catcher: one decode step / prefill chunk should be
+                    // well under a second — anything slower means contention or a stall
+                    to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms (active={n_active(g_sched)}, queued={n_queued(g_sched)})\n")
+                }
                 flush_events(server.server)
                 if (!busy) {
                     sleep(2u)

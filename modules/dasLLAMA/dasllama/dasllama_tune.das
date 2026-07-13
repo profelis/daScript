@@ -7,8 +7,8 @@ require daslib/ast
 require daslib/rtti
 require daslib/ast_boost
 require daslib/templates_boost
-require daslib/fio         // [tuned] reads the per-box profile at compile time
 require daslib/json_boost  // read_json / read_json_field (re-exports daslib/json)
+require llvm/daslib/llvm_tune   // the per-app tune sidecar (path, staleness, kernels read)
 
 // ===== Tune spec =====
 
@@ -240,32 +240,32 @@ def private tuned_template_name(func : FunctionPtr; args : AnnotationArgumentLis
     return "{func.name}_template"     // convention: dot -> dot_template
 }
 
-//! The per-box profile location, shared by the `[tuned]` compile-time read, the runtime apply
-//! (load_model), and the tuner harness write. `DASLLAMA_BOX_PROFILE` env overrides; otherwise
-//! `<das_root>/box_profile.json` — per-install == per-box, and independent of the compile cwd
-//! (a bare-cwd read silently loses the profile when compiling from anywhere but the repo root).
+//! The dasLLAMA tune location — the ONE per-app sidecar (`<app>.tune.json` beside the root
+//! script / binary; `DAS_TUNE_MANIFEST` env overrides): shared by the `[tuned]`
+//! compile-time read, the runtime apply (load_model), the `[tune]` generator winners, and
+//! the tuner harness write. Loop-hint winners live in its `"kernels"` section next to the
+//! generator perms; the knobs live under `"runtime"`.
 def box_profile_path() : string {
-    let env = get_env_variable("DASLLAMA_BOX_PROFILE")
-    if (!empty(env)) return env
-    return path_join(get_das_root(), "box_profile.json")
+    return tune_manifest_path()
 }
 
-// Compile-time read of the per-box profile written by the tuner harness:
-// function name -> winning perm suffix. Returns "" if the file is absent or lacks
-// the key (macros can do fio; fread returns "" on a missing file).
+//! The sidecar is older than the running binary — its measurements are dead (the runtime
+//! apply skips it; the compile-time reads already treat it as absent).
+def box_profile_stale() : bool {
+    return tune_sidecar_stale(tune_manifest_path())
+}
+
+// Compile-time read of the sidecar's "kernels" section written by the tuner harness:
+// function name -> winning perm suffix. "" when the sidecar is absent, stale, or lacks
+// the key (macros can do fio).
 def private config_perm_for(fname : string) : string {
-    let text = fread(box_profile_path())
-    if (empty(text)) return ""
-    var err = ""
-    let jv = read_json(text, err)
-    if (jv == null) return ""
-    return read_json_field(jv, fname, "")
+    return tune_manifest_get(fname)
 }
 
 // Perm precedence: explicit `perm=` pin (the profiler's per-variant stubs) >
-// per-box `box_profile.json` (keyed by the emitted function name) > `fallback=`
+// the app sidecar's "kernels" entry (keyed by the emitted function name) > `fallback=`
 // (the kernel's own hand-tuned hints when they aren't the global vec8_u2) >
-// DEFAULT_PERM (the bit-identical fallback when no profile exists).
+// DEFAULT_PERM (the bit-identical fallback when no sidecar exists).
 // (`fallback`, not `default` — `default` is a grammar keyword and won't parse as an arg name.)
 def private resolve_perm(func : FunctionPtr; args : AnnotationArgumentList) : string {
     let av = find_arg(args, "perm")
@@ -298,7 +298,7 @@ def private find_template_function(name : string) : FunctionPtr {
 //! `[tuned]` on an empty-body function clones the body of its source template
 //! (`<name>_template`, or `src="..."`) and stamps the selected permutation's hints onto the
 //! `[tune=N]` loops. The annotated function IS the real symbol — callers are untouched.
-//! Perm precedence: `perm="..."` pin > box_profile.json (see box_profile_path) >
+//! Perm precedence: `perm="..."` pin > the app sidecar (see box_profile_path) >
 //! `fallback="..."` (the kernel's own hand hints when they aren't vec8_u2) > vec8_u2.
 [function_macro(name="tuned")]
 class private TunedMacro : AstFunctionAnnotation {

@@ -1,12 +1,12 @@
 options gen2
 
-require daslib/fio
+require llvm/daslib/llvm_tune
 
 // Instant fake tuner for llvm_tune_scope.das (no [test] on purpose): records k2 for
-// scope_add into the manifest the framework points it at via DAS_TUNE_MANIFEST.
+// scope_add via the upsert API — the framework points it at the app sidecar through
+// DAS_TUNE_MANIFEST, and the upsert must leave every other scope's keys alone.
 [export]
 def main {
-    let path = get_env_variable("DAS_TUNE_MANIFEST")
-    print("FAKE TUNER -> {path}\n")
-    fwrite(path, "\{\"scope_add\":\"k2\"\}")
+    print("FAKE TUNER -> {tune_manifest_path()}\n")
+    tune_manifest_set("scope_add", "k2")
 }

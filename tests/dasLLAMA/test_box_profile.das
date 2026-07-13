@@ -5,9 +5,9 @@ require dasllama/dasllama_common
 require dasllama/dasllama_math  // the knob setters/getters (incl. set/get_q8_token_block) + the backend registry (engine-level, not re-exported)
 require daslib/fio
 
-// box_profile.json "runtime" section: apply_box_profile_runtime(path) sets the runtime knobs and
-// logs each applied entry. The explicit-path form keeps the test independent of the box's real
-// profile (DASLLAMA_BOX_PROFILE / <das_root>/box_profile.json); knobs are restored after each case.
+// The tune sidecar's "runtime" section: apply_box_profile_runtime(path) sets the runtime knobs
+// and logs each applied entry. The explicit-path form keeps the test independent of the app's
+// real sidecar (<app>.tune.json / DAS_TUNE_MANIFEST); knobs are restored after each case.
 
 def private restore_defaults() {
     set_q8_token_block(128l)

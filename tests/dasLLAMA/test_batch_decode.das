@@ -100,6 +100,20 @@ def private kv_blob_max_diff(blob : array<uint8>; refb : array<uint8>; pref : ar
                             maxd = max(maxd, abs(float(int8(qb[bb + 2l + k])) * db - float(int8(qr[bb + 2l + k])) * dr))
                         }
                     }
+                } elif (dt == KVDtype.tq4) {
+                    let qb = bp + base + row * rowb
+                    let qr = rp + base + row * rowb
+                    for (bi in range64(kvd / 32l)) {
+                        let bb = bi * 18l
+                        let db = f16_to_f32(uint(qb[bb]) | (uint(qb[bb + 1l]) << 8u))
+                        let dr = f16_to_f32(uint(qr[bb]) | (uint(qr[bb + 1l]) << 8u))
+                        for (k in range64(16l)) {
+                            let byb = int(qb[bb + 2l + k])
+                            let byr = int(qr[bb + 2l + k])
+                            maxd = max(maxd, abs(float((byb & 15) - 8) * db - float((byr & 15) - 8) * dr))
+                            maxd = max(maxd, abs(float((byb >> 4) - 8) * db - float((byr >> 4) - 8) * dr))
+                        }
+                    }
                 } else {
                     let fb = reinterpret<float const?>(bp + base + row * rowb)
                     let fr = reinterpret<float const?>(rp + base + row * rowb)
@@ -268,6 +282,35 @@ def test_batch_decode_q8_kv(t : T?) {
         set_fused_decode(false)
         with_job_que() {
             batch_vs_ref(t, tr, KVDtype.q8_0, 8l, 1.0e-6, "q8_0kv")
+        }
+        set_fused_decode(prev_fused)
+        delete tr
+    }
+}
+
+[test]
+def test_batch_decode_tq4_kv(t : T?) {
+    t |> run("batched decode == sequential under the tq4 KV codec (needs SmolLM2-135M)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        // stories15M's head_size 48 fails the tq4 pow2 check (by design) — SmolLM2 (head 64) carrier,
+        // same rail as test_batch_decode_q8_kv. Parity, not quality: both paths rotate + quantize
+        // through the same kernels, so batch == sequential holds at fp32 tolerance
+        let env = get_env_variable("DASLLAMA_MODELS_DIR")
+        let mdir = empty(env) ? "/Users/borisbatkin/Work/llama.cpp/models/" : env
+        let path = path_join(mdir, "SmolLM2-135M-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> skip("{path} not present")
+            return
+        }
+        var tr <- load_gguf(path, QuantMode.q8)
+        tr.config.seq_len = min(tr.config.seq_len, 64l)
+        let prev_fused = get_fused_decode()
+        set_fused_decode(false)
+        with_job_que() {
+            batch_vs_ref(t, tr, KVDtype.tq4, 8l, 1.0e-6, "tq4kv")
         }
         set_fused_decode(prev_fused)
         delete tr

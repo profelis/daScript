@@ -6,7 +6,7 @@ require dasllama/dasllama_math
 require dasllama/dasllama_math_aarch64_neon
 require dasllama/dasllama_math_default  // dot_q8q8_f16s — the row-major tails of the s16 twins
 require llvm/daslib/f16_cvt  // the kq reference bodies widen the f16 (s, o) scale pairs
-require llvm/daslib/llvm_tune  // [tune]/[tune_perm]/[tune_companion] + the [llvm_code] annotation it re-exports
+require llvm/daslib/llvm_tune public  // [tune]/[tune_perm]/[tune_companion] + [llvm_code]; PUBLIC so the auto-policy infer pass and tune_status reach app roots that require this module
 require dasllama/dasllama_gemm_schema
 require daslib/jobque_boost public
 require dasllama/dasllama_par
@@ -41,10 +41,14 @@ require math
 // generated family. The generators live in dasllama/dasllama_gemm_gen.das (llvm-jit context,
 // wired via llvm/daslib/llvm_user_modules.das).
 
-// The library-owned tune scope: every app that pulls dasLLAMA in shares the per-box winners
-// at <das_root>/dasllama.tune.json, and [tune_policy]/--tune run gen_tune_probe to produce
-// them (point DASLLAMA_CONFIRM_MODEL at a q8 gguf to arm its e2e confirm gate).
-[tune_scope(name = "dasllama", tuner = "../harness/gen_tune_probe.das")]
+// The library-owned tune scope: winners land in the app tune sidecar, and the policy rail
+// (auto default / --tune / daspkg release) runs dasllama_tuner — the wrapper that sweeps
+// BOTH halves: the [tune] generator grid (gen_tune_probe; point DASLLAMA_CONFIRM_MODEL at a
+// q8 gguf to arm its e2e confirm gate) and the [tuned] loop-hint grid + runtime snapshot
+// (tune_kernels). covers= names the modules whose [tuned] kernels this scope demands sidecar
+// entries for (the completeness set — drift shows up as a loud "missing:" list at startup).
+[tune_scope(name = "dasllama", tuner = "../harness/dasllama_tuner.das",
+            covers = "dasllama_math;dasllama_math_default;dasllama_quant;dasllama_math_aarch64_neon")]
 struct private DasllamaTuneScope {}
 
 //! The layout companion (the six-function stamp): the repack interleave (mr) the stamped tile

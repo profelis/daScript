@@ -56,6 +56,7 @@ var private log_open_failed = false
 var private log_min_level = LOG_INFO
 var private log_category_overrides : table<string; int>
 var private log_fallback_to_stderr = true
+var private log_tee = false
 
 // ── Internal helpers ─────────────────────────────────────────────────
 
@@ -309,8 +310,15 @@ class private LogHookAgent : DapiDebugAgent {
             fields = JV({"at" => JV("{at.fileInfo.name}:{at.line}")})
         }
         emit(level, "runtime", string(text), fields)
-        return true
+        return !log_tee   // tee mode: the line also continues to the default stdout/stderr path
     }
+}
+
+def logger_set_tee(tee : bool) {
+    //! Tee mode: hooked ``print``/``to_log`` lines go to the log file AND still reach
+    //! stdout/stderr (the default hook behavior diverts them to the file only — right for
+    //! stdio-transport tools, wrong for interactive servers watched on a console).
+    log_tee = tee
 }
 
 def logger_install_hook() {
@@ -329,4 +337,11 @@ def logger_init(name : string) {
     //! The common-case one-liner for tools that want both behaviors.
     logger_set_name(name)
     logger_install_hook()
+}
+
+def logger_init_tee(name : string) {
+    //! ``logger_init`` in tee mode: everything still prints to the console AND lands,
+    //! timestamped, in ``logs/<name>.log`` — the one-liner for interactive servers.
+    logger_set_tee(true)
+    logger_init(name)
 }

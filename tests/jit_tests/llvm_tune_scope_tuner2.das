@@ -1,13 +1,12 @@
 options gen2
 
-require daslib/fio
+require llvm/daslib/llvm_tune
 
-// Fake tuner for scope llvm_tune_scope_probe2 (no [test] on purpose) — POISONED: also
-// writes an entry for scope_add, which belongs to the OTHER scope. The scope-restricted
-// restamp must leave lib1's kernel on its own winner.
+// Fake tuner for scope llvm_tune_scope_probe2 (no [test] on purpose): upserts ONLY its own
+// key into the shared app sidecar — running after tuner 1 it must not clobber scope_add
+// (upsert-preservation is the isolation contract of the one-file-per-app world).
 [export]
 def main {
-    let path = get_env_variable("DAS_TUNE_MANIFEST")
-    print("FAKE TUNER2 -> {path}\n")
-    fwrite(path, "\{\"scope_mul\":\"k0\",\"scope_add\":\"k0\"\}")
+    print("FAKE TUNER2 -> {tune_manifest_path()}\n")
+    tune_manifest_set("scope_mul", "k0")
 }

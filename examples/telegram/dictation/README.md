@@ -1,23 +1,27 @@
 # dictation — a local voice-transcription Telegram bot
 
-Transcribes voice notes and audio files into clean, easy-to-read text — entirely on your machine.
+Transcribes voice notes and audio files into clean, easy-to-read text — entirely on your machines.
 For every voice/audio message (in a group or a direct message) the bot:
 
 1. downloads the audio and transcodes it to 16 kHz mono WAV with **ffmpeg**;
-2. transcribes it with a local **whisper** model (auto-detecting the language — Russian, English, …);
-3. rewrites the raw transcript into clean, paragraph-split text with a local **instruct LLM** (dasLLAMA),
-   preserving the speaker's own words and languages (no translation, no paraphrasing);
+2. sends it to a running **dasllama-server** — `/v1/audio/transcriptions` for the speech-to-text
+   (auto-detecting the language — Russian, English, …);
+3. asks the same server's `/v1/chat/completions` to rewrite the raw transcript into clean,
+   paragraph-split text, preserving the speaker's own words and languages (no translation,
+   no paraphrasing);
 4. replies with the result, threaded to the original message.
 
-Everything runs offline through [dasLLAMA](../../../modules/dasLLAMA) (whisper + the LLM) and
-[dasTelegram](https://github.com/borisbat/dasTelegram) (the Bot API).
+The bot itself is **Telegram-only** — no models, no job queue, no JIT requirement. All inference
+runs on [dasllama-server](../../../utils/dasllama-server) (one shared LLM instance for the bot and
+any other OpenAI-compatible client); Telegram plumbing is
+[dasTelegram](https://github.com/borisbat/dasTelegram).
 
 ## Requirements
 
-- A **JIT-enabled** `daslang` build (dasLLAMA inference on the interpreter is unusably slow).
+- A running **dasllama-server** with BOTH models in ITS config: `model =` the instruct LLM GGUF
+  (e.g. `Qwen3-4B-Instruct-2507`) and `asr =` the ASR ggml `.bin` (whisper or parakeet,
+  auto-sniffed — parakeet-tdt v3 is ~15× faster on short notes).
 - **ffmpeg** on `PATH` (or an absolute path in the config) — needed to decode Telegram's OGG/Opus voice notes.
-- A **whisper** ASR model (whisper.cpp `ggml-*.bin`) — multilingual `large-v3-turbo` is a good RU+EN default.
-- An **instruct LLM** GGUF (e.g. `Qwen3-4B-Instruct-2507`, `gemma-3-4b-it`).
 - A **bot token** from [@BotFather](https://t.me/BotFather).
 
 ## Setup
@@ -26,16 +30,16 @@ Everything runs offline through [dasLLAMA](../../../modules/dasLLAMA) (whisper +
 daspkg install                 # installs dasTelegram into modules/ (reads .das_package)
 ```
 
-Edit `dictation.toml` — point `whisper_model` / `llm_model` at your model files, adjust `threads`,
-`min_chars`, `keep_audio_dir`, etc. Put your bot token in `bot_token`, or leave it empty and set the
+Edit `dictation.toml` — point `server` at your dasllama-server, tweak the `prompt`, `min_chars`,
+`keep_audio_dir`, etc. Put your bot token in `bot_token`, or leave it empty and set the
 `TELEGRAM_BOT_TOKEN` environment variable (which overrides the config).
 
 ## Run
 
-From the repo root, under the JIT:
+From the repo root (the interpreter is fine — the bot does no inference):
 
 ```
-bin/daslang -jit -project_root examples/telegram/dictation examples/telegram/dictation/main.das
+bin/daslang -project_root examples/telegram/dictation examples/telegram/dictation/main.das
 ```
 
 The bot logs to `dictation.log` (a proper leveled/structured log via `daslib/logger`) — including each
@@ -53,13 +57,13 @@ To transcribe every voice note posted in a group, either:
 
 | Key | Meaning |
 |---|---|
-| `whisper_model` | Path to the whisper ggml `.bin` |
-| `llm_model` | Path to the instruct LLM GGUF |
+| `server` | dasllama-server base URL (default `http://127.0.0.1:8080`); it must have `asr =` loaded |
 | `bot_token` | Bot token (or use `TELEGRAM_BOT_TOKEN`, which wins) |
-| `threads` | dasLLAMA worker cap; workers + main = compute lanes (7 → 8) |
-| `language` | Whisper hint; `auto` detects per message |
+| `prompt` | The dictation system prompt (TOML multi-line string; `{lang}` → detected language; remove the key for the built-in) |
+| `language` | ASR hint; `auto` detects per message |
 | `max_tokens` | Reply-token budget for the cleanup |
 | `temp` | LLM sampling temperature (0 = greedy/faithful) |
+| `llm_timeout` | Seconds to wait for the cleanup response (long notes at low tok/s need headroom) |
 | `ffmpeg` | ffmpeg executable |
 | `poll_timeout` | `getUpdates` long-poll timeout, seconds |
 | `log_file` / `log_level` | Log path (default `dictation.log` next to the exe) and level |
@@ -68,10 +72,10 @@ To transcribe every voice note posted in a group, either:
 
 ## Notes
 
-- The LLM step's latency scales with transcript length (decode is memory-bandwidth-bound), so a long
-  voice note can take a few minutes. Model size — not core count — is the main lever.
-- The `-jit` invocation above is the run-from-source path. For a redistributable build,
-  `daspkg release --root examples/telegram/dictation --out <dir>` produces `<dir>/dictation-bot/` — a
-  standalone executable (plus the daslang runtime DLLs, shared modules, and `dictation.toml`) that runs
-  with no daslang installed. The whisper/LLM models are referenced by absolute path in the config, so
-  they are not bundled; edit the shipped `dictation.toml` to point at the models on the target machine.
+- The LLM step's latency scales with transcript length, so a long voice note can take a couple of
+  minutes — raise `llm_timeout` if you dictate essays. The server queues the bot fairly alongside
+  other clients (it serves several streams concurrently).
+- For a redistributable build, `daspkg release --root examples/telegram/dictation --out <dir>`
+  produces `<dir>/dictation-bot/` — a standalone executable (plus the daslang runtime DLLs, shared
+  modules, and `dictation.toml`) that runs with no daslang installed. Point the shipped
+  `dictation.toml` at the server on the target machine.

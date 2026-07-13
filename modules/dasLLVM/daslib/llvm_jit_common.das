@@ -384,6 +384,12 @@ var public g_handled_field_offset_globals : table<string; tuple<modName : string
 // wasm32-only miscompiles.
 var public g_target_is_wasm = false
 
+// The resolved host_features truth of the last flag pass (see init_jit_target_flags): true
+// when the g_target_* gates were computed from the running box's cpuid/host features, false
+// on the generic/forced-only rail (cross triples, kernel-free standalone exes). Build
+// provenance for generators and probes — a generated kernel can bake it into the artifact.
+var public g_target_host_features = false
+
 // Set by init_jit when the JIT target is aarch64 (arm64). Gates the g_aarch64_intrin_lookup
 // platform-intrinsic table in llvm_jit_intrin: NEON instructions (e.g. SDOT) are only emitted when
 // this is true; on every other target the intrinsic's daslang fallback body is emitted instead.
@@ -589,6 +595,7 @@ def public init_jit_clopts() {
 // fpext-through-half that lowers to compiler-rt libcalls (__extendhfsf2) msvcrt never links.
 // Env-FORCED features stay honored (explicit emission-only rail, same contract as cross triples).
 def public init_jit_target_flags(target_triple : string = ""; host_features : bool = true) {
+    g_target_host_features = host_features
     g_target_is_wasm = target_triple |> starts_with("wasm")
     // Host path (empty triple): the module targets the host, so the daslang binary's own arch is the
     // JIT target arch. Explicit cross-compile triple: read the arch off the triple prefix.

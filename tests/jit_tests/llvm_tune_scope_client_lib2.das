@@ -5,8 +5,8 @@ module llvm_tune_scope_client_lib2 public
 require llvm/daslib/llvm_tune public
 
 // Second library fixture for llvm_tune_scope.das (no [test] on purpose): a SEPARATE scope
-// with its own tuner — the two-libraries-each-ship-tuning case. Its tuner is poisoned with
-// an entry for lib1's kernel, which the scope-restricted restamp must ignore.
+// with its own tuner — the two-libraries-each-ship-tuning case. Both scopes share the ONE
+// app sidecar; each tuner upserts its own keys and must preserve the other's.
 [tune_scope(name = "llvm_tune_scope_probe2", tuner = "./llvm_tune_scope_tuner2.das")]
 struct private ScopeDecl2 {}
 
