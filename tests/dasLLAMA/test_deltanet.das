@@ -45,6 +45,11 @@ def test_deltanet_chunked_prefill(t : T?) {
         }
         let c = tr.config
         let prev_dn = get_deltanet_prefill_mode()
+        // pin the scalar activation forms: this gate isolates the CHUNK algebra, and the two forms
+        // are only reassociation-apart — exp4's ~2ulp is enough to flip a near-tie greedy pick and
+        // derail the id lockstep (the exp4 paths are parity-gated by the frozen fixtures instead)
+        let prev_vec = get_act_vec()
+        set_act_vec(false)
         with_job_que() {
             setup_dasllama_jobque_()
             let n = 150l
@@ -83,6 +88,7 @@ def test_deltanet_chunked_prefill(t : T?) {
             delete s1
             delete s2
         }
+        set_act_vec(prev_vec)
         set_deltanet_prefill_mode(prev_dn)
         delete tr
     }

@@ -62,6 +62,7 @@ def private with_llama_server(model_path : string; port : int; blk : block<(base
         new_thread() @() {
             var m <- load_model(model_path, QuantMode.q8)
             set_model(m, "test-llm")
+            set_default_max_tokens(4l)   // per-context global — exercised by the default-budget completion test
             run_server(port)   // blocks (with_job_que + tick loop) until POST /shutdown
             finished |> notify_and_release
         }
@@ -160,6 +161,20 @@ def test_openai_server(t : T?) {
                 t |> success(js != null, "chat JSON parses")
                 if (js != null) {
                     t |> equal(string(js?["object"] ?? ""), "chat.completion")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            // /v1/completions WITHOUT max_tokens — the configured default budget applies (4 in this
+            // harness; llm-cli-style clients omit the field, raw completions run to the budget)
+            POST("{base_url}/v1/completions", "\{\"prompt\":\"Once\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "default-budget completion JSON parses")
+                if (js != null) {
+                    t |> equal(int(js?["usage"]?["completion_tokens"] ?? 0l), 4)
                     unsafe {
                         delete js
                     }
