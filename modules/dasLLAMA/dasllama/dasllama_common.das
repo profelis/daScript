@@ -5638,9 +5638,13 @@ def private moe_experts_apply(t : Model; var s : Session; l : int64) {
     if (pre_q8) {
         let ts_rq = ref_time_ticks()
         if (layer_kq && moe_pair_kform(fmt_at(t.we1_fmt, l), fmt_at(t.we3_fmt, l))) {
-            // kq v2: kq gate/up stacks read the Q8_K-form scratch (the q8 image has no consumer
-            // — a q8/kq gate-up mix panics in moe_pair_kform)
+            // kq v2: kq gate/up stacks read the Q8_K-form scratch
             quantize_q8_k_into(s.xb, dim, s.kxq, s.kxs, s.kxbs, 0l, 0l, 0l)
+            if (c.n_ff_shexp > 0l && !c.moe_dense_shexp) {
+                // the q8 shexp downstream (moe_ffn_core) reads the hoisted moe_xq image — without
+                // this its quants are stale/zero and the shared expert silently drops out (#3450)
+                quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)
+            }
         } else {
             quantize_q8_0_into(s.xb, dim, s.moe_xq, s.moe_xs, 0l, 0l)
         }
