@@ -24,7 +24,7 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--config` | `-c` | *auto* | TOML config file; keys mirror the long flag names, explicit CLI flags override. Without the flag, a `dasllama-server.toml` in the cwd or next to the program loads automatically |
 | `--model` | `-m` | *(required)* | GGUF model to serve (here or in `--config`) |
 | `--port` | `-p` | `8080` | Listen port |
-| `--quant` | `-q` | `q8` | Weight quantization: `fp32` \| `q8` \| `q4` |
+| `--quant` | `-q` | `q8` | Weight quantization: `fp32` \| `q8` \| `q4` — plus the loader's file-format spellings `q4_k` \| `q5_k` \| `q6_k` \| `mxfp4` \| `f16` \| `bf16` (all serve on the `q8` kquant-native tier) |
 | `--kv-dtype` | — | `f16` | KV-cache codec: `f32` \| `f16` \| `q8_0` \| `tq4` (rotated 4-bit; needs pow2 head_size) |
 | `--asr` | `-a` | — | ASR model (whisper/parakeet/qwen3-asr) — enables the `/v1/audio/*` routes |
 | `--mmproj` | — | — | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
