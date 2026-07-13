@@ -189,6 +189,29 @@ class DapiDataWalker {
     def abstract URange(var value : urange&) : void
     def abstract Range64(var value : range64&) : void
     def abstract URange64(var value : urange64&) : void
+    def abstract Float16(var value : float16&) : void
+    def abstract Half2(var value : half2&) : void
+    def abstract Half3(var value : half3&) : void
+    def abstract Half4(var value : half4&) : void
+    def abstract Half8(var value : half8&) : void
+    def abstract Short2(var value : short2&) : void
+    def abstract Short3(var value : short3&) : void
+    def abstract Short4(var value : short4&) : void
+    def abstract Short8(var value : short8&) : void
+    def abstract UShort2(var value : ushort2&) : void
+    def abstract UShort3(var value : ushort3&) : void
+    def abstract UShort4(var value : ushort4&) : void
+    def abstract UShort8(var value : ushort8&) : void
+    def abstract Byte2(var value : byte2&) : void
+    def abstract Byte3(var value : byte3&) : void
+    def abstract Byte4(var value : byte4&) : void
+    def abstract Byte8(var value : byte8&) : void
+    def abstract Byte16(var value : byte16&) : void
+    def abstract UByte2(var value : ubyte2&) : void
+    def abstract UByte3(var value : ubyte3&) : void
+    def abstract UByte4(var value : ubyte4&) : void
+    def abstract UByte8(var value : ubyte8&) : void
+    def abstract UByte16(var value : ubyte16&) : void
     def abstract WalkBlock(var value : DapiBlock) : void
     def abstract WalkFunction(var value : DapiFunc) : void
     def abstract WalkEnumeration(var value : int&; ei : EnumInfo) : void

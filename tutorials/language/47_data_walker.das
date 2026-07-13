@@ -15,6 +15,8 @@
 // Key concepts:
 //   - DapiDataWalker is a visitor pattern for daScript data at runtime
 //   - Override scalar callbacks (Int, Float, String, ...) to handle values
+//   - Leaf callbacks exist for every leaf type: scalars, vectors, ranges,
+//     and the 16/8-bit lattice (Float16, Half*, Short*/UShort*, Byte*/UByte*)
 //   - Override before/after callbacks for containers (structures, arrays, etc.)
 //   - All canVisit methods default to true — override to prune traversal
 //   - Scalar callbacks receive mutable references — values can be modified
