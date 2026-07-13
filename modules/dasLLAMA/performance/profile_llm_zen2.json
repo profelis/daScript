@@ -1,14 +1,15 @@
 {
   "platform":{
     "cpu":"AMD Ryzen Threadripper 3990X 64-Core Processor",
-    "os":"Windows 11",
+    "os":"Microsoft Windows [Version 10.0.26200.8655]",
     "threads":16,
-    "daslang":"unknown",
+    "daslang":"0.6.3",
     "llama_cpp":"fdb1db877",
-    "date":"2026-07-09",
-    "box_profile":"box_profile.json",
+    "date":"2026-07-13",
+    "box_profile":"gen_profile.tune.json",
     "parsec_off":true,
-    "tune":"q8q8_tile_gen=dot_maddubs_width256_mr8_kstep2 (fallback)"
+    "affinity":"das jobque mode 2; llama-bench --cpu-mask 0x55555555 --cpu-strict 1",
+    "tune":"k4q8_tile_gen=dot_maddubs_width256_mr8 (manifest); k5q8_tile_gen=dot_maddubs_width256_mr8_nrsplit2 (manifest); k6q8_tile_gen=dot_maddubs_width256_mr8 (manifest); q8q8_tile_gen=dot_maddubs_width256_mr8_kstep2 (manifest)"
   },
   "tests":[
     {
@@ -18,13 +19,13 @@
       "active_b":0.134479872,
       "prefill":{
         "context":512,
-        "das_tok_s":2423.118060748327,
-        "llama_cpp_tok_s":2362.0486390000001
+        "das_tok_s":2499.4630059948058,
+        "llama_cpp_tok_s":2414.7431160000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":138.31437994095705,
-        "llama_cpp_tok_s":210.934189
+        "das_tok_s":231.84625695085947,
+        "llama_cpp_tok_s":226.31643500000001
       }
     },
     {
@@ -34,13 +35,13 @@
       "active_b":0.49396121599999998,
       "prefill":{
         "context":512,
-        "das_tok_s":1258.9039176008046,
-        "llama_cpp_tok_s":1023.460115
+        "das_tok_s":1294.4100195425576,
+        "llama_cpp_tok_s":1048.1715919999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":66.534602411567462,
-        "llama_cpp_tok_s":84.607169999999996
+        "das_tok_s":89.645082511995284,
+        "llama_cpp_tok_s":87.492925999999997
       }
     },
     {
@@ -50,13 +51,13 @@
       "active_b":0.59598438399999998,
       "prefill":{
         "context":512,
-        "das_tok_s":944.88479602853124,
-        "llama_cpp_tok_s":708.16510800000003
+        "das_tok_s":954.71268182894619,
+        "llama_cpp_tok_s":781.60196099999996
       },
       "emission":{
         "context":128,
-        "das_tok_s":56.194178985484342,
-        "llama_cpp_tok_s":69.120482999999993
+        "das_tok_s":72.559766856399122,
+        "llama_cpp_tok_s":71.394169000000005
       }
     },
     {
@@ -66,13 +67,13 @@
       "active_b":0.99975168000000003,
       "prefill":{
         "context":512,
-        "das_tok_s":664.08641424465361,
-        "llama_cpp_tok_s":521.54357600000003
+        "das_tok_s":653.49049439363864,
+        "llama_cpp_tok_s":564.05555400000003
       },
       "emission":{
         "context":128,
-        "das_tok_s":38.184141231205871,
-        "llama_cpp_tok_s":43.962519999999998
+        "das_tok_s":47.373281099356205,
+        "llama_cpp_tok_s":44.800516000000002
       }
     },
     {
@@ -82,13 +83,13 @@
       "active_b":1.099956224,
       "prefill":{
         "context":512,
-        "das_tok_s":616.31946534286385,
-        "llama_cpp_tok_s":406.32284900000002
+        "das_tok_s":630.94592596243899,
+        "llama_cpp_tok_s":441.89621799999998
       },
       "emission":{
         "context":128,
-        "das_tok_s":40.214241370903494,
-        "llama_cpp_tok_s":44.036313
+        "das_tok_s":46.16313981480647,
+        "llama_cpp_tok_s":44.984614999999998
       }
     },
     {
@@ -98,13 +99,13 @@
       "active_b":1.235746816,
       "prefill":{
         "context":512,
-        "das_tok_s":630.8464184680289,
-        "llama_cpp_tok_s":415.39842399999998
+        "das_tok_s":670.83053274688075,
+        "llama_cpp_tok_s":455.273121
       },
       "emission":{
         "context":128,
-        "das_tok_s":36.984097127173577,
-        "llama_cpp_tok_s":39.563918000000001
+        "das_tok_s":40.281378013353908,
+        "llama_cpp_tok_s":39.840736999999997
       }
     },
     {
@@ -114,13 +115,13 @@
       "active_b":1.543569408,
       "prefill":{
         "context":512,
-        "das_tok_s":413.7885330469141,
-        "llama_cpp_tok_s":323.20978000000002
+        "das_tok_s":440.20706927844731,
+        "llama_cpp_tok_s":329.69905699999998
       },
       "emission":{
         "context":128,
-        "das_tok_s":28.293826972195788,
-        "llama_cpp_tok_s":29.997119000000001
+        "das_tok_s":31.536888674043833,
+        "llama_cpp_tok_s":30.810911999999998
       }
     },
     {
@@ -130,13 +131,13 @@
       "active_b":1.711276032,
       "prefill":{
         "context":512,
-        "das_tok_s":384.12916343120378,
-        "llama_cpp_tok_s":247.78922900000001
+        "das_tok_s":404.66502903787728,
+        "llama_cpp_tok_s":272.19165199999998
       },
       "emission":{
         "context":128,
-        "das_tok_s":26.111380951380408,
-        "llama_cpp_tok_s":27.639506999999998
+        "das_tok_s":28.883368956155046,
+        "llama_cpp_tok_s":28.386243
       }
     },
     {
@@ -146,13 +147,13 @@
       "active_b":2.6140999680000001,
       "prefill":{
         "context":512,
-        "das_tok_s":299.40259825317298,
-        "llama_cpp_tok_s":201.22790599999999
+        "das_tok_s":313.45755313319802,
+        "llama_cpp_tok_s":219.956683
       },
       "emission":{
         "context":128,
-        "das_tok_s":17.08293189555549,
-        "llama_cpp_tok_s":17.386838000000001
+        "das_tok_s":19.333557179675054,
+        "llama_cpp_tok_s":17.877075000000001
       }
     },
     {
@@ -162,13 +163,13 @@
       "active_b":3.8208798719999999,
       "prefill":{
         "context":512,
-        "das_tok_s":179.23725446334021,
-        "llama_cpp_tok_s":114.038918
+        "das_tok_s":185.03353371404947,
+        "llama_cpp_tok_s":123.845068
       },
       "emission":{
         "context":128,
-        "das_tok_s":12.763768765980888,
-        "llama_cpp_tok_s":13.673068000000001
+        "das_tok_s":13.517635022164699,
+        "llama_cpp_tok_s":13.582352999999999
       }
     },
     {
@@ -178,13 +179,13 @@
       "active_b":3.8798950400000001,
       "prefill":{
         "context":512,
-        "das_tok_s":189.99166931059369,
-        "llama_cpp_tok_s":130.39688599999999
+        "das_tok_s":200.12210575358873,
+        "llama_cpp_tok_s":138.39662999999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":11.863109723292039,
-        "llama_cpp_tok_s":12.449761000000001
+        "das_tok_s":13.066272337456084,
+        "llama_cpp_tok_s":12.454217999999999
       }
     },
     {
@@ -194,13 +195,13 @@
       "active_b":4.0222720000000001,
       "prefill":{
         "context":512,
-        "das_tok_s":169.77191209926619,
-        "llama_cpp_tok_s":112.831193
+        "das_tok_s":176.24493640036241,
+        "llama_cpp_tok_s":120.28776999999999
       },
       "emission":{
         "context":128,
-        "das_tok_s":11.61344713785688,
-        "llama_cpp_tok_s":12.43751
+        "das_tok_s":12.54447039255078,
+        "llama_cpp_tok_s":12.3986
       }
     },
     {
@@ -210,13 +211,13 @@
       "active_b":2.2476226559999999,
       "prefill":{
         "context":512,
-        "das_tok_s":260.93519786481619,
-        "llama_cpp_tok_s":209.89474899999999
+        "das_tok_s":273.26516648360035,
+        "llama_cpp_tok_s":215.793621
       },
       "emission":{
         "context":128,
-        "das_tok_s":17.89871091526317,
-        "llama_cpp_tok_s":19.274581000000001
+        "das_tok_s":21.22874989696593,
+        "llama_cpp_tok_s":19.137046999999999
       }
     },
     {
@@ -226,13 +227,13 @@
       "active_b":7.2477573120000001,
       "prefill":{
         "context":512,
-        "das_tok_s":97.684607691365485,
-        "llama_cpp_tok_s":67.247034999999997
+        "das_tok_s":101.61389458868304,
+        "llama_cpp_tok_s":66.577089000000001
       },
       "emission":{
         "context":128,
-        "das_tok_s":6.9033017845250848,
-        "llama_cpp_tok_s":7.5006709999999996
+        "das_tok_s":7.3000335459354044,
+        "llama_cpp_tok_s":7.1539469999999996
       }
     },
     {
@@ -242,13 +243,13 @@
       "active_b":4.5888307199999998,
       "prefill":{
         "context":512,
-        "das_tok_s":143.42684838549553,
-        "llama_cpp_tok_s":101.754525
+        "das_tok_s":147.26417957025896,
+        "llama_cpp_tok_s":107.799064
       },
       "emission":{
         "context":128,
-        "das_tok_s":9.1594193357488916,
-        "llama_cpp_tok_s":10.339623
+        "das_tok_s":10.655108537680418,
+        "llama_cpp_tok_s":9.90944
       }
     },
     {
@@ -258,13 +259,93 @@
       "active_b":8.0299950080000002,
       "prefill":{
         "context":512,
-        "das_tok_s":94.797452836878577,
-        "llama_cpp_tok_s":66.933554999999998
+        "das_tok_s":99.797889781417283,
+        "llama_cpp_tok_s":65.886958000000007
       },
       "emission":{
         "context":128,
-        "das_tok_s":6.3864696254515181,
-        "llama_cpp_tok_s":7.1113999999999997
+        "das_tok_s":6.9493601213792608,
+        "llama_cpp_tok_s":6.7469400000000004
+      }
+    },
+    {
+      "model":"Qwen3-4B-q4k",
+      "arch":"qwen3",
+      "quant":"q4_k_m",
+      "active_b":4.0222720000000001,
+      "prefill":{
+        "context":512,
+        "das_tok_s":184.94083157633523,
+        "llama_cpp_tok_s":187.75493700000001
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":20.417085974594446,
+        "llama_cpp_tok_s":19.849736
+      }
+    },
+    {
+      "model":"Qwen3.6-35B-A3B",
+      "arch":"qwen35moe",
+      "quant":"q4_k_m",
+      "active_b":2.8626124800000001,
+      "prefill":{
+        "context":512,
+        "das_tok_s":142.17238290354882,
+        "llama_cpp_tok_s":103.709287
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":16.463693760890315,
+        "llama_cpp_tok_s":13.036918999999999
+      }
+    },
+    {
+      "model":"Qwen3.5-0.8B",
+      "arch":"qwen35",
+      "quant":"q8",
+      "active_b":0.62547558400000003,
+      "prefill":{
+        "context":512,
+        "das_tok_s":820.32220077065438,
+        "llama_cpp_tok_s":536.37608399999999
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":53.561460520600662,
+        "llama_cpp_tok_s":43.369441999999999
+      }
+    },
+    {
+      "model":"gpt-oss-20b",
+      "arch":"gpt-oss",
+      "quant":"mxfp4",
+      "active_b":4.1862758400000004,
+      "prefill":{
+        "context":512,
+        "das_tok_s":84.122142722416001,
+        "llama_cpp_tok_s":143.900982
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":19.89377037460125,
+        "llama_cpp_tok_s":19.647666999999998
+      }
+    },
+    {
+      "model":"Qwen3-30B-A3B",
+      "arch":"qwen3moe",
+      "quant":"q4_k_m",
+      "active_b":3.3528217599999999,
+      "prefill":{
+        "context":512,
+        "das_tok_s":171.1125288794168,
+        "llama_cpp_tok_s":150.74888200000001
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":23.088801876975285,
+        "llama_cpp_tok_s":22.939775000000001
       }
     }
   ]

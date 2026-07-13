@@ -14,6 +14,7 @@ require profile_common
 require daslib/clargs
 require strings
 require daslib/fio
+require llvm/daslib/llvm_tune   // [tune_policy]: this tool benches llama.cpp only — never auto-tune
 
 [CommandLineArgs]
 struct Args {
@@ -21,8 +22,8 @@ struct Args {
     @clarg_doc = "Tier: small | large | all (default small)"
     tier : string = "small"
 
-    @clarg_doc = "Threads (default 8 — the perf-core count on both target boxes)"
-    threads : int = 8
+    @clarg_doc = "Threads for llama-bench -t (0 = per-box default: 16, m1 8)"
+    threads : int = 0
 
     @clarg_doc = "Prompt tokens for the prefill test (default 512)"
     nprompt : int = 512
@@ -66,7 +67,8 @@ struct LlamaBenchRow {
 // Run llama-bench for one model and fold its two result rows (n_gen=0 prefill, n_prompt=0 decode) into
 // an LlmBaseline. prefill/emission stay -1 on a run or parse failure.
 def bench_one(display, path : string; threads, nprompt, ngen, ngl : int) : LlmBaseline {
-    let cmd = "{llama_bench_bin(ngl)} -m {path} -ngl {ngl} -t {threads} -p {nprompt} -n {ngen} -o json"
+    // affinity args pin the bench to distinct physical cores on the boxes that pin (see profile_common)
+    let cmd = "{llama_bench_bin(ngl)} -m {path} -ngl {ngl} -t {threads}{lcpp_affinity_args(threads)} -p {nprompt} -n {ngen} -o json"
     var out = ""
     unsafe {
         popen(cmd) $(f) {
@@ -105,7 +107,9 @@ def private upsert_baseline(var rows : array<LlmBaseline>; b : LlmBaseline) {
     rows |> push(b)
 }
 
-[export]
+// fallback: this tool only runs llama-bench — das gen-kernels never execute, so an
+// untuned box must NOT trigger the (minutes-long) auto-tune the measuring tools get
+[export, tune_policy(missing = "fallback")]
 def main() {
     var r <- parse_args(type<Args>)
     if (r |> is_err) {
@@ -119,11 +123,12 @@ def main() {
         return
     }
     let tier = parse_tier(cfg.tier)
+    let threads = cfg.threads > 0 ? cfg.threads : profile_threads()
     let suffix = cfg.ngl != 0 ? "_metal" : ""
     logger_set_name(prof_log_name())
     logger_info("profile.llm.baseline", "run start", JV({"box" => JV(box_name()), "tier" => JV(cfg.tier),
-        "threads" => JV(cfg.threads), "ngl" => JV(cfg.ngl), "bench" => JV(llama_bench_bin(cfg.ngl))}))
-    print("establishing LLM baselines: box={box_name()} tier={cfg.tier} threads={cfg.threads} ngl={cfg.ngl}\n")
+        "threads" => JV(threads), "affinity" => JV(affinity_on()), "ngl" => JV(cfg.ngl), "bench" => JV(llama_bench_bin(cfg.ngl))}))
+    print("establishing LLM baselines: box={box_name()} tier={cfg.tier} threads={threads} affinity={affinity_on()} ngl={cfg.ngl}\n")
     print("log: {logger_get_path()}  (tail for live, timestamped progress)\n")
     print("NOTE: this runs llama.cpp llama-bench (a measurement) — Parsec must be off.\n\n")
     // The baseline is persisted after EVERY model (upsert into the loaded file, rewrite): a crash or
@@ -141,7 +146,7 @@ def main() {
         let mb = int(sz / (1024ul * 1024ul))
         logger_info("profile.llm.baseline", "model start", JV({"model" => JV(m.display), "size_mb" => JV(mb)}))
         let t0 = ref_time_ticks()
-        let b = bench_one(m.display, model_path(m), cfg.threads, cfg.nprompt, cfg.ngen, cfg.ngl)
+        let b = bench_one(m.display, model_path(m), threads, cfg.nprompt, cfg.ngen, cfg.ngl)
         let ms = double(get_time_usec(t0)) / 1000.0lf
         if (b.prefill_tok_s < 0.0lf || b.emission_tok_s < 0.0lf) {
             logger_error("profile.llm.baseline", "model failed (llama-bench parse)", JV({"model" => JV(m.display), "elapsed_ms" => JV(ms)}))
