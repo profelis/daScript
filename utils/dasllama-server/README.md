@@ -28,7 +28,7 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--kv-dtype` | — | `f16` | KV-cache codec: `f32` \| `f16` \| `q8_0` \| `tq4` (rotated 4-bit; needs pow2 head_size) |
 | `--asr` | `-a` | — | ASR model (whisper/parakeet/qwen3-asr) — enables the `/v1/audio/*` routes |
 | `--mmproj` | — | — | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
-| `--ctx` | — | `4096` | Context-length cap in tokens |
+| `--ctx` | — | *model* | Context-length cap in tokens (default: the model's trained `context_length`; set it to bound `--flat` KV or trim RAM) |
 | `--max-tokens` | — | `256` | Default reply token budget when a request omits `max_tokens` (clamped to `--ctx` per request) |
 | `--streams` | `-s` | `4` | Max concurrent generation streams |
 | `--threads` | `-t` | `16` | Worker-lane cap for the matmul dispatch (`-1` = all cores) — decode is bandwidth-bound, so an uncapped dispatch just fights the rest of the box |

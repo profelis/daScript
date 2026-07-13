@@ -58,7 +58,7 @@ struct ServerArgs {
     @clarg_doc = "mmproj for the GGUF Qwen3-ASR route (paired with --asr)"
     mmproj : string
 
-    @clarg_doc = "Context-length cap in tokens (default 4096)"
+    @clarg_doc = "Context-length cap in tokens (default: the model's trained context_length)"
     ctx : int
 
     @clarg_doc = "Default reply token budget when a request omits max_tokens (default 256; clamped to ctx per request)"
@@ -253,7 +253,7 @@ def main : int {
     }
 
     let port = cfg.port > 0 ? cfg.port : 8080     // non-positive (incl. a stray negative) -> default
-    let ctx = cfg.ctx > 0 ? int64(cfg.ctx) : 4096l   // guard: a negative ctx would make seq_len < 0
+    let ctx = cfg.ctx > 0 ? int64(cfg.ctx) : 0l   // 0 = keep the model's trained context_length
     let streams = cfg.streams > 0 ? int64(cfg.streams) : 4l
     let chunk = cfg.chunk > 0 ? int64(cfg.chunk) : 64l
     let page_rows = cfg.flat ? 0l : (cfg.page_rows > 0 ? int64(cfg.page_rows) : 64l)
@@ -273,7 +273,11 @@ def main : int {
     log_tune_status("dasllama-server")
     print("loading {cfg.model} ...\n")
     var m <- load_model(cfg.model, pick_quant(cfg.quant))
-    m.config.seq_len = min(m.config.seq_len, ctx)
+    if (ctx > 0l) {
+        m.config.seq_len = min(m.config.seq_len, ctx)
+    }
+    let ctx_note = ctx > 0l ? "" : " (model default)"
+    to_log(LOG_INFO, "dasllama-server: ctx {m.config.seq_len}{ctx_note}\n")
     set_model(m, base_name(cfg.model))
     set_default_max_tokens(cfg.max_tokens > 0 ? int64(cfg.max_tokens) : 256l)
 
