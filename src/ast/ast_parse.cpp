@@ -1004,6 +1004,26 @@ namespace das {
                 }
             }
             gcStageReportDelta(moduleName.c_str(), fileName.c_str(), "infer", logs);
+            // fixupAnnotations runs HERE — after infer converges (types are final) but BEFORE
+            // lint / foldUnsafe / optimize, so anything a fixup() generates (the shader-blob
+            // captures: dasGlsl / dasSpirv / dasMetal filling their `{name}` globals) flows
+            // through the whole back half of the pipeline like ordinary code. A call-shaped
+            // init (e.g. the array<uint> literal's to_array_move lowering) is uninferred when
+            // fixup sets it — the gated dirty re-infer resolves it, and sitting before
+            // foldUnsafe keeps the re-infer from re-tripping already-folded unsafe (the same
+            // ordering constraint escape-analysis' scope_free insertion documents above).
+            if ( !program->failed() ) {
+                program->fixupAnnotations();
+                if ( !program->failed() ) {
+                    bool hasUninferredInit = false;
+                    program->thisModule->globals.foreach([&](auto & gvar){
+                        if ( gvar->init && !gvar->init->type ) hasUninferredInit = true;
+                    });
+                    if ( hasUninferredInit ) {
+                        inferTypesDirty(program.get(), logs, true);
+                    }
+                }
+            }
             if ( !program->failed() ) {
                 program->normalizeOptionTypes();
                 if (!program->failed())
@@ -1034,8 +1054,6 @@ namespace das {
                         program->removeUnusedSymbols();
                     }
                 }
-                if (!program->failed())
-                    program->fixupAnnotations();
                 if (!program->failed())
                     program->deriveAliases(logs,true,true);
                 if (!program->failed())

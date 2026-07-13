@@ -5,9 +5,12 @@ options indenting = 4
 // SPIR-V words are captured into a module global `{name} : array<uint>`. The global is DECLARED in
 // `apply` (so consumer code referencing it resolves during the first inference pass — declaring it
 // later, in patch/fixup, deadlocks: the consumer fails inference, which gates patchAnnotations off).
-// Its init is FILLED in `patch` with astChanged=true: an array<uint> literal lowers to a
-// `to_array_move(...)` CALL, and a call set into a global init in `fixup` (no re-infer) is never
-// resolved and crashes the alias pass — patch's astChanged triggers the re-infer that resolves it.
+// Its init is FILLED in `fixup` — types are final there, and the pipeline gives fixup-set global
+// inits a dirty re-infer (ast_parse.cpp), so the `to_array_move(...)` call the array<uint> literal
+// lowers to resolves like ordinary code. (Historically the fill lived in `patch` with
+// astChanged=true to force that re-infer by hand — at the price of a full-program infer restart
+// per shader-bearing module.) The backend body-fill hooks stay in `patch`: they populate function
+// BODIES, which genuinely need the in-loop re-infer.
 // Builtins come in via spirv_builtins. Host: feed `{name}` straight to vkCreateShaderModule.
 
 module spirv_shader shared public
@@ -91,6 +94,39 @@ class SpirvShader : AstFunctionAnnotation {
         return true
     }
     def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
+        // GPU compilers do their own inlining — the CPU auto-inliner (patchInline, which shares
+        // this patch slot and runs once annotation patches go quiet) must not reshape the shader
+        // tree the emitter reads at fixup. Callee-side neverInline pins every reachable function;
+        // flag writes need no re-infer, so astChanged stays untouched. SAME-MODULE only: that is
+        // the inliner's whole candidate universe, and the flag folds into the semantic hash — a
+        // cross-module mark desyncs that module's separately-compiled AOT registration (50101).
+        collect_dependencies(func) $(vfun, _vvar) {
+            for (dfn in vfun) {
+                if (dfn._module == compiling_module()) {
+                    dfn.moreFlags.neverInline = true
+                }
+            }
+        }
+        // Backend body-fill: the dummy bind_uniform / push_constants functions were reserved in apply();
+        // their bodies stay empty (still `exports = true`) until the backend's generate_* override
+        // populates them here. astChanged on the first fill triggers re-infer so the bodies resolve.
+        for_each_function(compiling_module(), bind_uniform_function_name(func)) $(bfun) {
+            if (bfun.flags.exports) {
+                bfun.flags.exports = false
+                generate_bind_uniform(func, bfun)
+                astChanged = true
+            }
+        }
+        for_each_function(compiling_module(), push_constants_function_name(func)) $(bfun) {
+            if (bfun.flags.exports) {
+                bfun.flags.exports = false
+                generate_push_constants(func, bfun)
+                astChanged = true
+            }
+        }
+        return true
+    }
+    def override fixup(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string) : bool {
         let argName = args |> find_arg("name") ?as tString ?? "{func.name}`spirv"
         var local_size : int3
         local_size.x = args |> find_arg("local_size_x") ?as tInt ?? 1
@@ -126,7 +162,7 @@ class SpirvShader : AstFunctionAnnotation {
             var words <- generate_spirv(func, err, shader_stage(), local_size, mesh_cfg, refl)
             if (err |> empty()) {
                 glob.init = build_uint_array_literal(words, func.at)
-                // Fill the companion reflection global in the same patch pass (gated on the blob's
+                // Fill the companion reflection global in the same fixup (gated on the blob's
                 // null init, so both fill exactly once).
                 var rwords <- encode_reflection(refl)
                 var rglob <- find_variable(compiling_module(), "{argName}_reflect")
@@ -135,7 +171,6 @@ class SpirvShader : AstFunctionAnnotation {
                 }
                 rglob := null
                 delete rwords
-                astChanged = true
             }
             finalize(refl)
             delete words
@@ -144,23 +179,6 @@ class SpirvShader : AstFunctionAnnotation {
         if (!(err |> empty())) {
             errors := join(err, "\n")
             return false
-        }
-        // Backend body-fill: the dummy bind_uniform / push_constants functions were reserved in apply();
-        // their bodies stay empty (still `exports = true`) until the backend's generate_* override
-        // populates them here. astChanged on the first fill triggers re-infer so the bodies resolve.
-        for_each_function(compiling_module(), bind_uniform_function_name(func)) $(bfun) {
-            if (bfun.flags.exports) {
-                bfun.flags.exports = false
-                generate_bind_uniform(func, bfun)
-                astChanged = true
-            }
-        }
-        for_each_function(compiling_module(), push_constants_function_name(func)) $(bfun) {
-            if (bfun.flags.exports) {
-                bfun.flags.exports = false
-                generate_push_constants(func, bfun)
-                astChanged = true
-            }
         }
         return true
     }

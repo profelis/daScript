@@ -300,6 +300,9 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | test_kgroup_repack.das | K-group repack layout round-trips | |
 | test_matmul.das | matmul/GEMV kernels (fp32/Q8/Q4) vs reference | |
 | test_matmul_batch.das | Batched (prefill) matmul vs reference — chunking invariance | |
+| test_metal_gemm.das | Metal GPU batch-GEMM donor vs portable CPU kernel — bit-exact on pow2 scales for BOTH kernel dispatch paths (32x32 + 64x64), dot-envelope tolerance on arbitrary scales, small-batch delegation, leak gate (Apple; feints elsewhere) | |
+| test_metal_prefill_kernels.das | Phase-6 resident-prefill kernel set (quant/rmsnorm/rope/swiglu/add/attention trio) vs dasLLAMA CPU twins on-device (Apple; feints elsewhere) | |
+| test_metal_prefill_parity.das | GPU-resident whole-prefill vs CPU control — 40-token greedy continuation token-for-token on the real 1B (model-gated, Apple) | |
 | test_mxfp4.das | MXFP4 dequant + expert matmul kernels | |
 | test_par_indexed.das | `maybe_parallel_for_indexed` contract — exactly-once coverage, slot bound, per-slot checksum across team/fifo/inline arms | |
 | test_parity.das | Frozen token-for-token parity fixtures (model-gated) | |
@@ -583,6 +586,8 @@ Every `.das` file in this directory tree is listed below, grouped by subdirector
 | _glob.das | *(helper)* Shared module defining `AAA = 10` | |
 | _helper_foo.das | *(helper)* Module providing `TestObjectFoo` struct and `testFoo` function | |
 | _helper_macro_uninferred.das | *(helper)* `[bad_emitter]` structure_macro that adds an un-inferred function during patch | |
+| _fixup_init_macro.das | *(helper)* `[fixup_init_capture]` function_macro whose fixup installs a call-shaped global init (to_array_move) | |
+| test_fixup_global_init.das | Pipeline contract — a call-shaped global init installed by an annotation's fixup() resolves via the post-fixup dirty re-infer and evaluates | |
 | _lambda_vis_inner.das | *(helper)* Non-public leaf module for lambda_in_generic_module_vis — provides `inner_dot` | |
 | _lambda_vis_mid.das | *(helper)* Mid module hosting generics whose outlined lambdas/generators/local fns must resolve `inner_dot` | |
 | _module_a.das | *(helper)* Module for module_vis_fail — globals, types, functions | |
@@ -892,6 +897,45 @@ Coverage of per-iteration `finally` semantics across every loop form. Each cell 
 | math_misc.das | Misc math — min, lerp, reflect, dot, length, cross, noise, ceili, saturate | |
 | math_pack_unpack.das | pack_float_to_byte / unpack_byte_to_float with fuzzing | |
 | math_quaternions.das | Quaternion operations with fuzzing | |
+
+## msl/
+
+> dasMetal's MSL text backend (pure das — runs on every platform).
+
+| File | Description | Expects errors |
+|---|---|---|
+| _msl_common.das | *(helper)* Shared fixtures — the `[metal_kernel]` classes every suite reads + the declared census (gate B contract) | |
+| test_msl_arith.das | Arithmetic/bitwise/shift/comparison/logical/ternary emission per scalar class + vector ops and broadcasts | |
+| test_msl_census.das | Census gate — union of emitted construct kinds across all fixtures == declared set, both directions | |
+| test_msl_control.das | if/elif/else, while, break/continue, compound assign, ++/--, zero-init locals, void return | |
+| test_msl_fail_closed.das | Fail-closed gate — every `_fail_closed/_fc_*.das` fixture must be REJECTED with its specific diagnostic (written/array `@uniform`, value return, user-function call, bound/dynamic `@workgroup`, sgmat misuse, wide-lattice buffers, partial packed stores) | |
+| test_msl_lattice.das | 16/8-bit lattice types in buffers/uniforms/locals — `packed_T3` layout rail, fp16 literals, ctor/cvt/sat call family | |
+| test_msl_loops.das | range/urange for loops — non-const end hoisting, nesting, bounds-guard shape | |
+| test_msl_math.das | Math builtin whitelist (exp/sqrt/rsqrt/sin/cos/tanh/abs/saturate/round, min/max) + i8 converts | |
+| test_msl_mul.das | a*b kernel text assertions — signature shape, buffer attributes, write-set const-ness, builtin param, companion globals, golden snapshot | |
+| test_msl_sgmat.das | simdgroup_matrix surface — tile locals as make_filled fills, load/store lowering (device + threadgroup), mac combos f32/f16/mixed | |
+| test_msl_simd.das | simdgroup intrinsics (`simd_sum`, `simd_shuffle*` families) + subgroup builtin params | |
+| test_msl_threadgroup.das | `@workgroup` members → threadgroup declarations; `barrier()`/`memoryBarrierShared()` strengthening | |
+
+## metal/
+
+> Real-GPU behavioral gate (Apple). Guarded requires — on non-Apple platforms the files compile and run the CPU-reference half only.
+
+| File | Description | Expects errors |
+|---|---|---|
+| _metal_common.das | *(helper)* GPU driver generics (device/pipeline/buffer/dispatch/download helpers instantiated only inside `static_if` Apple branches) | |
+| test_metal_arith.das | Arithmetic kernels on the GPU vs the CPU-reference run of the same method | |
+| test_metal_control.das | Control-flow kernels GPU vs CPU reference | |
+| test_metal_ids.das | Grid/threadgroup/subgroup ID builtins — readback-driven membership oracle (layout-agnostic) | |
+| test_metal_lattice.das | 16/8-bit lattice buffer round-trips; fp16 GPU parity pinned one-op-per-store (MTLMathModeSafe still contracts multi-op chains) | |
+| test_metal_loops.das | Loop kernels on a NON-exact grid with sentinel-filled pads — the bounds-guard proof | |
+| test_metal_math.das | Math builtins vs CPU (fastmath=false fixture — fast trig's absolute envelope swamps the oracle) | |
+| test_metal_mul_ab.das | Emitted a*b MSL executed on the GPU vs the CPU-reference run of the same method (driver loop feeds gl_GlobalInvocationID); leak gate | |
+| test_metal_plumbing.das | Pipeline cache + buffer pool + multi-dispatch encoder (hazard ordering) via the live-object counter | |
+| test_metal_reduce.das | Barrier reductions vs directly-computed per-group sums (sequential replay is meaningless under barriers) | |
+| test_metal_sgmat.das | simdgroup_matrix tile ops GPU vs CPU twins — bit-exact on exact-int values | |
+| test_metal_sgmat_tiled.das | Tiled sgmat GEMM (threadgroup staging + barriers) vs CPU reference | |
+| test_metal_simd.das | simd_sum/shuffle intrinsics under uniform flow — kernel reports width/lane/sgid (M1 width 32) | |
 
 ## option/
 
