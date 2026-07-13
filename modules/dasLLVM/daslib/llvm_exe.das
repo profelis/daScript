@@ -936,11 +936,13 @@ def private emit_module_registration(m : Module?; dynamic_modules : table<string
     return if (reg_visited |> key_exists(mod_name))
     reg_visited[mod_name] = true
     // dylibs register via the runtime LOAD path; ast_core / network_core registrations
-    // live in the COMPILER lib (whole-lib link) — this walk is prophylactic ordering, so
-    // skip them here (a program that genuinely CALLS into them still gets them via
-    // ensure_module's used gate + needs_whole_lib)
+    // live in the COMPILER lib (whole-lib link), and jit's ctor hard-requires ast_core
+    // (Module::require("ast_core") -> nullptr assert when ast_core isn't registered) —
+    // this walk is prophylactic ordering, so skip all three here (a program that
+    // genuinely CALLS into them still gets them via ensure_module's used gate +
+    // needs_whole_lib)
     return if (dynamic_modules |> key_exists(mod_name)
-        || mod_name == "ast_core" || mod_name == "network_core")
+        || mod_name == "ast_core" || mod_name == "network_core" || mod_name == "jit")
     module_for_each_dependency(m) $(var dep : Module?; var _pub : bool) {
         emit_module_registration(dep, dynamic_modules, emitted_reg, reg_visited,
             builder, g_mod, register_mod_type, has_cpp_modules)
@@ -1089,9 +1091,11 @@ def public inject_main(program_context : Context?; ctx : LLVMContextRef;
             let mn = "{m.name}"
             // dynamic modules stay OUT of used_modules: initialize_modules() would emit a
             // second jit_register_dynamic_module_resolve → "Module 'X' already created"
-            // (same rule as the --jit-register-all-modules force list above)
+            // (same rule as the --jit-register-all-modules force list above). jit stays
+            // out too — its ctor hard-requires ast_core, which this prophylactic set
+            // deliberately excludes (SIGTRAP "Trying to add nullptr module" on Debug)
             if (!empty("{m.cppClassName}") && mn != "ast_core" && mn != "network_core"
-                    && !(dynamic_modules |> key_exists(mn))) {
+                    && mn != "jit" && !(dynamic_modules |> key_exists(mn))) {
                 used_modules[mn] = true
             }
         }
