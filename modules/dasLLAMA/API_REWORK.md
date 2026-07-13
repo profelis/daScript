@@ -464,6 +464,70 @@ what it costs today and what the fix would change.
   loader; oracle = llama.cpp mtmd (GGUF pairs ship). ~1 modest arc; the encoder is SHARED
   infrastructure — the same implementation unlocks Ultravox (llama-3 decoder ✓ have it) and
   ~80% of a Whisper-proper port later.
+- **✅ SHIPPED (kq chain regrain, 2026-07-12 PM²): kq layers re-admitted to both fused decode
+  chains.** The chains run one activation image per consumed form (the per-op mm_pre_f
+  contract): q8 projections read the Q8_0 image, kq projections the Q8_K image (kxq/kxs/kxbs);
+  the w2-input requant moves to 256-row stage-0 groups and the wo-input requant to HEAD GROUPS
+  of 256/head_size heads (Qwen3's 128 = head pairs) so every Q8_K quantize covers whole
+  superblocks. Gates: dim % 256 for any kq weight, hidden % 256 for a kq down-proj, qd % 256 +
+  head-size divisibility for a kq wo (all real kq models pass). Bit-exact vs the per-op path —
+  test_fused_decode grew a kq arm (Qwen3-4B Q5_K_M = k5+k6+head-pairs, gemma-2-2b Q4_K_M =
+  k4+k6+softcap/post-norm; ids + full logits EXACT). Measured (M1 Max steady-state): Q6 tg
+  30.5 → 31.1 (+2.1%), Q5 ~flat (33.8, within run wobble), Q4 control flat; decode_prof
+  confirms attn_chain 26% + ffn_chain 63% carry the whole kq decode. Dead requant_rows_q8_bs
+  deleted with the last Q8_0-bs chain arms.
+- **✅ SHIPPED (kq v3 panel-scratch, 2026-07-12 PM): the k5/k6 kernel unpack lever.** The
+  tile now reads a BYTE-EXPANDED panel (one byte per weight — zero unpack ALU) that the
+  batch cell unpacks from the packed grp planes once per (group, token-block)
+  (`unpack_kq_panel_grp`, SWAR uint64 deposit), amortizing the 5/6-bit deposit over TB=128
+  tokens instead of the tile's 4; the DRAM planes KEEP the packed 160/192 B/superblock form
+  the decode path streams. M1 Max e2e (Qwen3-4B, warm/quiet, 3 alternated reps): Q5 pp512
+  110 → 150–168 (lcpp 131 → das 1.14–1.28×), Q6 111 → 140–143 (lcpp 138.5 → 1.01–1.03×),
+  tg64 at v2 parity (Q5 ~33.7, Q6 ~30.5, Q4 control untouched). Iso tile: k5 65→89, k6
+  58→76 GMAC/s at the probe's ×16 amortization (~94/~79 effective at production ×32).
+  **THE LESSON (measured, do not re-learn):** pure byte-expanded DRAM planes (no scratch)
+  win the same pp but cost tg −30%/−20% on Q5/Q6 — M1 Max decode is DRAM-bound at the
+  model level (~90 GB/s effective), so plane bytes ARE decode time; k4 stays nibble-packed
+  everywhere for the same reason. Residual headroom, ledgered: (a) k6 tile 76 vs k4 95 —
+  the per-16 SIGNED sub-scale fold pays 2 scale-row sexts + 4 muls per block vs k4/k5's 1;
+  (b) k5 unpack still ~6% of production tile (the broadcast+carry deposit — a generated
+  NEON tbl/cmtst unpack kernel would close it).
+- **✅ RESOLVED (2026-07-12 PM², trace-diagnosed): the das prefill "bimodality" is M1
+  package DVFS, not code.** Lane-timeline traces of a fast (168 t/s) vs slow (150) Q5
+  pp512 run: all 8 lanes 98–99% utilized in BOTH, identical chunk counts, and a UNIFORM
+  ×1.113 per-chunk slowdown flat across run-deciles — one P-cluster clock step
+  (3228→2904-class), run-scoped. First-run-after-idle rides a ~3 s boost window (168);
+  back-to-back runs sit at the sustained clock (150–152, ±0.6% — exactly llama-bench's
+  stability, because llama-bench's reps are always steady-state). 45 s cool-downs recover
+  only partially (155–162); pmset shows no thermal warnings (ordinary sustained-load DVFS).
+  E-core lane placement is EXONERATED — nothing to pin. **METHOD RULE: report the
+  steady-state MEDIAN of ≥3 back-to-back reps and discard the first-after-idle rep;
+  best-of-N systematically picks the boost outlier.** Steady-state scoreboard (M1 Max,
+  Qwen3-4B vs lcpp steady): Q5 ~150 vs 131 = 1.15×, Q6 ~141 vs 138.5 = 1.02×, Q4_K_M
+  ~155-158 vs 172 = 0.90×.
+- **✅ RACED (zen2, 2026-07-12 PM², 16 affinity-pinned cores both sides, ABBA before=52a22a39b
+  after=3d78ca8ef, Qwen3-4B): das WINS Q5 pp 1.84× / Q6 1.32× vs lcpp; the kq v2+v3 arc itself
+  is ~NEUTRAL on the maddubs lattice.** pp512 das-after/lcpp: Q4 161–180 vs 168.3 (~parity —
+  their one AVX2 K-quant repack), Q5 158–161 vs 87.0 (**1.84×**), Q6 128–130 vs 98.0
+  (**1.32×**); tg64 ≈ lcpp parity all three (19.3/16.6/14.5 vs 19.25/16.87/14.69). ABBA
+  before→after: Q4/Q5 pp par-to-+3%, **Q6 pp −4.6%** (135.2→129.0 median), tg within noise
+  (Q4 −4%, Q5 +2%, Q6 −3%). Reading: the M1 unpack win was an sdot-lattice property — on
+  Zen2's maddubs lattice the v1 unpack was never the bottleneck, and the Q5/Q6 lcpp wins
+  pre-date the arc (their vec_dot rail is that slow). The Q6 −4.6% is the arc's one x64 cost;
+  suspects (not yet attributed — needs a mid-arc leg): the v2 signed per-16 fold's separate
+  lo/hi i16 chains (flush every 2 madds) vs v1's, or v3's second verbatim load per weight
+  vector on a load-port-bound lattice. Candidate fix if chased: gate kqBytes per-ISA (byte
+  panels NEON-only — needs a per-format panel-flag companion so the batch cell knows).
+  Sized: ~5% Q6 pp on zen2 only; zen2 stays 1.32× ahead of lcpp regardless. Also not yet run:
+  the zen2 kq tune sweep (families ran the maddubs-mr8 fallback rows; crowns could shift a
+  few %). SPR when a box respins — per Boris (2026-07-12): future profiling moves to an
+  AWS box, local boxes are a bottleneck.
+- **kq tune bench lacks a MoE-shaped cell row (spotted validating the mr4 crowns, 2026-07-12).**
+  The mr4 tile crown gave dense pp +10-26% but gave back ~3% MoE prefill on qwen3moe-30B
+  (fused expert cells average ~32 tokens per expert with d=768-class group spans — a regime
+  the d=512/ntok=64 batch fixture doesn't represent; mr8's halved group count wins there).
+  Adding a MoE-cell-shaped fixture to kq_tune_family and weighting the decision (or a
+  per-model-class entry) recovers it. Sized: ~3% MoE pp on M1; re-check on zen2/SPR grids.
 - **AMX fold pipelining (double-buffered C spill) — only if amx silicon verdict ever flips.**
   lcpp's tinygemm_kernel_amx interleaves block i−1's AVX-512 scale-fold between block i's
   TMUL ops (double-buffered thread-local C scratch, mmq.cpp:2015-2105) — the fold hides under
