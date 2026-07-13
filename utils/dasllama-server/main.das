@@ -28,6 +28,7 @@ require daslib/module_path
 require daslib/logger
 require daslib/fio
 require math
+require strings                 // to_lower / starts_with (pick_quant's file-quant spellings)
 
 [CommandLineArgs]
 struct ServerArgs {
@@ -44,7 +45,7 @@ struct ServerArgs {
     port : int
 
     @clarg_short = "q"
-    @clarg_doc = "Weight quantization: fp32 | q8 | q4 (default q8)"
+    @clarg_doc = "Weight serving mode: fp32 | q8 | q4 (default q8); file-format spellings q4_k | q5_k | q6_k | mxfp4 | f16 | bf16 select q8, where those planes serve natively"
     quant : string
 
     @clarg_doc = "KV cache codec: f32 | f16 | q8_0 | tq4 (default f16)"
@@ -182,13 +183,20 @@ def apply_config(var cfg : ServerArgs) : bool {
     return true
 }
 
+// Besides the serving modes (fp32 | q8 | q4), the FILE formats the gguf loader reads are
+// first-class spellings too: q4_k / q5_k / q6_k (any case, _M/_S suffixes fine), mxfp4,
+// f16 / bf16, q8_0 — all of those serve under QuantMode.q8 (K-quant and mx4 planes run
+// NATIVELY on the kq tier). "q4" stays the legacy q4_0 requant tier — do not use it for
+// K-quant files (per-row fallback paths, the 14x prefill stall).
 def pick_quant(s : string) : QuantMode {
-    if (s == "fp32") {
+    let l = to_lower(s)
+    if (l == "fp32" || l == "f32") {
         return QuantMode.fp32
-    } elif (s == "q4") {
+    } elif (l == "q4" || l == "q4_0") {
         return QuantMode.q4
-    } elif (!empty(s) && s != "q8") {
-        to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q4)\n")
+    } elif (!empty(l) && l != "q8" && l != "q8_0" && l != "mxfp4" && l != "f16" && l != "bf16"
+            && !(starts_with(l, "q4_k") || starts_with(l, "q5_k") || starts_with(l, "q6_k"))) {
+        to_log(LOG_WARNING, "dasllama-server: unknown --quant '{s}', using q8 (valid: fp32 | q8 | q4 | q4_k | q5_k | q6_k | mxfp4 | f16 | bf16)\n")
     }
     return QuantMode.q8
 }
