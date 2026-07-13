@@ -50,12 +50,19 @@ struct private StreamWire {
 }
 
 var g_wires : table<int64; StreamWire>
+var g_default_max_new = 256l
 
 //! Move a loaded model into the server (call once, before run_server). ``name`` is the id reported
 //! by ``/v1/models`` and echoed back in responses.
 def set_model(var m : Model; name : string) {
     g_model <- m
     g_model_name = name
+}
+
+//! Default reply token budget for requests that omit ``max_tokens`` (call before run_server;
+//! clamped to the context length per request like an explicit value).
+def set_default_max_tokens(n : int64) {
+    g_default_max_new = n
 }
 
 //! Move a loaded ASR model in, enabling ``/v1/audio/transcriptions`` (call once, before run_server).
@@ -407,7 +414,7 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     var params = SamplingParams()
     params.temp = js?["temperature"] ?? 0.0
     params.top_k = js?["top_k"] ?? 0l
-    let max_new = clamp_max(js?["max_tokens"] ?? 256l)
+    let max_new = clamp_max(js?["max_tokens"] ?? g_default_max_new)
 
     // OpenAI is stateless — the client resends the whole transcript. Fold system turns, replay prior
     // user/assistant pairs through the renderer, then render the trailing user turn + generation prompt.
@@ -460,7 +467,7 @@ def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var
     var params = SamplingParams()
     params.temp = js?["temperature"] ?? 0.0
     params.top_k = js?["top_k"] ?? 0l
-    let max_new = clamp_max(js?["max_tokens"] ?? 256l)
+    let max_new = clamp_max(js?["max_tokens"] ?? g_default_max_new)
     var toks <- encode(g_model, prompt, true, false)
     defer() { delete toks }
     // no stop ids and no close: raw completions run to the budget, matching bare generate()

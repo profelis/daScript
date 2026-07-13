@@ -29,6 +29,7 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--asr` | `-a` | — | ASR model (whisper/parakeet/qwen3-asr) — enables the `/v1/audio/*` routes |
 | `--mmproj` | — | — | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
 | `--ctx` | — | `4096` | Context-length cap in tokens |
+| `--max-tokens` | — | `256` | Default reply token budget when a request omits `max_tokens` (clamped to `--ctx` per request) |
 | `--streams` | `-s` | `4` | Max concurrent generation streams |
 | `--threads` | `-t` | `16` | Worker-lane cap for the matmul dispatch (`-1` = all cores) — decode is bandwidth-bound, so an uncapped dispatch just fights the rest of the box |
 | `--chunk` | — | `64` | Prefill quantum in tokens — decode stalls at most this per tick |
@@ -47,6 +48,7 @@ port = 8080
 quant = "q8"
 kv_dtype = "tq4"   # rotated 4-bit KV — half the q8_0 cache bytes
 ctx = 4096
+max_tokens = 4096  # default reply budget for clients that omit max_tokens (e.g. `llm chat`)
 streams = 4
 threads = 16       # matmul dispatch lane cap; -1 = all cores
 ```
@@ -62,6 +64,18 @@ Clients whose connection drops mid-generation are evicted within a tick. The buf
 (`/v1/models`, `/v1/embeddings`, `/v1/audio/*`) still run to completion in-handler and pause
 generation for their duration. OpenAI is stateless — the client resends the full transcript each
 turn.
+
+## Deploying (daspkg release)
+
+```sh
+bin/daslang utils/daspkg/main.das -- release --root utils/dasllama-server --out <target>
+```
+
+Produces `<target>/dasllama-server/` — the standalone exe, the shared-module dylibs (dasHV,
+dasAudio), the runtime DLLs, and the `[tune]` sidecar (`dasllama-server.tune.json`; incomplete
+scopes are tuned and baked during the release build). Re-releasing over an existing bundle is the
+upgrade path: a `dasllama-server.toml` living in the bundle is NOT part of the release manifest,
+so the deployed config survives. Stop a running server first — Windows locks the exe.
 
 ## Endpoints
 

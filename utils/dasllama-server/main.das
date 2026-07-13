@@ -61,6 +61,9 @@ struct ServerArgs {
     @clarg_doc = "Context-length cap in tokens (default 4096)"
     ctx : int
 
+    @clarg_doc = "Default reply token budget when a request omits max_tokens (default 256; clamped to ctx per request)"
+    max_tokens : int
+
     @clarg_short = "s"
     @clarg_doc = "Max concurrent generation streams (default 4)"
     streams : int
@@ -154,6 +157,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     }
     if (cfg.ctx <= 0) {
         cfg.ctx = int(root?["ctx"] ?? 0l)
+    }
+    if (cfg.max_tokens <= 0) {
+        cfg.max_tokens = int(root?["max_tokens"] ?? 0l)
     }
     if (cfg.streams <= 0) {
         cfg.streams = int(root?["streams"] ?? 0l)
@@ -269,6 +275,7 @@ def main : int {
     var m <- load_model(cfg.model, pick_quant(cfg.quant))
     m.config.seq_len = min(m.config.seq_len, ctx)
     set_model(m, base_name(cfg.model))
+    set_default_max_tokens(cfg.max_tokens > 0 ? int64(cfg.max_tokens) : 256l)
 
     if (!empty(cfg.asr)) {
         print("loading ASR {cfg.asr} ...\n")
