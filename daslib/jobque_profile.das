@@ -34,7 +34,7 @@ var private g_nextCategoryId = 1
 
 def private resolve_color(name : string; color : uint) : uint {
     if (color != 0u) return color
-    return DEFAULT_PALETTE[int(hash(name) % uint64(12))]
+    return DEFAULT_PALETTE[int(hash(name) % uint64(length(DEFAULT_PALETTE)))]
 }
 
 def public profile_start(events_per_lane : int = 65536) {

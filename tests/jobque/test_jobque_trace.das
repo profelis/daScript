@@ -55,6 +55,7 @@ def test_trace_round_trip(t : T?) {
             set_jobque_team_mode(false)
             profile_marker(tokId, 41)
             profile_marker("token", 42)
+            profile_marker(tokId, -7)   // args are signed — must survive the JSON round-trip
             profile_stop()
 
             var terr = ""
@@ -131,9 +132,10 @@ def test_trace_round_trip(t : T?) {
             t |> equal(0, nUntaggedPublish)
             feint("tagged publishes: {nTaggedPublish}\n")
             sort(markerArgs)
-            t |> equal(2, length(markerArgs))
-            t |> equal(41, markerArgs[0])
-            t |> equal(42, markerArgs[1])
+            t |> equal(3, length(markerArgs))
+            t |> equal(-7, markerArgs[0])
+            t |> equal(41, markerArgs[1])
+            t |> equal(42, markerArgs[2])
         }
     }
 }
