@@ -333,7 +333,7 @@ struct Model {
     // kq stage 4: the kq planes were repacked at load into the active backend's grp<mr> layout
     // (kernel_backend_has_kq at load time). From then on every kq matmul MUST run the backend
     // slots — the disk-order portable kernels would read garbage — and embed_row gathers rows
-    // through the grp layout at kq_repack_mr (tail rows d % mr stay disk-order).
+    // through the grp layout at the format's kq_repack_mr4/5/6 (tail rows d % mr stay disk-order).
     kq_repacked : bool = false
     kq_repack_mr4 : int64 = 4l   // per-FORMAT repack interleaves (kq v2: the families tune separately)
     kq_repack_mr5 : int64 = 4l
