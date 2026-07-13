@@ -140,6 +140,7 @@ require strudel/strudel_sf2_voice
 require strudel/strudel_pattern
 require spirv/spirv_reflect
 require dasllama/dasllama
+require llvm/daslib/llvm_tune   // [tune_policy]: doc generation never runs kernels — no auto-tune
 
 def document_module_math(_root : string) {
     var mod = get_module("math")
@@ -1769,7 +1770,9 @@ def document_module_gltf(_root : string) {
     documents("glTF 2.0 loader (dasGLTF): GLB/.gltf parse, accessor decode, node hierarchy, skinning and keyframe animation into a backend-neutral scene", mod, "gltf.rst", groups)
 }
 
-[export]
+// fallback: das2rst compiles dasllama to document it but never RUNS its kernels — an
+// untuned box must not trigger the minutes-long auto-tune here
+[export, tune_policy(missing = "fallback")]
 def main {
     disable_profiler(this_context())
     disable_profiler_log(this_context())

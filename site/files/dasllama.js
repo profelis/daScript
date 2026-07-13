@@ -27,15 +27,34 @@
     return 50 + oct * 50;
   }
 
+  // The § 01 CHART shows current-generation models only — released on/after
+  // BARS_MIN_RELEASE; the table below always carries the full measured set.
+  // A model absent from the map counts as current, so new rows default to visible.
+  var BARS_MIN_RELEASE = '2025-06';   // "summer 2025" — anything older stays table-only
+  var MODEL_RELEASE = {
+    'TinyLlama-1.1B': '2024-01', 'Mistral-7B': '2024-05', 'gemma-2-2B': '2024-07',
+    'Llama-3.1-8B': '2024-07', 'Phi-3.5-mini': '2024-08', 'Qwen2.5-0.5B': '2024-09',
+    'Qwen2.5-1.5B': '2024-09', 'Llama-3.2-1B': '2024-09', 'SmolLM2-135M': '2024-10',
+    'SmolLM2-1.7B': '2024-10', 'gemma-3-1B': '2025-03', 'gemma-3-4B': '2025-03',
+    'Qwen3-0.6B': '2025-04', 'Qwen3-4B': '2025-07', 'Qwen3-4B-q4k': '2025-07',
+    'Qwen3-30B-A3B': '2025-07', 'gpt-oss-20b': '2025-08'
+    // gemma-4 family, Qwen3.5 / Qwen3.6 — post-cutoff, deliberately absent
+  };
+  function isCurrent(t) {
+    var rel = MODEL_RELEASE[t.model];
+    return !rel || rel >= BARS_MIN_RELEASE;
+  }
+
   /* ── LLM scoreboard ────────────────────────────────────────── */
   function renderLLM() {
     var box = document.querySelector('.js-llm-box.is-active').dataset.box;
     var phase = document.querySelector('.js-llm-phase.is-active').dataset.phase; // prefill | emission
     var d = DATA['llm_' + box];
     var rows = d.tests.slice();
+    var chartRows = rows.filter(isCurrent);   // chart = current-gen models; the table keeps all
 
     var wins = 0, ties = 0, measured = 0;
-    rows.forEach(function (t) {
+    chartRows.forEach(function (t) {
       var r = ratio(t[phase].das_tok_s, t[phase].llama_cpp_tok_s);
       if (r === null) return;              // no reference on this box → not counted
       measured++;
@@ -44,7 +63,7 @@
 
     // bars (sorted by ratio, descending; unmeasured rows sort last)
     function rval(t) { var r = ratio(t[phase].das_tok_s, t[phase].llama_cpp_tok_s); return r === null ? -Infinity : r; }
-    var barRows = rows.slice().sort(function (a, b) { return rval(b) - rval(a); });
+    var barRows = chartRows.slice().sort(function (a, b) { return rval(b) - rval(a); });
     var barsHTML = barRows.map(function (t) {
       var r = ratio(t[phase].das_tok_s, t[phase].llama_cpp_tok_s);
       if (r === null) {                    // no computable ratio → neutral bar, no NaN geometry
@@ -80,6 +99,7 @@
       return '<tr>' +
         '<td class="dl-td-model">' + t.model + '</td>' +
         '<td class="dl-num">' + fmt(t.active_b, 2) + '</td>' +
+        '<td class="dl-num dl-dim">' + (t.quant || '') + '</td>' +
         '<td class="dl-num">' + fmt(t.prefill.das_tok_s, 1) + '</td>' +
         '<td class="dl-num dl-dim">' + tps(t.prefill.llama_cpp_tok_s) + '</td>' +
         rcell(pr) +
@@ -94,7 +114,8 @@
     document.getElementById('llm-caption').innerHTML =
       '<span class="dl-win">' + wins + ' / ' + measured + '</span> models faster' +
       (ties ? ' · ' + ties + ' tie' + (ties > 1 ? 's' : '') : '') +
-      ' &nbsp;·&nbsp; ' + phaseLabel + ' &nbsp;·&nbsp; ' + BOX_LABEL[box].name;
+      ' &nbsp;·&nbsp; ' + phaseLabel + ' &nbsp;·&nbsp; ' + BOX_LABEL[box].name +
+      ' &nbsp;·&nbsp; chart: models released since summer 2025 — the table below has all ' + rows.length;
     document.getElementById('llm-table-body').innerHTML = tableHTML;
     document.getElementById('llm-plat').textContent =
       d.platform.cpu.replace('64-Core Processor', '').trim() + ' · daslang ' + d.platform.daslang +
@@ -167,6 +188,44 @@
     }).join('');
   }
 
+  /* ── hero stats — derived from the same JSONs, never hand-placed ── */
+  function renderHeroStats() {
+    // best prefill ratio across boxes
+    var best = null;
+    LLM_ORDER.forEach(function (box) {
+      DATA['llm_' + box].tests.forEach(function (t) {
+        var r = ratio(t.prefill.das_tok_s, t.prefill.llama_cpp_tok_s);
+        if (r !== null && (!best || r > best.r)) best = { r: r, model: t.model, box: box };
+      });
+    });
+    if (best) {
+      document.getElementById('stat-prefill-n').textContent = 'up to ' + fmt(best.r, 2) + '×';
+      document.getElementById('stat-prefill-l').textContent =
+        'LLM prefill vs llama.cpp · ' + best.model + ', ' + BOX_LABEL[best.box].name;
+    }
+    // win-or-tie count over both phases on the pinned x86 box
+    var d = DATA.llm_zen2, wins = 0, total = 0;
+    d.tests.forEach(function (t) {
+      ['prefill', 'emission'].forEach(function (ph) {
+        var r = ratio(t[ph].das_tok_s, t[ph].llama_cpp_tok_s);
+        if (r === null) return;
+        total++;
+        if (r >= 0.995) wins++;
+      });
+    });
+    document.getElementById('stat-wins-n').textContent = wins + ' / ' + total;
+    document.getElementById('stat-wins-l').textContent =
+      'runs das ≥ llama.cpp · ' + d.tests.length + ' models × both phases, 3990X';
+    // audio blowout (Qwen3-Omni jfk vs mtmd, M1)
+    var a = DATA.asr_m1.tests.find(function (x) { return x.model === 'Qwen3-Omni-30B audio'; });
+    if (a) {
+      var b = a.buckets.find(function (x) { return x.wav === 'jfk.wav'; });
+      if (b && b.refs.length) {
+        document.getElementById('stat-audio-n').textContent = '~' + fmt(b.refs[0].ms / b.das_ms, 0) + '×';
+      }
+    }
+  }
+
   /* ── wiring ─────────────────────────────────────────────────── */
   function wireToggle(sel, cb) {
     document.querySelectorAll(sel).forEach(function (btn) {
@@ -182,6 +241,7 @@
     renderLLM();
     renderASR();
     renderAudioChat();
+    renderHeroStats();
     wireToggle('.js-llm-box', renderLLM);
     wireToggle('.js-llm-phase', renderLLM);
     wireToggle('.js-asr-box', renderASR);
