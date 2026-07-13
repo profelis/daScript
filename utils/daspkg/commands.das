@@ -2100,8 +2100,9 @@ def cmd_release(root : string; out_dir : string) : int {
     // Scrub absolute LC_RPATH / RUNPATH entries the daslang build leaks into
     // the exe (build-tree `<das_root>/lib` etc.). The `@executable_path`/`$ORIGIN`
     // entries that PR #2588 added are kept — those are what makes the bundle
-    // portable in the first place.
-    scrub_external_rpaths(exe_path)
+    // portable in the first place. Target the runnable binary: `<exe_path>.exe`
+    // everywhere except a mac .app, where the rename above already dropped it.
+    scrub_external_rpaths(is_mac_app ? exe_path : "{exe_path}.exe")
 
     // 2. Parse deps JSON, ship dylibs at the relative path the exe expects.
     //    The writer has already merged force-included modules into shared_modules,
