@@ -374,6 +374,29 @@ def test_parity_qwen35moe_35b(t : T?) {
     }
 }
 
+// Qwen3-Coder-Next Q4_K_M — arch `qwen3next`, the parent hybrid (36 deltanet + 12 gated-attention
+// layers, softmax top-10-of-512 + shared expert). The FILE layout differs from qwen35: fused Q4_K
+// ssm_ba and HF grouped v-head order — this fixture proves the loader's grouped->tiled permutes
+// (qkv v-rows, z gate, conv channels, a/dt, ba split, ssm_out columns). Huge tier (45 GB).
+[test]
+def test_parity_qwen3next(t : T?) {
+    t |> run("qwen3next forward (Qwen3-Coder-Next Q4_K_M, grouped-layout deltanet MoE)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Qwen3-Coder-Next-Q4_K_M.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3next token-for-token")
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN, [dn_chunked = true]), "qwen3next chunked-prefill token-for-token")
+        delete tr
+    }
+}
+
 // Native K-quant rail: the same counting fixture over the Q4_K_M / Q5_K_M / Q6_K files of the
 // SAME model, forced through kquant_native planes (grp repack + kq kernels + kq embed gather).
 // The oracles were produced per-file by simple_ids (all three continue identically, equal to
