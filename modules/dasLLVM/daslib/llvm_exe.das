@@ -130,12 +130,20 @@ class CollectExternVisitor : AstVisitor {
                 registered_modules[m] = true
             }
         } else {
-            // Always register Module_BuiltIn ($) and Module_Strings (strings)
-            var reg_builtin = LLVMAddFunctionWithType(g_mod, "jit_register_Module_BuiltIn", register_mod_type)
-            LLVMBuildCall2(init_builder, register_mod_type, reg_builtin, array<LLVMValueRef>(), "")
+            // Always register Module_BuiltIn ($) and Module_Strings (strings) — unless
+            // inject_main's static sweep already emitted the call (the thunks are NOT
+            // idempotent: a second call dies with "Module '$' already created").
+            if (!(g_exe_emitted_reg |> key_exists("jit_register_Module_BuiltIn"))) {
+                g_exe_emitted_reg["jit_register_Module_BuiltIn"] = true
+                var reg_builtin = LLVMAddFunctionWithType(g_mod, "jit_register_Module_BuiltIn", register_mod_type)
+                LLVMBuildCall2(init_builder, register_mod_type, reg_builtin, array<LLVMValueRef>(), "")
+            }
             registered_modules["$"] = true
-            var reg_strings = LLVMAddFunctionWithType(g_mod, "jit_register_Module_Strings", register_mod_type)
-            LLVMBuildCall2(init_builder, register_mod_type, reg_strings, array<LLVMValueRef>(), "")
+            if (!(g_exe_emitted_reg |> key_exists("jit_register_Module_Strings"))) {
+                g_exe_emitted_reg["jit_register_Module_Strings"] = true
+                var reg_strings = LLVMAddFunctionWithType(g_mod, "jit_register_Module_Strings", register_mod_type)
+                LLVMBuildCall2(init_builder, register_mod_type, reg_strings, array<LLVMValueRef>(), "")
+            }
             registered_modules["strings"] = true
         }
 
@@ -284,7 +292,15 @@ class CollectExternVisitor : AstVisitor {
         if (mod_name == "ast_core" || mod_name == "network_core") {
             needs_whole_lib = true
         }
-        var reg_fn = LLVMAddFunctionWithType(g_mod, reg_fn_name, register_mod_type)
+        // one call per thunk process-wide (not idempotent — "Module already created"), and
+        // get-or-add: re-adding an existing LLVM function name silently RENAMES it
+        // (jit_register_X.NNN) into an undefined symbol at link
+        return if (g_exe_emitted_reg |> key_exists(reg_fn_name))
+        g_exe_emitted_reg[reg_fn_name] = true
+        var reg_fn = LLVMGetNamedFunction(g_mod, reg_fn_name)
+        if (reg_fn == null) {
+            reg_fn = LLVMAddFunctionWithType(g_mod, reg_fn_name, register_mod_type)
+        }
         LLVMBuildCall2(init_builder, register_mod_type, reg_fn, array<LLVMValueRef>(), "")
     }
 
@@ -896,13 +912,61 @@ def private write_release_deps(prog : Program?) {
     to_log(LOG_INFO, "LLVM EXE: wrote release deps to {dst_path} (shared={length(deps.shared_modules)}, das={length(deps.das_modules)})\n")
 }
 
+// ONE registration call per jit_register_<CppClass> across EVERY emission site (main's
+// static sweep, the extern resolver's ctor, ensure_module): the C++ thunks are NOT
+// idempotent — a second call dies with "Module '<x>' already created" at startup. Reset
+// per codegen run in inject_main.
+var private g_exe_emitted_reg : table<string; bool>
+
+// Emit one static-module registration call, DEPENDENCIES FIRST (a module's C++ init may
+// bind externs typed against a dependency's handled types — das_string, StructInfo, … —
+// so hash-ordered emission startup-crashes with "NEED_MODULE with <type> needs to be
+// before this module binding"). Deduped three ways: reg_visited stops the recursion,
+// g_exe_emitted_reg keeps one CALL per registration fn process-wide (several das modules
+// can share a C++ class, and the resolver's sites emit too), and get-or-add avoids the
+// silent LLVM function RENAME (jit_register_X.NNN — an undefined symbol at link).
+def private emit_module_registration(m : Module?; dynamic_modules : table<string; bool>;
+                                     var emitted_reg, reg_visited : table<string; bool>;
+                                     builder : LLVMBuilderRef; g_mod : LLVMOpaqueModule?;
+                                     register_mod_type : LLVMTypeRef; var has_cpp_modules : bool&) {
+    if (m == null) {
+        return
+    }
+    let mod_name = string(m.name)
+    return if (reg_visited |> key_exists(mod_name))
+    reg_visited[mod_name] = true
+    // dylibs register via the runtime LOAD path; ast_core / network_core registrations
+    // live in the COMPILER lib (whole-lib link) — this walk is prophylactic ordering, so
+    // skip them here (a program that genuinely CALLS into them still gets them via
+    // ensure_module's used gate + needs_whole_lib)
+    return if (dynamic_modules |> key_exists(mod_name)
+        || mod_name == "ast_core" || mod_name == "network_core")
+    module_for_each_dependency(m) $(var dep : Module?; var _pub : bool) {
+        emit_module_registration(dep, dynamic_modules, emitted_reg, reg_visited,
+            builder, g_mod, register_mod_type, has_cpp_modules)
+    }
+    let cpp_name = string(m.cppClassName)
+    return if (empty(cpp_name))
+    let reg_fn_name = "jit_register_{cpp_name}"
+    return if (emitted_reg |> key_exists(reg_fn_name) || g_exe_emitted_reg |> key_exists(reg_fn_name))
+    emitted_reg[reg_fn_name] = true
+    g_exe_emitted_reg[reg_fn_name] = true
+    has_cpp_modules = true
+    to_log(LOG_INFO, "LLVM EXE: NEED_MODULE({cpp_name}) for `{mod_name}`\n")
+    var reg_fn = LLVMGetNamedFunction(g_mod, reg_fn_name)
+    if (reg_fn == null) {
+        reg_fn = LLVMAddFunctionWithType(g_mod, reg_fn_name, register_mod_type)
+    }
+    LLVMBuildCall2(builder, register_mod_type, reg_fn, array<LLVMValueRef>(), "")
+}
+
 // Creates main function that initializes a standalone JIT context, registers
 // all compiled functions, runs init scripts, then calls the program entry point.
 def public inject_main(program_context : Context?; ctx : LLVMContextRef;
                        prog : Program?; entry_point : string; mod : LLVMOpaqueModule?;
                        var types : PrimitiveTypes?, var uids : UidNodes?; strict : bool;
                        register_all_modules : bool = false) : tuple<fn : LLVMOpaqueValue?; link_whole_lib : bool> {
-
+    g_exe_emitted_reg |> clear()   // per-codegen-run: one registration call per module thunk
     let builder = LLVMCreateBuilder()
     defer() {
         LLVMDisposeBuilder(builder)
@@ -999,6 +1063,7 @@ def public inject_main(program_context : Context?; ctx : LLVMContextRef;
     // during ctor, so the math/strings/... bundle must exist before any dynamic
     // module loads. Emit jit_register_all_builtin_modules here; the duplicate
     // call from initialize_modules() is a no-op via Module::require guards.
+    // (The symbol lives in the COMPILER lib — this flag implies a whole-lib link.)
     if (register_all_modules) {
         var reg_all_main = LLVMGetNamedFunction(g_mod, "jit_register_all_builtin_modules")
         if (reg_all_main == null) {
@@ -1006,18 +1071,49 @@ def public inject_main(program_context : Context?; ctx : LLVMContextRef;
         }
         LLVMBuildCall2(builder, das_ensure_env_type, reg_all_main, array<LLVMValueRef>(), "")
     }
+    // A dynamic module's ctor may bind externs typed against ANY builtin handled type
+    // (das_string, StructInfo, …) — C++-side dependencies the used-functions sweep cannot
+    // see ("NEED_MODULE with <type> needs to be before this module binding" at startup).
+    // So when the program SHIPS a dynamic module, register every builtin C++ module in the
+    // program graph, not just the used set — except the compiler-lib pair (ast_core /
+    // network_core), which force a whole-lib link and stay used-gated. Dynamic-free exes
+    // keep the minimal set.
+    var ships_dynamic = false
+    prog |> for_each_module() $(m) {
+        if (dynamic_modules |> key_exists("{m.name}")) {
+            ships_dynamic = true
+        }
+    }
+    if (ships_dynamic) {
+        prog |> for_each_module() $(m) {
+            let mn = "{m.name}"
+            // dynamic modules stay OUT of used_modules: initialize_modules() would emit a
+            // second jit_register_dynamic_module_resolve → "Module 'X' already created"
+            // (same rule as the --jit-register-all-modules force list above)
+            if (!empty("{m.cppClassName}") && mn != "ast_core" && mn != "network_core"
+                    && !(dynamic_modules |> key_exists(mn))) {
+                used_modules[mn] = true
+            }
+        }
+    }
+    // `options rtti` makes handled RTTI types (StructInfo & co) reachable through builtin
+    // machinery (sscan_json/sprint_json) with no direct CALL into rtti_core — but a dynamic
+    // module's C++ init typed against them needs Module_Rtti registered FIRST ("NEED_MODULE
+    // with StructInfo needs to be before this module binding"). The used-functions sweep
+    // can't see that, so pull rtti_core in whenever the program compiled with rtti on.
+    let wants_rtti = ((prog._options |> find_arg("rtti")) ?as tBool ?? false) || prog.policies.rtti
+    if (wants_rtti) {
+        used_modules["rtti_core"] = true
+    }
     var has_cpp_modules = false
+    var emitted_reg : table<string; bool>
+    var reg_visited : table<string; bool>
     for (mod_name in keys(used_modules)) {
         if (key_exists(dynamic_modules, mod_name)) continue
         prog |> for_each_module() $(m) {
             if (m.name != mod_name) return
-            if (!empty(m.cppClassName)) {
-                has_cpp_modules = true
-                let reg_fn_name = "jit_register_{m.cppClassName}"
-                to_log(LOG_INFO, "LLVM EXE: NEED_MODULE({m.cppClassName}) for `{m.name}`\n")
-                var reg_fn = LLVMAddFunctionWithType(g_mod, reg_fn_name, register_mod_type)
-                LLVMBuildCall2(builder, register_mod_type, reg_fn, array<LLVMValueRef>(), "")
-            }
+            emit_module_registration(m, dynamic_modules, emitted_reg, reg_visited,
+                builder, g_mod, register_mod_type, has_cpp_modules)
         }
     }
 
