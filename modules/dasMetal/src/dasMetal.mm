@@ -144,6 +144,19 @@ namespace das {
         }
     }
 
+    // occupancy introspection: register-pressure-limited kernels report < 1024 here
+    uint32_t metal_pipeline_max_total_threads ( MetalComputePipeline * pso, Context * ctx, LineInfoArg * at ) {
+        if ( !pso ) ctx->throw_error_at(at, "metal_pipeline_max_total_threads: null pipeline");
+        id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)(void *) pso;
+        return (uint32_t) p.maxTotalThreadsPerThreadgroup;
+    }
+
+    uint32_t metal_pipeline_thread_execution_width ( MetalComputePipeline * pso, Context * ctx, LineInfoArg * at ) {
+        if ( !pso ) ctx->throw_error_at(at, "metal_pipeline_thread_execution_width: null pipeline");
+        id<MTLComputePipelineState> p = (__bridge id<MTLComputePipelineState>)(void *) pso;
+        return (uint32_t) p.threadExecutionWidth;
+    }
+
     // ===== buffers =====
 
     MetalBuffer * metal_new_buffer ( MetalDevice * dev, uint64_t bytes, Context * ctx, LineInfoArg * at ) {
@@ -152,6 +165,19 @@ namespace das {
         @autoreleasepool {
             id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
             return retain_handle<MetalBuffer>([d newBufferWithLength:bytes options:MTLResourceStorageModeShared]);
+        }
+    }
+
+    // UNTRACKED buffer: opts out of the driver's per-command-buffer hazard/dependency analysis.
+    // For GPU-read-only data written by the CPU before commit (weights) — commit-boundary
+    // CPU->GPU coherency still holds for shared storage; the caller owns any GPU-GPU ordering.
+    MetalBuffer * metal_new_buffer_untracked ( MetalDevice * dev, uint64_t bytes, Context * ctx, LineInfoArg * at ) {
+        if ( !dev ) ctx->throw_error_at(at, "metal_new_buffer_untracked: null device");
+        if ( bytes == 0 ) ctx->throw_error_at(at, "metal_new_buffer_untracked: zero size");
+        @autoreleasepool {
+            id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
+            return retain_handle<MetalBuffer>([d newBufferWithLength:bytes
+                options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeUntracked]);
         }
     }
 
@@ -168,6 +194,16 @@ namespace das {
         @autoreleasepool {
             id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)(void *) queue;
             return retain_handle<MetalCommandBuffer>([q commandBuffer]);
+        }
+    }
+
+    // UNRETAINED command buffer: skips the per-dispatch retain/release of every referenced
+    // resource at commit — the CALLER guarantees all buffers/pipelines outlive completion
+    MetalCommandBuffer * metal_new_command_buffer_unretained ( MetalCommandQueue * queue, Context * ctx, LineInfoArg * at ) {
+        if ( !queue ) ctx->throw_error_at(at, "metal_new_command_buffer_unretained: null command queue");
+        @autoreleasepool {
+            id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)(void *) queue;
+            return retain_handle<MetalCommandBuffer>([q commandBufferWithUnretainedReferences]);
         }
     }
 
@@ -193,6 +229,18 @@ namespace das {
         if ( index < 0 ) ctx->throw_error_at(at, "metal_set_buffer: negative buffer index %i", index);
         id<MTLComputeCommandEncoder> e = (__bridge id<MTLComputeCommandEncoder>)(void *) enc;
         [e setBuffer:(__bridge id<MTLBuffer>)(void *) buf offset:offset atIndex:NSUInteger(index)];
+    }
+
+    void metal_set_threadgroup_memory_length ( MetalComputeEncoder * enc, uint64_t length, int32_t index,
+            Context * ctx, LineInfoArg * at ) {
+        if ( !enc ) ctx->throw_error_at(at, "metal_set_threadgroup_memory_length: null encoder");
+        if ( index < 0 ) ctx->throw_error_at(at, "metal_set_threadgroup_memory_length: negative index %i", index);
+        if ( length == 0 || (length % 16) != 0 ) {   // Metal requires a non-zero multiple of 16
+            ctx->throw_error_at(at, "metal_set_threadgroup_memory_length: length %llu is not a non-zero multiple of 16",
+                (unsigned long long) length);
+        }
+        id<MTLComputeCommandEncoder> e = (__bridge id<MTLComputeCommandEncoder>)(void *) enc;
+        [e setThreadgroupMemoryLength:NSUInteger(length) atIndex:NSUInteger(index)];
     }
 
     static bool valid_grid ( uint3 g ) {
@@ -312,9 +360,18 @@ namespace das {
             addExtern<DAS_BIND_FUN(metal_new_compute_pipeline)>(*this, lib, "metal_new_compute_pipeline",
                 SideEffects::modifyArgumentAndExternal, "metal_new_compute_pipeline")
                     ->args({"device", "function", "error", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_pipeline_max_total_threads)>(*this, lib, "metal_pipeline_max_total_threads",
+                SideEffects::none, "metal_pipeline_max_total_threads")
+                    ->args({"pipeline", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_pipeline_thread_execution_width)>(*this, lib, "metal_pipeline_thread_execution_width",
+                SideEffects::none, "metal_pipeline_thread_execution_width")
+                    ->args({"pipeline", "context", "at"});
 
             addExtern<DAS_BIND_FUN(metal_new_buffer)>(*this, lib, "metal_new_buffer",
                 SideEffects::modifyExternal, "metal_new_buffer")
+                    ->args({"device", "bytes", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_new_buffer_untracked)>(*this, lib, "metal_new_buffer_untracked",
+                SideEffects::modifyExternal, "metal_new_buffer_untracked")
                     ->args({"device", "bytes", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_buffer_contents)>(*this, lib, "metal_buffer_contents",
                 SideEffects::modifyExternal, "metal_buffer_contents")
@@ -322,6 +379,9 @@ namespace das {
 
             addExtern<DAS_BIND_FUN(metal_new_command_buffer)>(*this, lib, "metal_new_command_buffer",
                 SideEffects::modifyExternal, "metal_new_command_buffer")
+                    ->args({"queue", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_new_command_buffer_unretained)>(*this, lib, "metal_new_command_buffer_unretained",
+                SideEffects::modifyExternal, "metal_new_command_buffer_unretained")
                     ->args({"queue", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_new_compute_encoder)>(*this, lib, "metal_new_compute_encoder",
                 SideEffects::modifyExternal, "metal_new_compute_encoder")
@@ -332,6 +392,9 @@ namespace das {
             addExtern<DAS_BIND_FUN(metal_set_buffer)>(*this, lib, "metal_set_buffer",
                 SideEffects::modifyExternal, "metal_set_buffer")
                     ->args({"encoder", "buffer", "offset", "index", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_set_threadgroup_memory_length)>(*this, lib, "metal_set_threadgroup_memory_length",
+                SideEffects::modifyExternal, "metal_set_threadgroup_memory_length")
+                    ->args({"encoder", "length", "index", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_dispatch_threadgroups)>(*this, lib, "metal_dispatch_threadgroups",
                 SideEffects::modifyExternal, "metal_dispatch_threadgroups")
                     ->args({"encoder", "groups", "threads_per_group", "context", "at"});

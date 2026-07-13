@@ -40,6 +40,141 @@ def private approx(x, y : float) : bool {
     return abs(x - y) <= 1e-4 * max(1.0, max(abs(x), abs(y)))
 }
 
+// The tiled sgmat attention trio (QK^T -> softmax -> P.V) vs a direct causal-GQA oracle at one
+// (head_size, heads, kv_heads, npos) shape. Buffers carry np32 rows like the driver's (whole-tile
+// sgmat stores + staging reads walk the padded rows); rows >= npos are pad. GENERIC (untyped
+// dev/queue) so it instantiates only inside the Apple static_if.
+def private attn_trio_gate(t : T?; dev, queue; head_size, n_heads, n_kv_heads, npos : int; mm : bool) {
+    let kv_mul = n_heads / n_kv_heads
+    let qd = n_heads * head_size
+    let kv_dim = n_kv_heads * head_size
+    let np32 = (npos + 31) / 32 * 32
+    var err : string
+    var pso_sc = (mm
+        ? pipeline_from_source(dev, metal_attn_qk_mm_msl, metal_attn_qk_mm_msl_entry, metal_attn_qk_mm_msl_fastmath, err)
+        : pipeline_from_source(dev, metal_attn_qk_msl, metal_attn_qk_msl_entry, metal_attn_qk_msl_fastmath, err))
+    t |> success(pso_sc != null, "qk pipeline (mm={mm}): {err}")
+    var pso_sm = pipeline_from_source(dev, metal_attn_softmax_msl, metal_attn_softmax_msl_entry, metal_attn_softmax_msl_fastmath, err)
+    t |> success(pso_sm != null, "softmax pipeline: {err}")
+    var pso_av = (mm
+        ? pipeline_from_source(dev, metal_attn_av_mm_msl, metal_attn_av_mm_msl_entry, metal_attn_av_mm_msl_fastmath, err)
+        : pipeline_from_source(dev, metal_attn_av_msl, metal_attn_av_msl_entry, metal_attn_av_msl_fastmath, err))
+    t |> success(pso_av != null, "av pipeline (mm={mm}): {err}")
+    let scale = 1.0 / sqrt(float(head_size))
+    var aq : array<float>
+    var ak : array<float>
+    var av : array<float>
+    var axb_want : array<float>
+    aq |> resize(np32 * qd)
+    ak |> resize(np32 * kv_dim)
+    av |> resize(np32 * kv_dim)
+    axb_want |> resize(npos * qd)
+    for (k in range(npos * qd)) {
+        aq[k] = 0.13 * float(k % 31) - 1.9
+    }
+    for (k in range(npos * kv_dim)) {
+        ak[k] = 0.17 * float(k % 23) - 1.8
+        av[k] = 0.09 * float(k % 37) - 1.6
+    }
+    var prow : array<float>
+    prow |> resize(npos)
+    for (h in range(n_heads)) {
+        let kvhoff = (h / kv_mul) * head_size
+        for (qi in range(npos)) {
+            let cnt = qi + 1
+            var m = -1.0e30
+            for (j in range(cnt)) {
+                var dot = 0.0
+                for (d in range(head_size)) {
+                    dot += aq[qi * qd + h * head_size + d] * ak[j * kv_dim + kvhoff + d]
+                }
+                prow[j] = dot * scale
+                m = max(m, prow[j])
+            }
+            var sum = 0.0
+            for (j in range(cnt)) {
+                prow[j] = exp(prow[j] - m)
+                sum += prow[j]
+            }
+            for (d in range(head_size)) {
+                var acc = 0.0
+                for (j in range(cnt)) {
+                    acc += (prow[j] / sum) * av[j * kv_dim + kvhoff + d]
+                }
+                axb_want[qi * qd + h * head_size + d] = acc
+            }
+        }
+    }
+    var baq = buf_upload(dev, aq)
+    var bak = buf_upload(dev, ak)
+    var bav = buf_upload(dev, av)
+    var batt = buf_fill(dev, n_heads * np32 * np32, 0.0)
+    var bxb = buf_fill(dev, np32 * qd, 0.0)
+    var bqd = buf_u32(dev, uint(qd))
+    var bkvd = buf_u32(dev, uint(kv_dim))
+    var bhs = buf_u32(dev, uint(head_size))
+    var bkvm = buf_u32(dev, uint(kv_mul))
+    var bnp = buf_u32(dev, uint(npos))
+    var bnp32 = buf_u32(dev, uint(np32))
+    var bscale = buf_f32(dev, scale)
+    let aran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso_sc)
+        metal_set_threadgroup_memory_length(enc, mm ? metal_attn_qk_mm_msl_tgmem : metal_attn_qk_msl_tgmem, 0)
+        metal_set_buffer(enc, baq, 0ul, 0)
+        metal_set_buffer(enc, bak, 0ul, 1)
+        metal_set_buffer(enc, batt, 0ul, 2)
+        metal_set_buffer(enc, bqd, 0ul, 3)
+        metal_set_buffer(enc, bkvd, 0ul, 4)
+        metal_set_buffer(enc, bhs, 0ul, 5)
+        metal_set_buffer(enc, bkvm, 0ul, 6)
+        metal_set_buffer(enc, bnp, 0ul, 7)
+        metal_set_buffer(enc, bnp32, 0ul, 8)
+        metal_set_buffer(enc, bscale, 0ul, 9)
+        metal_dispatch_threadgroups(enc, uint3(uint(np32 / 32), uint(np32 / (mm ? 64 : 32)), uint(n_heads)), uint3(128u, 1u, 1u))
+        metal_set_pipeline(enc, pso_sm)
+        metal_set_threadgroup_memory_length(enc, metal_attn_softmax_msl_tgmem, 0)
+        metal_set_buffer(enc, batt, 0ul, 0)
+        metal_set_buffer(enc, bnp32, 0ul, 1)
+        metal_dispatch_threadgroups(enc, uint3(uint(npos), uint(n_heads), 1u), uint3(128u, 1u, 1u))
+        metal_set_pipeline(enc, pso_av)
+        metal_set_threadgroup_memory_length(enc, mm ? metal_attn_av_mm_msl_tgmem : metal_attn_av_msl_tgmem, 0)
+        metal_set_buffer(enc, batt, 0ul, 0)
+        metal_set_buffer(enc, bav, 0ul, 1)
+        metal_set_buffer(enc, bxb, 0ul, 2)
+        metal_set_buffer(enc, bqd, 0ul, 3)
+        metal_set_buffer(enc, bkvd, 0ul, 4)
+        metal_set_buffer(enc, bhs, 0ul, 5)
+        metal_set_buffer(enc, bkvm, 0ul, 6)
+        metal_set_buffer(enc, bnp, 0ul, 7)
+        metal_set_buffer(enc, bnp32, 0ul, 8)
+        metal_dispatch_threadgroups(enc, uint3(uint(np32 / 32), uint(head_size / (mm ? 64 : 32)), uint(n_heads)), uint3(128u, 1u, 1u))
+    }
+    t |> success(aran, "attention dispatches (hs={head_size}, mm={mm}): {err}")
+    // the mm pair stages HALF (llama.cpp's f32_f32 mul_mm does the same) — the envelope is the
+    // half-precision score shift through softmax, ~1% of the convex-combination output
+    t |> equal(buf_mismatch_tol(bxb, axb_want, mm ? 2e-2 : 1e-4), 0)
+    metal_release(baq)
+    metal_release(bak)
+    metal_release(bav)
+    metal_release(batt)
+    metal_release(bxb)
+    metal_release(bqd)
+    metal_release(bkvd)
+    metal_release(bhs)
+    metal_release(bkvm)
+    metal_release(bnp)
+    metal_release(bnp32)
+    metal_release(bscale)
+    metal_release(pso_sc)
+    metal_release(pso_sm)
+    metal_release(pso_av)
+    delete aq
+    delete ak
+    delete av
+    delete axb_want
+    delete prow
+}
+
 [test]
 def test_metal_prefill_kernels(t : T?) {
     t |> run("phase-6 prefill kernels == dasLLAMA CPU twins") <| @(t : T?) {
@@ -139,6 +274,7 @@ def test_metal_prefill_kernels(t : T?) {
                 var breps = buf_f32(dev, EPS)
                 let rran = with_compute_encoder(queue, err) <| $(enc : MetalComputeEncoder?) {
                     metal_set_pipeline(enc, pso_rms)
+                    metal_set_threadgroup_memory_length(enc, metal_rmsnorm_msl_tgmem, 0)
                     metal_set_buffer(enc, brx, 0ul, 0)
                     metal_set_buffer(enc, brw, 0ul, 1)
                     metal_set_buffer(enc, bry, 0ul, 2)
@@ -203,118 +339,14 @@ def test_metal_prefill_kernels(t : T?) {
                 metal_release(brnp)
                 metal_release(pso_rope)
 
-                // ===== attention: the tiled sgmat trio (QK^T -> softmax -> P.V) vs a direct
-                // causal-GQA oracle. Buffers carry NP32 rows like the driver's (whole-tile sgmat
-                // stores + staging reads walk the padded rows); rows >= NPOS are pad.
-                var pso_sc = pipeline_from_source(dev, metal_attn_qk_msl, metal_attn_qk_msl_entry, metal_attn_qk_msl_fastmath, err)
-                t |> success(pso_sc != null, "qk pipeline: {err}")
-                var pso_sm = pipeline_from_source(dev, metal_attn_softmax_msl, metal_attn_softmax_msl_entry, metal_attn_softmax_msl_fastmath, err)
-                t |> success(pso_sm != null, "softmax pipeline: {err}")
-                var pso_av = pipeline_from_source(dev, metal_attn_av_msl, metal_attn_av_msl_entry, metal_attn_av_msl_fastmath, err)
-                t |> success(pso_av != null, "av pipeline: {err}")
-                let scale = 1.0 / sqrt(float(HEAD_SIZE))
-                var aq : array<float>
-                var ak : array<float>
-                var av : array<float>
-                var axb_want : array<float>
-                aq |> resize(NP32 * QD)
-                ak |> resize(NP32 * KV_DIM)
-                av |> resize(NP32 * KV_DIM)
-                axb_want |> resize(NPOS * QD)
-                for (k in range(NPOS * QD)) {
-                    aq[k] = 0.13 * float(k % 31) - 1.9
-                }
-                for (k in range(NPOS * KV_DIM)) {
-                    ak[k] = 0.17 * float(k % 23) - 1.8
-                    av[k] = 0.09 * float(k % 37) - 1.6
-                }
-                var prow : array<float>
-                prow |> resize(NPOS)
-                for (h in range(N_HEADS)) {
-                    let kvhoff = (h / KV_MUL) * HEAD_SIZE
-                    for (qi in range(NPOS)) {
-                        let cnt = qi + 1
-                        var m = -1.0e30
-                        for (j in range(cnt)) {
-                            var dot = 0.0
-                            for (d in range(HEAD_SIZE)) {
-                                dot += aq[qi * QD + h * HEAD_SIZE + d] * ak[j * KV_DIM + kvhoff + d]
-                            }
-                            prow[j] = dot * scale
-                            m = max(m, prow[j])
-                        }
-                        var sum = 0.0
-                        for (j in range(cnt)) {
-                            prow[j] = exp(prow[j] - m)
-                            sum += prow[j]
-                        }
-                        for (d in range(HEAD_SIZE)) {
-                            var acc = 0.0
-                            for (j in range(cnt)) {
-                                acc += (prow[j] / sum) * av[j * KV_DIM + kvhoff + d]
-                            }
-                            axb_want[qi * QD + h * HEAD_SIZE + d] = acc
-                        }
-                    }
-                }
-                var baq = buf_upload(dev, aq)
-                var bak = buf_upload(dev, ak)
-                var bav = buf_upload(dev, av)
-                var batt = buf_fill(dev, N_HEADS * NP32 * NP32, 0.0)
-                var bxb = buf_fill(dev, NP32 * QD, 0.0)
-                var bqd = buf_u32(dev, uint(QD))
-                var bkvd = buf_u32(dev, uint(KV_DIM))
-                var bhs = buf_u32(dev, uint(HEAD_SIZE))
-                var bkvm = buf_u32(dev, uint(KV_MUL))
-                var bnp = buf_u32(dev, uint(NPOS))
-                var bnp32 = buf_u32(dev, uint(NP32))
-                var bscale = buf_f32(dev, scale)
-                let aran = with_compute_encoder(queue, err) <| $(enc : MetalComputeEncoder?) {
-                    metal_set_pipeline(enc, pso_sc)
-                    metal_set_buffer(enc, baq, 0ul, 0)
-                    metal_set_buffer(enc, bak, 0ul, 1)
-                    metal_set_buffer(enc, batt, 0ul, 2)
-                    metal_set_buffer(enc, bqd, 0ul, 3)
-                    metal_set_buffer(enc, bkvd, 0ul, 4)
-                    metal_set_buffer(enc, bhs, 0ul, 5)
-                    metal_set_buffer(enc, bkvm, 0ul, 6)
-                    metal_set_buffer(enc, bnp, 0ul, 7)
-                    metal_set_buffer(enc, bnp32, 0ul, 8)
-                    metal_set_buffer(enc, bscale, 0ul, 9)
-                    metal_dispatch_threadgroups(enc, uint3(uint(NP32 / 32), uint(NP32 / 32), uint(N_HEADS)), uint3(128u, 1u, 1u))
-                    metal_set_pipeline(enc, pso_sm)
-                    metal_set_buffer(enc, batt, 0ul, 0)
-                    metal_set_buffer(enc, bnp32, 0ul, 1)
-                    metal_dispatch_threadgroups(enc, uint3(uint(NPOS), uint(N_HEADS), 1u), uint3(128u, 1u, 1u))
-                    metal_set_pipeline(enc, pso_av)
-                    metal_set_buffer(enc, batt, 0ul, 0)
-                    metal_set_buffer(enc, bav, 0ul, 1)
-                    metal_set_buffer(enc, bxb, 0ul, 2)
-                    metal_set_buffer(enc, bqd, 0ul, 3)
-                    metal_set_buffer(enc, bkvd, 0ul, 4)
-                    metal_set_buffer(enc, bhs, 0ul, 5)
-                    metal_set_buffer(enc, bkvm, 0ul, 6)
-                    metal_set_buffer(enc, bnp, 0ul, 7)
-                    metal_set_buffer(enc, bnp32, 0ul, 8)
-                    metal_dispatch_threadgroups(enc, uint3(uint(NP32 / 32), uint(HEAD_SIZE / 32), uint(N_HEADS)), uint3(128u, 1u, 1u))
-                }
-                t |> success(aran, "attention dispatches: {err}")
-                t |> equal(buf_mismatch_approx(bxb, axb_want), 0)
-                metal_release(baq)
-                metal_release(bak)
-                metal_release(bav)
-                metal_release(batt)
-                metal_release(bxb)
-                metal_release(bqd)
-                metal_release(bkvd)
-                metal_release(bhs)
-                metal_release(bkvm)
-                metal_release(bnp)
-                metal_release(bnp32)
-                metal_release(bscale)
-                metal_release(pso_sc)
-                metal_release(pso_sm)
-                metal_release(pso_av)
+                // ===== attention: the tiled sgmat trio vs the direct causal-GQA oracle, at the
+                // classic small shape (hs 32 — one QK k-slab) AND the llama-3B head shape
+                // (hs 128 — the QK kernel's two-k-slab path; 2 heads keep the oracle cheap)
+                attn_trio_gate(t, dev, queue, HEAD_SIZE, N_HEADS, N_KV_HEADS, NPOS, false)
+                attn_trio_gate(t, dev, queue, 128, 2, 1, NPOS, false)
+                // the ggml-geometry pair (hs % 64 shapes: llama-1B/3B classes + GQA)
+                attn_trio_gate(t, dev, queue, 64, 4, 2, NPOS, true)
+                attn_trio_gate(t, dev, queue, 128, 6, 2, 40, true)
 
                 // ===== swiglu + residual add =====
                 var pso_sw = pipeline_from_source(dev, metal_swiglu_msl, metal_swiglu_msl_entry, metal_swiglu_msl_fastmath, err)
@@ -370,6 +402,17 @@ def test_metal_prefill_kernels(t : T?) {
                 metal_release(pso_sw)
                 metal_release(pso_add)
 
+                // ===== the production mul_mm — the resident path's default GEMM =====
+                mulmm_gate(t, dev, queue, 96, 128, 64)      // 3 k-blocks, 2 output tiles, 2 token tiles
+                mulmm_gate(t, dev, queue, 64, 192, 32)      // 2 k-blocks, 3 output tiles, 1 token tile
+
+                // ===== the classifier GEMV (logits-on-GPU) =====
+                // exact-arithmetic data (quants in [-8, 7], pow2 scales, int x): every per-byte4
+                // dot, scale product, and simd_sum partial is exactly representable — BIT-exact
+                // vs the CPU reference. d = 21 exercises the row < ddim tail guard (grid pads to 24).
+                gemv_gate(t, dev, queue, 96, 21)            // 3 blocks per row, guarded tail
+                gemv_gate(t, dev, queue, 160, 64)           // 5 blocks per row, exact grid
+
                 metal_release(queue)
             }
             t |> equal(metal_live_object_count(), 0l)
@@ -377,6 +420,154 @@ def test_metal_prefill_kernels(t : T?) {
             feint("das_metal is not built on this platform; nothing to compare\n")
         }
     }
+}
+
+// The classifier GEMV kernel on exact-arithmetic data: [d x n] Q8 rows dot one f32 vector vs
+// a direct CPU dot, BIT-exact (see the call site for why exactness holds).
+def private gemv_gate(t : T?; dev, queue; n, d : int) {
+    var err : string
+    var pso = pipeline_from_source(dev, metal_q8_gemv_msl, metal_q8_gemv_msl_entry, metal_q8_gemv_msl_fastmath, err)
+    t |> success(pso != null, "gemv pipeline: {err}")
+    if (pso == null) {
+        return
+    }
+    let nblk = n / 32
+    var wq : array<int8>
+    var ws : array<float>
+    var xv : array<float>
+    var want : array<float>
+    wq |> resize(d * n)
+    ws |> resize(d * nblk)
+    xv |> resize(n)
+    want |> resize(d)
+    let lut = fixed_array(0.25, 0.5, 1.0, 2.0)
+    for (i in range(d * n)) {
+        wq[i] = int8((i * 7 + i / 31) % 16 - 8)
+    }
+    for (i in range(d * nblk)) {
+        ws[i] = lut[(i / 5) % 4]
+    }
+    for (i in range(n)) {
+        xv[i] = float((i * 3) % 9 - 4)
+    }
+    for (r in range(d)) {
+        var acc = 0.0
+        for (k in range(n)) {
+            acc += float(wq[r * n + k]) * ws[r * nblk + k / 32] * xv[k]
+        }
+        want[r] = acc
+    }
+    var bwq = buf_upload(dev, wq)
+    var bws = buf_upload(dev, ws)
+    var bx = buf_upload(dev, xv)
+    var by = buf_fill(dev, d, -1000.0)
+    var bn = buf_u32(dev, uint(n))
+    var bd = buf_u32(dev, uint(d))
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_buffer(enc, bwq, 0ul, 0)
+        metal_set_buffer(enc, bws, 0ul, 1)
+        metal_set_buffer(enc, bx, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_buffer(enc, bn, 0ul, 4)
+        metal_set_buffer(enc, bd, 0ul, 5)
+        metal_dispatch_threadgroups(enc, uint3(uint((d + 3) / 4), 1u, 1u), uint3(128u, 1u, 1u))
+    }
+    t |> success(ran, "gemv dispatch n={n} d={d}: {err}")
+    t |> equal(buf_mismatch_exact(by, want), 0)
+    metal_release(bwq)
+    metal_release(bws)
+    metal_release(bx)
+    metal_release(by)
+    metal_release(bn)
+    metal_release(bd)
+    metal_release(pso)
+    delete wq
+    delete ws
+    delete xv
+    delete want
+}
+
+// The production mul_mm kernel on exact-arithmetic data: 34B q8-block W blobs (GGUF q8_0's
+// own layout: f16 scale + 32 int8) x raw f32 X rows vs a CPU reference, BIT-exact (quants in
+// [-8, 7], pow2 scales: every staged half, every product, and every f32 partial sum is exactly
+// representable, so any deviation is a real bug). The blob is built here independently of the
+// driver — it doubles as the layout oracle for upload_blob_region.
+def private mulmm_gate(t : T?; dev, queue; k, d, m : int) {
+    var err : string
+    var pso = pipeline_from_source(dev, metal_q8_mulmm_msl, metal_q8_mulmm_msl_entry, metal_q8_mulmm_msl_fastmath, err)
+    t |> success(pso != null, "mul_mm pipeline: {err}")
+    let nb = k / 32
+    let lut = fixed_array(0.25, 0.5, 1.0, 2.0)
+    var wq : array<int8>
+    var ws : array<float>
+    wq |> resize(d * k)
+    ws |> resize(d * nb)
+    for (i in range(d * k)) {
+        wq[i] = int8((i * 7 + i / 31) % 16 - 8)
+    }
+    for (i in range(d * nb)) {
+        ws[i] = lut[(i / 5) % 4]
+    }
+    // W blob: 34-byte blocks (half scale + 32 quants), built straight in the buffer
+    var bw = metal_new_buffer(dev, uint64(d * nb * 34))
+    var base = unsafe(reinterpret<int8?>(metal_buffer_contents(bw)))
+    for (b in range(d * nb)) {
+        let off = b * 34
+        unsafe {
+            var ph = reinterpret<float16?>(base + off)
+            ph[0] = float16(ws[b])
+            for (c in range(32)) {
+                base[off + 2 + c] = wq[b * 32 + c]
+            }
+        }
+    }
+    // X: raw f32 rows, integer-times-pow2 values (exact in half)
+    var xf : array<float>
+    xf |> resize(m * k)
+    for (i in range(m * k)) {
+        xf[i] = float((i * 5 + i / 17) % 16 - 8) * lut[(i / 3) % 4]
+    }
+    var bx = buf_upload(dev, xf)
+    var by = buf_fill(dev, m * d, 0.0)
+    var bk = buf_u32(dev, uint(k))
+    var bd = buf_u32(dev, uint(d))
+    var want : array<float>
+    want |> resize(m * d)
+    for (r in range(m)) {
+        for (j in range(d)) {
+            var acc = 0.0lf
+            for (c in range(k)) {
+                acc += double(float(wq[j * k + c]) * ws[j * nb + c / 32]) * double(xf[r * k + c])
+            }
+            want[r * d + j] = float(acc)
+        }
+    }
+    let ran = with_compute_encoder(queue, err) $(enc : MetalComputeEncoder?) {
+        metal_set_pipeline(enc, pso)
+        metal_set_threadgroup_memory_length(enc, metal_q8_mulmm_msl_tgmem, 0)
+        metal_set_buffer(enc, bw, 0ul, 0)
+        metal_set_buffer(enc, bw, 0ul, 1)
+        metal_set_buffer(enc, bx, 0ul, 2)
+        metal_set_buffer(enc, by, 0ul, 3)
+        metal_set_buffer(enc, bk, 0ul, 4)
+        metal_set_buffer(enc, bd, 0ul, 5)
+        metal_dispatch_threadgroups(enc, uint3(uint(m / 32), uint(d / 64), 1u), uint3(128u, 1u, 1u))
+    }
+    t |> success(ran, "mul_mm dispatch {k}x{d}x{m}: {err}")
+    t |> equal(buf_mismatch_exact(by, want), 0)
+    metal_release(bk)
+    metal_release(bd)
+    metal_release(bw)
+    metal_release(bx)
+    metal_release(by)
+    if (pso != null) {
+        metal_release(pso)
+    }
+    delete wq
+    delete ws
+    delete xf
+    delete want
 }
 
 // ===== local GPU plumbing (generic bodies instantiate only inside the static_if above) =====
@@ -435,6 +626,18 @@ def private buf_mismatch_exact(buf; want : array<auto(TT)>) : int {
     var bad = 0
     for (k in range(length(want))) {
         if (unsafe(p[k]) != want[k]) {
+            bad++
+        }
+    }
+    return bad
+}
+
+def private buf_mismatch_tol(buf; want : array<float>; tol : float) : int {
+    let p = unsafe(reinterpret<float const?>(metal_buffer_contents(buf)))
+    var bad = 0
+    for (k in range(length(want))) {
+        let g = unsafe(p[k])
+        if (abs(g - want[k]) > tol * max(1.0, max(abs(g), abs(want[k])))) {
             bad++
         }
     }

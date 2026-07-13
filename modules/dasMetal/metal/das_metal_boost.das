@@ -44,12 +44,15 @@ def public pipeline_from_source(dev : MetalDevice?; source, entry : string; fast
 //! One 1D dispatch: encode pipeline + buffers (bound to [[buffer(0..N-1)]] in array order),
 //! dispatch ceil(threads/threads_per_group) threadgroups, commit, wait. Returns false with
 //! `error` filled when the command buffer reports a GPU-side failure.
-def public run_compute_1d(queue : MetalCommandQueue?; pso : MetalComputePipeline?; buffers : array<MetalBuffer?>; threads, threads_per_group : uint; var error : string&) : bool {
+def public run_compute_1d(queue : MetalCommandQueue?; pso : MetalComputePipeline?; buffers : array<MetalBuffer?>; threads, threads_per_group : uint; var error : string&; tgmem : uint64 = 0ul) : bool {
     let cb = metal_new_command_buffer(queue)
     let enc = metal_new_compute_encoder(cb)
     metal_set_pipeline(enc, pso)
     for (buf, index in buffers, range(length(buffers))) {
         metal_set_buffer(enc, buf, 0ul, index)
+    }
+    if (tgmem > 0ul) {
+        metal_set_threadgroup_memory_length(enc, tgmem, 0)
     }
     let groups = (threads + threads_per_group - 1u) / threads_per_group
     metal_dispatch_threadgroups(enc, uint3(groups, 1u, 1u), uint3(threads_per_group, 1u, 1u))
@@ -132,6 +135,20 @@ def public pool_acquire(var pool : MetalBufferPool; dev : MetalDevice?; bytes : 
     return metal_new_buffer(dev, bucket)
 }
 
+//! The UNTRACKED-pool twin, for GPU-read-only pool data the CPU fills before commit (uniforms,
+//! lookup tables): skips the command-buffer scheduler's per-resource hazard analysis. Keep a
+//! SEPARATE MetalBufferPool for these — tracked and untracked buffers must not mix in one pool.
+def public pool_acquire_untracked(var pool : MetalBufferPool; dev : MetalDevice?; bytes : uint64) : MetalBuffer? {
+    let bucket = pool_bucket(bytes)
+    var lst & = unsafe(pool.free_bufs[bucket])
+    if (!empty(lst)) {
+        var buf = lst[length(lst) - 1]
+        lst |> pop()
+        return buf
+    }
+    return metal_new_buffer_untracked(dev, bucket)
+}
+
 def public pool_release(var pool : MetalBufferPool; var buf : MetalBuffer?; bytes : uint64) {
     pool.free_bufs[pool_bucket(bytes)] |> push(buf)
 }
@@ -161,10 +178,19 @@ def public with_compute_encoder(queue : MetalCommandQueue?; var error : string&;
 //! GPUStartTime, milliseconds) — the honest GPU-busy number, as opposed to the host wall time
 //! around commit+wait which folds in scheduling and readback.
 def public with_compute_encoder_timed(queue : MetalCommandQueue?; var error : string&; var gpu_ms : double&; blk : block<(enc : MetalComputeEncoder?) : void>) : bool {
+    var encode_ms = 0.0lf
+    return with_compute_encoder_timed(queue, error, gpu_ms, encode_ms, blk)
+}
+
+//! The 4-out twin: also reports the host-side ENCODE time (block entry to commit) — the
+//! encode-CPU vs GPU-window split that attributes command-buffer overhead.
+def public with_compute_encoder_timed(queue : MetalCommandQueue?; var error : string&; var gpu_ms : double&; var encode_ms : double&; blk : block<(enc : MetalComputeEncoder?) : void>) : bool {
     let cb = metal_new_command_buffer(queue)
     let enc = metal_new_compute_encoder(cb)
+    let ts_enc = ref_time_ticks()
     invoke(blk, enc)
     metal_end_encoding(enc)
+    encode_ms = double(get_time_usec(ts_enc)) / 1000.0lf
     metal_commit(cb)
     metal_wait_until_completed(cb)
     error = metal_command_buffer_error(cb)

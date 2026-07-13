@@ -20,9 +20,10 @@ kernel void reduce(device const uint* src [[buffer(0)]],
         uint gl_LocalInvocationIndex [[thread_index_in_threadgroup]],
         uint3 gl_NumWorkGroups [[threadgroups_per_grid]],
         uint3 gl_WorkGroupID [[threadgroup_position_in_grid]],
-        uint3 gl_WorkGroupSize [[threads_per_threadgroup]]) \{
-    threadgroup uint tile[64];
-    threadgroup uint total;
+        uint3 gl_WorkGroupSize [[threads_per_threadgroup]],
+        threadgroup char * shmem [[threadgroup(0)]]) \{
+    threadgroup uint * tile = (threadgroup uint *)(shmem);
+    threadgroup uint * total_wg = (threadgroup uint *)(shmem + 256);
     uint gid = gl_GlobalInvocationID.x;
     uint lid = gl_LocalInvocationID.x;
     tile[lid] = src[gid];
@@ -36,11 +37,11 @@ kernel void reduce(device const uint* src [[buffer(0)]],
         s /= 2u;
     \}
     if ((gl_LocalInvocationIndex == 0u)) \{
-        total = (tile[0] + (gl_NumWorkGroups.x * 0u));
+        (*total_wg) = (tile[0] + (gl_NumWorkGroups.x * 0u));
     \}
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if ((gl_LocalInvocationIndex == 0u)) \{
-        dst[gl_WorkGroupID.x] = total;
+        dst[gl_WorkGroupID.x] = (*total_wg);
     \}
 \}
 "
@@ -48,8 +49,8 @@ kernel void reduce(device const uint* src [[buffer(0)]],
 [test]
 def test_threadgroup_shape(t : T?) {
     t |> run("reduce: @workgroup members -> body-top threadgroup declarations") <| @(t : T?) {
-        t |> success(contains(reduce_msl, "    threadgroup uint tile[64];"), "fixed array -> threadgroup array declaration")
-        t |> success(contains(reduce_msl, "    threadgroup uint total;"), "scalar -> threadgroup scalar declaration")
+        t |> success(contains(reduce_msl, "    threadgroup uint * tile = (threadgroup uint *)(shmem);"), "fixed array -> shmem-derived pointer")
+        t |> success(contains(reduce_msl, "    threadgroup uint * total_wg = (threadgroup uint *)(shmem + 256);"), "scalar -> shmem-derived pointer, accesses dereference")
         t |> success(!contains(reduce_msl, "tile [[buffer"), "threadgroup memory is never a buffer parameter")
     }
     t |> run("reduce: barrier lowering") <| @(t : T?) {

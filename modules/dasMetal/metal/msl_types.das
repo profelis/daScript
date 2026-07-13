@@ -38,6 +38,23 @@ def public msl_type_name(t : TypeDecl?) : string {
     return cc > 1 ? "{base}{cc}" : base
 }
 
+//! MSL byte size of a THREADGROUP-resident element — the dynamic-shmem layout unit. Unlike the
+//! packed buffer path, threadgroup memory uses MSL's plain (non-packed) spellings, so 3-lane
+//! vectors stride four lanes.
+def public msl_tg_elem_bytes(t : TypeDecl?) : uint64 {
+    if (t == null) {
+        return 0ul
+    }
+    if (t.baseType == Type.tBool) {
+        return 1ul
+    }
+    if (scalar_class(t.baseType) < 0) {
+        return 0ul
+    }
+    let cc = component_count(t.baseType)
+    return uint64(scalar_width(t.baseType) / 8) * uint64(cc == 3 ? 4 : cc)
+}
+
 //! MSL spelling for a buffer/uniform ELEMENT — the layout-bearing position. das packs vectors
 //! tightly (float3 = 12B, half3 = 6B, byte3 = 3B) while non-packed MSL 3-vectors stride padded
 //! (float3 = 16B, half3 = 8B); with unified memory the das array IS the buffer, so 3-lane

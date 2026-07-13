@@ -37,6 +37,8 @@ struct private MslMember {
     workgroup : bool
     packed : bool           // elem != value_elem: 3-lane element behind a packed_T3 param
     wg_dim : int            // @workgroup fixed-array count; -1 = scalar/vector
+    wg_bytes : uint64       // @workgroup member's MSL byte size (whole member)
+    wg_off : uint64         // @workgroup member's offset inside the dynamic shmem buffer
 }
 
 struct private MslCtx {
@@ -45,6 +47,7 @@ struct private MslCtx {
     members : table<string; MslMember>          // das field name -> lowering
     builtins_used : table<string>               // referenced builtin globals (gl_*)
     renames : table<string; string>             // das identifier -> MSL-safe identifier
+    ptrs : table<string; string>                // pointer local (addr(member[..])) -> its member (das names)
     self_name : string
 }
 
@@ -159,18 +162,21 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
             }
             var wgElem = ""
             var wgDim = -1
+            var wgElemBytes = 0ul
             if (fld._type != null && fld._type.baseType == Type.tFixedArray && fld._type.firstType != null &&
                     fld._type.firstType.baseType != Type.tFixedArray) {
                 if (reject_cpu_only_width(ctx, fld.at, fld._type.firstType)) {
                     continue
                 }
                 wgElem = msl_type_name(fld._type.firstType)
+                wgElemBytes = msl_tg_elem_bytes(fld._type.firstType)
                 wgDim = fld._type.fixedDim
             } else {
                 if (reject_cpu_only_width(ctx, fld.at, fld._type)) {
                     continue
                 }
                 wgElem = msl_type_name(fld._type)
+                wgElemBytes = msl_tg_elem_bytes(fld._type)
             }
             if (empty(wgElem) || (wgDim == 0)) {
                 err(ctx, fld.at, "@workgroup member `{fld.name}` must be a scalar, vector, or single-dimension fixed array of those (e.g. uint[64]); got {fld._type == null ? "?" : describe(fld._type)}")
@@ -179,7 +185,8 @@ def private scan_members(var ctx : MslCtx; fn : FunctionPtr) {
             let wgName = string(fld.name)
             ctx.renames[wgName] = msl_safe_name(wgName)
             ctx.members[wgName] = MslMember(msl_name = msl_safe_name(wgName), elem = wgElem, value_elem = wgElem,
-                binding = -1, written = false, uniform = false, workgroup = true, packed = false, wg_dim = wgDim)
+                binding = -1, written = false, uniform = false, workgroup = true, packed = false, wg_dim = wgDim,
+                wg_bytes = wgElemBytes * uint64(wgDim > 0 ? wgDim : 1))
             continue
         }
         if (binding < 0) {
@@ -550,11 +557,17 @@ def private emit_value(var ctx : MslCtx; e : Expression?) : string {
         }
         err(ctx, ef.at, "field access `.{fieldName}` is not a kernel-class member access — only self.<@ssbo/@uniform member> lowers to MSL")
         return "/*.{fieldName}*/"
+    } elif (e is ExprCall && call_base_name("{(e as ExprCall).name}") == "i_das_ptr_add") {
+        // das pointer arithmetic (`p = unsafe(p + n)`): args = (ptr, elems, elem_size); MSL
+        // pointer addition element-scales the same way
+        let pc = e as ExprCall
+        note(ctx, "op.ptr_add")
+        return "({emit_value(ctx, pc.arguments[0])} + ({emit_value(ctx, pc.arguments[1])}))"
     } elif (e is ExprAt) {
         let ea = e as ExprAt
+        let pm = member_lookup(ctx, ea.subexpr)
         let sub = emit_value(ctx, ea.subexpr)
         let idx = emit_value(ctx, ea.index)
-        let pm = member_lookup(ctx, ea.subexpr)
         if (!empty(pm) && ctx.members[pm].packed) {
             // a packed 3-lane element loads back into its plain-type value form (packed types
             // have no arithmetic operators of their own)
@@ -934,12 +947,14 @@ def private emit_store_target(var ctx : MslCtx; e : Expression?) : string {
 // argument must be a kernel-class member — @ssbo (device) for both, @workgroup (threadgroup)
 // additionally as a load source — and lowers as `name + offset`. Element-type agreement is
 // enforced upstream by the das overloads (the reference body indexes src/dst with the matrix's
-// element type).
+// element type). A das pointer local (`var p = unsafe(addr(member[..]))`) is also accepted as
+// the source/destination and lowers through the pointer.
 def private emit_sgmat_load_store(var ctx : MslCtx; ec : ExprCall?; indent : string; var lines : array<string>) {
     let cname = call_base_name("{ec.name}")
     let isLoad = cname == "simdgroup_load"
-    if (length(ec.arguments) != 4) {
-        err(ctx, ec.at, "{cname} takes (matrix, buffer, offset, stride)")
+    let nargs = length(ec.arguments)
+    if (!(nargs == 4 || (isLoad && nargs == 5))) {
+        err(ctx, ec.at, "{cname} takes (matrix, buffer, offset, stride{isLoad ? "[, transpose]" : ""})")
         return
     }
     let sgname = sgmat_type_name(ec.arguments[0]._type)
@@ -947,9 +962,36 @@ def private emit_sgmat_load_store(var ctx : MslCtx; ec : ExprCall?; indent : str
         err(ctx, ec.at, "{cname} first argument must be a simdgroup matrix")
         return
     }
+    // pointer-local source: simdgroup_load(m, p, off, stride) where p = unsafe(addr(member[..]))
+    var parg = ec.arguments[1]
+    if (parg != null && parg is ExprRef2Value) {
+        parg = (parg as ExprRef2Value).subexpr
+    }
+    if (parg != null && parg is ExprVar && key_exists(ctx.ptrs, "{(parg as ExprVar).name}")) {
+        let pn0 = "{(parg as ExprVar).name}"
+        let pmem0 = ctx.ptrs[pn0]
+        let pmm = ctx.members[pmem0]
+        if (!isLoad) {
+            err(ctx, ec.at, "simdgroup_store through a das pointer is not supported — store to the @ssbo member directly")
+            return
+        }
+        let pmv = emit_value(ctx, ec.arguments[0])
+        let poff = emit_value(ctx, ec.arguments[2])
+        let pstride = emit_value(ctx, ec.arguments[3])
+        let pcls = sgmat_census_class(sgmat_type_name(ec.arguments[0]._type))
+        if (nargs == 5) {
+            let ptv = emit_value(ctx, ec.arguments[4])
+            note(ctx, "call.sgmat_load_ptr_t.{pcls}")
+            lines |> push("{indent}{cname}({pmv}, {ctx.renames[pn0]} + ({poff}), {pstride}, ulong2(0), {ptv});")
+            return
+        }
+        note(ctx, "call.sgmat_load_ptr.{pcls}")
+        lines |> push("{indent}{cname}({pmv}, {ctx.renames[pn0]} + ({poff}), {pstride});")
+        return
+    }
     let mem = member_lookup(ctx, ec.arguments[1])
     if (empty(mem)) {
-        err(ctx, ec.at, "{cname} {isLoad ? "source" : "destination"} must be an @ssbo{isLoad ? " or @workgroup" : ""} member")
+        err(ctx, ec.at, "{cname} {isLoad ? "source" : "destination"} must be an @ssbo{isLoad ? " or @workgroup" : ""} member, or a das pointer local over one")
         return
     }
     let m = ctx.members[mem]
@@ -962,15 +1004,48 @@ def private emit_sgmat_load_store(var ctx : MslCtx; ec : ExprCall?; indent : str
         return
     }
     let mv = emit_value(ctx, ec.arguments[0])
+    let cls = sgmat_census_class(sgname)
     let off = emit_value(ctx, ec.arguments[2])
     let stride = emit_value(ctx, ec.arguments[3])
-    let cls = sgmat_census_class(sgname)
+    if (nargs == 5) {   // the transpose-flag load: MSL's 5-arg form (origin 0, transpose_matrix)
+        note(ctx, m.workgroup ? "call.sgmat_load_tg_t.{cls}" : "call.sgmat_load_t.{cls}")
+        let tv = emit_value(ctx, ec.arguments[4])
+        lines |> push("{indent}{cname}({mv}, {m.msl_name} + {off}, {stride}, ulong2(0), {tv});")
+        return
+    }
     if (isLoad) {
         note(ctx, m.workgroup ? "call.sgmat_load_tg.{cls}" : "call.sgmat_load.{cls}")
     } else {
         note(ctx, "call.sgmat_store.{cls}")
     }
     lines |> push("{indent}{cname}({mv}, {m.msl_name} + {off}, {stride});")
+}
+
+// tg_store_half4(dst, idx, v): one aligned half4 vector store into a float16 @workgroup array —
+// `*(threadgroup half4*)(dst + idx) = half4(v);` (idx % 4 == 0 by contract; 8-byte alignment)
+def private emit_tg_store_half4(var ctx : MslCtx; ec : ExprCall?; indent : string; var lines : array<string>) {
+    if (length(ec.arguments) != 3) {
+        err(ctx, ec.at, "tg_store_half4 takes (workgroup array, index, float4)")
+        return
+    }
+    let mem = member_lookup(ctx, ec.arguments[0])
+    if (empty(mem)) {
+        err(ctx, ec.at, "tg_store_half4 destination must be a @workgroup member")
+        return
+    }
+    let m = ctx.members[mem]
+    if (!m.workgroup) {
+        err(ctx, ec.at, "tg_store_half4 destination must be a @workgroup member")
+        return
+    }
+    if (m.elem != "half") {
+        err(ctx, ec.at, "tg_store_half4 destination must be a float16 workgroup array (got {m.elem})")
+        return
+    }
+    let idx = emit_value(ctx, ec.arguments[1])
+    let v = emit_value(ctx, ec.arguments[2])
+    note(ctx, "call.tg_store_half4")
+    lines |> push("{indent}*(threadgroup half4*)({m.msl_name} + ({idx})) = half4({v});")
 }
 
 // simdgroup_multiply_accumulate(d, a, b, c) / simdgroup_multiply(d, a, b) — argument-type combos
@@ -1028,6 +1103,67 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
                     note(ctx, "stmt.var.sgmat")
                     lines |> push("{indent}{sgname} {ctx.renames[sgVarName]} = {init};")
                 }
+                continue
+            }
+            if (v.init != null && v.init is ExprRef2Ptr && (v.init as ExprRef2Ptr).subexpr is ExprAt) {
+                // `var p = unsafe(addr(member[expr]))` — a das pointer INTO a kernel member.
+                // Lowers to a real MSL pointer in the member's address space; the spelling
+                // exists because pointer-vs-index register-allocates differently on AGX and
+                // the winner is shape-dependent — both stay writable, plain das either way
+                let pat = (v.init as ExprRef2Ptr).subexpr as ExprAt
+                let pmem = member_lookup(ctx, pat.subexpr)
+                if (empty(pmem)) {
+                    err(ctx, v.at, "addr() in a kernel must take a kernel-class member element (addr(member[expr]))")
+                    continue
+                }
+                let pm = ctx.members[pmem]
+                if (pm.uniform || pm.packed) {
+                    err(ctx, v.at, "addr() over a @uniform or packed 3-lane member has no MSL pointer form")
+                    continue
+                }
+                let pname0 = string(v.name)
+                ctx.renames[pname0] = msl_safe_name(pname0)
+                ctx.ptrs[pname0] = pmem
+                let base = emit_value(ctx, pat.index)
+                let space = pm.workgroup ? "threadgroup" : (pm.written ? "device" : "device const")
+                note(ctx, pm.workgroup ? "decl.ptr.tg" : "decl.ptr.dev")
+                lines |> push("{indent}{space} {pm.elem} * {ctx.renames[pname0]} = {pm.msl_name} + ({base});")
+                continue
+            }
+            if (v._type != null && v._type.baseType == Type.tFixedArray && v._type.firstType != null &&
+                    v._type.firstType.baseType != Type.tFixedArray) {
+                // single-dim fixed-array local; das zero-init semantics, no initializer form
+                if (v.init != null) {
+                    err(ctx, v.at, "fixed-array local `{v.name}` takes no initializer — das zero-init is the MSL form")
+                    continue
+                }
+                let et = v._type.firstType
+                let n = v._type.fixedDim
+                let aname = string(v.name)
+                ctx.renames[aname] = msl_safe_name(aname)
+                let an = ctx.renames[aname]
+                let asg = sgmat_type_name(et)
+                if (!empty(asg)) {
+                    // the opaque tile type: `= {}` does not construct it — zero-fill in a
+                    // rolled pragma'd loop (the array form exists exactly for rolled math)
+                    note(ctx, "stmt.var.sgmat_array.{sgmat_census_class(asg)}")
+                    lines |> push("{indent}{asg} {an}[{n}];")
+                    lines |> push("{indent}#pragma clang loop unroll(full)")
+                    lines |> push("{indent}for (int {an}_zi = 0; {an}_zi < {n}; ++{an}_zi) \{")
+                    lines |> push("{indent}    {an}[{an}_zi] = {sgmat_zero_fill(asg)};")
+                    lines |> push("{indent}\}")
+                    continue
+                }
+                if (reject_cpu_only_width(ctx, v.at, et)) {
+                    continue
+                }
+                let ename = msl_type_name(et)
+                if (empty(ename)) {
+                    err(ctx, v.at, "local array `{v.name}` element type {describe(et)} has no MSL form")
+                    continue
+                }
+                note(ctx, "stmt.var.array")
+                lines |> push("{indent}{ename} {an}[{n}] = \{\};")
                 continue
             }
             if (reject_cpu_only_width(ctx, v.at, v._type)) {
@@ -1101,6 +1237,7 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
     } elif (e is ExprWhile) {
         let wh = e as ExprWhile
         let c = emit_value(ctx, wh.cond)
+        emit_loop_hints(ctx, wh.annotations, wh.at, indent, lines)
         note(ctx, "stmt.while")
         lines |> push("{indent}while ({c}) \{")
         emit_stmt(ctx, wh.body, indent + "    ", lines)
@@ -1122,6 +1259,8 @@ def private emit_stmt(var ctx : MslCtx; e : Expression?; indent : string; var li
             lines |> push("{indent}threadgroup_barrier(mem_flags::mem_threadgroup);")
         } elif (cname == "simdgroup_load" || cname == "simdgroup_store") {
             emit_sgmat_load_store(ctx, ec, indent, lines)
+        } elif (cname == "tg_store_half4") {
+            emit_tg_store_half4(ctx, ec, indent, lines)
         } elif (cname == "simdgroup_multiply_accumulate" || cname == "simdgroup_multiply") {
             emit_sgmat_multiply(ctx, ec, indent, lines)
         } else {
@@ -1169,6 +1308,31 @@ def private emit_if(var ctx : MslCtx; ite : ExprIfThenElse?; indent : string; va
 // endpoints ONCE at loop entry, so a non-constant end is hoisted into a loop-scoped local (the
 // comma-declaration keeps sequential same-name loops from colliding); a body that mutates memory
 // the end expression reads stays das-exact. Constant ranges inline the bounds.
+// Per-loop hint annotations (`for [unroll_full] (...)`) — the SAME AnnotationArgumentList
+// surface the JIT lowers to !llvm.loop.* metadata (llvm_jit.das append_loop_hint_operand);
+// here each recognized hint lowers to its clang loop pragma. The pragma'd loop reaches the
+// Metal frontend ROLLED and the GPU backend unrolls late, register-budget-aware — the
+// hand-unrolled spelling costs an occupancy tier (mul_mm: max_threads 1024 -> 832, -13%).
+def private emit_loop_hints(var ctx : MslCtx; anns : AnnotationArgumentList; at : LineInfo; indent : string; var lines : array<string>) {
+    for (a in anns) {
+        if (a.name == "unroll") {
+            note(ctx, "stmt.for.unroll")
+            lines |> push("{indent}#pragma clang loop unroll(enable)")
+        } elif (a.name == "unroll_full") {
+            note(ctx, "stmt.for.unroll")
+            lines |> push("{indent}#pragma clang loop unroll(full)")
+        } elif (a.name == "unroll_disable") {
+            note(ctx, "stmt.for.unroll")
+            lines |> push("{indent}#pragma clang loop unroll(disable)")
+        } elif (a.name == "unroll_count" && a.basicType == Type.tInt) {
+            note(ctx, "stmt.for.unroll")
+            lines |> push("{indent}#pragma clang loop unroll_count({a.iValue})")
+        } else {
+            err(ctx, at, "loop hint `{a.name}` has no MSL lowering — supported: unroll, unroll_full, unroll_disable, unroll_count=N")
+        }
+    }
+}
+
 def private emit_for(var ctx : MslCtx; fr : ExprFor?; indent : string; var lines : array<string>) {
     if (length(fr.iteratorVariables) != 1 || length(fr.sources) != 1) {
         err(ctx, fr.at, "only a single `for (i in range(...))` loop lowers to MSL")
@@ -1213,6 +1377,7 @@ def private emit_for(var ctx : MslCtx; fr : ExprFor?; indent : string; var lines
     let ivName = string(iv.name)
     ctx.renames[ivName] = msl_safe_name(ivName)
     let mn = ctx.renames[ivName]
+    emit_loop_hints(ctx, fr.annotations, fr.at, indent, lines)
     note(ctx, "stmt.for")
     if (hiIsConst) {
         lines |> push("{indent}for ({tname} {mn} = {lo}; {mn} < {hi}; ++{mn}) \{")
@@ -1239,7 +1404,7 @@ def public kernel_entry_name(fn : FunctionPtr; cfg : MslEmitConfig) : string {
 //! Lower a [metal_kernel] class method to MSL text. On any error the return is "" and `errors`
 //! explains; `census` collects the construct kinds emitted (gate B).
 [macro_function]
-def public generate_msl(fn : FunctionPtr; var errors : array<string>; cfg : MslEmitConfig; var census : table<string>) : string {
+def public generate_msl(fn : FunctionPtr; var errors : array<string>; cfg : MslEmitConfig; var census : table<string>; var tgmem : uint64&) : string {
     var ctx : MslCtx
     if (fn == null) {
         errors |> push("generate_msl: null function")
@@ -1256,24 +1421,38 @@ def public generate_msl(fn : FunctionPtr; var errors : array<string>; cfg : MslE
     ctx.self_name = string(fn.arguments[0].name)
     scan_members(ctx, fn)
     scan_body(ctx, fn.body)
-    var body_lines : array<string>
-    emit_stmt(ctx, fn.body, "    ", body_lines)
 
-    // @workgroup members are not parameters — MSL has no module-scope threadgroup variables, so
-    // each lowers to a threadgroup declaration at the top of the kernel body (name-sorted)
+    // @workgroup members lower to ONE dynamic [[threadgroup(0)]] buffer + derived pointers, NOT
+    // static threadgroup arrays: the AGX backend constant-folds tile pointers into a static
+    // array's absolute addresses, and the large offsets re-materialize as integer adds inside
+    // the math-bound loop phase (ISA-measured on mul_mm: 40 vs 24 iadds/iteration, the das
+    // kernel's whole residual vs llama.cpp). The opaque dynamic base keeps small carried
+    // offsets. Layout: name-sorted, each member 16B-aligned; the total ships as the `_tgmem`
+    // companion and the dispatch sets setThreadgroupMemoryLength(index 0) with it.
     var tg_lines : array<string>
     var wg_names <- [for (name, m in keys(ctx.members), values(ctx.members)); name; where m.workgroup]
     wg_names |> sort()
+    tgmem = 0ul
     for (name in wg_names) {
+        let moff = tgmem
+        ctx.members[name].wg_off = moff
         let m = ctx.members[name]
+        tgmem = (moff + m.wg_bytes + 15ul) & ~15ul
+        let base = moff == 0ul ? "(shmem)" : "(shmem + {int64(moff)})"
         if (m.wg_dim > 0) {
-            note(ctx, "decl.threadgroup_array")
-            tg_lines |> push("    threadgroup {m.elem} {m.msl_name}[{m.wg_dim}];")
+            note(ctx, "decl.shmem_ptr_array")
+            tg_lines |> push("    threadgroup {m.elem} * {m.msl_name} = (threadgroup {m.elem} *){base};")
         } else {
-            note(ctx, "decl.threadgroup")
-            tg_lines |> push("    threadgroup {m.elem} {m.msl_name};")
+            // scalar member: the pointer takes a derived name and every access dereferences it
+            note(ctx, "decl.shmem_ptr")
+            let pname = "{m.msl_name}_wg"
+            tg_lines |> push("    threadgroup {m.elem} * {pname} = (threadgroup {m.elem} *){base};")
+            ctx.members[name].msl_name = "(*{pname})"
         }
     }
+
+    var body_lines : array<string>
+    emit_stmt(ctx, fn.body, "    ", body_lines)
 
     var params : array<string>
     params |> reserve((ctx.members |> length) + (ctx.builtins_used |> length))
@@ -1306,6 +1485,10 @@ def public generate_msl(fn : FunctionPtr; var errors : array<string>; cfg : MslE
         let bi = builtin_msl_info(name)
         note(ctx, "param.builtin.{bi.attr}")
         params |> push("{bi.mslType} {name} [[{bi.attr}]]")
+    }
+    if (!empty(wg_names)) {
+        note(ctx, "param.shmem")
+        params |> push("threadgroup char * shmem [[threadgroup(0)]]")
     }
 
     if (!empty(ctx.errors)) {

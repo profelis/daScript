@@ -1,75 +1,81 @@
 options gen2
 options indenting = 4
 
-// Real-GPU behavioral gate for Phase-5 simdgroup_matrix, tiled-GEMM layer — the offload kernel's
-// shape: each threadgroup (32 threads = one simdgroup) owns one 8x8 C tile, walks K in 8-steps
-// staging f16 A/B tiles into threadgroup memory, barriers, and runs the MIXED-precision mac (f32
-// accumulators, f16 operands). A barrier kernel cannot be sequentially replayed (Phase-3 rule),
-// so the oracle is the directly computed matmul over the widened halves; all values are small
-// integers (every product exact in half, every K=32 sum exact in float), so the compare is
-// BIT-EXACT.
+// Real-GPU behavioral gate for the Phase-7 rolled-GEMM constructs: simdgroup-matrix ARRAYS,
+// [unroll_full] loops (rolled-with-pragma MSL), and fixed-array staging locals. One threadgroup
+// (32 threads = one simdgroup) computes C(16x8) = A(16xK) x B(Kx8) with two f32 accumulator
+// tiles over f16 operands. Barrier kernel — the oracle is the directly computed matmul over
+// the widened halves; all values small integers, so the compare is BIT-EXACT.
 
 require dastest/testing_boost public
 require metal/msl_shader
 require _metal_common  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 
 let M = 16
-let N = 16
+let N = 8
 let K = 32
-let TPG = 32u           // one simdgroup per threadgroup, one C tile each
+let TPG = 32u           // one simdgroup, two C tiles
 
-class SgMatTiledGpu {
+class SgMatRolledGpu {
     @ssbo @binding = 0 xa : array<float16>  // A [M x K] row-major
     @ssbo @binding = 1 wb : array<float16>  // B [K x N] row-major
     @ssbo @binding = 2 yo : array<float>    // C [M x N]
     @uniform @binding = 3 kdim : uint
-    @uniform @binding = 4 ndim : uint
-    @workgroup ta : float16[64]
-    @workgroup tb : float16[64]
+    @workgroup ta : float16[128]            // A slab: 2 row-tiles of 8x8
+    @workgroup tb : float16[64]             // B slab: one 8x8 tile
 
-    [metal_kernel(name="sgmat_tiled_gpu_msl"), marker(no_coverage)]
-    def sgmat_tiled_gpu {
+    [metal_kernel(name="sgmat_rolled_gpu_msl"), marker(no_coverage)]
+    def sgmat_rolled_gpu {
         let lid = gl_LocalInvocationID.x
-        let ntiles = ndim / 8u
-        let tr = gl_WorkGroupID.x / ntiles
-        let tc = gl_WorkGroupID.x % ntiles
-        var acc : simdgroup_float8x8
+        var mc : simdgroup_float8x8[2]
+        var ma : simdgroup_half8x8[2]
+        var va : float16[4]
         var kk = 0u
         while (kk < kdim) {
-            let i0 = lid
-            let i1 = lid + 32u
-            ta[i0] = xa[(tr * 8u + (i0 / 8u)) * kdim + (kk + (i0 % 8u))]
-            ta[i1] = xa[(tr * 8u + (i1 / 8u)) * kdim + (kk + (i1 % 8u))]
-            tb[i0] = wb[(kk + (i0 / 8u)) * ndim + (tc * 8u + (i0 % 8u))]
-            tb[i1] = wb[(kk + (i1 / 8u)) * ndim + (tc * 8u + (i1 % 8u))]
+            // this thread's 4 A elements are contiguous in xa — read through a das device pointer
+            let flat0 = lid * 4u
+            let xcur = unsafe(addr(xa[((flat0 / 64u) * 8u + (flat0 % 64u) / 8u) * kdim + kk + (flat0 % 8u)]))
+            for [unroll_full] (i in range(4)) {
+                va[i] = unsafe(xcur[i])
+            }
+            for [unroll_full] (i in range(4)) {
+                ta[lid * 4u + uint(i)] = va[i]
+            }
+            tb[lid] = wb[(kk + lid / 8u) * 8u + (lid % 8u)]
+            tb[lid + 32u] = wb[(kk + (lid + 32u) / 8u) * 8u + ((lid + 32u) % 8u)]
             barrier()
-            var ma : simdgroup_half8x8
-            var mb : simdgroup_half8x8
-            simdgroup_load(ma, ta, 0u, 8u)
-            simdgroup_load(mb, tb, 0u, 8u)
-            simdgroup_multiply_accumulate(acc, ma, mb, acc)
+            var mbb : simdgroup_half8x8
+            simdgroup_load(mbb, tb, 0u, 8u)
+            var acur = unsafe(addr(ta[0]))
+            for [unroll_full] (i in range(2)) {
+                simdgroup_load(ma[i], acur, 0u, 8u)
+                simdgroup_multiply_accumulate(mc[i], ma[i], mbb, mc[i])
+                acur = unsafe(acur + 64)
+            }
             barrier()
             kk += 8u
         }
-        simdgroup_store(acc, yo, (tr * 8u) * ndim + (tc * 8u), ndim)
+        for [unroll_full] (i in range(2)) {
+            simdgroup_store(mc[i], yo, uint(i) * 64u, 8u)
+        }
     }
 }
 
 [test]
-def test_sgmat_tiled_gpu_vs_cpu(t : T?) {
-    t |> run("simdgroup_matrix tiled GEMM: GPU == direct CPU matmul, bit-exact") <| @(t : T?) {
+def test_sgmat_rolled_gpu_vs_cpu(t : T?) {
+    t |> run("rolled GEMM (matrix arrays + [unroll_full]): GPU == direct CPU matmul, bit-exact") <| @(t : T?) {
         var a : array<float16>
         var b : array<float16>
         a |> resize(M * K)
         b |> resize(K * N)
         for (r in range(M)) {
             for (k in range(K)) {
-                a[r * K + k] = float16(float((r + k * 3) % 7 - 3))
+                a[r * K + k] = float16(float((r * 2 + k) % 7 - 3))
             }
         }
         for (k in range(K)) {
             for (c in range(N)) {
-                b[k * N + c] = float16(float((k * 5 + c) % 9 - 4))
+                b[k * N + c] = float16(float((k + c * 5) % 9 - 4))
             }
         }
         var want : array<float>
@@ -91,7 +97,7 @@ def test_sgmat_tiled_gpu_vs_cpu(t : T?) {
                     return
                 }
                 var perr : string
-                var pso = pipeline_from_source(dev, sgmat_tiled_gpu_msl, sgmat_tiled_gpu_msl_entry, sgmat_tiled_gpu_msl_fastmath, perr)
+                var pso = pipeline_from_source(dev, sgmat_rolled_gpu_msl, sgmat_rolled_gpu_msl_entry, sgmat_rolled_gpu_msl_fastmath, perr)
                 t |> success(pso != null, "pipeline_from_source: {perr}")
                 if (pso == null) {
                     return
@@ -101,11 +107,9 @@ def test_sgmat_tiled_gpu_vs_cpu(t : T?) {
                 var bwb = buf_upload(dev, b)
                 var byo = buf_fill(dev, M * N, -1000.0)
                 var bk = buf_fill(dev, 1, uint(K))
-                var bn = buf_fill(dev, 1, uint(N))
-                var bufs <- [bxa, bwb, byo, bk, bn]
+                var bufs <- [bxa, bwb, byo, bk]
                 var rerr : string
-                // (M/8)*(N/8) = 4 threadgroups of one simdgroup each — 128 threads
-                let ran = run_compute_1d(queue, pso, bufs, uint((M / 8) * (N / 8)) * TPG, TPG, rerr, sgmat_tiled_gpu_msl_tgmem)
+                let ran = run_compute_1d(queue, pso, bufs, TPG, TPG, rerr, sgmat_rolled_gpu_msl_tgmem)
                 t |> success(ran, "run_compute_1d: {rerr}")
                 if (ran) {
                     gpu_bad = buf_mismatch_exact(byo, want)
@@ -118,7 +122,6 @@ def test_sgmat_tiled_gpu_vs_cpu(t : T?) {
                 metal_release(bwb)
                 metal_release(byo)
                 metal_release(bk)
-                metal_release(bn)
                 metal_release(pso)
                 metal_release(queue)
             }

@@ -144,22 +144,7 @@ class MetalQ8Gemm64 {
         let nBase = (gl_WorkGroupID.x % ntileN) * 64u
         let qm = (sg / 2u) * 32u            // this simdgroup's 32x32 quadrant of the C block
         let qn = (sg % 2u) * 32u
-        var c00 : simdgroup_float8x8
-        var c01 : simdgroup_float8x8
-        var c02 : simdgroup_float8x8
-        var c03 : simdgroup_float8x8
-        var c10 : simdgroup_float8x8
-        var c11 : simdgroup_float8x8
-        var c12 : simdgroup_float8x8
-        var c13 : simdgroup_float8x8
-        var c20 : simdgroup_float8x8
-        var c21 : simdgroup_float8x8
-        var c22 : simdgroup_float8x8
-        var c23 : simdgroup_float8x8
-        var c30 : simdgroup_float8x8
-        var c31 : simdgroup_float8x8
-        var c32 : simdgroup_float8x8
-        var c33 : simdgroup_float8x8
+        var mc : simdgroup_float8x8[16]     // 4x4 tile quadrant
         let kdim4 = kdim / 4u
         let ra = lid / 2u                   // one A run and one B run per thread
         let c0a = (lid % 2u) * 16u
@@ -195,63 +180,33 @@ class MetalQ8Gemm64 {
                 }
             }
             barrier()
-            var k8 = 0u
-            while (k8 < 32u) {
-                var a0 : simdgroup_half8x8
-                var a1 : simdgroup_half8x8
-                var a2 : simdgroup_half8x8
-                var a3 : simdgroup_half8x8
-                var b0 : simdgroup_half8x8
-                var b1 : simdgroup_half8x8
-                var b2 : simdgroup_half8x8
-                var b3 : simdgroup_half8x8
-                simdgroup_load(a0, ta, qm * 32u + k8, 32u)
-                simdgroup_load(a1, ta, (qm + 8u) * 32u + k8, 32u)
-                simdgroup_load(a2, ta, (qm + 16u) * 32u + k8, 32u)
-                simdgroup_load(a3, ta, (qm + 24u) * 32u + k8, 32u)
-                simdgroup_load(b0, tb, k8 * 64u + qn, 64u)
-                simdgroup_load(b1, tb, k8 * 64u + (qn + 8u), 64u)
-                simdgroup_load(b2, tb, k8 * 64u + (qn + 16u), 64u)
-                simdgroup_load(b3, tb, k8 * 64u + (qn + 24u), 64u)
-                simdgroup_multiply_accumulate(c00, a0, b0, c00)
-                simdgroup_multiply_accumulate(c01, a0, b1, c01)
-                simdgroup_multiply_accumulate(c02, a0, b2, c02)
-                simdgroup_multiply_accumulate(c03, a0, b3, c03)
-                simdgroup_multiply_accumulate(c10, a1, b0, c10)
-                simdgroup_multiply_accumulate(c11, a1, b1, c11)
-                simdgroup_multiply_accumulate(c12, a1, b2, c12)
-                simdgroup_multiply_accumulate(c13, a1, b3, c13)
-                simdgroup_multiply_accumulate(c20, a2, b0, c20)
-                simdgroup_multiply_accumulate(c21, a2, b1, c21)
-                simdgroup_multiply_accumulate(c22, a2, b2, c22)
-                simdgroup_multiply_accumulate(c23, a2, b3, c23)
-                simdgroup_multiply_accumulate(c30, a3, b0, c30)
-                simdgroup_multiply_accumulate(c31, a3, b1, c31)
-                simdgroup_multiply_accumulate(c32, a3, b2, c32)
-                simdgroup_multiply_accumulate(c33, a3, b3, c33)
-                k8 += 8u
+            // math ROLLED over matrix arrays + das-pointer tile bumps (hand-unrolled
+            // spelling measured max_threads 704 — an occupancy tier down)
+            var ma : simdgroup_half8x8[4]
+            var mb : simdgroup_half8x8[4]
+            var acur = unsafe(addr(ta[qm * 32u]))
+            var bcur = unsafe(addr(tb[qn]))
+            for [unroll_full] (_k8 in range(4)) {
+                for [unroll_full] (i in range(4)) {
+                    simdgroup_load(ma[i], acur, uint(i) * 256u, 32u)
+                }
+                for [unroll_full] (i in range(4)) {
+                    simdgroup_load(mb[i], bcur, uint(i) * 8u, 64u)
+                }
+                for [unroll_full] (i in range(16)) {
+                    simdgroup_multiply_accumulate(mc[i], ma[i / 4], mb[i % 4], mc[i])
+                }
+                acur = unsafe(acur + 8)
+                bcur = unsafe(bcur + 512)
             }
             barrier()
             kb++
         }
         let row0 = mBase + qm
         let col0 = nBase + qn
-        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
-        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
-        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
-        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
-        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
-        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
-        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
-        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
-        simdgroup_store(c20, y, (row0 + 16u) * ndim + col0, ndim)
-        simdgroup_store(c21, y, (row0 + 16u) * ndim + (col0 + 8u), ndim)
-        simdgroup_store(c22, y, (row0 + 16u) * ndim + (col0 + 16u), ndim)
-        simdgroup_store(c23, y, (row0 + 16u) * ndim + (col0 + 24u), ndim)
-        simdgroup_store(c30, y, (row0 + 24u) * ndim + col0, ndim)
-        simdgroup_store(c31, y, (row0 + 24u) * ndim + (col0 + 8u), ndim)
-        simdgroup_store(c32, y, (row0 + 24u) * ndim + (col0 + 16u), ndim)
-        simdgroup_store(c33, y, (row0 + 24u) * ndim + (col0 + 24u), ndim)
+        for [unroll_full] (i in range(16)) {
+            simdgroup_store(mc[i], y, (row0 + uint(i / 4) * 8u) * ndim + col0 + uint(i % 4) * 8u, ndim)
+        }
     }
 }
 
@@ -419,6 +374,8 @@ def metal_q8q8_batch(var yp : float?; wp : int8 const?; sp : float const?; xqp :
     let groups = uint(use64 ? (mp / 64l) * (d / 64l) : (mp / 32l) * (d / 32l))
     let ran = with_compute_encoder(g_queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, use64 ? g_pso64 : g_pso)
+        metal_set_threadgroup_memory_length(enc, use64 ? metal_q8_gemm64_msl_tgmem : metal_q8_gemm_msl_tgmem, 0)
+        metal_set_threadgroup_memory_length(enc, use64 ? metal_q8_gemm64_msl_tgmem : metal_q8_gemm_msl_tgmem, 0)
         metal_set_buffer(enc, wbuf, 0ul, 0)
         metal_set_buffer(enc, sbuf, 0ul, 1)
         metal_set_buffer(enc, xqbuf, 0ul, 2)
