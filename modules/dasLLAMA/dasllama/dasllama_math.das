@@ -526,7 +526,7 @@ def public get_team_rank_gate() : int { return g_team_rank_gate }
 var g_trace_tags = false
 def public set_trace_tags(on : bool) {
     g_trace_tags = on
-    if (on) {
+    if (on && is_job_que_available()) {   // registries live on the que; stay que-independent like trace_tag
         register_trace_categories()
     }
 }
@@ -547,7 +547,7 @@ def public trace_tag(t : int) {
 }
 def public trace_marker(name : string; arg : int) {
     // instant unit boundary ("token", "layer", "step") on the caller lane; same gate as trace_tag
-    if (g_trace_tags) {
+    if (g_trace_tags && is_job_que_available()) {
         profile_marker(name, arg)
     }
 }

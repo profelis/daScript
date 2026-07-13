@@ -319,7 +319,10 @@ namespace das {
                 const auto & e = L.ev[i];
                 if ( e.tag == uint32_t(TraceTag::Marker) ) {
                     // perfetto instant event; name = the registered marker kind. arg is
-                    // signed in the API (jobque_trace_marker) — emit %d so it round-trips
+                    // signed in the API (jobque_trace_marker) — emit %d so it round-trips.
+                    // scope "g" is deliberate: unit boundaries (frame/token) draw across ALL
+                    // lanes in Perfetto; tid still records the emitting (caller) lane for
+                    // viewers that read it directly
                     fprintf(f, ",\n{\"ph\":\"i\",\"s\":\"g\",\"pid\":0,\"tid\":%d,\"ts\":%.3f,\"name\":",
                         int(lane), double(e.t0 - tmin) / 1000.0);
                     fputsJsonString(f, e.stage < uint32_t(markerNames.size()) ? markerNames[e.stage].c_str() : "marker");
