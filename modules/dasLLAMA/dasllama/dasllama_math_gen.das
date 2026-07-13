@@ -149,6 +149,31 @@ def mx4q8_gemv_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : 
     }
 }
 
+//! The mx4 TILE companion (the mx4 batch family): 4 tokens x mr rows per call off the
+//! grp<mr>-interleaved nibble/exponent planes — mx4q8_gemv_gen's batch twin, stamped with the
+//! SAME perm (the generated tile dequants each weight block-group once and reuses it across
+//! the 4 activation rows; wn/we arrive pre-offset to the group like the Q8 tile's wg/sg).
+//! Reference body = 4 single-token laneq mx4 dots with the tile's per-block fold order; it
+//! ignores xbsp (the mx4 plane is never biased). Not `private`: called from inside the
+//! lifted parallel_for worker lambdas.
+[unused_argument(xbsp), hint(unsafe_range_check, noalias = wn, noalias = we, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def mx4q8_tile_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d, g, t0 : int64) : void {
+    let nb = n / 32l
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])
+        for (t in range64(4l)) {
+            let f = dot_mx4q8_laneq4(lutp, wn, we, xqp + (t0 + t) * n, xsp + (t0 + t) * nb, n)
+            let r = g * 4l
+            yp[(t0 + t) * d + r + 0l] = f.x
+            yp[(t0 + t) * d + r + 1l] = f.y
+            yp[(t0 + t) * d + r + 2l] = f.z
+            yp[(t0 + t) * d + r + 3l] = f.w
+        }
+    }
+}
+
 //! One row's dot off the grp<mr> K-quant planes, scalar — the kq stubs' reference body (runs
 //! only when the stamp declined; production loads never see it) and the tests' repack oracle.
 //! kqg/ksg = the row's GROUP plane bases; r = the row within the group. Block contributions
@@ -466,6 +491,7 @@ def q8q8_tile_s16_gen(var yp : float?; wg : int8 const?; sg : uint16 const?; xqp
  tune_companion(fn = "q8q8_tile_s16_gen", gen = "dasllama_gemm_gen::q8q8_tile_s16"),
  tune_companion(fn = "q8q8_gemv_s16_gen", gen = "dasllama_gemm_gen::q8q8_gemv_s16"),
  tune_companion(fn = "mx4q8_gemv_gen", gen = "dasllama_gemm_gen::mx4_gemv"),
+ tune_companion(fn = "mx4q8_tile_gen", gen = "dasllama_gemm_gen::mx4_tile"),
  tune_companion(fn = "q8q8_family_live", gen = "dasllama_gemm_gen::q8q8_witness"),
  tune(gen = "dasllama_gemm_gen::q8q8_tile",
       fallback = "dot_vpdpbusd_width512_mr16_kstep2_gkstep2_bias128;dot_vpdpbusd_width256_mr8_kstep2_gkstep2_bias128;dot_maddubs_width256_mr8_kstep2;kstep2"), unused_argument(xbsp),
@@ -1342,6 +1368,116 @@ def private mx4q8_groupn_gen(var yp : float?; wn : uint8 const?; we : uint8 cons
     }
 }
 
+// one (group range x token range) cell of the mx4 batch walk: TB token blocks outer, groups
+// inner, 4-token tile calls + per-token rows-core tails — the q8 batch cell's shape with ts
+// pinned 4 (the mx4 tile is the 4-token vector form on every stamp, like kq; the amx tokstep
+// never applies). The tile dequants each block-group once per 4 tokens straight off the planes.
+def private mx4q8_batch_cell_gen(var myp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d, nb, mr, TB : int64; ub, ue : int; tb0, tend : int64) {
+    unsafe {
+        var tb = tb0
+        while (tb < tend) {
+            let tbe = min(tb + TB, tend)
+            let tb4 = tb + ((tbe - tb) / 4l) * 4l
+            for (gi in range(ub, ue)) {
+                let g = int64(gi)
+                let wng = wn + g * mr * (n / 2l)
+                let weg = we + g * mr * nb
+                var tk = tb
+                while (tk < tb4) {
+                    mx4q8_tile_gen(myp, wng, weg, xqp, xsp, null, n, d, g, tk)
+                    tk += 4l
+                }
+                while (tk < tbe) {   // token tail (< 4): the rows core, one position
+                    mx4q8_gemv_gen(myp + tk * d, wn, we, xqp + tk * n, xsp + tk * nb, n, g * mr, (g + 1l) * mr)
+                    tk++
+                }
+            }
+            tb += TB
+        }
+    }
+}
+
+// mx4_batch slot: batched MXFP4·Q8 GEMM straight off the interleaved planes — group chunks
+// parallel, the cell walk above per chunk, row tails (d % mr) row-major per token via
+// dot_mx4q8. No expansion scratch: this retires expand_mx4_region_q8 in grouped MoE prefill
+// on gen boxes (the 3·d·n Q8 round-trip through DRAM was 87% of gpt-oss x64 prefill wall).
+def private mx4q8_batch_kernel_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; xqp : int8 const?; xsp : float const?; n, d, ntok : int64) {
+    let nb = n / 32l
+    let nrow = n / 2l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+    var myp = yp
+    let TB = effective_token_block(g_q8_token_block, n)
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(0, int(ng), matmul_chunks(int(ng * mr), get_q8_batch_chunks_per_job(), n * d * ntok)) $(ub, ue) {
+            mx4q8_batch_cell_gen(myp, wn, we, xqp, xsp, n, d, nb, mr, TB, ub, ue, 0l, ntok)
+        }
+        for (tk in range64(ntok)) {   // row tails (d % mr): row-major per token
+            for (i in range64(ng * mr, d)) {
+                myp[tk * d + i] = dot_mx4q8(lutp, wn + i * nrow, we + i * nb, xqp + tk * n, xsp + tk * nb, n)
+            }
+        }
+    }
+}
+
+// mx4_batch_groupn slot: the fused MoE prefill form (the llama.cpp mul_mat_id shape) — ONE
+// dispatch runs every touched expert's batched GEMM (triple offs (woff, row0, cnt); y token-
+// major over the gathered whole image) through the SAME batch cell walk, region-contiguous
+// group spans; the bias post-adds over the span by the worker that owns it (bit-identical to
+// add-at-store: same add, same chain point). Row tails (d % mr) row-major per (region, token).
+def private mx4q8_batch_groupn_gen(var yp : float?; wn : uint8 const?; we : uint8 const?; offs : int64 const?; nregions : int64; xqp : int8 const?; xsp : float const?; bp : float const?; boffs : int64 const?; n, d : int64) {
+    let nb = n / 32l
+    let nrow = n / 2l
+    let mr = int64(q8q8_layout_gen())
+    let ng = d / mr
+    var myp = yp
+    let TB = effective_token_block(g_q8_token_block, n)
+    var lut : int8[16]
+    mxfp4_fill_lut(lut)
+    unsafe {
+        let lutp = addr(lut[0])   // frame outlives the join, so workers read a live pointer
+        maybe_parallel_for(0, int(nregions * ng), matmul_chunks_gemv(int(nregions * ng * mr), get_q8_batch_chunks_per_job(), n * d * nregions)) $(gb, ge) {
+            unsafe {
+                var gg = int64(gb)
+                while (gg < int64(ge)) {
+                    let r = gg / ng
+                    let gLocal = gg % ng
+                    let gEnd = min(int64(ge) - r * ng, ng)
+                    let woff = offs[r * 3l]
+                    let row0 = offs[r * 3l + 1l]
+                    let cnt = offs[r * 3l + 2l]
+                    mx4q8_batch_cell_gen(myp, wn + woff / 2l, we + woff / 32l, xqp, xsp, n, d, nb, mr, TB, int(gLocal), int(gEnd), row0, row0 + cnt)
+                    if (bp != null) {
+                        for (tk in range64(row0, row0 + cnt)) {
+                            for (i in range64(gLocal * mr, gEnd * mr)) {
+                                myp[tk * d + i] += bp[boffs[r] + i]
+                            }
+                        }
+                    }
+                    gg = r * ng + gEnd
+                }
+            }
+        }
+        for (r in range64(nregions)) {   // row tails (d % mr): row-major per (region, token)
+            let woff = offs[r * 3l]
+            let row0 = offs[r * 3l + 1l]
+            let cnt = offs[r * 3l + 2l]
+            for (tk in range64(row0, row0 + cnt)) {
+                for (i in range64(ng * mr, d)) {
+                    var v = dot_mx4q8(lutp, wn + woff / 2l + i * nrow, we + woff / 32l + i * nb, xqp + tk * n, xsp + tk * nb, n)
+                    if (bp != null) {
+                        v += bp[boffs[r] + i]
+                    }
+                    myp[tk * d + i] = v
+                }
+            }
+        }
+    }
+}
+
 // mm_kq slot: the K-quant twin of q8q8_kernel_gen/mx4q8_kernel_gen — group chunks handed to
 // the stamped kq rows core for the format, row tail (d % mr) row-major via the portable dots
 // (tail rows stay disk-order in the repack)
@@ -1822,6 +1958,8 @@ def dasllama_math_gen_register() {
             batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_gen,
             repack = @@repack_q8q8_gen,
             mm_mx4 = @@mx4q8_kernel_gen, repack_mx4 = @@repack_mx4_gen,
+            mx4_batch = @@mx4q8_batch_kernel_gen, mx4_batch_groupn = @@mx4q8_batch_groupn_gen,
+            mx4_native_batch = true,
             groupn = @@q8q8_groupn_gen, groupn_mx4 = @@mx4q8_groupn_gen,
             mm_rows = @@q8q8_gemv_gen,
             mm_s16 = @@q8q8_kernel_s16_gen, batch_s16 = @@q8q8_batch_kernel_s16_gen,
@@ -1849,6 +1987,8 @@ def dasllama_math_gen_register() {
             batch = @@q8q8_batch_kernel_neon_laneq_gen, group3 = @@q8q8_group3_gen,
             repack = @@repack_q8q8_gen,
             mm_mx4 = @@mx4q8_kernel_gen, repack_mx4 = @@repack_mx4_gen,
+            mx4_batch = @@mx4q8_batch_kernel_gen, mx4_batch_groupn = @@mx4q8_batch_groupn_gen,
+            mx4_native_batch = true,
             groupn = @@q8q8_groupn_gen, groupn_mx4 = @@mx4q8_groupn_gen,
             mm_rows = @@q8q8_gemv_gen,
             mm_s16 = @@q8q8_kernel_s16_gen, batch_s16 = @@q8q8_batch_kernel_s16_gen,

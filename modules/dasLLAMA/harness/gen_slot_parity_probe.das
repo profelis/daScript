@@ -164,6 +164,10 @@ def main {
         var mboffs <- [0l, d2]
         var bias <- rand_scales(d2 * 2l)
 
+        // batch-groupn triples (woff, row0, cnt): the two regions partition the 5-token image —
+        // region 0 gets a whole 4-token tile call, region 1 rides the token-tail rows core
+        var mtoffs <- [0l, 0l, 4l, d2 * n, 4l, 1l]
+
         pin_kernel_backend("portable")
         var mref : array<float>
         mref |> resize(int(d0))
@@ -171,6 +175,12 @@ def main {
         var mgref : array<float>
         mgref |> resize(int(d2 * 2l))
         matmul_mx4q8_groupn(mgref, gxq, gxs, moffs, 2l, xq, xs, bias, mboffs, n, d2)
+        var mbref : array<float>
+        mbref |> resize(int(ntok * d0))
+        matmul_mx4q8_batch(mbref, mxq, mxs, xq, xs, n, d0, ntok)
+        var mgbref : array<float>
+        mgbref |> resize(int(ntok * d2))
+        matmul_mx4q8_batch_groupn(mgbref, gxq, gxs, mtoffs, 2l, xq, xs, bias, mboffs, n, d2)
 
         pin_kernel_backend(genbe)
         repack_mx4_weight(mxq, mxs, 0l, n, d0)
@@ -184,17 +194,30 @@ def main {
         mgy |> resize(int(d2 * 2l))
         matmul_mx4q8_groupn(mgy, gxq, gxs, moffs, 2l, xq, xs, bias, mboffs, n, d2)
         compare("groupn_mx4 2x d={d2} (+bias, row tail)", mgy, mgref, fails)
+        var mby : array<float>
+        mby |> resize(int(ntok * d0))
+        matmul_mx4q8_batch(mby, mxq, mxs, xq, xs, n, d0, ntok)   // mx4_batch slot: tile + token tail
+        compare("mx4_batch d={d0} ntok={ntok}", mby, mbref, fails)
+        var mgby : array<float>
+        mgby |> resize(int(ntok * d2))
+        matmul_mx4q8_batch_groupn(mgby, gxq, gxs, mtoffs, 2l, xq, xs, bias, mboffs, n, d2)
+        compare("mx4_batch_groupn 2x d={d2} (+bias, row tail)", mgby, mgbref, fails)
         delete mxq
         delete mxs
         delete gxq
         delete gxs
         delete moffs
         delete mboffs
+        delete mtoffs
         delete bias
         delete mref
         delete mgref
+        delete mbref
+        delete mgbref
         delete my
         delete mgy
+        delete mby
+        delete mgby
 
         delete wq
         delete ws

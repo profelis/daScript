@@ -43,7 +43,7 @@ require dasllama/dasllama_gemm_schema
 // perm_declines), so repacks and kernels fall back to the grp4 reference family together.
 // Runs in the llvm-jit context; wired via llvm_user_modules.das. The stubs it generates for
 // are dasllama/dasllama_math_gen.das::q8q8_tile_gen, ::q8q8_layout_gen, ::q8q8_wbias_gen,
-// ::q8q8_kgroup_gen, ::q8q8_tokstep_gen, ::q8q8_gemv_gen, ::mx4q8_gemv_gen,
+// ::q8q8_kgroup_gen, ::q8q8_tokstep_gen, ::q8q8_gemv_gen, ::mx4q8_gemv_gen, ::mx4q8_tile_gen,
 // ::q8q8_family_live (the witness), the wscale_f16 twins ::q8q8_tile_s16_gen /
 // ::q8q8_gemv_s16_gen (same perm, same fold order — only the scale-fold load widens f16), and
 // the K-quant rows cores ::k4q8_gemv_gen / ::k5q8_gemv_gen / ::k6q8_gemv_gen (unsigned-quant
@@ -2186,6 +2186,53 @@ def private mx4_gemv_gen(var gc : LlvmCodeCtx) : bool {
     return true
 }
 
+// The mx4 TILE quarter (the mx4 batch family): tile_gen's 4-token walk over the group-base
+// nibble/exponent planes — emit_block_mx4 dequants each weight block-group ONCE (LUT +
+// in-register e8m0 fold) and reuses it across the 4 activation rows. amx winner perms ride
+// the busd lattice (companion_perm), like every non-TMUL companion.
+def private mx4_tile_gen(var gc : LlvmCodeCtx) : bool {
+    if (!is_tile_signature(gc.fn)) return false
+    let p0 = parse_perm(gc)
+    if (perm_declines(gc, p0)) return false
+    let p = companion_perm(p0)
+
+    var te = TileEmit(mx4 = true)
+    if (!setup_tile_emit(te, gc, p, true)) return false
+
+    let b = gc.jit.builder
+    var entry = LLVMAppendBasicBlockInContext(gc.jit.ctx, gc.impl, "entry")
+
+    // entry: per-token activation/scale bases; wn/we arrive pre-offset to the group
+    LLVMPositionBuilderAtEnd(b, entry)
+    var sa = SliceArgs(gc_impl = gc.impl, ctx = gc.jit.ctx, kstep = p.kstep)
+    sa.yp = LLVMGetParam(gc.impl, 0u)
+    te.wg = LLVMGetParam(gc.impl, 1u)
+    te.sg = LLVMGetParam(gc.impl, 2u)
+    let xqp = LLVMGetParam(gc.impl, 3u)
+    let xsp = LLVMGetParam(gc.impl, 4u)
+    let n = LLVMGetParam(gc.impl, 6u)
+    sa.d = LLVMGetParam(gc.impl, 7u)
+    sa.g = LLVMGetParam(gc.impl, 8u)
+    sa.t0 = LLVMGetParam(gc.impl, 9u)
+    sa.nb = LLVMBuildSDiv(b, n, te.types->ConstI64(32ul), "nb")
+    for (tk in range(4)) {
+        var tRow = LLVMBuildAdd(b, sa.t0, te.types->ConstI64(uint64(tk)), "")
+        te.x[tk] = LLVMBuildGEP2(b, te.types.t_int8, xqp, LLVMBuildMul(b, tRow, n, ""), "x{tk}")
+        te.xs[tk] = LLVMBuildGEP2(b, te.types.t_float, xsp, LLVMBuildMul(b, tRow, sa.nb, ""), "xs{tk}")
+    }
+
+    // one k-loop slice per nrsplit tokens — the Q8 tile's walk over the mx4 block form
+    var pred = entry
+    var tokBase = 0
+    while (tokBase < 4) {
+        pred = emit_slice(te, sa, pred, tokBase, p.nrsplit, tokBase == 0 ? "" : "_{tokBase}")
+        tokBase += p.nrsplit
+    }
+    LLVMPositionBuilderAtEnd(b, pred)
+    LLVMBuildRetVoid(b)
+    return true
+}
+
 def private is_kq_gemv_signature(fn : Function const?) : bool {
     if (length(fn.arguments) != 9 || fn.result.baseType != Type.tVoid) return false
     for (i in range(6)) {
@@ -2344,6 +2391,7 @@ def public register_dasllama_gemm_generators {
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_tile_s16", @@tile_s16_gen)
     register_llvm_code_generator("dasllama_gemm_gen::q8q8_gemv_s16", @@gemv_s16_gen)
     register_llvm_code_generator("dasllama_gemm_gen::mx4_gemv", @@mx4_gemv_gen)
+    register_llvm_code_generator("dasllama_gemm_gen::mx4_tile", @@mx4_tile_gen)
     register_llvm_code_generator("dasllama_gemm_gen::k4_gemv", @@k4_gemv_gen)
     register_llvm_code_generator("dasllama_gemm_gen::k5_gemv", @@k5_gemv_gen)
     register_llvm_code_generator("dasllama_gemm_gen::k6_gemv", @@k6_gemv_gen)

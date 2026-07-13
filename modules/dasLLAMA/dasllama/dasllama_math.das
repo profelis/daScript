@@ -1346,9 +1346,11 @@ struct KernelBackend {
     repack : RepackQ8Q8Fn
     mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
     // The mx4 BATCH kernels are optional (unlike mm_mx4): they are only dispatched when
-    // mx4_native_batch is set, so backends without them (arm64 — the laneq plane interleave makes a
-    // generic row-major fallback read garbage, not just run slow) keep the panic stubs and the
-    // expansion path instead. A backend that sets the flag must supply BOTH forms.
+    // mx4_native_batch is set, so backends without them keep the panic stubs (a generic row-major
+    // fallback over an interleaved plane would read garbage, not just run slow) and the expansion
+    // path instead. A backend that sets the flag must supply BOTH forms. The gen backends stamp
+    // them on both ISAs (the mx4 tile companion); portable carries row-major reference forms
+    // unflagged (probe/A-B only).
     mx4_batch : MatmulMx4Q8BatchFn = @@mx4q8_unset_batch
     mx4_batch_groupn : MatmulMx4Q8BatchGroupNFn = @@mx4q8_unset_batch_groupn
     repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
@@ -1779,6 +1781,14 @@ def kq_rows_fn(fmt : int) : MatmulKqRowsFn {
 //! batched dispatch gates on it and falls back to serial per-position GEMVs when down.
 def kernel_backend_has_kq_batch() : bool {
     return g_active_has_kq_batch
+}
+
+//! A/B override for the grouped-MoE-prefill mx4 route: native mx4 batch GEMMs (the backend's
+//! mx4_native_batch default) vs the expand-to-Q8 + Q8 batch path. Safe to flip after load —
+//! both routes read the same repacked planes. Forcing `true` on a backend without the mx4
+//! batch slots hits their panic stubs; benchmark knob only.
+def set_mx4_native_batch(on : bool) {
+    g_active_mx4_native_batch = on
 }
 
 //! Does the active backend carry the region-list kq GEMV (kq_groupn — MoE expert dispatch)?
