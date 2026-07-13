@@ -27,6 +27,7 @@ require daslib/apply
 require daslib/algorithm
 require daslib/ansi_colors
 require daslib/jobque_boost
+require daslib/jobque_profile
 require daslib/apply_in_context
 require daslib/contracts
 require daslib/defer
@@ -139,6 +140,7 @@ require strudel/strudel_sf2_voice
 require strudel/strudel_pattern
 require spirv/spirv_reflect
 require dasllama/dasllama
+require llvm/daslib/llvm_tune   // [tune_policy]: doc generation never runs kernels — no auto-tune
 
 def document_module_math(_root : string) {
     var mod = get_module("math")
@@ -584,8 +586,8 @@ def document_module_jobque(_root : string) {
     var groups <- array<DocGroup>(
         group_by_regex("Channel, JobStatus, Lockbox, Stream", mod, %regex~(append|notify|join|channel_create|channel_remove|stream_create|stream_remove|add_ref|release|notify_and_release|lock_box_create|lock_box_remove|job_status_create|job_status_remove)$%%),
         group_by_regex("Queries", mod, %regex~(get_total_hw_jobs|get_total_hw_threads|get_total_hw_cores|is_job_que_shutting_down|is_job_que_available|count_jobque_leaks)$%%),
-        group_by_regex("Event tracing", mod, %regex~(jobque_trace_start|jobque_trace_stop|jobque_trace_save|jobque_trace_tag)$%%),
-        group_by_regex("Internal invocations", mod, %regex~(new_job_invoke|new_thread_invoke|new_debugger_thread|set_jobque_fork_pool|set_jobque_fork_skip_heap_reset|set_jobque_worker_spin|set_jobque_batch_dispatch|set_jobque_join_spin|set_jobque_team_mode|get_jobque_team_mode|set_jobque_threads_cap|set_jobque_worker_limit|get_jobque_worker_limit|set_jobque_team_rank_gate|get_jobque_team_rank_gate|set_jobque_team_prof|reset_jobque_team_prof|get_jobque_team_prof|get_jobque_team_prof_counts|get_jobque_team_prof_react|team_parallel_for_invoke|team_parallel_for_indexed_invoke|team_parallel_stages_invoke|flush_jobque_batch|jobque_try_run_one)$%%),
+        group_by_regex("Event tracing", mod, %regex~(jobque_trace_start|jobque_trace_stop|jobque_trace_save|jobque_trace_tag|jobque_trace_category|jobque_trace_marker_name|jobque_trace_marker)$%%),
+        group_by_regex("Internal invocations", mod, %regex~(new_job_invoke|new_thread_invoke|new_debugger_thread|set_jobque_fork_pool|set_jobque_fork_skip_heap_reset|set_jobque_worker_spin|set_jobque_batch_dispatch|set_jobque_join_spin|set_jobque_team_mode|get_jobque_team_mode|set_jobque_threads_cap|set_jobque_affinity|get_jobque_affinity|set_jobque_worker_limit|get_jobque_worker_limit|set_jobque_team_rank_gate|get_jobque_team_rank_gate|set_jobque_team_prof|reset_jobque_team_prof|get_jobque_team_prof|get_jobque_team_prof_counts|get_jobque_team_prof_react|team_parallel_for_invoke|team_parallel_for_indexed_invoke|team_parallel_stages_invoke|flush_jobque_batch|jobque_try_run_one)$%%),
         group_by_regex("Construction", mod, %regex~(with_channel|with_stream|with_job_status|with_job_que|with_lock_box|create_job_que|destroy_job_que)$%%),
         group_by_regex("Atomic", mod, %regex~(atomic32_create|atomic32_remove|with_atomic32|atomic64_create|atomic64_remove|with_atomic64|get|set|inc|dec)$%%)
     )
@@ -605,6 +607,16 @@ def document_module_jobque_boost(_root : string) {
         group_by_regex("Internal capture details", mod, %regex~(capture_jobque_channel|capture_jobque_job_status|release_capture_jobque_channel|release_capture_jobque_job_status|capture_jobque_lock_box|release_capture_jobque_lock_box|capture_jobque_stream|release_capture_jobque_stream)$%%)
     )
     document("Boost package for jobs and threads", mod, "jobque_boost.rst", groups)
+}
+
+def document_module_jobque_profile(_root : string) {
+    var mod = find_module("jobque_profile")
+    var groups <- array<DocGroup>(
+        group_by_regex("Trace sessions", mod, %regex~(profile_start|profile_stop|profile_save)$%%),
+        group_by_regex("Categories", mod, %regex~(profile_category|profile_tag)$%%),
+        group_by_regex("Markers", mod, %regex~(profile_marker|profile_marker_id)$%%)
+    )
+    document("Self-describing jobque profiling", mod, "jobque_profile.rst", groups)
 }
 
 def document_module_apply_in_context(_root : string) {
@@ -1758,7 +1770,9 @@ def document_module_gltf(_root : string) {
     documents("glTF 2.0 loader (dasGLTF): GLB/.gltf parse, accessor decode, node hierarchy, skinning and keyframe animation into a backend-neutral scene", mod, "gltf.rst", groups)
 }
 
-[export]
+// fallback: das2rst compiles dasllama to document it but never RUNS its kernels — an
+// untuned box must not trigger the minutes-long auto-tune here
+[export, tune_policy(missing = "fallback")]
 def main {
     disable_profiler(this_context())
     disable_profiler_log(this_context())
@@ -1860,6 +1874,7 @@ def main {
     document_module_interfaces(root)
     document_module_is_local(root)
     document_module_jobque_boost(root)
+    document_module_jobque_profile(root)
     document_module_json_boost(root)
     document_module_json(root)
     document_module_jsonrpc(root)

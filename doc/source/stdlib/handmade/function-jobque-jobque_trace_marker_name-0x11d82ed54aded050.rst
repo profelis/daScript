@@ -1,0 +1,1 @@
+Registers a marker kind (a "unit" name such as "token", "frame", "layer") and returns its id for ``jobque_trace_marker``. Idempotent — re-registering the same name returns the existing id. Saved traces list all marker kinds in the ``jobqueProfile`` header.

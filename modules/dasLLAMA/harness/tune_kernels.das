@@ -19,6 +19,7 @@ require dasllama/dasllama_math_aarch64_neon   // laneq4x4 template (the repack b
 require dasllama/dasllama_quant  // quantize templates + the Q4/Q8 reference quantizers
 require dasllama/dasllama_common // the runtime-knob getters (the profile's "runtime" section snapshots them)
 require dasllama/dasllama_tune   // [dasllama_grid] emitter
+require llvm/daslib/llvm_tune    // tune_sidecar_merge — the app-sidecar upsert writer
 require llvm/daslib/aarch64_neon // nolint:STYLE030 — sdot4_laneq (referenced by the cloned laneq template bodies)
 require llvm/daslib/f16_cvt      // f16 references + the cloned f16-kernel template bodies
 require math                     // mad (referenced by the cloned template bodies)
@@ -1722,7 +1723,9 @@ def bench_laneq4x4() : string {
     return report("dot_q8q8_laneq4x4", names, best, ok, "u2")
 }
 
-[export]
+// fallback: the tuner rail drives this half explicitly (DAS_TUNE_MODE=tune) — the auto
+// policy must not fire a nested tuner off this program's own missing per-app sidecar
+[export, tune_policy(missing = "fallback")]
 def main {
     create_job_que()   // the benches are single-thread, but the runtime snapshot reads get_total_hw_jobs()
     print("kernel tuner: N={N}, {ROUNDS} rounds x {REPS} reps, interleaved best-of\n\n")
@@ -1820,7 +1823,7 @@ def main {
     // them) so the written profile is complete and hand-editable: load_model applies it via
     // apply_box_profile_runtime. TB/L2-budget refinement stays manual (tune_tb.das shows the raw
     // cliff; edit the file under the knee); "threads" is advisory — set DAS_JOBQUE_THREADS to change it.
-    let runtime = JV((q8_token_block = get_q8_token_block(), q8_l2_budget = get_q8_l2_budget(),
+    var runtime = JV((q8_token_block = get_q8_token_block(), q8_l2_budget = get_q8_l2_budget(),
         matmul_min_chunk_rows = get_matmul_min_chunk_rows(),
         matmul_min_chunk_rows_gemv = get_matmul_min_chunk_rows_gemv(),
         target_chunk_work = get_target_chunk_work(), gemv_lane_cap = get_gemv_lane_cap(),
@@ -1834,21 +1837,33 @@ def main {
         q4_chunks_per_job = get_q4_chunks_per_job(), q8_batch_chunks_per_job = get_q8_batch_chunks_per_job(),
         jobque_spin_us = get_jobque_spin_us(), jobque_join_poll = get_jobque_join_poll(),
         threads = get_total_hw_jobs()))
-    let profile = JV((dot = dotw, axpy = axpyw, dot_f16 = dotf16w, axpy_f16 = axpyf16w,
-        cvt_f32_to_f16 = cvt16w, cvt_f16_to_f32 = cvt32w, add_inplace = addw,
-        mul_inplace = mulw, scale_inplace = scalew, copy_floats = copyw,
-        softmax = softmaxw, softmax_sink = softmaxw, rmsnorm = rmsw,
-        dot_q4 = dq4w, dot_q8q8 = dq8w,
-        dot_q8kv = dq8kvw, dot_q8q8kv = dq8q8kvw, axpy_q8kv = axq8kvw,
-        cvt_q8kv_to_f32 = cvtq8kvw, quantize_q8kv_row = quantq8kvw,
-        dot_mx4q8 = dmx4w, quantize_q8_0_into_ptr = quantw, quantize_q8_0_bs_into_ptr = quantbsw,
-        rope_scaled_neox_tab = ropew, gemm_f32_uk_4x16 = gemmw, dot_q8q8_laneq4x4 = laneqw,
-        runtime = runtime))
-    let js = write_json(profile)
-    let ppath = box_profile_path()   // same resolution [tuned] reads from: env override, else <das_root>
-    if (fwrite(ppath, js)) {
-        print("wrote {ppath}: {js}\n")
-    } else {
-        print("FAILED to write {ppath} — if das_root is read-only (installed SDK), set DASLLAMA_BOX_PROFILE to a writable path\n")
+    var winners <- {
+        "dot" => dotw, "axpy" => axpyw, "dot_f16" => dotf16w, "axpy_f16" => axpyf16w,
+        "cvt_f32_to_f16" => cvt16w, "cvt_f16_to_f32" => cvt32w, "add_inplace" => addw,
+        "mul_inplace" => mulw, "scale_inplace" => scalew, "copy_floats" => copyw,
+        "softmax" => softmaxw, "softmax_sink" => softmaxw, "rmsnorm" => rmsw,
+        "dot_q4" => dq4w, "dot_q8q8" => dq8w,
+        "dot_q8kv" => dq8kvw, "dot_q8q8kv" => dq8q8kvw, "axpy_q8kv" => axq8kvw,
+        "cvt_q8kv_to_f32" => cvtq8kvw, "quantize_q8kv_row" => quantq8kvw,
+        "dot_mx4q8" => dmx4w, "quantize_q8_0_into_ptr" => quantw, "quantize_q8_0_bs_into_ptr" => quantbsw,
+        "rope_scaled_neox_tab" => ropew, "gemm_f32_uk_4x16" => gemmw, "dot_q8q8_laneq4x4" => laneqw,
+        // recorded-not-measured: [tuned] kernels this harness doesn't sweep yet keep their
+        // SHIPPED fallback as an explicit entry — the scope completeness check demands every
+        // non-pinned [tuned] kernel, and a missing key would re-tune on every start. Adding a
+        // sweep for one of these replaces its literal with the measured winner.
+        "dot_bf16" => "vec8_u2", "add_scale_inplace" => "vec8_u2",
+        "axpy_tq4kv" => "vec8_u2", "cvt_tq4kv_to_f32" => "vec8_u2",
+        "dot_q8tq4kv" => "vec16", "quantize_tq4kv_row" => "plain",
+        "dot_q8q8_f16s" => "vec16"
     }
+    // upsert into the app sidecar (same resolution [tuned] reads from): the loop-hint winners
+    // join the "kernels" section next to the [tune] generator perms, "runtime" is replaced —
+    // this tuner owns it — and everything else (other scopes' keys) survives
+    let ppath = box_profile_path()
+    if (tune_sidecar_merge(winners, runtime)) {
+        print("wrote {ppath}: {fread(ppath)}\n")
+    } else {
+        print("FAILED to write {ppath} — if the app dir is read-only, set DAS_TUNE_MANIFEST to a writable path\n")
+    }
+    delete winners
 }

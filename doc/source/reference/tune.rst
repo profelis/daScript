@@ -1,28 +1,36 @@
 .. _tune:
 
 ==========================================================================
-Kernel tuning — ``[tune]`` and the per-box tune manifest
+Kernel tuning — ``[tune]`` and the per-app tune sidecar
 ==========================================================================
 
 ``llvm/daslib/llvm_tune`` turns **one reference function into a tuned kernel
-family**: a grid of code-generation permutations, a per-box record of which
+family**: a grid of code-generation permutations, a per-app record of which
 one wins, and a small policy rail that keeps an application honest about
 whether it is running tuned code. It sits on top of ``[llvm_code]`` (the
 JIT-time external code generator), so the family only *generates* under the
 LLVM JIT; on every other tier the reference body runs verbatim.
 
 The design goal is that a shipped application reaches *its own box's* floor
-with **defaults that are data** — a small JSON manifest — rather than a fork
+with **defaults that are data** — a small JSON sidecar — rather than a fork
 of the kernels per machine. The winners are compile-time stamps: the front
-end reads the manifest and stamps the winning permutation onto the function
+end reads the sidecar and stamps the winning permutation onto the function
 before codegen.
+
+The sidecar is **per-app**: ``<app>.tune.json`` beside the app — the root
+script this process runs (the first ``.das`` on the command line), or the
+binary itself when there is none (standalone exe, embedded host).
+``DAS_TUNE_MANIFEST`` overrides the location outright. A sidecar **older than
+the running binary is stale** and reads as absent everywhere — a rebuilt
+binary invalidates every measured winner, so copied-around stale files can
+never resurrect dead measurements.
 
 .. note::
 
-   This is the ``[tune]`` framework (the ``[llvm_code]`` generator grid). It is
-   distinct from any application's own loop-hint profile (e.g. dasLLAMA's
-   ``box_profile.json``, read by its ``[tuned]`` macro). Both are per-box, but
-   they tune different things and use different files.
+   This is the ``[tune]`` framework (the ``[llvm_code]`` generator grid). An
+   application's own loop-hint profile (e.g. dasLLAMA's ``[tuned]`` macro)
+   tunes a different thing, but shares the same sidecar file — perm winners
+   under ``"kernels"``, library runtime knobs under ``"runtime"``.
 
 Overview
 ========
@@ -33,7 +41,7 @@ Overview
     require llvm/daslib/llvm_tune
 
     // one reference function, a grid of [llvm_code] generator permutations,
-    // and a per-ISA fallback for a box with no manifest yet.
+    // and a per-ISA fallback for an app with no sidecar yet.
     [tune_perm(kstep = 1), tune_perm(kstep = 2), tune_perm(kstep = 4),
      tune(gen = "mylib::gemm_gen", fallback = "kstep2")]
     def gemm(a, b, c : float?; n : int) : void {
@@ -43,12 +51,13 @@ Overview
 
 At compile time exactly one winner is stamped onto ``gemm``:
 
-* the manifest entry for ``gemm`` when one exists (this box has been tuned),
+* the sidecar entry for ``gemm`` when one exists (this app has been tuned on
+  this box, and the sidecar is not stale),
 * else the ``fallback=`` permutation (a generic per-ISA default),
 * else the reference body.
 
 A harness discovers the winner by benching the whole grid, then records it in
-the manifest. The next compile picks it up. Nothing about ``gemm``'s callers
+the sidecar. The next compile picks it up. Nothing about ``gemm``'s callers
 changes — the annotated function *is* the real symbol.
 
 The annotations
@@ -102,13 +111,13 @@ The ``DAS_TUNE_MODE`` environment variable selects the compile-time behavior:
 
 .. note::
 
-   A manifest with **no entry** for a function falls through to its
-   ``fallback=`` — a manifest written before a kernel family landed must not
+   A sidecar with **no entry** for a function falls through to its
+   ``fallback=`` — a sidecar written before a kernel family landed must not
    silently drop that family to the reference tier. An explicit ``"reference"``
    entry forces the original body.
 
-Per-box sharing — ``[tune_scope]``
-==================================
+Tuner wiring — ``[tune_scope]``
+===============================
 
 A library that owns tuned kernels declares one scope:
 
@@ -117,27 +126,43 @@ A library that owns tuned kernels declares one scope:
     [tune_scope(name = "mylib", tuner = "../harness/tune_mylib.das")]
     struct private MyLibTuneScope {}
 
-Every application that requires the library shares the same per-box winners at
-``<das_root>/mylib.tune.json`` — **with no application-side declaration**.
 ``tuner=`` (resolved against the declaring file) names the harness that
-produces the manifest; the policy rail and ``--tune`` run it. Scope isolation
-is structural: each module reads only its own scope's manifest, so a foreign
-entry for a same-named kernel is simply never read.
+regenerates this library's winners; the policy rail and ``--tune`` run it with
+``DAS_TUNE_MANIFEST`` pointed at the app sidecar. ``covers=`` (optional,
+``;``-joined module names) extends the scope's *demand* beyond its declaring
+module: the completeness check requires a sidecar entry for every ``[tune]``
+function AND every non-``perm=``-pinned ``[tuned]`` loop-hint kernel across
+the declaring + covered modules (dasLLAMA covers its math/quant modules, so
+first-start auto-tune sweeps loop hints too). The demand is AST-derived; a
+tuner that misses a demanded kernel re-tunes every start, and the startup
+warning **names the missing kernels**. The winners themselves live in the ONE
+per-app file — every library's tuner **upserts its own keys** and preserves
+everyone else's (that upsert is the isolation contract; "is this scope tuned"
+is per-key completeness, not file existence). Reading winners needs no scope
+at all — every ``[tune]`` resolves against the app sidecar.
 
-Resolution order for a tuned function's manifest: the ``DAS_TUNE_MANIFEST``
-environment override, then the application's ``[tune_manifest]`` (see below),
-then the declaring library's ``[tune_scope]`` file.
+.. warning::
+
+   The default-``auto`` policy fires only for app roots that **see**
+   ``llvm_tune`` — a library owning scopes must re-export it
+   (``require llvm/daslib/llvm_tune public``), or its apps silently get no
+   default policy. Re-export ``llvm_tune`` alone, not your module's whole
+   public surface (a blanket ``public`` on a module that also re-exports
+   ``jobque_boost`` floods requirers with name ambiguities).
 
 Application policy — ``[tune_policy]`` and ``--tune``
 =====================================================
 
-An application declares what to do when a scope's per-box manifest is missing
-at compile time. The annotation goes on ``main`` (the ``auto`` / ``restart``
-flavors prepend a runtime guard to its body):
+**Untuned does not start.** Any application whose program root has a ``main``
+and whose libraries declare tune scopes gets the ``auto`` policy **by
+default** — no annotation needed: an incomplete or stale sidecar tunes at
+startup and re-execs, so one launch already serves tuned kernels. The
+``[tune_policy]`` annotation on ``main`` overrides the flavor (the ``auto`` /
+``restart`` flavors prepend a runtime guard to its body):
 
 .. code-block:: das
 
-    [export, tune_policy(missing = "auto")]
+    [export, tune_policy(missing = "error")]   // dev mode: fail the compile instead
     def main {
         // ...
     }
@@ -147,22 +172,27 @@ flavors prepend a runtime guard to its body):
    :widths: 12 88
 
    * - ``missing``
-     - behavior on a box whose manifest is absent
+     - behavior when a scope's sidecar entries are absent or stale
    * - ``fallback``
-     - stamp ``fallback=`` silently (the default everywhere, also with no annotation)
+     - stamp ``fallback=`` silently (also what ``DAS_TUNE_POLICY=fallback`` — the
+       CI kill switch — forces everywhere)
    * - ``warn``
      - loud compile-time banner with the exact tuner command
    * - ``error``
      - fail the compile with the same message — the dev mode
    * - ``auto``
-     - tune at startup (a guard runs each missing scope's tuner), then **re-exec**
-       the process; the fresh compile stamps the winners. One launch, then it runs.
+     - **the default, declared or not**: tune at startup (a guard runs each
+       incomplete scope's tuner), then **re-exec** the process; the fresh compile
+       stamps the winners. One launch, then it runs.
    * - ``restart``
      - like ``auto`` but no re-exec — tune at startup, then exit asking for a
        manual restart.
 
+Programs whose root has no ``main`` never get the default — dastest-driven
+test files run ``[test]`` functions, so the test suite never tunes-on-start.
+
 ``--tune`` after ``--`` on the application's command line forces the tune path
-even when the manifests exist (a re-tune; the flag is stripped from the
+even when the sidecar is complete (a re-tune; the flag is stripped from the
 re-exec so the child converges). ``DAS_TUNE_POLICY`` overrides the declared
 value — ``DAS_TUNE_POLICY=fallback`` is the CI kill switch.
 
@@ -188,42 +218,50 @@ A frozen artifact must not demand or run tuning:
   off: a stamp changes the function's semantic hash, so a stamped function
   would fail the AOT link. Under ``-jit`` the JIT supersedes AOT bodies and
   tuned stamps stay live.
-* **Standalone exe** (``llvm-jit -exe``) still *stamps* — an exe built on a box
-  with a manifest ships those winners (a local-use artifact by definition), and
-  one built without ships the generic ``fallback=`` stamps — but the policy
-  rail is dead (no ``[tune_policy]``, no ``--tune``).
+* **Standalone exe** (``llvm-jit -exe``) still *stamps* — an exe built beside a
+  sidecar ships those winners (a local-use artifact by definition), and one
+  built without ships the generic ``fallback=`` stamps — but the policy rail
+  is dead (no ``[tune_policy]``, no ``--tune``). The exe DOES get the status
+  ``[init]``, so the artifact self-reports its baked stamps
+  (``tune_status()`` / ``log_tune_status`` work inside a standalone exe). A
+  native exe carrying any ``[llvm_code]`` kernel also *targets the build box*
+  (CPU **and** feature gates, decided before the target-flag pass) so the
+  stamped generators actually emit instead of declining to their reference
+  bodies on the generic-CPU rail; a kernel-free exe stays
+  generic/redistributable.
 
-Per-app override — ``[tune_manifest]``
-======================================
+``daspkg release`` applies "untuned does not start" to artifacts at **build
+time**: the ``-exe`` build's release-deps JSON reports every scope with
+per-key completeness (``tune_scopes_status``); daspkg runs the tuners of
+incomplete scopes, rebuilds so the exe bakes the measured winners, and ships
+the sidecar beside the exe as ``<bundle>.tune.json`` (touched newer than the
+exe — the ``"runtime"`` knob section travels with the artifact, and the file
+documents the baked winners).
 
-An application can point at its own manifest instead of (or on top of) the
-library scope:
+Sidecar location and staleness
+==============================
 
-.. code-block:: das
+The sidecar is ``<app>.tune.json`` beside the app: ``utils/myapp/main.das``
+reads and writes ``utils/myapp/main.tune.json``; a standalone exe (or an
+embedded host with no ``.das`` on its command line) uses the binary's own stem.
+The app identity is the first ``.das`` argument before ``--`` on the process
+command line — macro time and runtime read the same argv, so compile-time
+stamps and the harness write API always agree on the file. No declaration is
+needed; ``DAS_TUNE_MANIFEST`` overrides the location, and
+``set_tune_manifest_runtime_path`` points just the get/set APIs elsewhere for
+self-managed harnesses.
 
-    [export, tune_manifest(name = "myapp")]
-    def main { /* ... */ }
-
-The manifest resolves to ``<dir>/<name>.tune.json`` (``dir=`` defaults to the
-declaring file's directory). Its entries win over the scope's; missing entries
-keep the scope winners. This is the isolation escape hatch — two applications
-sharing a folder pick distinct names.
-
-.. warning::
-
-   ``[tune_manifest]`` re-stamps the program's tuned functions after the fact.
-   This is proven only for functions in the **declaring (root) module**;
-   re-stamping a *required* library's already-compiled ``[tune]`` function is a
-   cross-module mutation the re-infer pass does not survive. Library kernels
-   should take their winners at ``[tune]`` time via ``[tune_scope]`` (or the
-   ``DAS_TUNE_MANIFEST`` env), which is what the policy rail's re-exec relies on.
+A sidecar whose mtime **predates the running binary's** is stale: it reads as
+absent (stamps fall back, the policy rail re-tunes), and the first
+``tune_manifest_set`` resets it to a fresh document. Measurements never
+outlive the binary that made them.
 
 Runtime status — ``tune_status()``
 ==================================
 
 ``tune_status()`` returns one row per ``[tune]`` function — its winning suffix,
 the source (``manifest`` / ``fallback`` / ``reference``), the scope, and the
-manifest path. It is populated when the application declares ``[tune_policy]``.
+sidecar path. It is populated when the application declares ``[tune_policy]``.
 ``log_tune_status("myapp")`` is the ready-made "am I tuned?" surface — it logs
 the table at ``LOG_INFO`` (``<n>/<total> kernels tuned for this box``, one line
 per function, plus a ``--tune`` hint when any kernel is on a non-manifest tier),
@@ -247,21 +285,27 @@ every candidate, best-of-N, confirm the winner), then records the winner:
     let ok = tune_manifest_set("gemm", winning_suffix)
 
 ``tune_manifest_set`` writes to the ``DAS_TUNE_MANIFEST`` the policy rail sets
-when it spawns the harness, so the winner lands in the right scope file. A
-following ``normal`` compile stamps it.
+when it spawns the harness, so the winner lands in the app's sidecar. It
+UPSERTS: other functions' entries and other sections survive. A following
+``normal`` compile stamps it.
 
-Manifest format
-===============
+Sidecar format
+==============
 
-A flat ``{ "function name": "perm suffix" }`` JSON map:
+A sectioned JSON object — perm winners under ``"kernels"``, library runtime
+knobs under ``"runtime"`` (owned by the library that reads them), and
+``"provenance"`` (who wrote it) refreshed on every write:
 
 .. code-block:: json
 
-    { "gemm": "kstep4", "gemm_gemv": "reference" }
+    {
+        "kernels" : { "gemm" : "kstep4", "gemm_gemv" : "reference" },
+        "provenance" : { "binary" : "...", "platform" : "windows", "arch" : "x86_64" }
+    }
 
-It is a per-box artifact — gitignored (``*.tune.json``), and any change re-keys
-the JIT DLL cache automatically (the winning permutation's args fold into the
-DLL basename).
+It is a per-app, per-box artifact — gitignored (``*.tune.json``), and any
+change re-keys the JIT DLL cache automatically (the winning permutation's args
+fold into the DLL basename).
 
 .. seealso::
 

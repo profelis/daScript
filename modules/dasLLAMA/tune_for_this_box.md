@@ -55,6 +55,7 @@ knobs, and the measurement discipline are still the manual, hands-on story — r
 | Batch backend (hybrid) | `select_batch_backend(name)` / profile `runtime.batch_backend` / env `DASLLAMA_PIN_BATCH_BACKEND` (benches) — overrides ONLY the batch-shaped slots (prefill GEMM + mx4 batch) from a layout-compatible donor, GEMV slots stay with `runtime.backend`. For boxes where decode and prefill prefer different backends (e.g. portable GEMV + a row-major donor's batch). Survives load-time re-select | runtime | the batch matmul wrappers |
 | Loop hints per kernel (`vectorize_width` × `unroll_count`) | `box_profile.json` flat keys, read at **compile time** by `[tuned]` | compile (JIT re-keys automatically) | all 16 `[tuned]` kernels: dot, axpy, add/mul/scale_inplace, copy_floats, softmax(+_sink), rmsnorm, dot_q4, dot_q8q8, dot_mx4q8, quantize_q8_0_into_ptr, rope_scaled_neox_tab, gemm_f32_uk_4x16, dot_q8q8_laneq4x4 |
 | Gen GEMM tile family (manifest) | `gen_tune_probe` (the `[tune_scope(name="dasllama")]` tuner — run by `dasllama-server`'s `policy=auto` / `--tune`, or by hand with `DAS_TUNE_MODE=tune`) benches the `[tune_perm]` grid and writes the winner to `<das_root>/dasllama.tune.json` — **guarded by the e2e confirm pass**: a winner that diverges from the per-ISA fallback must beat it in a real-model prefill A/B (`DASLLAMA_CONFIRM_MODEL=<q8 gguf>`, interleaved, challenger needs >×1.02, else the fallback stays pinned). The guard exists because the 1-core fixture regime CAN crown an e2e loser (SPR: amx won the tile bench, lost prefill ~2×; M1: a +3.3%-iso shape made only +2.0% e2e — rejected) | compile (stamp at `[tune]`) | `q8q8_tile_gen` + companions (the gen batch/gemv kernels) |
+| K-quant tile families (manifest, per format) | the same `gen_tune_probe` tune run benches each kq family's own grid (mr × nrsplit per ISA tier) and writes `k4q8_tile_gen` / `k5q8_tile_gen` / `k6q8_tile_gen` entries — tile-best wins (the kq gemv is nrsplit-independent; same-mr rows share its plane), no child confirm pass (the stamp only moves that format's plane interleave, decode stays DRAM-bound — e2e-validated when the split landed: M1 mr4 = pp +10/+26/+22% on Q4_K_M/Q5_K_M/Q6_K, tg flat, MoE pp −3%; kq v2 lifted k4 pp512 to 0.88–0.95× lcpp on a CLEAN box (das 151–163 vs lcpp 172 — the earlier 158-vs-158 'parity' was two load-depressed reads coinciding) and MoE to 1.34×; the k5/k6 v2 port took Q5/Q6 pp to 0.84×/0.80×; kq v3 (panel-scratch byte-expanded tiles, 2026-07-12 PM) then took Q5 pp to 150–168 (1.14–1.28× lcpp) and Q6 to 140–143 (1.01–1.03×), tg at v2 parity — the tile reads a byte panel unpacked per (group, token-block) while the DRAM planes stay packed (decode is model-level DRAM-bound: pure byte planes cost tg −30%). Iso (M1): tile k4 95 / k5 89 / k6 76 GMAC/s at the probe's ×16 amortization, gemv 64 / 27.5 / 34.5 unchanged) | compile (stamp at `[tune]`) | `k{4,5,6}q8_tile_gen` + their gemv/layout companions (each format's planes take their OWN mr) |
 | Token block `TB` | `set_q8_token_block(n)` (default 128) / profile `runtime.q8_token_block` | runtime | the repack-tier batch kernel only |
 | L2 budget (TB cliff guard) | `set_q8_l2_budget(bytes)` (default 4 MB — provisional, one M1 Max) / profile `runtime.q8_l2_budget` | runtime | `effective_token_block(tb, n) = clamp(tb, 1, budget/n)` (dasllama_math.das) |
 | Work-proportional dispatch | `set_target_chunk_work` (MACs per dispatch chunk, default 1 = dispatch everything the grain floors admit; lanes = clamp(work/target, 1, lanes); the pre-2026-07 default was 1M, which left every per-layer attn matmul of a ≤4B model single-lane) + `set_gemv_chunks_per_lane` (default 8 — fine-grain self-serve chunks per lane; 1 = the old equal split) + `set_gemv_lane_cap` / `set_batch_lane_cap` (per-regime lane ceilings, 0 = uncapped — the GEMV cap is the box's DRAM knee, measured by `harness/team_probe.das`) / profile `runtime.target_chunk_work` / `runtime.gemv_chunks_per_lane` / `runtime.gemv_lane_cap` / `runtime.batch_lane_cap` | runtime | every matmul dispatch (the `matmul_chunks*` shapers), the fused-chain gates, decode attention |
@@ -70,12 +71,15 @@ knobs, and the measurement discipline are still the manual, hands-on story — r
 Axes are ~independent (unroll ⊥ width ⊥ TB ⊥ threads) — sweep them separately
 (coordinate descent), never as a full cross-product.
 
-**One file carries all of it.** `box_profile.json` resolves as `DASLLAMA_BOX_PROFILE` env when
-set, else `<das_root>/box_profile.json` (per-install == per-box; `get_das_root()` — never the
-cwd). Flat keys = the compile-time kernel perms (`[tuned]` reads them, precedence
-`perm=` pin > profile > the kernel's `fallback=` > `vec8_u2`); the `"runtime"` object = the
-runtime knobs above, applied by `load_model` (logged per entry) or explicitly via
-`apply_box_profile_runtime(path)`. Direct `load_gguf` users opt in by calling the latter.
+**One file carries all of it — the PER-APP tune sidecar.** `box_profile_path()` now resolves
+to `<app>.tune.json` beside the app (the root script the process runs, else the binary;
+`DAS_TUNE_MANIFEST` env overrides) — shared with the `[tune]` generator winners. The
+`"kernels"` section = the compile-time kernel perms (`[tuned]` reads them, precedence
+`perm=` pin > sidecar > the kernel's `fallback=` > `vec8_u2`; the `[tune]` families' perms
+live in the same map); the `"runtime"` object = the runtime knobs above, applied by
+`load_model` (logged per entry) or explicitly via `apply_box_profile_runtime(path)`. Direct
+`load_gguf` users opt in by calling the latter. A sidecar OLDER than the running binary is
+stale — every reader treats it as absent, and the next tuner write resets it.
 
 ---
 
@@ -102,7 +106,7 @@ runtime knobs above, applied by `load_model` (logged per entry) or explicitly vi
 
 ---
 
-## Tool 1 — `harness/tune_kernels.das` (the box tuner → `box_profile.json`)
+## Tool 1 — `harness/tune_kernels.das` (the loop-hint tuner → the app sidecar)
 
 ```
 bin/daslang -jit modules/dasLLAMA/harness/tune_kernels.das
@@ -115,27 +119,31 @@ only, clean skip elsewhere — the laneq4x4 tile) across the 20-permutation grid
 (80 rounds × 2000 reps at N=4096), correctness gate per variant (f64 reference; EXACT
 quant/scale equality for the requant), reports each variant as %Δ vs that kernel's SHIPPED
 fallback perm (`vec8_u2` for most; dot_q8q8 ships `vec16`, dot_q4 `vec4_u4`, the tile k-loops
-`u2`, rmsnorm/requant `plain`), and writes the COMPLETE profile — flat kernel-perm keys plus a
-`"runtime"` section snapshotting the current runtime knobs (hand-editable afterwards;
+`u2`, rmsnorm/requant `plain`), and UPSERTS the winners into the app sidecar's `"kernels"`
+section plus a `"runtime"` section snapshotting the current runtime knobs (hand-editable
+afterwards; everything else in the sidecar — the `[tune]` generator winners — survives;
 `softmax_sink` mirrors `softmax`'s winner — same loop shape):
 
 ```json
-{"dot":"vec8_u2", "...":"...", "dot_q8q8":"vec16",
+{"kernels":{"dot":"vec8_u2", "...":"...", "dot_q8q8":"vec16"},
  "runtime":{"q8_token_block":128,"q8_l2_budget":4194304,"target_chunk_work":1000000,
             "attn_par_threshold":100000, "...":0, "q8_chunks_per_job":2,"threads":8}}
 ```
 
-**How the profile is consumed:** the flat keys are read at **compile time** by `[tuned]`
-(`dasllama_tune.das`), keyed by function name; precedence = explicit `perm=` pin > profile >
-the kernel's `fallback=` > `vec8_u2`. The `"runtime"` section is applied at **run time** by
-`load_model` (or `apply_box_profile_runtime(path)` for direct `load_gguf` users). Both sides
-resolve the same path: `DASLLAMA_BOX_PROFILE` env, else `<das_root>/box_profile.json` — and
-the tuner WRITES through that resolution too, failing loudly with env advice when das_root is
-read-only (installed SDK). Missing file or key = silent default, so an untuned box ships the
-hand-tuned M1 hints. The file is **gitignored** (per-box artifact) and any change **re-keys
-the JIT DLL cache automatically** (loop hints are folded into `jit_dll_basename` — no manual
-`.jitted_scripts` clearing). A consumer compile logs
-`dasllama_tune: dot <- vec16 (<resolved path>)` per applied flat entry, and `load_model` logs
+**How the sidecar is consumed:** the `"kernels"` entries are read at **compile time** by
+`[tuned]` (`dasllama_tune.das`), keyed by function name; precedence = explicit `perm=` pin >
+sidecar > the kernel's `fallback=` > `vec8_u2`. The `"runtime"` section is applied at
+**run time** by `load_model` (or `apply_box_profile_runtime(path)` for direct `load_gguf`
+users). Both sides resolve the same path — the app sidecar (`tune_manifest_path()`:
+`DAS_TUNE_MANIFEST` env, else `<app>.tune.json` beside the app) — and the tuner WRITES
+through that resolution too, failing loudly with env advice when the app dir is read-only.
+NOTE the per-app consequence: the tuner writes the sidecar of the app it RUNS AS
+(`tune_kernels.tune.json` beside the harness) — to tune another app, point
+`DAS_TUNE_MANIFEST` at that app's sidecar. Missing/stale file or key = silent default, so an
+untuned box ships the hand-tuned M1 hints. The file is **gitignored** (per-app, per-box
+artifact) and any change **re-keys the JIT DLL cache automatically** (loop hints are folded
+into `jit_dll_basename` — no manual `.jitted_scripts` clearing). A consumer compile logs
+`dasllama_tune: dot <- vec16 (<resolved path>)` per applied entry, and `load_model` logs
 `dasLLAMA: box profile runtime: <key> = <v>` per applied runtime entry — that's your proof it
 took.
 
@@ -221,6 +229,13 @@ other models. This is the kernel scoreboard; `prefill_perf.das` is the end-to-en
 - Fairness: end-to-end comparisons run ours with `options _jit_fast_math = true` (ggml
   hand-codes equivalent FP laxity; strict-IEEE-us vs fast-ggml understates us ~8-10%).
   Tests and oracle gates stay bit-exact — never put fast-math on a test.
+- **Steady-state, not best-of (M1/Apple Silicon; trace-diagnosed 2026-07-12):** a
+  first-run-after-idle prefill rides a ~3 s P-cluster boost window (+11% — one DVFS step,
+  uniform per-chunk, all lanes; NOT E-core placement, NOT jobque — lane traces show 98–99%
+  utilization in both modes). Back-to-back reps sit at the sustained clock at llama-bench
+  stability (±0.6%), and llama-bench numbers ARE steady-state. Report the MEDIAN of ≥3
+  back-to-back reps and discard the first-after-idle rep — best-of-N systematically picks
+  the boost outlier.
 
 ---
 

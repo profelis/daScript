@@ -1,0 +1,1 @@
+Sets the worker-thread affinity mode applied when a job queue is created: 0 off, 1 ideal-processor hint, 2 hard mask. Call before with_job_que/create_job_que; the DAS_JOBQUE_AFFINITY environment variable overrides this setting.

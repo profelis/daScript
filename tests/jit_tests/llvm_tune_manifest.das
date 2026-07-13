@@ -6,12 +6,12 @@ require daslib/strings_boost
 require daslib/fio
 require strings
 
-// [tune_manifest] round-trip, declaration-driven (no env): copy the client template into a
-// temp directory (the declaration resolves the manifest against the declaring file's dir),
-// spawn it once with "write" — the injected [init] points tune_manifest_set at
-// <tempdir>/llvm_tune_manifest_probe.tune.json and it records k2 — then spawn it again: the
-// fresh compile's [tune_manifest] apply re-stamps man_add from the manifest, so RESULT moves
-// from the fallback k1 tier (6) to the k2 tier (7).
+// Per-app sidecar round-trip, declaration-free: copy the client template into a temp
+// directory (the sidecar resolves beside the ROOT SCRIPT — <client>.tune.json), spawn it
+// once with "write" — tune_manifest_set targets that sidecar and records k2 — then spawn it
+// again: the fresh compile stamps man_add from the sidecar, so RESULT moves from the
+// fallback k1 tier (6) to the k2 tier (7). A third arm back-dates the sidecar older than
+// the daslang binary: STALE reads as absent, so the stamps drop back to fallback.
 
 def private spawn_client(cmd : string; var lines : array<string>) : int {
     // cmd.exe /c strips the first and last quote of a line that starts with a quote —
@@ -53,7 +53,8 @@ def test_llvm_tune_manifest_roundtrip(t : T?) {
     let tmplText = fread("{get_this_module_dir()}/llvm_tune_manifest_client.das")
     t |> success(!empty(tmplText))
     t |> success(fwrite(clientPath, tmplText))
-    let manifestPath = path_join(dir_name(clientPath), "llvm_tune_manifest_probe.tune.json")
+    // the per-app sidecar: <root-script-stem>.tune.json beside the spawned script
+    let sidecarPath = "{slice(clientPath, 0, length(clientPath) - 4)}.tune.json"
 
     var wlines : array<string>
     let rcw = spawn_client("\"{bin}\" -jit \"{clientPath}\" -- write", wlines)
@@ -63,7 +64,7 @@ def test_llvm_tune_manifest_roundtrip(t : T?) {
         wrote ||= ln |> starts_with("WRITE ok")
     }
     t |> success(wrote)
-    t |> success(!empty(fread(manifestPath)))
+    t |> success(!empty(fread(sidecarPath)))
 
     var rlines : array<string>
     let rcr = spawn_client("\"{bin}\" -jit \"{clientPath}\"", rlines)
@@ -80,14 +81,30 @@ def test_llvm_tune_manifest_roundtrip(t : T?) {
         other6 ||= ln == "OTHER 6"
         ref5 ||= ln == "REF 5"
     }
-    t |> success(stamped)  // the declaration's re-stamp consumed the manifest
+    t |> success(stamped)  // the sidecar entry stamped at [tune] time
     t |> success(result7)  // and the k2 tier actually ran
-    t |> success(kv2)      // and the companion was re-stamped from the same entry
-    t |> success(other6)   // no manifest entry -> the fallback stamp (k1) stands
+    t |> success(kv2)      // and the companion was stamped from the same entry
+    t |> success(other6)   // no sidecar entry -> the fallback stamp (k1) stands
     t |> success(ref5)     // explicit "reference" entry -> the original body despite fallback
 
-    remove(manifestPath)
+    // STALE sidecar (older than the daslang binary) reads as absent: back to fallback tier
+    let backRes = set_mtime_result(sidecarPath, mktime(2000, 1, 1, 0, 0, 0))
+    t |> success(!(backRes is error), "could not back-date the sidecar")
+    var slines : array<string>
+    let rcs = spawn_client("\"{bin}\" -jit \"{clientPath}\"", slines)
+    t |> equal(rcs, 0)
+    var staleStampedK2 = false
+    var staleResult6 = false
+    for (ln in slines) {
+        staleStampedK2 ||= ln |> starts_with("llvm_tune: man_add <- k2")
+        staleResult6 ||= ln == "RESULT 6"
+    }
+    t |> success(!staleStampedK2)  // stale winners must not stamp
+    t |> success(staleResult6)     // fallback k1 tier: 2+3+1
+
+    remove(sidecarPath)
     remove(clientPath)
     delete wlines
     delete rlines
+    delete slines
 }

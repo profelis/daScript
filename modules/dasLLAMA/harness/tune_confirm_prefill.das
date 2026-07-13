@@ -5,6 +5,7 @@ options _jit_fast_math = true   // production prefill config (prefill_perf parit
 
 require dasllama/dasllama_transformer   // nolint:STYLE029 — umbrella fires each arch [init] registration; requiring dasllama_common directly would drop them
 require dasllama/dasllama_math  // setup_dasllama_jobque_ + apply_box_profile_runtime
+require llvm/daslib/llvm_tune   // [tune_policy]: the confirm arm measures WHAT THE MANIFEST SAYS — never self-tune
 require daslib/jobque_boost
 require strings
 require math
@@ -21,7 +22,10 @@ require math
 let PP_TOKENS = 512l
 let PP_REPS = 3
 
-[export]
+// fallback: this child measures the manifest handed to it (or the fallback stamps when the
+// arm passes an empty manifest) — an incomplete sidecar must NOT recurse into a nested tune
+// inside a confirm arm (each arm burned a full hidden tune before this)
+[export, tune_policy(missing = "fallback")]
 def main {
     if (!jit_enabled()) {
         print("CONFIRM_PP: FAIL (run with -jit)\n")

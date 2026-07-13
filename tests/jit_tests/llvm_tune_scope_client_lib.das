@@ -6,8 +6,8 @@ require llvm/daslib/llvm_tune public
 
 // Library-side fixture for llvm_tune_scope.das (no [test] on purpose — the suite just
 // compiles it): declares the scope that llvm_tune_scope_client.das inherits by requiring
-// this module. The fake tuner lives next to this file; the scope manifest lands at
-// <das_root>/llvm_tune_scope_probe.tune.json (the per-box location IS the feature).
+// this module. The fake tuner lives next to this file; the winners land in the app
+// SIDECAR — <client>.tune.json beside the spawned client script (per-app IS the feature).
 [tune_scope(name = "llvm_tune_scope_probe", tuner = "./llvm_tune_scope_tuner.das")]
 struct private ScopeDecl {}
 

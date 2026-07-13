@@ -105,6 +105,13 @@ namespace das {
     void JobQue::set_default_threads_cap(int cap) { g_jobqueDefaultThreadsCap = max(cap, 0); }
     int JobQue::get_default_threads_cap() { return g_jobqueDefaultThreadsCap.load(); }
 
+    // App-declared affinity mode of a future JobQue (das set_jobque_affinity — apps expose it in
+    // their config next to threads). -1 = unset (off). Applied at thread spawn, so it must be set
+    // BEFORE the que exists; the DAS_JOBQUE_AFFINITY env still overrides it (the A/B rail).
+    static atomic<int> g_jobqueDefaultAffinity{-1};
+    void JobQue::set_default_affinity(int mode) { g_jobqueDefaultAffinity = mode; }
+    int JobQue::get_default_affinity() { return g_jobqueDefaultAffinity.load(); }
+
 #if defined(_WIN32) && !defined(_GAMING_XBOX) && !defined(_DURANGO) && !defined(_M_ARM64)
     int GetPhysicalCoreCountInWindows();   // defined in sysos.cpp under the same _WIN32 gate (incl. mingw)
 #endif
@@ -161,9 +168,9 @@ namespace das {
     // the que-creating (dispatch caller) thread, workers take slots 1..N. Without this the OS
     // placement is a lottery: 32 busy lanes on a 32c/64t box sometimes land on 16 cores' SMT
     // pairs — measured pp512 bimodal 306 vs 199 tok/s on the 3990X. Modes (DAS_JOBQUE_AFFINITY):
-    // 0 = off (default — placement belongs to the OS unless a box opts in), 1 = ideal-processor
-    // hint (scheduler can still migrate under contention), 2 = hard mask (pins survive ambient
-    // load but also can't dodge it).
+    // 0 = off (default — placement hints fight ambient load on shared boxes; opt in per run),
+    // 1 = ideal-processor hint (scheduler can still migrate under contention),
+    // 2 = hard mask (pins survive ambient load but also can't dodge it).
     static void jobque_apply_affinity_slot ( int slot, int mode ) {
         if ( mode <= 0 ) return;
         int hw = static_cast<int>(thread::hardware_concurrency());
@@ -190,8 +197,8 @@ namespace das {
         mTeamRankGate = (rankGateEnv != nullptr && atoi(rankGateEnv) != 0) ? 1 : 0;
         const char * eagerExitEnv = getenv("DAS_JOBQUE_TEAM_EAGER_EXIT");   // =0 re-enables the final-barrier spin (see setTeamEagerExit)
         mTeamEagerExit = (eagerExitEnv != nullptr) ? ((atoi(eagerExitEnv) != 0) ? 1 : 0) : 1;
-        const char * affinityEnv = getenv("DAS_JOBQUE_AFFINITY");   // 0 off (default) / 1 ideal-CPU hint / 2 hard mask
-        int affinityMode = affinityEnv ? atoi(affinityEnv) : 0;
+        const char * affinityEnv = getenv("DAS_JOBQUE_AFFINITY");   // 0 off (default) / 1 ideal-CPU hint / 2 hard mask; overrides the app's set_default_affinity
+        int affinityMode = affinityEnv ? atoi(affinityEnv) : (max)(0, get_default_affinity());
         SetCurrentThreadPriority(JobPriority::High);
         jobque_apply_affinity_slot(0, affinityMode);   // the que creator = the dispatch caller
         for (int j = 0, js = mThreadCount; j < js; j++) {
@@ -247,6 +254,42 @@ namespace das {
         mTraceOn.store(1, std::memory_order_seq_cst);
     }
 
+    void JobQue::traceCategory ( int id, const char * name, uint32_t rgb ) {
+        lock_guard<mutex> guard(mTraceRegMutex);
+        for ( auto & c : mTraceCategories ) {
+            if ( c.id == id ) { c.name = name ? name : ""; c.rgb = rgb; return; }
+        }
+        mTraceCategories.push_back({id, name ? name : "", rgb});
+    }
+
+    int JobQue::traceMarkerName ( const char * name ) {
+        lock_guard<mutex> guard(mTraceRegMutex);
+        string n = name ? name : "";
+        for ( size_t i = 0; i != mTraceMarkerNames.size(); ++i ) {
+            if ( mTraceMarkerNames[i] == n ) return int(i);
+        }
+        mTraceMarkerNames.push_back(n);
+        return int(mTraceMarkerNames.size()) - 1;
+    }
+
+    void JobQue::traceMarker ( int nameId, int arg ) {
+        if ( !mTraceOn.load(std::memory_order_relaxed) ) return;
+        // caller lane — markers come from the orchestrating thread (per-token/per-frame loops)
+        uint64_t t = uint64_t(ref_time_ticks());
+        traceEvent(int(mTrace.size()) - 1, TraceTag::Marker, t, t, uint32_t(nameId), uint32_t(arg), 0);
+    }
+
+    static void fputsJsonString ( FILE * f, const char * s ) {
+        fputc('"', f);
+        for ( ; s && *s; ++s ) {
+            char c = *s;
+            if ( c == '"' || c == '\\' ) { fputc('\\', f); fputc(c, f); }
+            else if ( uint8_t(c) >= 0x20 ) fputc(c, f);
+            else fprintf(f, "\\u%04x", c);
+        }
+        fputc('"', f);
+    }
+
     bool JobQue::traceSave ( const char * path ) {
         if ( mTraceOn.load(std::memory_order_relaxed) ) return false;   // stop before saving
         uint64_t tmin = ~0ull;
@@ -256,6 +299,13 @@ namespace das {
         if ( tmin == ~0ull ) return false;
         FILE * f = fopen(path, "wb");
         if ( !f ) return false;
+        vector<TraceCategory> cats;
+        vector<string> markerNames;
+        {
+            lock_guard<mutex> guard(mTraceRegMutex);
+            cats = mTraceCategories;
+            markerNames = mTraceMarkerNames;
+        }
         static const char * tagName[] = { "publish", "chunk", "stage_wait", "wake", "fifo_job" };
         fprintf(f, "{\"traceEvents\":[");
         bool first = true;
@@ -267,13 +317,38 @@ namespace das {
             first = false;
             for ( uint32_t i = 0; i != L.n; ++i ) {
                 const auto & e = L.ev[i];
+                if ( e.tag == uint32_t(TraceTag::Marker) ) {
+                    // perfetto instant event; name = the registered marker kind. arg is
+                    // signed in the API (jobque_trace_marker) — emit %d so it round-trips.
+                    // scope "g" is deliberate: unit boundaries (frame/token) draw across ALL
+                    // lanes in Perfetto; tid still records the emitting (caller) lane for
+                    // viewers that read it directly
+                    fprintf(f, ",\n{\"ph\":\"i\",\"s\":\"g\",\"pid\":0,\"tid\":%d,\"ts\":%.3f,\"name\":",
+                        int(lane), double(e.t0 - tmin) / 1000.0);
+                    fputsJsonString(f, e.stage < uint32_t(markerNames.size()) ? markerNames[e.stage].c_str() : "marker");
+                    fprintf(f, ",\"args\":{\"arg\":%d}}", int32_t(e.arg));
+                    continue;
+                }
                 fprintf(f, ",\n{\"ph\":\"X\",\"pid\":0,\"tid\":%d,\"ts\":%.3f,\"dur\":%.3f,\"name\":\"%s\","
                     "\"args\":{\"stage\":%u,\"arg\":%u,\"chain\":%u}}",
                     int(lane), double(e.t0 - tmin) / 1000.0, double(e.t1 - e.t0) / 1000.0,
                     tagName[e.tag < 5 ? e.tag : 4], e.stage, e.arg, e.chain);
             }
         }
-        fprintf(f, "\n]}\n");
+        // sibling key after traceEvents (JSON Object Format) — Perfetto/chrome ignore unknown keys
+        fprintf(f, "\n],\"jobqueProfile\":{\"version\":1,\"lanes\":%d,\"categories\":[", int(mTrace.size()));
+        for ( size_t i = 0; i != cats.size(); ++i ) {
+            fprintf(f, "%s{\"id\":%d,\"name\":", i ? "," : "", cats[i].id);
+            fputsJsonString(f, cats[i].name.c_str());
+            fprintf(f, ",\"color\":\"#%06X\"}", cats[i].rgb & 0xFFFFFFu);
+        }
+        fprintf(f, "],\"markers\":[");
+        for ( size_t i = 0; i != markerNames.size(); ++i ) {
+            fprintf(f, "%s{\"id\":%d,\"name\":", i ? "," : "", int(i));
+            fputsJsonString(f, markerNames[i].c_str());
+            fputc('}', f);
+        }
+        fprintf(f, "]}}\n");
         fclose(f);
         return true;
     }

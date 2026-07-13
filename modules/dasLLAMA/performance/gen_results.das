@@ -12,6 +12,7 @@ require profile_common
 require daslib/md_boost
 require daslib/fio
 require strings
+require llvm/daslib/llvm_tune   // [tune_policy]: the renderer reads JSON only — never auto-tune
 
 let PERF_DIR = "modules/dasLLAMA/performance"
 let RESULTS_PATH = "modules/dasLLAMA/performance/results_llm.md"
@@ -82,9 +83,10 @@ def render_section(p : LlmProfile) : string {
         ColAlign.right, ColAlign.right, ColAlign.right
     ]
     let parsec = pl.parsec_off ? "Parsec off" : "Parsec ON"
+    let aff = empty(pl.affinity) ? "" : " Affinity: {pl.affinity}."
     return build_string() $(w) {
         w |> write("## {pl.cpu}, {pl.threads} threads — daslang {pl.daslang}, llama.cpp {pl.llama_cpp}, {pl.date} ({parsec})\n\n")
-        w |> write("{pl.os}; box profile `{pl.box_profile}`.\n\n")
+        w |> write("{pl.os}; box profile `{pl.box_profile}`.{aff}\n\n")
         w |> write(render_md_table(headers, aligns, rows))
         w |> write("\n")
     }
@@ -94,7 +96,7 @@ def render_doc(profiles : array<LlmProfile>) : string {
     return build_string() $(w) {
         w |> write("# LLM CPU scoreboard (living doc — CURRENT numbers only; history in git)\n\n")
         w |> write("GENERATED from `profile_llm_<box>.json` by `gen_results.das` — do not hand-edit. ")
-        w |> write("das = dasLLAMA (JIT, Q8); llama.cpp = `llama-bench` CPU (`-ngl 0`, no Accelerate/AMX BLAS). ")
+        w |> write("das = dasLLAMA (JIT; quant column = the GGUF's format, q4_k_m loads kq-native); llama.cpp = `llama-bench` CPU (`-ngl 0`, no Accelerate/AMX BLAS). ")
         w |> write("pp*N* = prefill throughput over *N* prompt tokens; tg*N* = greedy generation of *N* tokens. ")
         w |> write("Ratio = das / llama.cpp (>1 = das faster); winners bold.\n\n")
         for (p in profiles) {
@@ -319,7 +321,9 @@ def regen_asr(profiles : array<string>) : int {
     return nrepl
 }
 
-[export]
+// fallback: the renderer reads committed JSON — das gen-kernels never execute, so an
+// untuned box must NOT trigger the (minutes-long) auto-tune the measuring tools get
+[export, tune_policy(missing = "fallback")]
 def main() {
     // ---- LLM scoreboard (fully generated file) ----
     var profiles : array<LlmProfile>

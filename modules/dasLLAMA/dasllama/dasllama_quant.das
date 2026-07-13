@@ -144,6 +144,53 @@ def template quantize_q8_0_bs_into_ptr_template(src : float const ?; n : int64; 
 [hint(noalias = src, noalias = qdst, noalias = sdst, noalias = bdst), tuned(fallback = "plain")]
 def quantize_q8_0_bs_into_ptr(src : float const?; n : int64; var qdst : int8?; var sdst : float?; var bdst : int?; qoff, soff, boff : int64) {}
 
+//! Q8_K-form activation quantization (kq v2 — the llama.cpp K-quant dot contract): ONE scale
+//! per 256-element superblock (sdst, soff in superblocks) + plain per-16 quant sums (bdst,
+//! boff in per-16 units, 16 per superblock). The K-quant kernels fold integer sub-scale and
+//! bsums-x-mins sums against these, paying one float fold per superblock instead of one per
+//! 32-block. Quants differ from the Q8_0 form (per-256 divisor) — the two forms are separate
+//! planes, chosen by the consumer weight's format.
+def quantize_q8_k_into(src : array<float> | #; n : int64; var qdst : array<int8>; var sdst : array<float>; var bdst : array<int>; qoff, soff, boff : int64) {
+    assert(n % 256l == 0l, "quantize_q8_k_into requires n to be a multiple of 256")
+    quantize_q8_k_into_ptr(unsafe(addr(src[0])), n, unsafe(addr(qdst[0])), unsafe(addr(sdst[0])), unsafe(addr(bdst[0])), qoff, soff, boff)
+}
+
+//! Pointer core of quantize_q8_k_into (see there); fork-context callers thread raw addresses.
+[hint(noalias = src, noalias = qdst, noalias = sdst, noalias = bdst)]
+def quantize_q8_k_into_ptr(src : float const?; n : int64; var qdst : int8?; var sdst : float?; var bdst : int?; qoff, soff, boff : int64) {
+    let nsb = n / 256l
+    unsafe {
+        let p4 = reinterpret<float4 const?>(src)
+        for (s in range64(nsb)) {
+            let base = s * 256l
+            // amax reduction: the same hand-vectorized two-lane shape as the Q8_0 quantizers
+            let f4 = base / 4l
+            var m0 = abs(p4[f4])
+            var m1 = abs(p4[f4 + 1l])
+            for (k in range64(1l, 32l)) {
+                m0 = max(m0, abs(p4[f4 + 2l * k]))
+                m1 = max(m1, abs(p4[f4 + 2l * k + 1l]))
+            }
+            let m = max(m0, m1)
+            let amax = max(max(m.x, m.y), max(m.z, m.w))
+            let d = amax / 127.0
+            let id = d != 0.0 ? 1.0 / d : 0.0
+            sdst[soff + s] = d
+            for (i in range64(256l)) {
+                qdst[qoff + base + i] = int8(round(src[base + i] * id))
+            }
+            for (h in range64(16l)) {
+                var bs = 0
+                let hb = qoff + base + h * 16l
+                for (i in range64(16l)) {
+                    bs += int(qdst[hb + i])
+                }
+                bdst[boff + s * 16l + h] = bs
+            }
+        }
+    }
+}
+
 //! Dequantize Q8_0 back to fp32 in place: dst[i] = q[i] * scales[i / 32]. The exact
 //! reference the dequant-in-dot kernel must reproduce, and the input to the fp32 forward
 //! when measuring end-to-end quantization loss. dst must be pre-sized to qt.n.

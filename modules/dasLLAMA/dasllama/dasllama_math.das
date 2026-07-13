@@ -6,6 +6,7 @@ require math
 require strings  // to_int: DASLLAMA_CALLER_PRIO env override in setup_dasllama_jobque_
 require daslib/fio  // has_env_variable: DAS_JOBQUE_TEAM_RANK_GATE suppresses the profile's team_rank_gate knob
 require daslib/jobque_boost public  // matmul's threaded path expands parallel_for; consumers need its symbols
+require daslib/jobque_profile  // named trace categories + unit markers (set_trace_tags registers them)
 require dasllama/dasllama_par  // maybe_parallel_for: thread-or-inline a kernel body on a runtime size flag
 require dasllama/dasllama_tune  // [tuned]: reconstitute dot from dot_template with per-box loop hints
 require llvm/daslib/f16_cvt  // f16<->f32 converts: JIT half intrinsics on aarch64 / x64+F16C, exact bit-twiddle elsewhere
@@ -36,8 +37,8 @@ def dot(a, b : float const?; n : int64) : float {}
 
 // The elementwise kernels below share dot's tuning rig: each `<name>_template` holds the `[tune=1]`
 // hot loop (single source of truth) and `[tuned]` reconstitutes `<name>` with the per-box permutation
-// from box_profile.json — default `vec8_u2` = the original `[vectorize_width=8, unroll_count=2]`, so
-// each migrated kernel is bit-identical until the profiler picks a different perm for this box.
+// from the app tune sidecar — default `vec8_u2` = the original `[vectorize_width=8, unroll_count=2]`,
+// so each migrated kernel is bit-identical until the profiler picks a different perm for this box.
 
 //! AXPY: d[j] += scale * s[j] over n elements, auto-vectorized. Used single-threaded AND as the
 //! V-accumulate in threaded prefill attention — `d` (output) and `s` (value-cache) never overlap, so
@@ -253,6 +254,168 @@ def template quantize_q8kv_row_template(var dst : uint8 ?; src : float const ?; 
 [hint(unsafe_range_check, noalias = dst, noalias = src), tuned(fallback = "plain")]
 def quantize_q8kv_row(var dst : uint8?; src : float const?; n : int64) {}
 
+// The tq4 KV-codec kernels: TurboQuant-style rotated 4-bit cache — a seeded-sign FWHT basis
+// change at the store/query seams (dasllama_common) over a q4_0-shaped block: 32 4-bit quants
+// sharing one f16 scale, {f16 d; uint8 qs[16]} = 18 bytes per block, element 2i in the low
+// nibble of byte i. Scale is ggml q4_0's d = signed-max / -8 (the extreme element hits the -8
+// code exactly, so full range survives). Rows are whole blocks (kv_dim % 32 == 0; head_size a
+// power of two for the FWHT — validated at create).
+
+//! In-place per-head rotation: v *= signs, then the orthonormal FWHT (n a power of two).
+//! ⟨Hx, Hy⟩ = ⟨x, y⟩, so scores/AV run entirely in the rotated basis.
+def fwht_signs_row(var v : float?; signs : float const?; n : int64) {
+    unsafe {
+        for (i in range64(n)) {
+            v[i] *= signs[i]
+        }
+        fwht_core(v, n)
+    }
+}
+
+//! Inverse of fwht_signs_row: FWHT first (self-inverse), then the signs.
+def fwht_unsign_row(var v : float?; signs : float const?; n : int64) {
+    unsafe {
+        fwht_core(v, n)
+        for (i in range64(n)) {
+            v[i] *= signs[i]
+        }
+    }
+}
+
+def private fwht_core(var v : float?; n : int64) {
+    unsafe {
+        var h = 1l
+        while (h < n) {
+            var i = 0l
+            while (i < n) {
+                for (j in range64(i, i + h)) {
+                    let a = v[j]
+                    let b = v[j + h]
+                    v[j] = a + b
+                    v[j + h] = a - b
+                }
+                i += h * 2l
+            }
+            h *= 2l
+        }
+        let inv = 1.0 / sqrt(float(n))
+        for (i in range64(n)) {
+            v[i] *= inv
+        }
+    }
+}
+
+//! Fill the tq4 rotation sign vector (±1), deterministic — sessions and pools sharing cache
+//! bytes MUST agree, so the seed is a fixed constant and layers with a smaller head_size use
+//! a prefix of the same vector.
+def tq4_fill_signs(var dst : array<float>; n : int64) {
+    dst |> resize(int(n))
+    var s = 0xC0FFEEu
+    for (x in dst) {
+        s = s * 1664525u + 1013904223u
+        x = (s & 0x10000u) != 0u ? -1.0 : 1.0
+    }
+}
+
+//! THE tq4 decode hot path: a Q8-quantized (rotated) query against a tq4 cache row — int8×int4
+//! multiply-accumulate per 32-block, both block scales in once. The nibble unpack is two MACs
+//! per cache byte.
+[hint(unsafe_range_check, noalias = q, noalias = qs, noalias = b)]
+def template dot_q8tq4kv_template(q : int8 const ?; qs : float const ?; b : uint8 const ?; n : int64) : float {
+    var acc = 0.0
+    unsafe {
+        let b16 = reinterpret<uint16 const?>(b)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 18l + 2l
+            var iacc = 0
+            for [tune = 1] (k in range64(16l)) {
+                let by = int(b[qb + k])
+                iacc += int(q[base + 2l * k]) * ((by & 15) - 8)
+                iacc += int(q[base + 2l * k + 1l]) * ((by >> 4) - 8)
+            }
+            acc += float(iacc) * qs[bi] * f16_to_f32(uint(b16[bi * 9l]))
+        }
+    }
+    return acc
+}
+[hint(unsafe_range_check, noalias = q, noalias = qs, noalias = b), tuned(fallback = "vec16")]
+def dot_q8tq4kv(q : int8 const?; qs : float const?; b : uint8 const?; n : int64) : float {}
+
+//! AXPY from a tq4 cache row: d[j] += scale * ((nib - 8) * d_block) — the V-accumulate under
+//! the tq4 codec (in the rotated basis; the driver un-rotates the head's output once).
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template axpy_tq4kv_template(var d : float ?; s : uint8 const ?; scale : float; n : int64) : void {
+    unsafe {
+        let s16 = reinterpret<uint16 const?>(s)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 18l + 2l
+            let c = scale * f16_to_f32(uint(s16[bi * 9l]))
+            for [tune = 1] (k in range64(16l)) {
+                let by = int(s[qb + k])
+                d[base + 2l * k] = mad(c, float((by & 15) - 8), d[base + 2l * k])
+                d[base + 2l * k + 1l] = mad(c, float((by >> 4) - 8), d[base + 2l * k + 1l])
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def axpy_tq4kv(var d : float?; s : uint8 const?; scale : float; n : int64) {}
+
+//! tq4 -> f32 row convert (the flash pack's bulk dequant): d[j] = (nib - 8) * d_block.
+[hint(unsafe_range_check, noalias = d, noalias = s)]
+def template cvt_tq4kv_to_f32_template(var d : float ?; s : uint8 const ?; n : int64) : void {
+    unsafe {
+        let s16 = reinterpret<uint16 const?>(s)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            let qb = bi * 18l + 2l
+            let db = f16_to_f32(uint(s16[bi * 9l]))
+            for [tune = 1] (k in range64(16l)) {
+                let by = int(s[qb + k])
+                d[base + 2l * k] = float((by & 15) - 8) * db
+                d[base + 2l * k + 1l] = float((by >> 4) - 8) * db
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = d, noalias = s), tuned]
+def cvt_tq4kv_to_f32(var d : float?; s : uint8 const?; n : int64) {}
+
+//! Quantize n (rotated) f32s into tq4 blocks at dst — the codec store. ggml quantize_row_q4_0
+//! semantics: d = signed-max / -8 stored as f16, quants truncate x*id + 8.5 (never negative:
+//! |x*id| <= 8 by construction), capped at 15.
+[hint(unsafe_range_check, noalias = dst, noalias = src)]
+def template quantize_tq4kv_row_template(var dst : uint8 ?; src : float const ?; n : int64) : void {
+    unsafe {
+        var d16 = reinterpret<uint16?>(dst)
+        for (bi in range64(n / 32l)) {
+            let base = bi * 32l
+            var amax = 0.0
+            var mval = 0.0
+            for (i in range64(32l)) {
+                let v = src[base + i]
+                if (abs(v) > amax) {
+                    amax = abs(v)
+                    mval = v
+                }
+            }
+            let d = mval / -8.0
+            let id = d != 0.0 ? 1.0 / d : 0.0
+            d16[bi * 9l] = uint16(f32_to_f16(d))
+            let qb = bi * 18l + 2l
+            for [tune = 1] (k in range64(16l)) {
+                let q0 = min(15, int(src[base + 2l * k] * id + 8.5))
+                let q1 = min(15, int(src[base + 2l * k + 1l] * id + 8.5))
+                dst[qb + k] = uint8(q0 | (q1 << 4))
+            }
+        }
+    }
+}
+[hint(unsafe_range_check, noalias = dst, noalias = src), tuned(fallback = "plain")]
+def quantize_tq4kv_row(var dst : uint8?; src : float const?; n : int64) {}
+
 //! d[j] += s[j], width-8 vectorized (the residual-stream update). The plain `for k; a[k]+=b[k]`
 //! over bounds-checked arrays does NOT vectorize under the JIT — this pointer form is ~5x faster.
 [hint(unsafe_range_check, noalias = d, noalias = s)]
@@ -361,7 +524,12 @@ def public get_team_rank_gate() : int { return g_team_rank_gate }
 // by OP rather than stage-count. Gated — set_trace_tags(true) rides with jobque_trace_start in
 // the profiling harness; production dispatches never pay the extern call.
 var g_trace_tags = false
-def public set_trace_tags(on : bool) { g_trace_tags = on }
+def public set_trace_tags(on : bool) {
+    g_trace_tags = on
+    if (on && is_job_que_available()) {   // registries live on the que; stay que-independent like trace_tag
+        register_trace_categories()
+    }
+}
 let public TRACE_TAG_ATTN_CHAIN = 1
 let public TRACE_TAG_ATTN_STD = 2
 let public TRACE_TAG_FFN_CHAIN = 3
@@ -378,9 +546,29 @@ def public trace_tag(t : int) {
         jobque_trace_tag(t)
     }
 }
+def public trace_marker(name : string; arg : int) {
+    // instant unit boundary ("token", "layer", "step") on the caller lane; same gate as trace_tag
+    if (g_trace_tags && is_job_que_available()) {
+        profile_marker(name, arg)
+    }
+}
+// names/colors match the lane-timeline viewer's dark-theme palette, so saved traces carry
+// the exact legend the artifact hardcoded
+def private register_trace_categories() {
+    profile_category(TRACE_TAG_ATTN_CHAIN, "attn chain", 0x5E96DEu)
+    profile_category(TRACE_TAG_ATTN_STD, "attn std", 0x5E96DEu)
+    profile_category(TRACE_TAG_FFN_CHAIN, "ffn chain", 0x43B08Au)
+    profile_category(TRACE_TAG_FFN_STD, "ffn per-op", 0x43B08Au)
+    profile_category(TRACE_TAG_CLS, "classifier", 0xAC82E4u)
+    profile_category(TRACE_TAG_MOE, "moe experts", 0xE08563u)
+    profile_category(TRACE_TAG_SHEXP, "shexp", 0xC39536u)
+    profile_category(TRACE_TAG_PLE, "ple", 0xC39536u)
+    profile_category(TRACE_TAG_ROUTE, "router", 0x4FC3D0u)
+    profile_category(TRACE_TAG_PARK, "park/reduce", 0xD678B4u)
+}
 
 //! Configure the job queue for dasLLAMA's pure fork/join matmul dispatch: pooled fork contexts,
-//! batched dispatch, the spin-before-park window (box_profile.json "runtime" `jobque_spin_us`
+//! batched dispatch, the spin-before-park window (the tune sidecar's "runtime" `jobque_spin_us`
 //! overrides the shipped 30000us; 0 disables the spin), and the join-poll level ("jobque_join_poll",
 //! shipped 50 = ggml's default; 0 parks). Call INSIDE `with_job_que` (or after `create_job_que`) —
 //! the queue must exist, which is why apply_box_profile_runtime cannot apply these knobs itself
@@ -1159,9 +1347,11 @@ struct KernelBackend {
     repack : RepackQ8Q8Fn
     mm_mx4 : MatmulMx4Q8Fn = @@mx4q8_unset_kernel
     // The mx4 BATCH kernels are optional (unlike mm_mx4): they are only dispatched when
-    // mx4_native_batch is set, so backends without them (arm64 — the laneq plane interleave makes a
-    // generic row-major fallback read garbage, not just run slow) keep the panic stubs and the
-    // expansion path instead. A backend that sets the flag must supply BOTH forms.
+    // mx4_native_batch is set, so backends without them keep the panic stubs (a generic row-major
+    // fallback over an interleaved plane would read garbage, not just run slow) and the expansion
+    // path instead. A backend that sets the flag must supply BOTH forms. The gen backends stamp
+    // them on both ISAs (the mx4 tile companion); portable carries row-major reference forms
+    // unflagged (probe/A-B only).
     mx4_batch : MatmulMx4Q8BatchFn = @@mx4q8_unset_batch
     mx4_batch_groupn : MatmulMx4Q8BatchGroupNFn = @@mx4q8_unset_batch_groupn
     repack_mx4 : RepackMx4Fn = @@repack_mx4_identity
@@ -1210,6 +1400,9 @@ struct KernelBackend {
     // layout still answers with its reference tier there). The mx4 expand's positional map and
     // the probes read the cached value via active_q8_layout_mr().
     q8_layout : function<() : int> = @@q8_layout_grp4
+    // per-FORMAT kq plane interleave (kq v2: the k4/k5/k6 families tune separately, so their
+    // grp layouts can differ from the q8 family's and from each other)
+    kq_layout : function<(fmt : int) : int> = @@kq_layout_grp4_fmt
     // The additive bias the backend's repack bakes into GROUP-row weight bytes (128 for a
     // bias128 gen stamp, 0 everywhere else). Same activation-time contract as q8_layout;
     // the mx4->Q8 expand reads the cached value via active_q8_wbias().
@@ -1261,6 +1454,7 @@ var g_active_needs_repack = false   // does the active backend need repacked wei
 var g_active_mx4_expand_interleaved = false   // see KernelBackend.mx4_expand_interleaved
 var g_active_mx4_native_batch = false         // see KernelBackend.mx4_native_batch
 var g_active_q8_layout_mr = 4l                // see KernelBackend.q8_layout (activation-time cache)
+var g_active_kq_layout = @@kq_layout_grp4_fmt // see KernelBackend.kq_layout (activation-time cache)
 var g_active_q8_wbias = 0l                    // see KernelBackend.q8_wbias (activation-time cache)
 var g_active_q8_kgroup = 4l                   // see KernelBackend.q8_kgroup (activation-time cache)
 var g_backend_pin = ""              // A/B: force this backend by name; "" = auto-select
@@ -1284,12 +1478,19 @@ def private no_backend() {
 }
 def private backend_always_available() : bool => true
 def private q8_layout_grp4() : int => 4
+
+[unused_argument(fmt)]
+def private kq_layout_grp4_fmt(fmt : int) : int => 4
 def private q8_wbias_zero() : int => 0
 def private q8_kgroup_four() : int => 4
 
 //! The Q8 interleave (mr) of the ACTIVE backend's weight layout — cached at activation from
 //! KernelBackend.q8_layout (4 for every hand tier; the stamped mr on the gen backend).
 def active_q8_layout_mr() : int64 => g_active_q8_layout_mr
+
+//! The active backend's kq plane interleave for `fmt` (4/5/6) — per-format since the kq v2
+//! family split; the loader freezes these onto the Model at repack time.
+def active_kq_layout_mr(fmt : int) : int64 => int64(invoke(g_active_kq_layout, fmt))
 
 //! The weight-plane bias of the ACTIVE backend's Q8 layout — cached at activation from
 //! KernelBackend.q8_wbias (0 for every hand tier; 128 on a bias128 gen stamp). The mx4->Q8
@@ -1409,6 +1610,7 @@ def private activate(be : KernelBackend) {
     g_active_mx4_expand_interleaved = be.mx4_expand_interleaved
     g_active_mx4_native_batch = be.mx4_native_batch
     g_active_q8_layout_mr = int64(invoke(be.q8_layout))
+    g_active_kq_layout = be.kq_layout
     g_active_q8_wbias = int64(invoke(be.q8_wbias))
     g_active_q8_kgroup = int64(invoke(be.q8_kgroup))
     g_active_batch_backend = be.name
@@ -1582,6 +1784,14 @@ def kernel_backend_has_kq_batch() : bool {
     return g_active_has_kq_batch
 }
 
+//! A/B override for the grouped-MoE-prefill mx4 route: native mx4 batch GEMMs (the backend's
+//! mx4_native_batch default) vs the expand-to-Q8 + Q8 batch path. Safe to flip after load —
+//! both routes read the same repacked planes. Forcing `true` on a backend without the mx4
+//! batch slots hits their panic stubs; benchmark knob only.
+def set_mx4_native_batch(on : bool) {
+    g_active_mx4_native_batch = on
+}
+
 //! Does the active backend carry the region-list kq GEMV (kq_groupn — MoE expert dispatch)?
 //! The MoE dispatch gates on it and falls back to per-region GEMVs when down.
 def kernel_backend_has_kq_groupn() : bool {
@@ -1626,7 +1836,7 @@ def matmul_kq_groupn_active(fmt : int; var y : array<float> | #; kq : array<uint
 def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d, ntok : int64) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq_batch, fmt, addr(y[0]),
             reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
@@ -1641,7 +1851,7 @@ def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; 
 def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq, fmt, addr(y[yoff]),
             reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
@@ -1656,7 +1866,7 @@ def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
 def repack_kq_weight(fmt : int; var kq : array<uint8>; var ks : array<uint8>; woff, n, d : int64) {
     let sb = woff / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 32l
+    let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_repack_kq, fmt, addr(kq[sb * qsb]), addr(ks[sb * ssb]), n, d)
     }

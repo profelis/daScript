@@ -1388,9 +1388,17 @@ struct private DasModuleEntry {
     package_dir : string            //!< absolute path to the enclosing daspkg package
 }
 
+struct private TuneScopeDep {
+    name : string                   //!< [tune_scope] name
+    manifest : string               //!< the app tune sidecar the winners live in
+    tuner : string                  //!< tuner harness path ("" = none declared)
+    complete : bool                 //!< every [tune] kernel of this scope has a fresh sidecar entry
+}
+
 struct private ReleaseDeps {
     shared_modules : array<SharedModuleEntry>
     das_modules : array<DasModuleEntry>
+    tune_scopes : array<TuneScopeDep>
 }
 
 def private read_release_deps(path : string; var deps : ReleaseDeps) : bool {
@@ -1409,6 +1417,16 @@ def private read_release_deps(path : string; var deps : ReleaseDeps) : bool {
     }
     deps = from_JV(parsed, type<ReleaseDeps>)
     return true
+}
+
+// the exact env+cmd shape llvm_tune's policy rail uses for scope tuners (the env prefix
+// leads so the line never starts with a quote — cmd.exe strips a LEADING one)
+def private release_tuner_cmd(daslang : string; ts : TuneScopeDep) : string {
+    let win = get_platform_name() == "windows"
+    let envs = (win ?
+        "set \"DAS_TUNE_MODE=tune\"&& set \"DAS_TUNE_MANIFEST={ts.manifest}\"&& " :
+        "DAS_TUNE_MODE=tune DAS_TUNE_MANIFEST=\"{ts.manifest}\" ")
+    return "{envs}\"{daslang}\" -jit \"{ts.tuner}\" -dasroot \"{get_das_root()}\""
 }
 
 // Bundle path for the standalone exe (daslang -exe appends `.exe` itself).
@@ -1490,7 +1508,7 @@ def private build_info_plist(name, exe, bundle_id : string) : string {
 // Run release() on a dep package and copy its release_include files into the
 // bundle at `<bundle>/modules/<DepName>/<rel>`. Returns 0 on success, non-zero
 // on copy failure (missing release() is NOT an error — dep just contributes nothing).
-def private ship_dep_assets(pkg_dir, bundle_modules_dir : string) : int {
+def private ship_dep_assets(pkg_dir, bundle_modules_dir : string; var shipped : array<string>) : int {
     let dep_pkg_file = "{pkg_dir}/.das_package"
     if (!fexist(dep_pkg_file)) return 0
     var dep_spec : PackageReleaseInfo
@@ -1504,6 +1522,7 @@ def private ship_dep_assets(pkg_dir, bundle_modules_dir : string) : int {
             dep_files |> push_clone(rel_path)
         }
     }
+    shipped |> reserve(length(shipped) + length(dep_files))
     for (rel in dep_files) {
         let src = path_join(pkg_dir, rel)
         let dst = path_join(dep_dst_dir, rel)
@@ -1513,12 +1532,13 @@ def private ship_dep_assets(pkg_dir, bundle_modules_dir : string) : int {
             to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
             return 1
         }
+        shipped |> push("modules/{dep_name}/{rel}")
     }
     if (!empty(dep_files)) {
         log("  ship dep `{dep_name}`: {length(dep_files)} file(s)\n")
     }
     if (!empty(dep_spec.native_dlls)) {
-        let rc = ship_native_dlls(dep_name, dep_dst_dir, dep_spec.native_dlls)
+        let rc = ship_native_dlls(dep_name, dep_dst_dir, dep_spec.native_dlls, shipped, "modules/{dep_name}/")
         if (rc != 0) return rc
     }
     return 0
@@ -1562,7 +1582,14 @@ def private have_patchelf() : bool {
 //
 // `equivalent()` follows symlinks transitively, so a sibling that links to
 // the leaf file through any number of hops will compare equal to it.
-def private preserve_dylib_symlinks(src_dir, dst_dir, src_name : string) {
+// bundle-relative sibling path of `filename` next to the shipped file at `rel_dst`
+def private sibling_rel(rel_dst, filename : string) : string {
+    let rd = dir_name(rel_dst)
+    return empty(rd) || rd == "." ? filename : "{rd}/{filename}"
+}
+
+def private preserve_dylib_symlinks(src_dir, dst_dir, src_name : string;
+                                    var shipped : array<string>; rel_dst : string) {
     if (get_platform_name() == "windows") return
     let src_abs = path_join(src_dir, src_name)
     dir(src_dir) $(filename) {
@@ -1579,6 +1606,7 @@ def private preserve_dylib_symlinks(src_dir, dst_dir, src_name : string) {
         let ln_rc = run_cmd("ln -s \"{src_name}\" \"{link_path}\"", ln_out)
         if (ln_rc == 0) {
             log("  ship symlink: {filename} -> {src_name}\n")
+            shipped |> push(sibling_rel(rel_dst, filename))
         } else {
             to_log(LOG_WARNING, "release: ln -s {src_name} -> {link_path} failed (rc={ln_rc}): {ln_out}\n")
         }
@@ -1774,7 +1802,7 @@ def private read_dylib_self_name(dst : string) : string {
 //
 // No-op when basename(self-name) == basename(dst), the alias already exists,
 // or (macOS) the install_name isn't @-relative.
-def private ensure_dylib_alias(dst : string) {
+def private ensure_dylib_alias(dst : string; var shipped : array<string>; rel_dst : string) {
     let platform = get_platform_name()
     if (platform != "darwin" && platform != "linux") return
     let self_name = read_dylib_self_name(dst)
@@ -1794,6 +1822,7 @@ def private ensure_dylib_alias(dst : string) {
     let ln_rc = run_cmd("ln -s \"{base_name(dst)}\" \"{link_path}\"", ln_out)
     if (ln_rc == 0) {
         log("  ship alias: {alias} -> {base_name(dst)}\n")
+        shipped |> push(sibling_rel(rel_dst, alias))
     } else {
         to_log(LOG_WARNING, "release: ln -s {base_name(dst)} -> {link_path} failed (rc={ln_rc}): {ln_out}\n")
     }
@@ -1801,10 +1830,12 @@ def private ensure_dylib_alias(dst : string) {
 
 // One-liner used at every ship site: preserve any sibling symlink chain from
 // the source, materialize the install_name alias if it's still missing
-// (macOS), then strip absolute rpath entries from the copy.
-def private finalize_shipped_binary(src, dst : string) {
-    preserve_dylib_symlinks(dir_name(src), dir_name(dst), base_name(src))
-    ensure_dylib_alias(dst)
+// (macOS), then strip absolute rpath entries from the copy. Symlinks/aliases
+// it creates are recorded in `shipped` (as siblings of `rel_dst`) so the
+// next release's manifest cleanup removes them too.
+def private finalize_shipped_binary(src, dst : string; var shipped : array<string>; rel_dst : string) {
+    preserve_dylib_symlinks(dir_name(src), dir_name(dst), base_name(src), shipped, rel_dst)
+    ensure_dylib_alias(dst, shipped, rel_dst)
     scrub_external_rpaths(dst)
 }
 
@@ -1819,12 +1850,14 @@ def private finalize_shipped_binary(src, dst : string) {
 //   2. Build-tree config dirs in fixed preference: Release > RelWithDebInfo >
 //      MinSizeRel > Debug, e.g. `<search_root>/Release/<name>`.
 //   3. Fall through to `**/<name>` and pick the first match.
-def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<string>) : int {
+def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<string>;
+                             var shipped : array<string>; rel_prefix : string) : int {
     let platform = get_platform_name()
     let search_root = (platform == "windows"
         ? "{get_das_root()}/bin"
         : "{get_das_root()}/lib")
     mkdir_rec(dst_dir)
+    shipped |> reserve(length(shipped) + length(native_dlls))
     for (name in native_dlls) {
         var found_src = ""
         // 1. exact path under search_root
@@ -1864,9 +1897,40 @@ def private ship_native_dlls(dep_name, dst_dir : string; native_dlls : array<str
             return 1
         }
         log("  ship dep `{dep_name}` native: {name}\n")
-        finalize_shipped_binary(found_src, dst)
+        finalize_shipped_binary(found_src, dst, shipped, "{rel_prefix}{name}")
+        shipped |> push("{rel_prefix}{name}")
     }
     return 0
+}
+
+// Every release writes this manifest (each shipped file, bundle-relative) so the NEXT release
+// deletes exactly what it produced. The bundle dir also holds USER files — the auto-loaded
+// <name>.toml config, logs — that the old whole-dir wipe destroyed on every re-release.
+let RELEASE_MANIFEST = ".daspkg_release.manifest"
+
+def private clean_previous_release(bundle_dir : string) {
+    let mpath = path_join(bundle_dir, RELEASE_MANIFEST)
+    if (!fexist(mpath)) {
+        return   // first release into this dir (or a pre-manifest bundle): nothing to clean
+    }
+    let body = fread(mpath)
+    if (empty(body)) {
+        to_log(LOG_WARNING, "release: {RELEASE_MANIFEST} exists but reads empty — skipping cleanup; stale files from a previous release may remain\n")
+        return
+    }
+    for (line in split(body, "\n")) {
+        let rel = strip(line)
+        // skip blanks; stay inside the bundle even on a corrupt or hostile manifest —
+        // reject `..`, drive colons, and both absolute spellings (`/x`, `\x` = drive root)
+        if (empty(rel) || find(rel, "..") >= 0 || starts_with(rel, "/") || starts_with(rel, "\\") || find(rel, ":") >= 0) {
+            continue
+        }
+        let p = path_join(bundle_dir, rel)
+        if (fexist(p)) {
+            remove(p)
+        }
+    }
+    remove(mpath)
 }
 
 // Copy of `daslib/command_line.get_das_exe()`. We can't require command_line
@@ -1934,11 +1998,18 @@ def cmd_release(root : string; out_dir : string) : int {
     let is_mac_app = get_platform_name() == "darwin"
     let app_root = is_mac_app ? path_join(out_dir, "{bundle_name}.app") : ""
     let bundle_dir = is_mac_app ? path_join(app_root, "Contents/MacOS") : path_join(out_dir, bundle_name)
-    let cleanup_target = is_mac_app ? app_root : bundle_dir
-    if (fexist(cleanup_target)) {
-        force_rmdir(cleanup_target)
+    // The macOS .app is wholly daspkg-owned: full wipe. A flat bundle dir is NOT — it
+    // accumulates user files next to daspkg's output — so it cleans via the previous
+    // release's manifest instead (empty dirs from removed deps may linger; harmless).
+    if (is_mac_app) {
+        if (fexist(app_root)) {
+            force_rmdir(app_root)
+        }
+    } elif (fexist(bundle_dir)) {
+        clean_previous_release(bundle_dir)
     }
     mkdir_rec(bundle_dir)
+    var shipped : array<string>   // bundle-relative paths -> RELEASE_MANIFEST at the end
 
     // 1. Build the standalone exe; `--list-shared-modules` writes the deps JSON
     //    (auto-detected dylibs + transitive .das_package list) as a side effect.
@@ -1968,11 +2039,53 @@ def cmd_release(root : string; out_dir : string) : int {
         }
         return 1
     }
+    // 1.5 Build-time tuning: the deps JSON reports each [tune_scope] with per-key
+    //     completeness against the app sidecar. Run the tuners of incomplete scopes and
+    //     REBUILD, so the shipped exe bakes measured winners instead of the generic
+    //     fallback stamps ("untuned does not start" applies to release artifacts at
+    //     BUILD time — the frozen exe itself never tunes).
+    {
+        var deps0 : ReleaseDeps
+        if (read_release_deps(deps_file, deps0)) {
+            var tuned_any = false
+            for (ts in deps0.tune_scopes) {
+                continue if (ts.complete)
+                if (empty(ts.tuner)) {
+                    to_log(LOG_WARNING, "release: tune scope `{ts.name}` is untuned and declares no tuner — shipping fallback stamps\n")
+                    continue
+                }
+                log("  tune: scope `{ts.name}` -> {ts.manifest}\n")
+                var tout : string
+                let trc = run_cmd(release_tuner_cmd(daslang, ts), tout)
+                if (trc != 0) {
+                    to_log(LOG_WARNING, "release: tuner for scope `{ts.name}` failed (rc={trc}) — shipping fallback stamps\n{tout}\n")
+                } else {
+                    tuned_any = true
+                }
+            }
+            if (tuned_any) {
+                log("  rebuild: baking the fresh tune winners into the exe\n")
+                var out2 : string
+                let rc2 = run_cmd(cmd, out2)
+                if (rc2 != 0) {
+                    to_log(LOG_ERROR, "release: daslang -exe rebuild failed (rc={rc2}):\n{out2}\n")
+                    if (fexist(deps_file)) {
+                        remove(deps_file)
+                    }
+                    return 1
+                }
+            }
+        }
+    }
     // daslang -exe writes <exe_path>.exe (the runnable binary) and <exe_path>.o
     // (a build-time object file). Drop the .o — it's not needed at runtime.
     let obj_path = "{exe_path}.o"
     if (fexist(obj_path)) {
         remove(obj_path)
+    }
+    shipped |> push(is_mac_app ? bundle_name : "{bundle_name}.exe")
+    if (fexist("{exe_path}.lib")) {   // MSVC linker side artifact lands next to the exe
+        shipped |> push("{bundle_name}.lib")
     }
     // macOS .app: drop the .exe extension (Mac convention). Info.plist's
     // CFBundleExecutable matches the renamed binary.
@@ -1987,8 +2100,9 @@ def cmd_release(root : string; out_dir : string) : int {
     // Scrub absolute LC_RPATH / RUNPATH entries the daslang build leaks into
     // the exe (build-tree `<das_root>/lib` etc.). The `@executable_path`/`$ORIGIN`
     // entries that PR #2588 added are kept — those are what makes the bundle
-    // portable in the first place.
-    scrub_external_rpaths(exe_path)
+    // portable in the first place. Target the runnable binary: `<exe_path>.exe`
+    // everywhere except a mac .app, where the rename above already dropped it.
+    scrub_external_rpaths(is_mac_app ? exe_path : "{exe_path}.exe")
 
     // 2. Parse deps JSON, ship dylibs at the relative path the exe expects.
     //    The writer has already merged force-included modules into shared_modules,
@@ -2013,7 +2127,8 @@ def cmd_release(root : string; out_dir : string) : int {
             return 1
         }
         log("  ship: {e.rel}\n")
-        finalize_shipped_binary(e.abs, dst)
+        finalize_shipped_binary(e.abs, dst, shipped, e.rel)
+        shipped |> push_clone(e.rel)
     }
 
     // 2.5 Ship daslang runtime dylibs next to the exe. Without these the bundle
@@ -2052,9 +2167,32 @@ def cmd_release(root : string; out_dir : string) : int {
         }
         runtime_copies++
         log("  ship runtime: {base_name(rel_path)}\n")
-        finalize_shipped_binary(src, dst)
+        finalize_shipped_binary(src, dst, shipped, base_name(rel_path))
+        shipped |> push(base_name(rel_path))
     }
     if (runtime_copy_failed) return 1
+
+    // 2.6 Ship the app tune sidecar beside the exe as <bundle>.tune.json — the exe's own
+    //     runtime resolution (`<exe-stem>.tune.json`) finds it there: the "runtime" knob
+    //     section travels with the artifact and the file documents the baked winners
+    //     (provenance included). Touch it NEWER than the exe: the sidecar predates the
+    //     build by construction, and a stale-looking sidecar would be ignored at runtime.
+    let sidecar_src = "{slice(main_path, 0, length(main_path) - 4)}.tune.json"
+    if (fexist(sidecar_src)) {
+        let sidecar_rel = "{bundle_name}.tune.json"
+        let sidecar_dst = path_join(bundle_dir, sidecar_rel)
+        var serr : string
+        if (!copy_file(sidecar_src, sidecar_dst, true, serr)) {
+            to_log(LOG_ERROR, "release: copy_file({sidecar_src} -> {sidecar_dst}) failed: {serr}\n")
+            return 1
+        }
+        var terr : string
+        if (!set_mtime(sidecar_dst, get_clock(), terr)) {
+            to_log(LOG_WARNING, "release: cannot touch {sidecar_dst}: {terr} — the shipped sidecar may read as stale\n")
+        }
+        log("  ship: {sidecar_rel} (tune sidecar)\n")
+        shipped |> push(sidecar_rel)
+    }
     if (runtime_copies == 0) {
         to_log(LOG_ERROR, "release: no daslang runtime libs matched `{runtime_glob}` under `{runtime_lib_dir}`; bundle would not load on a relocated machine\n")
         return 1
@@ -2071,7 +2209,7 @@ def cmd_release(root : string; out_dir : string) : int {
         let pkg_abs = get_full_file_name(dm.package_dir)
         if (key_exists(seen_pkg_dirs, pkg_abs)) continue
         seen_pkg_dirs[pkg_abs] = true
-        let rc2 = ship_dep_assets(pkg_abs, bundle_modules_dir)
+        let rc2 = ship_dep_assets(pkg_abs, bundle_modules_dir, shipped)
         if (rc2 != 0) return rc2
     }
 
@@ -2082,6 +2220,7 @@ def cmd_release(root : string; out_dir : string) : int {
             asset_files |> push_clone(rel_path)
         }
     }
+    shipped |> reserve(length(shipped) + length(asset_files))
     for (rel_path in asset_files) {
         let src = path_join(root, rel_path)
         let dst = path_join(bundle_dir, rel_path)
@@ -2091,6 +2230,7 @@ def cmd_release(root : string; out_dir : string) : int {
             to_log(LOG_ERROR, "release: copy_file({src} -> {dst}) failed: {err}\n")
             return 1
         }
+        shipped |> push_clone(rel_path)
     }
     if (!empty(asset_files)) {
         log("  shipped {length(asset_files)} project asset file(s)\n")
@@ -2098,7 +2238,7 @@ def cmd_release(root : string; out_dir : string) : int {
     // Project-declared native deps land next to the exe (the project has no
     // .shared_module to colocate with — its deps are loaded directly by the exe).
     if (!empty(spec.native_dlls)) {
-        let rc3 = ship_native_dlls(bundle_name, bundle_dir, spec.native_dlls)
+        let rc3 = ship_native_dlls(bundle_name, bundle_dir, spec.native_dlls, shipped, "")
         if (rc3 != 0) return rc3
     }
 
@@ -2121,6 +2261,16 @@ def cmd_release(root : string; out_dir : string) : int {
         log("  wrote: Contents/Info.plist (CFBundleIdentifier={bundle_id})\n")
         log("Released to: {app_root}\n")
     } else {
+        let mbody = build_string() $(var writer) {
+            for (s in shipped) {
+                writer |> write(s)
+                writer |> write("\n")
+            }
+        }
+        if (!fwrite(path_join(bundle_dir, RELEASE_MANIFEST), mbody)) {
+            to_log(LOG_ERROR, "release: cannot write {RELEASE_MANIFEST}\n")
+            return 1
+        }
         log("Released to: {bundle_dir}\n")
     }
     return 0

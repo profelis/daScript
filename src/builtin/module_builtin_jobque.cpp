@@ -828,6 +828,21 @@ namespace das {
         if ( g_jobQue ) g_jobQue->traceSetTag(tag);
     }
 
+    void jobque_trace_category ( int32_t id, const char * name, uint32_t color, Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        g_jobQue->traceCategory(id, name ? name : "", color);
+    }
+
+    int32_t jobque_trace_marker_name ( const char * name, Context * context, LineInfoArg * at ) {
+        if ( !g_jobQue ) context->throw_error_at(at, "need to be in a 'with_job_que' block, or call create_job_que() first");
+        return g_jobQue->traceMarkerName(name ? name : "");
+    }
+
+    void jobque_trace_marker ( int32_t id, int32_t arg, Context *, LineInfoArg * ) {
+        // instant "unit" event (frame/token boundary); no-op without a que or with tracing off
+        if ( g_jobQue ) g_jobQue->traceMarker(id, arg);
+    }
+
     void jobque_set_thread_priority ( int32_t level, Context *, LineInfoArg * ) {
         // OS priority of the CALLING thread, JobPriority scale -2 (Minimum) .. 2 (Maximum).
         // The dispatch caller is load-bearing in team mode — only it publishes chains, so a
@@ -1229,6 +1244,17 @@ namespace das {
         JobQue::set_default_threads_cap(cap);
     }
 
+    // Affinity mode of a future JobQue: 0 off / 1 ideal-CPU hint / 2 hard mask (-1 = unset).
+    // Applied at worker spawn — call BEFORE with_job_que / create_job_que. The
+    // DAS_JOBQUE_AFFINITY env still overrides it (the A/B rail).
+    void setJobqueAffinity ( int32_t mode ) {
+        JobQue::set_default_affinity(mode);
+    }
+
+    int32_t getJobqueAffinity () {
+        return JobQue::get_default_affinity();
+    }
+
     class Module_JobQue : public Module {
     public:
         Module_JobQue() : Module("jobque") {
@@ -1497,6 +1523,15 @@ namespace das {
             addExtern<DAS_BIND_FUN(jobque_trace_tag)>(*this, lib,  "jobque_trace_tag",
                 SideEffects::modifyExternal, "jobque_trace_tag")
                     ->args({"tag","context","line"});
+            addExtern<DAS_BIND_FUN(jobque_trace_category)>(*this, lib,  "jobque_trace_category",
+                SideEffects::modifyExternal, "jobque_trace_category")
+                    ->args({"id","name","color","context","line"});
+            addExtern<DAS_BIND_FUN(jobque_trace_marker_name)>(*this, lib,  "jobque_trace_marker_name",
+                SideEffects::modifyExternal, "jobque_trace_marker_name")
+                    ->args({"name","context","line"});
+            addExtern<DAS_BIND_FUN(jobque_trace_marker)>(*this, lib,  "jobque_trace_marker",
+                SideEffects::modifyExternal, "jobque_trace_marker")
+                    ->args({"id","arg","context","line"});
             addExtern<DAS_BIND_FUN(jobque_set_thread_priority)>(*this, lib,  "set_current_thread_priority",
                 SideEffects::modifyExternal, "jobque_set_thread_priority")
                     ->args({"level","context","line"});
@@ -1528,6 +1563,11 @@ namespace das {
             addExtern<DAS_BIND_FUN(setJobqueThreadsCap)>(*this, lib,  "set_jobque_threads_cap",
                 SideEffects::modifyExternal, "setJobqueThreadsCap")
                     ->args({"cap"});
+            addExtern<DAS_BIND_FUN(setJobqueAffinity)>(*this, lib,  "set_jobque_affinity",
+                SideEffects::modifyExternal, "setJobqueAffinity")
+                    ->args({"mode"});
+            addExtern<DAS_BIND_FUN(getJobqueAffinity)>(*this, lib,  "get_jobque_affinity",
+                SideEffects::accessExternal, "getJobqueAffinity");
             addExtern<DAS_BIND_FUN(new_thread_invoke)>(*this, lib,  "new_thread_invoke",
                 SideEffects::modifyExternal, "new_thread_invoke")
                     ->args({"lambda","function","lambdaSize","context","line"});

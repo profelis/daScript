@@ -11,6 +11,7 @@ module profile_common shared public
 
 require daslib/fio public
 require strings public
+require math
 require daslib/strings_boost public
 require daslib/logger public              // structured, ISO-8601-timestamped ndjson event log
 require daslib/json public                // JV(...) for logger field payloads
@@ -39,6 +40,36 @@ def box_name() : string {
     return empty(env) ? "m1" : env
 }
 
+//! Profiling lane/thread count for this box. 16-cores-with-affinity is the standing methodology on
+//! the x64 boxes; the M1 rig keeps its 8 P-core lanes. Override with DASLLAMA_THREADS.
+def profile_threads() : int {
+    let env = get_env_variable("DASLLAMA_THREADS")
+    if (!empty(env)) {
+        return max(to_int(env), 1)
+    }
+    return box_name() == "m1" ? 8 : 16
+}
+
+//! True when profiling lanes pin to distinct physical cores (all Windows/x64 boxes — OS placement
+//! is a lottery: SMT pairs measured pp512 bimodal on the 3990X). macOS has no thread-affinity API.
+def affinity_on() : bool {
+    return is_windows()
+}
+
+//! llama-bench affinity arguments (leading space; "" when affinity is off): the first `threads`
+//! physical cores as a logical-CPU mask — SMT siblings are adjacent on Windows, so even bits
+//! (16 -> 0x55555555) — plus --cpu-strict so the pins hold. The das-side mirror is jobque affinity.
+def lcpp_affinity_args(threads : int) : string {
+    if (!affinity_on()) {
+        return ""
+    }
+    var mask = 0ul
+    for (i in range(min(threads, 32))) {
+        mask |= 1ul << uint64(2 * i)
+    }
+    return " --cpu-mask 0x{mask:x} --cpu-strict 1"
+}
+
 // Models at or above this are large-tier (deferred unless --tier large|all). 6 GiB splits the
 // ~5GB-and-under carriers (incl. gemma-4-E2B at 4.63GB) from the 7GB+ heavies.
 let LARGE_TIER_BYTES = 6ul * 1024ul * 1024ul * 1024ul
@@ -51,6 +82,7 @@ struct LlmModel {
     file : string
     display : string
     quant : QuantMode
+    quant_label : string   // scoreboard quant cell override ("" = quant_str) — Q4_K_M carriers load kq-native under q8 mode
     prefill_ctx : int
     emission_ctx : int
 }
@@ -62,6 +94,7 @@ def llm_catalog() : array<LlmModel> {
         LlmModel(file="SmolLM2-135M-Instruct-Q8_0.gguf", display="SmolLM2-135M", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen2.5-0.5B-Instruct-Q8_0.gguf", display="Qwen2.5-0.5B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen3-0.6B-Q8_0.gguf", display="Qwen3-0.6B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Qwen3.5-0.8B-Q8_0.gguf", display="Qwen3.5-0.8B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gemma-3-1b-it-Q8_0.gguf", display="gemma-3-1B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="tinyllama-1.1b-chat-v1.0.Q8_0.gguf", display="TinyLlama-1.1B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Llama-3.2-1B-Instruct-Q8_0.gguf", display="Llama-3.2-1B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
@@ -71,10 +104,14 @@ def llm_catalog() : array<LlmModel> {
         LlmModel(file="Phi-3.5-mini-instruct-Q8_0.gguf", display="Phi-3.5-mini", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gemma-3-4b-it-Q8_0.gguf", display="gemma-3-4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen3-4B-Instruct-2507-Q8_0.gguf", display="Qwen3-4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Qwen3-4B-Instruct-2507-Q4_K_M.gguf", display="Qwen3-4B-q4k", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gemma-4-E2B-it-Q8_0.gguf", display="gemma-4-E2B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Mistral-7B-Instruct-v0.3-Q8_0.gguf", display="Mistral-7B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gemma-4-E4B-it-Q8_0.gguf", display="gemma-4-E4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
-        LlmModel(file="Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", display="Llama-3.1-8B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128)
+        LlmModel(file="Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", display="Llama-3.1-8B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="gpt-oss-20b-mxfp4.gguf", display="gpt-oss-20b", quant=QuantMode.q8, quant_label="mxfp4", prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", display="Qwen3-30B-A3B", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", display="Qwen3.6-35B-A3B", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128)
     ]
 }
 
@@ -109,6 +146,12 @@ def quant_str(q : QuantMode) : string {
         return "q4"
     }
     return "fp32"
+}
+
+//! The scoreboard quant cell for a catalog entry: its explicit label when set (the kq-native
+//! Q4_K_M carriers load under QuantMode.q8), else the plain quant-mode spelling.
+def model_quant_str(m : LlmModel) : string {
+    return empty(m.quant_label) ? quant_str(m.quant) : m.quant_label
 }
 
 //! Active (per-token) parameter count in billions, derived from `t`'s Config geometry: the full
@@ -167,6 +210,9 @@ struct PlatformInfo {
     date : string
     box_profile : string
     parsec_off : bool
+    // core-pinning provenance ("das jobque mode 1; llama-bench --cpu-mask 0x55555555 --cpu-strict 1");
+    // absent = unpinned (the m1 rig)
+    @optional affinity : string
     // gen-kernel stamp provenance ("fname=suffix (manifest|fallback|reference)") — an untuned
     // box publishing fallback-tier numbers must be visible in the profile itself
     @optional tune : string
