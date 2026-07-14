@@ -127,6 +127,12 @@ namespace das {
         VariablePtr             cmresVAR = nullptr;
         bool                    failedToCMRES = false;
         bool                    isEverything = false;
+        // SimNode_MakeArrayHeap repoints abiCMRES at the heap block while constructing
+        // elements, so a CMRES-aliased local read inside a heap-mode literal would resolve
+        // into the (zeroed) heap buffer instead of the return slot. Track such reads and
+        // decline the elision for that variable — an extra move at return, always correct.
+        das_hash_set<Variable *> usedInHeapLiteral;
+        int                     heapLiteralDepth = 0;
     protected:
 
         virtual bool canVisitStructureFieldInit ( Structure * ) override { return false; }
@@ -140,12 +146,30 @@ namespace das {
             func = f;
         }
         virtual FunctionPtr visit ( Function * that ) override {
-            if ( cmresVAR && !failedToCMRES ) cmresVAR->aliasCMRES = true;
+            if ( cmresVAR && !failedToCMRES
+                && usedInHeapLiteral.find(cmresVAR) == usedInHeapLiteral.end() ) cmresVAR->aliasCMRES = true;
             func = nullptr;
             cmresVAR = nullptr;
             failedToCMRES = false;
+            usedInHeapLiteral.clear();
             DAS_ASSERT(blocks.size()==0);
+            DAS_ASSERT(heapLiteralDepth==0);
             return Visitor::visit(that);
+        }
+    // heap-mode array literal (gen2 [..] feeding to_array_move/to_table_move)
+        virtual void preVisit ( ExprMakeArray * expr ) override {
+            Visitor::preVisit(expr);
+            if ( expr->makeArrayOnHeap ) heapLiteralDepth ++;
+        }
+        virtual ExpressionPtr visit ( ExprMakeArray * expr ) override {
+            if ( expr->makeArrayOnHeap ) heapLiteralDepth --;
+            return Visitor::visit(expr);
+        }
+        virtual void preVisit ( ExprVar * expr ) override {
+            Visitor::preVisit(expr);
+            if ( heapLiteralDepth && expr->local && expr->variable ) {
+                usedInHeapLiteral.insert(expr->variable);
+            }
         }
     // ExprBlock
         virtual void preVisit ( ExprBlock * block ) override {
