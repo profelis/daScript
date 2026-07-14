@@ -4,6 +4,8 @@ module dasllama_quant shared public
 
 require math
 require dasllama/dasllama_tune  // [tuned]: reconstitute the activation-requant kernel with per-box loop hints
+require dasllama/dasllama_par   // maybe_parallel_for: the load-time bulk requant threads
+require dasllama/dasllama_math  // count_inline_run / count_parallel_dispatch_thru (the par macro's counters)
 
 // dasLLAMA quantization — curriculum step 6. Batch-1 inference is bandwidth-bound
 // (time ~= bytes_read / bandwidth), so the lever is reading FEWER bytes per weight.
@@ -53,7 +55,19 @@ def quantize_q8_0(src : array<float> | #; n : int64) : Q8Tensor {
 //! quantize one tensor at a time into the model's shared qblob/qscales. n must be a multiple of 32.
 def quantize_q8_0_into(src : array<float> | #; n : int64; var qdst : array<int8>; var sdst : array<float>; qoff, soff : int64) {
     assert(n % QK8 == 0l, "quantize_q8_0_into requires n to be a multiple of 32")
-    quantize_q8_0_into_ptr(unsafe(addr(src[0])), n, unsafe(addr(qdst[0])), unsafe(addr(sdst[0])), qoff, soff)
+    // threads only past ~2M elements (the load-time bulk requant); decode-sized calls stay inline
+    let njobs = is_job_que_available() ? int(clamp(n / 2097152l, 1l, 64l)) : 1
+    unsafe {
+        let sp = reinterpret<float const?>(addr(src[0]))
+        var qp = addr(qdst[0])
+        var scp = addr(sdst[0])
+        maybe_parallel_for(0, int(n / QK8), njobs) $(rb, re) {
+            unsafe {
+                quantize_q8_0_into_ptr(sp + int64(rb) * QK8, (int64(re) - int64(rb)) * QK8,
+                    qp, scp, qoff + int64(rb) * QK8, soff + int64(rb))
+            }
+        }
+    }
 }
 
 [hint(noalias = src, noalias = qdst, noalias = sdst)]

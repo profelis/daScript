@@ -977,13 +977,21 @@ def private load_dn_grouped(m : GGUFMeta; bytes : array<uint8> | #; var t : Mode
     gguf_read_tensor_f32(m, bytes, "blk.{l}.ssm_out.weight", raw, 0l, n)
     scratch |> resize(n)
     let din = t.config.ssm_d_inner
-    for (r in range64(dim)) {
-        for (g in range64(nk)) {
-            for (j in range64(nvpk)) {
-                let src = r * din + (g * nvpk + j) * hv
-                let dst = r * din + (j * nk + g) * hv
-                for (x in range64(hv)) {
-                    scratch[dst + x] = raw[src + x]
+    unsafe {   // column-permute threaded over output rows (disjoint writes per row)
+        let rawp = reinterpret<float const?>(addr(raw[0]))
+        var scrp = addr(scratch[0])
+        maybe_parallel_for(0, int(dim), is_job_que_available() ? 16 : 1) $(rb, re) {
+            unsafe {
+                for (r in range64(int64(rb), int64(re))) {
+                    for (g in range64(nk)) {
+                        for (j in range64(nvpk)) {
+                            let src = r * din + (g * nvpk + j) * hv
+                            let dst = r * din + (j * nk + g) * hv
+                            for (x in range64(hv)) {
+                                scrp[dst + x] = rawp[src + x]
+                            }
+                        }
+                    }
                 }
             }
         }

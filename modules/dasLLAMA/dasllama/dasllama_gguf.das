@@ -513,6 +513,114 @@ def dequant_q6k_superblock(bytes : array<uint8> | #; bo : int64; var dst : array
     }
 }
 
+// Pointer twins of the three superblock dequants — same math op-for-op, no bounds checks; the
+// threaded gguf_read_tensor_f32 arms drive these from worker lanes (raw pointers only).
+def private rd_u16_p(p : uint8 const?; o : int64) : uint {
+    unsafe {
+        return uint(p[o]) | (uint(p[o + 1l]) << 8u)
+    }
+}
+
+def private rd_i8_p(p : uint8 const?; o : int64) : int {
+    unsafe {
+        let v = int(p[o])
+        return v < 128 ? v : v - 256
+    }
+}
+
+def private q4k_scale_min_p(p : uint8 const?; so, j : int64) : int2 {
+    unsafe {
+        if (j < 4l) {
+            return int2(int(p[so + j]) & 63, int(p[so + j + 4l]) & 63)
+        }
+        let sc = (int(p[so + j + 4l]) & 15) | ((int(p[so + j - 4l]) >> 6) << 4)
+        let mn = (int(p[so + j + 4l]) >> 4) | ((int(p[so + j]) >> 6) << 4)
+        return int2(sc, mn)
+    }
+}
+
+def private dequant_q4k_superblock_p(sp : uint8 const?; bo : int64; var dp : float?; doff : int64) {
+    unsafe {
+        let d = f16_to_f32(rd_u16_p(sp, bo))
+        let dmin = f16_to_f32(rd_u16_p(sp, bo + 2l))
+        let so = bo + 4l
+        var qo = bo + 16l
+        var dsto = doff
+        for (js in range64(4l)) {
+            let s0 = q4k_scale_min_p(sp, so, 2l * js)
+            let s1 = q4k_scale_min_p(sp, so, 2l * js + 1l)
+            let d1 = d * float(s0.x)
+            let m1 = dmin * float(s0.y)
+            let d2 = d * float(s1.x)
+            let m2 = dmin * float(s1.y)
+            for (l in range64(32l)) {
+                let b = int(sp[qo + l])
+                dp[dsto + l] = d1 * float(b & 15) - m1
+                dp[dsto + 32l + l] = d2 * float(b >> 4) - m2
+            }
+            qo += 32l
+            dsto += 64l
+        }
+    }
+}
+
+def private dequant_q5k_superblock_p(sp : uint8 const?; bo : int64; var dp : float?; doff : int64) {
+    unsafe {
+        let d = f16_to_f32(rd_u16_p(sp, bo))
+        let dmin = f16_to_f32(rd_u16_p(sp, bo + 2l))
+        let so = bo + 4l
+        let qho = bo + 16l
+        var qo = bo + 48l
+        var dsto = doff
+        for (js in range64(4l)) {
+            let s0 = q4k_scale_min_p(sp, so, 2l * js)
+            let s1 = q4k_scale_min_p(sp, so, 2l * js + 1l)
+            let d1 = d * float(s0.x)
+            let m1 = dmin * float(s0.y)
+            let d2 = d * float(s1.x)
+            let m2 = dmin * float(s1.y)
+            let u1 = 1 << (int(js) * 2)
+            let u2 = 2 << (int(js) * 2)
+            for (l in range64(32l)) {
+                let b = int(sp[qo + l])
+                let h = int(sp[qho + l])
+                dp[dsto + l] = d1 * float((b & 15) + ((h & u1) != 0 ? 16 : 0)) - m1
+                dp[dsto + 32l + l] = d2 * float((b >> 4) + ((h & u2) != 0 ? 16 : 0)) - m2
+            }
+            qo += 32l
+            dsto += 64l
+        }
+    }
+}
+
+def private dequant_q6k_superblock_p(sp : uint8 const?; bo : int64; var dp : float?; doff : int64) {
+    unsafe {
+        let d = f16_to_f32(rd_u16_p(sp, bo + 208l))
+        var qlo = bo
+        var qho = bo + 128l
+        var sco = bo + 192l
+        var dsto = doff
+        for (_half in range(2)) {
+            for (l in range64(32l)) {
+                let si = l / 16l
+                let hl = int(sp[qho + l])
+                let q1 = ((int(sp[qlo + l]) & 15) | (((hl >> 0) & 3) << 4)) - 32
+                let q2 = ((int(sp[qlo + 32l + l]) & 15) | (((hl >> 2) & 3) << 4)) - 32
+                let q3 = ((int(sp[qlo + l]) >> 4) | (((hl >> 4) & 3) << 4)) - 32
+                let q4 = ((int(sp[qlo + 32l + l]) >> 4) | (((hl >> 6) & 3) << 4)) - 32
+                dp[dsto + l] = d * float(rd_i8_p(sp, sco + si)) * float(q1)
+                dp[dsto + 32l + l] = d * float(rd_i8_p(sp, sco + si + 2l)) * float(q2)
+                dp[dsto + 64l + l] = d * float(rd_i8_p(sp, sco + si + 4l)) * float(q3)
+                dp[dsto + 96l + l] = d * float(rd_i8_p(sp, sco + si + 6l)) * float(q4)
+            }
+            qlo += 64l
+            qho += 32l
+            sco += 8l
+            dsto += 128l
+        }
+    }
+}
+
 // ===== K-quant native-plane transcode (superblock payloads -> split quant/scale planes) =====
 // Plane layouts (per 256-weight superblock; element offsets are plane-local and superblock-aligned):
 //   k4 quant: 128B nibbles verbatim            k4 scale: [f16 d][f16 dmin][12B 6-bit sc/mn][4B pad] = 20B
@@ -652,6 +760,30 @@ let K5_SSB = 20l   // kq v2: 16B verbatim disk scale block + 4B pad (the k4 form
 let K6_QSB = 192l
 let K6_SSB = 18l
 
+// Raw byte copy via unaligned u64 moves + byte tail — the workhorse of the pointerized transcode
+// loops (uint8 source and destination regions never overlap).
+def private bcopy(var d : uint8?; s : uint8 const?; n : int64) {
+    unsafe {
+        var d8 = reinterpret<uint64?>(d)
+        let s8 = reinterpret<uint64 const?>(s)
+        for (i in range64(n / 8l)) {
+            d8[i] = s8[i]
+        }
+        for (i in range64((n / 8l) * 8l, n)) {
+            d[i] = s[i]
+        }
+    }
+}
+
+// Job count for a parallel transcode/dequant over `blocks` blocks of `disk_sb` bytes: ~1MB of
+// source per job, capped, 1 (inline) without a jobque.
+def private transcode_jobs(blocks, disk_sb : int64) : int {
+    if (!is_job_que_available()) {
+        return 1
+    }
+    return int(clamp(blocks * disk_sb / 1048576l, 1l, 64l))
+}
+
 // Shared header for the three file-level transcodes: locate + type-check + bounds-check, return
 // the superblock-aligned disk cursor.
 def private kq_transcode_base(m : GGUFMeta; name : string; want_type : int; type_name : string; src_off, expect_n, disk_sb : int64) : int64 {
@@ -674,40 +806,72 @@ def private kq_transcode_base(m : GGUFMeta; name : string; want_type : int; type
 //! Transcode a Q4_K tensor into the k4 planes at plane-local element offset `eloff` (from the
 //! layout's k4 cursor): quant bytes at (eloff/256)*128, scale blocks at (eloff/256)*20.
 def gguf_transcode_q4k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
-    var bo = kq_transcode_base(m, name, GGML_TYPE_Q4_K, "Q4_K", src_off, expect_n, 144l)
-    var kqo = (eloff / 256l) * K4_QSB
-    var kso = (eloff / 256l) * K4_SSB
-    for (_blk in range64(expect_n / 256l)) {
-        transcode_q4k_superblock(bytes, bo, kq, kqo, ks, kso)
-        bo += 144l
-        kqo += K4_QSB
-        kso += K4_SSB
+    let bo = kq_transcode_base(m, name, GGML_TYPE_Q4_K, "Q4_K", src_off, expect_n, 144l)
+    let nb = expect_n / 256l
+    if (nb <= 0l) {
+        return
+    }
+    unsafe {   // per-superblock byte shuffle (see transcode_q4k_superblock), threaded + pointerized
+        let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
+        var kqp = addr(kq[(eloff / 256l) * K4_QSB])
+        var ksp = addr(ks[(eloff / 256l) * K4_SSB])
+        maybe_parallel_for(0, int(nb), transcode_jobs(nb, 144l)) $(rb, re) {
+            unsafe {
+                for (blk in range64(int64(rb), int64(re))) {
+                    bcopy(ksp + blk * K4_SSB, srcp + blk * 144l, 16l)
+                    var pad = reinterpret<uint?>(ksp + blk * K4_SSB + 16l)
+                    pad[0] = 0u
+                    bcopy(kqp + blk * K4_QSB, srcp + blk * 144l + 16l, 128l)
+                }
+            }
+        }
     }
 }
 
 //! Transcode a Q5_K tensor into the k5 planes (see gguf_transcode_q4k; strides 160/20).
 def gguf_transcode_q5k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
-    var bo = kq_transcode_base(m, name, GGML_TYPE_Q5_K, "Q5_K", src_off, expect_n, 176l)
-    var kqo = (eloff / 256l) * K5_QSB
-    var kso = (eloff / 256l) * K5_SSB
-    for (_blk in range64(expect_n / 256l)) {
-        transcode_q5k_superblock(bytes, bo, kq, kqo, ks, kso)
-        bo += 176l
-        kqo += K5_QSB
-        kso += K5_SSB
+    let bo = kq_transcode_base(m, name, GGML_TYPE_Q5_K, "Q5_K", src_off, expect_n, 176l)
+    let nb = expect_n / 256l
+    if (nb <= 0l) {
+        return
+    }
+    unsafe {   // per-superblock byte shuffle (see transcode_q5k_superblock), threaded + pointerized
+        let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
+        var kqp = addr(kq[(eloff / 256l) * K5_QSB])
+        var ksp = addr(ks[(eloff / 256l) * K5_SSB])
+        maybe_parallel_for(0, int(nb), transcode_jobs(nb, 176l)) $(rb, re) {
+            unsafe {
+                for (blk in range64(int64(rb), int64(re))) {
+                    bcopy(ksp + blk * K5_SSB, srcp + blk * 176l, 16l)
+                    var pad = reinterpret<uint?>(ksp + blk * K5_SSB + 16l)
+                    pad[0] = 0u
+                    bcopy(kqp + blk * K5_QSB, srcp + blk * 176l + 48l, 128l)   // qs
+                    bcopy(kqp + blk * K5_QSB + 128l, srcp + blk * 176l + 16l, 32l)   // qh
+                }
+            }
+        }
     }
 }
 
 //! Transcode a Q6_K tensor into the k6 planes (see gguf_transcode_q4k; strides 192/18, exact).
 def gguf_transcode_q6k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
-    var bo = kq_transcode_base(m, name, GGML_TYPE_Q6_K, "Q6_K", src_off, expect_n, 210l)
-    var kqo = (eloff / 256l) * K6_QSB
-    var kso = (eloff / 256l) * K6_SSB
-    for (_blk in range64(expect_n / 256l)) {
-        transcode_q6k_superblock(bytes, bo, kq, kqo, ks, kso)
-        bo += 210l
-        kqo += K6_QSB
-        kso += K6_SSB
+    let bo = kq_transcode_base(m, name, GGML_TYPE_Q6_K, "Q6_K", src_off, expect_n, 210l)
+    let nb = expect_n / 256l
+    if (nb <= 0l) {
+        return
+    }
+    unsafe {   // per-superblock byte shuffle (see transcode_q6k_superblock), threaded + pointerized
+        let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
+        var kqp = addr(kq[(eloff / 256l) * K6_QSB])
+        var ksp = addr(ks[(eloff / 256l) * K6_SSB])
+        maybe_parallel_for(0, int(nb), transcode_jobs(nb, 210l)) $(rb, re) {
+            unsafe {
+                for (blk in range64(int64(rb), int64(re))) {
+                    bcopy(kqp + blk * K6_QSB, srcp + blk * 210l, 192l)   // ql then qh — disk order
+                    bcopy(ksp + blk * K6_SSB, srcp + blk * 210l + 192l, 18l)   // 16 sub-scales + f16 d
+                }
+            }
+        }
     }
 }
 
@@ -729,17 +893,35 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
     let gtype = m.tensors[ti].ggml_type
     let base = m.data_offset + m.tensors[ti].offset
     if (gtype == GGML_TYPE_F32) {
-        unsafe {
-            let src = temp_array(reinterpret<float?>(addr(bytes[base + src_off * 4l])), expect_n, type<float>)
-            for (i in range64(expect_n)) {
-                dst[dst_off + i] = src[i]
+        unsafe {   // raw copy, threaded in u64 words (+ one odd-float tail)
+            let sp = reinterpret<uint64 const?>(addr(bytes[base + src_off * 4l]))
+            var dp = reinterpret<uint64?>(addr(dst[dst_off]))
+            let nw = expect_n / 2l
+            maybe_parallel_for(0, int(nw), transcode_jobs(expect_n, 4l)) $(rb, re) {
+                unsafe {
+                    for (i in range64(int64(rb), int64(re))) {
+                        dp[i] = sp[i]
+                    }
+                }
+            }
+            if (expect_n % 2l != 0l) {
+                let spf = reinterpret<float const?>(addr(bytes[base + src_off * 4l]))
+                var dpf = addr(dst[dst_off])
+                dpf[expect_n - 1l] = spf[expect_n - 1l]
             }
         }
     } elif (gtype == GGML_TYPE_F16) {
-        unsafe {
-            let src = temp_array(reinterpret<uint16?>(addr(bytes[base + src_off * 2l])), expect_n, type<uint16>)
-            for (i in range64(expect_n)) {
-                dst[dst_off + i] = f16_to_f32(uint(src[i]))
+        unsafe {   // threaded 32-aligned chunks through the tuned cvt kernel (+ scalar tail)
+            let sp = reinterpret<uint16 const?>(addr(bytes[base + src_off * 2l]))
+            var dp = addr(dst[dst_off])
+            let ng = expect_n / 32l
+            maybe_parallel_for(0, int(ng), transcode_jobs(expect_n, 2l)) $(rb, re) {
+                unsafe {
+                    cvt_f16_to_f32(dp + int64(rb) * 32l, sp + int64(rb) * 32l, (int64(re) - int64(rb)) * 32l)
+                }
+            }
+            for (i in range64(ng * 32l, expect_n)) {
+                dp[i] = f16_to_f32(uint(sp[i]))
             }
         }
     } elif (gtype == GGML_TYPE_BF16) {
@@ -778,35 +960,32 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
             }
             bo += 16l
         }
-    } elif (gtype == GGML_TYPE_Q4_K) {
+    } elif (gtype == GGML_TYPE_Q4_K || gtype == GGML_TYPE_Q5_K || gtype == GGML_TYPE_Q6_K) {
         if (src_off % 256l != 0l || expect_n % 256l != 0l) {
-            panic("gguf: tensor '{name}' Q4_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
+            panic("gguf: tensor '{name}' K-quant slice [{src_off}, +{expect_n}) is not superblock-aligned")
         }
+        // threaded superblock dequant: each worker gets a temp view over ITS chunk of the disk
+        // slice + dst and drives the exact per-superblock helper — bit-identical to the serial loop
+        let sbb = gtype == GGML_TYPE_Q4_K ? 144l : (gtype == GGML_TYPE_Q5_K ? 176l : 210l)
         let nb = expect_n / 256l
-        var bo = base + (src_off / 256l) * 144l
-        for (blk in range64(nb)) {
-            dequant_q4k_superblock(bytes, bo, dst, dst_off + blk * 256l)
-            bo += 144l
-        }
-    } elif (gtype == GGML_TYPE_Q5_K) {
-        if (src_off % 256l != 0l || expect_n % 256l != 0l) {
-            panic("gguf: tensor '{name}' Q5_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
-        }
-        let nb = expect_n / 256l
-        var bo = base + (src_off / 256l) * 176l
-        for (blk in range64(nb)) {
-            dequant_q5k_superblock(bytes, bo, dst, dst_off + blk * 256l)
-            bo += 176l
-        }
-    } elif (gtype == GGML_TYPE_Q6_K) {
-        if (src_off % 256l != 0l || expect_n % 256l != 0l) {
-            panic("gguf: tensor '{name}' Q6_K slice [{src_off}, +{expect_n}) is not superblock-aligned")
-        }
-        let nb = expect_n / 256l
-        var bo = base + (src_off / 256l) * 210l
-        for (blk in range64(nb)) {
-            dequant_q6k_superblock(bytes, bo, dst, dst_off + blk * 256l)
-            bo += 210l
+        if (nb > 0l) {
+            unsafe {
+                let sp = reinterpret<uint8 const?>(addr(bytes[base + (src_off / 256l) * sbb]))
+                var dp = addr(dst[dst_off])
+                maybe_parallel_for(0, int(nb), transcode_jobs(nb, sbb)) $(rb, re) {
+                    unsafe {
+                        for (blk in range64(int64(rb), int64(re))) {
+                            if (sbb == 144l) {
+                                dequant_q4k_superblock_p(sp, blk * sbb, dp, blk * 256l)
+                            } elif (sbb == 176l) {
+                                dequant_q5k_superblock_p(sp, blk * sbb, dp, blk * 256l)
+                            } else {
+                                dequant_q6k_superblock_p(sp, blk * sbb, dp, blk * 256l)
+                            }
+                        }
+                    }
+                }
+            }
         }
     } elif (gtype == GGML_TYPE_MXFP4) {
         // block of 32: 1 E8M0 scale byte + 16 nibble bytes (low nibbles = elems 0..15, high = 16..31);
