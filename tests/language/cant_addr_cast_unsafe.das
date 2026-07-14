@@ -3,8 +3,6 @@
 options gen2
 expect 31000:2, 31004    // unsafe_address, unsafe_cast
 
-require math
-
 def test {
     var v = float3(1., 2., 3.)
     var p = addr<float?>(v)     // 31000 + 31004

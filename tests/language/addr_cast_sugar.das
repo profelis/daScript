@@ -2,7 +2,6 @@ options gen2
 options indenting = 4
 
 require dastest/testing_boost public
-require math
 
 [test]
 def test_addr_cast_basic(t : T?) {
