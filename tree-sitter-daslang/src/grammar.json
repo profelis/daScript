@@ -4280,34 +4280,34 @@
           "value": "("
         },
         {
-          "type": "FIELD",
-          "name": "object",
-          "content": {
-            "type": "CHOICE",
-            "members": [
-              {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "object",
+              "content": {
                 "type": "SYMBOL",
                 "name": "_expression"
-              },
-              {
-                "type": "SEQ",
-                "members": [
-                  {
-                    "type": "STRING",
-                    "value": "module"
-                  },
-                  {
-                    "type": "FIELD",
-                    "name": "module",
-                    "content": {
-                      "type": "SYMBOL",
-                      "name": "require_module_name"
-                    }
-                  }
-                ]
               }
-            ]
-          }
+            },
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "module"
+                },
+                {
+                  "type": "FIELD",
+                  "name": "module",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "require_module_name"
+                  }
+                }
+              ]
+            }
+          ]
         },
         {
           "type": "STRING",

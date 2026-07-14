@@ -4523,15 +4523,11 @@
       },
       "object": {
         "multiple": false,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "_expression",
             "named": true
-          },
-          {
-            "type": "module",
-            "named": false
           }
         ]
       }
