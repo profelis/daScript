@@ -116,9 +116,9 @@ def test_reduce_gpu_vs_cpu(t : T?) {
                 var bfdst = buf_fill(dev, GROUPS, -1.0)
                 var bufs <- [busrc, budst, bfsrc, bfdst]
                 var rerr : string
-                let ranU = run_compute_1d(queue, psoU, bufs, uint(N), TPG, rerr)
+                let ranU = run_compute_1d(queue, psoU, bufs, uint(N), TPG, rerr, reduce_u_gpu_msl_tgmem)
                 t |> success(ranU, "run_compute_1d(u): {rerr}")
-                let ranF = run_compute_1d(queue, psoF, bufs, uint(N), TPG, rerr)
+                let ranF = run_compute_1d(queue, psoF, bufs, uint(N), TPG, rerr, reduce_f_gpu_msl_tgmem)
                 t |> success(ranF, "run_compute_1d(f): {rerr}")
                 if (ranU && ranF) {
                     gpu_bad = buf_mismatch_exact(budst, wantU) + buf_mismatch_approx(bfdst, wantF)

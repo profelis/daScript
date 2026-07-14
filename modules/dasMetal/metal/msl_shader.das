@@ -14,6 +14,9 @@ options indenting = 4
 //   N_entry    : string  — the kernel entry-point name (feed to metal_new_function)
 //   N_fastmath : bool    — the [metal_kernel(fastmath=...)] property, default true; feed to
 //                          metal_new_library_from_source
+//   N_tgmem    : uint64  — total dynamic [[threadgroup(0)]] bytes the kernel's @workgroup
+//                          members occupy (0 = none); the dispatch MUST pass it to
+//                          setThreadgroupMemoryLength (run_compute_1d takes it directly)
 //   N_census   : string  — newline-joined census kinds (gate B; text has no disassembler, so the
 //                          census is recorded at emit time and published for the meta-test)
 
@@ -54,7 +57,8 @@ class MetalKernel : AstFunctionAnnotation {
         return (add_typed_global(argName, Type.tString, func.at, errors) &&
             add_typed_global("{argName}_entry", Type.tString, func.at, errors) &&
             add_typed_global("{argName}_fastmath", Type.tBool, func.at, errors) &&
-            add_typed_global("{argName}_census", Type.tString, func.at, errors))
+            add_typed_global("{argName}_census", Type.tString, func.at, errors) &&
+            add_typed_global("{argName}_tgmem", Type.tUInt64, func.at, errors))
     }
     def override patch(var func : FunctionPtr; var group : ModuleGroup; args, progArgs : AnnotationArgumentList; var errors : das_string; var astChanged : bool&) : bool {
         // Metal's runtime compiler does its own inlining — the CPU auto-inliner (patchInline,
@@ -84,7 +88,8 @@ class MetalKernel : AstFunctionAnnotation {
         var err : array<string>
         var census : table<string>
         let cfg = MslEmitConfig()
-        let text = generate_msl(func, err, cfg, census)
+        var tgmem = 0ul
+        let text = generate_msl(func, err, cfg, census, tgmem)
         if (!empty(err)) {
             errors := join(err, "\n")
             return false
@@ -99,6 +104,12 @@ class MetalKernel : AstFunctionAnnotation {
             fmGlob.init = new ExprConstBool(at = func.at, value = fastmath,
                 _type = new TypeDecl(at = func.at, baseType = Type.tBool))
             fmGlob._type.flags.constant = true
+        }
+        var tgGlob = find_variable(compiling_module(), "{argName}_tgmem")
+        if (tgGlob != null && tgGlob.init == null) {
+            tgGlob.init = new ExprConstUInt64(at = func.at, value = tgmem,
+                _type = new TypeDecl(at = func.at, baseType = Type.tUInt64))
+            tgGlob._type.flags.constant = true
         }
         return true
     }

@@ -5,6 +5,7 @@ require dastest/testing_boost
 require metal/msl_shader
 require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — GPU driver half, Apple builds only
 require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — the production kernel MSL (v0 baseline)
+require dasllama/dasllama_metal_prefill  // nolint:STYLE030 — the production mul_mm companions (v25 = zero copy drift)
 require daslib/fio
 require math  // nolint:STYLE030 — used only inside the Apple static_if half; off-Apple lint sees the branch compiled out
 require strings
@@ -1363,6 +1364,383 @@ class MetalGemmLab6464Vec4 {
     }
 }
 
+// v18: v13 with 32-ELEMENT runs — each thread stages one whole Q8 block (row, kb): ONE scale
+// load (v13 pays it twice, once per 16-half) + 8 byte4 loads + 32 cvt/stores. 64 threads cover
+// A, the other 64 cover B — same tiles, same mac loop, half the scale traffic and address setup.
+class MetalGemmLab6464Run32 {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // 64 tokens x 32 k
+    @workgroup tb : float16[2048]           // 32 k x 64 outputs, transposed
+
+    [metal_kernel(name="lab_6464run32_msl")]
+    def lab_6464run32 {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let ntileN = ndim / 64u
+        let mBase = (gl_WorkGroupID.x / ntileN) * 64u
+        let nBase = (gl_WorkGroupID.x % ntileN) * 64u
+        let qm = (sg / 2u) * 32u
+        let qn = (sg % 2u) * 32u
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        var c20 : simdgroup_float8x8
+        var c21 : simdgroup_float8x8
+        var c22 : simdgroup_float8x8
+        var c23 : simdgroup_float8x8
+        var c30 : simdgroup_float8x8
+        var c31 : simdgroup_float8x8
+        var c32 : simdgroup_float8x8
+        var c33 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let ra = lid % 64u                  // staged row (token row for A half, output row for B)
+        let isB = lid >= 64u
+        var kb = 0u
+        while (kb * 32u < kdim) {
+            if (isB) {
+                let sw = ws[(nBase + ra) * (kdim / 32u) + kb]
+                let srcw = (nBase + ra) * kdim4 + kb * 8u
+                var j4 = 0u
+                while (j4 < 8u) {
+                    let v = float4(int4(wq[srcw + j4])) * sw
+                    let o = j4 * 4u
+                    tb[o * 64u + ra] = float16(v.x)
+                    tb[(o + 1u) * 64u + ra] = float16(v.y)
+                    tb[(o + 2u) * 64u + ra] = float16(v.z)
+                    tb[(o + 3u) * 64u + ra] = float16(v.w)
+                    j4++
+                }
+            } else {
+                let s = xs[(mBase + ra) * (kdim / 32u) + kb]
+                let src = (mBase + ra) * kdim4 + kb * 8u
+                let dst = ra * 32u
+                var i4 = 0u
+                while (i4 < 8u) {
+                    let v = float4(int4(xq[src + i4])) * s
+                    let o = dst + i4 * 4u
+                    ta[o] = float16(v.x)
+                    ta[o + 1u] = float16(v.y)
+                    ta[o + 2u] = float16(v.z)
+                    ta[o + 3u] = float16(v.w)
+                    i4++
+                }
+            }
+            barrier()
+            var k8 = 0u
+            while (k8 < 32u) {
+                var a0 : simdgroup_half8x8
+                var a1 : simdgroup_half8x8
+                var a2 : simdgroup_half8x8
+                var a3 : simdgroup_half8x8
+                var b0 : simdgroup_half8x8
+                var b1 : simdgroup_half8x8
+                var b2 : simdgroup_half8x8
+                var b3 : simdgroup_half8x8
+                simdgroup_load(a0, ta, qm * 32u + k8, 32u)
+                simdgroup_load(a1, ta, (qm + 8u) * 32u + k8, 32u)
+                simdgroup_load(a2, ta, (qm + 16u) * 32u + k8, 32u)
+                simdgroup_load(a3, ta, (qm + 24u) * 32u + k8, 32u)
+                simdgroup_load(b0, tb, k8 * 64u + qn, 64u)
+                simdgroup_load(b1, tb, k8 * 64u + (qn + 8u), 64u)
+                simdgroup_load(b2, tb, k8 * 64u + (qn + 16u), 64u)
+                simdgroup_load(b3, tb, k8 * 64u + (qn + 24u), 64u)
+                simdgroup_multiply_accumulate(c00, a0, b0, c00)
+                simdgroup_multiply_accumulate(c01, a0, b1, c01)
+                simdgroup_multiply_accumulate(c02, a0, b2, c02)
+                simdgroup_multiply_accumulate(c03, a0, b3, c03)
+                simdgroup_multiply_accumulate(c10, a1, b0, c10)
+                simdgroup_multiply_accumulate(c11, a1, b1, c11)
+                simdgroup_multiply_accumulate(c12, a1, b2, c12)
+                simdgroup_multiply_accumulate(c13, a1, b3, c13)
+                simdgroup_multiply_accumulate(c20, a2, b0, c20)
+                simdgroup_multiply_accumulate(c21, a2, b1, c21)
+                simdgroup_multiply_accumulate(c22, a2, b2, c22)
+                simdgroup_multiply_accumulate(c23, a2, b3, c23)
+                simdgroup_multiply_accumulate(c30, a3, b0, c30)
+                simdgroup_multiply_accumulate(c31, a3, b1, c31)
+                simdgroup_multiply_accumulate(c32, a3, b2, c32)
+                simdgroup_multiply_accumulate(c33, a3, b3, c33)
+                k8 += 8u
+            }
+            barrier()
+            kb++
+        }
+        let row0 = mBase + qm
+        let col0 = nBase + qn
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c20, y, (row0 + 16u) * ndim + col0, ndim)
+        simdgroup_store(c21, y, (row0 + 16u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c22, y, (row0 + 16u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c23, y, (row0 + 16u) * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c30, y, (row0 + 24u) * ndim + col0, ndim)
+        simdgroup_store(c31, y, (row0 + 24u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c32, y, (row0 + 24u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c33, y, (row0 + 24u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+// v19: v13 with the staging rebuilt on the two emitter extensions — B stages ROW-major
+// ([64 outputs x 32 k], contiguous like A) and the mac loop transposes at simdgroup_load
+// (the MSL transpose_matrix flag), killing the 64-strided threadgroup writes; ALL staging
+// stores collapse 4:1 through tg_store_half4 (one aligned half4 per byte4 dequant).
+class MetalGemmLab6464Trans {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // 64 tokens x 32 k
+    @workgroup tb : float16[2048]           // 64 outputs x 32 k — ROW-major (transposed at load)
+
+    [metal_kernel(name="lab_6464trans_msl")]
+    def lab_6464trans {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let ntileN = ndim / 64u
+        let mBase = (gl_WorkGroupID.x / ntileN) * 64u
+        let nBase = (gl_WorkGroupID.x % ntileN) * 64u
+        let qm = (sg / 2u) * 32u
+        let qn = (sg % 2u) * 32u
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        var c20 : simdgroup_float8x8
+        var c21 : simdgroup_float8x8
+        var c22 : simdgroup_float8x8
+        var c23 : simdgroup_float8x8
+        var c30 : simdgroup_float8x8
+        var c31 : simdgroup_float8x8
+        var c32 : simdgroup_float8x8
+        var c33 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let ra = lid / 2u
+        let c0a = (lid % 2u) * 16u
+        var kb = 0u
+        while (kb * 32u < kdim) {
+            {
+                let s = xs[(mBase + ra) * (kdim / 32u) + kb]
+                let src = (mBase + ra) * kdim4 + (kb * 32u + c0a) / 4u
+                let dst = ra * 32u + c0a
+                var i4 = 0u
+                while (i4 < 4u) {
+                    let v = float4(int4(xq[src + i4])) * s
+                    tg_store_half4(ta, dst + i4 * 4u, v)
+                    i4++
+                }
+            }
+            {
+                let sw = ws[(nBase + ra) * (kdim / 32u) + kb]
+                let srcw = (nBase + ra) * kdim4 + (kb * 32u + c0a) / 4u
+                let dstw = ra * 32u + c0a
+                var j4 = 0u
+                while (j4 < 4u) {
+                    let v = float4(int4(wq[srcw + j4])) * sw
+                    tg_store_half4(tb, dstw + j4 * 4u, v)
+                    j4++
+                }
+            }
+            barrier()
+            var k8 = 0u
+            while (k8 < 32u) {
+                var a0 : simdgroup_half8x8
+                var a1 : simdgroup_half8x8
+                var a2 : simdgroup_half8x8
+                var a3 : simdgroup_half8x8
+                var b0 : simdgroup_half8x8
+                var b1 : simdgroup_half8x8
+                var b2 : simdgroup_half8x8
+                var b3 : simdgroup_half8x8
+                simdgroup_load(a0, ta, qm * 32u + k8, 32u)
+                simdgroup_load(a1, ta, (qm + 8u) * 32u + k8, 32u)
+                simdgroup_load(a2, ta, (qm + 16u) * 32u + k8, 32u)
+                simdgroup_load(a3, ta, (qm + 24u) * 32u + k8, 32u)
+                simdgroup_load(b0, tb, qn * 32u + k8, 32u, true)
+                simdgroup_load(b1, tb, (qn + 8u) * 32u + k8, 32u, true)
+                simdgroup_load(b2, tb, (qn + 16u) * 32u + k8, 32u, true)
+                simdgroup_load(b3, tb, (qn + 24u) * 32u + k8, 32u, true)
+                simdgroup_multiply_accumulate(c00, a0, b0, c00)
+                simdgroup_multiply_accumulate(c01, a0, b1, c01)
+                simdgroup_multiply_accumulate(c02, a0, b2, c02)
+                simdgroup_multiply_accumulate(c03, a0, b3, c03)
+                simdgroup_multiply_accumulate(c10, a1, b0, c10)
+                simdgroup_multiply_accumulate(c11, a1, b1, c11)
+                simdgroup_multiply_accumulate(c12, a1, b2, c12)
+                simdgroup_multiply_accumulate(c13, a1, b3, c13)
+                simdgroup_multiply_accumulate(c20, a2, b0, c20)
+                simdgroup_multiply_accumulate(c21, a2, b1, c21)
+                simdgroup_multiply_accumulate(c22, a2, b2, c22)
+                simdgroup_multiply_accumulate(c23, a2, b3, c23)
+                simdgroup_multiply_accumulate(c30, a3, b0, c30)
+                simdgroup_multiply_accumulate(c31, a3, b1, c31)
+                simdgroup_multiply_accumulate(c32, a3, b2, c32)
+                simdgroup_multiply_accumulate(c33, a3, b3, c33)
+                k8 += 8u
+            }
+            barrier()
+            kb++
+        }
+        let row0 = mBase + qm
+        let col0 = nBase + qn
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c20, y, (row0 + 16u) * ndim + col0, ndim)
+        simdgroup_store(c21, y, (row0 + 16u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c22, y, (row0 + 16u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c23, y, (row0 + 16u) * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c30, y, (row0 + 24u) * ndim + col0, ndim)
+        simdgroup_store(c31, y, (row0 + 24u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c32, y, (row0 + 24u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c33, y, (row0 + 24u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+// v20: DEVICE-DIRECT B — the W tile never stages at all: B tiles simdgroup_load straight from
+// a resident PRE-DEQUANTIZED f16 W panel (row-major, transposed at load), killing the whole
+// B-side staging chain (device byte4 loads + dequant ALU + tg stores + half the barrier
+// pressure); only the A (activation) half stages. Trades W device traffic 1.03 -> 2 B/weight.
+class MetalGemmLab6464DevB {
+    @ssbo @binding = 0 wh : array<float16>  // [d x kdim] f16 weights (dequantized at upload)
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // 64 tokens x 32 k — the only staged tile
+
+    [metal_kernel(name="lab_6464devb_msl")]
+    def lab_6464devb {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let ntileN = ndim / 64u
+        let mBase = (gl_WorkGroupID.x / ntileN) * 64u
+        let nBase = (gl_WorkGroupID.x % ntileN) * 64u
+        let qm = (sg / 2u) * 32u
+        let qn = (sg % 2u) * 32u
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        var c20 : simdgroup_float8x8
+        var c21 : simdgroup_float8x8
+        var c22 : simdgroup_float8x8
+        var c23 : simdgroup_float8x8
+        var c30 : simdgroup_float8x8
+        var c31 : simdgroup_float8x8
+        var c32 : simdgroup_float8x8
+        var c33 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let ra = lid / 2u
+        let c0a = (lid % 2u) * 16u
+        var kb = 0u
+        while (kb * 32u < kdim) {
+            {
+                let s = xs[(mBase + ra) * (kdim / 32u) + kb]
+                let src = (mBase + ra) * kdim4 + (kb * 32u + c0a) / 4u
+                let dst = ra * 32u + c0a
+                var i4 = 0u
+                while (i4 < 4u) {
+                    let v = float4(int4(xq[src + i4])) * s
+                    tg_store_half4(ta, dst + i4 * 4u, v)
+                    i4++
+                }
+            }
+            barrier()
+            let kw = kb * 32u
+            var k8 = 0u
+            while (k8 < 32u) {
+                var a0 : simdgroup_half8x8
+                var a1 : simdgroup_half8x8
+                var a2 : simdgroup_half8x8
+                var a3 : simdgroup_half8x8
+                var b0 : simdgroup_half8x8
+                var b1 : simdgroup_half8x8
+                var b2 : simdgroup_half8x8
+                var b3 : simdgroup_half8x8
+                simdgroup_load(a0, ta, qm * 32u + k8, 32u)
+                simdgroup_load(a1, ta, (qm + 8u) * 32u + k8, 32u)
+                simdgroup_load(a2, ta, (qm + 16u) * 32u + k8, 32u)
+                simdgroup_load(a3, ta, (qm + 24u) * 32u + k8, 32u)
+                simdgroup_load(b0, wh, (nBase + qn) * kdim + kw + k8, kdim, true)
+                simdgroup_load(b1, wh, (nBase + qn + 8u) * kdim + kw + k8, kdim, true)
+                simdgroup_load(b2, wh, (nBase + qn + 16u) * kdim + kw + k8, kdim, true)
+                simdgroup_load(b3, wh, (nBase + qn + 24u) * kdim + kw + k8, kdim, true)
+                simdgroup_multiply_accumulate(c00, a0, b0, c00)
+                simdgroup_multiply_accumulate(c01, a0, b1, c01)
+                simdgroup_multiply_accumulate(c02, a0, b2, c02)
+                simdgroup_multiply_accumulate(c03, a0, b3, c03)
+                simdgroup_multiply_accumulate(c10, a1, b0, c10)
+                simdgroup_multiply_accumulate(c11, a1, b1, c11)
+                simdgroup_multiply_accumulate(c12, a1, b2, c12)
+                simdgroup_multiply_accumulate(c13, a1, b3, c13)
+                simdgroup_multiply_accumulate(c20, a2, b0, c20)
+                simdgroup_multiply_accumulate(c21, a2, b1, c21)
+                simdgroup_multiply_accumulate(c22, a2, b2, c22)
+                simdgroup_multiply_accumulate(c23, a2, b3, c23)
+                simdgroup_multiply_accumulate(c30, a3, b0, c30)
+                simdgroup_multiply_accumulate(c31, a3, b1, c31)
+                simdgroup_multiply_accumulate(c32, a3, b2, c32)
+                simdgroup_multiply_accumulate(c33, a3, b3, c33)
+                k8 += 8u
+            }
+            barrier()
+            kb++
+        }
+        let row0 = mBase + qm
+        let col0 = nBase + qn
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c20, y, (row0 + 16u) * ndim + col0, ndim)
+        simdgroup_store(c21, y, (row0 + 16u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c22, y, (row0 + 16u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c23, y, (row0 + 16u) * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c30, y, (row0 + 24u) * ndim + col0, ndim)
+        simdgroup_store(c31, y, (row0 + 24u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c32, y, (row0 + 24u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c33, y, (row0 + 24u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
 // knockout: v13 with staging removed — the 64x64 math + barrier + store ceiling
 class MetalGemmLab6464NoStage {
     @ssbo @binding = 0 wq : array<byte4>
@@ -1773,6 +2151,1353 @@ class MetalGemmLab6464Prefetch {
     }
 }
 
+// v21: the ggml kernel_mul_mm GEOMETRY on our planar Q8 contract — measured head-to-head vs
+// the (since-removed) verbatim llama.cpp reference. 64 outputs x 32 tokens per threadgroup (their NR0xNR1 — transposed
+// vs our 64x64), TILE-MAJOR 8x8 shared blocks so every simdgroup_load is one contiguous
+// 64-half run at stride 8, weights transposed WITHIN their tiles at staging (the math loop
+// needs no transposed loads), and all device reads issued into registers BEFORE the
+// pre-staging barrier (their latency-hiding order). Each simdgroup owns a 16-token x
+// 32-output quadrant: 8 accumulators, 6 tile loads per 8-k slab. Deviations from ggml, both
+// deliberate: our planar int8 + f32-scale buffers via byte4 loads (theirs: interleaved blobs
+// read a byte at a time), and no simdgroup_barrier(mem_none) scheduling hints (no emitter
+// spelling; production would inherit them via a fastmath-safe pragma if this lands).
+class MetalGemmLabGgmlGeo {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
+    @workgroup tb : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, each tile (token row, k col)
+
+    [metal_kernel(name="lab_ggmlgeo_msl")]
+    def lab_ggmlgeo {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u  // token rows — FAST axis: concurrent tgs share the W panel (ggml rasterization)
+        let nBase = gl_WorkGroupID.y * 64u  // output (weight) rows
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        // A split: each thread stages 16 weight elems — row lr0, k half il0
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA         // k-tiles il0*2 (lanes at stride 8)
+        let tA1 = ((il0 * 2u + 1u) * 8u + syA) * 64u + lxA  // k-tile il0*2+1
+        // B split: each thread stages 8 activation elems — token lr1, k offset iy
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u           // this simdgroup's A quadrant: 4 row-tiles of 64
+        let bB = (sg / 2u) * 128u           // this simdgroup's B quadrant: 2 token-tiles of 64
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            // device reads first — they fly while the previous math loop drains
+            let sA = ws[(nBase + lr0) * nkb + kb]
+            let srcA = (nBase + lr0) * kdim4 + (kb * 32u + il0 * 16u) / 4u
+            let a0 = wq[srcA]
+            let a1 = wq[srcA + 1u]
+            let a2 = wq[srcA + 2u]
+            let a3 = wq[srcA + 3u]
+            let sB = xs[(mBase + lr1) * nkb + kb]
+            let srcB = (mBase + lr1) * kdim4 + (kb * 32u + iy) / 4u
+            let b0 = xq[srcB]
+            let b1 = xq[srcB + 1u]
+            barrier()                       // previous math done reading the tiles
+            let va0 = float4(int4(a0)) * sA
+            let va1 = float4(int4(a1)) * sA
+            let va2 = float4(int4(a2)) * sA
+            let va3 = float4(int4(a3)) * sA
+            ta[tA0] = float16(va0.x)        // ly = k%8 -> +8 per lane; +32 = second 4-k half
+            ta[tA0 + 8u] = float16(va0.y)
+            ta[tA0 + 16u] = float16(va0.z)
+            ta[tA0 + 24u] = float16(va0.w)
+            ta[tA0 + 32u] = float16(va1.x)
+            ta[tA0 + 40u] = float16(va1.y)
+            ta[tA0 + 48u] = float16(va1.z)
+            ta[tA0 + 56u] = float16(va1.w)
+            ta[tA1] = float16(va2.x)
+            ta[tA1 + 8u] = float16(va2.y)
+            ta[tA1 + 16u] = float16(va2.z)
+            ta[tA1 + 24u] = float16(va2.w)
+            ta[tA1 + 32u] = float16(va3.x)
+            ta[tA1 + 40u] = float16(va3.y)
+            ta[tA1 + 48u] = float16(va3.z)
+            ta[tA1 + 56u] = float16(va3.w)
+            let vb0 = float4(int4(b0)) * sB
+            let vb1 = float4(int4(b1)) * sB
+            tg_store_half4(tb, ibB, vb0)    // k runs contiguous within the tile row — 2 vector stores
+            tg_store_half4(tb, ibB + 4u, vb1)
+            barrier()
+            // math fully unrolled (their FOR_UNROLL): 4 k-slabs x (6 tile loads + 8 macs),
+            // constant tile offsets off hoisted quadrant bases
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u  // accumulator rows = tokens
+        let col0 = nBase + (sg % 2u) * 32u  // accumulator cols = outputs
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+class MetalGemmLabGgmlGeoF32X {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 xf : array<float4>   // PRE-DEQUANTIZED f32 activations — the raw-f32 B contract
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
+    @workgroup tb : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, each tile (token row, k col)
+
+    [metal_kernel(name="lab_ggmlgeof32x_msl")]
+    def lab_ggmlgeof32x {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u  // token rows — FAST axis: concurrent tgs share the W panel (ggml rasterization)
+        let nBase = gl_WorkGroupID.y * 64u  // output (weight) rows
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        // A split: each thread stages 16 weight elems — row lr0, k half il0
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA         // k-tiles il0*2 (lanes at stride 8)
+        let tA1 = ((il0 * 2u + 1u) * 8u + syA) * 64u + lxA  // k-tile il0*2+1
+        // B split: each thread stages 8 activation elems — token lr1, k offset iy
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u           // this simdgroup's A quadrant: 4 row-tiles of 64
+        let bB = (sg / 2u) * 128u           // this simdgroup's B quadrant: 2 token-tiles of 64
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            // device reads first — they fly while the previous math loop drains
+            let sA = ws[(nBase + lr0) * nkb + kb]
+            let srcA = (nBase + lr0) * kdim4 + (kb * 32u + il0 * 16u) / 4u
+            let a0 = wq[srcA]
+            let a1 = wq[srcA + 1u]
+            let a2 = wq[srcA + 2u]
+            let a3 = wq[srcA + 3u]
+            let srcB = (mBase + lr1) * kdim4 + (kb * 32u + iy) / 4u
+            let b0 = xf[srcB]
+            let b1 = xf[srcB + 1u]
+            barrier()                       // previous math done reading the tiles
+            let va0 = float4(int4(a0)) * sA
+            let va1 = float4(int4(a1)) * sA
+            let va2 = float4(int4(a2)) * sA
+            let va3 = float4(int4(a3)) * sA
+            ta[tA0] = float16(va0.x)        // ly = k%8 -> +8 per lane; +32 = second 4-k half
+            ta[tA0 + 8u] = float16(va0.y)
+            ta[tA0 + 16u] = float16(va0.z)
+            ta[tA0 + 24u] = float16(va0.w)
+            ta[tA0 + 32u] = float16(va1.x)
+            ta[tA0 + 40u] = float16(va1.y)
+            ta[tA0 + 48u] = float16(va1.z)
+            ta[tA0 + 56u] = float16(va1.w)
+            ta[tA1] = float16(va2.x)
+            ta[tA1 + 8u] = float16(va2.y)
+            ta[tA1 + 16u] = float16(va2.z)
+            ta[tA1 + 24u] = float16(va2.w)
+            ta[tA1 + 32u] = float16(va3.x)
+            ta[tA1 + 40u] = float16(va3.y)
+            ta[tA1 + 48u] = float16(va3.z)
+            ta[tA1 + 56u] = float16(va3.w)
+            tg_store_half4(tb, ibB, b0)     // no dequant on B — pure convert-and-store
+            tg_store_half4(tb, ibB + 4u, b1)
+            barrier()
+            // math fully unrolled (their FOR_UNROLL): 4 k-slabs x (6 tile loads + 8 macs),
+            // constant tile offsets off hoisted quadrant bases
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u  // accumulator rows = tokens
+        let col0 = nBase + (sg % 2u) * 32u  // accumulator cols = outputs
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+class MetalGemmLabGgmlGeoNoScale {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
+    @workgroup tb : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, each tile (token row, k col)
+
+    [metal_kernel(name="lab_ggmlgeonosc_msl")]
+    def lab_ggmlgeonosc {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u  // token rows — FAST axis: concurrent tgs share the W panel (ggml rasterization)
+        let nBase = gl_WorkGroupID.y * 64u  // output (weight) rows
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        // A split: each thread stages 16 weight elems — row lr0, k half il0
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA         // k-tiles il0*2 (lanes at stride 8)
+        let tA1 = ((il0 * 2u + 1u) * 8u + syA) * 64u + lxA  // k-tile il0*2+1
+        // B split: each thread stages 8 activation elems — token lr1, k offset iy
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u           // this simdgroup's A quadrant: 4 row-tiles of 64
+        let bB = (sg / 2u) * 128u           // this simdgroup's B quadrant: 2 token-tiles of 64
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            // device reads first — they fly while the previous math loop drains
+            let sA = 1.0
+            let srcA = (nBase + lr0) * kdim4 + (kb * 32u + il0 * 16u) / 4u
+            let a0 = wq[srcA]
+            let a1 = wq[srcA + 1u]
+            let a2 = wq[srcA + 2u]
+            let a3 = wq[srcA + 3u]
+            let sB = 1.0
+            let srcB = (mBase + lr1) * kdim4 + (kb * 32u + iy) / 4u
+            let b0 = xq[srcB]
+            let b1 = xq[srcB + 1u]
+            barrier()                       // previous math done reading the tiles
+            let va0 = float4(int4(a0)) * sA
+            let va1 = float4(int4(a1)) * sA
+            let va2 = float4(int4(a2)) * sA
+            let va3 = float4(int4(a3)) * sA
+            ta[tA0] = float16(va0.x)        // ly = k%8 -> +8 per lane; +32 = second 4-k half
+            ta[tA0 + 8u] = float16(va0.y)
+            ta[tA0 + 16u] = float16(va0.z)
+            ta[tA0 + 24u] = float16(va0.w)
+            ta[tA0 + 32u] = float16(va1.x)
+            ta[tA0 + 40u] = float16(va1.y)
+            ta[tA0 + 48u] = float16(va1.z)
+            ta[tA0 + 56u] = float16(va1.w)
+            ta[tA1] = float16(va2.x)
+            ta[tA1 + 8u] = float16(va2.y)
+            ta[tA1 + 16u] = float16(va2.z)
+            ta[tA1 + 24u] = float16(va2.w)
+            ta[tA1 + 32u] = float16(va3.x)
+            ta[tA1 + 40u] = float16(va3.y)
+            ta[tA1 + 48u] = float16(va3.z)
+            ta[tA1 + 56u] = float16(va3.w)
+            let vb0 = float4(int4(b0)) * sB
+            let vb1 = float4(int4(b1)) * sB
+            tg_store_half4(tb, ibB, vb0)    // k runs contiguous within the tile row — 2 vector stores
+            tg_store_half4(tb, ibB + 4u, vb1)
+            barrier()
+            // math fully unrolled (their FOR_UNROLL): 4 k-slabs x (6 tile loads + 8 macs),
+            // constant tile offsets off hoisted quadrant bases
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u  // accumulator rows = tokens
+        let col0 = nBase + (sg % 2u) * 32u  // accumulator cols = outputs
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+class MetalGemmLabGgmlGeoScT {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>     // TRANSPOSED: [block][row] — 64 A-scales/tg = 4 cachelines, not 64
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
+    @workgroup tb : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, each tile (token row, k col)
+
+    [metal_kernel(name="lab_ggmlgeosct_msl")]
+    def lab_ggmlgeosct {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u  // token rows — FAST axis: concurrent tgs share the W panel (ggml rasterization)
+        let nBase = gl_WorkGroupID.y * 64u  // output (weight) rows
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        // A split: each thread stages 16 weight elems — row lr0, k half il0
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA         // k-tiles il0*2 (lanes at stride 8)
+        let tA1 = ((il0 * 2u + 1u) * 8u + syA) * 64u + lxA  // k-tile il0*2+1
+        // B split: each thread stages 8 activation elems — token lr1, k offset iy
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u           // this simdgroup's A quadrant: 4 row-tiles of 64
+        let bB = (sg / 2u) * 128u           // this simdgroup's B quadrant: 2 token-tiles of 64
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            // device reads first — they fly while the previous math loop drains
+            let sA = ws[kb * ndim + nBase + lr0]
+            let srcA = (nBase + lr0) * kdim4 + (kb * 32u + il0 * 16u) / 4u
+            let a0 = wq[srcA]
+            let a1 = wq[srcA + 1u]
+            let a2 = wq[srcA + 2u]
+            let a3 = wq[srcA + 3u]
+            let sB = xs[(mBase + lr1) * nkb + kb]
+            let srcB = (mBase + lr1) * kdim4 + (kb * 32u + iy) / 4u
+            let b0 = xq[srcB]
+            let b1 = xq[srcB + 1u]
+            barrier()                       // previous math done reading the tiles
+            let va0 = float4(int4(a0)) * sA
+            let va1 = float4(int4(a1)) * sA
+            let va2 = float4(int4(a2)) * sA
+            let va3 = float4(int4(a3)) * sA
+            ta[tA0] = float16(va0.x)        // ly = k%8 -> +8 per lane; +32 = second 4-k half
+            ta[tA0 + 8u] = float16(va0.y)
+            ta[tA0 + 16u] = float16(va0.z)
+            ta[tA0 + 24u] = float16(va0.w)
+            ta[tA0 + 32u] = float16(va1.x)
+            ta[tA0 + 40u] = float16(va1.y)
+            ta[tA0 + 48u] = float16(va1.z)
+            ta[tA0 + 56u] = float16(va1.w)
+            ta[tA1] = float16(va2.x)
+            ta[tA1 + 8u] = float16(va2.y)
+            ta[tA1 + 16u] = float16(va2.z)
+            ta[tA1 + 24u] = float16(va2.w)
+            ta[tA1 + 32u] = float16(va3.x)
+            ta[tA1 + 40u] = float16(va3.y)
+            ta[tA1 + 48u] = float16(va3.z)
+            ta[tA1 + 56u] = float16(va3.w)
+            let vb0 = float4(int4(b0)) * sB
+            let vb1 = float4(int4(b1)) * sB
+            tg_store_half4(tb, ibB, vb0)    // k runs contiguous within the tile row — 2 vector stores
+            tg_store_half4(tb, ibB + 4u, vb1)
+            barrier()
+            // math fully unrolled (their FOR_UNROLL): 4 k-slabs x (6 tile loads + 8 macs),
+            // constant tile offsets off hoisted quadrant bases
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u  // accumulator rows = tokens
+        let col0 = nBase + (sg % 2u) * 32u  // accumulator cols = outputs
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+class MetalGemmLabBlob36 {
+    @ssbo @binding = 0 wsc : array<float>   // 36B-block W blob (f32 scale + 32 int8), SCALE view: scale of block b at 9*b
+    @ssbo @binding = 1 wqv : array<byte4>   // the SAME blob buffer, QUANT view: block b quants at 9*b + 1 .. 9*b + 8
+    @ssbo @binding = 2 xf : array<float4>   // PRE-DEQUANTIZED f32 activations — the raw-f32 B contract
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
+    @workgroup tb : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, each tile (token row, k col)
+
+    [metal_kernel(name="lab_blob36_msl")]
+    def lab_blob36 {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u  // token rows — FAST axis: concurrent tgs share the W panel (ggml rasterization)
+        let nBase = gl_WorkGroupID.y * 64u  // output (weight) rows
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        // A split: each thread stages 16 weight elems — row lr0, k half il0
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA         // k-tiles il0*2 (lanes at stride 8)
+        let tA1 = ((il0 * 2u + 1u) * 8u + syA) * 64u + lxA  // k-tile il0*2+1
+        // B split: each thread stages 8 activation elems — token lr1, k offset iy
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u           // this simdgroup's A quadrant: 4 row-tiles of 64
+        let bB = (sg / 2u) * 128u           // this simdgroup's B quadrant: 2 token-tiles of 64
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            // device reads first — they fly while the previous math loop drains
+            let b9 = ((nBase + lr0) * nkb + kb) * 9u
+            let sA = wsc[b9]                // scale rides the quants' cacheline — the blob's point
+            let srcA = b9 + 1u + il0 * 4u
+            let a0 = wqv[srcA]
+            let a1 = wqv[srcA + 1u]
+            let a2 = wqv[srcA + 2u]
+            let a3 = wqv[srcA + 3u]
+            let srcB = (mBase + lr1) * kdim4 + (kb * 32u + iy) / 4u
+            let b0 = xf[srcB]
+            let b1 = xf[srcB + 1u]
+            barrier()                       // previous math done reading the tiles
+            let va0 = float4(int4(a0)) * sA
+            let va1 = float4(int4(a1)) * sA
+            let va2 = float4(int4(a2)) * sA
+            let va3 = float4(int4(a3)) * sA
+            ta[tA0] = float16(va0.x)        // ly = k%8 -> +8 per lane; +32 = second 4-k half
+            ta[tA0 + 8u] = float16(va0.y)
+            ta[tA0 + 16u] = float16(va0.z)
+            ta[tA0 + 24u] = float16(va0.w)
+            ta[tA0 + 32u] = float16(va1.x)
+            ta[tA0 + 40u] = float16(va1.y)
+            ta[tA0 + 48u] = float16(va1.z)
+            ta[tA0 + 56u] = float16(va1.w)
+            ta[tA1] = float16(va2.x)
+            ta[tA1 + 8u] = float16(va2.y)
+            ta[tA1 + 16u] = float16(va2.z)
+            ta[tA1 + 24u] = float16(va2.w)
+            ta[tA1 + 32u] = float16(va3.x)
+            ta[tA1 + 40u] = float16(va3.y)
+            ta[tA1 + 48u] = float16(va3.z)
+            ta[tA1 + 56u] = float16(va3.w)
+            tg_store_half4(tb, ibB, b0)     // no dequant on B — pure convert-and-store
+            tg_store_half4(tb, ibB + 4u, b1)
+            barrier()
+            // math fully unrolled (their FOR_UNROLL): 4 k-slabs x (6 tile loads + 8 macs),
+            // constant tile offsets off hoisted quadrant bases
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u  // accumulator rows = tokens
+        let col0 = nBase + (sg % 2u) * 32u  // accumulator cols = outputs
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+// v23: v22's geometry on llama.cpp's OWN 34B blob (half scale + 32 int8, quants 2-byte-offset)
+// — their exact W contract and byte-wise load/dequant pattern, das-authored. Isolates the
+// residual data-contract share of the verbatim gap: half scale = 5.6% less W traffic, and the
+// +2 quant offset forces scalar byte loads (the reason ggml reads bytes, not vectors).
+class MetalGemmLabBlob34 {
+    @ssbo @binding = 0 wsh : array<float16> // 34B-block W blob, HALF-SCALE view: scale of block b at 17*b
+    @ssbo @binding = 1 wqb : array<int8>    // the SAME blob buffer, BYTE view: quants of block b at 34*b + 2
+    @ssbo @binding = 2 xf : array<float4>   // PRE-DEQUANTIZED f32 activations — the raw-f32 B contract
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
+    @workgroup tb : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, each tile (token row, k col)
+
+    [metal_kernel(name="lab_blob34_msl")]
+    def lab_blob34 {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u  // token rows — FAST axis: concurrent tgs share the W panel (ggml rasterization)
+        let nBase = gl_WorkGroupID.y * 64u  // output (weight) rows
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        // A split: each thread stages 16 weight elems — row lr0, k half il0
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA         // k-tiles il0*2 (lanes at stride 8)
+        let tA1 = ((il0 * 2u + 1u) * 8u + syA) * 64u + lxA  // k-tile il0*2+1
+        // B split: each thread stages 8 activation elems — token lr1, k offset iy
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u           // this simdgroup's A quadrant: 4 row-tiles of 64
+        let bB = (sg / 2u) * 128u           // this simdgroup's B quadrant: 2 token-tiles of 64
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            // device reads first — they fly while the previous math loop drains
+            let blk = (nBase + lr0) * nkb + kb
+            let sA = float(wsh[blk * 17u])   // half scale rides the quants' cacheline
+            let qb = blk * 34u + 2u + il0 * 16u
+            let q0 = wqb[qb]
+            let q1 = wqb[qb + 1u]
+            let q2 = wqb[qb + 2u]
+            let q3 = wqb[qb + 3u]
+            let q4 = wqb[qb + 4u]
+            let q5 = wqb[qb + 5u]
+            let q6 = wqb[qb + 6u]
+            let q7 = wqb[qb + 7u]
+            let q8 = wqb[qb + 8u]
+            let q9 = wqb[qb + 9u]
+            let q10 = wqb[qb + 10u]
+            let q11 = wqb[qb + 11u]
+            let q12 = wqb[qb + 12u]
+            let q13 = wqb[qb + 13u]
+            let q14 = wqb[qb + 14u]
+            let q15 = wqb[qb + 15u]
+            let srcB = (mBase + lr1) * kdim4 + (kb * 32u + iy) / 4u
+            let b0 = xf[srcB]
+            let b1 = xf[srcB + 1u]
+            barrier()                       // previous math done reading the tiles
+            ta[tA0] = float16(float(q0) * sA)   // ly = k%8 -> +8 per lane; tA1 = second 8-k tile
+            ta[tA0 + 8u] = float16(float(q1) * sA)
+            ta[tA0 + 16u] = float16(float(q2) * sA)
+            ta[tA0 + 24u] = float16(float(q3) * sA)
+            ta[tA0 + 32u] = float16(float(q4) * sA)
+            ta[tA0 + 40u] = float16(float(q5) * sA)
+            ta[tA0 + 48u] = float16(float(q6) * sA)
+            ta[tA0 + 56u] = float16(float(q7) * sA)
+            ta[tA1] = float16(float(q8) * sA)
+            ta[tA1 + 8u] = float16(float(q9) * sA)
+            ta[tA1 + 16u] = float16(float(q10) * sA)
+            ta[tA1 + 24u] = float16(float(q11) * sA)
+            ta[tA1 + 32u] = float16(float(q12) * sA)
+            ta[tA1 + 40u] = float16(float(q13) * sA)
+            ta[tA1 + 48u] = float16(float(q14) * sA)
+            ta[tA1 + 56u] = float16(float(q15) * sA)
+            tg_store_half4(tb, ibB, b0)     // no dequant on B — pure convert-and-store
+            tg_store_half4(tb, ibB + 4u, b1)
+            barrier()
+            // math fully unrolled (their FOR_UNROLL): 4 k-slabs x (6 tile loads + 8 macs),
+            // constant tile offsets off hoisted quadrant bases
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u  // accumulator rows = tokens
+        let col0 = nBase + (sg % 2u) * 32u  // accumulator cols = outputs
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+// knockouts: v21 staging bisect — A half only / B half only (timing-only)
+class MetalGemmLabGgmlGeoAOnly {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
+    @workgroup tb : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, each tile (token row, k col)
+
+    [metal_kernel(name="lab_ggmlgeoa_msl")]
+    def lab_ggmlgeoa {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u  // token rows — FAST axis: concurrent tgs share the W panel (ggml rasterization)
+        let nBase = gl_WorkGroupID.y * 64u  // output (weight) rows
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        // A split: each thread stages 16 weight elems — row lr0, k half il0
+        let lr0 = lid / 2u
+        let il0 = lid % 2u
+        let syA = lr0 / 8u
+        let lxA = lr0 % 8u
+        let tA0 = (il0 * 2u * 8u + syA) * 64u + lxA         // k-tiles il0*2 (lanes at stride 8)
+        let tA1 = ((il0 * 2u + 1u) * 8u + syA) * 64u + lxA  // k-tile il0*2+1
+        // B split: each thread stages 8 activation elems — token lr1, k offset iy
+        let aB = (sg % 2u) * 256u           // this simdgroup's A quadrant: 4 row-tiles of 64
+        let bB = (sg / 2u) * 128u           // this simdgroup's B quadrant: 2 token-tiles of 64
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            // device reads first — they fly while the previous math loop drains
+            let sA = ws[(nBase + lr0) * nkb + kb]
+            let srcA = (nBase + lr0) * kdim4 + (kb * 32u + il0 * 16u) / 4u
+            let a0 = wq[srcA]
+            let a1 = wq[srcA + 1u]
+            let a2 = wq[srcA + 2u]
+            let a3 = wq[srcA + 3u]
+            barrier()                       // previous math done reading the tiles
+            let va0 = float4(int4(a0)) * sA
+            let va1 = float4(int4(a1)) * sA
+            let va2 = float4(int4(a2)) * sA
+            let va3 = float4(int4(a3)) * sA
+            ta[tA0] = float16(va0.x)        // ly = k%8 -> +8 per lane; +32 = second 4-k half
+            ta[tA0 + 8u] = float16(va0.y)
+            ta[tA0 + 16u] = float16(va0.z)
+            ta[tA0 + 24u] = float16(va0.w)
+            ta[tA0 + 32u] = float16(va1.x)
+            ta[tA0 + 40u] = float16(va1.y)
+            ta[tA0 + 48u] = float16(va1.z)
+            ta[tA0 + 56u] = float16(va1.w)
+            ta[tA1] = float16(va2.x)
+            ta[tA1 + 8u] = float16(va2.y)
+            ta[tA1 + 16u] = float16(va2.z)
+            ta[tA1 + 24u] = float16(va2.w)
+            ta[tA1 + 32u] = float16(va3.x)
+            ta[tA1 + 40u] = float16(va3.y)
+            ta[tA1 + 48u] = float16(va3.z)
+            ta[tA1 + 56u] = float16(va3.w)
+            barrier()
+            // math fully unrolled (their FOR_UNROLL): 4 k-slabs x (6 tile loads + 8 macs),
+            // constant tile offsets off hoisted quadrant bases
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u  // accumulator rows = tokens
+        let col0 = nBase + (sg % 2u) * 32u  // accumulator cols = outputs
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+class MetalGemmLabGgmlGeoBOnly {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]           // W: 4 k-tiles x 8 row-tiles of 8x8, each tile (k row, wrow col)
+    @workgroup tb : float16[1024]           // X: 4 k-tiles x 4 token-tiles of 8x8, each tile (token row, k col)
+
+    [metal_kernel(name="lab_ggmlgeob_msl")]
+    def lab_ggmlgeob {
+        let lid = gl_LocalInvocationID.x
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u  // token rows — FAST axis: concurrent tgs share the W panel (ggml rasterization)
+        let nBase = gl_WorkGroupID.y * 64u  // output (weight) rows
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let kdim4 = kdim / 4u
+        let nkb = kdim / 32u
+        // A split: each thread stages 16 weight elems — row lr0, k half il0
+        // B split: each thread stages 8 activation elems — token lr1, k offset iy
+        let lr1 = lid / 4u
+        let iy = (lid % 4u) * 8u
+        let ibB = ((lid % 4u) * 4u + lr1 / 8u) * 64u + (lr1 % 8u) * 8u
+        let aB = (sg % 2u) * 256u           // this simdgroup's A quadrant: 4 row-tiles of 64
+        let bB = (sg / 2u) * 128u           // this simdgroup's B quadrant: 2 token-tiles of 64
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            // device reads first — they fly while the previous math loop drains
+            let sB = xs[(mBase + lr1) * nkb + kb]
+            let srcB = (mBase + lr1) * kdim4 + (kb * 32u + iy) / 4u
+            let b0 = xq[srcB]
+            let b1 = xq[srcB + 1u]
+            barrier()                       // previous math done reading the tiles
+            let vb0 = float4(int4(b0)) * sB
+            let vb1 = float4(int4(b1)) * sB
+            tg_store_half4(tb, ibB, vb0)    // k runs contiguous within the tile row — 2 vector stores
+            tg_store_half4(tb, ibB + 4u, vb1)
+            barrier()
+            // math fully unrolled (their FOR_UNROLL): 4 k-slabs x (6 tile loads + 8 macs),
+            // constant tile offsets off hoisted quadrant bases
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u  // accumulator rows = tokens
+        let col0 = nBase + (sg % 2u) * 32u  // accumulator cols = outputs
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
+// knockout: v21 with the staging removed (math + barriers + stores only, tiles read
+// uninitialized) — the ggml-geometry math ceiling; attributes v21's staging share
+class MetalGemmLabGgmlGeoNoStage {
+    @ssbo @binding = 0 wq : array<byte4>
+    @ssbo @binding = 1 ws : array<float>
+    @ssbo @binding = 2 xq : array<byte4>
+    @ssbo @binding = 3 xs : array<float>
+    @ssbo @binding = 4 y : array<float>
+    @uniform @binding = 5 kdim : uint
+    @uniform @binding = 6 ndim : uint
+    @workgroup ta : float16[2048]
+    @workgroup tb : float16[1024]
+
+    [metal_kernel(name="lab_ggmlgeons_msl")]
+    def lab_ggmlgeons {
+        let sg = gl_SubgroupID
+        let mBase = gl_WorkGroupID.x * 32u
+        let nBase = gl_WorkGroupID.y * 64u
+        var c00 : simdgroup_float8x8
+        var c01 : simdgroup_float8x8
+        var c02 : simdgroup_float8x8
+        var c03 : simdgroup_float8x8
+        var c10 : simdgroup_float8x8
+        var c11 : simdgroup_float8x8
+        var c12 : simdgroup_float8x8
+        var c13 : simdgroup_float8x8
+        let nkb = kdim / 32u
+        let aB = (sg % 2u) * 256u
+        let bB = (sg / 2u) * 128u
+        var ma0 : simdgroup_half8x8
+        var ma1 : simdgroup_half8x8
+        var ma2 : simdgroup_half8x8
+        var ma3 : simdgroup_half8x8
+        var mb0 : simdgroup_half8x8
+        var mb1 : simdgroup_half8x8
+        var kb = 0u
+        while (kb < nkb) {
+            barrier()
+            barrier()
+            simdgroup_load(ma0, ta, aB, 8u)
+            simdgroup_load(ma1, ta, aB + 64u, 8u)
+            simdgroup_load(ma2, ta, aB + 128u, 8u)
+            simdgroup_load(ma3, ta, aB + 192u, 8u)
+            simdgroup_load(mb0, tb, bB, 8u)
+            simdgroup_load(mb1, tb, bB + 64u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 512u, 8u)
+            simdgroup_load(ma1, ta, aB + 576u, 8u)
+            simdgroup_load(ma2, ta, aB + 640u, 8u)
+            simdgroup_load(ma3, ta, aB + 704u, 8u)
+            simdgroup_load(mb0, tb, bB + 256u, 8u)
+            simdgroup_load(mb1, tb, bB + 320u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1024u, 8u)
+            simdgroup_load(ma1, ta, aB + 1088u, 8u)
+            simdgroup_load(ma2, ta, aB + 1152u, 8u)
+            simdgroup_load(ma3, ta, aB + 1216u, 8u)
+            simdgroup_load(mb0, tb, bB + 512u, 8u)
+            simdgroup_load(mb1, tb, bB + 576u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            simdgroup_load(ma0, ta, aB + 1536u, 8u)
+            simdgroup_load(ma1, ta, aB + 1600u, 8u)
+            simdgroup_load(ma2, ta, aB + 1664u, 8u)
+            simdgroup_load(ma3, ta, aB + 1728u, 8u)
+            simdgroup_load(mb0, tb, bB + 768u, 8u)
+            simdgroup_load(mb1, tb, bB + 832u, 8u)
+            simdgroup_multiply_accumulate(c00, mb0, ma0, c00)
+            simdgroup_multiply_accumulate(c01, mb0, ma1, c01)
+            simdgroup_multiply_accumulate(c02, mb0, ma2, c02)
+            simdgroup_multiply_accumulate(c03, mb0, ma3, c03)
+            simdgroup_multiply_accumulate(c10, mb1, ma0, c10)
+            simdgroup_multiply_accumulate(c11, mb1, ma1, c11)
+            simdgroup_multiply_accumulate(c12, mb1, ma2, c12)
+            simdgroup_multiply_accumulate(c13, mb1, ma3, c13)
+            kb++
+        }
+        let row0 = mBase + (sg / 2u) * 16u
+        let col0 = nBase + (sg % 2u) * 32u
+        simdgroup_store(c00, y, row0 * ndim + col0, ndim)
+        simdgroup_store(c01, y, row0 * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c02, y, row0 * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c03, y, row0 * ndim + (col0 + 24u), ndim)
+        simdgroup_store(c10, y, (row0 + 8u) * ndim + col0, ndim)
+        simdgroup_store(c11, y, (row0 + 8u) * ndim + (col0 + 8u), ndim)
+        simdgroup_store(c12, y, (row0 + 8u) * ndim + (col0 + 16u), ndim)
+        simdgroup_store(c13, y, (row0 + 8u) * ndim + (col0 + 24u), ndim)
+    }
+}
+
 // ===== driver (Apple-only; every Metal-typed helper is a generic so non-Apple never compiles it) =====
 
 struct private LabVariant {
@@ -1784,6 +3509,14 @@ struct private LabVariant {
     bn : int                                // C-tile output columns — requires d % bn == 0
     check : bool = true                     // false = knockout: time it, never compare output
     threads : int = 128                     // threads per threadgroup
+    f16w : bool = false                     // binding 0 gets the PRE-DEQUANTIZED f16 W panel
+    grid2d : bool = false                   // dispatch (M'/bm, d/bn, 1) — tokens on the fast axis (ggml rasterization)
+    f32x : bool = false                     // binding 2 gets the PRE-DEQUANTIZED f32 activation panel
+    wscT : bool = false                     // binding 1 gets the [block][row]-TRANSPOSED W scales
+    blob36 : bool = false                   // bindings 0+1 get the SAME 36B-block W blob (scale/quant views) + f32 X
+    blob34 : bool = false                   // bindings 0+1 get llama.cpp's OWN 34B blob (half-scale/byte views) + f32 X
+    blob34p : bool = false                  // the PRODUCTION mul_mm binding set: blob x2, f32 X, y, kdim, ndim
+    tgmem : uint64 = 0ul                    // dynamic [[threadgroup(0)]] bytes (0 = kernel uses static tg arrays)
 }
 
 def private align_up(v, a : int64) : int64 => ((v + a - 1l) / a) * a
@@ -1846,6 +3579,470 @@ def private download_floats(buf; var dst : array<float>; count : int64) {
     }
 }
 
+// ===== v24 probe: hand-restructured MSL — v22's emitted text, math section rolled =====
+// The emitted v22 is fully unrolled SSA: LLVM hoists ~42 loop-invariant threadgroup addresses
+// (16 A-store + 2 B-store + 24 sgmat-load pointers) out of the k-loop, holding them in registers
+// for the kernel's whole life — max_threads drops 1024 -> 832 (register-limited) and occupancy
+// eats ~13%. This probe keeps v22's staging verbatim but rewrites the math as llama.cpp shapes
+// it: matrix ARRAYS + rolled unroll(full) loops + two bumped tile pointers, so the AGX backend
+// unrolls with register-budget awareness. das-side equivalent needs emitter work — probe first.
+let LAB_V22ROLL_MSL = "#include <metal_stdlib>
+using namespace metal;
+kernel void lab_v22roll(device const float* wsc [[buffer(0)]],
+        device const char4* wqv [[buffer(1)]],
+        device const float4* xf [[buffer(2)]],
+        device const float* xs [[buffer(3)]],
+        device float* y [[buffer(4)]],
+        constant uint& kdim [[buffer(5)]],
+        constant uint& ndim [[buffer(6)]],
+        uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]],
+        uint gl_SubgroupID [[simdgroup_index_in_threadgroup]],
+        uint3 gl_WorkGroupID [[threadgroup_position_in_grid]]) \{
+    threadgroup half ta[2048];
+    threadgroup half tb[1024];
+    uint lid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint mBase = (gl_WorkGroupID.x * 32u);
+    uint nBase = (gl_WorkGroupID.y * 64u);
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) \{
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    \}
+    uint kdim4 = (kdim / 4u);
+    uint nkb = (kdim / 32u);
+    uint lr0 = (lid / 2u);
+    uint il0 = (lid % 2u);
+    uint syA = (lr0 / 8u);
+    uint lxA = (lr0 % 8u);
+    uint tA0 = (((((il0 * 2u) * 8u) + syA) * 64u) + lxA);
+    uint tA1 = ((((((il0 * 2u) + 1u) * 8u) + syA) * 64u) + lxA);
+    uint lr1 = (lid / 4u);
+    uint iy = ((lid % 4u) * 8u);
+    uint ibB = (((((lid % 4u) * 4u) + (lr1 / 8u)) * 64u) + ((lr1 % 8u) * 8u));
+    uint aB = ((sg % 2u) * 256u);
+    uint bB = ((sg / 2u) * 128u);
+    uint kb = 0u;
+    while ((kb < nkb)) \{
+        uint b9 = ((((nBase + lr0) * nkb) + kb) * 9u);
+        float sA = wsc[b9];
+        uint srcA = ((b9 + 1u) + (il0 * 4u));
+        char4 a0 = wqv[srcA];
+        char4 a1 = wqv[(srcA + 1u)];
+        char4 a2 = wqv[(srcA + 2u)];
+        char4 a3 = wqv[(srcA + 3u)];
+        uint srcB = (((mBase + lr1) * kdim4) + (((kb * 32u) + iy) / 4u));
+        float4 b0 = xf[srcB];
+        float4 b1 = xf[(srcB + 1u)];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float4 va0 = (float4(int4(a0)) * sA);
+        float4 va1 = (float4(int4(a1)) * sA);
+        float4 va2 = (float4(int4(a2)) * sA);
+        float4 va3 = (float4(int4(a3)) * sA);
+        ta[tA0] = half(va0.x);
+        ta[(tA0 + 8u)] = half(va0.y);
+        ta[(tA0 + 16u)] = half(va0.z);
+        ta[(tA0 + 24u)] = half(va0.w);
+        ta[(tA0 + 32u)] = half(va1.x);
+        ta[(tA0 + 40u)] = half(va1.y);
+        ta[(tA0 + 48u)] = half(va1.z);
+        ta[(tA0 + 56u)] = half(va1.w);
+        ta[tA1] = half(va2.x);
+        ta[(tA1 + 8u)] = half(va2.y);
+        ta[(tA1 + 16u)] = half(va2.z);
+        ta[(tA1 + 24u)] = half(va2.w);
+        ta[(tA1 + 32u)] = half(va3.x);
+        ta[(tA1 + 40u)] = half(va3.y);
+        ta[(tA1 + 48u)] = half(va3.z);
+        ta[(tA1 + 56u)] = half(va3.w);
+        *(threadgroup half4*)(tb + (ibB)) = half4(b0);
+        *(threadgroup half4*)(tb + ((ibB + 4u))) = half4(b1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half * lsma = ta + aB;
+        threadgroup const half * lsmb = tb + bB;
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ik++) \{
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) \{
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            \}
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) \{
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            \}
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) \{
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            \}
+            lsma += 8*64;
+            lsmb += 4*64;
+        \}
+        ++kb;
+    \}
+    uint row0 = (mBase + ((sg / 2u) * 16u));
+    uint col0 = (nBase + ((sg % 2u) * 32u));
+    device float * C = y + ((row0 * ndim) + col0);
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) \{
+        simdgroup_store(mc[i], C + 8*(i%4) + 8*ndim*(i/4), ndim, 0, false);
+    \}
+\}
+"
+
+let LAB_V24G_MSL = "#include <metal_stdlib>
+using namespace metal;
+kernel void lab_v24g(device const half* wsh [[buffer(0)]],
+        device const char* wqb [[buffer(1)]],
+        device const float4* xf [[buffer(2)]],
+        device const float* xs [[buffer(3)]],
+        device float* y [[buffer(4)]],
+        constant uint& kdim [[buffer(5)]],
+        constant uint& ndim [[buffer(6)]],
+        uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]],
+        uint gl_SubgroupID [[simdgroup_index_in_threadgroup]],
+        uint3 gl_WorkGroupID [[threadgroup_position_in_grid]]) \{
+    threadgroup half ta[2048];
+    threadgroup half tb[1024];
+    uint lid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint mBase = (gl_WorkGroupID.x * 32u);
+    uint nBase = (gl_WorkGroupID.y * 64u);
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) \{
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    \}
+    uint kdim4 = (kdim / 4u);
+    uint nkb = (kdim / 32u);
+    uint lr0 = (lid / 2u);
+    uint il0 = (lid % 2u);
+    uint syA = (lr0 / 8u);
+    uint lxA = (lr0 % 8u);
+    uint tA0 = (((((il0 * 2u) * 8u) + syA) * 64u) + lxA);
+    uint lr1 = (lid / 4u);
+    uint iy = ((lid % 4u) * 8u);
+    uint ibB = (((((lid % 4u) * 4u) + (lr1 / 8u)) * 64u) + ((lr1 % 8u) * 8u));
+    uint aB = ((sg % 2u) * 256u);
+    uint bB = ((sg / 2u) * 128u);
+    uint kb = 0u;
+    while ((kb < nkb)) \{
+        uint blk = (((nBase + lr0) * nkb) + kb);
+        float sA = (float)wsh[blk * 17u];
+        device const char * qp = wqb + blk * 34u + 2u + il0 * 16u;
+        uint srcB = (((mBase + lr1) * kdim4) + (((kb * 32u) + iy) / 4u));
+        float4 b0 = xf[srcB];
+        float4 b1 = xf[(srcB + 1u)];
+        half va[16];
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) \{
+            va[i] = (half)((float)qp[i] * sA);
+        \}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) \{
+            ta[tA0 + (i/8)*512 + (i%8)*8] = va[i];
+        \}
+        *(threadgroup half4*)(tb + (ibB)) = half4(b0);
+        *(threadgroup half4*)(tb + ((ibB + 4u))) = half4(b1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half * lsma = ta + aB;
+        threadgroup const half * lsmb = tb + bB;
+        #pragma clang loop unroll(full)
+        for (short ik = 0; ik < 4; ik++) \{
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; i++) \{
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            \}
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 2; i++) \{
+                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+            \}
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 8; i++) \{
+                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
+            \}
+            lsma += 8*64;
+            lsmb += 4*64;
+        \}
+        ++kb;
+    \}
+    uint row0 = (mBase + ((sg / 2u) * 16u));
+    uint col0 = (nBase + ((sg % 2u) * 32u));
+    device float * C = y + ((row0 * ndim) + col0);
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) \{
+        simdgroup_store(mc[i], C + 8*(i%4) + 8*ndim*(i/4), ndim, 0, false);
+    \}
+\}
+"
+
+let LAB_V24H1_MSL = "#include <metal_stdlib>
+using namespace metal;
+kernel void lab_v24h1(device const half* wsh [[buffer(0)]],
+        device const char* wqb [[buffer(1)]],
+        device const float4* xf [[buffer(2)]],
+        device const float* xs [[buffer(3)]],
+        device float* y [[buffer(4)]],
+        constant uint& kdim [[buffer(5)]],
+        constant uint& ndim [[buffer(6)]],
+        uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]],
+        uint gl_SubgroupID [[simdgroup_index_in_threadgroup]],
+        uint3 gl_WorkGroupID [[threadgroup_position_in_grid]]) \{
+    threadgroup half ta[2048];
+    threadgroup half tb[1024];
+    uint lid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint mBase = (gl_WorkGroupID.x * 32u);
+    uint nBase = (gl_WorkGroupID.y * 64u);
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) \{
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    \}
+    uint kdim4 = (kdim / 4u);
+    uint nkb = (kdim / 32u);
+    uint lr0 = (lid / 2u);
+    uint il0 = (lid % 2u);
+    uint syA = (lr0 / 8u);
+    uint lxA = (lr0 % 8u);
+    uint tA0 = (((((il0 * 2u) * 8u) + syA) * 64u) + lxA);
+    uint lr1 = (lid / 4u);
+    uint iy = ((lid % 4u) * 8u);
+    uint ibB = (((((lid % 4u) * 4u) + (lr1 / 8u)) * 64u) + ((lr1 % 8u) * 8u));
+    uint aB = ((sg % 2u) * 256u);
+    uint bB = ((sg / 2u) * 128u);
+    uint kb = 0u;
+    while ((kb < nkb)) \{
+        uint blk = (((nBase + lr0) * nkb) + kb);
+        float sA = (float)wsh[blk * 17u];
+        device const char * qp = wqb + blk * 34u + 2u + il0 * 16u;
+        uint srcB = (((mBase + lr1) * kdim4) + (((kb * 32u) + iy) / 4u));
+        float4 b0 = xf[srcB];
+        float4 b1 = xf[(srcB + 1u)];
+        half va[16];
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) \{
+            va[i] = (half)((float)qp[i] * sA);
+        \}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 16; i++) \{
+            ta[tA0 + (i/8)*512 + (i%8)*8] = va[i];
+        \}
+        *(threadgroup half4*)(tb + (ibB)) = half4(b0);
+        *(threadgroup half4*)(tb + ((ibB + 4u))) = half4(b1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int ik = 0; ik < 4; ++ik) \{
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) \{
+                simdgroup_load(ma[i], ta + ((aB + (uint(ik) * 512u)) + (uint(i) * 64u)), 8u);
+            \}
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 2; ++i) \{
+                simdgroup_load(mb[i], tb + ((bB + (uint(ik) * 256u)) + (uint(i) * 64u)), 8u);
+            \}
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 8; ++i) \{
+                simdgroup_multiply_accumulate(mc[i], mb[(i / 4)], ma[(i % 4)], mc[i]);
+            \}
+        \}
+        ++kb;
+    \}
+    uint row0 = (mBase + ((sg / 2u) * 16u));
+    uint col0 = (nBase + ((sg % 2u) * 32u));
+    device float * C = y + ((row0 * ndim) + col0);
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) \{
+        simdgroup_store(mc[i], C + 8*(i%4) + 8*ndim*(i/4), ndim, 0, false);
+    \}
+\}
+"
+
+
+// v26 probe: v25's emitted text with the STATIC threadgroup arrays swapped for one dynamic
+// [[threadgroup(0)]] buffer (llama.cpp's shmem shape). ISA rail: the backend constant-folds
+// carried tile pointers into absolute addresses of STATIC tg arrays and must materialize the
+// large offsets (23 iadds in the math phase); the opaque dynamic base keeps small carried
+// offsets — loop 185 -> 156 instructions, iadd 40 -> 15 (the llama.cpp reference: 165 / 24).
+let LAB_V26_SHMEM_MSL = "#include <metal_stdlib>
+using namespace metal;
+kernel void lab_shmem(device const half* wsh [[buffer(0)]],
+        device const char* wqb [[buffer(1)]],
+        device const float4* xf [[buffer(2)]],
+        device const float* xs [[buffer(3)]],
+        device float* y [[buffer(4)]],
+        constant uint& kdim [[buffer(5)]],
+        constant uint& ndim [[buffer(6)]],
+        uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]],
+        uint gl_SubgroupID [[simdgroup_index_in_threadgroup]],
+        uint3 gl_WorkGroupID [[threadgroup_position_in_grid]],
+        threadgroup char * shmem [[threadgroup(0)]]) \{
+    threadgroup half * ta = (threadgroup half *)(shmem);
+    threadgroup half * tb = (threadgroup half *)(shmem + 4096);
+    uint lid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint mBase = (gl_WorkGroupID.x * 32u);
+    uint nBase = (gl_WorkGroupID.y * 64u);
+    simdgroup_float8x8 mc[8];
+    #pragma clang loop unroll(full)
+    for (int mc_zi = 0; mc_zi < 8; ++mc_zi) \{
+        mc[mc_zi] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \}
+    simdgroup_half8x8 ma[4];
+    #pragma clang loop unroll(full)
+    for (int ma_zi = 0; ma_zi < 4; ++ma_zi) \{
+        ma[ma_zi] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    \}
+    simdgroup_half8x8 mb[2];
+    #pragma clang loop unroll(full)
+    for (int mb_zi = 0; mb_zi < 2; ++mb_zi) \{
+        mb[mb_zi] = make_filled_simdgroup_matrix<half, 8, 8>(0.0h);
+    \}
+    half va[16] = \{\};
+    uint kdim4 = (kdim / 4u);
+    uint nkb = (kdim / 32u);
+    uint lr0 = (lid / 2u);
+    uint il0 = (lid % 2u);
+    uint syA = (lr0 / 8u);
+    uint lxA = (lr0 % 8u);
+    uint tA0 = (((((il0 * 2u) * 8u) + syA) * 64u) + lxA);
+    uint lr1 = (lid / 4u);
+    uint iy = ((lid % 4u) * 8u);
+    uint ibB = (((((lid % 4u) * 4u) + (lr1 / 8u)) * 64u) + ((lr1 % 8u) * 8u));
+    uint aB = ((sg % 2u) * 256u);
+    uint bB = ((sg / 2u) * 128u);
+    uint blk0 = ((nBase + lr0) * nkb);
+    device const half * scur = wsh + ((blk0 * 17u));
+    device const char * qp = wqb + ((((blk0 * 34u) + 2u) + (il0 * 16u)));
+    device const float4 * xcur = xf + ((((mBase + lr1) * kdim4) + (iy / 4u)));
+    uint kb = 0u;
+    while ((kb < nkb)) \{
+        float sA = float(scur[0]);
+        float4 b0 = xcur[0];
+        float4 b1 = xcur[(1u)];
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; ++i) \{
+            va[i] = half((float(qp[(uint(i))]) * sA));
+        \}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; ++i) \{
+            ta[((tA0 + (uint((i / 8)) * 512u)) + (uint((i % 8)) * 8u))] = va[i];
+        \}
+        *(threadgroup half4*)(tb + (ibB)) = half4(b0);
+        *(threadgroup half4*)(tb + ((ibB + 4u))) = half4(b1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half * acur = ta + (aB);
+        threadgroup const half * bcur = tb + (bB);
+        #pragma clang loop unroll(full)
+        for (int _ik = 0; _ik < 4; ++_ik) \{
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 4; ++i) \{
+                simdgroup_load(ma[i], acur + ((uint(i) * 64u)), 8u);
+            \}
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 2; ++i) \{
+                simdgroup_load(mb[i], bcur + ((uint(i) * 64u)), 8u);
+            \}
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 8; ++i) \{
+                simdgroup_multiply_accumulate(mc[i], mb[(i / 4)], ma[(i % 4)], mc[i]);
+            \}
+            acur += 512u;
+            bcur += 256u;
+        \}
+        scur += 17u;
+        qp += 34u;
+        xcur += 8u;
+        ++kb;
+    \}
+    uint row0 = (mBase + ((sg / 2u) * 16u));
+    uint col0 = (nBase + ((sg % 2u) * 32u));
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) \{
+        simdgroup_store(mc[i], y + ((((row0 + (uint((i / 4)) * 8u)) * ndim) + col0) + (uint((i % 4)) * 8u)), ndim);
+    \}
+\}
+"
+
+// ===== 34B q8-block data builders (GGUF q8_0's on-disk block layout: f16 scale + 32 int8) =====
+
+def private upload_q8_blob34(dev; q : array<int8>; s : array<float>; rows, k : int64; enabled : bool) {
+    if (!enabled) {
+        return metal_new_buffer(dev, 64ul)
+    }
+    let nb = int(k / 32l)
+    let kk = int(k)
+    var buf = metal_new_buffer(dev, uint64(rows * (k / 32l) * 34l))
+    var base = unsafe(reinterpret<int8?>(metal_buffer_contents(buf)))
+    for (r in range(int(rows))) {
+        for (bi in range(nb)) {
+            let off = (r * nb + bi) * 34
+            unsafe {
+                var ph = reinterpret<float16?>(base + off)
+                ph[0] = float16(s[r * nb + bi])
+                let src = r * kk + bi * 32
+                for (c in range(32)) {
+                    base[off + 2 + c] = q[src + c]
+                }
+            }
+        }
+    }
+    return buf
+}
+
+def private upload_f32_x(dev; xq : array<int8>; xs : array<float>; rows, k : int64; enabled : bool) {
+    if (!enabled) {
+        return metal_new_buffer(dev, 64ul)
+    }
+    let nb = int(k / 32l)
+    let kk = int(k)
+    var buf = metal_new_buffer(dev, uint64(rows * k * 4l))
+    var pf = unsafe(reinterpret<float?>(metal_buffer_contents(buf)))
+    for (r in range(int(rows))) {
+        let s0 = r * nb
+        for (i in range(kk)) {
+            unsafe(pf[r * kk + i]) = float(xq[r * kk + i]) * xs[s0 + i / 32]
+        }
+    }
+    return buf
+}
+
+// interleaved 36B-block W blob (f32 scale + 32 int8 quants, 4-aligned) — the Option-A
+// production layout: same bytes as planar quants+scales, but the scale rides the quants'
+// cacheline and byte4 quant loads stay aligned (ggml's 34B half-scale blocks force scalar reads)
+def private upload_blob36(dev; q : array<int8>; s : array<float>; rows, k : int64; enabled : bool) {
+    if (!enabled) {
+        return metal_new_buffer(dev, 64ul)
+    }
+    let nb = int(k / 32l)
+    let kk = int(k)
+    var buf = metal_new_buffer(dev, uint64(rows * (k / 32l) * 36l))
+    var pf = unsafe(reinterpret<float?>(metal_buffer_contents(buf)))
+    var p8 = unsafe(reinterpret<int8?>(metal_buffer_contents(buf)))
+    for (r in range(int(rows))) {
+        for (bi in range(nb)) {
+            let b = r * nb + bi
+            unsafe {
+                pf[b * 9] = s[b]
+                let dst = b * 36 + 4
+                let src = r * kk + bi * 32
+                for (c in range(32)) {
+                    p8[dst + c] = q[src + c]
+                }
+            }
+        }
+    }
+    return buf
+}
+
 // count bit-mismatches vs the reference (exact-arithmetic data — any deviation is a real bug)
 def private count_mismatch(got, ref_v : array<float>; cnt : int64; var firstBad : int64&) : int64 {
     var bad = 0l
@@ -1872,7 +4069,7 @@ def private compile_lab_pso(dev; v : LabVariant) {
 
 // one timed encoder: set state once, dispatch `reps` back-to-back (hazard tracking on the shared
 // y buffer serializes them); returns per-dispatch GPU milliseconds, or -1 on failure
-def private time_reps(queue; pso; bufs; groups, threads : uint; reps : int) : double {
+def private time_reps(queue; pso; bufs; groups : uint3; threads : uint; reps : int; tgmem : uint64) : double {
     var err : string
     var gpu_ms = 0.0lf
     let ok = with_compute_encoder_timed(queue, err, gpu_ms) $(enc) {
@@ -1880,8 +4077,11 @@ def private time_reps(queue; pso; bufs; groups, threads : uint; reps : int) : do
         for (bi in range(length(bufs))) {
             metal_set_buffer(enc, bufs[bi], 0ul, bi)
         }
+        if (tgmem > 0ul) {
+            metal_set_threadgroup_memory_length(enc, tgmem, 0)
+        }
         for (_i in range(reps)) {
-            metal_dispatch_threadgroups(enc, uint3(groups, 1u, 1u), uint3(threads, 1u, 1u))
+            metal_dispatch_threadgroups(enc, groups, uint3(threads, 1u, 1u))
         }
     }
     if (!ok) {
@@ -1913,10 +4113,17 @@ def private run_lab(b : B?; variants) {
     var psos <- [for (v in variants); compile_lab_pso(dev, v)]
     for (v, pso in variants, psos) {
         b |> success(pso != null, "pipeline compiles: {v.name}")
+        if (pso != null && want("DASMETAL_LAB_VARIANTS", v.name)) {
+            // register-pressure signal: a reg-limited kernel reports max_threads < 1024
+            to_log(LOG_INFO, "{v.name}: max_threads={metal_pipeline_max_total_threads(pso)} simd_width={metal_pipeline_thread_execution_width(pso)}\n")
+        }
     }
     // llama1b GEMM geometries (n = reduction dim, d = output rows)
     var shapes <- [("kv", 2048l, 512l), ("q", 2048l, 2048l), ("w13", 2048l, 8192l),
-                   ("w2", 8192l, 2048l), ("cls", 2048l, 128256l)]
+                   ("w2", 8192l, 2048l), ("cls", 2048l, 128256l),
+                   // the llama-3B set (dim 3072, hidden 8192, kv_dim 1024)
+                   ("kv3b", 3072l, 1024l), ("q3b", 3072l, 3072l), ("w13_3b", 3072l, 8192l),
+                   ("w2_3b", 8192l, 3072l)]
     let mp_max = align_up(ntok, 64l)
     for (sh in shapes) {
         if (!want("DASMETAL_LAB_SHAPES", sh._0)) {
@@ -1935,12 +4142,56 @@ def private run_lab(b : B?; variants) {
         var yref <- cpu_ref_rows(wq, ws, xq, xs, n, d, ref_rows)
         var wbuf = upload_array(dev, wq, d * n)
         var sbuf = upload_array(dev, ws, d * nb * 4l)
+        // the f16 W panel (v.f16w variants): W dequantized once host-side — exact in f16 under
+        // the lab's exact-arithmetic fill (|w| <= 16, int x pow2)
+        var wh : array<float16>
+        wh |> resize(int(d * n))
+        for (i in range64(d * n)) {
+            wh[i] = float16(float(wq[i]) * ws[(i / n) * nb + (i % n) / 32l])
+        }
+        var whbuf = upload_array(dev, wh, d * n * 2l)
         var xqbuf = upload_array(dev, xq, mp_max * n)
         var xsbuf = upload_array(dev, xs, mp_max * nb * 4l)
         var ybuf = metal_new_buffer(dev, uint64(mp_max * d * 4l))
         var kdimbuf = upload_u32(dev, uint(n))
         var ndimbuf = upload_u32(dev, uint(d))
         var bufs <- [wbuf, sbuf, xqbuf, xsbuf, ybuf, kdimbuf, ndimbuf]
+        var bufs16 <- [whbuf, sbuf, xqbuf, xsbuf, ybuf, kdimbuf, ndimbuf]
+        // the f32-X / blob legs' buffers — built only when a variant that needs them will run
+        var xf32On = false
+        for (v in variants) {
+            if ((v.f32x || v.blob36 || v.blob34 || v.blob34p) && want("DASMETAL_LAB_VARIANTS", v.name) && (d % int64(v.bn)) == 0l) {
+                xf32On = true
+            }
+        }
+        var blob36On = false
+        var blob34On = false
+        for (v in variants) {
+            if (v.blob36 && want("DASMETAL_LAB_VARIANTS", v.name) && (d % int64(v.bn)) == 0l) {
+                blob36On = true
+            }
+            if ((v.blob34 || v.blob34p) && want("DASMETAL_LAB_VARIANTS", v.name) && (d % int64(v.bn)) == 0l) {
+                blob34On = true
+            }
+        }
+        var wblob34 = upload_q8_blob34(dev, wq, ws, d, n, blob34On)
+        var xf32buf = upload_f32_x(dev, xq, xs, mp_max, n, xf32On)
+        var bufsf32x <- [wbuf, sbuf, xf32buf, xsbuf, ybuf, kdimbuf, ndimbuf]
+        // [block][row]-transposed W scales (wscT variants)
+        var wsT : array<float>
+        wsT |> resize(int(d * nb))
+        for (r in range64(d)) {
+            for (bi in range64(nb)) {
+                wsT[int(bi * d + r)] = ws[r * nb + bi]
+            }
+        }
+        var wsTbuf = upload_array(dev, wsT, d * nb * 4l)
+        delete wsT
+        var bufswsct <- [wbuf, wsTbuf, xqbuf, xsbuf, ybuf, kdimbuf, ndimbuf]
+        var wblob36 = upload_blob36(dev, wq, ws, d, n, blob36On)
+        var bufs36 <- [wblob36, wblob36, xf32buf, xsbuf, ybuf, kdimbuf, ndimbuf]
+        var bufs34 <- [wblob34, wblob34, xf32buf, xsbuf, ybuf, kdimbuf, ndimbuf]
+        var bufs34p <- [wblob34, wblob34, xf32buf, ybuf, kdimbuf, ndimbuf]
         let setup_ms = double(ref_time_ticks() - t_shape0) / 1000000.0lf
         to_log(LOG_INFO, "=== {sh._0} n={n} d={d} === (setup {setup_ms} ms)\n")
         var y0 : array<float>                // v0's full output — the cross-variant reference
@@ -1956,8 +4207,10 @@ def private run_lab(b : B?; variants) {
                 continue
             }
             let mp = align_up(ntok, int64(v.bm))
-            let groups = uint((mp / int64(v.bm)) * (d / int64(v.bn)))
-            let ms = time_reps(queue, pso, bufs, groups, uint(v.threads), 1)   // warmup + correctness dispatch
+            let groups = (v.grid2d
+                ? uint3(uint(mp / int64(v.bm)), uint(d / int64(v.bn)), 1u)
+                : uint3(uint((mp / int64(v.bm)) * (d / int64(v.bn))), 1u, 1u))
+            let ms = time_reps(queue, pso, v.blob36 ? bufs36 : (v.blob34p ? bufs34p : (v.blob34 ? bufs34 : (v.wscT ? bufswsct : (v.f32x ? bufsf32x : (v.f16w ? bufs16 : bufs))))), groups, uint(v.threads), 1, v.tgmem)   // warmup + correctness dispatch
             if (ms < 0.0lf) {
                 b |> success(false, "{v.name} {sh._0}: dispatch")
                 continue
@@ -1999,9 +4252,11 @@ def private run_lab(b : B?; variants) {
                     continue
                 }
                 let mp = align_up(ntok, int64(v.bm))
-                let groups = uint((mp / int64(v.bm)) * (d / int64(v.bn)))
+                let groups = (v.grid2d
+                    ? uint3(uint(mp / int64(v.bm)), uint(d / int64(v.bn)), 1u)
+                    : uint3(uint((mp / int64(v.bm)) * (d / int64(v.bn))), 1u, 1u))
                 let reps = clamp(int(25.0lf / max(est_ms[idx], 0.01lf)) + 1, 1, 128)
-                let ms = time_reps(queue, pso, bufs, groups, uint(v.threads), reps)
+                let ms = time_reps(queue, pso, v.blob36 ? bufs36 : (v.blob34p ? bufs34p : (v.blob34 ? bufs34 : (v.wscT ? bufswsct : (v.f32x ? bufsf32x : (v.f16w ? bufs16 : bufs))))), groups, uint(v.threads), reps, v.tgmem)
                 if (ms > 0.0lf && ms < best[idx]) {
                     best[idx] = ms
                 }
@@ -2020,6 +4275,36 @@ def private run_lab(b : B?; variants) {
             let rel = base_gmacs > 0.0lf ? gmacs / base_gmacs : 0.0lf
             to_log(LOG_INFO, "{v.name}  {sh._0} {best[idx]} ms  {gmacs} GMAC/s  {rel}x vs v0\n")
         }
+        metal_release(wblob34)
+        metal_release(xf32buf)
+        bufsf32x |> clear()                  // pointees released via bufs loop + blob releases
+        unsafe {
+            delete bufsf32x
+        }
+        metal_release(wsTbuf)
+        bufswsct |> clear()
+        unsafe {
+            delete bufswsct
+        }
+        metal_release(wblob36)               // bound twice in bufs36 — release exactly once here
+        bufs36 |> clear()
+        unsafe {
+            delete bufs36
+        }
+        bufs34 |> clear()                    // pointees released via blob releases + bufs loop
+        unsafe {
+            delete bufs34
+        }
+        bufs34p |> clear()
+        unsafe {
+            delete bufs34p
+        }
+        metal_release(whbuf)
+        bufs16 |> clear()
+        unsafe {
+            delete bufs16
+        }
+        delete wh
         for (buf in bufs) {
             metal_release(buf)
         }
@@ -2062,45 +4347,92 @@ def bench_metal_gemm_kernels(b : B?) {
     static_if (typeinfo builtin_module_exists(das_metal)) {
         var variants <- [
             LabVariant(name = "v0_prod32", src = metal_q8_gemm_msl, entry = metal_q8_gemm_msl_entry,
-                       fastmath = metal_q8_gemm_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = metal_q8_gemm_msl_fastmath, bm = 32, bn = 32, tgmem = metal_q8_gemm_msl_tgmem),
             LabVariant(name = "v0b_prod64", src = metal_q8_gemm64_msl, entry = metal_q8_gemm64_msl_entry,
-                       fastmath = metal_q8_gemm64_msl_fastmath, bm = 64, bn = 64),
+                       fastmath = metal_q8_gemm64_msl_fastmath, bm = 64, bn = 64, tgmem = metal_q8_gemm64_msl_tgmem),
+            LabVariant(name = "v21_ggmlgeo", src = lab_ggmlgeo_msl, entry = lab_ggmlgeo_msl_entry,
+                       fastmath = lab_ggmlgeo_msl_fastmath, bm = 32, bn = 64, grid2d = true, tgmem = lab_ggmlgeo_msl_tgmem),
+            // v21 with B staged from the pre-dequantized f32 panel — the raw-f32 B contract on our
+            // W path; tests whether in-kernel X dequant is the residual staging tax
+            LabVariant(name = "v21f32x", src = lab_ggmlgeof32x_msl, entry = lab_ggmlgeof32x_msl_entry,
+                       fastmath = lab_ggmlgeof32x_msl_fastmath, bm = 32, bn = 64, grid2d = true, f32x = true, tgmem = lab_ggmlgeof32x_msl_tgmem),
+            // v22: the Option-A production kernel — v21 geometry, W from the interleaved 36B
+            // blob (scale + quants one cacheline, byte4-aligned), X from the f32 panel
+            LabVariant(name = "v22_blob36", src = lab_blob36_msl, entry = lab_blob36_msl_entry,
+                       fastmath = lab_blob36_msl_fastmath, bm = 32, bn = 64, grid2d = true, blob36 = true, tgmem = lab_blob36_msl_tgmem),
+            // v23: v22's geometry on the 34B q8_0-layout blob (half scale, byte-wise quant
+            // loads) — isolates the data-contract residue from emitter codegen
+            LabVariant(name = "v23_blob34", src = lab_blob34_msl, entry = lab_blob34_msl_entry,
+                       fastmath = lab_blob34_msl_fastmath, bm = 32, bn = 64, grid2d = true, blob34 = true, tgmem = lab_blob34_msl_tgmem),
+            // v24: hand-MSL probe — v22's emitted text with the math section restructured
+            // rolled (matrix arrays + unroll(full) loops + bumped tile pointers);
+            // tests the register-pressure/occupancy hypothesis (v22 max_threads 832 vs 1024)
+            LabVariant(name = "v24_roll", src = LAB_V22ROLL_MSL, entry = "lab_v22roll",
+                       fastmath = true, bm = 32, bn = 64, grid2d = true, blob36 = true),
+            LabVariant(name = "v24g_roll34", src = LAB_V24G_MSL, entry = "lab_v24g",
+                       fastmath = true, bm = 32, bn = 64, grid2d = true, blob34 = true),
+            LabVariant(name = "v24h1_idx", src = LAB_V24H1_MSL, entry = "lab_v24h1",
+                       fastmath = true, bm = 32, bn = 64, grid2d = true, blob34 = true),
+            // v25: the PRODUCTION mul_mm (metal_q8_mulmm in dasllama_metal_prefill) — zero
+            // copy drift, exactly what the resident prefill dispatches
+            LabVariant(name = "v25_das_rolled", src = metal_q8_mulmm_msl, entry = metal_q8_mulmm_msl_entry,
+                       fastmath = metal_q8_mulmm_msl_fastmath, bm = 32, bn = 64, grid2d = true, blob34p = true, tgmem = metal_q8_mulmm_msl_tgmem),
+            LabVariant(name = "v26_shmem", src = LAB_V26_SHMEM_MSL, entry = "lab_shmem",
+                       fastmath = true, bm = 32, bn = 64, grid2d = true, blob34 = true, tgmem = 6144ul),
+            // v21 + [block][row]-transposed W scales — format-compatible (planar q8 unchanged,
+            // scale array re-laid at upload); collapses the A-scale reads to 4 cachelines/tg
+            LabVariant(name = "v21sct", src = lab_ggmlgeosct_msl, entry = lab_ggmlgeosct_msl_entry,
+                       fastmath = lab_ggmlgeosct_msl_fastmath, bm = 32, bn = 64, grid2d = true, wscT = true, tgmem = lab_ggmlgeosct_msl_tgmem),
             LabVariant(name = "v1_n64", src = lab_n64_msl, entry = lab_n64_msl_entry,
-                       fastmath = lab_n64_msl_fastmath, bm = 32, bn = 64),
+                       fastmath = lab_n64_msl_fastmath, bm = 32, bn = 64, tgmem = lab_n64_msl_tgmem),
             LabVariant(name = "v2_m64", src = lab_m64_msl, entry = lab_m64_msl_entry,
-                       fastmath = lab_m64_msl_fastmath, bm = 64, bn = 32),
+                       fastmath = lab_m64_msl_fastmath, bm = 64, bn = 32, tgmem = lab_m64_msl_tgmem),
             LabVariant(name = "v3_db32", src = lab_db32_msl, entry = lab_db32_msl_entry,
-                       fastmath = lab_db32_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = lab_db32_msl_fastmath, bm = 32, bn = 32, tgmem = lab_db32_msl_tgmem),
             LabVariant(name = "v4_k64", src = lab_k64_msl, entry = lab_k64_msl_entry,
-                       fastmath = lab_k64_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = lab_k64_msl_fastmath, bm = 32, bn = 32, tgmem = lab_k64_msl_tgmem),
             LabVariant(name = "v5_tile", src = lab_tile32_msl, entry = lab_tile32_msl_entry,
-                       fastmath = lab_tile32_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = lab_tile32_msl_fastmath, bm = 32, bn = 32, tgmem = lab_tile32_msl_tgmem),
             LabVariant(name = "v6_pad36", src = lab_pad36_msl, entry = lab_pad36_msl_entry,
-                       fastmath = lab_pad36_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = lab_pad36_msl_fastmath, bm = 32, bn = 32, tgmem = lab_pad36_msl_tgmem),
             LabVariant(name = "v7_run16", src = lab_run16_msl, entry = lab_run16_msl_entry,
-                       fastmath = lab_run16_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = lab_run16_msl_fastmath, bm = 32, bn = 32, tgmem = lab_run16_msl_tgmem),
             LabVariant(name = "v8_vec4", src = lab_vec4_msl, entry = lab_vec4_msl_entry,
-                       fastmath = lab_vec4_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = lab_vec4_msl_fastmath, bm = 32, bn = 32, tgmem = lab_vec4_msl_tgmem),
             LabVariant(name = "v9_vec16", src = lab_vec16_msl, entry = lab_vec16_msl_entry,
-                       fastmath = lab_vec16_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = lab_vec16_msl_fastmath, bm = 32, bn = 32, tgmem = lab_vec16_msl_tgmem),
             LabVariant(name = "v10_dbvec4", src = lab_dbvec4_msl, entry = lab_dbvec4_msl_entry,
-                       fastmath = lab_dbvec4_msl_fastmath, bm = 32, bn = 32),
+                       fastmath = lab_dbvec4_msl_fastmath, bm = 32, bn = 32, tgmem = lab_dbvec4_msl_tgmem),
             LabVariant(name = "v11_n64vec4", src = lab_n64vec4_msl, entry = lab_n64vec4_msl_entry,
-                       fastmath = lab_n64vec4_msl_fastmath, bm = 32, bn = 64),
+                       fastmath = lab_n64vec4_msl_fastmath, bm = 32, bn = 64, tgmem = lab_n64vec4_msl_tgmem),
             LabVariant(name = "v12_m64vec4", src = lab_m64vec4_msl, entry = lab_m64vec4_msl_entry,
-                       fastmath = lab_m64vec4_msl_fastmath, bm = 64, bn = 32),
+                       fastmath = lab_m64vec4_msl_fastmath, bm = 64, bn = 32, tgmem = lab_m64vec4_msl_tgmem),
             LabVariant(name = "v13_6464vec4", src = lab_6464vec4_msl, entry = lab_6464vec4_msl_entry,
-                       fastmath = lab_6464vec4_msl_fastmath, bm = 64, bn = 64),
+                       fastmath = lab_6464vec4_msl_fastmath, bm = 64, bn = 64, tgmem = lab_6464vec4_msl_tgmem),
+            LabVariant(name = "v18_6464run32", src = lab_6464run32_msl, entry = lab_6464run32_msl_entry,
+                       fastmath = lab_6464run32_msl_fastmath, bm = 64, bn = 64, tgmem = lab_6464run32_msl_tgmem),
+            LabVariant(name = "v19_6464trans", src = lab_6464trans_msl, entry = lab_6464trans_msl_entry,
+                       fastmath = lab_6464trans_msl_fastmath, bm = 64, bn = 64, tgmem = lab_6464trans_msl_tgmem),
+            LabVariant(name = "v20_6464devb", src = lab_6464devb_msl, entry = lab_6464devb_msl_entry,
+                       fastmath = lab_6464devb_msl_fastmath, bm = 64, bn = 64, f16w = true, tgmem = lab_6464devb_msl_tgmem),
             LabVariant(name = "v15_6464x256", src = lab_6464x256_msl, entry = lab_6464x256_msl_entry,
-                       fastmath = lab_6464x256_msl_fastmath, bm = 64, bn = 64, threads = 256),
+                       fastmath = lab_6464x256_msl_fastmath, bm = 64, bn = 64, threads = 256, tgmem = lab_6464x256_msl_tgmem),
             LabVariant(name = "v16_6464pf", src = lab_6464pf_msl, entry = lab_6464pf_msl_entry,
-                       fastmath = lab_6464pf_msl_fastmath, bm = 64, bn = 64),
+                       fastmath = lab_6464pf_msl_fastmath, bm = 64, bn = 64, tgmem = lab_6464pf_msl_tgmem),
             LabVariant(name = "vk_nostage", src = lab_nostage_msl, entry = lab_nostage_msl_entry,
-                       fastmath = lab_nostage_msl_fastmath, bm = 32, bn = 32, check = false),
+                       fastmath = lab_nostage_msl_fastmath, bm = 32, bn = 32, check = false, tgmem = lab_nostage_msl_tgmem),
+            LabVariant(name = "vk21_nostage", src = lab_ggmlgeons_msl, entry = lab_ggmlgeons_msl_entry,
+                       fastmath = lab_ggmlgeons_msl_fastmath, bm = 32, bn = 64, grid2d = true, check = false, tgmem = lab_ggmlgeons_msl_tgmem),
+            LabVariant(name = "vk21_aonly", src = lab_ggmlgeoa_msl, entry = lab_ggmlgeoa_msl_entry,
+                       fastmath = lab_ggmlgeoa_msl_fastmath, bm = 32, bn = 64, grid2d = true, check = false, tgmem = lab_ggmlgeoa_msl_tgmem),
+            LabVariant(name = "vk21_noscale", src = lab_ggmlgeonosc_msl, entry = lab_ggmlgeonosc_msl_entry,
+                       fastmath = lab_ggmlgeonosc_msl_fastmath, bm = 32, bn = 64, grid2d = true, check = false, tgmem = lab_ggmlgeonosc_msl_tgmem),
+            LabVariant(name = "vk21_bonly", src = lab_ggmlgeob_msl, entry = lab_ggmlgeob_msl_entry,
+                       fastmath = lab_ggmlgeob_msl_fastmath, bm = 32, bn = 64, grid2d = true, check = false, tgmem = lab_ggmlgeob_msl_tgmem),
             LabVariant(name = "vk_6464nostage", src = lab_6464nostage_msl, entry = lab_6464nostage_msl_entry,
-                       fastmath = lab_6464nostage_msl_fastmath, bm = 64, bn = 64, check = false),
+                       fastmath = lab_6464nostage_msl_fastmath, bm = 64, bn = 64, check = false, tgmem = lab_6464nostage_msl_tgmem),
             LabVariant(name = "vk_nomath", src = lab_nomath_msl, entry = lab_nomath_msl_entry,
-                       fastmath = lab_nomath_msl_fastmath, bm = 32, bn = 32, check = false)
+                       fastmath = lab_nomath_msl_fastmath, bm = 32, bn = 32, check = false, tgmem = lab_nomath_msl_tgmem)
         ]
         run_lab(b, variants)
         delete variants

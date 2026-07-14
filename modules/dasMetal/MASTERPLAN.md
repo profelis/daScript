@@ -650,3 +650,337 @@ it once). Anchors (stored from the 2026-07-11 clean window, per the no-baseline-
 rule): llama.cpp CPU pp512 813 (das CPU 823 ✓ sane window); **llama.cpp full-Metal pp512 3960 —
 das GPU-resident is now 1.65x away** (hybrid clean was 3.75x, resident-with-old-kernel dirty
 2.5x). Clean best == the dirty single-shot (2395 vs 2398) — the box was quiet.
+
+**2026-07-13 — Phase 7 (session 1): llama-3B unlock + the overhead hunt — pp512 111 (CPU
+fallback) -> ~880-960 tok/s DIRTY; lcpp full-Metal 3B = 1402 (1.5-1.6x away).** The 3B
+(dim 3072, hs 128, 28L) now serves: MetalAttnQK walks head_size in 64-wide k-slabs through the
+same 32x64 staging tiles (hs=64 one slab bit-identical, 128 two; gate's hs<=64 dropped;
+hs=128 unit arm + 1B parity green). Overhead work, measured by the new encode-vs-gpu split
+(with_compute_encoder_timed 4-out overload; encode is ~0.15ms = FREE): (1) weight region
+buffers HAZARD-UNTRACKED (new metal_new_buffer_untracked extern) — the scheduler's
+per-resource analysis over ~450 tracked weights was the dominant slack, 72 -> 32ms on its
+first read (876 -> 962 t/s), though later reps put the slack band at ~50-70ms (box wobble;
+re-read on a clean window); (2) uniforms + rope tables moved to an UNTRACKED pool
+(pool_acquire_untracked) — measured NO-OP on top of (1); the residual commit-to-done slack is
+NOT per-resource analysis; (3) fused dispatch set 21 -> 15/layer (metal_add_rms_quant folds
+the pending residual add into the next norm with a threadgroup row stage — dim <= 3072 gates
+it; metal_swiglu_quant recomputes silu on the quant pass, gate never written back;
+metal_rope_qk one grid) — interleaved ABBA says NEUTRAL (the "ew = launch gaps" hypothesis was
+WRONG — Metal pipelines back-to-back dispatches; the ew bucket is real kernel time and the
+fused rms+quant's 12KB tg stage gives the saving back in occupancy); kept for the smaller
+graph; DASLLAMA_METAL_FUSE=0 is the A/B rail. GEMM kernel round 2 (lab, 3B shapes kv3b/q3b/
+w13_3b/w2_3b added): **three structural variants ALL LOST to v13** — v18 32-elem runs (-1%),
+v19 row-major-B + transposed sgload + tg_store_half4 (-1.3%; the two NEW emitter constructs —
+simdgroup_load transpose-flag overload and tg_store_half4 — are GPU-validated bit-exact and
+stay as surface), v20 device-direct f16 B panels (-6-9%; strided transposed device loads beat
+by staging). v13 (run-staging + 64x64) holds a ~3480-3590 GMAC/s plateau vs the staging-
+removed ceiling 4600-4950 at 3B shapes; lcpp's implied kernel rate ~4400-4500 (from their own
+1B/3B walls). 3B GPU budget: gemm ~415ms, attn ~25, ew ~28; slack ~50-70; readback ~14.
+**Parity ledger (needs BOTH):** kernel 3590 -> ~4400 (next ideas: faithful ggml
+kernel_mul_mm geometry port — 64x32, 2x4 sg layout, their exact staging shape — as a lab
+variant; simdgroup async device->tg copies; f16-accumulate risk analysis) AND the ~90ms
+non-GEMM tail -> ~35 (next: commit-to-done slack attribution beyond resource tracking —
+retainedReferences=NO, split command buffers, concurrent encoder + coarse barriers; attention
+f16; readback overlap). (Labeled DIRTY when logged; Boris 2026-07-13: Parsec was OFF for
+these windows — treat the numbers as clean. The ~50-70ms slack band variance is real
+box-side variance, not Parsec.)
+
+**2026-07-13 — Phase 7 (session 2): llama.cpp's kernel VERBATIM in the lab — their geometry is
+worth +16-21% over our best, measured head-to-head.** `kernel_mul_mm_q8_0_f32` (classic
+simdgroup path, ggml @ ebd048f) now runs as lab variant `lcpp_mulmm` — byte-verbatim MSL
+(`benchmarks/matmul/_lcpp_mul_mm_q8.das`, function constants baked to their same-shape
+specialization), on their own production contract: interleaved block_q8_0 blobs, RAW F32
+activations (4x our activation bytes — they still win), kargs struct, 6144 B dynamic tg
+scratch via new `metal_set_threadgroup_memory_length` extern. Bit-exact vs v0 on all 9 shapes.
+M1 Max, ntok=512, CLEAN window (Parsec off — Boris), interleaved best-of-3 (GMAC/s):
+
+| shape | v0_prod32 | v0b_prod64 | lcpp_mulmm | lcpp vs our best |
+|---|---|---|---|---|
+| kv 2048x512 | 2742 | 2516 | 3330 | 1.21x |
+| q 2048x2048 | 2932 | 3345 | 4001 | 1.20x |
+| w13 2048x8192 | 3004 | 3595 | 4180 | 1.16x |
+| w2 8192x2048 | 2958 | 3393 | 4074 | 1.20x |
+| cls 2048x128256 | 3024 | 3648 | 4245 | 1.16x |
+| kv3b 3072x1024 | 2854 | 3220 | 3884 | 1.21x |
+| q3b 3072x3072 | 2969 | 3463 | 4105 | 1.19x |
+| w13_3b 3072x8192 | 3008 | 3573 | 4199 | 1.18x |
+| w2_3b 8192x3072 | 2984 | 3485 | 4134 | 1.19x |
+
+These are clean numbers: lcpp's real kernel rate on M1 Max is ~3900-4250 GMAC/s — slightly
+BELOW the ~4400-4500 implied-from-their-walls estimate, so the kernel gap to close is
+1.16-1.21x, not 1.25x+. Settles the Phase-7 kernel question: the gap is their 64x32 tile +
+2x4 sg layout + tile-major 8x8
+shared blocks + dequant-to-registers-then-scatter staging, not their data format (they pay
+MORE device traffic). Next lever: port that geometry faithfully as a das lab variant (the
+masterplan's step-2 idea, now de-risked — the win is proven in OUR harness, not inferred from
+their walls). Repro: `DASMETAL_LAB_VARIANTS=v0_prod32,v0b_prod64,lcpp_mulmm bin/daslang -jit
+dastest/dastest.das -- --bench --test modules/dasLLAMA/benchmarks/matmul/bench_metal_gemm_kernels.das`.
+
+**2026-07-13 — Phase 7 (session 2b): the ggml geometry port (v21) + the attribution ledger —
++19% over v0_prod32, beats BOTH production kernels, still 13-19% behind verbatim.**
+`v21_ggmlgeo` (+`v21sct` scale-transpose flavor): ggml's exact geometry on our planar contract
+— 64-output x 32-token tile, tile-major 8x8 shared blocks (every sgload = one contiguous
+64-half run), W transposed within tiles at staging, byte4 device loads to registers before the
+pre-staging barrier, fully-unrolled math (4 slabs x 6 loads + 8 macs), 2D grid tokens-fast,
+tg_store_half4 B stores. Bit-exact. CLEAN M1 Max (GMAC/s): kv 2948 / q 3474 / w13 3633 / w2
+3512 / cls 3684 / kv3b 3268 / q3b 3555 / w13_3b 3639 / w2_3b 3577 — beats v0b_prod64 on every
+shape (+1-4% big, and it WINS the kv shapes where v0b loses to v0_prod32, so one kernel could
+replace both + the gemm_use64 heuristic). Verbatim lcpp still +13-19% ahead. **Attribution
+(q3b, knockouts + string-surgery on the verbatim source):** total gap 0.186 ms/dispatch =
+math-loop codegen ~0.045 (their staging-stripped ceiling 4936 vs v21's 4719 GMAC/s) + staging
+~0.144 (theirs 0.197 vs ours 0.341). Within staging: dequant multiplies + dependency chain
+~0.076 (scales-baked-to-1.0 probe), B int-dequant ~0.024 (f32-activation-panel probe v21f32x:
+their B contract reads raw f32 — no dequant at all), residual staging codegen ~0.044. RULED
+OUT by measurement: simdgroup_barrier(mem_none) hints (lcpp_nosgbar identical), rasterization
+order (2D grid no change), scale-stream cacheline scatter (v21sct [block][row] transpose
++0.4%). **Upshot: the remaining lcpp edge is their DATA CONTRACT (f32 activations, inline
+scales) plus better-scheduled staging/math MSL — no single structural lever left on the planar
+format.** Production fork to decide: (A) adopt their contract for GPU prefill — one-time W
+repack to interleaved blobs at region-cache upload + feed f32 activations directly (also
+deletes the X-quant dispatches from the graph) → the lab-proven 4000-4250 rate; (B) ship v21
+as the planar harvest (+2-4% big shapes, kv fix, kernel unification) and put the effort into
+the ~90ms non-GEMM tail; (C) f32-X feed only (cheap, +2%, kills quant dispatches). All probe
+variants live in the lab (lcpp_nosgbar/lcpp_nostage/vk21_*/v21f32x/v21sct).
+
+**2026-07-13 — Phase 7 (session 2c): Option A SHIPPED — verbatim mul_mm + blob repack + f32-X
+in the resident prefill. 3B pp512 850 -> 1053 t/s (+24%); gap to lcpp 1402 now 1.33x.** Boris
+picked (A). First tried the das-native blob kernel (lab v22_blob36: das-friendly 36B blocks,
+f32 scale + byte4-aligned quants, two typed views of one buffer) — 3623 GMAC/s, only +2.3%
+over v21: the residual ~13% vs verbatim is emitter/MSL codegen, not format. So production runs
+the VERBATIM kernel: `dasllama/dasllama_lcpp_mulmm.das` (moved from the bench fixture, in
+.das_module), compiled alongside the kernel set. Driver (dasllama_metal_prefill.das):
+`upload_blob_region` lazily repacks each (quants, scales) weight region into resident
+block_q8_0 blobs — one-time CPU pass, 235ms 1B / 686ms 3B, f32->f16 scale exact for
+GGUF-q8_0-sourced weights; `uniform_mm_args` pooled 88-byte kargs images; `enc_gemm_lcpp`
+(kargs/blob/f32-X/dst, 6144B dynamic tg scratch, grid (mp/32, d/64) x (32,4,1)); mode gate
+`lcppmm` = default when every GEMM output dim % 64 == 0 (bc_out=false specialization), rails:
+`DASLLAMA_METAL_MULMM=0` env + `set_metal_prefill_mulmm_legacy()` setter. The lcpp path runs
+the UNFUSED elementwise set minus ALL X-quant dispatches (17/layer; rms/swiglu feed f32
+straight to mul_mm). Legacy quantized path fully preserved (donor/batch path untouched).
+Gates: mulmm_gate unit (verbatim PSO on exact-arithmetic blob W x f32 X vs CPU ref, BIT-exact,
+2 shapes — also the kargs layout oracle), parity test now runs BOTH modes — 40-token greedy
+matches the CPU control EXACTLY on the f32-X path too (counting-prompt family robust as
+designed), leak gates green. E2E A/B (clean, same binary, 3B): N=256 748.9 -> 899.4 t/s,
+N=512 849.8 -> 1053.0 t/s (GPU 508 -> 396 ms, -22%); 1B parity-run GPU 150.9 -> 116.9 ms
+(-22.5%). NEXT: the ~80ms non-GEMM tail (slack attribution / split command buffers /
+retainedReferences; f16 attention; readback overlap) — at gpu=396ms the tail is now ~17% of
+total; then the das-emitter codegen chase to retire the verbatim kernel (ledger: math-loop
+scheduling ~4.5%, staging codegen ~0.04ms/dispatch).
+
+**2026-07-13 — Phase 7 (session 2d): the tail is DEAD — chunked command buffers + interleaved
+KV readback. 3B pp512 1053 -> 1219.6 t/s (+16%); gap to lcpp 1402 now 1.15x.**
+metal_prefill_forward now splits the layer loop across N command buffers (default ~4
+layers/chunk = 7 on the 3B; DASLLAMA_METAL_NCB overrides, =1 restores single-buffer), each
+committed the moment it finishes encoding — the scheduler analyzes chunk k while chunk k-1
+executes (same-queue commit order + hazard tracking on the activation buffers carries
+cross-chunk ordering; untracked weights/uniforms are CPU-written before their chunk commits).
+Measured (3B pp512): slack 57ms -> 9ms, 1069 -> 1176 t/s. Then completion+readback
+interleave: wait per chunk in commit order, stream that chunk's K/V rows into the CPU KV
+codec while later chunks run — the 13ms store cost disappears inside the GPU window; residual
+stream copies after the last chunk. 1176 -> 1219.6 t/s; total-minus-GPU-window is now ~11ms
+(was ~80). Bonus: the one-time blob repack ALSO overlaps (encode of later chunks proceeds
+while earlier chunks execute — 1B first-prefill total 277ms w/ 242ms repack inside), and the
+legacy q8 path gains equally (1B GPU-run total 243 -> 173ms). RULED OUT by measurement:
+commandBufferWithUnretainedReferences (new extern metal_new_command_buffer_unretained, rail
+DASLLAMA_METAL_UNRETAINED=1) — neutral at every chunk count, kept as surface. Gates: parity
+BOTH modes green on the chunked driver, mulmm unit, donor gemm, leak gates. **Remaining vs
+lcpp 1402: the 398ms GPU window itself** — gemm ~343 (verbatim-rate; emitter chase is the
+lever), attn ~25 (f16 candidate), ew ~28.
+
+**2026-07-13 — Phase 7 (session 3): ggml-geometry attention pair — 3B pp512 1220 -> 1251 t/s;
+we now beat llama.cpp's fa=0 wall.** Window re-attribution first (new attn_qk/attn_sm/attn_av
+sub-skip rails): gemm ~350 / attn 28 (QK 14.2 + AV 10.2 + softmax 3.2) / ew only ~9 (the
+quant deletions already took the old 28ms bucket). llama-bench 3B: fa=0 1350.5, fa=1 1391.4
+— their OWN flash attention nets +3%, and their fa=0 attention is mul_mm + masked softmax =
+exactly our structure, so the trio's kernels were the outlier (32x32 C tiles, scalar f32
+staging, the pre-run-staging style — ~60x below mul_mm rate). Rewrote QK/AV with the v21
+lessons (MetalAttnQKMm/MetalAttnAVMm): 32x64 C tiles, tile-major 8x8 shared blocks staged
+HALF via float4 loads (lcpp's f32_f32 mul_mm stages half from f32 too), 2x4 sg quadrants,
+unrolled math, per-head z grid, QK causal block early-exit, AV causal k-limit, V pad rows
+zeroed at staging (0*NaN guard); K pads need NO guard (their scores land in columns the
+causal softmax zeroes). Softmax unchanged. Default at head_size % 64 == 0; rail
+DASLLAMA_METAL_ATTN=0 pins the trio (also serves other hs). Attention 28 -> 14.2ms
+(QK 5.2 + AV 6.3 + softmax 3.5); GPU window ~374ms; our wall 376ms vs their fa=0 379ms.
+Gates: causal-GQA oracle hs64-GQA2 + hs128-GQA3 within the half-staging envelope (2e-2 —
+the honest envelope of half-staged scores through softmax, same as lcpp's), parity 40/40
+exact both modes. Framing re-measured same-run: ~10ms (logits 3.7 + embed 0.7 + alloc ~5),
+NOT the 33ms cross-run wobble suggested. GEMM chain check: 1.44 TMAC / 343ms = 4190 GMAC/s =
+AT the verbatim kernel's lab rate — that bucket is done. **NEXT (the one big lever left):
+verbatim lcpp kernel_flash_attn_ext port — collapses QK+softmax+AV (~14 -> ~6ms, +2.5-3%)
+AND kills the heads x np32^2 score slab (the g_max_npos=2048 cap). Needs their KV-dtype
+contract read first (f16 K/V vs our f32 buffers). Micro ledger: softmax restructure ~2ms,
+logits-on-GPU ~3ms, prefill alloc caching ~5ms.**
+
+**2026-07-13 — Phase 7 (session 4): verbatim flash-attn ported — CORRECT but LOSES to the trio,
+kept as an opt-in rail.** New module `dasllama/dasllama_lcpp_flash_attn.das` = `kernel_flash_attn_ext`
++ `_blk` brought VERBATIM (byte round-trip-diffed; 33 KB MSL das-escaped) with three mechanical
+deviations (baked `constant` function-constants for our fixed specialization: causal mask, no
+bias/sinks/softcap, has_kvpad=false, nsg=4; NS10/NS20 from args so one entry pair serves every
+kv_dim; f32 AND f16 KV entries for dk64/dk128), plus one non-lcpp `metal_fa_causal_mask` kernel
+(ggml builds KQ_mask host-side). KEY layout fact: lcpp's KV-pad kernel assumes ggml's per-head-
+contiguous KV (nb11=head_size); OURS is interleaved [token][kv_head][d] (nb11=kv_dim), so the pad
+kernel is unusable — instead ne11=mp (64-padded => has_kvpad=false) + the causal mask covers the pad
+columns [npos,mp). V pad rows are safe (the mul_mm GEMM writes ALL mp rows finite => 0*finite=0). The
+flash impl is otherwise stride-generic so our strides drop straight into nb11/nb12/ns10; GQA via
+ne_12_2=n_kv_heads; ne1=n_heads lands dst in our [token][head][d] bxb. CORRECTNESS (both KV dtypes):
+1B parity exact vs CPU control; 3B (hs128) token-for-token vs the trio. **PERF (2 clean Parsec-off
+same-session A/B, flash-MINUS-trio delta rock-consistent): flash attention costs ~3ms MORE than the
+ggml-geometry trio — f32 KV +3.3ms (13.9 vs 10.6), f16 KV +3.1ms (17.4 vs 14.3).** f16 KV (lcpp's
+contract, via a per-layer f32->f16 pack) did NOT help — the pack overhead (56 dispatches + KV
+bandwidth) cancels the f16 kernel's bandwidth saving. WHY flash loses: the trio already runs QK/AV as
+mul_mm-rate GEMMs (session 3, 4190 GMAC/s) + causal skips, so the score-slab device round-trip flash
+eliminates is NOT the bottleneck (M1 Max bandwidth ample); meanwhile flash RE-READS K/V once per
+query block (~32x after the causal skip vs the trio's 1x), costing more than the fusion saves. lcpp's
+fa=1 +3% over fa=0 comes from their WHOLE f16 pipeline, not graftable via a KV-only pack. DECISION
+(Boris): keep the trio as default; flash is an OPT-IN rail (`DASLLAMA_METAL_FLASH=1`, KV dtype via
+`DASLLAMA_METAL_FLASH_KV=f16|f32`) with lazy pipeline compile (default never pays the 33 KB compile).
+Residual flash value = drops the heads x mp^2 score slab (memory) => a future lever to lift
+g_max_npos for long-context prefill. **NEXT: das-emitter codegen chase (retire the verbatim mul_mm),
+logits-on-GPU ~3ms, prefill-alloc caching ~5ms. Then PR the arc (preflight --full).**
+
+**2026-07-13 — Phase 7 (session 5): the emitter codegen chase — das kernel from 87% to ~98% of
+verbatim; the gap was REGISTER PRESSURE from frontend-unrolled statements.** Method: AIR-level
+IR diff (new Metal offline toolchain, `xcrun metal -S -emit-llvm`) + the new occupancy
+introspection externs (`metal_pipeline_max_total_threads` / `_thread_execution_width`, printed
+per variant by the lab) + hand-MSL morph probes bisected one spelling at a time. ROOT CAUSE:
+the das emitter's hand-unrolled statement blocks reach LLVM as one giant SSA body; LLVM hoists
+every loop-invariant tile address (~42 pointers: 16 A-store + 2 B-store + 24 sgmat-load) into
+long-lived registers -> max_threads 1024 -> 832 (an occupancy tier) -> flat -13% vs the verbatim
+lcpp kernel on every shape. llama.cpp's kernel keeps its loops ROLLED with
+`_Pragma("clang loop unroll(full)")` + two bumped tile POINTERS; the AGX backend unrolls late,
+register-budget-aware. Bisect verdicts (all on the 34B-blob contract, bit-exact, interleaved):
+34B-blob/byte loads on the OLD unrolled shape = neutral (v23); rolled math = +10-11% and 1024
+back (v24_roll); rolled A-staging = neutral; device-pointer k-loop bumps = -1%; vectorized
+half2x4 B move = -1%; ushort prologue = -1%; int-vs-short loop vars = FREE; index-form tile
+addressing (`aB + ik*512`) REGRESSES to 896/-12% even inside pragma'd loops (v24h1, kept in lab
+as the negative control) — the load operand must be a loop-carried POINTER; A-staging via a
+hoisted device pointer = the last +1.5%. SHIPPED (emitter + builtins, pure das, no C++ rebuild
+for the das half): `unroll_range(n)` (rolled-with-pragma for; const bound), fixed-array locals
+(scalar `half va[16] = {};` + sgmat arrays w/ pragma'd zero-fill loops), indexed sgmat args
+(`mc[i]`), `tg_cursor(member, base)` / `dev_cursor(member, base)` (CPU = plain uint offset;
+MSL = threadgroup/device const pointer local; sgmat-load offsets and element reads led by a
+cursor lower through the pointer; advance = `cur += N`). New dasMetal externs (dasMetal.mm):
+pipeline occupancy introspection (the register-pressure oracle — a reg-limited PSO reports
+max_threads < 1024). Tests: tests/msl census +8 tags + SgMatRolled fixture + golden (73/73);
+tests/metal test_metal_sgmat_rolled GPU-vs-CPU bit-exact (36/36). Lab: `v25_das_rolled` = the
+das-AUTHORED kernel on the production 34B contract — q3b 4028 / w13_3b 4112 / w2_3b 4034 GMAC/s
+= 97.6-98.6% of verbatim (4101/4201/4132), == the hand-MSL v24g reference, +11-12% over v22.
+One-shot morph probes pruned post-verdict; v22/v23/v24_roll/v24g/v24h1/v25 kept as the
+reproducible A/B family. PRODUCTION CALL (for PR review): verbatim stays the default GEMM —
+the last ~2% is AGX-backend scheduling even hand-MSL in the same shape can't reach, and ~2%
+GEMM ~= ~1% pp512 = the margin by which das beats lcpp fa=0. The das v25 kernel + constructs
+are the retirement PATH once the last 2% closes (ISA-level chase, priced separately).
+**NEXT: logits-on-GPU ~3ms, prefill-alloc caching ~5ms. Then PR the arc (preflight --full).**
+
+**2026-07-13 — Phase 7 (session 5b): logits-on-GPU — 3B pp512 -5.5ms (interleaved, rock-steady
+across 5 rounds: 377.3 vs 382.9 ms/prefill, ~+1.5%).** The final rmsnorm (one row, bx bound at
+the last position's byte offset into the existing rms PSO) + a new classifier GEMV kernel
+(`metal_q8_gemv`: one simdgroup per output row, lanes stride byte4s, 4-blocks-in-flight unroll —
+the rolled x1 form measured only ~140 GB/s; per-byte4 scale product, simd_sum reduce, row < ddim
+tail guard) ride the END of the last command buffer; s.logits reads back with the residual copy.
+The saving EXCEEDS the ~3.7ms CPU logits it replaces because the GEMV overlaps the interleaved
+KV-readback tail instead of serializing after the wait. Contract: the override calls the new
+`prefill_override_logits_done()` (dasllama_common) after filling s.logits; forward_prefill_body
+then skips its CPU final-norm/classifier step. Gates mirror the CPU q8 `mm` branch only — softcap,
+suppressed-token pins, non-q8 / tied-f32 classifiers decline to the CPU step (semantics preserved
+by construction). Cls weights ride the existing upload_region cache (tied-q8 = the embedding
+region, one-time). Rails: `DASLLAMA_METAL_LOGITS=0` env + `set_metal_prefill_logits_cpu()` (the
+in-process A/B setter). Tests: gemv_gate x2 shapes in test_metal_prefill_kernels (exact-arithmetic
+BIT-exact, incl. the guarded-tail grid), 1B parity token-for-token with GPU logits active, leak
+gates green. Attribution rail: g_skip modes keep logits OFF so knockout deltas stay comparable.
+**NEXT: prefill-alloc caching ~5ms. Then PR the arc (preflight --full).**
+
+**2026-07-13 — Phase 7 (session 5c): prefill scratch alloc — framing 5.7ms -> 1.1ms.** The
+"alloc 5ms" was forward_prefill_alloc's batched-scratch GROWTH cost on the first prefill at a
+new npos (~70 MB across 10 arrays at 512 rows): das `resize` zero-fills the grown span AND the
+realloc copies the old block. Both are pure waste here — the scratch is stage output, fully
+written before any read. Fix = `scratch_resize` (dasllama_common): grow-only, contents-
+DISCARDING (`delete` on grow skips the realloc's old-block copy), `resize_no_init` (skips the
+zero-fill). Measured (3B pp512, per-bucket profile): alloc 4969us -> 55us; embed +0.2ms
+(absorbs the first-touch page faults); framing TOTAL 5728 -> 1075us. A new `alloc` prof bucket
+makes the cost visible in every profile run. Exotic scratch (ple/deltanet/att_b/fa_*) stays on
+zeroing resize — only the 10 always-fully-written arrays switch. Gate: full tests/dasLLAMA
+suite (model oracles token-for-token).
+**NEXT: PR the arc — preflight --full + clean Parsec-off measurement round (announce, wait for go).**
+
+**2026-07-13 — Phase 7 CLEAN MEASUREMENT ROUND (Parsec off, Boris-confirmed window, best-of-3
+process-fresh prefill_perf runs + one interleaved lab sweep).** llama-3.2-3B pp512: **1300.5 t/s
+best** (median 1256; GPU window 375.4-378.9 ms, tight; e2e spread is commit-wait slack 15-35 ms);
+pp256 best 1256. Anchors: lcpp -ngl 99 fa=1 = 1402 (0.93x), fa=0 = ~1351 (0.96x) — GPU-window-vs-
+GPU-window we hold the session-3 fa=0 win (375-379 vs their 379). llama-3.2-1B pp512: **3467 t/s
+best** (median 3440; GPU 137.1-138.4 ms); pp256 best 3173; lcpp full-Metal anchor 3960 (0.88x) —
+vs Phase-6's 1054 clean hybrid = 3.3x across Phase 7. Lab GEMM (GMAC/s, das v25 vs verbatim lcpp):
+kv 3197/3326, q 3959/3999, w13 4099/4184, w2 4010/4069, cls 4161/4245, kv3b 3898/3890 (das WINS),
+q3b 4028/4102, w13_3b 4115/4200, w2_3b 4047/4132 — the das-authored kernel at 96-100% of verbatim
+everywhere, >= the hand-MSL v24g reference on most shapes. NOTE: 1B GPU window vs session 2c's
+dirty 116.9 ms is not comparable — the chunked driver's window now spans first-chunk-start to
+last-chunk-end (includes inter-chunk gaps) and sessions 3-5 added the attention pair + logits
+dispatches; the t/s headline is the honest cross-session metric.
+
+**2026-07-13 — Phase 7 REWORK step 1 (PR #3456 closed for redesign): `unroll_range` deleted,
+loop hints ride das's existing `for [hint] (...)` annotation surface.** Boris's call: the
+iterator-function spelling was a construct where the language already had the right one —
+`ExprFor/ExprWhile.annotations` (the per-loop hint list the JIT lowers to !llvm.loop.*
+metadata). The emitter now lowers the SAME vocabulary to clang loop pragmas: `[unroll]` ->
+unroll(enable), `[unroll_full]` -> unroll(full), `[unroll_disable]` -> unroll(disable),
+`[unroll_count=N]` -> unroll_count(N); unknown hints fail closed. Works on `for` and `while`.
+Kernels/fixtures rewritten to `for [unroll_full] (i in range(N))`; emitted MSL is byte-identical
+(msl goldens unchanged, 73/73). One spelling, per-backend lowering — CPU JIT gets LLVM metadata,
+Metal gets pragmas, interp ignores. REMAINING REWORK (design session): tg_cursor/dev_cursor —
+likely emitter-automatic LSR so natural source gets the pointer form; then das GEMM as default.
+
+**2026-07-13 — Phase 7 REWORK step 2: @workgroup -> dynamic shmem lowering — the das GEMM now
+BEATS verbatim llama.cpp on every shape.** The ISA rail (applegpu + MTLBinaryArchive harvest;
+`compiler_explorer.py` flow, MCT_MAX_THREADS env patch) settled the residual ~2%: registers a
+wash (r49/r50), heavy work identical, the whole gap = integer address materialization (40 vs 24
+iadd/iter, 23 of ours inside the fmadd-bound math phase vs their 5). Nulls along the way:
+pipeline-descriptor knobs (maxTotalThreads=128 + multiple-of-width — byte-identical ISA),
+unsigned-vs-signed offsets (identical), loop-carried device cursors (44->40 only). ROOT CAUSE:
+STATIC `threadgroup T name[N]` arrays — the AGX backend constant-folds carried tile pointers
+into their absolute addresses and the large offsets exceed the load immediate field; an opaque
+dynamic [[threadgroup(0)]] base keeps small carried offsets (loop 185 -> 156 instructions,
+SHORTER than verbatim's 165). Emitter change: @workgroup members lower to ONE dynamic
+threadgroup(0) param + derived pointers (scalars deref a derived pointer), name-sorted
+16B-aligned layout, total published as the `_tgmem` companion; `run_compute_1d` takes it,
+drivers pass it per dispatch. Every wg-bearing kernel inherits the codegen with zero source
+changes. Lab (interleaved, bit-exact): das v25 4128-4292 GMAC/s vs verbatim 4002-4201 —
+**+2.2-3.2% on all six big shapes**; emitted == hand morph exactly. Parity token-for-token.
+**NEXT: swap the production GEMM default to the das kernel (retiring the 33KB verbatim MSL to a
+rail), re-run the clean round, reopen the PR.**
+
+**2026-07-13 — Phase 7 REWORK step 3 (Boris's call: "get rid of abstraction — das is das is
+das"): tg_cursor/dev_cursor DELETED; the pointer form is spelled as a real das pointer.** The
+post-shmem re-measure proved BOTH spellings still matter (index-form math = max_threads 896,
+-10%, even on dynamic shmem), so the choice must stay visible in source. New spelling — plain
+das: `var p = unsafe(addr(member[expr]))` declares a pointer into a kernel member (emitter
+recognizes ExprRef2Ptr(ExprAt(member, idx)) by SHAPE, no magic names; address space from the
+member: @workgroup -> `threadgroup T *`, read-only @ssbo -> `device const T *`, written ->
+`device T *`); reads are das pointer indexing `unsafe(p[i])` (generic ExprAt emission);
+advance is das pointer arithmetic `p = unsafe(p + n)` (the i_das_ptr_add intrinsic lowers to
+element-scaled MSL pointer addition); a pointer is accepted as a simdgroup_load source (loads
+only — pointer stores fail closed). CPU semantics are das's REAL pointer semantics — the
+reference bodies walk actual memory (the simdgroup_load builtin bodies gained `unsafe()` on
+their indexing for pointer instantiations). Index form stays the safe spelling; pointer form
+is explicitly unsafe — exactly das's own contract. v25 + fixtures rewritten; emitted MSL and
+rates identical to the cursor world (v25 4133/4277 GMAC/s == v26, > verbatim's 3996/4184).
+Census: decl.ptr.tg/dev, op.ptr_add, call.sgmat_load_ptr.f16 (cursor tags gone).
+
+**2026-07-13 — Phase 7 REWORK step 4: the das mul_mm IS the production GEMM; verbatim + flash
+plumbing out of the driver; lessons swept across the kernel set (clean Parsec-off round).**
+Production: new `MetalQ8MulMm` (`metal_q8_mulmm_msl`) — the v25 shape on the driver's existing
+34B q8-block repack (GGUF q8_0's own layout), bindings blob x2 (half-scale/byte views) + f32 X
++ y + kdim/ndim; `enc_gemm_mm` replaces the verbatim dispatch at all five GEMM sites; the flash
+opt-in rail (verbatim lcpp MSL) is DELETED from the driver along with the kargs plumbing (rail
+findings preserved here as prose). The lab's v25 variant now references the production
+companions (zero copy drift, like v0). Lessons sweep via the new
+`benchmarks/matmul/occupancy_report.das` (permanent tool — run after any kernel change):
+found attn_qk_mm/attn_av_mm at 704 (the hot pair!) and q8_gemm64 at 704, everything else 1024.
+Rolled rework (matrix arrays + [unroll_full] + das-pointer tile bumps + QK staging via a
+register array): attention pair 704 -> 896 (residual = f32 source values live across the
+staging barrier; diminishing returns), gemm64 rolled but stays 704 — 16 accumulators = 32
+regs/lane of C is that geometry's floor (off the resident default path; the batch donor's
+call). CLEAN ROUND (best-of-3, process-fresh): 3B pp512 GPU window **367.5-372.0 ms** (was
+375.4-378.9 pre-swap) — **matches llama.cpp's fa=1 best mode (368 ms) head-on**; e2e best
+1299.3 t/s, median 1287.5 (spread = commit-wait slack). Parity token-for-token; all gates
+green. NEXT: pre-PR scrub (delete both verbatim modules + lab lcpp variants, squash to one
+fresh commit off origin/master, delete the old remote branch) -> final clean round -> reopen PR.
