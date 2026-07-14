@@ -13,6 +13,7 @@ module _model_tier shared public
 require dastest/testing_boost public
 require daslib/fio public
 require strings public
+require dasllama/dasllama_gguf   // gguf_shard_paths — split models tier on their TOTAL size
 
 // Models larger than this are large-tier. 6 GiB cleanly splits the ~5GB-and-under carriers
 // (incl. gemma-4-E2B at 4.97GB) from the 7.7GB+ heavies.
@@ -40,8 +41,21 @@ def model_available(t : T?; path : string) : bool {
         t |> skip("{base_name(path)} not present")
         return false
     }
-    if (!parity_full_mode() && st.size > LARGE_TIER_BYTES) {
-        t |> skip("{base_name(path)} is large-tier ({int64(st.size / (1024ul * 1024ul * 1024ul))} GB) — set DASLLAMA_PARITY_FULL=1 to run")
+    var total = st.size
+    // split models tier on their TOTAL size; an incomplete split is "not present" (skip), not a panic
+    let shards <- gguf_shard_paths(path, [missing_ok = true])
+    if (empty(shards)) {
+        t |> skip("{base_name(path)} split is incomplete (missing sibling shard)")
+        return false
+    }
+    if (length(shards) > 1) {
+        total = 0ul
+        for (s in shards) {
+            total += stat(s).size
+        }
+    }
+    if (!parity_full_mode() && total > LARGE_TIER_BYTES) {
+        t |> skip("{base_name(path)} is large-tier ({int64(total / (1024ul * 1024ul * 1024ul))} GB) — set DASLLAMA_PARITY_FULL=1 to run")
         return false
     }
     return true

@@ -48,12 +48,14 @@ require daslib/strings_convert
 
 let n = to_int(s)              // silent — returns 0 for "foo", 12 for "12abc"
 let r = try_to_int(s)          // Result<int; ConversionError>
-if (r is value) {
-    use(r as value)
+if (r._is_ok) {
+    use(r._value)
 } else {
-    bail("bad input: {s} ({r as error})")
+    bail("bad input: {s} ({r._error})")
 }
 ```
+
+`Result<T; E>` (daslib/result) is a **structural tuple** `tuple<_is_ok : bool; _value : T; _error : E>` — access via `r._is_ok` / `r._value` / `r._error`, NOT variant `is value`/`as value` (that's `error[30190] is value only allowed for variants`; the variant form belongs to fio's `fs_result_*` types, which are real variants).
 
 - **`to_int(s)` / `to_float(s)`** silently return `0` / `0.0` for unparseable input and partial-parse for `"12abc"`. Fine for trusted internal data; **never** for user input, env vars, file contents, command-line args, or anything that flows into a shell call, file path, or system call. `";rm -rf;"` parses as `0` with `to_int`.
 - **`try_to_int` / `try_to_float`** in `daslib/strings_convert` return a `Result<T; ConversionError>` distinguishing `invalid_argument` (no digits), `out_of_range` (overflow), and `trailing_garbage` (`"12abc"`). The whole `try_to_*` family covers `int8`/`uint8`/.../`int64`/`uint64`/`float`/`double`.
