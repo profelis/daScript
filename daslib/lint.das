@@ -80,6 +80,7 @@ class LintVisitor : AstVisitor {
     // analyzed local in the current function. Reset on function entry.
     branch_depth : int = 0
     ds_entries : array<DeadStoreEntry>
+    funcFile : string       // current function's source file, anchors lint_error's foreign-lineinfo gate
     def LintVisitor() {
         pass
     }
@@ -92,7 +93,11 @@ class LintVisitor : AstVisitor {
         return is_lint_suppressed(at, code)
     }
     def lint_error(text : string; at : LineInfo) : void {
-        if (noLint || is_suppressed(text, at)) return
+        // a node carrying another file's lineinfo (an inliner splice from a required
+        // module, macro-manufactured code) gets its diagnostics from that file's own
+        // compile — reporting it here would fail modules on idioms they cannot edit
+        if (noLint || is_suppressed(text, at)
+                || (at.fileInfo != null && !empty(funcFile) && at.fileInfo.name != funcFile)) return
         if (compile_time_errors) {
             compiling_program() |> macro_error(at, text)
         } elif (collect_errors) {
@@ -104,6 +109,7 @@ class LintVisitor : AstVisitor {
     }
     def override preVisitFunction(fun : FunctionPtr) : void {
         noLint = false
+        funcFile = fun.at.fileInfo != null ? "{fun.at.fileInfo.name}" : ""
         if (fun.fromGeneric != null || fun.flags.generated) {
             genericDepth++
         }

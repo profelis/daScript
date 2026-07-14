@@ -40,6 +40,7 @@ Whether to use gen2 make syntax.
 Allows relaxing of the assignment rules.
 Disables all unsafe operations.
 Local references are considered unsafe.
+User-written `with (module ...)` requires unsafe.
 Disallows global variables in this context (except for generated).
 Disallows global variables at all in this context.
 Disallows global heap in this context.
