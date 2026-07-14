@@ -597,6 +597,44 @@ Without ``with``, the same code would require the ``p.`` prefix on each field ac
 
 Multiple ``with`` blocks can be nested. If field names conflict, the innermost ``with`` takes precedence.
 
+^^^^^^^^^^^^^^^^^
+with (module ...)
+^^^^^^^^^^^^^^^^^
+
+.. index::
+    pair: with module; statement
+
+The module flavor of ``with`` is a compile-time resolution scope: names inside the block
+resolve as if the code were written in the named module — including that module's private
+functions, globals, structures, enumerations, and type aliases:
+
+.. code-block:: das
+
+    require game_internals
+
+    def debug_dump() {
+        with ( module game_internals ) {
+            print("{secret_state}\n")       // private global of game_internals
+            dump_internal_tables()          // private function of game_internals
+        }
+    }
+
+The scope affects name resolution only — it is erased after type inference and has zero
+runtime cost. Inside the block:
+
+- Unqualified names resolve in the named module, seeing its privates and its require graph.
+- Local variables are lexical and always win over the module's globals.
+- ``_::name`` still resolves at the enclosing (real) module — it is the escape hatch back.
+- The enclosing module's own symbols are otherwise **not** visible inside the block,
+  exactly as if the code were written in the named module.
+
+Nested module-``with`` blocks do not combine: the innermost one wins outright.
+
+Because it bypasses module privacy, a project can gate the statement: the
+``with_module_is_unsafe`` :ref:`option/policy <options>` makes user-written module-``with``
+require ``unsafe``, and a ``.das_project`` may demand the same per target module by
+exporting ``with_module_unsafe(target_module, file : string) : bool``.
+
 ------
 delete
 ------

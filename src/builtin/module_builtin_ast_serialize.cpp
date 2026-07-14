@@ -1881,7 +1881,7 @@ namespace das {
 
     void SerializeVisitor::preVisit ( ExprWith * expr ) {
         serializeBase(expr);
-        ser << expr->with << expr->body;
+        ser << expr->with << expr->body << expr->moduleName << expr->moduleUnsafeByProject;
     }
 
     void SerializeVisitor::preVisit ( ExprAssume * expr ) {
@@ -2620,6 +2620,7 @@ namespace das {
               << value.relaxed_assign
               << value.no_unsafe
               << value.local_ref_is_unsafe
+              << value.with_module_is_unsafe
               << value.no_global_variables
               << value.no_global_variables_at_all
               << value.no_global_heap

@@ -748,7 +748,8 @@ namespace das {
                 auto f = static_cast<ExprFor *>(e);
                 for ( auto & s : f->sources ) out.emplace_back(s, 0);
             } else if ( e->rtti_isWith() ) {
-                out.emplace_back(static_cast<ExprWith *>(e)->with, 0);
+                auto wi = static_cast<ExprWith *>(e);
+                if ( wi->with ) out.emplace_back(wi->with, 0);
             } else if ( e->rtti_isField() ) {
                 out.emplace_back(static_cast<ExprField *>(e)->value, 0);
             } else if ( e->rtti_isAt() ) {

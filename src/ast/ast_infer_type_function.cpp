@@ -14,6 +14,12 @@ namespace das {
         } else if (moduleName == "__") {
             moduleName = thisModule->name;
             return thisModule;
+        } else if (!moduleScope.empty() && moduleScope.back()) {
+            // inside `with (module foo)` - resolve as if written in foo (innermost scope wins outright)
+            if (moduleName.empty()) { // ::foo means definition-context module, here that's the with-module
+                moduleName = moduleScope.back()->name;
+            }
+            return moduleScope.back();
         } else if (func) {
             if (func->fromGeneric) {
                 auto origin = func->getOrigin();

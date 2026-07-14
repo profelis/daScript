@@ -967,6 +967,7 @@ namespace das {
             addField<DAS_BIND_MANAGED_FIELD(relaxed_assign)>("relaxed_assign");
             addField<DAS_BIND_MANAGED_FIELD(no_unsafe)>("no_unsafe");
             addField<DAS_BIND_MANAGED_FIELD(local_ref_is_unsafe)>("local_ref_is_unsafe");
+            addField<DAS_BIND_MANAGED_FIELD(with_module_is_unsafe)>("with_module_is_unsafe");
             addField<DAS_BIND_MANAGED_FIELD(no_global_variables)>("no_global_variables");
             addField<DAS_BIND_MANAGED_FIELD(no_global_variables_at_all)>("no_global_variables_at_all");
             addField<DAS_BIND_MANAGED_FIELD(no_global_heap)>("no_global_heap");

@@ -164,7 +164,7 @@ namespace das {
             }
             virtual void preVisit ( ExprWith * expr ) override {
                 Visitor::preVisit(expr);
-                anchorOf[expr->with] = curAnchor();
+                if ( expr->with ) anchorOf[expr->with] = curAnchor();
             }
         };
 

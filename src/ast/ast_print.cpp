@@ -707,6 +707,7 @@ namespace das {
             Visitor::preVisit(wh);
             ss << "with ";
             if ( gen2 ) ss << "( ";
+            if ( wh->isModuleWith() ) ss << "module " << wh->moduleName;
         }
         virtual void preVisitWithBody ( ExprWith * wh, Expression * body ) override {
             Visitor::preVisitWithBody(wh,body);

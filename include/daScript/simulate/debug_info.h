@@ -292,6 +292,7 @@ namespace das
         virtual bool isPodInScopeAllowed ( const string & /*moduleName*/, const string & /*fileName*/ ) const { return true; };
         virtual bool isModuleAllowed ( const string &, const string & ) const { return true; };
         virtual bool canModuleBeUnsafe ( const string &, const string & ) const { return true; };
+        virtual bool isWithModuleUnsafe ( const string & /*targetModule*/, const string & /*fileName*/ ) const { return false; };
         virtual bool canBeRequired ( const string &, const string &, bool ) const { return true; };
         virtual bool addFsRoot ( const string & , const string & ) { return false; }
         virtual void serialize ( AstSerializer & ser );
@@ -342,6 +343,7 @@ namespace das
         virtual string getIncludeFileName ( const string & fileName, const string & incFileName ) const override;
         virtual bool isModuleAllowed ( const string &, const string & ) const override;
         virtual bool canModuleBeUnsafe ( const string &, const string & ) const override;
+        virtual bool isWithModuleUnsafe ( const string &, const string & ) const override;
         virtual bool canBeRequired ( const string &, const string &, bool ) const override;
         virtual void serialize ( AstSerializer & ser ) override;
         virtual bool isSameFileName ( const string & f1, const string & f2 ) const override;
@@ -355,6 +357,7 @@ namespace das
         SimFunction *       includeGet = nullptr;
         SimFunction *       moduleAllowed = nullptr;
         SimFunction *       moduleUnsafe = nullptr;
+        SimFunction *       withModuleUnsafe = nullptr;
         SimFunction *       canModuleBeRequired = nullptr;
         SimFunction *       sameFileName = nullptr;
         SimFunction *       optionAllowed = nullptr;

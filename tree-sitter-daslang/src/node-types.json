@@ -4511,6 +4511,16 @@
           }
         ]
       },
+      "module": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "require_module_name",
+            "named": true
+          }
+        ]
+      },
       "object": {
         "multiple": false,
         "required": true,
@@ -4518,6 +4528,10 @@
           {
             "type": "_expression",
             "named": true
+          },
+          {
+            "type": "module",
+            "named": false
           }
         ]
       }

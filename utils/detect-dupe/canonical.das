@@ -148,7 +148,7 @@ class CanonicalVisitor : AstVisitor {
 
 // with / assume
     def override preVisitExprWith(expr : ExprWith?) {
-        emit("WITH")
+        emit(empty(expr.moduleName) ? "WITH" : "WITHMOD {expr.moduleName}")
     }
     def override preVisitExprAssume(expr : ExprAssume?) {
         emit("ASSUME")
