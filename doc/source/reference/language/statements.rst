@@ -627,8 +627,16 @@ runtime cost. Inside the block:
 - ``_::name`` still resolves at the enclosing (real) module — it is the escape hatch back.
 - The enclosing module's own symbols are otherwise **not** visible inside the block,
   exactly as if the code were written in the named module.
+- Instances of generics reachable through the named module's require graph resolve too,
+  even when their origin module is not visible from the program module.
 
 Nested module-``with`` blocks do not combine: the innermost one wins outright.
+
+The inliner manufactures this scope internally: a cross-module ``[inline]`` or auto-inline
+splice whose body uses the callee module's private symbols (or generic instances the caller
+cannot see) is wrapped in a generated module-``with``, so the spliced body resolves exactly
+as at the callee's own compile. Generated scopes are erased with the rest and are exempt
+from the ``with_module_is_unsafe`` policy.
 
 Because it bypasses module privacy, a project can gate the statement: the
 ``with_module_is_unsafe`` :ref:`option/policy <options>` makes user-written module-``with``

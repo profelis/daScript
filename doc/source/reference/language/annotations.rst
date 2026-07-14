@@ -296,7 +296,13 @@ Optimization and AOT
     (``finally`` sections and iterator cleanup run exactly as they did for the real
     return). The one refused mix is an early return inside a ``finally``-carrying
     block with statements after it — the rewrite would separate the finally from
-    declarations it references. Operator overloads (``+``, ``==``,
+    declarations it references. Cross-module splices resolve exactly: a body that uses
+    its home module's private symbols (or generic instances the caller cannot see)
+    splices under a generated ``with (module ...)`` resolution scope, with argument
+    temporaries bound outside it so caller expressions keep resolving at the caller.
+    What cannot cross is user-spelled ``_::`` dispatch — it binds the program module
+    at the call site, so a cross-module ``[inline]`` body carrying it is a compile-time
+    error. Operator overloads (``+``, ``==``,
     ``+=``, unary ``-``, ...) take ``[inline]`` too - their operator sites splice exactly
     like calls; punctuation functions dispatched through other node kinds (``[]``,
     ``??``, properties) are refused. ``options disable_inline`` (or the

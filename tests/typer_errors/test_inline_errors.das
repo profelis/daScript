@@ -72,4 +72,12 @@ def test_inline_contract_errors(t : T?) {
         t |> expect_issue("_inline_mixed_ternary.das",
             "inside a mixed-type ternary")
     }
+    t |> run("cross-module body with user-spelled _:: dispatch") @(t : T?) {
+        t |> expect_issue("_inline_scope_dispatch.das",
+            "body dispatches '_::help_scale' at the call site's module")
+    }
+    t |> run("[inline] call site inside a different module's with scope") @(t : T?) {
+        t |> expect_issue("_inline_scope_in_with.das",
+            "the call site resolves inside with (module _inline_scope_dispatch_helper)")
+    }
 }

@@ -204,91 +204,101 @@ namespace das {
         };
 
         // ----- cross-module reference scan (splice gate) -----
-        // a spliced body re-resolves its calls and globals in the DESTINATION module:
-        // everything it references must be public and visible from there. generic
-        // instances are judged by their origin (instances do not carry the private flag)
+        // a spliced body re-resolves its calls and globals in the DESTINATION module.
+        // references that stop resolving there fall in two classes. SCOPE needs -
+        // private symbols, foreign-module generic instances, require-graph visibility -
+        // re-resolve exactly under a generated `with (module <origin>)` wrapper, so
+        // those sites splice wrapped. HARD stops no resolution scope can fix: an
+        // `explicit`-flavored instance (typing soundness, not resolution - the ==const
+        // clone family marks a body TYPED against a locked constness view), and
+        // user-spelled `_::` / `__::` dispatch, which binds the PROGRAM module before
+        // and after the splice - only bodies this program itself compiled keep their
+        // meaning. locked instance names ("__::mod`fn`hash") are exempt from the
+        // dispatch stop: the locked-name fallback re-resolves them through the origin
+        // generic, and under the wrapper that origin is visible by construction
+
+        struct CrossVerdict {
+            string hard;        // symbol that stops the splice outright
+            string hardWhy;     // ... with the reason to report
+            string scope;       // symbol that needs the with (module) wrapper
+        };
 
         class PrivateUseScan : public Visitor {
         public:
-            PrivateUseScan ( Module * calleeModule, Module * destModule )
-                : mod(calleeModule), dest(destModule) {}
-            string privateSymbol;
+            PrivateUseScan ( Module * calleeModule, Module * destModule, bool programOwnsBody )
+                : mod(calleeModule), dest(destModule), underscoreExempt(programOwnsBody) {}
+            CrossVerdict verdict;
         protected:
             Module * mod;
             Module * dest;
-            void checkFunc ( Function * fn ) {
-                if ( !fn || !privateSymbol.empty() ) return;
+            bool underscoreExempt;  // callee lives in the program module: its _:: already bound here
+            void scopeNeed ( const string & name ) {
+                if ( verdict.scope.empty() ) verdict.scope = name;
+            }
+            void checkName ( const string & name ) {
+                if ( !verdict.hard.empty() || underscoreExempt ) return;
+                size_t ofs = 0;
+                if ( name.compare(0,4,"__::")==0 ) ofs = 4;
+                else if ( name.compare(0,3,"_::")==0 ) ofs = 3;
+                if ( !ofs ) return;
+                if ( name.find('`', ofs)!=string::npos ) return;    // locked/manufactured mangled name
+                verdict.hard = name;
+                verdict.hardWhy = "body dispatches '" + name + "' at the call site's module";
+            }
+            void checkFunc ( Function * fn, const string & callName ) {
+                checkName(callName);
+                if ( !fn || !verdict.hard.empty() ) return;
                 auto origin = fn->fromGeneric ? fn->fromGeneric : fn;
-                // instances are stamped private by instantiation, which keeps this gate
-                // deliberately conservative: a body calling ANY generic instance stays
-                // un-spliced across modules. Loosening it to origin-privateness re-fires
-                // hundreds of linq_fold_common splices and destabilizes the fold macro's
-                // shape assumptions - measure before widening
-                if ( fn->privateFunction || origin->privateFunction ) {
-                    // a private reference resolves after the splice only when it lives in
-                    // the DESTINATION module itself - a private instance in the callee's
-                    // module or any third module (a builtin generic instantiated there)
-                    // is unreachable from the caller's re-infer
-                    if ( fn->module!=dest && origin->module!=dest ) {
-                        privateSymbol = origin->name;
-                        return;
-                    }
-                }
-                // a generic INSTANCE call is name-mangled for the argument flavor it was
-                // instantiated with. tolerant instances (push, length) re-match after a
-                // splice - and a re-typed locked call now falls back to its origin
-                // generic - but an `explicit`-flavored parameter (==const generics: the
-                // clone family) marks a body TYPED against a locked constness view;
-                // splicing one under the caller's optimizer scope is a soundness
-                // boundary (see the flavor gates in processFunction). foreign-module
-                // instances decline outright (reachability), destination-module
-                // instances decline only on the explicit flavor
                 if ( fn->fromGeneric ) {
-                    bool explicitFlavor = false;
                     for ( auto & arg : fn->arguments ) {
                         if ( arg->type && (arg->type->explicitConst || arg->type->explicitRef) ) {
-                            explicitFlavor = true;
-                            break;
+                            verdict.hard = origin->name;
+                            verdict.hardWhy = "body calls explicit-flavored instance '" + origin->name + "'";
+                            return;
                         }
                     }
-                    if ( explicitFlavor || fn->module!=dest ) {
-                        privateSymbol = origin->name;
-                        return;
-                    }
+                    // a foreign-module instance is reachable from the caller's re-infer
+                    // only through the origin-generic fallback, which needs the origin's
+                    // module visible - the wrapper's perspective, not the destination's
+                    if ( fn->module!=dest ) scopeNeed(origin->name);
+                }
+                if ( fn->privateFunction || origin->privateFunction ) {
+                    if ( fn->module!=dest && origin->module!=dest ) scopeNeed(origin->name);
                 }
                 if ( dest && origin->module && !dest->isVisibleDirectly(origin->module) ) {
-                    privateSymbol = origin->name;
+                    scopeNeed(origin->name);
                 }
             }
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             virtual void preVisit ( ExprCall * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func);
+                checkFunc(expr->func, expr->name);
             }
             virtual void preVisit ( ExprOp1 * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func);
+                checkFunc(expr->func, "");
             }
             virtual void preVisit ( ExprOp2 * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func);
+                checkFunc(expr->func, "");
             }
             virtual void preVisit ( ExprOp3 * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func);
+                checkFunc(expr->func, "");
             }
             virtual void preVisit ( ExprAddr * expr ) override {
                 Visitor::preVisit(expr);
-                checkFunc(expr->func);
+                checkFunc(expr->func, expr->target);
             }
             virtual void preVisit ( ExprVar * expr ) override {
                 Visitor::preVisit(expr);
-                if ( !expr->variable || !privateSymbol.empty() ) return;
+                if ( !expr->variable || !verdict.hard.empty() ) return;
+                checkName(expr->name);
                 if ( expr->variable->private_variable ) {
-                    privateSymbol = expr->variable->name;
+                    if ( expr->variable->module!=dest ) scopeNeed(expr->variable->name);
                 } else if ( dest && expr->isGlobalVariable() && expr->variable->module
                     && !dest->isVisibleDirectly(expr->variable->module) ) {
-                    privateSymbol = expr->variable->name;
+                    scopeNeed(expr->variable->name);
                 }
             }
         };
@@ -452,6 +462,7 @@ namespace das {
             Expression * stmt = nullptr;
             StmtAnchor  anchor;
             SiteKind    kind = SiteKind::MustCall;
+            string      withModule;             // innermost `with (module ...)` at the site
         };
 
         // annotations other than inert markers may carry call-site semantics (verifyCall,
@@ -596,6 +607,7 @@ namespace das {
         protected:
             const AutoInlineCfg & autoCfg;
             vector<StmtAnchor> blockStack;
+            vector<string> withModules;     // enclosing module-flavored with scopes
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
             virtual void preVisit ( ExprBlock * blk ) override {
                 Visitor::preVisit(blk);
@@ -604,6 +616,14 @@ namespace das {
             virtual ExpressionPtr visit ( ExprBlock * blk ) override {
                 blockStack.pop_back();
                 return Visitor::visit(blk);
+            }
+            virtual void preVisit ( ExprWith * expr ) override {
+                Visitor::preVisit(expr);
+                if ( expr->isModuleWith() ) withModules.push_back(expr->moduleName);
+            }
+            virtual ExpressionPtr visit ( ExprWith * expr ) override {
+                if ( expr->isModuleWith() ) withModules.pop_back();
+                return Visitor::visit(expr);
             }
             virtual void preVisitBlockExpression ( ExprBlock * block, Expression * expr ) override {
                 Visitor::preVisitBlockExpression(block, expr);
@@ -616,6 +636,7 @@ namespace das {
                 PlannedSite site;
                 site.callLike = expr;
                 site.kind = kind;
+                if ( !withModules.empty() ) site.withModule = withModules.back();
                 if ( !blockStack.empty() && blockStack.back().index >= 0
                     && blockStack.back().index < int(blockStack.back().block->list.size()) ) {
                     site.anchor = blockStack.back();
@@ -656,19 +677,36 @@ namespace das {
         // never REBOUND still holds that literal at every invoke. write flags are fresh
         // at patch time (buildAccessFlags runs right before patchAnnotations); an invoke
         // stamps a write on its non-const block argument, but invoking cannot rebind the
-        // holder to a different literal, so arg0 occurrences stay clean for this purpose
+        // holder to a different literal, so arg0 occurrences stay clean for this purpose.
+        // each binding remembers its module-with context: a literal is caller code and
+        // must keep resolving where it was written - devirt at an invoke under a
+        // DIFFERENT `with (module ...)` scope would re-home it, so those sites decline
+        struct BlockBinding {
+            ExprMakeBlock * literal = nullptr;
+            string          withModule;
+        };
         class BlockBindingScan : public Visitor {
         public:
-            das_hash_map<Variable *, ExprMakeBlock *> binding;
+            das_hash_map<Variable *, BlockBinding> binding;
             das_hash_set<Variable *> disq;
         protected:
             das_hash_set<Expression *> invokeArg0;
+            vector<string> withModules;
             virtual bool canVisitQuoteSubexpression ( ExprQuote * ) override { return false; }
+            virtual void preVisit ( ExprWith * expr ) override {
+                Visitor::preVisit(expr);
+                if ( expr->isModuleWith() ) withModules.push_back(expr->moduleName);
+            }
+            virtual ExpressionPtr visit ( ExprWith * expr ) override {
+                if ( expr->isModuleWith() ) withModules.pop_back();
+                return Visitor::visit(expr);
+            }
             virtual void preVisitLet ( ExprLet * let, const VariablePtr & var, bool last ) override {
                 Visitor::preVisitLet(let, var, last);
                 if ( var->init && var->init->rtti_isMakeBlock() ) {
                     if ( binding.find(var)!=binding.end() ) disq.insert(var);  // paranoia: one binding only
-                    binding[var] = static_cast<ExprMakeBlock *>(var->init);
+                    binding[var] = BlockBinding{static_cast<ExprMakeBlock *>(var->init),
+                        withModules.empty() ? string() : withModules.back()};
                 }
             }
             virtual void preVisit ( ExprInvoke * expr ) override {
@@ -1599,7 +1637,7 @@ namespace das {
             das_hash_map<Function *, bool> shapeCache;
             das_hash_map<Function *, pair<bool,string>> autoOkCache;
             das_hash_map<ExprMakeBlock *, pair<bool,string>> devirtShapeCache;
-            das_hash_map<Function *, string> privateUseCache;
+            das_hash_map<Function *, CrossVerdict> privateUseCache;
             das_hash_map<Function *, bool> cycleCache;
 
             // reachability of `fn` from its own body over the RUNTIME call graph
@@ -1716,12 +1754,13 @@ namespace das {
                 return st;
             }
 
-            const string & privateUse ( Function * fn, Module * originModule ) {
+            const CrossVerdict & privateUse ( Function * fn, Module * originModule ) {
                 auto it = privateUseCache.find(fn);
                 if ( it != privateUseCache.end() ) return it->second;
-                PrivateUseScan scan(originModule, program->thisModule.get());
+                PrivateUseScan scan(originModule, program->thisModule.get(),
+                    fn->module==program->thisModule.get());
                 fn->body->visit(scan);
-                return privateUseCache[fn] = scan.privateSymbol;
+                return privateUseCache[fn] = scan.verdict;
             }
 
             // next free __inl counter across a subtree; names are function-scoped and
@@ -1769,7 +1808,8 @@ namespace das {
                 }
             }
 
-            void completeSite ( const PlannedSite & site, Function * caller, const string & subjName ) {
+            void completeSite ( const PlannedSite & site, Function * caller, const string & subjName,
+                    const string & scopeModule = string() ) {
                 switch ( site.kind ) {
                     case SiteKind::MustCall: inlined ++; break;
                     case SiteKind::AutoCall: inlinedAuto ++; break;
@@ -1778,8 +1818,9 @@ namespace das {
                 if ( logOpt && logs ) {
                     const char * verb = site.kind==SiteKind::MustCall ? "INLINE "
                         : site.kind==SiteKind::AutoCall ? "AUTO-INLINE " : "DEVIRT ";
-                    *logs << verb << subjName << " into " << caller->getMangledName()
-                          << " at " << site.callLike->at.describe() << "\n";
+                    *logs << verb << subjName << " into " << caller->getMangledName();
+                    if ( !scopeModule.empty() ) *logs << " under with (module " << scopeModule << ")";
+                    *logs << " at " << site.callLike->at.describe() << "\n";
                 }
                 changed = true;
             }
@@ -1825,7 +1866,7 @@ namespace das {
             fn->body->visit(collect);
             if ( collect.sites.empty() ) return;
             // let-bound block literals this function's invokes may resolve to
-            das_hash_map<Variable *, ExprMakeBlock *> bindings;
+            das_hash_map<Variable *, BlockBinding> bindings;
             if ( autoCfg.blockLiterals ) {
                 BlockBindingScan bscan;
                 fn->body->visit(bscan);
@@ -1856,7 +1897,15 @@ namespace das {
                         auto v = static_cast<ExprVar *>(a0);
                         if ( v->variable ) {
                             auto bit = bindings.find(v->variable);
-                            if ( bit!=bindings.end() ) literal = bit->second;
+                            if ( bit!=bindings.end() ) {
+                                if ( bit->second.withModule != site.withModule ) {
+                                    // splicing would re-home the literal's names into the
+                                    // invoke's `with (module ...)` scope (or out of its own)
+                                    decline(site, "block literal binding crosses a module resolution scope", callLike->at);
+                                    continue;
+                                }
+                                literal = bit->second.literal;
+                            }
                         }
                     }
                     if ( !literal ) continue;   // not a traceable block literal
@@ -1914,6 +1963,8 @@ namespace das {
                 TypeDecl * subjResult = nullptr;    // null = void result
                 SiteArgs sa;
                 vector<ExpressionPtr> opArgs;   // operator sites: operands as an argument vector
+                bool needScope = false;         // wrap the spliced body in with (module <origin>)
+                string scopeModule;
                 if ( site.kind==SiteKind::Devirt ) {
                     string why;
                     if ( !devirtShapeOk(literal, why) ) { decline(site, why, callLike->at); continue; }
@@ -1957,12 +2008,32 @@ namespace das {
                     // (and the reachability of its references) by the generic's origin
                     Module * originModule = calleeFn->fromGeneric
                         ? calleeFn->fromGeneric->module : calleeFn->module;
+                    // a site under a `with (module ...)` scope resolves at THAT module:
+                    // only a body from the same module keeps its meaning spliced bare
+                    // there (a wrap for any other module would fight the enclosing scope).
+                    // user-written scopes may spell a require path - compare the last leg
+                    string siteWith = site.withModule;
+                    auto slash = siteWith.find_last_of('/');
+                    if ( slash != string::npos ) siteWith.erase(0, slash+1);
+                    if ( !siteWith.empty() && siteWith != originModule->name ) {
+                        siteFail(site, "can't inline " + subjName + " here: the call site resolves inside with (module "
+                            + site.withModule + ")", callLike->at);
+                        continue;
+                    }
                     if ( originModule != program->thisModule.get() ) {
-                        auto & priv = privateUse(calleeFn, originModule);
-                        if ( !priv.empty() ) {
-                            siteFail(site, "can't inline " + subjName + " across modules: body uses private symbol '" + priv + "'", callLike->at);
+                        auto & verdict = privateUse(calleeFn, originModule);
+                        if ( !verdict.hard.empty() ) {
+                            siteFail(site, "can't inline " + subjName + " across modules: " + verdict.hardWhy, callLike->at);
                             continue;
                         }
+                        // resolution-only needs splice under a generated
+                        // `with (module <origin>)` - see the wrap below. a site already
+                        // inside with (module <origin>) splices bare: the enclosing scope
+                        // is the resolution context (wrapping again would re-wrap interior
+                        // sites every round - the patch pass would never converge)
+                        needScope = !verdict.scope.empty()
+                            && siteWith != originModule->name;
+                        if ( needScope ) scopeModule = originModule->name;
                     }
                     body = static_cast<ExprBlock *>(calleeFn->body);
                     if ( calleeFn->result && !calleeFn->result->isVoid() ) subjResult = calleeFn->result;
@@ -1988,9 +2059,12 @@ namespace das {
                 // path: its generated `unsafe { }` wrapper must be a statement, so that
                 // every later-round splice inside it anchors INSIDE the wrapper's block
                 // (nothing unsafe can hoist out of its authorization region)
+                // a scope-needing body always takes the statement path: the with (module)
+                // wrapper is a statement, and a pure graft would re-resolve at the caller
                 bool exprBody = body->list.size()==1 && body->list.back()->rtti_isReturn()
                     && !static_cast<ExprReturn *>(body->list.back())->moveSemantics
-                    && !(calleeFn && calleeFn->hasUnsafe);
+                    && !(calleeFn && calleeFn->hasUnsafe)
+                    && !needScope;
                 bool writeFree = calleeFn ? calleeWriteFree(calleeFn) : false;  // a block body is judged unknown
                 das_hash_map<Variable *, ArgSub> paramSub;
                 vector<ExpressionPtr> temps;
@@ -2014,7 +2088,18 @@ namespace das {
                         sub.tempName = tname;
                     };
                     if ( leafA->rtti_isTypeDecl() ) {
-                        // type<...> witness: a compile-time tag - a temp would "use" it
+                        // type<...> witness: a compile-time tag - a temp would "use" it.
+                        // a resolved witness carries its type by pointer and crosses a
+                        // module scope safely; an alias would re-resolve in the wrong module
+                        if ( needScope ) {
+                            auto td = static_cast<ExprTypeDecl *>(leafA);
+                            if ( td->typeexpr && td->typeexpr->isAutoOrAlias() ) {
+                                siteFail(site, "can't inline " + subjName + ": type witness argument '"
+                                    + P->name + "' can't cross the module scope", callLike->at);
+                                argFlavorFail = true;
+                                break;
+                            }
+                        }
                         sub.substitute = leafA;
                         paramSub[P] = sub;
                         continue;
@@ -2072,9 +2157,13 @@ namespace das {
                         // var replacing a const param read re-types body subtrees the
                         // optimizer already trusts (the `:=` clone family being the
                         // proven case). when the param is more const than the leaf,
-                        // bind a const reference instead
+                        // bind a const reference instead. under a module-scope wrap a
+                        // GLOBAL var's unqualified name would re-resolve in the callee's
+                        // module - it binds a reference outside the wrap instead
                         bool sameConstView = !P->type->constant || (leafA->type && leafA->type->constant);
-                        if ( leafVar && sameConstView ) {
+                        bool globalUnderScope = needScope && leafVar
+                            && static_cast<ExprVar *>(leafA)->isGlobalVariable();
+                        if ( leafVar && sameConstView && !globalUnderScope ) {
                             sub.substitute = leafA;             // same aliasing as the call itself
                         } else if ( leafVar ) {
                             // const-widened var: bind the const reference explicitly - a bare
@@ -2082,18 +2171,25 @@ namespace das {
                             // materialize (and MOVE a non-copyable) instead of aliasing
                             auto init = A->clone();
                             init->alwaysSafe = true;            // generated binding to real storage
-                            makeArgTemp(init, true, true, false);
+                            makeArgTemp(init, !varParam, true, false);
                         } else if ( leafA->rtti_isMakeBlock() ) {
                             // a block literal read once outside loops substitutes textually,
                             // keeping shapes a holder can't reproduce (temporary-typed block
                             // parameters do not survive a `var <-` binding). multi-read and
-                            // under-loop literals bind a holder; devirtualization takes over
+                            // under-loop literals bind a holder; devirtualization takes over.
+                            // under a module-scope wrap the literal is caller code and MUST
+                            // bind a holder outside - a `#` parameter can't, so it declines
                             int reads = 0;
                             auto rit = stats.readCount.find(P);
                             if ( rit != stats.readCount.end() ) reads = rit->second;
                             bool underLoop = stats.readUnderLoop.find(P)!=stats.readUnderLoop.end();
-                            if ( reads<=1 && !underLoop ) {
+                            if ( reads<=1 && !underLoop && !needScope ) {
                                 sub.substitute = leafA;
+                            } else if ( needScope && P->type->temporary ) {
+                                siteFail(site, "can't inline " + subjName + ": block argument '"
+                                    + P->name + "' can't bind outside the module scope", callLike->at);
+                                argFlavorFail = true;
+                                break;
                             } else {
                                 makeArgTemp(A->clone(), false, false, true);
                             }
@@ -2117,7 +2213,13 @@ namespace das {
                         // a mutable by-value param IS a local copy
                         makeArgTemp(A->clone(), false, false, A->type && !A->type->canCopy());
                     } else if ( leafConst ) {
-                        sub.substitute = leafA;
+                        // an enum constant re-resolves its enumeration by name - under a
+                        // module-scope wrap that name lands in the wrong module; bind it out
+                        if ( needScope && leafA->type && leafA->type->isEnumT() ) {
+                            makeArgTemp(A->clone(), true, false, false);
+                        } else {
+                            sub.substitute = leafA;
+                        }
                     } else if ( leafVar ) {
                         auto av = static_cast<ExprVar *>(leafA);
                         // snapshot hazard: the spliced body could write the same storage
@@ -2141,6 +2243,8 @@ namespace das {
                                 // body's writes could reach it, breaking snapshot semantics
                                 hazard = !writeFree;
                             }
+                            // a global's unqualified name would re-resolve inside the wrap
+                            if ( needScope && av->isGlobalVariable() ) hazard = true;
                         }
                         if ( hazard ) {
                             makeArgTemp(A->clone(), true, false, false);
@@ -2148,13 +2252,15 @@ namespace das {
                             sub.substitute = leafA;
                         }
                     } else {
-                        // tier B: pure, read at most once, never under a loop
+                        // tier B: pure, read at most once, never under a loop. a composed
+                        // caller expression may carry calls and globals that must keep
+                        // resolving at the caller - under a module-scope wrap it binds out
                         int reads = 0;
                         auto rit = stats.readCount.find(P);
                         if ( rit != stats.readCount.end() ) reads = rit->second;
                         bool underLoop = stats.readUnderLoop.find(P)!=stats.readUnderLoop.end();
                         bool orderSafe = writeFree || argReadsOnlyPrivateLocals(A, sa);
-                        if ( reads<=1 && !underLoop && inlinePure(A) && orderSafe ) {
+                        if ( reads<=1 && !underLoop && inlinePure(A) && orderSafe && !needScope ) {
                             sub.substitute = A;
                         } else {
                             makeArgTemp(A->clone(), true, false, A->type && !A->type->canCopy());
@@ -2487,6 +2593,30 @@ namespace das {
                         wrap->generated = true;
                         spliced = wrap;
                     }
+                    if ( needScope ) {
+                        // module-flavored with: the body re-resolves as if written in the
+                        // callee's module - privates, foreign instances, and its require
+                        // graph land exactly where the callee's own compile put them. arg
+                        // and prefix temps stay OUTSIDE (caller expressions must keep
+                        // resolving at the caller - the mirror rule); param-temp, result
+                        // and flag reads inside are locals, lexical and unaffected.
+                        // generated = exempt from the with_module_is_unsafe policy. the
+                        // unsafe wrapper stays INSIDE so later-round splices keep
+                        // anchoring within their authorization region
+                        ExprBlock * host = nullptr;
+                        if ( spliced->rtti_isBlock() ) {
+                            host = static_cast<ExprBlock *>(spliced);
+                        } else {
+                            host = new ExprBlock();
+                            host->at = callLike->at;
+                            host->list.push_back(spliced);
+                        }
+                        auto scopeWrap = new ExprWith(callLike->at);
+                        scopeWrap->moduleName = scopeModule;
+                        scopeWrap->generated = true;
+                        scopeWrap->body = host;
+                        spliced = scopeWrap;
+                    }
                     splice.push_back(spliced);
                 }
                 auto & list = site.anchor.block->list;
@@ -2511,7 +2641,7 @@ namespace das {
                         continue;
                     }
                 }
-                completeSite(site, fn, subjName);
+                completeSite(site, fn, subjName, scopeModule);
                 inlineId ++;
             }
         }

@@ -157,6 +157,7 @@ namespace das {
         //      inWhichModule = this
         //      objModule = _b
         bool isVisibleFunc(Module *inWhichModule, Module *objModule) const;
+        bool isVisibleInstanceFunc(Module *inWhichModule, Function *pFn) const;
 
         MatchingFunctions findFuncAddr(const string &name) const;
 
