@@ -2025,6 +2025,28 @@ The existing-array collapse matches a **plain-variable receiver** (``dst |> …`
 only; a chain receiver (``obj.arr |> …``) is out of scope for now — a planned
 follow-up, mirroring STYLE012's separate chain form.
 
+.. _style034:
+
+STYLE034 — ``reinterpret<T?>(addr(x))`` collapses to ``addr<T?>(x)``
+====================================================================
+
+``addr<T?>(x)`` is pure sugar for ``reinterpret<T?>(addr(x))``, with one
+``unsafe()`` covering both halves — the spelled-out form needs two gates:
+
+.. code-block:: das
+
+    // Bad — two unsafe gates for one operation
+    let p = unsafe(reinterpret<int?>(unsafe(addr(f))))      // STYLE034
+
+    // Good
+    let p = unsafe(addr<int?>(f))
+
+Pointer targets only: a pointer→integer pun such as
+``reinterpret<uint64>(addr(x))`` has no ``addr<T?>`` spelling and stays
+silent. So does a reinterpret whose operand is not an ``addr(...)``. The
+sugar's own desugared output is exempt (it carries the ``fromAddrSugar``
+cast flag), so ``addr<T?>(x)`` never re-flags itself.
+
 -----
 Tests
 -----
