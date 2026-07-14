@@ -1262,6 +1262,7 @@ def private prefill_supported(t : Model; s : Session; npos, start_pos : int64) :
 def private enc_gemm(enc : MetalComputeEncoder?; bwq, bws, bxq, bxs, by, bkdim, bndim : MetalBuffer?; mp, d : int64) {
     let use64 = gemm_use64(mp, d)
     metal_set_pipeline(enc, use64 ? g_pso_gemm64 : g_pso_gemm)
+    metal_set_threadgroup_memory_length(enc, use64 ? metal_q8_gemm64_msl_tgmem : metal_q8_gemm_msl_tgmem, 0)
     metal_set_buffer(enc, bwq, 0ul, 0)
     metal_set_buffer(enc, bws, 0ul, 1)
     metal_set_buffer(enc, bxq, 0ul, 2)
