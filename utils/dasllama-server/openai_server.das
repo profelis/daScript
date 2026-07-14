@@ -49,6 +49,7 @@ struct private StreamWire {
     utf8_tail : string              // streaming: held-back bytes of a multi-byte char split across tokens
     has_tools : bool                // chat request declared tools on a tool-capable template
     hold : bool                     // streaming: tool-call opener seen — buffer instead of stream
+    held_pieces : int               // pieces buffered since hold engaged (drives keepalive chunks)
     call_open : string              // the family's tool-call markers (copied from the chat template)
     call_close : string
 }
@@ -741,7 +742,15 @@ def private flush_events(srv : WebSocketServer) {
             if (!w.streaming || w.has_tools) {
                 w.reply_parts |> push(e.text)   // buffered reply, and/or the finish-time tool-call parse
             }
-            if (w.streaming && !w.hold) {
+            if (w.streaming && w.hold) {
+                // a long tool-call body buffers for minutes at decode speed; with no bytes on the
+                // wire the client's idle timeout kills the stream (pi: "terminated" + retry loop).
+                // An empty delta {} is protocol-legal liveness every ~16 tokens.
+                w.held_pieces ++
+                if (w.held_pieces % 16 == 0) {
+                    send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "")
+                }
+            } elif (w.streaming) {
                 // re-join any held-back partial character, then hold the new incomplete tail
                 // so every delta on the wire is valid UTF-8 by itself
                 let whole = "{w.utf8_tail}{e.text}"
@@ -752,6 +761,7 @@ def private flush_events(srv : WebSocketServer) {
                     if (o >= 0) {
                         w.hold = true
                         w.utf8_tail = ""
+                        to_log(LOG_INFO, "stream {w.id}: tool-call opener — buffering the call body (keepalives on)\n")
                         let head = slice(whole, 0, o)   // the opener starts on a char boundary (ascii)
                         if (!empty(head)) {
                             send_chat_chunk(srv, w.writer, w.id, w.created, "", head, "")
