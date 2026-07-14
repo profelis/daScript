@@ -30,6 +30,13 @@ require daslib/templates_boost
 
 let private builtin_files = fixed_array("fio.das", "ast.das", "builtin.das", "debugger.das", "network.das", "rtti.das")
 
+def private generated_call(var e : ExpressionPtr) : ExpressionPtr {
+    // instrumentation calls are machinery output: lint skips them, and the inliner's
+    // cross-module `_::` gate exempts generated calls whose target resolves anywhere
+    e.genFlags.generated = true
+    return e
+}
+
 def private resolve_file_path(name : string) : string {
     for (bf in builtin_files) {
         if (name == bf) return "{get_das_root()}/src/builtin/{name}"
@@ -312,7 +319,7 @@ class CoverageMacro : AstVisitor {
             prev.emplace(ex)
         }
         blk.list |> clear()
-        blk.list |> emplace_new <| qmacro(_::add_func_coverage($v(file), $v(fname)))
+        blk.list |> emplace_new <| generated_call(qmacro(_::add_func_coverage($v(file), $v(fname))))
         for (el in prev) {
             blk.list |> emplace <| el
         }
@@ -351,7 +358,7 @@ class CoverageMacro : AstVisitor {
                 prevTrue.emplace(ex)
             }
             true_blk.list |> clear()
-            true_blk.list |> emplace_new <| qmacro(_::add_branch_coverage($v(file), $v(true_idx)))
+            true_blk.list |> emplace_new <| generated_call(qmacro(_::add_branch_coverage($v(file), $v(true_idx))))
             for (el in prevTrue) {
                 true_blk.list |> emplace <| el
             }
@@ -364,14 +371,14 @@ class CoverageMacro : AstVisitor {
                 prevFalse.emplace(ex)
             }
             false_blk.list |> clear()
-            false_blk.list |> emplace_new <| qmacro(_::add_branch_coverage($v(file), $v(false_idx)))
+            false_blk.list |> emplace_new <| generated_call(qmacro(_::add_branch_coverage($v(file), $v(false_idx))))
             for (el in prevFalse) {
                 false_blk.list |> emplace <| el
             }
         } elif (ifte.if_false == null) {
             // no else branch — create one with just the branch coverage call
             var elseBlk = new ExprBlock(at = ifte.at)
-            elseBlk.list |> emplace_new <| qmacro(_::add_branch_coverage($v(file), $v(false_idx)))
+            elseBlk.list |> emplace_new <| generated_call(qmacro(_::add_branch_coverage($v(file), $v(false_idx))))
             ifte.if_false = elseBlk
         }
         astChanged = true
@@ -407,7 +414,7 @@ class CoverageMacro : AstVisitor {
                         flines |> insert(line)
                     }
                 }
-                blk.list |> emplace_new <| qmacro(_::add_line_coverage($v(file), $v(fname), $v(line)))
+                blk.list |> emplace_new <| generated_call(qmacro(_::add_line_coverage($v(file), $v(fname), $v(line))))
                 blk.list |> emplace <| el
             }
         }
