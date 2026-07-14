@@ -5326,7 +5326,34 @@ def private attention_qwen35_gated_decode(t : Model; var s : Session; l : int64;
         }
     }
     prof_add("rope", ts_rope)
-    if (s.kv_dtype_k == KVDtype.q8_0) {
+    let ktq4 = s.kv_dtype_k == KVDtype.tq4
+    let vtq4 = s.kv_dtype_v == KVDtype.tq4
+    if (ktq4 || vtq4) {
+        // tq4 basis change at the RoPE seam (attention_std_decode's twin): attention runs in the
+        // rotated basis; xb un-rotates per head after — the sigmoid out-gate lives in the original
+        let ts_rot = ref_time_ticks()
+        unsafe {
+            let sgp = reinterpret<float const?>(addr(s.kv_signs[0]))
+            if (ktq4) {
+                var qrp = addr(s.q[0])
+                for (hh in range64(qd / head_size)) {
+                    fwht_signs_row(qrp + hh * head_size, sgp, head_size)
+                }
+                var krp = addr(s.k[0])
+                for (hh in range64(kv_dim / head_size)) {
+                    fwht_signs_row(krp + hh * head_size, sgp, head_size)
+                }
+            }
+            if (vtq4) {
+                var vrp = addr(s.v[0])
+                for (hh in range64(kv_dim / head_size)) {
+                    fwht_signs_row(vrp + hh * head_size, sgp, head_size)
+                }
+            }
+        }
+        prof_add("tq4_rot", ts_rot)
+    }
+    if (s.kv_dtype_k == KVDtype.q8_0 || ktq4) {
         quantize_q8_0_into(s.q, qd, s.attq, s.atts, 0l, 0l)
     }
     let ts_kv = ref_time_ticks()
@@ -5345,9 +5372,10 @@ def private attention_qwen35_gated_decode(t : Model; var s : Session; l : int64;
     let vdt = s.kv_dtype_v
     let nrun = kv_runs(s, kstart, pos + 1l, s.kv_runs)
     unsafe {
+        let kplanes = kdt == KVDtype.q8_0 || kdt == KVDtype.tq4
         let qp = reinterpret<float const?>(addr(s.q[0]))
-        let qqp = kdt == KVDtype.q8_0 ? reinterpret<int8 const?>(addr(s.attq[0])) : null
-        let qsp = kdt == KVDtype.q8_0 ? reinterpret<float const?>(addr(s.atts[0])) : null
+        let qqp = kplanes ? reinterpret<int8 const?>(addr(s.attq[0])) : null
+        let qsp = kplanes ? reinterpret<float const?>(addr(s.atts[0])) : null
         let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))
         var xbp = addr(s.xb[0])
         var attp = addr(s.att[0])
@@ -5364,6 +5392,15 @@ def private attention_qwen35_gated_decode(t : Model; var s : Session; l : int64;
         }
     }
     prof_add("attn", ts_attn)
+    if (vtq4) {   // tq4 V: xb accumulated in the rotated basis — un-rotate before the out-gate
+        unsafe {
+            let sgp = reinterpret<float const?>(addr(s.kv_signs[0]))
+            var xrp = addr(s.xb[0])
+            for (hh in range64(n_heads)) {
+                fwht_unsign_row(xrp + hh * head_size, sgp, head_size)
+            }
+        }
+    }
     // per-head sigmoid output gate on the attention output, before the out projection (exp4)
     let ts_wo = ref_time_ticks()
     unsafe {
@@ -7691,6 +7728,22 @@ def private attention_qwen35_gated_prefill(t : Model; var s : Session; l : int64
         }
     }
     prof_add("rope", ts_rope)
+    let ktq4 = s.kv_dtype_k == KVDtype.tq4
+    let vtq4 = s.kv_dtype_v == KVDtype.tq4
+    if (ktq4 || vtq4) {   // tq4 basis change (attention_std_prefill's twin); xb_b un-rotates below
+        let ts_rot = ref_time_ticks()
+        unsafe {
+            let sgp = reinterpret<float const?>(addr(s.kv_signs[0]))
+            if (ktq4) {
+                tq4_rotate_batch(s.q_b, npos, qd, head_size, sgp)
+                tq4_rotate_batch(s.k_b, npos, kv_dim, head_size, sgp)
+            }
+            if (vtq4) {
+                tq4_rotate_batch(s.v_b, npos, kv_dim, head_size, sgp)
+            }
+        }
+        prof_add("tq4_rot", ts_rot)
+    }
     let ts_kv = ref_time_ticks()
     let store_nrun = kv_runs(s, start_pos, start_pos + npos, s.kv_runs)
     unsafe {
@@ -7702,6 +7755,11 @@ def private attention_qwen35_gated_prefill(t : Model; var s : Session; l : int64
     prefill_attention(s, kcl, vcl, npos, start_pos, head_size, qd, kv_dim, n_heads, kv_mul, scale,
                       false, 0l, c.attn_logit_softcap, null)
     prof_add("attn", ts_attn)
+    if (vtq4) {   // un-rotate every position's xb before the out-gate (gate is in the original basis)
+        unsafe {
+            tq4_unrotate_batch(s.xb_b, npos, qd, head_size, reinterpret<float const?>(addr(s.kv_signs[0])))
+        }
+    }
     // per-head sigmoid output gate on every position's attention output, before the out projection.
     // Threaded + exp4: the serial scalar loop was npos·qd (2.1M @pp512) libm exps on the caller —
     // a ~10ms all-lane hole per attention layer in the lane trace. qd % 4 == 0 keeps the float4
