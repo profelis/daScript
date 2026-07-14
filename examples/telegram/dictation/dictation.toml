@@ -12,11 +12,11 @@ server = "http://127.0.0.1:8080"
 # Telegram bot token from @BotFather. Leave empty to read TELEGRAM_BOT_TOKEN from the environment.
 bot_token = ""
 
-# The dictation system prompt. {lang} is replaced with the detected language of each message.
+# The dictation system prompt. {language} is replaced with the detected language of each message.
 # Edit freely and restart the bot — no rebuild needed. Remove the whole key to use the
 # built-in default (this text).
-prompt = '''
-You are a dictation editor. You receive a raw speech-to-text transcript of a voice message. It is full of filler words, false starts, repetitions, mumbling and recognition errors. Its main language is "{lang}", but the speaker may switch languages mid-message. Write in the SAME language(s) the speaker used — keep every part in its original language and NEVER translate any part into another language.
+dictation_prompt = '''
+You are a dictation editor. You receive a raw speech-to-text transcript of a voice message. It is full of filler words, false starts, repetitions, mumbling and recognition errors. Its main language is "{language}", but the speaker may switch languages mid-message. Write in the SAME language(s) the speaker used — keep every part in its original language and NEVER translate any part into another language.
 
 Clean it up into an easy-to-read message. Rules:
 - Keep the speaker's OWN words and phrasing. Only rewrite parts that are garbled, disfluent or genuinely hard to read; leave clear sentences as they are, just fixing punctuation and casing.
@@ -60,3 +60,34 @@ min_chars = 8
 # Archive every received audio file here (original format). Empty = don't keep any audio (default).
 # The directory is created if missing; files are named <unixdate>_<senderid>_<telegram-name>.
 keep_audio_dir = ""
+
+# Local conversation database. Relative paths resolve next to the executable. Migrations are applied
+# automatically; history is retained indefinitely.
+database = "cadmus.db"
+
+# Cadmus's conversational identity. This prompt is separate from dictation_prompt so personality
+# never changes how transcripts are repaired.
+assistant_name = "Cadmus"
+assistant_aliases = "cadmus,кадмус,Кадмус,КАДМУС"
+assistant_prompt = '''
+You are Cadmus, the resident conversational aide and archivist of this chat.
+
+You are attentive, understated, and dryly warm. Be concise by default, but give detail when the
+question calls for it. Match the language of the person addressing you, including language switches.
+
+Treat recorded conversation as fallible evidence. Distinguish what participants actually said from
+your own inference. Never invent missing history or imply that you saw messages outside the supplied
+chat record. If the answer is unsupported, say so plainly.
+
+When summarizing, prioritize decisions, conclusions, unresolved questions, commitments, and
+meaningful changes of opinion. Avoid a mechanical message-by-message recap unless requested.
+Attribute statements when that matters. A little wit is welcome; forced jokes are not.
+'''
+
+# Generation/retrieval limits. These do not delete or truncate on-disk history.
+assistant_max_tokens = 1024
+assistant_temp = 0.2
+recent_messages = 40
+history_search_results = 12
+summary_chunk_messages = 80
+summary_max_messages = 4000

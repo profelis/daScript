@@ -1,81 +1,101 @@
-# dictation — a local voice-transcription Telegram bot
+# dictation / Cadmus - local Telegram dictation and conversation bot
 
-Transcribes voice notes and audio files into clean, easy-to-read text — entirely on your machines.
-For every voice/audio message (in a group or a direct message) the bot:
+Cadmus transcribes Telegram voice notes through a local `dasllama-server`, cleans the transcript,
+and answers questions using the current chat's locally stored history. The Telegram bot contains no
+models; the server owns ASR and LLM inference.
 
-1. downloads the audio and transcodes it to 16 kHz mono WAV with **ffmpeg**;
-2. sends it to a running **dasllama-server** — `/v1/audio/transcriptions` for the speech-to-text
-   (auto-detecting the language — Russian, English, …);
-3. asks the same server's `/v1/chat/completions` to rewrite the raw transcript into clean,
-   paragraph-split text, preserving the speaker's own words and languages (no translation,
-   no paraphrasing);
-4. replies with the result, threaded to the original message.
+For each voice message the bot downloads the audio, converts it to 16 kHz mono WAV with ffmpeg,
+calls `/v1/audio/transcriptions`, then applies the editable `dictation_prompt` through
+`/v1/chat/completions`. The cleaned transcript is recorded as the user's message. The bot's
+transcript-delivery reply is deliberately not recorded as an assistant turn.
 
-The bot itself is **Telegram-only** — no models, no job queue, no JIT requirement. All inference
-runs on [dasllama-server](../../../utils/dasllama-server) (one shared LLM instance for the bot and
-any other OpenAI-compatible client); Telegram plumbing is
-[dasTelegram](https://github.com/borisbat/dasTelegram).
+Every inbound text, caption, voice, and audio message visible to the bot is retained in local SQLite.
+Real Cadmus answers are retained in the same history. In private chats Cadmus answers every message;
+in groups it answers mentions, replies to the bot, commands, and configured wake-name prefixes.
+Retrieval and summaries never cross the current Telegram chat.
 
 ## Requirements
 
-- A running **dasllama-server** with BOTH models in ITS config: `model =` the instruct LLM GGUF
-  (e.g. `Qwen3-4B-Instruct-2507`) and `asr =` the ASR ggml `.bin` (whisper or parakeet,
-  auto-sniffed — parakeet-tdt v3 is ~15× faster on short notes).
-- **ffmpeg** on `PATH` (or an absolute path in the config) — needed to decode Telegram's OGG/Opus voice notes.
-- A **bot token** from [@BotFather](https://t.me/BotFather).
+- A running `dasllama-server` with both an instruct model and an ASR model.
+- ffmpeg on `PATH`, or an absolute `ffmpeg` path in `dictation.toml`.
+- A Telegram token from `@BotFather`.
 
-## Setup
+## Setup and run from source
 
-```
-daspkg install                 # installs dasTelegram into modules/ (reads .das_package)
-```
-
-Edit `dictation.toml` — point `server` at your dasllama-server, tweak the `prompt`, `min_chars`,
-`keep_audio_dir`, etc. Put your bot token in `bot_token`, or leave it empty and set the
-`TELEGRAM_BOT_TOKEN` environment variable (which overrides the config).
-
-## Run
-
-From the repo root (the interpreter is fine — the bot does no inference):
-
-```
+```text
+bin/daslang utils/daspkg/main.das -- install --root examples/telegram/dictation
 bin/daslang -project_root examples/telegram/dictation examples/telegram/dictation/main.das
 ```
 
-The bot logs to `dictation.log` (a proper leveled/structured log via `daslib/logger`) — including each
-message's sender, transcript, reply, and a link to the archived audio. Watch it with `tail -f dictation.log`.
+The bot itself does not require JIT. Edit `dictation.toml` first. `TELEGRAM_BOT_TOKEN` overrides
+`bot_token`. Relative database and log paths resolve beside the executable in a release and beside
+`main.das` during development.
 
-## Receiving messages in a group
+The database is created automatically. Migration 1 creates message/state storage; migration 2 adds
+the FTS5 retrieval index. Telegram update offsets are persisted, and `(chat_id, message_id)` makes
+replayed updates and edits idempotent. History is retained indefinitely.
 
-Telegram bots have **privacy mode on** by default, so in a group a bot only sees messages that address it.
-To transcribe every voice note posted in a group, either:
+## Conversation and summary commands
 
-- disable privacy mode in @BotFather (`/setprivacy` → *Disable*), then remove and re-add the bot to the group; **or**
-- add the bot to the group and make it an **admin**.
+```text
+/help
+/summary
+/summary me
+/summary yesterday
+/summary 2026-07-13
+/summary @username 2026-07-13
+```
 
-## Configuration (`dictation.toml`)
+Bare `/summary` (and `today`) means the rolling previous 24 hours. `yesterday` and an explicit
+`YYYY-MM-DD` use local calendar days. `me` and `@username` filter by Telegram user ID after resolving
+the participant inside this chat. Forum topics currently share their parent chat's history.
+
+Anyone who can address the bot in a chat can request a chat-wide or per-user summary. Long histories
+are summarized in chunks and reduced into one answer.
+
+## Telegram group setup
+
+Commands work without registering them, but the Telegram command menu is configured manually:
+
+1. Open `@BotFather`, run `/setcommands`, and select this bot.
+2. Paste:
+
+   ```text
+   summary - Summarize recent conversation
+   help - Show Cadmus commands and usage
+   ```
+
+3. Run `/setprivacy`, select the bot, and choose `Disable` so it can retain ordinary group messages.
+4. Remove and re-add the bot to each group, or make it an administrator, for the privacy change to
+   take effect.
+
+## Important configuration
 
 | Key | Meaning |
 |---|---|
-| `server` | dasllama-server base URL (default `http://127.0.0.1:8080`); it must have `asr =` loaded |
-| `bot_token` | Bot token (or use `TELEGRAM_BOT_TOKEN`, which wins) |
-| `prompt` | The dictation system prompt (TOML multi-line string; `{lang}` → detected language; remove the key for the built-in) |
-| `language` | ASR hint; `auto` detects per message |
-| `max_tokens` | Reply-token budget for the cleanup |
-| `temp` | LLM sampling temperature (0 = greedy/faithful) |
-| `llm_timeout` | Seconds to wait for the cleanup response (long notes at low tok/s need headroom) |
-| `ffmpeg` | ffmpeg executable |
-| `poll_timeout` | `getUpdates` long-poll timeout, seconds |
-| `log_file` / `log_level` | Log path (default `dictation.log` next to the exe) and level |
-| `min_chars` | Skip the LLM when the transcript is ≤ this many bytes (drops silence hallucinations) |
-| `keep_audio_dir` | If set, archive every received audio file here (empty = don't keep) |
+| `server` | dasllama-server base URL |
+| `bot_token` | BotFather token; the environment variable wins |
+| `dictation_prompt` | Transcript-repair prompt; `{language}` is replaced per message |
+| `assistant_name`, `assistant_aliases` | Display identity and comma-separated group wake names |
+| `assistant_prompt` | Editable conversational personality, separate from trusted runtime rules |
+| `database` | Local SQLite history path |
+| `recent_messages`, `history_search_results` | Recent and FTS context sizes |
+| `summary_chunk_messages`, `summary_max_messages` | Summary reduction limits |
+| `max_tokens`, `temp` | Dictation cleanup generation settings |
+| `assistant_max_tokens`, `assistant_temp` | Conversational generation settings |
+| `language`, `min_chars`, `llm_timeout` | ASR and request controls |
+| `ffmpeg`, `poll_timeout`, `log_file`, `log_level` | Process and logging controls |
+| `keep_audio_dir` | Optional archive for original audio; empty keeps none |
 
-## Notes
+The legacy `prompt` key is still accepted for deployed configs, but new configs should use
+`dictation_prompt`. Keeping it separate from `assistant_prompt` prevents conversational personality
+from changing dictation.
 
-- The LLM step's latency scales with transcript length, so a long voice note can take a couple of
-  minutes — raise `llm_timeout` if you dictate essays. The server queues the bot fairly alongside
-  other clients (it serves several streams concurrently).
-- For a redistributable build, `daspkg release --root examples/telegram/dictation --out <dir>`
-  produces `<dir>/dictation-bot/` — a standalone executable (plus the daslang runtime DLLs, shared
-  modules, and `dictation.toml`) that runs with no daslang installed. Point the shipped
-  `dictation.toml` at the server on the target machine.
+## Release
+
+```text
+bin/daslang utils/daspkg/main.das -- release --root examples/telegram/dictation --out <staging>
+```
+
+The release contains a standalone executable, runtime DLLs, required shared modules, and the config
+template. Preserve deployed `dictation.toml` and `cadmus.db` when re-releasing.
