@@ -182,6 +182,7 @@ struct Tokenizer {
 //! else -> SentencePiece (Llama-2, Phi-3, Gemma).
 def load_tokenizer_auto(path : string) : Tokenizer {
     var tk = Tokenizer()
+    let ts_sniff = ref_time_ticks()
     let f = fopen(path, "rb")
     if (f == null) {
         panic("dasLLAMA: cannot open gguf '{path}'")
@@ -194,6 +195,8 @@ def load_tokenizer_auto(path : string) : Tokenizer {
         }
     }
     fclose(f)
+    let sniff_ms = get_time_usec(ts_sniff) / 1000
+    let ts_build = ref_time_ticks()
     if (model_kind == "gpt2" || model_kind == "gemma4") {
         tk.kind = TokKind.bpe
         tk.bpe <- load_bpe_tokenizer_gguf(path)
@@ -201,6 +204,7 @@ def load_tokenizer_auto(path : string) : Tokenizer {
         tk.kind = TokKind.spm
         tk.spm <- load_tokenizer_gguf(path)
     }
+    to_log(LOG_INFO, "dasLLAMA: tokenizer sniff {sniff_ms} ms, build {get_time_usec(ts_build) / 1000} ms\n")
     return <- tk
 }
 

@@ -1174,6 +1174,12 @@ def private emit_status_init(var errors : string&) {
 // below): resolve the policy (env > declared), then per incomplete scope warn / error /
 // inject the auto or restart guard into `func` (the app's main)
 def private apply_tune_policy(var func : FunctionPtr; declared : string; var errors : string&) : bool {
+    // `options _no_tune = true` — program-level opt-out: reflection/doc tools (das2rst) compile
+    // [tune_scope] libraries without wanting a tuner run or an injected auto/restart guard; the
+    // whole policy pass goes inert for that program (fallback stamps stay in effect)
+    if (compiling_program()._options |> find_arg("_no_tune") ?as tBool ?? false) {
+        return true
+    }
     var policy = declared
     {
         let penv = get_env_variable("DAS_TUNE_POLICY")
