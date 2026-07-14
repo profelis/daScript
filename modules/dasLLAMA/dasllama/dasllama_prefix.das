@@ -79,7 +79,9 @@ def prefix_held_groups_(cache : PrefixCache) : int64 => int64(length(cache.entri
 //! at one token short of the prompt so the tail eval always produces the sampling logits.
 def prefix_attach_(var cache : PrefixCache; var pool : KVPool; var s : Session; prompt : array<int64>) : int64 {
     if (!empty(s.dn_state_prefix)) {
-        panic("prefix_attach: hybrid (deltanet) models are not supported — KV pages alone cannot reconstruct recurrent state")
+        // hybrid (deltanet): KV pages alone cannot reconstruct recurrent state, so no cached
+        // prefix is ever attachable — 0 matched is the correct result, the caller prefills all
+        return 0l
     }
     if (s.kv_pool == null || s.kv_pool != unsafe(addr(pool))) {
         panic("prefix_attach: the session is not paged out of this pool")
@@ -136,6 +138,9 @@ def private prefix_evict_lru(var cache : PrefixCache; var pool : KVPool) {
 //! already cached, bumping the pool refcnt so the pages survive the session's release. Pages past
 //! the budget LRU-drop. Call right before ``release_kv_pages``.
 def prefix_insert_(var cache : PrefixCache; var pool : KVPool; s : Session; tokens : array<int64>) {
+    if (!empty(s.dn_state_prefix)) {
+        return   // hybrid (deltanet): pages without recurrent state can never be attached — don't cache
+    }
     if (s.kv_pool == null || s.kv_pool != unsafe(addr(pool))) {
         panic("prefix_insert: the session is not paged out of this pool")
     }
