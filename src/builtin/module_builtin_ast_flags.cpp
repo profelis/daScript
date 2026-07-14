@@ -96,7 +96,7 @@ namespace das {
     TypeDeclPtr makeExprCastFlags() {
         auto ft = new TypeDecl(Type::tBitfield);
         ft->alias = "ExprCastFlags";
-        ft->argNames = { "upcastCast", "reinterpretCast" };
+        ft->argNames = { "upcastCast", "reinterpretCast", "fromAddrSugar" };
         return ft;
     }
     TypeDeclPtr makeExprVarFlags() {

@@ -2402,6 +2402,14 @@ expr_no_bracket
     |   '*'[loc] expr_no_bracket[subexpr] %prec DEREF         { $$ = new ExprPtr2Ref(tokAt(scanner,@loc),$subexpr); }
     |   DAS_DEREF[loc] '(' expr[subexpr] ')'       { $$ = new ExprPtr2Ref(tokAt(scanner,@loc),$subexpr); }
     |   DAS_ADDR[loc] '(' expr[subexpr] ')'        { $$ = new ExprRef2Ptr(tokAt(scanner,@loc),$subexpr); }
+    |   DAS_ADDR[loc] '<' { yyextra->das_arrow_depth ++; } type_declaration_no_options[decl] '>' { yyextra->das_arrow_depth --; } '(' expr[subexpr] ')' {
+        auto pRef2Ptr = new ExprRef2Ptr(tokAt(scanner,@loc),$subexpr);
+        pRef2Ptr->generated = true;
+        auto pCast = new ExprCast(tokAt(scanner,@loc),pRef2Ptr,$decl);
+        pCast->reinterpret = true;
+        pCast->fromAddrSugar = true;
+        $$ = pCast;
+    }
     |   expr_generator[gen]                        { $$ = $gen; }
     |   expr_no_bracket[subexpr] QQ[loc] expr_no_bracket[dval]           { $$ = new ExprNullCoalescing(tokAt(scanner,@loc),$subexpr,$dval); }
     |   expr_no_bracket[subexpr] '?'[loc] expr_no_bracket[left] ':' expr_no_bracket[right] {

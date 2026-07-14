@@ -410,6 +410,7 @@ namespace das {
         TypeDeclPtr castStruct(const LineInfo &at, const TypeDeclPtr &subexprType, const TypeDeclPtr &castType, bool upcast) const;
         TypeDeclPtr castFunc(const LineInfo &at, const TypeDeclPtr &subexprType, const TypeDeclPtr &castType, bool upcast) const;
 
+        virtual void preVisit(ExprCast *expr) override;
         virtual ExpressionPtr visit(ExprCast *expr) override;
         // ExprAscend
         void updateNewFlags(ExprAscend *expr);
