@@ -396,7 +396,8 @@ def private tmpdir() : string {
 
 // Top-level fields each JSON route reads; anything else in a request logs a warning instead of
 // silently vanishing — the diagnostic for "agent X immediately fails against this server".
-let CHAT_FIELDS : table<string> <- { "model", "messages", "stream", "temperature", "top_k", "max_tokens", "tools", "tool_choice" }
+let CHAT_FIELDS : table<string> <- { "model", "messages", "stream", "temperature", "top_k", "max_tokens",
+                                     "max_completion_tokens", "tools", "tool_choice" }
 let COMPL_FIELDS : table<string> <- { "model", "prompt", "stream", "temperature", "top_k", "max_tokens" }
 let EMB_FIELDS : table<string> <- { "model", "input" }
 
@@ -409,6 +410,35 @@ def private warn_ignored_fields(js : JsonValue?; known : table<string>; route : 
             to_log(LOG_WARNING, "{route}: ignoring unsupported request field '{k}'\n")
         }
     }
+}
+
+// A message's text content: a plain string, or the OpenAI content-parts array (agents send
+// [\{type:"text", text:"..."}] even for pure text) — text parts concatenate; other part kinds
+// (image_url, ...) log and are skipped.
+def private message_text(mv : JsonValue?; route : string) : string {
+    let cv = mv?["content"]
+    if (cv == null || cv.value is _null) {
+        return ""
+    }
+    if (cv.value is _string) {
+        return cv ?? ""
+    }
+    if (cv.value is _array) {
+        var parts : array<string>
+        for (pv in (cv.value as _array)) {
+            let ptype = pv?["type"] ?? ""
+            if (ptype == "text") {
+                parts |> push(pv?["text"] ?? "")
+            } else {
+                to_log(LOG_WARNING, "{route}: skipping non-text content part '{ptype}'\n")
+            }
+        }
+        let s = join(parts, "")
+        delete parts
+        return s
+    }
+    to_log(LOG_WARNING, "{route}: message content is neither a string nor a parts array — parsed as empty\n")
+    return ""
 }
 
 // Unknown endpoint: log the probe (method, path, body head) and 404 with an OpenAI error body.
@@ -537,7 +567,11 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     var params = SamplingParams()
     params.temp = js?["temperature"] ?? 0.0
     params.top_k = js?["top_k"] ?? 0l
-    let max_new = clamp_max(js?["max_tokens"] ?? g_default_max_new)
+    var req_max = js?["max_tokens"] ?? 0l
+    if (req_max <= 0l) {
+        req_max = js?["max_completion_tokens"] ?? g_default_max_new   // the newer OpenAI spelling
+    }
+    let max_new = clamp_max(req_max)
 
     // tools: each tools[] entry re-serialized verbatim into the system turn's tool block.
     // tool_choice: "none" drops them; the object form (forced function) is not honored.
@@ -570,7 +604,7 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     var system = ""
     for (mv in (msgs_v.value as _array)) {
         if ((mv?["role"] ?? "") == "system") {
-            let sc = mv?["content"] ?? ""
+            let sc = message_text(mv, "/v1/chat/completions")
             system = empty(system) ? sc : "{system}\n{sc}"
         }
     }
@@ -591,11 +625,7 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     defer() { delete tool_results }
     for (mv in (msgs_v.value as _array)) {
         let role = mv?["role"] ?? ""
-        let cv = mv?["content"]
-        if (cv != null && !(cv.value is _string) && !(cv.value is _null)) {
-            to_log(LOG_WARNING, "/v1/chat/completions: non-string message content (multimodal parts?) parsed as empty\n")
-        }
-        let content = mv?["content"] ?? ""
+        let content = message_text(mv, "/v1/chat/completions")
         if (role != "tool" && !empty(tool_results)) {
             add_tool_results(chat, tool_results)   // flush the consecutive tool-result run
             tool_results |> clear()

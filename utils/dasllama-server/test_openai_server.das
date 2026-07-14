@@ -180,6 +180,21 @@ def test_openai_server(t : T?) {
                     }
                 }
             }
+            // content-parts array form (what pi/opencode send even for pure text): the text
+            // must reach the prompt — an empty-parse would render a near-empty user turn
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"messages\":[\{\"role\":\"user\",\"content\":[\{\"type\":\"text\",\"text\":\"Please repeat the word strawberry twenty times, then count the letters in it, then explain why.\"}]}],\"max_tokens\":4}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "parts-form chat JSON parses")
+                if (js != null) {
+                    t |> success(int(js?["usage"]?["prompt_tokens"] ?? 0l) > 40, "parts text reached the prompt")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
             // tools on a template with no tool format (TinyLlama resolves Zephyr) — honest 400
             POST("{base_url}/v1/chat/completions",
                  "\{\"messages\":[\{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[\{\"type\":\"function\",\"function\":\{\"name\":\"f\"}}]}") $(resp) {
