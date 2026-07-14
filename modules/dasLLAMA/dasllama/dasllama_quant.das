@@ -55,6 +55,10 @@ def quantize_q8_0(src : array<float> | #; n : int64) : Q8Tensor {
 //! quantize one tensor at a time into the model's shared qblob/qscales. n must be a multiple of 32.
 def quantize_q8_0_into(src : array<float> | #; n : int64; var qdst : array<int8>; var sdst : array<float>; qoff, soff : int64) {
     assert(n % QK8 == 0l, "quantize_q8_0_into requires n to be a multiple of 32")
+    // O(1) range guards — the pointerized path below bypasses per-element bounds checks
+    if (n > long_length(src) || qoff < 0l || qoff + n > long_length(qdst) || soff < 0l || soff + n / QK8 > long_length(sdst)) {
+        panic("quantize_q8_0_into: [{qoff}, +{n}) / scales [{soff}, +{n / QK8}) exceeds dst ({long_length(qdst)}, {long_length(sdst)}) or src {long_length(src)}")
+    }
     // threads only past ~2M elements (the load-time bulk requant); decode-sized calls stay inline
     let njobs = is_job_que_available() ? int(clamp(n / 2097152l, 1l, 64l)) : 1
     unsafe {

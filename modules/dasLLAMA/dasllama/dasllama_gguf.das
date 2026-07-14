@@ -784,6 +784,14 @@ def private transcode_jobs(blocks, disk_sb : int64) : int {
     return int(clamp(blocks * disk_sb / 1048576l, 1l, 64l))
 }
 
+// One-time destination-range guard for the pointerized copy loops: the raw-pointer writes bypass
+// per-element bounds checks, so fail loudly up front instead — same trap, O(1) cost per tensor.
+def private guard_dst(name : string; what : string; off, need, have : int64) {
+    if (off < 0l || need < 0l || off + need > have) {
+        panic("gguf: tensor '{name}' {what} range [{off}, +{need}) exceeds {have}")
+    }
+}
+
 // Shared header for the three file-level transcodes: locate + type-check + bounds-check, return
 // the superblock-aligned disk cursor.
 def private kq_transcode_base(m : GGUFMeta; name : string; want_type : int; type_name : string; src_off, expect_n, disk_sb : int64) : int64 {
@@ -811,6 +819,8 @@ def gguf_transcode_q4k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
     if (nb <= 0l) {
         return
     }
+    guard_dst(name, "k4 quant plane", (eloff / 256l) * K4_QSB, nb * K4_QSB, long_length(kq))
+    guard_dst(name, "k4 scale plane", (eloff / 256l) * K4_SSB, nb * K4_SSB, long_length(ks))
     unsafe {   // per-superblock byte shuffle (see transcode_q4k_superblock), threaded + pointerized
         let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
         var kqp = addr(kq[(eloff / 256l) * K4_QSB])
@@ -835,6 +845,8 @@ def gguf_transcode_q5k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
     if (nb <= 0l) {
         return
     }
+    guard_dst(name, "k5 quant plane", (eloff / 256l) * K5_QSB, nb * K5_QSB, long_length(kq))
+    guard_dst(name, "k5 scale plane", (eloff / 256l) * K5_SSB, nb * K5_SSB, long_length(ks))
     unsafe {   // per-superblock byte shuffle (see transcode_q5k_superblock), threaded + pointerized
         let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
         var kqp = addr(kq[(eloff / 256l) * K5_QSB])
@@ -860,6 +872,8 @@ def gguf_transcode_q6k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
     if (nb <= 0l) {
         return
     }
+    guard_dst(name, "k6 quant plane", (eloff / 256l) * K6_QSB, nb * K6_QSB, long_length(kq))
+    guard_dst(name, "k6 scale plane", (eloff / 256l) * K6_SSB, nb * K6_SSB, long_length(ks))
     unsafe {   // per-superblock byte shuffle (see transcode_q6k_superblock), threaded + pointerized
         let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
         var kqp = addr(kq[(eloff / 256l) * K6_QSB])
@@ -892,6 +906,7 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
     }
     let gtype = m.tensors[ti].ggml_type
     let base = m.data_offset + m.tensors[ti].offset
+    guard_dst(name, "f32 dst", dst_off, expect_n, long_length(dst))
     if (gtype == GGML_TYPE_F32) {
         unsafe {   // raw copy, threaded in u64 words (+ one odd-float tail)
             let sp = reinterpret<uint64 const?>(addr(bytes[base + src_off * 4l]))
@@ -1057,6 +1072,8 @@ def gguf_transcode_q8_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
     if (nb <= 0l) {
         return
     }
+    guard_dst(name, "q8 quant", qoff, nb * 32l, long_length(qdst))
+    guard_dst(name, "q8 scale", soff, nb, long_length(sdst))
     // pointerized + threaded: the quant copy is a bit-reinterpret (uint8 -> int8, same bits), so a
     // block is 4 unaligned u64 moves + one f16 scale widen. Blocks are disjoint — bit-exact at any
     // lane count; jobs are floored to ~1MB of source each so small tensors stay inline.
