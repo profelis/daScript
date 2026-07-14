@@ -322,7 +322,8 @@ def private send_chat_tool_calls_chunk(srv : WebSocketServer; var writer : HttpR
 
 //! Extract Hermes-style tool calls from a finished reply: every well-formed open…close span becomes
 //! one call; returns the content BEFORE the first opener (everything when nothing parses, so no
-//! reply text is silently dropped). Malformed spans log and end the scan.
+//! reply text is silently dropped). Unparseable call JSON logs and is skipped; an unterminated
+//! span logs and ends the scan.
 def parse_tool_calls(full : string; open_mark, close_mark, id_base : string;
                      var calls : array<OaiToolCall>) : string {
     var content_end = -1
@@ -338,7 +339,7 @@ def parse_tool_calls(full : string; open_mark, close_mark, id_base : string;
         let bstart = o + length(open_mark)
         let cl = find(full, close_mark, bstart)
         if (cl < 0) {
-            to_log(LOG_WARNING, "dasllama-server: unterminated {open_mark} span (token budget cut?) — kept as content\n")
+            to_log(LOG_WARNING, "dasllama-server: unterminated {open_mark} span (token budget cut?) — scan stopped\n")
             break
         }
         let body = strip(slice(full, bstart, cl))
@@ -579,7 +580,11 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     var tools : array<string>
     defer() { delete tools }
     let tools_v = js?["tools"]
-    if (tools_v != null && tools_v.value is _array) {
+    if (tools_v != null && !(tools_v.value is _null)) {
+        if (!(tools_v.value is _array)) {
+            bad_request(srv, writer, "'tools' must be an array of tool definitions")
+            return
+        }
         tools |> reserve(length(tools_v.value as _array))
         for (tv in (tools_v.value as _array)) {
             tools |> push(write_json_compact(tv))   // the template's one-tool-per-line tojson shape
