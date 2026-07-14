@@ -2987,8 +2987,10 @@ namespace das {
     }
     void InferTypes::preVisit(ExprCast *expr) {
         Visitor::preVisit(expr);
-        // addr<T?>(x) sugar: unsafe() on the reinterpret covers the generated addr under it
-        if (expr->fromAddrSugar && expr->alwaysSafe && expr->subexpr->rtti_isRef2Ptr() && !expr->subexpr->alwaysSafe) {
+        // addr<T?>(x) sugar: unsafe() on the reinterpret covers the generated addr under it.
+        // gated on generated so the flag can't broaden safety onto a user-written addr
+        if (expr->fromAddrSugar && expr->alwaysSafe && expr->subexpr->rtti_isRef2Ptr()
+            && expr->subexpr->generated && !expr->subexpr->alwaysSafe) {
             expr->subexpr->alwaysSafe = true;
         }
     }
