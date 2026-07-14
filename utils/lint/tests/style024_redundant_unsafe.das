@@ -82,7 +82,7 @@ struct Foo {
 
 def good_reinterpret_needs_unsafe() : void {
     var f = Foo(x = 5)
-    let p = unsafe(reinterpret<int?>(unsafe(addr(f))))  // wrap justified — reinterpret cast
+    let p = unsafe(reinterpret<int?>(unsafe(addr(f))))  // nolint:STYLE034 — wrap justified (reinterpret cast); raw shape kept to exercise the recognizer
     print("{*p}\n")
 }
 
@@ -90,8 +90,8 @@ def good_block_with_two_unsafe_ops() : void {
     var f = Foo(x = 5)
     var g = Foo(x = 7)
     unsafe {
-        let pa = reinterpret<int?>(addr(f))           // reinterpret + addr need unsafe
-        let pb = reinterpret<int?>(addr(g))           // second one — STYLE025 silent (≥2)
+        let pa = reinterpret<int?>(addr(f))           // nolint:STYLE034 — reinterpret + addr need unsafe
+        let pb = reinterpret<int?>(addr(g))           // nolint:STYLE034 — second one — STYLE025 silent (≥2)
         print("{*pa} {*pb}\n")
     }
 }

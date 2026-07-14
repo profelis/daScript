@@ -40,6 +40,7 @@ module style_lint shared private
 //!   STYLE031 — table<K;V> (or table<K> set) var initialized via a run of insert / '[]=' statements; use a table (set) literal move-assign
 //!   STYLE032 — array<T> with empty default-init then a single 'push_from' / 'push_clone_from' from another array<T>; that is a clone — use 'var w := SRC' (clone-assign). Cloneable elements only (a copyable-but-not-cloneable element such as a lambda stays silent — ':=' would not compile)
 //!   STYLE033 — run of >=2 'push_from' / 'push_clone_from' from arrays; into a fresh-empty array that is a concatenation (use 'var c <- concat(s1, s2, ...)', needs 'require daslib/linq'; cloneable elements only, as STYLE032); into an existing array — plain var or a pure chain like 'obj.arr' / 'bags[0].nums' — collapse to one variadic call of the same name ('dst |> push_from(...)' or 'dst |> push_clone_from(...)')
+//!   STYLE034 — reinterpret<T?>(addr(x)) — use addr<T?>(x); one unsafe() covers both halves (pointer targets only; the sugar's own desugared output is exempt via fromAddrSugar)
 
 require daslib/ast_boost
 require daslib/is_local
@@ -2427,6 +2428,15 @@ class StyleLintVisitor : AstVisitor {
         if (!expr.genFlags.generated
                 && (expr.castFlags.upcastCast || expr.castFlags.reinterpretCast)) {
             mark_unsafe_in_stack()
+        }
+        // ===== STYLE034 — reinterpret<T?>(addr(x)) is addr<T?>(x) =====
+        // The sugar's own desugared output is exempt via fromAddrSugar.
+        if (expr.castFlags.reinterpretCast && !expr.castFlags.fromAddrSugar
+                && !expr.genFlags.generated
+                && expr.castType != null && expr.castType.baseType == Type.tPointer
+                && expr.subexpr != null && expr.subexpr is ExprRef2Ptr
+                && !expr.subexpr.genFlags.generated) {
+            style_warning("STYLE034: reinterpret<{describe(expr.castType)}>(addr(...)) collapses to addr<{describe(expr.castType)}>(...); one unsafe() covers both halves", expr.at)
         }
     }
 
