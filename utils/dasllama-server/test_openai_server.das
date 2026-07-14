@@ -180,6 +180,94 @@ def test_openai_server(t : T?) {
                     }
                 }
             }
+            // content-parts array form (what pi/opencode send even for pure text): the text
+            // must reach the prompt — an empty-parse would render a near-empty user turn
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"messages\":[\{\"role\":\"user\",\"content\":[\{\"type\":\"text\",\"text\":\"Please repeat the word strawberry twenty times, then count the letters in it, then explain why.\"}]}],\"max_tokens\":4}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null, "parts-form chat JSON parses")
+                if (js != null) {
+                    t |> success(int(js?["usage"]?["prompt_tokens"] ?? 0l) > 40, "parts text reached the prompt")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+            // tools on a template with no tool format (TinyLlama resolves Zephyr) — honest 400
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"messages\":[\{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[\{\"type\":\"function\",\"function\":\{\"name\":\"f\"}}]}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.BAD_REQUEST))
+            }
+            // unknown endpoint hits the ANY("*") catch-all: logged server-side, OpenAI-shaped 404 back
+            POST("{base_url}/v1/responses", "\{\"input\":\"hi\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.NOT_FOUND))
+                var err : string
+                var js = read_json(string(resp.body), err)
+                t |> success(js != null && js?["error"] != null, "404 body is an OpenAI error object")
+                if (js != null) {
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
         }
+    }
+}
+
+// ===== parse_tool_calls (model-free) =====
+
+[test]
+def test_parse_tool_calls(t : T?) {
+    t |> run("single call: content prefix, name, compact arguments, id/type") @(t : T?) {
+        var calls : array<OaiToolCall>
+        let pre = parse_tool_calls("Let me check.\n<tool_call>\n\{\"name\": \"get_weather\", \"arguments\": \{\"city\": \"Paris\"}}\n</tool_call>",
+                                   "<tool_call>", "</tool_call>", "call_7", calls)
+        t |> equal(pre, "Let me check.")
+        t |> equal(length(calls), 1)
+        if (length(calls) == 1) {
+            t |> equal(calls[0]._function.name, "get_weather")
+            t |> equal(calls[0]._function.arguments, "\{\"city\": \"Paris\"}")
+            t |> equal(calls[0].id, "call_7_0")
+            t |> equal(calls[0]._type, "function")
+        }
+        delete calls
+    }
+    t |> run("two calls parse in order; empty content strips clean") @(t : T?) {
+        var calls : array<OaiToolCall>
+        let pre = parse_tool_calls("<tool_call>\n\{\"name\": \"a\", \"arguments\": \{}}\n</tool_call>\n<tool_call>\n\{\"name\": \"b\", \"arguments\": \{\"n\": 1}}\n</tool_call>",
+                                   "<tool_call>", "</tool_call>", "call_1", calls)
+        t |> equal(pre, "")
+        t |> equal(length(calls), 2)
+        if (length(calls) == 2) {
+            t |> equal(calls[0]._function.name, "a")
+            t |> equal(calls[0]._function.arguments, "\{}")
+            t |> equal(calls[1]._function.name, "b")
+            t |> equal(calls[1].id, "call_1_1")
+        }
+        delete calls
+    }
+    t |> run("malformed spans keep the reply as content") @(t : T?) {
+        var calls : array<OaiToolCall>
+        // unterminated span (token budget cut): no calls, full text back
+        let full1 = "text <tool_call>\n\{\"name\": \"a\""
+        t |> equal(parse_tool_calls(full1, "<tool_call>", "</tool_call>", "c", calls), full1)
+        t |> equal(length(calls), 0)
+        // unparseable JSON inside a well-formed span: no calls, full text back
+        let full2 = "<tool_call>\nnot json\n</tool_call>"
+        t |> equal(parse_tool_calls(full2, "<tool_call>", "</tool_call>", "c", calls), full2)
+        t |> equal(length(calls), 0)
+        delete calls
+    }
+    t |> run("arguments emitted as a JSON string pass through verbatim") @(t : T?) {
+        var calls : array<OaiToolCall>
+        parse_tool_calls("<tool_call>\n\{\"name\": \"a\", \"arguments\": \"\{\\\"x\\\": 1}\"}\n</tool_call>",
+                         "<tool_call>", "</tool_call>", "c", calls)
+        t |> equal(length(calls), 1)
+        if (length(calls) == 1) {
+            t |> equal(calls[0]._function.arguments, "\{\"x\": 1}")
+        }
+        delete calls
     }
 }

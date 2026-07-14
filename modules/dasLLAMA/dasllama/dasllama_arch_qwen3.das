@@ -18,6 +18,7 @@ def register_arch_qwen3() {
     d.chat.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
     d.chat.assistant_open.parts <- [chat_special("<|im_start|>"), chat_text("assistant\n")]
     d.chat.stop <- ["<|im_end|>", "<|endoftext|>"]
+    hermes_tools(d.chat)
     // Qwen3-ASR's decoder converts as `qwen3vl` — M-RoPE + deepstack. For text + audio input
     // every M-RoPE coordinate equals the linear position (angles depend only on the coordinate
     // and the dim's frequency, so ANY section layout degenerates to standard rope), and the

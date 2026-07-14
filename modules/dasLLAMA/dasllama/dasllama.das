@@ -299,6 +299,26 @@ def render_close(model : Model; chat : ChatSession) : array<int64> {
     return <- render_close_(model, chat)
 }
 
+def set_tools(var chat : ChatSession; var tools : array<string>) {
+    //! Declare the conversation's tools (verbatim JSON objects, one per tool — the OpenAI
+    //! ``tools[]`` entries, moved in) BEFORE the first turn renders; the system turn then carries
+    //! the family's tool block. Families with no tool format (``tmpl.tool_call_open`` empty)
+    //! ignore them.
+    set_tools_(chat, tools)
+}
+
+def add_tool_results(var chat : ChatSession; results : array<string>) {
+    //! Queue tool results as the next pending turn — the reply to an assistant turn that called
+    //! tools. Call in place of ``add_user``, then ``respond``/``render_turn`` as usual.
+    add_tool_results_(chat, results)
+}
+
+def render_assistant_calls(model : Model; var chat : ChatSession; text : string; calls : array<string>; var out : array<int64>) {
+    //! ``render_assistant``'s tool-calling twin: replay an assistant turn that emitted tool calls
+    //! (verbatim ``\{"name":…,"arguments":…}`` objects) plus any ``text`` alongside.
+    render_assistant_calls_(model, chat, text, calls, out)
+}
+
 def respond(model : Model; var chat : ChatSession; params : SamplingParams;
             blk : block<(piece : string) : bool>) : string {
     //! Generate the assistant's reply to the queued user message: render the turn, prefill it, then

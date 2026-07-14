@@ -82,7 +82,7 @@ so the deployed config survives. Stop a running server first — Windows locks t
 | Method | Path | Notes |
 |---|---|---|
 | `GET`  | `/v1/models` | Lists the served model (and `--asr` if loaded) |
-| `POST` | `/v1/chat/completions` | Chat; `stream: true` → SSE, else buffered |
+| `POST` | `/v1/chat/completions` | Chat; `stream: true` → SSE, else buffered; OpenAI function calling (`tools`) |
 | `POST` | `/v1/completions` | Raw completion; `stream: true` → SSE, else buffered |
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |
 | `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`) |
@@ -98,6 +98,24 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
   "max_tokens": 16, "stream": false
 }'
 ```
+
+### Tool / function calling
+
+`/v1/chat/completions` speaks the OpenAI function-calling protocol: pass `tools` (and optionally
+`tool_choice`; `"none"` disables, the forced-function object form is not honored), get back
+`finish_reason: "tool_calls"` with `message.tool_calls`, send the results as `role: "tool"`
+messages, repeat. Assistant `tool_calls` turns and `role: "tool"` results replay exactly through
+the chat template on each stateless resend, so agent loops (opencode, pi, …) work end-to-end.
+
+The wire format is per model family: the ChatML/Hermes shape (Qwen2.5 / Qwen3 — tool JSONs in a
+`<tools>` system block, calls as `<tool_call>{"name":…,"arguments":…}</tool_call>`) is
+implemented; a model whose chat template declares no tool format gets an honest 400. Streaming
+with tools streams content up to the first tool-call marker, then buffers and emits the parsed
+calls as one `delta.tool_calls` chunk at finish.
+
+Requests the server does NOT fully understand are visible in the log: unknown endpoints 404
+through a catch-all that logs method + path + body head, and known routes warn per ignored field
+(`response_format`, `stop`, multimodal content parts, …).
 
 ### Embeddings
 
@@ -127,8 +145,9 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
 All tests in this directory are model-gated and JIT-only (they skip cleanly when the GGUF is
 absent; set `DASLLAMA_MODELS_DIR`):
 
-- `test_openai_server.das` — endpoint conformance (`/v1/models`, `/v1/embeddings`, buffered chat)
-  over the real dashv HTTP client; needs `tinyllama-1.1b-chat-v1.0.Q8_0.gguf`.
+- `test_openai_server.das` — endpoint conformance (`/v1/models`, `/v1/embeddings`, buffered chat,
+  the tools-unsupported 400, the unknown-endpoint 404) over the real dashv HTTP client, plus
+  model-free `parse_tool_calls` unit tests; needs `tinyllama-1.1b-chat-v1.0.Q8_0.gguf`.
 - `test_llm_scheduler.das` — the continuous-batching scheduler against `generate()` references
   (bit-exact single stream, chunk invariance, staggered admits, eviction); needs
   `SmolLM2-135M-Instruct-Q8_0.gguf`.
@@ -147,4 +166,5 @@ and warm-vs-cold TTFT for the prefix cache.
 
 ## Not yet implemented
 
-Tool / function calling (`tools`, `tool_choice`) — parked as a follow-up.
+Multimodal content arrays in chat messages, the request's `stop` / `response_format` fields, and
+the forced-function `tool_choice` object form — all logged when a request carries them.

@@ -309,7 +309,8 @@ def document_module_dasllama(_root : string) {
         group_by_regex("Evaluation and sampling", mod, %regex~(eval|eval_embd|eval_batch|sample|set_seed|stats)$%%),
         group_by_regex("Generation", mod, %regex~(generate|generate_embd)$%%),
         group_by_regex("Embeddings", mod, %regex~(embed)$%%),
-        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_assistant|render_turn|render_assistant|render_close|respond)$%%)
+        group_by_regex("Chat", mod, %regex~(create_chat|create_chat_renderer|add_user|add_user_audio|add_assistant|render_turn|render_assistant|render_close|respond)$%%),
+        group_by_regex("Tool calling", mod, %regex~(set_tools|add_tool_results|render_assistant_calls)$%%)
     )
     var hook = DocsHook()
     hook.afterEnums <- @(var f : FILE const?; _was_enums : bool) {
@@ -509,7 +510,7 @@ def document_module_json(_root : string) {
     var mod = find_module("json")
     var groups <- array<DocGroup>(
         group_by_regex("Value conversion", mod, %regex~(JV|JVNull)$%%),
-        group_by_regex("Read and write", mod, %regex~(read_json|write_json)$%%),
+        group_by_regex("Read and write", mod, %regex~(read_json|write_json|write_json_compact)$%%),
         group_by_regex("Memory management", mod, %regex~(delete_json|update|json_null_sentinel)$%%),
         group_by_regex("JSON properties", mod, %regex~(set_no_trailing_zeros|set_no_empty_arrays|set_allow_duplicate_keys)$%%),
         group_by_regex("Broken JSON", mod, %regex~(try_fixing_broken_json)$%%)
