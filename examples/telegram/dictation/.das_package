@@ -5,7 +5,7 @@ require daslib/daspkg
 [export]
 def package() {
     package_name("dictation-bot")
-    package_description("Telegram bot that transcribes voice/audio messages into clean, readable text (whisper + dasLLAMA)")
+    package_description("Local Telegram dictation, conversation history, Q&A, and summaries via dasllama-server + SQLite")
 }
 
 [export]

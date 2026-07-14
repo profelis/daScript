@@ -23,6 +23,7 @@ Capability gates are **compile-time** `macro_error`s naming the provider (`caps`
 ```das
 require sqlite/sqlite_boost         // provider: SqlRunner, exec/query runtime, [sql_fts5], [sql_function]
 require daslib/sql_linq             // _sql / _try_sql / _each_sql / _sql_update / _sql_delete / _sql_upsert / _create_view / _sql_text
+require daslib/linq_das             // OPTIONAL: `%linq! from row : T in db ... %%`; lowers through the same SQL analyzer
 require sqlite/sqlite_migrate       // OPTIONAL — [sql_migration], migrate_to_latest, with_latest_sqlite, baseline
 ```
 
@@ -43,6 +44,7 @@ When writing or reading SQL, the order of preference is fixed. Reach for the sim
 | Open / close a DB for a scoped block | **`with_sqlite(path) <\| $(db) { ... }`** (or `with_latest_sqlite` if migrations) | RAII; closes on panic / early return. Per-provider: `with_duckdb(path)` / `with_postgres(conninfo)` in the external repos |
 | Declare a row shape | **`[sql_table(name="...")]` struct** | Generates CREATE / DROP / INSERT / SELECT-row helpers + adapter dispatch. The struct is the single source of truth |
 | Query a table you own | **`_sql(db \|> select_from(type<T>) \|> _where(...) \|> _select(...))`** | Compile-time SQL emission, captured-vars auto-bound, type-checked column refs. The flagship; every read-side tutorial uses it |
+| Write a declarative reader query | **`%linq! from row : T in db where ... orderby ... select ... %%`** | C#-style reader syntax from `daslib/linq_das`; a typed SQL source lowers through `_fold` into the same `_sql` analyzer, so supported filters, projections, ordering, grouping, and joins remain one SQL statement |
 | Stream millions of rows | **`for (row in _each_sql(...))`** | Generator; `sqlite3_finalize` runs in `finally` on break/exhaustion/panic. Same chain shape as `_sql`, rejects materializing terminals |
 | Bulk write by predicate | **`_sql_update` / `_sql_delete` / `_sql_upsert`** | Predicate + named-tuple SET in one macro; mirrors `_sql` on the write side |
 | Single row by PK | **`db \|> update(row)` / `db \|> delete_(row)` / `db \|> delete_by_id(type<T>, id)`** | Plain functions; `delete_` carries trailing underscore because `delete` is a daslang keyword |
@@ -173,6 +175,15 @@ Construction at insert time: `none(type<T>)` — the type witness is required. `
 ## `_sql(chain)` — the LINQ-to-SQL flagship
 
 `_sql(...)` walks a daslib/linq-shaped chain at compile time, classifies each operator, and emits a SQL string + a list of bind expressions. The runtime helper preps, binds, steps, materializes. There is no runtime LINQ→SQL inspection — by program-run-time only the SQL and binds remain.
+
+The `%linq! … %%` reader macro from `daslib/linq_das` is an equal front door for declarative reads. A typed SQL range source such as `from m : Message in db` lowers to `select_from(db, type<Message>)`, then through `_fold` into this same `_sql` analyzer. Prefer the reader form when it makes the query clearer; prefer the explicit `_sql` chain for dynamic composition, SQL-only terminals such as `_first_opt`, or operators not represented by the reader grammar. Do not replace either form with raw `query(...)` for an ordinary typed table read.
+
+```das
+let rows <- %linq! from m : Message in db
+                   where m.ChatId == chat_id && !m.Deleted
+                   orderby m.MessageDate descending
+                   select m %%
+```
 
 ```das
 let cutoff = 100
