@@ -46,7 +46,7 @@ def fill_scales(var a : array<float>; cnt, phase : int64) {
 def blit_i8(src : array<int8>; var dst : array<int8>; at : int64) {
     let cnt = int64(length(src))
     unsafe {
-        let sp = reinterpret<int8 const?>(addr(src[0]))
+        let sp = addr<int8 const?>(src[0])
         var dp = addr(dst[at])
         for [vectorize] (i in range64(cnt)) {
             dp[i] = sp[i]
@@ -57,7 +57,7 @@ def blit_i8(src : array<int8>; var dst : array<int8>; at : int64) {
 def blit_f32(src : array<float>; var dst : array<float>; at : int64) {
     let cnt = int64(length(src))
     unsafe {
-        let sp = reinterpret<float const?>(addr(src[0]))
+        let sp = addr<float const?>(src[0])
         var dp = addr(dst[at])
         for [vectorize] (i in range64(cnt)) {
             dp[i] = sp[i]
@@ -187,14 +187,14 @@ def race_cell(vsel : int; reps : int; threaded, align : bool; var y : array<floa
     var total : int64
     unsafe {
         var yp = addr(y[0])
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         let t0 = ref_time_ticks()
         for (r in range(reps)) {
             let c = int64(r) % ncopies
-            let wp = reinterpret<int8 const?>(addr(wgq[c * wstride]))
-            let sp = reinterpret<float const?>(addr(wgs[c * sstride]))
-            let ip = reinterpret<int8 const?>(addr(inl[c * istride]))
+            let wp = addr<int8 const?>(wgq[c * wstride])
+            let sp = addr<float const?>(wgs[c * sstride])
+            let ip = addr<int8 const?>(inl[c * istride])
             var myp = yp
             if (threaded) {
                 maybe_parallel_for(true, 0, ng, njobs) $(rb, re) {
@@ -252,11 +252,11 @@ def bench_shape(name : string; n, d : int64; reps_st, reps_thr : int) {
     for (v in range(NV)) {
         unsafe {
             var yp = addr(yv[0])
-            let wp = reinterpret<int8 const?>(addr(wgq0[0]))
-            let sp = reinterpret<float const?>(addr(wgs0[0]))
-            let ip = reinterpret<int8 const?>(addr(inl0[0]))
-            let xqp = reinterpret<int8 const?>(addr(xq[0]))
-            let xsp = reinterpret<float const?>(addr(xs[0]))
+            let wp = addr<int8 const?>(wgq0[0])
+            let sp = addr<float const?>(wgs0[0])
+            let ip = addr<int8 const?>(inl0[0])
+            let xqp = addr<int8 const?>(xq[0])
+            let xsp = addr<float const?>(xs[0])
             gemv_range(v, 0, int(d / 4l), yp, wp, sp, ip, xqp, xsp, n)
         }
         var mx = 0.0

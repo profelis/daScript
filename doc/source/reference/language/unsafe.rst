@@ -65,6 +65,13 @@ Upcast and reinterpret cast require an unsafe section:
         return reinterpret<void?>(13)            // reinterpret can create unsafe pointers
     }
 
+``addr<T?>(x)`` — sugar for ``reinterpret<T?>(addr(x))`` — needs only one
+``unsafe`` covering both the address-of and the reinterpret:
+
+.. code-block:: das
+
+    let p = unsafe(addr<float?>(v))              // instead of unsafe(reinterpret<float?>(unsafe(addr(v))))
+
 Indexing into a pointer is unsafe:
 
 .. code-block:: das

@@ -11,7 +11,7 @@ options gen2
 //
 // ta = 1500 encoder positions (30 s window), hs = 64 on every whisper size.
 
-require dasllama/dasllama_common // nolint:STYLE030 — jit_enabled() for the -jit warning
+require dasllama/dasllama_common // nolint:STYLE029,STYLE030 — jit_enabled() via the ?-conditional llvm_tune re-export; a direct require would hard-require dasLLVM
 require daslib/clargs
 require math
 
@@ -51,7 +51,7 @@ def kx_cur(var kx : array<float>; tmp : array<float>; d, hh, ta : int64; kscale 
 def kx_f4t(var kx : array<float>; tmp : array<float>; d, hh, ta : int64; kscale : float) {
     let hs = d / hh
     unsafe {
-        let sp = reinterpret<float const?>(addr(tmp[0]))
+        let sp = addr<float const?>(tmp[0])
         var op = addr(kx[0])
         for (h in range64(hh)) {
             let hoff = h * hs
@@ -78,7 +78,7 @@ def kx_f4t(var kx : array<float>; tmp : array<float>; d, hh, ta : int64; kscale 
 def kx_blk4(var kx : array<float>; tmp : array<float>; d, hh, ta : int64; kscale : float) {
     let hs = d / hh
     unsafe {
-        let sp = reinterpret<float const?>(addr(tmp[0]))
+        let sp = addr<float const?>(tmp[0])
         var op = addr(kx[0])
         var t = 0l
         while (t + 3l < ta) {
@@ -134,7 +134,7 @@ def vx_cur(var vx : array<float>; tmp : array<float>; d, hh, ta : int64) {
 def vx_f4(var vx : array<float>; tmp : array<float>; d, hh, ta : int64) {
     let hs = d / hh
     unsafe {
-        let sp = reinterpret<float const?>(addr(tmp[0]))
+        let sp = addr<float const?>(tmp[0])
         var op = addr(vx[0])
         for (t in range64(ta)) {
             let src = sp + t * d

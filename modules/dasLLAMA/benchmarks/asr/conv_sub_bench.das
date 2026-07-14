@@ -152,9 +152,9 @@ def dw_unroll(var out : array<float>; x : array<float>; w, b : array<float>; iw,
     let rs = iw * ch
     unsafe {
         var op = addr(out[0])
-        let xp = reinterpret<float const?>(addr(x[0]))
-        let wp = reinterpret<float const?>(addr(w[0]))
-        let bp = reinterpret<float const?>(addr(b[0]))
+        let xp = addr<float const?>(x[0])
+        let wp = addr<float const?>(w[0])
+        let bp = addr<float const?>(b[0])
         for (oy in range64(1l, oy_end)) {
             let r0 = ((oy * 2l - 1l) * iw - 1l) * ch   // tap (0,0) of ox=0's neighborhood
             for (c in range64(ch)) {
@@ -223,9 +223,9 @@ def dw_f4(var out : array<float>; x : array<float>; wt, b : array<float>; iw, ih
     let rs = iw * ch
     unsafe {
         var op = addr(out[0])
-        let xp = reinterpret<float const?>(addr(x[0]))
-        let wp = reinterpret<float const?>(addr(wt[0]))
-        let bp = reinterpret<float const?>(addr(b[0]))
+        let xp = addr<float const?>(x[0])
+        let wp = addr<float const?>(wt[0])
+        let bp = addr<float const?>(b[0])
         for (oy in range64(1l, oy_end)) {
             for (ox in range64(1l, ox_end)) {
                 let x0 = ((oy * 2l - 1l) * iw + ox * 2l - 1l) * ch
@@ -267,9 +267,9 @@ def c0_fused_f4(var out : array<float>; x : array<float>; wt, b : array<float>; 
     let oh = (ih - 1l) / 2l + 1l
     unsafe {
         var op = addr(out[0])
-        let xp = reinterpret<float const?>(addr(x[0]))
-        let wp = reinterpret<float const?>(addr(wt[0]))
-        let bp = reinterpret<float const?>(addr(b[0]))
+        let xp = addr<float const?>(x[0])
+        let wp = addr<float const?>(wt[0])
+        let bp = addr<float const?>(b[0])
         let zero = float4(0.0)
         for (oy in range64(oh)) {
             let iy0 = oy * 2l - 1l
@@ -383,7 +383,7 @@ def permute_ptr(var xf : array<float>; y6 : array<float>; tt, w3, nch : int64) {
     let feat = w3 * nch
     unsafe {
         var fp = addr(xf[0])
-        let yp = reinterpret<float const?>(addr(y6[0]))
+        let yp = addr<float const?>(y6[0])
         for (t in range64(tt)) {
             let yb = t * feat
             let fb = t * feat
@@ -405,7 +405,7 @@ def permute_f4(var xf : array<float>; y6 : array<float>; tt, w3, nch : int64) {
     let feat = w3 * nch
     unsafe {
         var fp = addr(xf[0])
-        let yp = reinterpret<float const?>(addr(y6[0]))
+        let yp = addr<float const?>(y6[0])
         for (t in range64(tt)) {
             let yb = t * feat
             let fb = t * feat
@@ -430,7 +430,7 @@ def permute_f4(var xf : array<float>; y6 : array<float>; tt, w3, nch : int64) {
 def bias_relu_f4(var y : array<float>; b : array<float>; d, npos : int64) {
     unsafe {
         var yp = addr(y[0])
-        let bp = reinterpret<float const?>(addr(b[0]))
+        let bp = addr<float const?>(b[0])
         let zero = float4(0.0)
         for (p in range64(npos)) {
             let row = p * d
@@ -609,8 +609,8 @@ def bench_meldot(rounds : int) {
     }
     unsafe {
         var mdp = addr(md[0])
-        let fpp = reinterpret<float const?>(addr(fp[0]))
-        let flp = reinterpret<float const?>(addr(flt[0]))
+        let fpp = addr<float const?>(fp[0])
+        let flp = addr<float const?>(flt[0])
         meldot_cur(mdp, fpp, flp, n_mel, n_bins, mel_eps)
         meldot_dot(mdp + n_mel, fpp, flp, n_mel, n_bins, mel_eps)
         meldot_f4(mdp + 2l * n_mel, fpp, flp, n_mel, n_bins, mel_eps)

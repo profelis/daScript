@@ -190,11 +190,11 @@ def head_emu_ms(Q, tt, dh : int64; jo : bool; rounds : int) : double {
         var scp = addr(sc[0])
         var rlp = addr(rl[0])
         var ohp = addr(oh[0])
-        let qup = reinterpret<float const?>(addr(qu[0]))
-        let qvp = reinterpret<float const?>(addr(qv[0]))
-        let ktp = reinterpret<float const?>(addr(kt[0]))
-        let pop_ = reinterpret<float const?>(addr(pop[0]))
-        let vhp = reinterpret<float const?>(addr(vh[0]))
+        let qup = addr<float const?>(qu[0])
+        let qvp = addr<float const?>(qv[0])
+        let ktp = addr<float const?>(kt[0])
+        let pop_ = addr<float const?>(pop[0])
+        let vhp = addr<float const?>(vh[0])
         for (rnd in range(rounds + 1)) {   // round 0 = warmup
             let t0 = ref_time_ticks()
             var r0 = 0l

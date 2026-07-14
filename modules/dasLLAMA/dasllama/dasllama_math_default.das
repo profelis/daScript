@@ -113,7 +113,7 @@ def private q8q8_batch_kernel(var yp : float?; wp : int8 const?; sp : float cons
     if (g_pf_prof) {
         // instrumented path: raw parallel_for + per-worker start capture (see pf_prof_report)
         unsafe {
-            var wsp0 = reinterpret<int64?>(addr(g_pf_ws[0]))
+            var wsp0 = addr<int64?>(g_pf_ws[0])
             for (k in range(int(d))) {
                 wsp0[k] = 0l
             }
@@ -561,12 +561,12 @@ def matmul_kq_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
     let ssb = fmt == 6 ? 18l : 20l
     unsafe {
-        let kqp = reinterpret<uint8 const?>(addr(kq[0]))
-        let ksp = reinterpret<uint8 const?>(addr(ks[0]))
-        let offp = reinterpret<int64 const?>(addr(offs[0]))
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
-        let xbsp = reinterpret<int const?>(addr(xbs[0]))
+        let kqp = addr<uint8 const?>(kq[0])
+        let ksp = addr<uint8 const?>(ks[0])
+        let offp = addr<int64 const?>(offs[0])
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
+        let xbsp = addr<int const?>(xbs[0])
         var myp = addr(y[0])
         maybe_parallel_for(0, int(nregions * d), matmul_chunks_gemv(int(nregions * d), 1, n * d * nregions)) $(rb, re) {
             unsafe {

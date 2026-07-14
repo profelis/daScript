@@ -462,6 +462,20 @@ This is an unsafe operation:
         var p = addr(x)     // p is int?
     }
 
+``addr<T?>(x)`` takes the address and reinterprets it as ``T?`` in one step —
+pure syntax sugar for ``reinterpret<T?>(addr(x))``. A single ``unsafe()``
+covers both halves, where the spelled-out form needs two:
+
+.. code-block:: das
+
+    var v = float3(1., 2., 3.)
+    let p = unsafe(addr<float?>(v))                         // one unsafe gate
+    // equivalent long form, two gates:
+    // let q = unsafe(reinterpret<float?>(unsafe(addr(v))))
+
+The target type must be a pointer — ``addr<int>(x)`` is a compile error
+(it is always a typo for ``addr<int?>(x)``).
+
 ^^^^^^^^^^^^^^^^^^^
 Dot Operator Bypass
 ^^^^^^^^^^^^^^^^^^^

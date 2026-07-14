@@ -1517,9 +1517,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     }
     // upload the embedded rows + this prefill's rope table
     unsafe {
-        memcpy(metal_buffer_contents(bx), reinterpret<void?>(addr(s.x_b[0])), int(npos * dim * 4l))
-        memcpy(metal_buffer_contents(bcos), reinterpret<void?>(addr(s.rope_cos[0])), int(npos * half * 4l))
-        memcpy(metal_buffer_contents(bsin), reinterpret<void?>(addr(s.rope_sin[0])), int(npos * half * 4l))
+        memcpy(metal_buffer_contents(bx), addr<void?>(s.x_b[0]), int(npos * dim * 4l))
+        memcpy(metal_buffer_contents(bcos), addr<void?>(s.rope_cos[0]), int(npos * half * 4l))
+        memcpy(metal_buffer_contents(bsin), addr<void?>(s.rope_sin[0]), int(npos * half * 4l))
     }
     // layer-invariant uniforms (weight offsets ride the region cache, so nothing varies per layer)
     var u_dim = uniform_u32(uint(dim))
@@ -1599,8 +1599,8 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 enc = metal_new_compute_encoder(cb)
             }
             unsafe {
-                var bw_att = upload_region(reinterpret<void?>(addr(t.fblob[t.rms_att_off + l * dim])), uint64(dim * 4l))
-                var bw_ffn = upload_region(reinterpret<void?>(addr(t.fblob[t.rms_ffn_off + l * dim])), uint64(dim * 4l))
+                var bw_att = upload_region(addr<void?>(t.fblob[t.rms_att_off + l * dim]), uint64(dim * 4l))
+                var bw_ffn = upload_region(addr<void?>(t.fblob[t.rms_ffn_off + l * dim]), uint64(dim * 4l))
                 // attention: [pending W2 residual +] norm -> [requant ->] Q/K/V -> rope ->
                 // scores+softmax -> P.V -> out-proj (fused path folds each residual add into
                 // the FOLLOWING add+rms+quant; the last layer's pending add lands after the loop;
@@ -1617,19 +1617,19 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 }
                 if (g_skip != "gemm") {
                     if (mm) {
-                        var bwqb = upload_blob_region(reinterpret<void?>(addr(t.qblob[t.wq_offs[l]])), reinterpret<void?>(addr(t.qscales[t.wq_offs[l] / 32l])), qd, dim)
-                        var bwkb = upload_blob_region(reinterpret<void?>(addr(t.qblob[t.wk_offs[l]])), reinterpret<void?>(addr(t.qscales[t.wk_offs[l] / 32l])), kv_dim, dim)
-                        var bwvb = upload_blob_region(reinterpret<void?>(addr(t.qblob[t.wv_offs[l]])), reinterpret<void?>(addr(t.qscales[t.wv_offs[l] / 32l])), kv_dim, dim)
+                        var bwqb = upload_blob_region(addr<void?>(t.qblob[t.wq_offs[l]]), addr<void?>(t.qscales[t.wq_offs[l] / 32l]), qd, dim)
+                        var bwkb = upload_blob_region(addr<void?>(t.qblob[t.wk_offs[l]]), addr<void?>(t.qscales[t.wk_offs[l] / 32l]), kv_dim, dim)
+                        var bwvb = upload_blob_region(addr<void?>(t.qblob[t.wv_offs[l]]), addr<void?>(t.qscales[t.wv_offs[l] / 32l]), kv_dim, dim)
                         enc_gemm_mm(enc, bwqb, bxb, bq, u_dim, u_qd, mp, qd)
                         enc_gemm_mm(enc, bwkb, bxb, bks[l], u_dim, u_kvd, mp, kv_dim)
                         enc_gemm_mm(enc, bwvb, bxb, bvs[l], u_dim, u_kvd, mp, kv_dim)
                     } else {
-                        var bwq = upload_region(reinterpret<void?>(addr(t.qblob[t.wq_offs[l]])), uint64(qd * dim))
-                        var bwq_s = upload_region(reinterpret<void?>(addr(t.qscales[t.wq_offs[l] / 32l])), uint64(qd * (dim / 32l) * 4l))
-                        var bwk = upload_region(reinterpret<void?>(addr(t.qblob[t.wk_offs[l]])), uint64(kv_dim * dim))
-                        var bwk_s = upload_region(reinterpret<void?>(addr(t.qscales[t.wk_offs[l] / 32l])), uint64(kv_dim * (dim / 32l) * 4l))
-                        var bwv = upload_region(reinterpret<void?>(addr(t.qblob[t.wv_offs[l]])), uint64(kv_dim * dim))
-                        var bwv_s = upload_region(reinterpret<void?>(addr(t.qscales[t.wv_offs[l] / 32l])), uint64(kv_dim * (dim / 32l) * 4l))
+                        var bwq = upload_region(addr<void?>(t.qblob[t.wq_offs[l]]), uint64(qd * dim))
+                        var bwq_s = upload_region(addr<void?>(t.qscales[t.wq_offs[l] / 32l]), uint64(qd * (dim / 32l) * 4l))
+                        var bwk = upload_region(addr<void?>(t.qblob[t.wk_offs[l]]), uint64(kv_dim * dim))
+                        var bwk_s = upload_region(addr<void?>(t.qscales[t.wk_offs[l] / 32l]), uint64(kv_dim * (dim / 32l) * 4l))
+                        var bwv = upload_region(addr<void?>(t.qblob[t.wv_offs[l]]), uint64(kv_dim * dim))
+                        var bwv_s = upload_region(addr<void?>(t.qscales[t.wv_offs[l] / 32l]), uint64(kv_dim * (dim / 32l) * 4l))
                         enc_gemm(enc, bwq, bwq_s, bxq, bxs, bq, u_dim, u_qd, mp, qd)
                         enc_gemm(enc, bwk, bwk_s, bxq, bxs, bks[l], u_dim, u_kvd, mp, kv_dim)
                         enc_gemm(enc, bwv, bwv_s, bxq, bxs, bvs[l], u_dim, u_kvd, mp, kv_dim)
@@ -1667,11 +1667,11 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 }
                 if (g_skip != "gemm") {
                     if (mm) {
-                        var bwob = upload_blob_region(reinterpret<void?>(addr(t.qblob[t.wo_offs[l]])), reinterpret<void?>(addr(t.qscales[t.wo_offs[l] / 32l])), dim, qd)
+                        var bwob = upload_blob_region(addr<void?>(t.qblob[t.wo_offs[l]]), addr<void?>(t.qscales[t.wo_offs[l] / 32l]), dim, qd)
                         enc_gemm_mm(enc, bwob, bxb, bxb2, u_qd, u_dim, mp, dim)
                     } else {
-                        var bwo = upload_region(reinterpret<void?>(addr(t.qblob[t.wo_offs[l]])), uint64(dim * qd))
-                        var bwo_s = upload_region(reinterpret<void?>(addr(t.qscales[t.wo_offs[l] / 32l])), uint64(dim * (qd / 32l) * 4l))
+                        var bwo = upload_region(addr<void?>(t.qblob[t.wo_offs[l]]), uint64(dim * qd))
+                        var bwo_s = upload_region(addr<void?>(t.qscales[t.wo_offs[l] / 32l]), uint64(dim * (qd / 32l) * 4l))
                         enc_gemm(enc, bwo, bwo_s, bxq, bxs, bxb2, u_qd, u_dim, mp, dim)
                     }
                 }
@@ -1689,15 +1689,15 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 }
                 if (g_skip != "gemm") {
                     if (mm) {
-                        var bw1b = upload_blob_region(reinterpret<void?>(addr(t.qblob[t.w1_offs[l]])), reinterpret<void?>(addr(t.qscales[t.w1_offs[l] / 32l])), hidden, dim)
-                        var bw3b = upload_blob_region(reinterpret<void?>(addr(t.qblob[t.w3_offs[l]])), reinterpret<void?>(addr(t.qscales[t.w3_offs[l] / 32l])), hidden, dim)
+                        var bw1b = upload_blob_region(addr<void?>(t.qblob[t.w1_offs[l]]), addr<void?>(t.qscales[t.w1_offs[l] / 32l]), hidden, dim)
+                        var bw3b = upload_blob_region(addr<void?>(t.qblob[t.w3_offs[l]]), addr<void?>(t.qscales[t.w3_offs[l] / 32l]), hidden, dim)
                         enc_gemm_mm(enc, bw1b, bxb, bhb, u_dim, u_hidden, mp, hidden)
                         enc_gemm_mm(enc, bw3b, bxb, bhb2, u_dim, u_hidden, mp, hidden)
                     } else {
-                        var bw1 = upload_region(reinterpret<void?>(addr(t.qblob[t.w1_offs[l]])), uint64(hidden * dim))
-                        var bw1_s = upload_region(reinterpret<void?>(addr(t.qscales[t.w1_offs[l] / 32l])), uint64(hidden * (dim / 32l) * 4l))
-                        var bw3 = upload_region(reinterpret<void?>(addr(t.qblob[t.w3_offs[l]])), uint64(hidden * dim))
-                        var bw3_s = upload_region(reinterpret<void?>(addr(t.qscales[t.w3_offs[l] / 32l])), uint64(hidden * (dim / 32l) * 4l))
+                        var bw1 = upload_region(addr<void?>(t.qblob[t.w1_offs[l]]), uint64(hidden * dim))
+                        var bw1_s = upload_region(addr<void?>(t.qscales[t.w1_offs[l] / 32l]), uint64(hidden * (dim / 32l) * 4l))
+                        var bw3 = upload_region(addr<void?>(t.qblob[t.w3_offs[l]]), uint64(hidden * dim))
+                        var bw3_s = upload_region(addr<void?>(t.qscales[t.w3_offs[l] / 32l]), uint64(hidden * (dim / 32l) * 4l))
                         enc_gemm(enc, bw1, bw1_s, bxq, bxs, bhb, u_dim, u_hidden, mp, hidden)
                         enc_gemm(enc, bw3, bw3_s, bxq, bxs, bhb2, u_dim, u_hidden, mp, hidden)
                     }
@@ -1714,11 +1714,11 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 }
                 if (g_skip != "gemm") {
                     if (mm) {
-                        var bw2b = upload_blob_region(reinterpret<void?>(addr(t.qblob[t.w2_offs[l]])), reinterpret<void?>(addr(t.qscales[t.w2_offs[l] / 32l])), dim, hidden)
+                        var bw2b = upload_blob_region(addr<void?>(t.qblob[t.w2_offs[l]]), addr<void?>(t.qscales[t.w2_offs[l] / 32l]), dim, hidden)
                         enc_gemm_mm(enc, bw2b, bhb, bxb, u_hidden, u_dim, mp, dim)
                     } else {
-                        var bw2 = upload_region(reinterpret<void?>(addr(t.qblob[t.w2_offs[l]])), uint64(dim * hidden))
-                        var bw2_s = upload_region(reinterpret<void?>(addr(t.qscales[t.w2_offs[l] / 32l])), uint64(dim * (hidden / 32l) * 4l))
+                        var bw2 = upload_region(addr<void?>(t.qblob[t.w2_offs[l]]), uint64(dim * hidden))
+                        var bw2_s = upload_region(addr<void?>(t.qscales[t.w2_offs[l] / 32l]), uint64(dim * (hidden / 32l) * 4l))
                         enc_gemm(enc, bw2, bw2_s, bxq, bxs, bxb, u_hidden, u_dim, mp, dim)
                     }
                 }
@@ -1734,9 +1734,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
             // final rmsnorm on the LAST position + classifier GEMV — the caller samples from
             // s.logits, so this closes the whole forward inside the GPU window
             unsafe {
-                var bwfin = upload_region(reinterpret<void?>(addr(t.fblob[t.rms_final_off])), uint64(dim * 4l))
-                var bwc = upload_region(reinterpret<void?>(addr(t.qblob[t.wcls_off])), uint64(c.vocab_size * dim))
-                var bwc_s = upload_region(reinterpret<void?>(addr(t.qscales[t.wcls_off / 32l])), uint64(c.vocab_size * (dim / 32l) * 4l))
+                var bwfin = upload_region(addr<void?>(t.fblob[t.rms_final_off]), uint64(dim * 4l))
+                var bwc = upload_region(addr<void?>(t.qblob[t.wcls_off]), uint64(c.vocab_size * dim))
+                var bwc_s = upload_region(addr<void?>(t.qscales[t.wcls_off / 32l]), uint64(c.vocab_size * (dim / 32l) * 4l))
                 enc_rms_last(enc, bx, uint64((npos - 1l) * dim * 4l), bwfin, bxf, u_dim, u_eps)
                 enc_gemv(enc, bwc, bwc_s, bxf, blog, u_dim, u_vocab, c.vocab_size)
             }
@@ -1757,7 +1757,7 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     var readback_us = 0l
     unsafe {
         let store_nrun = kv_runs(s, start_pos, start_pos + npos, s.kv_runs)
-        let runsp = reinterpret<KVRun const?>(addr(s.kv_runs[0]))
+        let runsp = addr<KVRun const?>(s.kv_runs[0])
         for (cbi, i in cbs, count()) {
             metal_wait_until_completed(cbi)
             let e = metal_command_buffer_error(cbi)
@@ -1778,8 +1778,8 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
                 let ts_rb = ref_time_ticks()
                 let l1 = min(int64(i + 1) * layers_per_cb, c.n_layers)
                 for (l in range64(int64(i) * layers_per_cb, l1)) {
-                    memcpy(reinterpret<void?>(addr(s.k_b[0])), metal_buffer_contents(bks[l]), int(npos * kv_dim * 4l))
-                    memcpy(reinterpret<void?>(addr(s.v_b[0])), metal_buffer_contents(bvs[l]), int(npos * kv_dim * 4l))
+                    memcpy(addr<void?>(s.k_b[0]), metal_buffer_contents(bks[l]), int(npos * kv_dim * 4l))
+                    memcpy(addr<void?>(s.v_b[0]), metal_buffer_contents(bvs[l]), int(npos * kv_dim * 4l))
                     kv_store_batch(kv_layer_kbase(s, l, c.seq_len), kv_layer_vbase(s, l, c.seq_len),
                         s.kv_dtype_k, s.kv_dtype_v, s.k_b, s.v_b, runsp, store_nrun, start_pos, npos, kv_dim)
                 }
@@ -1797,9 +1797,9 @@ def metal_prefill_forward(t : Model; var s : Session; npos, start_pos : int64) :
     if (ran) {
         let ts_rb = ref_time_ticks()
         unsafe {
-            memcpy(reinterpret<void?>(addr(s.x_b[0])), metal_buffer_contents(bx), int(npos * dim * 4l))
+            memcpy(addr<void?>(s.x_b[0]), metal_buffer_contents(bx), int(npos * dim * 4l))
             if (gpu_logits) {
-                memcpy(reinterpret<void?>(addr(s.logits[0])), metal_buffer_contents(blog), int(c.vocab_size * 4l))
+                memcpy(addr<void?>(s.logits[0]), metal_buffer_contents(blog), int(c.vocab_size * 4l))
             }
         }
         if (gpu_logits) {

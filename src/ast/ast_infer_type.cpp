@@ -2985,6 +2985,15 @@ namespace das {
         }
         return Visitor::visit(expr);
     }
+    void InferTypes::preVisit(ExprCast *expr) {
+        Visitor::preVisit(expr);
+        // addr<T?>(x) sugar: unsafe() on the reinterpret covers the generated addr under it.
+        // gated on generated so the flag can't broaden safety onto a user-written addr
+        if (expr->fromAddrSugar && expr->alwaysSafe && expr->subexpr->rtti_isRef2Ptr()
+            && expr->subexpr->generated && !expr->subexpr->alwaysSafe) {
+            expr->subexpr->alwaysSafe = true;
+        }
+    }
     ExpressionPtr InferTypes::visit(ExprCast *expr) {
         if (!expr->subexpr->type)
             return Visitor::visit(expr);
@@ -3006,6 +3015,11 @@ namespace das {
         if (expr->castType->isAuto()) {
             error("casting to undefined type " + describeType(expr->castType), "", "",
                   expr->at, CompilationError::lookup_cast_type);
+            return Visitor::visit(expr);
+        }
+        if (expr->fromAddrSugar && !expr->castType->isPointer()) {
+            error("addr<> type must be a pointer, not " + describeType(expr->castType), "", "",
+                  expr->at, CompilationError::invalid_cast_type);
             return Visitor::visit(expr);
         }
         if (expr->subexpr->type->isSameExactType(*expr->castType)) {

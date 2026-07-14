@@ -208,7 +208,7 @@ def test_kv_paged_store_roundtrip(t : T?) {
             var kcl = kv_layer_kbase(s, 1l, c.seq_len)
             let pos = 6l   // second page
             kv_store_row(kcl, s.kv_dtype_k, kv_dim, kv_phys_row(s, pos), 0l, kv_dim,
-                reinterpret<float const?>(addr(src[0])))
+                addr<float const?>(src[0]))
             var d = reinterpret<float const?>(kcl)
             var ok = true
             for (i in range64(kv_dim)) {

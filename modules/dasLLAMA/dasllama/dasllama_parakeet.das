@@ -366,7 +366,7 @@ def private pk_bytes_str(b : array<uint8> | #; o, n : int64) : string {
     }
     var s = ""
     unsafe {
-        s = string(temp_array(reinterpret<uint8?>(addr(b[o])), n, type<uint8>))
+        s = string(temp_array(addr<uint8?>(b[o]), n, type<uint8>))
     }
     return s
 }
@@ -674,11 +674,11 @@ def parakeet_log_mel(samples : array<float> | #; m : ParakeetModel; var st : Par
     // independent — bit-exact at any lane count); scratch is a per-worker stack frame,
     // so a 9-minute clip no longer materializes the whole [frames × n_fft] image
     unsafe {
-        let pdd = reinterpret<float const?>(addr(st.padded[0]))
-        let wnd = reinterpret<float const?>(addr(m.window[0]))
-        let flt = reinterpret<float const?>(addr(m.filters[0]))
-        let rev = reinterpret<int const?>(addr(m.fft.rev[0]))
-        let tw = reinterpret<float const?>(addr(m.fft.tw[0]))
+        let pdd = addr<float const?>(st.padded[0])
+        let wnd = addr<float const?>(m.window[0])
+        let flt = addr<float const?>(m.filters[0])
+        let rev = addr<int const?>(m.fft.rev[0])
+        let tw = addr<float const?>(m.fft.tw[0])
         var md = addr(st.mel.data[0])
         maybe_parallel_for(0, int(n_len), lanes_for_work(n_len * n_fft * 8l, 0)) $(rb, re) {
             var frame : float[FFT_FRAME]   // 512 interleaved (re, im) pairs, stack-resident
@@ -742,9 +742,9 @@ def private pk_conv2d_c1_s2_relu(var out : array<float>; x : array<float>; blob 
     pk_ensure(out, oh * ow * cout)
     unsafe {
         var op = addr(out[0])
-        let xp = reinterpret<float const?>(addr(x[0]))
-        let wp = reinterpret<float const?>(addr(blob[w_off]))
-        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        let xp = addr<float const?>(x[0])
+        let wp = addr<float const?>(blob[w_off])
+        let bp = addr<float const?>(blob[b_off])
         let zero = float4(0.0)
         maybe_parallel_for(0, int(oh), lanes_for_work(oh * ow * cout * 9l, 0)) $(rb, re) {
             unsafe {
@@ -827,9 +827,9 @@ def private pk_conv2d_dw_s2(var out : array<float>; x : array<float>; blob : arr
     pk_ensure(out, oh * ow * ch)
     unsafe {
         var op = addr(out[0])
-        let xp = reinterpret<float const?>(addr(x[0]))
-        let wp = reinterpret<float const?>(addr(blob[w_off]))
-        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        let xp = addr<float const?>(x[0])
+        let wp = addr<float const?>(blob[w_off])
+        let bp = addr<float const?>(blob[b_off])
         maybe_parallel_for(1, int(oy_end), lanes_for_work(oh * ow * ch * 9l, 0)) $(rb, re) {
             unsafe {
                 for (oy in range64(int64(rb), int64(re))) {
@@ -871,7 +871,7 @@ def private pk_xf_permute(var xf : array<float>; y6 : array<float>; tt, w3, nch 
     let feat = w3 * nch
     unsafe {
         var fp = addr(xf[0])
-        let yp = reinterpret<float const?>(addr(y6[0]))
+        let yp = addr<float const?>(y6[0])
         maybe_parallel_for(0, int(tt), lanes_for_work(tt * feat, 0)) $(rb, re) {
             unsafe {
                 for (t in range64(int64(rb), int64(re))) {
@@ -902,7 +902,7 @@ def private pk_bias_relu(var y : array<float>; blob : array<float>; b_off, d, np
     let d4 = d - d % 4l
     unsafe {
         var yp = addr(y[0])
-        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        let bp = addr<float const?>(blob[b_off])
         let zero = float4(0.0)
         maybe_parallel_for(0, int(npos), lanes_for_work(npos * d, 0)) $(rb, re) {
             unsafe {
@@ -1076,12 +1076,12 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
                 var rlp = addr(st.relm[0])
                 var ohp = addr(st.oh[0])
                 var aop = addr(st.ao[0])
-                let qqp = reinterpret<float const?>(addr(st.qq[0]))
-                let kkp = reinterpret<float const?>(addr(st.kk[0]))
-                let vvp = reinterpret<float const?>(addr(st.vv[0]))
-                let plp = reinterpret<float const?>(addr(st.posl[0]))
-                let bup = reinterpret<float const?>(addr(m.blob[lo.bias_u + hi * dh]))
-                let bvp = reinterpret<float const?>(addr(m.blob[lo.bias_v + hi * dh]))
+                let qqp = addr<float const?>(st.qq[0])
+                let kkp = addr<float const?>(st.kk[0])
+                let vvp = addr<float const?>(st.vv[0])
+                let plp = addr<float const?>(st.posl[0])
+                let bup = addr<float const?>(m.blob[lo.bias_u + hi * dh])
+                let bvp = addr<float const?>(m.blob[lo.bias_v + hi * dh])
                 // transposed head views ((Q+u), (Q+v), Kᵀ, V_h, pos_hᵀ) — the row GEMMs read
                 // these in full, so they build before the compute dispatch
                 var th = ref_time_ticks()
@@ -1167,12 +1167,12 @@ def parakeet_encode(m : ParakeetModel; var st : ParakeetState) : int64 {
         layernorm_batch(st.xb, st.x, m.blob, lo.ncv_w, lo.ncv_b, d, tt, m.eps)
         pk_mm_rq(m, st.h, lo.pw1_w, st.xb, st.xqi, st.xsi, d, 2l * d, tt)
         unsafe {
-            let hp = reinterpret<float const?>(addr(st.h[0]))
+            let hp = addr<float const?>(st.h[0])
             var xbp = addr(st.xb[0])
             var aop = addr(st.ao[0])
-            let dwp = reinterpret<float const?>(addr(m.blob[lo.dw_w]))     // tap-major [k][d] since load
-            let scp = reinterpret<float const?>(addr(m.blob[lo.bn_w]))     // folded BN scale (pk_fold_bn)
-            let shp = reinterpret<float const?>(addr(m.blob[lo.bn_b]))     // folded BN shift
+            let dwp = addr<float const?>(m.blob[lo.dw_w])     // tap-major [k][d] since load
+            let scp = addr<float const?>(m.blob[lo.bn_w])     // folded BN scale (pk_fold_bn)
+            let shp = addr<float const?>(m.blob[lo.bn_b])     // folded BN shift
             let nk = m.n_conv_kernel
             let kpad = (nk - 1l) / 2l   // depthwise pad (k−1)/2 both sides
             let one = float4(1.0, 1.0, 1.0, 1.0)
@@ -1314,9 +1314,9 @@ def private pk_predict(m : ParakeetModel; var s : ParakeetPredState; token : int
         matmul(s.gates2, m.blob, m.lstm_hh[l], s.hbuf, pd, 4l * pd)
         // gates via float4 exp4: σ = 1/(1+exp4(-a)), tanh(a) = 1 − 2/(1+exp4(2a)) (geglu4 identity)
         unsafe {
-            let gp = reinterpret<float const?>(addr(s.gates[0]))
-            let g2p = reinterpret<float const?>(addr(s.gates2[0]))
-            let bp = reinterpret<float const?>(addr(m.blob[m.lstm_b[l]]))
+            let gp = addr<float const?>(s.gates[0])
+            let g2p = addr<float const?>(s.gates2[0])
+            let bp = addr<float const?>(m.blob[m.lstm_b[l]])
             var cp = addr(s.c[l * pd])
             var hsp = addr(s.h[l * pd])
             var xp = addr(s.xin[0])

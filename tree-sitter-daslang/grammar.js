@@ -1040,7 +1040,9 @@ module.exports = grammar({
     ),
 
     addr_expression: $ => seq(
-      'addr', '(', $._expression, ')',
+      'addr',
+      optional(seq('<', field('type', $._type), '>')),  // addr<T?>(x) — sugar for reinterpret<T?>(addr(x))
+      '(', $._expression, ')',
     ),
 
     // ---- Calls ----

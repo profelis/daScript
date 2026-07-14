@@ -1305,6 +1305,7 @@ namespace das
             struct {
                 bool            upcast : 1;
                 bool            reinterpret : 1;
+                bool            fromAddrSugar : 1;      // addr<T?>(x) sugar; unsafe() on this cast covers the generated addr under it
             };
             uint32_t castFlags = 0;
         };

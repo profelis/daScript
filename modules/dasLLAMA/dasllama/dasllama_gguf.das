@@ -81,7 +81,7 @@ def private rd_str(b : array<uint8> | #; var o : int64&) : string {
     o += 8l
     var s = ""
     unsafe {
-        s = string(temp_array(reinterpret<uint8?>(addr(b[o])), n, type<uint8>))
+        s = string(temp_array(addr<uint8?>(b[o]), n, type<uint8>))
     }
     o += n
     return s
@@ -822,7 +822,7 @@ def gguf_transcode_q4k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
     guard_dst(name, "k4 quant plane", (eloff / 256l) * K4_QSB, nb * K4_QSB, long_length(kq))
     guard_dst(name, "k4 scale plane", (eloff / 256l) * K4_SSB, nb * K4_SSB, long_length(ks))
     unsafe {   // per-superblock byte shuffle (see transcode_q4k_superblock), threaded + pointerized
-        let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
+        let srcp = addr<uint8 const?>(bytes[bo])
         var kqp = addr(kq[(eloff / 256l) * K4_QSB])
         var ksp = addr(ks[(eloff / 256l) * K4_SSB])
         maybe_parallel_for(0, int(nb), transcode_jobs(nb, 144l)) $(rb, re) {
@@ -848,7 +848,7 @@ def gguf_transcode_q5k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
     guard_dst(name, "k5 quant plane", (eloff / 256l) * K5_QSB, nb * K5_QSB, long_length(kq))
     guard_dst(name, "k5 scale plane", (eloff / 256l) * K5_SSB, nb * K5_SSB, long_length(ks))
     unsafe {   // per-superblock byte shuffle (see transcode_q5k_superblock), threaded + pointerized
-        let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
+        let srcp = addr<uint8 const?>(bytes[bo])
         var kqp = addr(kq[(eloff / 256l) * K5_QSB])
         var ksp = addr(ks[(eloff / 256l) * K5_SSB])
         maybe_parallel_for(0, int(nb), transcode_jobs(nb, 176l)) $(rb, re) {
@@ -875,7 +875,7 @@ def gguf_transcode_q6k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
     guard_dst(name, "k6 quant plane", (eloff / 256l) * K6_QSB, nb * K6_QSB, long_length(kq))
     guard_dst(name, "k6 scale plane", (eloff / 256l) * K6_SSB, nb * K6_SSB, long_length(ks))
     unsafe {   // per-superblock byte shuffle (see transcode_q6k_superblock), threaded + pointerized
-        let srcp = reinterpret<uint8 const?>(addr(bytes[bo]))
+        let srcp = addr<uint8 const?>(bytes[bo])
         var kqp = addr(kq[(eloff / 256l) * K6_QSB])
         var ksp = addr(ks[(eloff / 256l) * K6_SSB])
         maybe_parallel_for(0, int(nb), transcode_jobs(nb, 210l)) $(rb, re) {
@@ -909,8 +909,8 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
     guard_dst(name, "f32 dst", dst_off, expect_n, long_length(dst))
     if (gtype == GGML_TYPE_F32) {
         unsafe {   // raw copy, threaded in u64 words (+ one odd-float tail)
-            let sp = reinterpret<uint64 const?>(addr(bytes[base + src_off * 4l]))
-            var dp = reinterpret<uint64?>(addr(dst[dst_off]))
+            let sp = addr<uint64 const?>(bytes[base + src_off * 4l])
+            var dp = addr<uint64?>(dst[dst_off])
             let nw = expect_n / 2l
             maybe_parallel_for(0, int(nw), transcode_jobs(expect_n, 4l)) $(rb, re) {
                 unsafe {
@@ -920,14 +920,14 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
                 }
             }
             if (expect_n % 2l != 0l) {
-                let spf = reinterpret<float const?>(addr(bytes[base + src_off * 4l]))
+                let spf = addr<float const?>(bytes[base + src_off * 4l])
                 var dpf = addr(dst[dst_off])
                 dpf[expect_n - 1l] = spf[expect_n - 1l]
             }
         }
     } elif (gtype == GGML_TYPE_F16) {
         unsafe {   // threaded 32-aligned chunks through the tuned cvt kernel (+ scalar tail)
-            let sp = reinterpret<uint16 const?>(addr(bytes[base + src_off * 2l]))
+            let sp = addr<uint16 const?>(bytes[base + src_off * 2l])
             var dp = addr(dst[dst_off])
             let ng = expect_n / 32l
             maybe_parallel_for(0, int(ng), transcode_jobs(expect_n, 2l)) $(rb, re) {
@@ -942,7 +942,7 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
     } elif (gtype == GGML_TYPE_BF16) {
         // bf16 is the top 16 bits of an f32 — the shift-up conversion is exact
         unsafe {
-            let src = temp_array(reinterpret<uint16?>(addr(bytes[base + src_off * 2l])), expect_n, type<uint16>)
+            let src = temp_array(addr<uint16?>(bytes[base + src_off * 2l]), expect_n, type<uint16>)
             for (i in range64(expect_n)) {
                 dst[dst_off + i] = reinterpret<float>(uint(src[i]) << 16u)
             }
@@ -985,7 +985,7 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
         let nb = expect_n / 256l
         if (nb > 0l) {
             unsafe {
-                let sp = reinterpret<uint8 const?>(addr(bytes[base + (src_off / 256l) * sbb]))
+                let sp = addr<uint8 const?>(bytes[base + (src_off / 256l) * sbb])
                 var dp = addr(dst[dst_off])
                 maybe_parallel_for(0, int(nb), transcode_jobs(nb, sbb)) $(rb, re) {
                     unsafe {
@@ -1037,7 +1037,7 @@ def gguf_transcode_bf16(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
     }
     let base = m.data_offset + m.tensors[ti].offset
     unsafe {
-        let src = temp_array(reinterpret<uint16?>(addr(bytes[base])), expect_n, type<uint16>)
+        let src = temp_array(addr<uint16?>(bytes[base]), expect_n, type<uint16>)
         for (i in range64(expect_n)) {
             dst[dst_off + i] = src[i]
         }
@@ -1079,7 +1079,7 @@ def gguf_transcode_q8_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
     // lane count; jobs are floored to ~1MB of source each so small tensors stay inline.
     let base = m.data_offset + m.tensors[ti].offset + (src_off / 32l) * 34l
     unsafe {
-        let srcp = reinterpret<uint8 const?>(addr(bytes[base]))
+        let srcp = addr<uint8 const?>(bytes[base])
         var qdp = addr(qdst[qoff])
         var sdp = addr(sdst[soff])
         let njobs = is_job_que_available() ? int(clamp(nb / 32768l, 1l, 64l)) : 1

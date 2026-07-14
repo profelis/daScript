@@ -129,8 +129,8 @@ def main {
     unsafe {
         for (d in range64(int64(ND))) {
             let s & = sessions[int(d)]
-            let kb = reinterpret<uint8 const?>(addr(s.key_cache[0]))
-            let vb = reinterpret<uint8 const?>(addr(s.value_cache[0]))
+            let kb = addr<uint8 const?>(s.key_cache[0])
+            let vb = addr<uint8 const?>(s.value_cache[0])
             for (l in range64(nl)) {
                 if (layer_kv_source(c, l) != l) {
                     continue
@@ -212,8 +212,8 @@ def main {
                     for (d in range64(int64(ND))) {
                         let s & = sessions[int(d)]
                         let cb = (side == 0l
-                            ? reinterpret<uint8 const?>(addr(s.key_cache[0])) + s.kv_bprefix_k[l] * c.seq_len
-                            : reinterpret<uint8 const?>(addr(s.value_cache[0])) + s.kv_bprefix_v[l] * c.seq_len)
+                            ? addr<uint8 const?>(s.key_cache[0]) + s.kv_bprefix_k[l] * c.seq_len
+                            : addr<uint8 const?>(s.value_cache[0]) + s.kv_bprefix_v[l] * c.seq_len)
                         let src = reinterpret<float const?>(cb)
                         let base = (slot * int64(ND) + d) * np
                         for (p in range64(np)) {

@@ -162,7 +162,7 @@ struct public Image {
     [class_method]
     def static load_from_memory(data : array<uint8> # const; requested_channels : int = 0) : tuple<bool; string> {
         //! Load an 8-bit image from a temporary memory buffer. Sets ``bpc = 1``.
-        return load_from_memory_impl(self, unsafe(reinterpret<void?>(addr(data[0]))), length(data), requested_channels)
+        return load_from_memory_impl(self, unsafe(addr<void?>(data[0])), length(data), requested_channels)
     }
 
     [class_method]
@@ -174,7 +174,7 @@ struct public Image {
     [class_method]
     def static load_hdr_from_memory(data : array<uint8> # const; requested_channels : int = 0) : tuple<bool; string> {
         //! Load a float (HDR) image from a temporary memory buffer. Sets ``bpc = 4``.
-        return load_hdr_from_memory_impl(self, unsafe(reinterpret<void?>(addr(data[0]))), length(data), requested_channels)
+        return load_hdr_from_memory_impl(self, unsafe(addr<void?>(data[0])), length(data), requested_channels)
     }
 
     [class_method]
@@ -186,7 +186,7 @@ struct public Image {
     [class_method]
     def static load_16_from_memory(data : array<uint8> # const; requested_channels : int = 0) : tuple<bool; string> {
         //! Load a 16-bit image from a temporary memory buffer. Sets ``bpc = 2``.
-        return load_16_from_memory_impl(self, unsafe(reinterpret<void?>(addr(data[0]))), length(data), requested_channels)
+        return load_16_from_memory_impl(self, unsafe(addr<void?>(data[0])), length(data), requested_channels)
     }
 
     // ---- save to file ----
@@ -208,7 +208,7 @@ struct public Image {
             let q = quality != 0 ? quality : 90
             ok = stbi_write_jpg(path, width, height, channels, unsafe(addr(bytes[0])), q)
         } elif (ext == ".hdr") {
-            let fp = unsafe(reinterpret<float?>(unsafe(addr(bytes[0]))))
+            let fp = unsafe(addr<float?>(bytes[0]))
             ok = stbi_write_hdr(path, width, height, channels, fp)
         } else {
             return (false, "unsupported format: {ext}")
@@ -302,8 +302,8 @@ struct public Image {
         //! Flip image horizontally (mirror). Returns a new Image.
         var result = Image(width = width, height = height, channels = channels, bpc = bpc)
         result.bytes |> resize(width * height * channels * bpc)
-        let w = int(width)
-        let h = int(height)
+        let w = width
+        let h = height
         unsafe {
             let px = channels * bpc
             let dp = addr(result.bytes[0])
@@ -337,14 +337,14 @@ struct public Image {
     def static const crop(cx, cy, cw, ch : int) : Image {
         //! Extract a rectangular sub-region. Returns a new Image.
         //! Coordinates are clamped to image bounds.
-        let x0 = clamp(cx, 0, int(width))
-        let y0 = clamp(cy, 0, int(height))
-        let x1 = clamp(cx + cw, 0, int(width))
-        let y1 = clamp(cy + ch, 0, int(height))
+        let x0 = clamp(cx, 0, width)
+        let y0 = clamp(cy, 0, height)
+        let x1 = clamp(cx + cw, 0, width)
+        let y1 = clamp(cy + ch, 0, height)
         let rw = x1 - x0
         let rh = y1 - y0
         if (rw <= 0 || rh <= 0) return <- Image()
-        var result = Image(width = int(rw), height = int(rh), channels = channels, bpc = bpc)
+        var result = Image(width = rw, height = rh, channels = channels, bpc = bpc)
         let px_bytes = channels * bpc
         let src_stride = width * px_bytes
         let dst_stride = rw * px_bytes
@@ -353,7 +353,7 @@ struct public Image {
             for (row in range(rh)) {
                 let src_off = (y0 + row) * src_stride + x0 * px_bytes
                 let dst_off = row * dst_stride
-                memcpy(addr(result.bytes[int(dst_off)]), addr(bytes[int(src_off)]), dst_stride)
+                memcpy(addr(result.bytes[dst_off]), addr(bytes[src_off]), dst_stride)
             }
         }
         return <- result
@@ -367,15 +367,15 @@ struct public Image {
         assert(src.channels == channels && src.bpc == bpc, "blit requires matching channels and bpc")
         let x0 = max(dst_x, 0)
         let y0 = max(dst_y, 0)
-        let x1 = min(dst_x + src.width, int(width))
-        let y1 = min(dst_y + src.height, int(height))
+        let x1 = min(dst_x + src.width, width)
+        let y1 = min(dst_y + src.height, height)
         if (x0 >= x1 || y0 >= y1) return
         let cw = x1 - x0
         let rh = y1 - y0
         let sx0 = x0 - dst_x
         let sy0 = y0 - dst_y
-        let dw = int(width)
-        let sw = int(src.width)
+        let dw = width
+        let sw = src.width
         unsafe {
             let px = channels * bpc
             let dp = addr(bytes[0])
@@ -406,11 +406,11 @@ struct public Image {
         assert(channels == 4 && bpc == 1, "fill_rect(uint) requires 4-channel uint8 image")
         let cx0 = max(x, 0)
         let cy0 = max(y, 0)
-        let cx1 = min(x + w, int(width))
-        let cy1 = min(y + h, int(height))
+        let cx1 = min(x + w, width)
+        let cy1 = min(y + h, height)
         if (cx0 >= cx1 || cy0 >= cy1) return
         unsafe {
-            rast_fill_rect_4(reinterpret<uint?>(addr(bytes[0])), int(width), cx0, cy0, cx1 - cx0, cy1 - cy0, color)
+            rast_fill_rect_4(addr<uint?>(bytes[0]), width, cx0, cy0, cx1 - cx0, cy1 - cy0, color)
         }
     }
 
@@ -420,11 +420,11 @@ struct public Image {
         assert(channels == 1 && bpc == 1, "fill_rect(uint8) requires 1-channel uint8 image")
         let cx0 = max(x, 0)
         let cy0 = max(y, 0)
-        let cx1 = min(x + w, int(width))
-        let cy1 = min(y + h, int(height))
+        let cx1 = min(x + w, width)
+        let cy1 = min(y + h, height)
         if (cx0 >= cx1 || cy0 >= cy1) return
         unsafe {
-            rast_fill_rect_1(addr(bytes[0]), int(width), cx0, cy0, cx1 - cx0, cy1 - cy0, val)
+            rast_fill_rect_1(addr(bytes[0]), width, cx0, cy0, cx1 - cx0, cy1 - cy0, val)
         }
     }
 
@@ -438,17 +438,17 @@ struct public Image {
         var csx = sx; var csy = sy; var cdx = dx; var cdy = dy; var cw = w; var ch = h
         if (csx < 0) { cdx -= csx; cw += csx; csx = 0; }
         if (csy < 0) { cdy -= csy; ch += csy; csy = 0; }
-        if (csx + cw > int(src.width)) { cw = int(src.width) - csx; }
-        if (csy + ch > int(src.height)) { ch = int(src.height) - csy; }
+        if (csx + cw > src.width) { cw = src.width - csx; }
+        if (csy + ch > src.height) { ch = src.height - csy; }
         // clip to dest bounds
         if (cdx < 0) { csx -= cdx; cw += cdx; cdx = 0; }
         if (cdy < 0) { csy -= cdy; ch += cdy; cdy = 0; }
-        if (cdx + cw > int(width)) { cw = int(width) - cdx; }
-        if (cdy + ch > int(height)) { ch = int(height) - cdy; }
+        if (cdx + cw > width) { cw = width - cdx; }
+        if (cdy + ch > height) { ch = height - cdy; }
         if (cw <= 0 || ch <= 0) return
         unsafe {
             rast_blit_alpha(addr(bytes[0]), addr(src.bytes[0]),
-                int(width), int(src.width),
+                width, src.width,
                 csx, csy, cdx, cdy, cw, ch,
                 uint8(clamp(r, 0, 255)), uint8(clamp(g, 0, 255)), uint8(clamp(b, 0, 255)))
         }
@@ -467,9 +467,9 @@ struct public Image {
             if (bpc == 1) {
                 rast_convert_channels_u8(addr(result.bytes[0]), addr(bytes[0]), num_pixels, channels, target_channels)
             } elif (bpc == 2) {
-                rast_convert_channels_u16(reinterpret<uint16?>(addr(result.bytes[0])), reinterpret<uint16?>(addr(bytes[0])), num_pixels, channels, target_channels)
+                rast_convert_channels_u16(addr<uint16?>(result.bytes[0]), addr<uint16?>(bytes[0]), num_pixels, channels, target_channels)
             } elif (bpc == 4) {
-                rast_convert_channels_f32(reinterpret<float?>(addr(result.bytes[0])), reinterpret<float?>(addr(bytes[0])), num_pixels, channels, target_channels)
+                rast_convert_channels_f32(addr<float?>(result.bytes[0]), addr<float?>(bytes[0]), num_pixels, channels, target_channels)
             }
         }
         return <- result
@@ -486,17 +486,17 @@ struct public Image {
         result.bytes |> resize(count * target_bpc)
         unsafe {
             if (bpc == 1 && target_bpc == 4) {
-                rast_convert_u8_to_f32(reinterpret<float?>(addr(result.bytes[0])), addr(bytes[0]), count)
+                rast_convert_u8_to_f32(addr<float?>(result.bytes[0]), addr(bytes[0]), count)
             } elif (bpc == 4 && target_bpc == 1) {
-                rast_convert_f32_to_u8(addr(result.bytes[0]), reinterpret<float?>(addr(bytes[0])), count)
+                rast_convert_f32_to_u8(addr(result.bytes[0]), addr<float?>(bytes[0]), count)
             } elif (bpc == 1 && target_bpc == 2) {
-                rast_convert_u8_to_u16(reinterpret<uint16?>(addr(result.bytes[0])), addr(bytes[0]), count)
+                rast_convert_u8_to_u16(addr<uint16?>(result.bytes[0]), addr(bytes[0]), count)
             } elif (bpc == 2 && target_bpc == 1) {
-                rast_convert_u16_to_u8(addr(result.bytes[0]), reinterpret<uint16?>(addr(bytes[0])), count)
+                rast_convert_u16_to_u8(addr(result.bytes[0]), addr<uint16?>(bytes[0]), count)
             } elif (bpc == 2 && target_bpc == 4) {
-                rast_convert_u16_to_f32(reinterpret<float?>(addr(result.bytes[0])), reinterpret<uint16?>(addr(bytes[0])), count)
+                rast_convert_u16_to_f32(addr<float?>(result.bytes[0]), addr<uint16?>(bytes[0]), count)
             } elif (bpc == 4 && target_bpc == 2) {
-                rast_convert_f32_to_u16(reinterpret<uint16?>(addr(result.bytes[0])), reinterpret<float?>(addr(bytes[0])), count)
+                rast_convert_f32_to_u16(addr<uint16?>(result.bytes[0]), addr<float?>(bytes[0]), count)
             }
         }
         return <- result
@@ -523,7 +523,7 @@ def public with_pixels(var self : Image; blk : block<(var pixels : array<float>#
     unsafe {
         __builtin_array_lock(self.bytes)
         var view : array<float>#
-        _builtin_make_temp_array(view, reinterpret<float?>(addr(self.bytes[0])), self.width * self.height * self.channels)
+        _builtin_make_temp_array(view, addr<float?>(self.bytes[0]), self.width * self.height * self.channels)
         invoke(blk, view)
         __builtin_array_unlock(self.bytes)
     }
@@ -535,7 +535,7 @@ def public with_pixels(var self : Image; blk : block<(var pixels : array<uint16>
     unsafe {
         __builtin_array_lock(self.bytes)
         var view : array<uint16>#
-        _builtin_make_temp_array(view, reinterpret<uint16?>(addr(self.bytes[0])), self.width * self.height * self.channels)
+        _builtin_make_temp_array(view, addr<uint16?>(self.bytes[0]), self.width * self.height * self.channels)
         invoke(blk, view)
         __builtin_array_unlock(self.bytes)
     }
@@ -575,7 +575,7 @@ def public with_row(var self : Image; y : int; blk : block<(var row : array<floa
     unsafe {
         __builtin_array_lock(self.bytes)
         var view : array<float>#
-        _builtin_make_temp_array(view, reinterpret<float?>(addr(self.bytes[y * row_elems * 4])), row_elems)
+        _builtin_make_temp_array(view, addr<float?>(self.bytes[y * row_elems * 4]), row_elems)
         invoke(blk, view)
         __builtin_array_unlock(self.bytes)
     }
@@ -589,7 +589,7 @@ def public with_row(var self : Image; y : int; blk : block<(var row : array<uint
     unsafe {
         __builtin_array_lock(self.bytes)
         var view : array<uint16>#
-        _builtin_make_temp_array(view, reinterpret<uint16?>(addr(self.bytes[y * row_elems * 2])), row_elems)
+        _builtin_make_temp_array(view, addr<uint16?>(self.bytes[y * row_elems * 2]), row_elems)
         invoke(blk, view)
         __builtin_array_unlock(self.bytes)
     }

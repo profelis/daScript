@@ -42,6 +42,16 @@ addr and deref
       *p = 999          // modifies x through pointer
   }
 
+``addr<T?>(x)`` takes the address and reinterprets it as ``T?`` in one
+step — sugar for ``reinterpret<T?>(addr(x))``, with a single ``unsafe()``
+covering both halves::
+
+  var w = 1.0
+  let bits = unsafe(addr<int?>(w))   // instead of unsafe(reinterpret<int?>(unsafe(addr(w))))
+  unsafe {
+      print("0x{*bits:08x}\n")       // 0x3f800000
+  }
+
 Null pointers
 =============
 

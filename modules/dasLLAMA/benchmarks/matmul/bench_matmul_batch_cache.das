@@ -49,10 +49,10 @@ def matmul_q8q8_batch_ntile(var y : array<float>; wq : array<int8> | #; ws : arr
     let nb = n / 32l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         parallel_for(0, int(d), get_total_hw_jobs()) $(rb, re, wg) {
             unsafe {
                 var myp = reinterpret<float?>(yp)
@@ -90,10 +90,10 @@ def matmul_q8q8_batch_ttok(var y : array<float>; wq : array<int8> | #; ws : arra
     let nb = n / 32l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         var t0 = 0l
         while (t0 < ntok) {
             let t1 = min(t0 + tb, ntok)

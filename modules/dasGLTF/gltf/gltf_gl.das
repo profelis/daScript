@@ -94,7 +94,7 @@ def private create_gl_texture(img : GltfImage; sampler : GltfSampler; srgb : boo
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
     unsafe {
         glTexImage2D(GL_TEXTURE_2D, 0, internal, img.width, img.height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-            reinterpret<void const?>(addr(img.pixels[0])))
+            addr<void const?>(img.pixels[0]))
     }
     glPixelStorei(GL_UNPACK_ALIGNMENT, prev_align)
     glGenerateMipmap(GL_TEXTURE_2D)
@@ -114,7 +114,7 @@ def private create_solid_texture(r, g, b, a : uint) : uint {
     var px = [uint8(r), uint8(g), uint8(b), uint8(a)]
     unsafe {
         glTexImage2D(GL_TEXTURE_2D, 0, int(GL_RGBA8), 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-            reinterpret<void const?>(addr(px[0])))
+            addr<void const?>(px[0]))
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)

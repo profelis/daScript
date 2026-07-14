@@ -263,8 +263,8 @@ def test_metal_prefill_kernels(t : T?) {
                 }
                 unsafe {
                     for (r in range(NROWS)) {
-                        rmsnorm(addr(rwant[r * DIM]), reinterpret<float const?>(addr(rx[r * DIM])),
-                            reinterpret<float const?>(addr(rw[0])), int64(DIM), EPS)
+                        rmsnorm(addr(rwant[r * DIM]), addr<float const?>(rx[r * DIM]),
+                            addr<float const?>(rw[0]), int64(DIM), EPS)
                     }
                 }
                 var brx = buf_upload(dev, rx)
@@ -314,7 +314,7 @@ def test_metal_prefill_kernels(t : T?) {
                 unsafe {
                     for (p in range(NPOS)) {
                         rope_scaled_tab(addr(rvwant[p * QD]), int64(HEAD_SIZE), int64(QD),
-                            reinterpret<float const?>(addr(rcos[p * half])), reinterpret<float const?>(addr(rsin[p * half])))
+                            addr<float const?>(rcos[p * half]), addr<float const?>(rsin[p * half]))
                     }
                 }
                 var brv = buf_upload(dev, rv)

@@ -267,7 +267,7 @@ def getStructFieldOffset(var st : TokenStream; ident : string; var result : Resu
     for (field in *result.tinfo.structType) {
         var tinfo : TypeInfo?
         unsafe {
-            tinfo = reinterpret<TypeInfo?>(unsafe(addr(field)))
+            tinfo = addr<TypeInfo?>(field)
         }
         if (field.name == ident) return (offset = size, tinfo = *tinfo)
         let al = get_type_align(tinfo) - 1

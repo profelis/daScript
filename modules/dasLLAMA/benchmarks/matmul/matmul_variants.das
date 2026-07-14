@@ -134,8 +134,8 @@ def matmul_f4(var y : array<float> | #; w : array<float> | #; x : array<float> |
         var j = 0l
         while (j + 4l <= n) {
             unsafe {
-                let w4 = *reinterpret<float4?>(addr(w[row + j]))
-                let x4 = *reinterpret<float4?>(addr(x[j]))
+                let w4 = *addr<float4?>(w[row + j])
+                let x4 = *addr<float4?>(x[j])
                 acc += w4 * x4
             }
             j += 4l
@@ -186,7 +186,7 @@ def matmul_q8_flat(var y : array<float> | #; wq : array<int8> | #; ws : array<fl
     unsafe {
         let xp = addr(x[0])
         for (i in range64(d)) {
-            y[i] = dot_q8_flat(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xp, n)
+            y[i] = dot_q8_flat(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xp, n)
         }
     }
 }
@@ -198,8 +198,8 @@ def matmul_q8(var y : array<float> | #; wq : array<int8> | #; ws : array<float> 
     unsafe {
         let xp = addr(x[0])
         for (i in range64(d)) {
-            let wp = reinterpret<int8 const?>(addr(wq[i * n]))
-            let sp = reinterpret<float const?>(addr(ws[i * nb]))
+            let wp = addr<int8 const?>(wq[i * n])
+            let sp = addr<float const?>(ws[i * nb])
             y[i] = dot_q8(wp, sp, xp, n)
         }
     }
@@ -229,7 +229,7 @@ def matmul_q8b(var y : array<float> | #; wq : array<int8> | #; ws : array<float>
         let xp = addr(x[0])
         var wop = addr(wrow[0])
         for (i in range64(d)) {
-            dequant_row(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), wop, n)
+            dequant_row(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), wop, n)
             y[i] = dot_vec(wop, xp, n)
         }
     }
@@ -250,7 +250,7 @@ def dot_q8_f4(wq : int8 const?; ws : float const?; x : float const?; n : int64) 
             let off = base + c
             unsafe {
                 let q4 = float4(float(wq[off]), float(wq[off + 1l]), float(wq[off + 2l]), float(wq[off + 3l]))
-                let x4 = *reinterpret<float4?>(addr(x[off]))
+                let x4 = *addr<float4?>(x[off])
                 bacc += q4 * x4
             }
             c += 4l
@@ -264,7 +264,7 @@ def matmul_q8_f4(var y : array<float> | #; wq : array<int8> | #; ws : array<floa
     unsafe {
         let xp = addr(x[0])
         for (i in range64(d)) {
-            y[i] = dot_q8_f4(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xp, n)
+            y[i] = dot_q8_f4(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xp, n)
         }
     }
 }
@@ -275,8 +275,8 @@ def matmul_q8_par(var y : array<float>; wq : array<int8> | #; ws : array<float> 
     let nb = n / 32l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
@@ -296,8 +296,8 @@ def matmul_q8f4_par(var y : array<float>; wq : array<int8> | #; ws : array<float
     let nb = n / 32l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
@@ -317,8 +317,8 @@ def matmul_q8flat_par(var y : array<float>; wq : array<int8> | #; ws : array<flo
     let nb = n / 32l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
@@ -357,10 +357,10 @@ def dot_q8q8(wq : int8 const?; ws : float const?; xq : int8 const?; xs : float c
 def matmul_q8q8(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -429,10 +429,10 @@ def dot_q8q8_sdot4x4(wq : int8 const?; ws : float const?; xq : int8 const?; xs :
 def matmul_q8q8_sdot4(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_sdot4(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_sdot4(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -440,10 +440,10 @@ def matmul_q8q8_sdot4(var y : array<float> | #; wq : array<int8> | #; ws : array
 def matmul_q8q8_sdot4x4(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_sdot4x4(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_sdot4x4(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -462,8 +462,8 @@ def repack_q8q8_4(wq : array<int8>; ws : array<float>; n, d : int64; var wout : 
     wout |> resize(d * n)
     sout |> resize(d * nb)
     unsafe {
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         var wo = addr(wout[0])
         var so = addr(sout[0])
         for (g in range64(ng)) {
@@ -528,10 +528,10 @@ def matmul_q8q8_laneq(var y : array<float> | #; wgq : array<int8> | #; wgs : arr
     let ng = d / 4l
     unsafe {
         var yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wgq[0]))
-        let sp = reinterpret<float const?>(addr(wgs[0]))
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let wp = addr<int8 const?>(wgq[0])
+        let sp = addr<float const?>(wgs[0])
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (g in range64(ng)) {
             let f = dot_q8q8_laneq4(wp + g * 4l * n, sp + g * 4l * nb, xqp, xsp, n)
             yp[g * 4l + 0l] = f.x
@@ -565,10 +565,10 @@ def dot_q8q8_uf(wq : int8 const?; ws : float const?; xq : int8 const?; xs : floa
 def matmul_q8q8_uf(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_uf(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_uf(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -675,10 +675,10 @@ def dot_q8q8_4acc(wq : int8 const?; ws : float const?; xq : int8 const?; xs : fl
 def matmul_q8q8_w8(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_w8(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_w8(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -686,10 +686,10 @@ def matmul_q8q8_w8(var y : array<float> | #; wq : array<int8> | #; ws : array<fl
 def matmul_q8q8_w32(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_w32(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_w32(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -697,10 +697,10 @@ def matmul_q8q8_w32(var y : array<float> | #; wq : array<int8> | #; ws : array<f
 def matmul_q8q8_w16u2(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_w16u2(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_w16u2(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -708,10 +708,10 @@ def matmul_q8q8_w16u2(var y : array<float> | #; wq : array<int8> | #; ws : array
 def matmul_q8q8_4acc(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_4acc(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_4acc(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -752,10 +752,10 @@ def dot_q8q8_8acc(wq : int8 const?; ws : float const?; xq : int8 const?; xs : fl
 def matmul_q8q8_8acc(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_8acc(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_8acc(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -798,10 +798,10 @@ def dot_q8q8_8acc_int(wq : int8 const?; ws : float const?; xq : int8 const?; xs 
 def matmul_q8q8_8acc_int(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_8acc_int(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_8acc_int(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -859,10 +859,10 @@ def dot_q8q8_flat_int(wq : int8 const?; ws : float const?; xq : int8 const?; xs 
 def matmul_q8q8_flat_int(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_flat_int(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_flat_int(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -870,10 +870,10 @@ def matmul_q8q8_flat_int(var y : array<float> | #; wq : array<int8> | #; ws : ar
 def matmul_q8q8_flat(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_flat(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_flat(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -881,10 +881,10 @@ def matmul_q8q8_flat(var y : array<float> | #; wq : array<int8> | #; ws : array<
 def matmul_q8q8_flat_w8u2(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_flat_w8u2(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_flat_w8u2(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -892,10 +892,10 @@ def matmul_q8q8_flat_w8u2(var y : array<float> | #; wq : array<int8> | #; ws : a
 def matmul_q8q8_flat_w16u4(var y : array<float> | #; wq : array<int8> | #; ws : array<float> | #; xq : array<int8> | #; xs : array<float> | #; n, d : int64) {
     let nb = n / 32l
     unsafe {
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         for (i in range64(d)) {
-            y[i] = dot_q8q8_flat_w16u4(reinterpret<int8 const?>(addr(wq[i * n])), reinterpret<float const?>(addr(ws[i * nb])), xqp, xsp, n)
+            y[i] = dot_q8q8_flat_w16u4(addr<int8 const?>(wq[i * n]), addr<float const?>(ws[i * nb]), xqp, xsp, n)
         }
     }
 }
@@ -906,10 +906,10 @@ def matmul_q8q8_par(var y : array<float>; wq : array<int8> | #; ws : array<float
     let nb = n / 32l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
                 var myp = reinterpret<float?>(yp)
@@ -937,10 +937,10 @@ def matmul_q8q8_group3_par(var y0 : array<float>; var y1 : array<float>; var y2 
         let y0p = addr(y0[0])
         let y1p = addr(y1[0])
         let y2p = addr(y2[0])
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
         parallel_for(0, int(dtot), num_jobs) $(rb, re, wg) {
             unsafe {
                 var w0 = reinterpret<float?>(y0p)
@@ -989,8 +989,8 @@ def dot_q4(wq : uint8 const?; ws : float const?; x : float const?; n : int64) : 
                 let b3 = int(wq[bbyte + j + 3l])
                 let lo4 = float4(float((b0 & 0x0F) - 8), float((b1 & 0x0F) - 8), float((b2 & 0x0F) - 8), float((b3 & 0x0F) - 8))
                 let hi4 = float4(float((b0 >> 4) - 8), float((b1 >> 4) - 8), float((b2 >> 4) - 8), float((b3 >> 4) - 8))
-                let xlo = *reinterpret<float4?>(addr(x[base + j]))
-                let xhi = *reinterpret<float4?>(addr(x[base + 16l + j]))
+                let xlo = *addr<float4?>(x[base + j])
+                let xhi = *addr<float4?>(x[base + 16l + j])
                 bacc += lo4 * xlo + hi4 * xhi
             }
             j += 4l
@@ -1005,7 +1005,7 @@ def matmul_q4(var y : array<float> | #; wq : array<uint8> | #; ws : array<float>
     unsafe {
         let xp = addr(x[0])
         for (i in range64(d)) {
-            y[i] = dot_q4(reinterpret<uint8 const?>(addr(wq[i * (n / 2l)])), reinterpret<float const?>(addr(ws[i * nb])), xp, n)
+            y[i] = dot_q4(addr<uint8 const?>(wq[i * (n / 2l)]), addr<float const?>(ws[i * nb]), xp, n)
         }
     }
 }
@@ -1038,7 +1038,7 @@ def matmul_q4_fv(var y : array<float> | #; wq : array<uint8> | #; ws : array<flo
     unsafe {
         let xp = addr(x[0])
         for (i in range64(d)) {
-            y[i] = dot_q4_fv(reinterpret<uint8 const?>(addr(wq[i * nh])), reinterpret<float const?>(addr(ws[i * nb])), xp, n)
+            y[i] = dot_q4_fv(addr<uint8 const?>(wq[i * nh]), addr<float const?>(ws[i * nb]), xp, n)
         }
     }
 }
@@ -1072,7 +1072,7 @@ def matmul_q4_fv_w4u4(var y : array<float> | #; wq : array<uint8> | #; ws : arra
     unsafe {
         let xp = addr(x[0])
         for (i in range64(d)) {
-            y[i] = dot_q4_fv_w4u4(reinterpret<uint8 const?>(addr(wq[i * nh])), reinterpret<float const?>(addr(ws[i * nb])), xp, n)
+            y[i] = dot_q4_fv_w4u4(addr<uint8 const?>(wq[i * nh]), addr<float const?>(ws[i * nb]), xp, n)
         }
     }
 }
@@ -1083,8 +1083,8 @@ def matmul_q4fvw4u4_par(var y : array<float>; wq : array<uint8> | #; ws : array<
     let nh = n / 2l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<uint8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<uint8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
@@ -1121,7 +1121,7 @@ def matmul_q4_fv_w16(var y : array<float> | #; wq : array<uint8> | #; ws : array
     unsafe {
         let xp = addr(x[0])
         for (i in range64(d)) {
-            y[i] = dot_q4_fv_w16(reinterpret<uint8 const?>(addr(wq[i * nh])), reinterpret<float const?>(addr(ws[i * nb])), xp, n)
+            y[i] = dot_q4_fv_w16(addr<uint8 const?>(wq[i * nh]), addr<float const?>(ws[i * nb]), xp, n)
         }
     }
 }
@@ -1151,7 +1151,7 @@ def matmul_q4_flat(var y : array<float> | #; wq : array<uint8> | #; ws : array<f
     unsafe {
         let xp = addr(x[0])
         for (i in range64(d)) {
-            y[i] = dot_q4_flat(reinterpret<uint8 const?>(addr(wq[i * nh])), reinterpret<float const?>(addr(ws[i * nb])), xp, n)
+            y[i] = dot_q4_flat(addr<uint8 const?>(wq[i * nh]), addr<float const?>(ws[i * nb]), xp, n)
         }
     }
 }
@@ -1163,8 +1163,8 @@ def matmul_q4_par(var y : array<float>; wq : array<uint8> | #; ws : array<float>
     let nh = n / 2l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<uint8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<uint8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
@@ -1184,8 +1184,8 @@ def matmul_q4fv_par(var y : array<float>; wq : array<uint8> | #; ws : array<floa
     let nh = n / 2l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<uint8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<uint8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
@@ -1205,8 +1205,8 @@ def matmul_q4flat_par(var y : array<float>; wq : array<uint8> | #; ws : array<fl
     let nh = n / 2l
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<uint8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<uint8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
@@ -1226,7 +1226,7 @@ def matmul_q4flat_par(var y : array<float>; wq : array<uint8> | #; ws : array<fl
 def matmul_par(var y : array<float>; w : array<float> | #; x : array<float>; n, d : int64; num_jobs : int) {
     unsafe {
         let yp = addr(y[0])
-        let wp = reinterpret<float const?>(addr(w[0]))  // strip the `#` if w is a view
+        let wp = addr<float const?>(w[0])  // strip the `#` if w is a view
         let xp = addr(x[0])
         parallel_for(0, int(d), num_jobs) $(rb, re, wg) {
             unsafe {
@@ -1605,8 +1605,8 @@ def repack_q8q8_inline(wgq : array<int8>; wgs : array<float>; n, d : int64; var 
     out |> reserve(ng * nb * 144l)
     out |> resize(ng * nb * 144l)
     unsafe {
-        let wp = reinterpret<int8 const?>(addr(wgq[0]))
-        let sp = reinterpret<int8 const?>(addr(wgs[0]))
+        let wp = addr<int8 const?>(wgq[0])
+        let sp = addr<int8 const?>(wgs[0])
         var op = addr(out[0])
         for (g in range64(ng)) {
             for (bi in range64(nb)) {

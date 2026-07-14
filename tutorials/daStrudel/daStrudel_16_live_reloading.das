@@ -25,9 +25,9 @@ require strudel/strudel public
 require strudel/strudel_player
 // strudel_live registers [before_reload]/[after_reload] hooks automatically —
 // just require it and player state (tracks, SID, SF2 data) is preserved.
-require strudel/strudel_live
+require strudel/strudel_live // nolint:STYLE030 — required for its [before_reload]/[after_reload] handlers, not symbols
 require audio/audio_boost
-require live/audio_live
+require live/audio_live // nolint:STYLE030 — required for its live-reload handlers, not symbols
 require live/live_commands
 require live/live_api
 require live_host
@@ -126,7 +126,7 @@ var g_reload_count : int = 0
 def save_my_state() {
     var data : array<uint8>
     data |> resize(4)
-    unsafe { *reinterpret<int?>(addr(data[0])) = g_reload_count; }
+    unsafe { *addr<int?>(data[0]) = g_reload_count; }
     live_store_bytes("tutorial15_reload_count", data)
 }
 
@@ -134,7 +134,7 @@ def save_my_state() {
 def restore_my_state() {
     var data : array<uint8>
     if (live_load_bytes("tutorial15_reload_count", data) && length(data) >= 4) {
-        unsafe { g_reload_count = *reinterpret<int?>(addr(data[0])); }
+        unsafe { g_reload_count = *addr<int?>(data[0]); }
         g_reload_count ++
         to_log(LOG_INFO, "tutorial15: reload #{g_reload_count}\n")
     }

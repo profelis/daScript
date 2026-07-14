@@ -106,6 +106,18 @@ def main {
         print("  unsafe(addr(z)) = {*ptr}\n")
     }
 
+    // === addr<T?> — typed address-of ===
+    // addr<T?>(x) is sugar for reinterpret<T?>(addr(x)): take the address,
+    // view it as T?. One unsafe() covers both halves — the spelled-out form
+    // would need two.
+
+    print("addr<T?>:\n")
+    var w = 1.0
+    let bits = unsafe(addr<int?>(w))
+    unsafe {
+        print("  1.0 bits via addr<int?>: 0x{*bits:08x}\n")   // same 0x3f800000
+    }
+
     // === When unsafe is required ===
     //
     // 1.  addr(x)                  — pointer can outlive variable

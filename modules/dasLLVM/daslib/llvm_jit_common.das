@@ -579,7 +579,7 @@ def public init_jit_clopts() {
     ]
     unsafe {
         LLVMParseCommandLineOptions(length(argv),
-            reinterpret<string const?>(addr(argv[0])),
+            addr<string const?>(argv[0]),
             "daslang JIT cl::opts")
     }
 }

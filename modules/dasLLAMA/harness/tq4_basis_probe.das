@@ -42,10 +42,10 @@ def measure_sorted(sL, sS : Session; c : Config; hs, npastL, npastS : int64; pai
     dq |> resize(int(hs))
     blk |> resize(int(hs / 32l * 18l))
     unsafe {
-        let kbL = reinterpret<uint8 const?>(addr(sL.key_cache[0]))
-        let vbL = reinterpret<uint8 const?>(addr(sL.value_cache[0]))
-        let kbS = reinterpret<uint8 const?>(addr(sS.key_cache[0]))
-        let vbS = reinterpret<uint8 const?>(addr(sS.value_cache[0]))
+        let kbL = addr<uint8 const?>(sL.key_cache[0])
+        let vbL = addr<uint8 const?>(sL.value_cache[0])
+        let kbS = addr<uint8 const?>(sS.key_cache[0])
+        let vbS = addr<uint8 const?>(sS.value_cache[0])
         for (l in range64(c.n_layers)) {
             if (layer_kv_source(c, l) != l) {
                 continue
@@ -230,9 +230,9 @@ def main {
     blk |> resize(int(hs / 32l * 18l))
 
     unsafe {
-        let kb = reinterpret<uint8 const?>(addr(s.key_cache[0]))
-        let vb = reinterpret<uint8 const?>(addr(s.value_cache[0]))
-        let sgp = reinterpret<float const?>(addr(signs[0]))
+        let kb = addr<uint8 const?>(s.key_cache[0])
+        let vb = addr<uint8 const?>(s.value_cache[0])
+        let sgp = addr<float const?>(signs[0])
         for (l in range64(c.n_layers)) {
             if (layer_kv_source(c, l) != l) {
                 continue
@@ -311,8 +311,8 @@ def main {
     chrms |> resize(int(hs))
     order |> resize(int(hs))
     unsafe {
-        let kb = reinterpret<uint8 const?>(addr(s.key_cache[0]))
-        let vb = reinterpret<uint8 const?>(addr(s.value_cache[0]))
+        let kb = addr<uint8 const?>(s.key_cache[0])
+        let vb = addr<uint8 const?>(s.value_cache[0])
         for (l in range64(c.n_layers)) {
             if (layer_kv_source(c, l) != l) {
                 continue
