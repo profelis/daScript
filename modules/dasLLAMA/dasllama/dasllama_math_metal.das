@@ -375,7 +375,6 @@ def metal_q8q8_batch(var yp : float?; wp : int8 const?; sp : float const?; xqp :
     let ran = with_compute_encoder(g_queue, err) $(enc : MetalComputeEncoder?) {
         metal_set_pipeline(enc, use64 ? g_pso64 : g_pso)
         metal_set_threadgroup_memory_length(enc, use64 ? metal_q8_gemm64_msl_tgmem : metal_q8_gemm_msl_tgmem, 0)
-        metal_set_threadgroup_memory_length(enc, use64 ? metal_q8_gemm64_msl_tgmem : metal_q8_gemm_msl_tgmem, 0)
         metal_set_buffer(enc, wbuf, 0ul, 0)
         metal_set_buffer(enc, sbuf, 0ul, 1)
         metal_set_buffer(enc, xqbuf, 0ul, 2)
