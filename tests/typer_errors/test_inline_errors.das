@@ -32,10 +32,6 @@ def expect_issue(t : T?; fixture, message : string) {
 
 [test]
 def test_inline_contract_errors(t : T?) {
-    t |> run("multiple returns violate single-exit") @(t : T?) {
-        t |> expect_issue("_inline_multiret.das",
-            "[inline] requires a single-exit body")
-    }
     t |> run("taking the address of an [inline] function") @(t : T?) {
         t |> expect_issue("_inline_addr.das",
             "can't take the address of [inline] function")
@@ -68,8 +64,20 @@ def test_inline_contract_errors(t : T?) {
         t |> expect_issue("_inline_never_inline_conflict.das",
             "[never_inline] conflicts with [inline]")
     }
+    t |> run("early return with a tail inside a finally-carrying block") @(t : T?) {
+        t |> expect_issue("_inline_finally_hazard.das",
+            "early returns conflict with a finally section")
+    }
     t |> run("[inline] call in a mixed-type ternary arm") @(t : T?) {
         t |> expect_issue("_inline_mixed_ternary.das",
             "inside a mixed-type ternary")
+    }
+    t |> run("cross-module body with user-spelled _:: dispatch") @(t : T?) {
+        t |> expect_issue("_inline_scope_dispatch.das",
+            "body dispatches '_::help_scale' at the call site's module")
+    }
+    t |> run("[inline] call site inside a different module's with scope") @(t : T?) {
+        t |> expect_issue("_inline_scope_in_with.das",
+            "the call site resolves inside with (module _inline_scope_dispatch_helper)")
     }
 }

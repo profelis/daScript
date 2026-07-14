@@ -7,3 +7,4 @@ Expression flags
 Expression print flags
 The expression to be used as the context for the with block
 The body of the with block
+Target module name for the module-flavored form (`with (module foo)`); empty for the expression flavor.

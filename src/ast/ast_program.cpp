@@ -215,12 +215,13 @@ namespace das {
         library.addModule(thisModule.get());
     }
 
-    TypeDecl * Program::makeTypeDeclaration(const LineInfo &at, const string &name) {
+    TypeDecl * Program::makeTypeDeclaration(const LineInfo &at, const string &name, Module * perspective) {
         das::vector<das::StructurePtr> structs;
         das::vector<das::AnnotationPtr> handles;
         das::vector<das::EnumerationPtr> enums;
         das::vector<das::TypeDeclPtr> aliases;
-        library.findWithCallback(name, thisModule.get(), [&](Module * pm, const string &name, Module * inWhichModule) {
+        if ( !perspective ) perspective = thisModule.get();
+        library.findWithCallback(name, perspective, [&](Module * pm, const string &name, Module * inWhichModule) {
             library.findStructure(structs, pm, name, inWhichModule);
             library.findAnnotation(handles, pm, name, inWhichModule);
             library.findEnum(enums, pm, name, inWhichModule);
@@ -250,7 +251,7 @@ namespace das {
             if ( handles.size()==1 ) {
                 if ( handles.back()->rtti_isDistinctTypeAnnotation() ) {
                     auto dann = static_cast<DistinctTypeAnnotation *>(handles.back());
-                    if ( dann->isPrivate && dann->module && dann->module!=thisModule.get() ) {
+                    if ( dann->isPrivate && dann->module && dann->module!=perspective ) {
                         error("can't access private distinct type "+name,"","",
                             at,CompilationError::invalid_distinct_type);
                         return nullptr;

@@ -1101,13 +1101,35 @@ expression_while_loop
     }
     ;
 
-expression_with
+/* factored so both alternatives share ONE empty action nonterminal — a copy of the
+   mid-rule action per alternative would be a reduce/reduce conflict ahead of DAS_WITH */
+with_keyword_on
     :   {
         yyextra->das_keyword = true;
-    } DAS_WITH[loc] '(' expr[with] ')' optional_emit_semis expression_block[block] {
+    }
+    ;
+
+expression_with
+    :   with_keyword_on DAS_WITH[loc] '(' expr[with] ')' optional_emit_semis expression_block[block] {
         yyextra->das_keyword = false;
         auto pWith = new ExprWith(tokAt(scanner,@loc));
         pWith->with = $with;
+        pWith->body = $block;
+        $$ = pWith;
+    }
+    |   with_keyword_on DAS_WITH[loc] '(' DAS_MODULE require_module_name[name] ')' optional_emit_semis expression_block[block] {
+        yyextra->das_keyword = false;
+        auto pWith = new ExprWith(tokAt(scanner,@loc));
+        { // single-name targets honor `require foo as bar` aliases
+            auto ita = yyextra->das_module_alias.find(*$name);
+            if ( ita != yyextra->das_module_alias.end() ) *$name = ita->second;
+        }
+        pWith->moduleName = *$name;
+        delete $name;
+        if ( yyextra->g_Access ) { // .das_project may demand unsafe for this target module
+            auto fi = pWith->at.fileInfo;
+            pWith->moduleUnsafeByProject = yyextra->g_Access->isWithModuleUnsafe(pWith->moduleName, fi ? fi->name : "");
+        }
         pWith->body = $block;
         $$ = pWith;
     }

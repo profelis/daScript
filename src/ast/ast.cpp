@@ -2433,7 +2433,7 @@ namespace das {
 
     ExpressionPtr ExprWith::visit(Visitor & vis) {
         vis.preVisit(this);
-        with = with->visit(vis);
+        if ( with ) with = with->visit(vis);    // null for the module flavor
         vis.preVisitWithBody(this, body);
         body = body->visit(vis);
         return vis.visit(this);
@@ -2442,8 +2442,10 @@ namespace das {
     ExpressionPtr ExprWith::clone( ExpressionPtr expr ) const {
         auto cexpr = clonePtr<ExprWith>(expr);
         Expression::clone(cexpr);
-        cexpr->with = with->clone();
+        if ( with ) cexpr->with = with->clone();
         cexpr->body = body->clone();
+        cexpr->moduleName = moduleName;
+        cexpr->moduleUnsafeByProject = moduleUnsafeByProject;
         return cexpr;
     }
 

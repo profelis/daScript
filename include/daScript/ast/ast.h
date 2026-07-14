@@ -1574,6 +1574,7 @@ namespace das
         /*option*/ bool relaxed_assign = true;                     // allow = to <- substitution, in certain expressions
         bool no_unsafe = false;
         bool local_ref_is_unsafe = true;                // var a & = ... unsafe. should be
+        /*option*/ bool with_module_is_unsafe = false;             // user-written with (module foo) requires unsafe (inliner-generated ones are exempt)
         /*option*/ bool no_global_variables = false;
         /*option*/ bool no_global_variables_at_all = false;
         /*option*/ bool no_global_heap = false;
@@ -1760,7 +1761,7 @@ namespace das
         static ExpressionPtr makeConst ( const LineInfo & at, const TypeDeclPtr & type, vec4f value );
         ExprLooksLikeCall * makeCall ( const LineInfo & at, const string & name );
         ExprLooksLikeCall * makeCall ( const LineInfo & at, const LineInfo & atEnd, const string & name );
-        TypeDecl * makeTypeDeclaration ( const LineInfo & at, const string & name );
+        TypeDecl * makeTypeDeclaration ( const LineInfo & at, const string & name, Module * perspective = nullptr );    // perspective defaults to thisModule
         StructurePtr visitStructure(Visitor & vis, Structure *);
         EnumerationPtr visitEnumeration(Visitor & vis, Enumeration *);
         void visitModule(Visitor & vis, Module * thatModule, bool visitGenerics = false, bool sortStructures = false);

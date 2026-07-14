@@ -296,6 +296,7 @@ namespace das
     ,   invalid_yield_in_block                                      =   30295    // 1 site(s)
     ,   invalid_empty_name                                          =   30296    // AST node with empty name; usually a macro emission bug
     ,   invalid_distinct_type                                       =   30297    // distinct underlying must be a workhorse type, not another distinct
+    ,   invalid_with_module                                         =   30298    // with (module foo) names a module that is not part of the program
 
 // missing_*
 
@@ -528,6 +529,7 @@ namespace das
     ,   unsafe_table_safe_index                                     =   31034    // 2 site(s)
     ,   unsafe_variant_field                                        =   31035    // 2 site(s)
     ,   unsafe_variant_safe_as                                      =   31036    // 1 site(s)
+    ,   unsafe_with_module                                          =   31037    // user-written with (module foo) under the with_module_is_unsafe policy
 
 // recursion_*
 

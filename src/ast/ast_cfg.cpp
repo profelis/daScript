@@ -115,7 +115,7 @@ namespace das {
                     return loop(cur, nullptr, fr->body, fr);  // the iteration check is implicit; model like while
                 } else if ( e->rtti_isWith() ) {
                     auto wi = (ExprWith *) e;
-                    cur->stmts.push_back(wi->with);       // the subject, then the body runs unconditionally
+                    if ( wi->with ) cur->stmts.push_back(wi->with);   // the subject, then the body runs unconditionally (null for module flavor)
                     return stmt(cur, wi->body);
                 } else if ( e->rtti_isReturn() ) {
                     cur->stmts.push_back(e);

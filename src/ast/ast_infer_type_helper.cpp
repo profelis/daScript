@@ -310,7 +310,8 @@ namespace das {
                 return false; });
         if (rT)
             return rT;
-        TypeDeclPtr mtd = program->makeTypeDeclaration(LineInfo(), name);
+        TypeDeclPtr mtd = program->makeTypeDeclaration(LineInfo(), name,
+            moduleScope.empty() ? nullptr : moduleScope.back());
         return (!mtd || mtd->isAlias()) ? nullptr : mtd;
     }
     TypeDeclPtr InferTypes::findAlias(const string &name, bool *constUnderDim) const {
@@ -350,7 +351,8 @@ namespace das {
                 return false; });
         if (rT)
             return rT;
-        TypeDeclPtr mtd = program->makeTypeDeclaration(LineInfo(), name);
+        TypeDeclPtr mtd = program->makeTypeDeclaration(LineInfo(), name,
+            moduleScope.empty() ? nullptr : moduleScope.back());
         return (!mtd || mtd->isAlias()) ? nullptr : mtd;
     }
 
@@ -631,6 +633,7 @@ namespace das {
     ExprWith *InferTypes::hasMatchingWith(const string &fieldName) const {
         for (auto it = with.rbegin(), its = with.rend(); it != its; ++it) {
             auto eW = *it;
+            if (!eW->with) continue;    // module flavor opens no field scope
             if (auto eWT = eW->with->type) {
                 StructurePtr pSt = nullptr;
                 if (eWT->isStructure()) {
@@ -658,6 +661,7 @@ namespace das {
     ExpressionPtr InferTypes::promoteToProperty(ExprVar *expr, ExpressionPtr right) {
         for (auto it = with.rbegin(), its = with.rend(); it != its; ++it) {
             auto eW = *it;
+            if (!eW->with) continue;    // module flavor opens no field scope
             if (auto eWT = eW->with->type) {
                 StructurePtr pSt = nullptr;
                 if (eWT->isStructure()) {

@@ -111,6 +111,7 @@ namespace das {
         relaxedAssign = prog->options.getBoolOption("relaxed_assign", prog->policies.relaxed_assign);
         relaxedPointerConst = prog->options.getBoolOption("relaxed_pointer_const", prog->policies.relaxed_pointer_const);
         unsafeTableLookup = prog->options.getBoolOption("unsafe_table_lookup", prog->policies.unsafe_table_lookup);
+        withModuleIsUnsafe = prog->options.getBoolOption("with_module_is_unsafe", prog->policies.with_module_is_unsafe);
         forceInscopePod = prog->options.getBoolOption("force_inscope_pod", prog->policies.force_inscope_pod);
         logInscopePod = prog->options.getBoolOption("log_inscope_pod", prog->policies.log_inscope_pod);
         thisModule = prog->thisModule.get();
@@ -4893,8 +4894,31 @@ namespace das {
     void InferTypes::preVisitWithBody ( ExprWith * expr, Expression * body) {
         Visitor::preVisitWithBody(expr, body);
         with.push_back(expr);
+        if (expr->isModuleWith()) {
+            auto mod = program->library.findModule(expr->moduleName);
+            if (!mod) {
+                auto slash = expr->moduleName.find_last_of('/');
+                if (slash != string::npos) { // path form - the module is named by the last component
+                    mod = program->library.findModule(expr->moduleName.substr(slash + 1));
+                }
+            }
+            if (!mod) {
+                error("with module '" + expr->moduleName + "' is not found", "", "",
+                      expr->at, CompilationError::invalid_with_module);
+            }
+            moduleScope.push_back(mod);     // nullptr = poisoned scope, behaves as if absent
+        }
     }
     ExpressionPtr InferTypes::visit(ExprWith *expr) {
+        if (expr->isModuleWith()) {
+            moduleScope.pop_back();
+            if ((withModuleIsUnsafe || expr->moduleUnsafeByProject) && !expr->generated && !safeExpression(expr)) {
+                error("with (module " + expr->moduleName + ") requires unsafe", "", "",
+                      expr->at, CompilationError::unsafe_with_module);
+            }
+            with.pop_back();
+            return Visitor::visit(expr);
+        }
         if (auto wT = expr->with->type) {
             StructurePtr pSt = nullptr;
             if (wT->baseType == Type::tFixedArray) {

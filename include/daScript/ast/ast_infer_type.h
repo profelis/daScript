@@ -38,6 +38,7 @@ namespace das {
         vector<ExprBlock *> blocks;
         vector<ExprBlock *> scopes;
         vector<ExprWith *> with;
+        vector<Module *> moduleScope;   // `with (module foo)` resolution override; top wins, nullptr = unresolved (poisoned)
         struct AssumeEntry {
             ExprAssume *   expr;
             das_hash_set<string>    vars;   // ExprVar names referenced in subexpr
@@ -81,6 +82,7 @@ namespace das {
         bool relaxedAssign = false;
         bool relaxedPointerConst = false;
         bool unsafeTableLookup = false;
+        bool withModuleIsUnsafe = false;
         bool debugInferFlag = false;
         bool forceInscopePod = false;
         bool logInscopePod = false;
@@ -155,6 +157,7 @@ namespace das {
         //      inWhichModule = this
         //      objModule = _b
         bool isVisibleFunc(Module *inWhichModule, Module *objModule) const;
+        bool isVisibleInstanceFunc(Module *inWhichModule, Function *pFn) const;
 
         MatchingFunctions findFuncAddr(const string &name) const;
 

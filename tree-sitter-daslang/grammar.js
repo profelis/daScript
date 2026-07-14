@@ -708,7 +708,10 @@ module.exports = grammar({
     with_statement: $ => seq(
       'with',
       '(',
-      field('object', $._expression),
+      choice(
+        field('object', $._expression),
+        seq('module', field('module', $.require_module_name)),
+      ),
       ')',
       field('body', $.block),
     ),

@@ -116,6 +116,7 @@ namespace das {
         string incModName;
         const char * src_end = src + length;
         bool wb = true;
+        char lastSig = 0;   // last significant (non-space) character — '(' means a following `module` is `with (module ...)`, not a declaration
         int32_t line = 1;
         while ( src < src_end ) {
             if ( src[0]=='\n' ) {
@@ -273,6 +274,9 @@ namespace das {
                             goto nextChar;
                         }
                     } else if ( isMod ) {
+                        if ( lastSig=='(' ) { // `with (module foo)` resolution scope — not a module declaration
+                            goto nextChar;
+                        }
                         src += 6;
                         if ( isspace(src[0]) ) {
                             while ( src < src_end && isspace(src[0]) ) {
@@ -309,6 +313,7 @@ namespace das {
             }
         nextChar:
             wb = src[0]!='_' && (wb ? !isalnumE(src[0]) : !isalphaE(src[0]));
+            if ( !isspace(static_cast<unsigned char>(src[0])) ) lastSig = src[0];
             src ++;
         }
     }

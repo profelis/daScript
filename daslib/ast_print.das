@@ -511,6 +511,9 @@ class PrintVisitor : AstVisitor {
     def override preVisitExprWith(expr : ExprWith?) {
         //! Prints the 'with' keyword of a with-expression.
         write(*writer, "with ");
+        if (!empty(expr.moduleName)) {
+            write(*writer, "(module {expr.moduleName})");
+        }
     }
     def override preVisitExprWithBody(expr : ExprWith?; right : ExpressionPtr) {
         //! Prints the separator before the with-expression body.

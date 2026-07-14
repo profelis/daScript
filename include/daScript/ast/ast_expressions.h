@@ -1009,7 +1009,10 @@ namespace das
         virtual bool rtti_isWith() const override { return true; }
         virtual void dispatch( Visitor & vis ) override;
         virtual void gc_collect ( gc_root * target, gc_root * from ) override;
+        bool isModuleWith() const { return !moduleName.empty(); }
         ExpressionPtr   with = nullptr, body = nullptr;
+        string          moduleName;     // module-flavored `with (module foo/bar)`; with==nullptr for this flavor
+        bool            moduleUnsafeByProject = false;  // .das_project with_module_unsafe() demanded unsafe for this target (stamped at parse)
     };
 
     struct DAS_API ExprAssume : Expression {

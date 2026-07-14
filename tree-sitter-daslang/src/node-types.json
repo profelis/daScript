@@ -4511,9 +4511,19 @@
           }
         ]
       },
+      "module": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "require_module_name",
+            "named": true
+          }
+        ]
+      },
       "object": {
         "multiple": false,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "_expression",

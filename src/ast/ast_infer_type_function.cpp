@@ -14,6 +14,12 @@ namespace das {
         } else if (moduleName == "__") {
             moduleName = thisModule->name;
             return thisModule;
+        } else if (!moduleScope.empty() && moduleScope.back()) {
+            // inside `with (module foo)` - resolve as if written in foo (innermost scope wins outright)
+            if (moduleName.empty()) { // ::foo means definition-context module, here that's the with-module
+                moduleName = moduleScope.back()->name;
+            }
+            return moduleScope.back();
         } else if (func) {
             if (func->fromGeneric) {
                 auto origin = func->getOrigin();
@@ -68,6 +74,20 @@ namespace das {
         }
         return false;
     }
+    bool InferTypes::isVisibleInstanceFunc(Module *inWhichModule, Function *pFn) const {
+        if (isVisibleFunc(inWhichModule, pFn->getOrigin()->module))
+            return true;
+        // a generic INSTANCE resolving inside `with (module foo)`: foo's require graph
+        // is the resolution context, reaching origins the program module may not see.
+        // locked names ("__::...") route perspective to the program module, and without
+        // this arm the locked-name fallback and the generic re-lock ping-pong forever
+        // (30507). instances only - user-spelled escapes over plain functions keep
+        // their overload sets exactly as before
+        if (!moduleScope.empty() && moduleScope.back()
+            && moduleScope.back()->isVisibleDirectly(pFn->getOrigin()->module))
+            return true;
+        return false;
+    }
     MatchingFunctions InferTypes::findFuncAddr(const string &name) const {
         string moduleName, funcName;
         splitTypeName(name, moduleName, funcName);
@@ -83,7 +103,7 @@ namespace das {
                     for ( auto & pFn : goodFunctions ) {
                         // if ( pFn->isTemplate ) continue;
                         const bool funcVis = !pFn->fromGeneric ? modVis
-                                          : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                          : isVisibleInstanceFunc(inWhichModule, pFn);
                         if ( funcVis ) {
                             if ( canCallPrivate(pFn,inWhichModule,thisModule) ) {
                                 result.push_back(pFn);
@@ -455,7 +475,7 @@ namespace das {
                             if ( pFn->isTemplate ) continue;
                             const bool funcVis = !visCheck ? true
                                               : !pFn->fromGeneric ? modVis
-                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                              : isVisibleInstanceFunc(inWhichModule, pFn);
                             if ( funcVis ) {
                                 if ( !pFn->fromGeneric || modVisFromThis ) {
                                     if ( !visCheck || canCallPrivate(pFn,inWhichModule,thisModule) ) {
@@ -479,7 +499,7 @@ namespace das {
                             if ( pFn->isTemplate ) continue;
                             const bool funcVis = !visCheck ? true
                                               : !pFn->fromGeneric ? modVis
-                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                              : isVisibleInstanceFunc(inWhichModule, pFn);
                             if ( funcVis ) {
                                 if ( !visCheck || canCallPrivate(pFn,inWhichModule,thisModule) ) {
                                     int blockParam = -1, padCount = 0;
@@ -701,7 +721,7 @@ namespace das {
                             if ( pFn->isTemplate ) continue;
                             const bool funcVis = !visCheck ? true
                                               : !pFn->fromGeneric ? modVis
-                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                              : isVisibleInstanceFunc(inWhichModule, pFn);
                             if ( funcVis && ( !pFn->fromGeneric || modVisFromThis ) ) {
                                 if ( !visCheck || canCallPrivate(pFn,inWhichModule,thisModule) ) {
                                     int blockParam = -1, padCount = 0;
@@ -722,7 +742,7 @@ namespace das {
                             if ( pFn->isTemplate ) continue;
                             const bool funcVis = !visCheck ? true
                                               : !pFn->fromGeneric ? modVis
-                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                              : isVisibleInstanceFunc(inWhichModule, pFn);
                             if ( funcVis && ( !visCheck || canCallPrivate(pFn,inWhichModule,thisModule) ) ) {
                                 int blockParam = -1, padCount = 0;
                                 if ( findPipedNamedLanding(pFn, nonNamedTypes, arguments, true, blockParam, padCount) ) {
@@ -883,7 +903,7 @@ namespace das {
                     for ( auto & pFn : goodFunctions ) {
                         if ( pFn->isTemplate ) continue;
                         const bool funcVis = !pFn->fromGeneric ? modVis
-                                          : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                          : isVisibleInstanceFunc(inWhichModule, pFn);
                         if ( funcVis ) {
                             if ( !pFn->fromGeneric || modVisFromThis ) {
                                 if ( canCallPrivate(pFn,inWhichModule,thisModule) ) {
@@ -927,7 +947,7 @@ namespace das {
                         if ( pFn->isTemplate ) continue;
                         const bool funcVis = !visCheck ? true
                                           : !pFn->fromGeneric ? modVis
-                                          : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                          : isVisibleInstanceFunc(inWhichModule, pFn);
                         if ( funcVis ) {
                             if ( !pFn->fromGeneric || modVisFromThis ) {
                                 if ( canCallPrivate(pFn,inWhichModule,thisModule) ) {
@@ -1004,7 +1024,7 @@ namespace das {
                         for ( auto & pFn : goodFunctions ) {
                             if ( pFn->isTemplate ) continue;
                             const bool funcVis = !pFn->fromGeneric ? modVis
-                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                              : isVisibleInstanceFunc(inWhichModule, pFn);
                             if ( funcVis ) {
                                 if ( !pFn->fromGeneric || modVisFromThis ) {
                                     if ( canCallPrivate(pFn,inWhichModule,thisModule) ) {
@@ -1026,7 +1046,7 @@ namespace das {
                             if ( pFn->jitOnly && !jitEnabled() ) continue;
                             if ( pFn->isTemplate ) continue;
                             const bool funcVis = !pFn->fromGeneric ? modVis
-                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                              : isVisibleInstanceFunc(inWhichModule, pFn);
                             if ( funcVis ) {
                                 if ( canCallPrivate(pFn,inWhichModule,thisModule) ) {
                                     if ( isFunctionCompatible(pFn, types, arguments, true, true) ) {   // infer block here?
@@ -1058,7 +1078,7 @@ namespace das {
                             if ( pFn->isTemplate ) continue;
                             const bool funcVis = !visCheck ? true
                                               : !pFn->fromGeneric ? modVis
-                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                              : isVisibleInstanceFunc(inWhichModule, pFn);
                             if ( funcVis ) {
                                 if ( !pFn->fromGeneric || modVisFromThis ) {
                                     if ( !visCheck || canCallPrivate(pFn,inWhichModule,thisModule) ) {
@@ -1090,7 +1110,7 @@ namespace das {
                             if ( pFn->isTemplate ) continue;
                             const bool funcVis = !visCheck ? true
                                               : !pFn->fromGeneric ? modVis
-                                              : isVisibleFunc(inWhichModule, pFn->getOrigin()->module);
+                                              : isVisibleInstanceFunc(inWhichModule, pFn);
                             if ( funcVis ) {
                                 if ( !visCheck || canCallPrivate(pFn,inWhichModule,thisModule) ) {
                                     auto itLook = pFn->lookup.find_and_reserve(argHash);    // if found in lookup
