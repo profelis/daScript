@@ -706,13 +706,15 @@ namespace das {
         virtual void preVisit ( ExprWith * wh ) override {
             Visitor::preVisit(wh);
             ss << "with ";
-            if ( gen2 ) ss << "( ";
+            // module flavor is gen2-only surface, but generated nodes can land in a
+            // gen1 program (the inliner's scope wraps) - always parenthesize it
+            if ( gen2 || wh->isModuleWith() ) ss << "( ";
             if ( wh->isModuleWith() ) ss << "module " << wh->moduleName;
         }
         virtual void preVisitWithBody ( ExprWith * wh, Expression * body ) override {
             Visitor::preVisitWithBody(wh,body);
-            if ( gen2 ) ss << " )";
-            if ( !gen2 ) ss << "\n";
+            if ( gen2 || wh->isModuleWith() ) ss << " )";
+            if ( !gen2 && !wh->isModuleWith() ) ss << "\n";
         }
     // with alias
         virtual bool canVisitWithAliasSubexpression ( ExprAssume * ) override {
