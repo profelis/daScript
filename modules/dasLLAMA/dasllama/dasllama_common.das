@@ -496,6 +496,13 @@ struct ChatTemplate {
     audio_pre : ChatTurn = ChatTurn()
     audio_post : ChatTurn = ChatTurn()
     stop : array<string>
+    // tool-calling format (empty tool_call_open = the family declares none; see hermes_tools)
+    tool_sys_prelude : string = ""    // opens the tool-definitions block in the system turn
+    tool_sys_epilogue : string = ""   // closes the block + the call-format instructions
+    tool_call_open : string = ""      // marker opening one call in assistant output
+    tool_call_close : string = ""
+    tool_resp_open : string = ""      // wraps one tool result in the reply turn
+    tool_resp_close : string = ""
 }
 
 //! What a decoder honestly supports at the chat layer — declared by each arch registration,
@@ -9671,6 +9678,18 @@ def chat_special(s : string) : ChatPart {
 }
 def chat_content() : ChatPart {
     return ChatPart(kind = ChatPartKind.content, s = "")
+}
+
+//! Install the Hermes-style tool-calling format (the Qwen2.5/Qwen3 chat template's tool block):
+//! ``<tools>`` JSON definitions in the system turn, ``<tool_call>`` JSON calls in assistant
+//! output, ``<tool_response>`` results riding user turns.
+def hermes_tools(var ct : ChatTemplate) {
+    ct.tool_sys_prelude = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>"
+    ct.tool_sys_epilogue = "</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n\{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>"
+    ct.tool_call_open = "<tool_call>"
+    ct.tool_call_close = "</tool_call>"
+    ct.tool_resp_open = "<tool_response>"
+    ct.tool_resp_close = "</tool_response>"
 }
 
 //! The default llama-family blocks (std attention, dense gated FFN), shared by every dense arch.

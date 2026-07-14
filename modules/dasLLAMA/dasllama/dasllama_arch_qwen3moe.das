@@ -25,6 +25,7 @@ def register_arch_qwen3moe() {
     d.chat.user.parts <- [chat_special("<|im_start|>"), chat_text("user\n"), chat_content(), chat_special("<|im_end|>"), chat_text("\n")]
     d.chat.assistant_open.parts <- [chat_special("<|im_start|>"), chat_text("assistant\n")]
     d.chat.stop <- ["<|im_end|>", "<|endoftext|>"]
+    hermes_tools(d.chat)
     // Qwen3-Omni-30B's thinker converts as `qwen3vlmoe` — qwen3moe + M-RoPE + deepstack. For
     // text + audio input every M-RoPE coordinate equals the linear position (so any section
     // layout degenerates to standard rope), and the deepstack merge is inactive without vision

@@ -613,6 +613,69 @@ def write_json(val : JsonValue?) : string {
     return st
 }
 
+def private write_value_compact(var writer : StringBuilderWriter; jsv : JsonValue?) {
+    if (jsv == null) {
+        write(writer, "null")
+    } elif (jsv.value is _string) {
+        write(writer, "\"")
+        write_escape_string(writer, jsv.value as _string)
+        write(writer, "\"")
+    } elif (jsv.value is _number) {
+        if (no_trailing_zeros) {
+            write(writer, fmt(":.17f", jsv.value as _number) |> rtrim("0") |> rtrim("."))
+        } else {
+            write(writer, jsv.value as _number)
+        }
+    } elif (jsv.value is _longint) {
+        write(writer, jsv.value as _longint)
+    } elif (jsv.value is _array) {
+        write(writer, "[")
+        var first = true
+        for (elem in jsv.value as _array) {
+            if (first) {
+                first = false
+            } else {
+                write(writer, ", ")
+            }
+            write_value_compact(writer, elem)
+        }
+        write(writer, "]")
+    } elif (jsv.value is _object) {
+        write(writer, "\{")
+        var first = true
+        for (elemK, elemV in keys(jsv.value as _object), values(jsv.value as _object)) {
+            if (no_empty_arrays && elemV.value is _array && empty(elemV.value as _array)) {
+                continue
+            }
+            if (first) {
+                first = false
+            } else {
+                write(writer, ", ")
+            }
+            write(writer, "\"")
+            write_escape_string(writer, elemK)
+            write(writer, "\": ")
+            write_value_compact(writer, elemV)
+        }
+        write(writer, "\}")
+    } elif (jsv.value is _bool) {
+        write(writer, (jsv.value as _bool) ? "true" : "false")
+    } elif (jsv.value is _null) {
+        write(writer, "null")
+    } else {
+        panic("unexpected {jsv}")
+    }
+}
+
+def write_json_compact(val : JsonValue?) : string {
+    //! ``write_json`` on one line: no newlines or indentation, ``", "`` / ``": "`` separators —
+    //! the python ``json.dumps`` / jinja ``tojson`` shape chat templates and wire protocols carry.
+    let st = build_string() $(var writer) {
+        write_value_compact(writer, val)
+    }
+    return st
+}
+
 def write_json(val : JsonValue?#) : string {
     //! Overload accepting temporary type
     unsafe {// Fine, as json doesn't escape the function

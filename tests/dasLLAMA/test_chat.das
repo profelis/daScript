@@ -238,6 +238,115 @@ def test_chat_end_to_end(t : T?) {
     }
 }
 
+// ===== Hermes tool-calling render (Qwen family) =====
+
+// The reference is the Qwen2.5/Qwen3 chat template + HF added-token tokenization: tool JSONs one
+// per line inside <tools>, and EVERY <tool_call>/</tool_call> spelling — the prose mentions in the
+// format instructions included — encodes as its single vocab id. <tools> and (on Qwen2.5, which
+// lacks the token) <tool_response> stay in the text runs.
+
+[test]
+def test_chat_tools_hermes(t : T?) {
+    t |> run("Qwen ChatML renders the Hermes tool block token-for-token (needs Qwen2.5-0.5B)") @(t : T?) {
+        let path = path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> skip("{path} not present")
+            return
+        }
+        var m <- load_capped(path)
+        var raw <- load_bpe_tokenizer_gguf(path)
+        let ims = special_id(raw, "<|im_start|>")
+        let ime = special_id(raw, "<|im_end|>")
+        let tco = special_id(m, "<tool_call>")
+        let tcc = special_id(m, "</tool_call>")
+        t |> success(tco >= 0l && tcc >= 0l, "the vocab carries the tool-call markers")
+        t |> equal(special_id(m, "<tool_response>"), -1l)   // NOT a Qwen2.5 token — stays text below
+
+        let tooldef = "\{\"type\": \"function\", \"function\": \{\"name\": \"get_weather\", \"parameters\": \{}}}"
+        var c = create_chat_renderer(m, SYS, 8l)
+        var tools : array<string>
+        tools |> push(tooldef)
+        set_tools(c, tools)
+        add_user(c, USR)
+        let got <- render_turn(m, c)
+
+        var want : array<int64>
+        want |> push(ims)
+        want |> push_from(bpe_encode(raw, "system\n{SYS}\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{tooldef}\n</tools>\n\nFor each function call, return a json object with function name and arguments within "))
+        want |> push(tco)
+        want |> push(tcc)
+        want |> push_from(bpe_encode(raw, " XML tags:\n"))
+        want |> push(tco)
+        want |> push_from(bpe_encode(raw, "\n\{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"))
+        want |> push(tcc)
+        want |> push(ime)
+        want |> push_from(bpe_encode(raw, "\n"))
+        want |> push(ims)
+        want |> push_from(bpe_encode(raw, "user\n{USR}"))
+        want |> push(ime)
+        want |> push_from(bpe_encode(raw, "\n"))
+        want |> push(ims)
+        want |> push_from(bpe_encode(raw, "assistant\n"))
+        t |> success(same(got, want), "system tool block token-for-token")
+        delete c
+        delete raw
+        delete m
+    }
+    t |> run("tool-call replay + tool-results turn render token-for-token (needs Qwen2.5-0.5B)") @(t : T?) {
+        let path = path_join(models_dir(), "Qwen2.5-0.5B-Instruct-Q8_0.gguf")
+        if (!stat(path).is_valid) {
+            t |> skip("{path} not present")
+            return
+        }
+        var m <- load_capped(path)
+        var raw <- load_bpe_tokenizer_gguf(path)
+        let ims = special_id(raw, "<|im_start|>")
+        let ime = special_id(raw, "<|im_end|>")
+        let tco = special_id(m, "<tool_call>")
+        let tcc = special_id(m, "</tool_call>")
+
+        // no system, no tools: the replay shape alone. The assistant called get_weather...
+        var c = create_chat_renderer(m, "", 8l)
+        add_user(c, USR)
+        var toks : array<int64>
+        let call = "\{\"name\": \"get_weather\", \"arguments\": \{\"city\": \"Paris\"}}"
+        var calls : array<string>
+        calls |> push(call)
+        render_assistant_calls(m, c, "", calls, toks)
+        var want : array<int64>
+        want |> push(ims)
+        want |> push_from(bpe_encode(raw, "user\n{USR}"))
+        want |> push(ime)
+        want |> push_from(bpe_encode(raw, "\n"))
+        want |> push(ims)
+        want |> push_from(bpe_encode(raw, "assistant\n"))
+        want |> push(tco)
+        want |> push_from(bpe_encode(raw, "\n{call}\n"))
+        want |> push(tcc)
+        want |> push(ime)
+        want |> push_from(bpe_encode(raw, "\n"))
+        t |> success(same(toks, want), "assistant tool-call turn token-for-token")
+
+        // ...and its result arrives: a user-framed turn, <tool_response> as plain text
+        var results : array<string>
+        results |> push("\{\"temp_c\": 21}")
+        add_tool_results(c, results)
+        let got2 <- render_turn(m, c)
+        var want2 : array<int64>
+        want2 |> push(ims)
+        want2 |> push_from(bpe_encode(raw, "user\n<tool_response>\n\{\"temp_c\": 21}\n</tool_response>"))
+        want2 |> push(ime)
+        want2 |> push_from(bpe_encode(raw, "\n"))
+        want2 |> push(ims)
+        want2 |> push_from(bpe_encode(raw, "assistant\n"))
+        t |> success(same(got2, want2), "tool-results turn token-for-token")
+        t |> success(c.history[2].role == Role.tool, "tool result recorded in the transcript")
+        delete c
+        delete raw
+        delete m
+    }
+}
+
 // ===== Template detection (model-free) =====
 
 // Distinctive first special of a template's user turn — "" when the user turn opens with plain

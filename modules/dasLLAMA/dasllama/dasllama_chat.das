@@ -36,8 +36,10 @@ struct ChatSession {
     close_parts : array<ChatPart>   // how a turn terminates (the user template after its content slot)
     stop_ids : array<int64>         // resolved stop-token ids
     system : string = ""
+    tools_json : array<string>      // verbatim tool JSONs; non-empty => the system turn carries the family's tool block
     pending : string = ""           // the user text awaiting the next respond()
     has_pending : bool = false
+    pending_is_tool : bool = false  // pending is a tool-results block: marker-split at render
     first : bool = true             // first turn emits add_bos + the system turn
     max_new : int64 = 256l          // per-reply token budget
     history : array<Message>
@@ -164,20 +166,107 @@ def private render_parts(m : Model; parts : array<ChatPart>; content : string; v
     }
 }
 
+// Split `s` into template parts at every occurrence of a tool marker that resolves in the vocab —
+// HF added-token splitting: vocab markers tokenize as their single ids, the prose around them as
+// text (probe-verified: encode() does NOT match added tokens inline, so a marker left in a text
+// run tokenizes as plain BPE — not what the model saw in training). Markers absent from the
+// vocab stay in the text run, exactly what the family's own tokenizer does (Qwen2.5 has
+// <tool_call> but not <tool_response>; Qwen3 has both).
+def private split_on_tool_markers(m : Model; c : ChatSession; s : string; var parts : array<ChatPart>) {
+    let markers = fixed_array(c.tmpl.tool_call_open, c.tmpl.tool_call_close,
+                              c.tmpl.tool_resp_open, c.tmpl.tool_resp_close)
+    var pos = 0
+    let n = length(s)
+    while (pos < n) {
+        var best = -1
+        var best_mark = ""
+        for (mk in markers) {
+            if (!empty(mk) && special_id(m, mk) >= 0l) {
+                let f = find(s, mk, pos)
+                if (f >= 0 && (best < 0 || f < best)) {
+                    best = f
+                    best_mark = mk
+                }
+            }
+        }
+        if (best < 0) {
+            break
+        }
+        if (best > pos) {
+            parts |> push(chat_text(slice(s, pos, best)))
+        }
+        parts |> push(chat_special(best_mark))
+        pos = best + length(best_mark)
+    }
+    if (pos < n) {
+        parts |> push(chat_text(slice(s, pos, n)))
+    }
+}
+
+// Render a turn with its content slot replaced by pre-split parts.
+def private render_parts_spliced(m : Model; turn_parts : array<ChatPart>; spliced : array<ChatPart>; var out : array<int64>) {
+    var parts : array<ChatPart>
+    parts |> reserve(length(turn_parts) + length(spliced))
+    for (p in turn_parts) {
+        if (p.kind == ChatPartKind.content) {
+            parts |> push_from(spliced)
+        } else {
+            parts |> push(p)
+        }
+    }
+    render_parts(m, parts, "", out)
+    delete parts
+}
+
+// The system-turn content on the first turn: the user system prompt, and — when tools are
+// declared and the family has a tool format — the tool block wrapping the verbatim tool JSONs
+// (one per line, the Qwen/Hermes shape).
+def private system_content(c : ChatSession) : string {
+    if (empty(c.tools_json) || empty(c.tmpl.tool_call_open)) {
+        return c.system
+    }
+    var parts : array<string>
+    parts |> push(empty(c.system) ? c.tmpl.tool_sys_prelude : "{c.system}\n\n{c.tmpl.tool_sys_prelude}")
+    parts |> push_from(c.tools_json)
+    parts |> push(c.tmpl.tool_sys_epilogue)
+    let s = join(parts, "\n")
+    delete parts
+    return s
+}
+
 // Render this turn's prefill: (first turn) BOS + system, then the user turn and the generation prompt.
 def private render_prompt(m : Model; c : ChatSession; var out : array<int64>) {
     if (c.first && c.tmpl.add_bos) {
         out |> push(bos_id(m))
     }
     var user_content = c.pending
-    if (c.first && !empty(c.system)) {
-        if (!empty(c.tmpl.system.parts)) {
-            render_parts(m, c.tmpl.system.parts, c.system, out)
-        } else {
-            user_content = "{c.system}\n\n{c.pending}"   // no system role (Gemma): fold into the first user turn
+    if (c.first) {
+        let sys = system_content(c)
+        if (!empty(sys)) {
+            if (!empty(c.tmpl.system.parts)) {
+                if (empty(c.tools_json)) {
+                    render_parts(m, c.tmpl.system.parts, sys, out)
+                } else {
+                    // the tool block quotes the call markers (format instructions) — marker-split
+                    var sp : array<ChatPart>
+                    split_on_tool_markers(m, c, sys, sp)
+                    render_parts_spliced(m, c.tmpl.system.parts, sp, out)
+                    delete sp
+                }
+            } else {
+                user_content = "{sys}\n\n{c.pending}"   // no system role (Gemma): fold into the first user turn
+            }
         }
     }
-    render_parts(m, c.tmpl.user.parts, user_content, out)
+    if (c.pending_is_tool) {
+        // tool results ride the user turn frames; their response markers split like the system block's
+        var tp : array<ChatPart>
+        split_on_tool_markers(m, c, user_content, tp)
+        render_parts_spliced(m, c.tmpl.user.parts, tp, out)
+        delete tp
+    } else {
+        render_parts(m, c.tmpl.user.parts, user_content, out)
+    }
     render_parts(m, c.tmpl.assistant_open.parts, "", out)
 }
 
@@ -191,11 +280,14 @@ def private render_prompt_audio(m : Model; c : ChatSession; var head : array<int
         head |> push(bos_id(m))
     }
     var user_content = c.pending
-    if (c.first && !empty(c.system)) {
-        if (!empty(c.tmpl.system.parts)) {
-            render_parts(m, c.tmpl.system.parts, c.system, head)
-        } else {
-            user_content = "{c.system}\n\n{c.pending}"
+    if (c.first) {
+        let sys = system_content(c)
+        if (!empty(sys)) {
+            if (!empty(c.tmpl.system.parts)) {
+                render_parts(m, c.tmpl.system.parts, sys, head)
+            } else {
+                user_content = "{sys}\n\n{c.pending}"
+            }
         }
     }
     var before : array<ChatPart>
@@ -227,6 +319,7 @@ def private consume_pending_(var c : ChatSession) {
     c.first = false
     c.has_pending = false
     c.pending = ""
+    c.pending_is_tool = false
 }
 
 //! `create_chat_`'s RENDER-ONLY twin: resolves the chat template, stop ids, and turn close exactly
@@ -339,7 +432,61 @@ def render_assistant_(m : Model; var c : ChatSession; text : string; var out : a
 def add_user_(var c : ChatSession; text : string) {
     c.pending = text
     c.has_pending = true
+    c.pending_is_tool = false
     c.history |> push(Message(role = Role.user, content = text))
+}
+
+//! Declare the conversation's tools (verbatim JSON objects, one per tool — the OpenAI ``tools[]``
+//! entries, moved in). The first rendered turn then carries the family's tool block in its system
+//! turn. Families with no tool format (``tmpl.tool_call_open`` empty) ignore them.
+def set_tools_(var c : ChatSession; var tools : array<string>) {
+    c.tools_json <- tools
+}
+
+//! Queue TOOL RESULTS as the next pending turn — the reply to an assistant turn that called
+//! tools. Each result wraps in the family's tool-response markers; consecutive results share one
+//! turn, riding the user turn frames (the ChatML/Hermes convention). Call in place of
+//! ``add_user_``, then respond/render as usual.
+def add_tool_results_(var c : ChatSession; results : array<string>) {
+    var parts : array<string>
+    parts |> reserve(length(results))
+    c.history |> reserve(length(c.history) + length(results))
+    for (r in results) {
+        parts |> push("{c.tmpl.tool_resp_open}\n{r}\n{c.tmpl.tool_resp_close}")
+        c.history |> push(Message(role = Role.tool, content = r))
+    }
+    c.pending = join(parts, "\n")
+    c.has_pending = true
+    c.pending_is_tool = true
+    delete parts
+}
+
+//! `render_assistant_`'s tool-calling twin: replay an assistant turn that emitted tool calls.
+//! ``calls`` are the verbatim ``\{"name":…,"arguments":…}`` JSON objects, one per call; ``text``
+//! is any content alongside (empty for a pure tool-call turn). Precondition: a pending user or
+//! tool turn; a no-op otherwise.
+def render_assistant_calls_(m : Model; var c : ChatSession; text : string; calls : array<string>; var out : array<int64>) {
+    if (!c.has_pending) {
+        return
+    }
+    render_prompt(m, c, out)
+    var parts : array<string>
+    parts |> reserve(length(calls) + 1)
+    if (!empty(text)) {
+        parts |> push(text)
+    }
+    for (cj in calls) {
+        parts |> push("{c.tmpl.tool_call_open}\n{cj}\n{c.tmpl.tool_call_close}")
+    }
+    let body = join(parts, "\n")
+    delete parts
+    var bp : array<ChatPart>
+    split_on_tool_markers(m, c, body, bp)   // call markers tokenize as their ids where the vocab has them
+    render_parts(m, bp, "", out)
+    delete bp
+    consume_pending_(c)
+    render_parts(m, c.close_parts, "", out)
+    c.history |> push(Message(role = Role.assistant, content = body))
 }
 
 //! Inject a KNOWN assistant reply into the conversation WITHOUT generating: prefills the pending
