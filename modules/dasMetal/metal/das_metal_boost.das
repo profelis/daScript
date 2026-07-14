@@ -182,8 +182,9 @@ def public with_compute_encoder_timed(queue : MetalCommandQueue?; var error : st
     return with_compute_encoder_timed(queue, error, gpu_ms, encode_ms, blk)
 }
 
-//! The 4-out twin: also reports the host-side ENCODE time (block entry to commit) — the
-//! encode-CPU vs GPU-window split that attributes command-buffer overhead.
+//! The 4-out twin: also reports the host-side ENCODE time — the CPU cost of building the command
+//! buffer, measured from block entry through end_encoding (captured just before commit) — for the
+//! encode-CPU vs GPU-window split. The metal_commit hand-off itself falls in neither number.
 def public with_compute_encoder_timed(queue : MetalCommandQueue?; var error : string&; var gpu_ms : double&; var encode_ms : double&; blk : block<(enc : MetalComputeEncoder?) : void>) : bool {
     let cb = metal_new_command_buffer(queue)
     let enc = metal_new_compute_encoder(cb)
