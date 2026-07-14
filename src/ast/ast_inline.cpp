@@ -241,7 +241,13 @@ namespace das {
                 if ( name.compare(0,4,"__::")==0 ) ofs = 4;
                 else if ( name.compare(0,3,"_::")==0 ) ofs = 3;
                 if ( !ofs ) return;
-                if ( name.find('`', ofs)!=string::npos ) return;    // locked/manufactured mangled name
+                // locked instance names ("__::mod`fn`hash") re-resolve through the
+                // locked-name origin fallback and stay exempt. "_::" has no such
+                // fallback: a mangled _:: name (a [template] product, class-method
+                // dispatch) binds the program module before AND after the splice -
+                // it stops the splice exactly like a user-spelled escape (proven:
+                // sqlite_boost's ok() template products, sql tutorial dry-runs)
+                if ( ofs==4 && name.find('`', ofs)!=string::npos ) return;
                 verdict.hard = name;
                 verdict.hardWhy = "body dispatches '" + name + "' at the call site's module";
             }
