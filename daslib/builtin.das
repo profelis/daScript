@@ -1400,7 +1400,7 @@ def each(str : string) : iterator<int> {
 [unsafe_outside_of_for, nodiscard]
 def each(a : auto(TT)[]) : iterator<TT&> {
     unsafe {
-        var parr : void? = reinterpret<void?>(addr(a[0]))
+        var parr : void? = addr<void?>(a[0])
         var it : iterator<TT&>
         _builtin_make_fixed_array_iterator(it, parr, int64(typeinfo dim(a)), typeinfo sizeof(a[0]))
         return <- it
@@ -1804,9 +1804,7 @@ def lock_data(var a : array<auto(TT)> ==const | #; blk : block<(var p : TT?#; s 
     let len = length(a)
     if (len != 0) {
         __builtin_array_lock(a)
-        unsafe {   // nolint:STYLE025 addr() needs unsafe too -- not detected as an unsafe leaf by the lint
-            invoke(blk, reinterpret<TT?#>(addr(a[0])), len)
-        }
+        invoke(blk, unsafe(addr<TT?#>(a[0])), len)
         __builtin_array_unlock(a)
     } else {
         var nullT : TT?
@@ -1818,9 +1816,7 @@ def lock_data(a : array<auto(TT)> ==const | #; blk : block<(p : TT const?#; s : 
     let len = length(a)
     if (len != 0) {
         __builtin_array_lock_mutable(a)
-        unsafe {   // nolint:STYLE025 addr() needs unsafe too -- not detected as an unsafe leaf by the lint
-            invoke(blk, reinterpret<TT const?#>(addr(a[0])), len)
-        }
+        invoke(blk, unsafe(addr<TT const?#>(a[0])), len)
         __builtin_array_unlock_mutable(a)
     } else {
         invoke(blk, unsafe(reinterpret<TT const?#>(null)), 0)

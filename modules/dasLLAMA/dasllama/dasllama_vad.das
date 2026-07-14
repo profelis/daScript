@@ -78,7 +78,7 @@ def private sv_str(b : array<uint8> | #; o, n : int64) : string {
     }
     var s = ""
     unsafe {
-        s = string(temp_array(reinterpret<uint8?>(addr(b[o])), n, type<uint8>))
+        s = string(temp_array(addr<uint8?>(b[o]), n, type<uint8>))
     }
     return s
 }

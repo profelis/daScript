@@ -207,7 +207,7 @@ def private bytes_str(b : array<uint8> | #; o, n : int64) : string {
     }
     var s = ""
     unsafe {
-        s = string(temp_array(reinterpret<uint8?>(addr(b[o])), n, type<uint8>))
+        s = string(temp_array(addr<uint8?>(b[o]), n, type<uint8>))
     }
     return s
 }
@@ -574,7 +574,7 @@ def whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<fl
         // contiguously; threaded over t-blocks — pure scatter, bit-exact under any chunking
         // (cross_kv_bench: 3.5-4.5x over the scalar form even single-lane)
         unsafe {
-            let sp = reinterpret<float const?>(addr(ds.ckv_tmp[0]))
+            let sp = addr<float const?>(ds.ckv_tmp[0])
             var op = addr(ds.kx[l * d * ta])
             let nblk = ta / 4l
             maybe_parallel_for(0, int(nblk), lanes_for_work(ta * d, 0)) $(bb, be) {
@@ -624,7 +624,7 @@ def whisper_cross_kv(w : WhisperModel; var ds : DecoderState; enc_out : array<fl
         // vx: t-major f4 copy — each source row streams once, hh contiguous hs-chunks fan
         // out; threaded over t (cross_kv_bench: 4.3-5.1x single-lane)
         unsafe {
-            let sp = reinterpret<float const?>(addr(ds.ckv_tmp[0]))
+            let sp = addr<float const?>(ds.ckv_tmp[0])
             var op = addr(ds.vx[l * d * ta])
             maybe_parallel_for(0, int(ta), lanes_for_work(ta * d, 0)) $(tb, te) {
                 unsafe {
@@ -668,9 +668,9 @@ def private dec_self_attn(w : WhisperModel; var ds : DecoderState; l, n, p0 : in
     let tmax = w.n_text_ctx
     let tbig = max(tmax, w.enc.n_ctx)
     unsafe {
-        let qp = reinterpret<float const?>(addr(ds.qq[0]))
-        let kcp = reinterpret<float const?>(addr(ds.kcache[0]))
-        let vcp = reinterpret<float const?>(addr(ds.vcache[0]))
+        let qp = addr<float const?>(ds.qq[0])
+        let kcp = addr<float const?>(ds.kcache[0])
+        let vcp = addr<float const?>(ds.vcache[0])
         var hpp = addr(ds.hp[0])
         var attp = addr(ds.att[0])
         var aop = addr(ds.xb2[0])
@@ -727,9 +727,9 @@ def private dec_cross_attn(w : WhisperModel; var ds : DecoderState; l, n : int64
     let tbig = max(w.n_text_ctx, ta)
     let sm_scale = 1.0 / sqrt(sqrt(float(hs)))
     unsafe {
-        let qp = reinterpret<float const?>(addr(ds.qq[0]))
-        let kxp = reinterpret<float const?>(addr(ds.kx[0]))
-        let vxp = reinterpret<float const?>(addr(ds.vx[0]))
+        let qp = addr<float const?>(ds.qq[0])
+        let kxp = addr<float const?>(ds.kx[0])
+        let vxp = addr<float const?>(ds.vx[0])
         var hpp = addr(ds.hp[0])
         var attp = addr(ds.att[0])
         var aop = addr(ds.xb2[0])
@@ -983,7 +983,7 @@ def private exp_sum4(p : float const?; n : int64; m : float) : float {
 def private whisper_force_ts_rule(w : WhisperModel; var logits : array<float>) {
     let n_ts = int64(length(logits)) - int64(w.tok_beg)
     unsafe {
-        let p = reinterpret<float const?>(addr(logits[0]))
+        let p = addr<float const?>(logits[0])
         let ts_max = hmax(p + int64(w.tok_beg), n_ts)   // bit-identical to the scalar max fold
         if (ts_max > NEG_INF_LOGIT * 0.5) {
             let ts_logsumexp = log(exp_sum4(p + int64(w.tok_beg), n_ts, ts_max)) + ts_max
@@ -1002,7 +1002,7 @@ def private whisper_force_ts_rule(w : WhisperModel; var logits : array<float>) {
 def private logits_lse(logits : array<float>) : float {
     let n = int64(length(logits))
     unsafe {
-        let p = reinterpret<float const?>(addr(logits[0]))
+        let p = addr<float const?>(logits[0])
         let m = hmax(p, n)
         return log(exp_sum4(p, n, m)) + m
     }
@@ -1014,7 +1014,7 @@ def private logits_lse(logits : array<float>) : float {
 def private sample_greedy(w : WhisperModel; logits : array<float>; lse : float) : SampledTok {
     var r = SampledTok(id = 0, tid = w.tok_beg)
     unsafe {
-        let p = reinterpret<float const?>(addr(logits[0]))
+        let p = addr<float const?>(logits[0])
         let bestv = hmax(p, int64(length(logits)))
         for (i in range64(int64(length(logits)))) {
             if (p[i] == bestv) {
@@ -1042,7 +1042,7 @@ def private sample_greedy(w : WhisperModel; logits : array<float>; lse : float) 
 def private token_prob(logits : array<float>; id : int) : float {
     let n = int64(length(logits))
     unsafe {
-        let p = reinterpret<float const?>(addr(logits[0]))
+        let p = addr<float const?>(logits[0])
         let m = hmax(p, n)
         return exp(logits[id] - m) / exp_sum4(p, n, m)
     }

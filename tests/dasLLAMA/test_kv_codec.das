@@ -166,7 +166,7 @@ def test_kv_store_row_q8(t : T?) {
         unsafe {
             let kbase = kv_base_k(s, 1l, c.seq_len)
             var kcl = addr(s.key_cache[0]) + kbase
-            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 3l, 0l, kv_dim, reinterpret<float const?>(addr(src[0])))
+            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 3l, 0l, kv_dim, addr<float const?>(src[0]))
             // round-trip: |src - dequant| <= d/2 per element (d = that block's stored scale)
             let row3 = reinterpret<uint8 const?>(kcl + 3l * rowb)
             var ok_rt = true
@@ -185,14 +185,14 @@ def test_kv_store_row_q8(t : T?) {
             }
             t |> success(ok_rt, "every element within half a quantization step (+ f16-scale rounding)")
             // idempotence: re-quantizing the dequantized row reproduces the bytes exactly
-            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 4l, 0l, kv_dim, reinterpret<float const?>(addr(dq[0])))
+            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 4l, 0l, kv_dim, addr<float const?>(dq[0]))
             var idem = true
             for (b in range64(rowb)) {
                 idem &&= kcl[3l * rowb + b] == kcl[4l * rowb + b]
             }
             t |> success(idem, "quantize(dequantize(row)) is byte-identical")
             // head-slot partial store (sub = head_size = 32): lands at whole-block offset in row 1
-            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 1l, 32l, 32l, reinterpret<float const?>(addr(src[0])))
+            kv_store_row(kcl, s.kv_dtype_k, kv_dim, 1l, 32l, 32l, addr<float const?>(src[0]))
             let row1 = reinterpret<uint8 const?>(kcl + 1l * rowb)
             var ok_sub = true
             for (k in range64(32l)) {
@@ -252,7 +252,7 @@ def test_kv_store_row_f16(t : T?) {
         unsafe {
             let kbase = kv_base_k(s, 1l, c.seq_len)
             kv_store_row(addr(s.key_cache[0]) + kbase, s.kv_dtype_k, kv_dim, 3l, 0l, kv_dim,
-                reinterpret<float const?>(addr(src[0])))
+                addr<float const?>(src[0]))
             let kcp = reinterpret<uint16 const?>(addr(s.key_cache[0]) + kbase)
             var ok = true
             for (i in range64(kv_dim)) {
@@ -609,9 +609,9 @@ def test_kv_store_row_roundtrip(t : T?) {
         unsafe {
             let kbase = kv_base_k(s, 1l, c.seq_len)
             kv_store_row(addr(s.key_cache[0]) + kbase, s.kv_dtype_k, kv_dim, 3l, 0l, kv_dim,
-                reinterpret<float const?>(addr(src[0])))   // whole row at row 3
+                addr<float const?>(src[0]))   // whole row at row 3
             kv_store_row(addr(s.key_cache[0]) + kbase, s.kv_dtype_k, kv_dim, 1l, 16l, 16l,
-                reinterpret<float const?>(addr(src[0])))   // one head slot at row 1, sub 16
+                addr<float const?>(src[0]))   // one head slot at row 1, sub 16
             let kcp = reinterpret<float const?>(addr(s.key_cache[0]) + kbase)
             var ok_row = true
             for (i in range64(kv_dim)) {

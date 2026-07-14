@@ -61,11 +61,11 @@ def main {
     }
 
     unsafe {
-        let kqp = reinterpret<uint8 const?>(addr(kq[0]))
-        let ksp = reinterpret<uint8 const?>(addr(ks[0]))
-        let xqp = reinterpret<int8 const?>(addr(xq[0]))
-        let xsp = reinterpret<float const?>(addr(xs[0]))
-        let xbsp = reinterpret<int const?>(addr(xbs[0]))
+        let kqp = addr<uint8 const?>(kq[0])
+        let ksp = addr<uint8 const?>(ks[0])
+        let xqp = addr<int8 const?>(xq[0])
+        let xsp = addr<float const?>(xs[0])
+        let xbsp = addr<int const?>(xbs[0])
         var yp = addr(y[0])
 
         // GEMV (decode shape): full matrix, one token

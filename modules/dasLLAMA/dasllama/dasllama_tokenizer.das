@@ -31,14 +31,14 @@ def load_tokenizer(path : string; vocab_size : int64) : SpmTokenizer {
     }
     fmap(f) $(var bytes : array<uint8>#) {
         unsafe {
-            tk.max_token_length = temp_array(reinterpret<int?>(addr(bytes[0])), 1, type<int>)[0]
+            tk.max_token_length = temp_array(addr<int?>(bytes[0]), 1, type<int>)[0]
             var cur = 4
             for (i in range64(vocab_size)) {
-                let score = temp_array(reinterpret<float?>(addr(bytes[cur])), 1, type<float>)[0]
+                let score = temp_array(addr<float?>(bytes[cur]), 1, type<float>)[0]
                 cur += 4
-                let len = temp_array(reinterpret<int?>(addr(bytes[cur])), 1, type<int>)[0]
+                let len = temp_array(addr<int?>(bytes[cur]), 1, type<int>)[0]
                 cur += 4
-                let piece = string(temp_array(reinterpret<uint8?>(addr(bytes[cur])), len, type<uint8>))
+                let piece = string(temp_array(addr<uint8?>(bytes[cur]), len, type<uint8>))
                 tk.scores |> push(score)
                 tk.lookup |> insert(piece, i)
                 tk.vocab |> push(piece)

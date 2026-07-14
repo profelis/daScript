@@ -11,7 +11,6 @@
 options gen2
 options solid_context
 
-require math
 require daslib/strings
 
 let {
@@ -108,7 +107,7 @@ def sha256(msg : array<uint8>) {
     let len = length(msg) / 64
     for (i in range(len)) {
         unsafe {
-            digestBlock(reinterpret<uint?>(addr(msg[i * 64])), hash)
+            digestBlock(addr<uint?>(msg[i * 64]), hash)
         }
     }
     return toHex(hash)

@@ -112,7 +112,7 @@ def gelu_tanh_lut_batch(var x : array<float> | #; d, npos : int64) {
     gelu_lut_ensure()
     unsafe {
         var xp = addr(x[0])
-        let lp = reinterpret<float const?>(addr(g_gelu_lut[0]))
+        let lp = addr<float const?>(g_gelu_lut[0])
         maybe_parallel_for(0, int(npos), lanes_for_work(npos * d * 8l, 0)) $(rb, re) {
             unsafe {
                 for (i in range64(int64(rb) * d, int64(re) * d)) {
@@ -512,10 +512,10 @@ def log_mel_whisper(samples : array<float> | #; plan : WhisperMelPlan; filters :
     // ~170 MB [frames × n_fft] + [frames × 2·n_bins] images the GEMM form needed
     let n_len = m.n_len
     unsafe {
-        let pdd = reinterpret<float const?>(addr(padded[0]))
-        let hw = reinterpret<float const?>(addr(plan.hann[0]))
-        let twt = reinterpret<float const?>(addr(plan.twt[0]))
-        let flt = reinterpret<float const?>(addr(filters[0]))
+        let pdd = addr<float const?>(padded[0])
+        let hw = addr<float const?>(plan.hann[0])
+        let twt = addr<float const?>(plan.twt[0])
+        let flt = addr<float const?>(filters[0])
         var md = addr(m.data[0])
         maybe_parallel_for(0, int(n_compute), lanes_for_work(n_compute * n_fft * n_bins * 2l, 0)) $(rb, re) {
             var xwin : float[MEL_DFT_N]    // windowed samples, stack-resident
@@ -723,9 +723,9 @@ def layernorm(var o : float?; x, w, b : float const?; size : int64; eps : float)
 def layernorm_batch(var out : array<float>; src : array<float>; blob : array<float>; w_off, b_off, dim, npos : int64; eps : float) {
     unsafe {
         var op = addr(out[0])
-        let ip = reinterpret<float const?>(addr(src[0]))
-        let wp = reinterpret<float const?>(addr(blob[w_off]))
-        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        let ip = addr<float const?>(src[0])
+        let wp = addr<float const?>(blob[w_off])
+        let bp = addr<float const?>(blob[b_off])
         maybe_parallel_for(0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
@@ -742,7 +742,7 @@ def layernorm_batch(var out : array<float>; src : array<float>; blob : array<flo
 def asr_requant_rows_q8(x : array<float>; n, npos : int64; var xqb : array<int8>; var xsb : array<float>) {
     let nb = n / 32l
     unsafe {
-        let xp = reinterpret<float const?>(addr(x[0]))
+        let xp = addr<float const?>(x[0])
         var qp = addr(xqb[0])
         var sp = addr(xsb[0])
         maybe_parallel_for(0, int(npos), get_dispatch_lanes()) $(rb, re) {
@@ -764,7 +764,7 @@ def add_bias_rows(var y : array<float>; blob : array<float>; b_off, d, npos : in
     let d4 = d - d % 4l
     unsafe {
         var yp = addr(y[0])
-        let bp = reinterpret<float const?>(addr(blob[b_off]))
+        let bp = addr<float const?>(blob[b_off])
         maybe_parallel_for(0, int(npos), lanes_for_work(npos * d, get_gemv_lane_cap())) $(rb, re) {
             unsafe {
                 for (p in range64(int64(rb), int64(re))) {
@@ -791,7 +791,7 @@ def add_inplace_rows(var x : array<float>; r : array<float>; n : int64) {
     let nblk = n / 4l
     unsafe {
         var xp = addr(x[0])
-        let rp = reinterpret<float const?>(addr(r[0]))
+        let rp = addr<float const?>(r[0])
         maybe_parallel_for(0, int(nblk), lanes_for_work(n, get_gemv_lane_cap())) $(bb, be) {
             unsafe {
                 for (b in range64(int64(bb), int64(be))) {
@@ -1118,9 +1118,9 @@ def private enc_attention(t : AudioTower; var s : EncoderState; tt : int64) {
         s.att |> resize(int(attNeed))
     }
     unsafe {
-        let qp = reinterpret<float const?>(addr(s.qq[0]))
-        let kp = reinterpret<float const?>(addr(s.kk[0]))
-        let vp = reinterpret<float const?>(addr(s.vv[0]))
+        let qp = addr<float const?>(s.qq[0])
+        let kp = addr<float const?>(s.kk[0])
+        let vp = addr<float const?>(s.vv[0])
         var hpp = addr(s.hp[0])
         var attp = addr(s.att[0])
         var aop = addr(s.xb2[0])
@@ -1209,7 +1209,7 @@ def private diff_stage(name : string; x : array<float>; n : int64) {
         var maxd = 0.0
         var maxi = 0
         unsafe {
-            let rp = reinterpret<float?>(addr(bytes[0]))
+            let rp = addr<float?>(bytes[0])
             // int loop: raw-pointer indexing by int64 is AOT-ambiguous (das_index<T*>::at
             // only has int32/uint32 overloads); witness stages are far below 2^31 floats
             for (i in range(int(n))) {
@@ -1422,7 +1422,7 @@ def swiglu_swapped_rows(var o : array<float>; x : array<float>; half, rows : int
 def private rms_rows_blob(var x : array<float>; blob : array<float>; w_off, dim, rows : int64) {
     unsafe {
         var xp = addr(x[0])
-        let wp = reinterpret<float const?>(addr(blob[w_off]))
+        let wp = addr<float const?>(blob[w_off])
         for (r in range64(rows)) {
             rmsnorm(xp + r * dim, xp + r * dim, wp, dim, 1e-6)
         }

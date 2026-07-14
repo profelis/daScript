@@ -73,8 +73,8 @@ def private kv_blob_max_diff(blob : array<uint8>; refb : array<uint8>; pref : ar
                              dt : KVDtype; c : Config; npast : int64) : float {
     var maxd = 0.0
     unsafe {
-        let bp = reinterpret<uint8 const?>(addr(blob[0]))
-        let rp = reinterpret<uint8 const?>(addr(refb[0]))
+        let bp = addr<uint8 const?>(blob[0])
+        let rp = addr<uint8 const?>(refb[0])
         for (l in range64(c.n_layers)) {
             if (layer_kv_source(c, l) != l) {
                 continue

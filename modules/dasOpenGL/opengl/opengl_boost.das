@@ -186,7 +186,7 @@ def glUniformMatrix3fv(location : int; value : float3x3) {
 def glBufferData(target : GLenum; arr; usage : GLenum) {
     unsafe {
         assert(!empty(arr))
-        glBufferData(target, int64(length(arr) * typeinfo sizeof(arr[0])), reinterpret<void?>(addr(arr[0])), usage)
+        glBufferData(target, int64(length(arr) * typeinfo sizeof(arr[0])), addr<void?>(arr[0]), usage)
     }
 }
 
@@ -212,8 +212,8 @@ def std140_reset(program : uint; blockName : string; size : int) {
 def std140_set(program : uint; blockName : string; offset : uint; var value : auto(TT) const) {
     let key = "{program}/{blockName}"
     unsafe {
-        let dst = reinterpret<void?>(addr(g_std140_staging[key][int(offset)]))
-        memcpy(dst, reinterpret<void?>(addr(value)), typeinfo sizeof(type<TT>))
+        let dst = addr<void?>(g_std140_staging[key][int(offset)])
+        memcpy(dst, addr<void?>(value), typeinfo sizeof(type<TT>))
     }
 }
 

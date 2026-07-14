@@ -883,7 +883,7 @@ def public chain_stage_chunks(groups : int; rows : int; work : int64) : int {
 def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : int64) {
     unsafe {
         var yp = addr(y[0])                              // var: stays a writable pointer when captured
-        let wp = reinterpret<float const?>(addr(w[0]))   // strip the `#` if w is a view
+        let wp = addr<float const?>(w[0])   // strip the `#` if w is a view
         let xp = addr(x[0])
         maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
             unsafe {
@@ -901,7 +901,7 @@ def matmul(var y : array<float>; w : array<float> | #; x : array<float>; n, d : 
 def matmul(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d : int64) {
     unsafe {
         var yp = addr(y[0])
-        let wp = reinterpret<float const?>(addr(w[woff]))
+        let wp = addr<float const?>(w[woff])
         let xp = addr(x[0])
         maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
             unsafe {
@@ -919,7 +919,7 @@ def matmul(var y : array<float>; w : array<float>; woff : int64; x : array<float
 //! all ntok tokens, vs ntok× matmul re-reading W every call. Bit-for-bit ntok× matmul.
 def matmul_batch(var y : array<float>; w : array<float> | #; x : array<float>; n, d, ntok : int64) {
     unsafe {
-        matmul_batch_core(addr(y[0]), reinterpret<float const?>(addr(w[0])), reinterpret<float const?>(addr(x[0])), n, d, ntok)
+        matmul_batch_core(addr(y[0]), addr<float const?>(w[0]), addr<float const?>(x[0]), n, d, ntok)
     }
 }
 
@@ -968,7 +968,7 @@ def private matmul_batch_core(var yp : float?; wp : float const?; xp : float con
 //! Blob+offset form of matmul_batch (see the matmul woff overload).
 def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array<float>; n, d, ntok : int64) {
     unsafe {
-        matmul_batch_core(addr(y[0]), reinterpret<float const?>(addr(w[woff])), reinterpret<float const?>(addr(x[0])), n, d, ntok)
+        matmul_batch_core(addr(y[0]), addr<float const?>(w[woff]), addr<float const?>(x[0]), n, d, ntok)
     }
 }
 
@@ -979,8 +979,8 @@ def matmul_batch(var y : array<float>; w : array<float>; woff : int64; x : array
 def matmul_bf16_batch(var y : array<float>; w : array<uint16>; woff : int64; x : array<float>; n, d, ntok : int64) {
     unsafe {
         var yp = addr(y[0])
-        let wp = reinterpret<uint16 const?>(addr(w[woff]))
-        let xp = reinterpret<float const?>(addr(x[0]))
+        let wp = addr<uint16 const?>(w[woff])
+        let xp = addr<float const?>(x[0])
         let nch = ntok == 1l ? matmul_chunks_gemv(int(d), 1, n * d) : matmul_chunks(int(d), get_q8_batch_chunks_per_job(), n * d * ntok)
         maybe_parallel_for(0, int(d), nch) $(rb, re) {
             unsafe {
@@ -1130,7 +1130,7 @@ def dot_q8(wq : int8 const?; ws : float const?; x : float const?; n : int64) : f
             let off = base + c
             unsafe {
                 let q4 = float4(float(wq[off]), float(wq[off + 1l]), float(wq[off + 2l]), float(wq[off + 3l]))
-                let x4 = *reinterpret<float4?>(addr(x[off]))
+                let x4 = *addr<float4?>(x[off])
                 bacc += q4 * x4
             }
             c += 4l
@@ -1148,8 +1148,8 @@ def matmul_q8(var y : array<float>; wq : array<int8>; ws : array<float>; woff : 
     let nb = n / 32l
     unsafe {
         var yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wq[woff]))
-        let sp = reinterpret<float const?>(addr(ws[woff / 32l]))
+        let wp = addr<int8 const?>(wq[woff])
+        let sp = addr<float const?>(ws[woff / 32l])
         let xp = addr(x[0])
         maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q8_chunks_per_job, n * d)) $(rb, re) {
             unsafe {
@@ -1165,8 +1165,8 @@ def matmul_q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #;
     let nb = n / 32l
     unsafe {
         var yp = addr(y[0])
-        let wp = reinterpret<int8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<int8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         // default 2 chunks per hw job (knob): Q8 dequant-in-dot is compute-bound and threads better than fp32
         maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q8_chunks_per_job, n * d)) $(rb, re) {
@@ -1809,10 +1809,10 @@ def kernel_backend_has_kq_batch_groupn() : bool {
 def matmul_kq_batch_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; offs : array<int64> | #; nregions : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64) {
     unsafe {
         invoke(g_mm_kq_batch_groupn, fmt, addr(y[0]),
-            reinterpret<uint8 const?>(addr(kq[0])), reinterpret<uint8 const?>(addr(ks[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
-            reinterpret<int const?>(addr(xbs[0])), n, d)
+            addr<uint8 const?>(kq[0]), addr<uint8 const?>(ks[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            addr<int const?>(xbs[0]), n, d)
     }
 }
 
@@ -1823,10 +1823,10 @@ def matmul_kq_batch_groupn(fmt : int; var y : array<float> | #; kq : array<uint8
 def matmul_kq_groupn_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; offs : array<int64> | #; nregions : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64) {
     unsafe {
         invoke(g_mm_kq_groupn, fmt, addr(y[0]),
-            reinterpret<uint8 const?>(addr(kq[0])), reinterpret<uint8 const?>(addr(ks[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
-            reinterpret<int const?>(addr(xbs[0])), n, d)
+            addr<uint8 const?>(kq[0]), addr<uint8 const?>(ks[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            addr<int const?>(xbs[0]), n, d)
     }
 }
 
@@ -1839,9 +1839,9 @@ def matmul_kq_batch(fmt : int; var y : array<float> | #; kq : array<uint8> | #; 
     let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq_batch, fmt, addr(y[0]),
-            reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
-            reinterpret<int const?>(addr(xbs[0])), n, d, ntok)
+            addr<uint8 const?>(kq[sb * qsb]), addr<uint8 const?>(ks[sb * ssb]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            addr<int const?>(xbs[0]), n, d, ntok)
     }
 }
 
@@ -1854,9 +1854,9 @@ def matmul_kq_active(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
     let ssb = fmt == 6 ? 18l : 20l
     unsafe {
         invoke(g_mm_kq, fmt, addr(y[yoff]),
-            reinterpret<uint8 const?>(addr(kq[sb * qsb])), reinterpret<uint8 const?>(addr(ks[sb * ssb])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
-            reinterpret<int const?>(addr(xbs[0])), n, d)
+            addr<uint8 const?>(kq[sb * qsb]), addr<uint8 const?>(ks[sb * ssb]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            addr<int const?>(xbs[0]), n, d)
     }
 }
 
@@ -1922,8 +1922,8 @@ def kernel_backend_needs_repack(name : string) : bool {
 def matmul_q8q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_q8q8, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+            addr<int8 const?>(wq[0]), addr<float const?>(ws[0]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
     }
 }
 
@@ -1932,8 +1932,8 @@ def matmul_q8q8(var y : array<float>; wq : array<int8> | #; ws : array<float> | 
 def matmul_q8q8(var y : array<float>; wq : array<int8>; ws : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_q8q8, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<float const?>(addr(ws[woff / 32l])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+            addr<int8 const?>(wq[woff]), addr<float const?>(ws[woff / 32l]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
     }
 }
 
@@ -1943,8 +1943,8 @@ def matmul_q8q8(var y : array<float>; wq : array<int8>; ws : array<float>; woff 
 def matmul_q8q8_batch(var y : array<float>; wq : array<int8> | #; ws : array<float> | #; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
     unsafe {
         invoke(g_mm_q8q8_batch, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+            addr<int8 const?>(wq[0]), addr<float const?>(ws[0]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, ntok)
     }
 }
 
@@ -1952,8 +1952,8 @@ def matmul_q8q8_batch(var y : array<float>; wq : array<int8> | #; ws : array<flo
 def matmul_q8q8_batch(var y : array<float>; wq : array<int8>; ws : array<float>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
     unsafe {
         invoke(g_mm_q8q8_batch, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<float const?>(addr(ws[woff / 32l])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+            addr<int8 const?>(wq[woff]), addr<float const?>(ws[woff / 32l]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, ntok)
     }
 }
 
@@ -1968,9 +1968,9 @@ def matmul_q8q8_group3(var y0 : array<float>; var y1 : array<float>; var y2 : ar
                        xq : array<int8>; xs : array<float>; n, d0, d1, d2 : int64) {
     unsafe {
         invoke(g_mm_q8q8_group3, addr(y0[0]), addr(y1[0]), addr(y2[0]),
-            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
+            addr<int8 const?>(wq[0]), addr<float const?>(ws[0]),
             woff0, woff1, woff2,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d0, d1, d2)
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d0, d1, d2)
     }
 }
 
@@ -1981,8 +1981,8 @@ def matmul_q8q8_group3(var y0 : array<float>; var y1 : array<float>; var y2 : ar
 def matmul_q8q8(var y : array<float>; wq : array<int8>; ws : array<uint16>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_q8q8_s16, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<uint16 const?>(addr(ws[woff / 32l])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+            addr<int8 const?>(wq[woff]), addr<uint16 const?>(ws[woff / 32l]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
     }
 }
 
@@ -1990,8 +1990,8 @@ def matmul_q8q8(var y : array<float>; wq : array<int8>; ws : array<uint16>; woff
 def matmul_q8q8_batch(var y : array<float>; wq : array<int8>; ws : array<uint16>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
     unsafe {
         invoke(g_mm_q8q8_batch_s16, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[woff])), reinterpret<uint16 const?>(addr(ws[woff / 32l])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+            addr<int8 const?>(wq[woff]), addr<uint16 const?>(ws[woff / 32l]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, ntok)
     }
 }
 
@@ -2001,9 +2001,9 @@ def matmul_q8q8_group3(var y0 : array<float>; var y1 : array<float>; var y2 : ar
                        xq : array<int8>; xs : array<float>; n, d0, d1, d2 : int64) {
     unsafe {
         invoke(g_mm_q8q8_group3_s16, addr(y0[0]), addr(y1[0]), addr(y2[0]),
-            reinterpret<int8 const?>(addr(wq[0])), reinterpret<uint16 const?>(addr(ws[0])),
+            addr<int8 const?>(wq[0]), addr<uint16 const?>(ws[0]),
             woff0, woff1, woff2,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d0, d1, d2)
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d0, d1, d2)
     }
 }
 
@@ -2012,9 +2012,9 @@ def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<ui
                        xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_q8q8_groupn_s16, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[0])), reinterpret<uint16 const?>(addr(ws[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            addr<int8 const?>(wq[0]), addr<uint16 const?>(ws[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
             null, null, n, d)
     }
 }
@@ -2024,10 +2024,10 @@ def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<ui
                        xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
     unsafe {
         invoke(g_mm_q8q8_groupn_s16, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[0])), reinterpret<uint16 const?>(addr(ws[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
-            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
+            addr<int8 const?>(wq[0]), addr<uint16 const?>(ws[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            addr<float const?>(bias[0]), addr<int64 const?>(boffs[0]), n, d)
     }
 }
 
@@ -2063,8 +2063,8 @@ def mxfp4_fill_lut(var lut : int8[16]) {
 def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_mx4q8, addr(y[0]),
-            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+            addr<uint8 const?>(wn[0]), addr<uint8 const?>(we[0]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
     }
 }
 
@@ -2073,8 +2073,8 @@ def matmul_mx4q8(var y : array<float>; wn : array<uint8> | #; we : array<uint8> 
 def matmul_mx4q8(var y : array<float>; wn : array<uint8>; we : array<uint8>; woff : int64; xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_mx4q8, addr(y[0]),
-            reinterpret<uint8 const?>(addr(wn[woff / 2l])), reinterpret<uint8 const?>(addr(we[woff / 32l])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d)
+            addr<uint8 const?>(wn[woff / 2l]), addr<uint8 const?>(we[woff / 32l]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d)
     }
 }
 
@@ -2085,8 +2085,8 @@ def matmul_mx4q8(var y : array<float>; wn : array<uint8>; we : array<uint8>; wof
 def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8> | #; we : array<uint8> | #; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
     unsafe {
         invoke(g_mm_mx4q8_batch, addr(y[0]),
-            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+            addr<uint8 const?>(wn[0]), addr<uint8 const?>(we[0]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, ntok)
     }
 }
 
@@ -2094,8 +2094,8 @@ def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8> | #; we : array<u
 def matmul_mx4q8_batch(var y : array<float>; wn : array<uint8>; we : array<uint8>; woff : int64; xq : array<int8>; xs : array<float>; n, d, ntok : int64) {
     unsafe {
         invoke(g_mm_mx4q8_batch, addr(y[0]),
-            reinterpret<uint8 const?>(addr(wn[woff / 2l])), reinterpret<uint8 const?>(addr(we[woff / 32l])),
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])), n, d, ntok)
+            addr<uint8 const?>(wn[woff / 2l]), addr<uint8 const?>(we[woff / 32l]),
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]), n, d, ntok)
     }
 }
 
@@ -2106,9 +2106,9 @@ def matmul_mx4q8_batch_groupn(var y : array<float>; wn : array<uint8> | #; we : 
                               xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_mx4q8_batch_groupn, addr(y[0]),
-            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            addr<uint8 const?>(wn[0]), addr<uint8 const?>(we[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
             null, null, n, d)
     }
 }
@@ -2118,10 +2118,10 @@ def matmul_mx4q8_batch_groupn(var y : array<float>; wn : array<uint8> | #; we : 
                               xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
     unsafe {
         invoke(g_mm_mx4q8_batch_groupn, addr(y[0]),
-            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
-            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
+            addr<uint8 const?>(wn[0]), addr<uint8 const?>(we[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            addr<float const?>(bias[0]), addr<int64 const?>(boffs[0]), n, d)
     }
 }
 
@@ -2132,9 +2132,9 @@ def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<fl
                        xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_q8q8_groupn, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            addr<int8 const?>(wq[0]), addr<float const?>(ws[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
             null, null, n, d)
     }
 }
@@ -2144,10 +2144,10 @@ def matmul_q8q8_groupn(var y : array<float>; wq : array<int8> | #; ws : array<fl
                        xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
     unsafe {
         invoke(g_mm_q8q8_groupn, addr(y[0]),
-            reinterpret<int8 const?>(addr(wq[0])), reinterpret<float const?>(addr(ws[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
-            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
+            addr<int8 const?>(wq[0]), addr<float const?>(ws[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            addr<float const?>(bias[0]), addr<int64 const?>(boffs[0]), n, d)
     }
 }
 
@@ -2157,9 +2157,9 @@ def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<
                         xq : array<int8>; xs : array<float>; n, d : int64) {
     unsafe {
         invoke(g_mm_mx4q8_groupn, addr(y[0]),
-            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
+            addr<uint8 const?>(wn[0]), addr<uint8 const?>(we[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
             null, null, n, d)
     }
 }
@@ -2169,10 +2169,10 @@ def matmul_mx4q8_groupn(var y : array<float>; wn : array<uint8> | #; we : array<
                         xq : array<int8>; xs : array<float>; bias : array<float> | #; boffs : array<int64>; n, d : int64) {
     unsafe {
         invoke(g_mm_mx4q8_groupn, addr(y[0]),
-            reinterpret<uint8 const?>(addr(wn[0])), reinterpret<uint8 const?>(addr(we[0])),
-            reinterpret<int64 const?>(addr(offs[0])), nregions,
-            reinterpret<int8 const?>(addr(xq[0])), reinterpret<float const?>(addr(xs[0])),
-            reinterpret<float const?>(addr(bias[0])), reinterpret<int64 const?>(addr(boffs[0])), n, d)
+            addr<uint8 const?>(wn[0]), addr<uint8 const?>(we[0]),
+            addr<int64 const?>(offs[0]), nregions,
+            addr<int8 const?>(xq[0]), addr<float const?>(xs[0]),
+            addr<float const?>(bias[0]), addr<int64 const?>(boffs[0]), n, d)
     }
 }
 
@@ -2212,8 +2212,8 @@ def matmul_q4(var y : array<float>; wq : array<uint8>; ws : array<float>; woff :
     let nh = n / 2l
     unsafe {
         var yp = addr(y[0])
-        let wp = reinterpret<uint8 const?>(addr(wq[woff / 2l]))
-        let sp = reinterpret<float const?>(addr(ws[woff / 32l]))
+        let wp = addr<uint8 const?>(wq[woff / 2l])
+        let sp = addr<float const?>(ws[woff / 32l])
         let xp = addr(x[0])
         maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), g_q4_chunks_per_job, n * d)) $(rb, re) {
             unsafe {
@@ -2230,8 +2230,8 @@ def matmul_q4(var y : array<float>; wq : array<uint8> | #; ws : array<float> | #
     let nh = n / 2l
     unsafe {
         var yp = addr(y[0])
-        let wp = reinterpret<uint8 const?>(addr(wq[0]))
-        let sp = reinterpret<float const?>(addr(ws[0]))
+        let wp = addr<uint8 const?>(wq[0])
+        let sp = addr<float const?>(ws[0])
         let xp = addr(x[0])
         // default 4 chunks per hw job (knob): the heavy nibble unpack makes each row compute-bound, so finer
         // splitting balances better (esp. the classifier) — more than the compute-light Q8 path.
@@ -2276,8 +2276,8 @@ def rmsnorm(var o : array<float> | #; x : array<float> | #; weight : array<float
     // reinterpret strips the temporary (#) qualifier — rms_at passes array_view (#) slices. Output `o`
     // keeps a non-const pointer (it's written); the read-only x/weight add const.
     unsafe {
-        rmsnorm(reinterpret<float?>(addr(o[0])), reinterpret<float const?>(addr(x[0])),
-            reinterpret<float const?>(addr(weight[0])), size, eps)
+        rmsnorm(addr<float?>(o[0]), addr<float const?>(x[0]),
+            addr<float const?>(weight[0]), size, eps)
     }
 }
 
@@ -2861,8 +2861,8 @@ def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float
 def rope_scaled(var vec : array<float> | #; pos, head_size, n : int64; theta, fscale : float; freq_factors : array<float> | #) {
     let has_ff = !empty(freq_factors)
     unsafe {
-        let ff = has_ff ? reinterpret<float const?>(addr(freq_factors[0])) : null
-        rope_scaled(reinterpret<float?>(addr(vec[0])), pos, head_size, n, theta, fscale, has_ff, ff)
+        let ff = has_ff ? addr<float const?>(freq_factors[0]) : null
+        rope_scaled(addr<float?>(vec[0]), pos, head_size, n, theta, fscale, has_ff, ff)
     }
 }
 
@@ -2897,8 +2897,8 @@ def rope_scaled_neox(var v : float?; pos, head_size, n : int64; theta, fscale : 
 def rope_scaled_neox(var vec : array<float> | #; pos, head_size, n : int64; theta, fscale : float; freq_factors : array<float> | #; mscale : float = 1.0) {
     let has_ff = !empty(freq_factors)
     unsafe {
-        let ff = has_ff ? reinterpret<float const?>(addr(freq_factors[0])) : null
-        rope_scaled_neox(reinterpret<float?>(addr(vec[0])), pos, head_size, n, theta, fscale, has_ff, ff, mscale)
+        let ff = has_ff ? addr<float const?>(freq_factors[0]) : null
+        rope_scaled_neox(addr<float?>(vec[0]), pos, head_size, n, theta, fscale, has_ff, ff, mscale)
     }
 }
 
@@ -3020,7 +3020,7 @@ def rope_apply(var vec : float?; pos, head_size, n : int64; theta, fscale : floa
 def rope_apply(var vec : array<float> | #; pos, head_size, n : int64; theta, fscale : float; freq_factors : array<float> | #; neox : bool; mscale : float = 1.0; use_ff : bool = true) {
     let has_ff = use_ff && !empty(freq_factors)
     unsafe {
-        let ff = has_ff ? reinterpret<float const?>(addr(freq_factors[0])) : null
-        rope_apply(reinterpret<float?>(addr(vec[0])), pos, head_size, n, theta, fscale, has_ff, ff, neox, mscale)
+        let ff = has_ff ? addr<float const?>(freq_factors[0]) : null
+        rope_apply(addr<float?>(vec[0]), pos, head_size, n, theta, fscale, has_ff, ff, neox, mscale)
     }
 }

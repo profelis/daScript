@@ -43,7 +43,7 @@ def operator [] (t : Goo; cmp : string) {
 def operator ?[] (t : Goo; cmp : string) : string const?# {
     if (cmp == t . . a) {
         unsafe {
-            return reinterpret<string const?#>(addr(t . . a))
+            return addr<string const?#>(t . . a)
         }
     } else {
         unsafe {
@@ -59,7 +59,7 @@ def operator .(t : Goo; name : string) {
 def operator ?.(t : Goo; name : string) : string const?# {
     if (name == "yes") {
         unsafe {
-            return reinterpret<string const?#>(addr(t . . a))
+            return addr<string const?#>(t . . a)
         }
     } else {
         unsafe {

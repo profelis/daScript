@@ -88,7 +88,7 @@ class SampleStackWalker : DapiStackWalker {
     ctxid : Context?
     def override onArgument(info : FuncInfo; index : int; vinfo : VarInfo; arg : float4) : void {
         if (vinfo.flags.ref || vinfo.flags.refType) {
-            describe_arg(*ctxid, vinfo, *unsafe(reinterpret<void ??>(unsafe(addr(arg)))))
+            describe_arg(*ctxid, vinfo, *unsafe(addr<void ??>(arg)))
         } else {
             describe_arg(*ctxid, vinfo, unsafe(addr(arg)))
         }

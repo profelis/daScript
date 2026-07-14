@@ -29,7 +29,7 @@ def main {
 
     profile(10, "PEG json") {
         get_parser_with(input) $(res_json; _err) {
-            print("{intptr(unsafe(reinterpret<JsonValue?>(addr(res_json))))}")
+            print("{intptr(unsafe(addr<JsonValue?>(res_json)))}")
         }
     }
 

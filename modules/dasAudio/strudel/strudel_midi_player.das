@@ -921,7 +921,7 @@ def private midi_thread_main(sid : uint64; var cmd_stream : Stream?; var done_st
         // render all tracks
         let t0 = ref_time_ticks()
         unsafe {
-            memset32(reinterpret<uint?>(addr(output[0])), 0u, length(output))
+            memset32(addr<uint?>(output[0]), 0u, length(output))
         }
         var ii = length(tracks) - 1
         while (ii >= 0) {
@@ -1075,7 +1075,7 @@ def public midi_play(name : string; path : string; gain : float = 1.0; looping :
     }
     let file_ptr = unsafe(addr(g_midi_files[name]))
     let sf2_ptr = use_sf2 && g_midi_sf2 != null ? unsafe(reinterpret<SF2File const?>(g_midi_sf2)) : null
-    let bank_ptr = bank != null ? bank : unsafe(reinterpret<SampleBank const?>(unsafe(addr(g_midi_bank))))
+    let bank_ptr = bank != null ? bank : unsafe(addr<SampleBank const?>(g_midi_bank))
     g_midi_cmd_stream |> push_archive(MidiCommand(add_track = MidiTrackCmd(
         name = name,
         file = intptr(file_ptr),
@@ -1100,7 +1100,7 @@ def public midi_play_data(name : string; data : array<uint8>; gain : float = 1.0
     }
     let file_ptr = unsafe(addr(g_midi_files[name]))
     let sf2_ptr = use_sf2 && g_midi_sf2 != null ? unsafe(reinterpret<SF2File const?>(g_midi_sf2)) : null
-    let bank_ptr = bank != null ? bank : unsafe(reinterpret<SampleBank const?>(unsafe(addr(g_midi_bank))))
+    let bank_ptr = bank != null ? bank : unsafe(addr<SampleBank const?>(g_midi_bank))
     g_midi_cmd_stream |> push_archive(MidiCommand(add_track = MidiTrackCmd(
         name = name,
         file = intptr(file_ptr),

@@ -115,7 +115,7 @@ class ImplementsMacro : AstStructureAnnotation {
         // that uses interior mutability to lazily cache the proxy
         if (is_const_interface(parent)) {
             var fn_get_i_const = qmacro_method(iface_get_name_func, st) $(self : $t(st) ==const) : $t(iface_ptr) {
-                var pS = unsafe(reinterpret<$t(st)? -const>(addr(self)))
+                var pS = unsafe(addr<$t(st)? -const>(self))
                 if (pS.$f(iface_var_name) == null) {
                     pS.$f(iface_var_name) = new <$t(cls)>(pS)
                 }

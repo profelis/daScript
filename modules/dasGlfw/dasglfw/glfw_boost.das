@@ -30,19 +30,19 @@ def glfwGetFramebufferSize(window : GLFWwindow?; var display_w, display_h : int&
 
 def gl_array_ptr(foo : array<auto>) : void? {
     unsafe {
-        return reinterpret<void?>(addr(foo[0]))
+        return addr<void?>(foo[0])
     }
 }
 
 def gl_array_ptr(foo : auto[]) : void? {
     unsafe {
-        return reinterpret<void?>(addr(foo[0]))
+        return addr<void?>(foo[0])
     }
 }
 
 def gl_array_ptr(foo : auto[][]) : void? {
     unsafe {
-        return reinterpret<void?>(addr(foo[0][0]))
+        return addr<void?>(foo[0][0])
     }
 }
 

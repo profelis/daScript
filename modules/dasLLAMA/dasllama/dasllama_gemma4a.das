@@ -492,8 +492,8 @@ def private g4a_rms_rows(enc : Gemma4aEncoder; var dst : array<float>; src : arr
                          w_off, d, npos : int64) {
     unsafe {
         var dp = addr(dst[0])
-        let sp = reinterpret<float const?>(addr(src[0]))
-        let wp = reinterpret<float const?>(addr(enc.blob[w_off]))
+        let sp = addr<float const?>(src[0])
+        let wp = addr<float const?>(enc.blob[w_off])
         for (r in range64(npos)) {
             rmsnorm(dp + r * d, sp + r * d, wp, d, enc.eps)
         }
@@ -653,7 +653,7 @@ def gemma4a_encode(enc : Gemma4aEncoder; var st : Gemma4aState) : int64 {
     add_bias_rows(st.tmp, enc.blob, enc.outproj_b, enc.proj_dim, npos)
     unsafe {
         var tp = addr(st.tmp[0])
-        let wp = reinterpret<float const?>(addr(enc.ones[0]))
+        let wp = addr<float const?>(enc.ones[0])
         for (r in range64(npos)) {
             rmsnorm(tp + r * enc.proj_dim, tp + r * enc.proj_dim, wp, enc.proj_dim, enc.eps)
         }

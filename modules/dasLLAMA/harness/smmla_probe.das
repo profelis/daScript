@@ -35,8 +35,8 @@ def main() {
         b[i] = int8((i * 73 + 5) % 255 - 127)
     }
     unsafe {
-        let ap = reinterpret<int8 const?>(addr(a[0]))
-        let bp = reinterpret<int8 const?>(addr(b[0]))
+        let ap = addr<int8 const?>(a[0])
+        let bp = addr<int8 const?>(b[0])
 
         // correctness: one smmla vs its 2x2 definition computed with plain int math
         {

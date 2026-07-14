@@ -215,9 +215,9 @@ def public imgui_gl_render(r : ImguiGlRenderer) {
         // block-form unsafe: expression-form would not authorize the nested addr() (CLAUDE.md gotcha)
         unsafe {
             glBufferData(GL_ARRAY_BUFFER, int64(vcnt * VERT_SIZE),
-                reinterpret<void?>(addr(cl.VtxBuffer[0])), GL_STREAM_DRAW)
+                addr<void?>(cl.VtxBuffer[0]), GL_STREAM_DRAW)
             glBufferData(GL_ELEMENT_ARRAY_BUFFER, int64(icnt * IDX_SIZE),
-                reinterpret<void?>(addr(cl.IdxBuffer[0])), GL_STREAM_DRAW)
+                addr<void?>(cl.IdxBuffer[0]), GL_STREAM_DRAW)
         }
 
         for (j in range(length(cl.CmdBuffer))) {

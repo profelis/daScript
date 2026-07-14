@@ -12,7 +12,7 @@ options gen2
 // Single-threaded on purpose — the engine wraps both loops in maybe_parallel_for over t;
 // the loop-form decision is per-row and carries over.
 
-require dasllama/dasllama_common // nolint:STYLE030 — jit_enabled() for the -jit warning
+require dasllama/dasllama_common // nolint:STYLE029,STYLE030 — jit_enabled() via the ?-conditional llvm_tune re-export; a direct require would hard-require dasLLVM
 require dasllama/dasllama_math
 require daslib/clargs
 require math
@@ -51,7 +51,7 @@ struct BenchArgs {
 // engine-verbatim (dasllama_parakeet conv module, GLU dispatch body)
 def glu_cur(var out : array<float>; h : array<float>; d, tt : int64) {
     unsafe {
-        let hp = reinterpret<float const?>(addr(h[0]))
+        let hp = addr<float const?>(h[0])
         var op = addr(out[0])
         for (t in range64(tt)) {
             for (j in range64(d)) {
@@ -66,7 +66,7 @@ def glu_cur(var out : array<float>; h : array<float>; d, tt : int64) {
 // same loop, LLVM hints on the channel loop
 def glu_hint(var out : array<float>; h : array<float>; d, tt : int64) {
     unsafe {
-        let hp = reinterpret<float const?>(addr(h[0]))
+        let hp = addr<float const?>(h[0])
         var op = addr(out[0])
         for (t in range64(tt)) {
             for [vectorize, vectorize_width = 8] (j in range64(d)) {
@@ -82,7 +82,7 @@ def glu_hint(var out : array<float>; h : array<float>; d, tt : int64) {
 def glu_exp4(var out : array<float>; h : array<float>; d, tt : int64) {
     let one = float4(1.0, 1.0, 1.0, 1.0)
     unsafe {
-        let hp = reinterpret<float const?>(addr(h[0]))
+        let hp = addr<float const?>(h[0])
         var op = addr(out[0])
         let n4 = d / 4l
         for (t in range64(tt)) {
@@ -106,7 +106,7 @@ def glu_exp4(var out : array<float>; h : array<float>; d, tt : int64) {
 def glu_exp4_u2(var out : array<float>; h : array<float>; d, tt : int64) {
     let one = float4(1.0, 1.0, 1.0, 1.0)
     unsafe {
-        let hp = reinterpret<float const?>(addr(h[0]))
+        let hp = addr<float const?>(h[0])
         var op = addr(out[0])
         let n4 = d / 4l
         for (t in range64(tt)) {
@@ -135,12 +135,12 @@ def dwm_cur(var out : array<float>; x, w9, bm, bv, bw, bb : array<float>; d, tt 
     let kpad = (nk - 1l) / 2l
     unsafe {
         var op = addr(out[0])
-        let xp = reinterpret<float const?>(addr(x[0]))
-        let wp = reinterpret<float const?>(addr(w9[0]))
-        let bmp = reinterpret<float const?>(addr(bm[0]))
-        let bvp = reinterpret<float const?>(addr(bv[0]))
-        let bwp = reinterpret<float const?>(addr(bw[0]))
-        let bbp = reinterpret<float const?>(addr(bb[0]))
+        let xp = addr<float const?>(x[0])
+        let wp = addr<float const?>(w9[0])
+        let bmp = addr<float const?>(bm[0])
+        let bvp = addr<float const?>(bv[0])
+        let bwp = addr<float const?>(bw[0])
+        let bbp = addr<float const?>(bb[0])
         for (t in range64(tt)) {
             for (j in range64(d)) {
                 var acc = 0.0
@@ -163,12 +163,12 @@ def dwm_cur(var out : array<float>; x, w9, bm, bv, bw, bb : array<float>; d, tt 
 def dwm_hint(var out : array<float>; x, w9, bm, bv, bw, bb : array<float>; d, tt : int64) {
     unsafe {
         var op = addr(out[0])
-        let xp = reinterpret<float const?>(addr(x[0]))
-        let wp = reinterpret<float const?>(addr(w9[0]))
-        let bmp = reinterpret<float const?>(addr(bm[0]))
-        let bvp = reinterpret<float const?>(addr(bv[0]))
-        let bwp = reinterpret<float const?>(addr(bw[0]))
-        let bbp = reinterpret<float const?>(addr(bb[0]))
+        let xp = addr<float const?>(x[0])
+        let wp = addr<float const?>(w9[0])
+        let bmp = addr<float const?>(bm[0])
+        let bvp = addr<float const?>(bv[0])
+        let bwp = addr<float const?>(bw[0])
+        let bbp = addr<float const?>(bb[0])
         for (t in range64(tt)) {
             for [vectorize, vectorize_width = 8] (j in range64(d)) {
                 var acc = 0.0
@@ -197,12 +197,12 @@ def dwm_f4(var out : array<float>; x, wt, bm, bv, bw, bb : array<float>; d, tt :
     let one = float4(1.0, 1.0, 1.0, 1.0)
     unsafe {
         var op = addr(out[0])
-        let xp = reinterpret<float const?>(addr(x[0]))
-        let wp = reinterpret<float const?>(addr(wt[0]))
-        let bmp = reinterpret<float const?>(addr(bm[0]))
-        let bvp = reinterpret<float const?>(addr(bv[0]))
-        let bwp = reinterpret<float const?>(addr(bw[0]))
-        let bbp = reinterpret<float const?>(addr(bb[0]))
+        let xp = addr<float const?>(x[0])
+        let wp = addr<float const?>(wt[0])
+        let bmp = addr<float const?>(bm[0])
+        let bvp = addr<float const?>(bv[0])
+        let bwp = addr<float const?>(bw[0])
+        let bbp = addr<float const?>(bb[0])
         var scp = addr(sc[0])
         var shp = addr(sh[0])
         for (j in range64(d)) {

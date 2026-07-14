@@ -62,7 +62,7 @@ def quantize_q8_0_into(src : array<float> | #; n : int64; var qdst : array<int8>
     // threads only past ~2M elements (the load-time bulk requant); decode-sized calls stay inline
     let njobs = is_job_que_available() ? int(clamp(n / 2097152l, 1l, 64l)) : 1
     unsafe {
-        let sp = reinterpret<float const?>(addr(src[0]))
+        let sp = addr<float const?>(src[0])
         var qp = addr(qdst[0])
         var scp = addr(sdst[0])
         maybe_parallel_for(0, int(n / QK8), njobs) $(rb, re) {
