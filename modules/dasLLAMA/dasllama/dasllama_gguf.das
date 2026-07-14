@@ -5,6 +5,8 @@ module dasllama_gguf shared public
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs
 require strings
 require llvm/daslib/f16_cvt public  // f16_to_f32 / f32_to_f16 (re-export: whisper/vad/parakeet/audio callers)
+require dasllama/dasllama_par       // maybe_parallel_for — the transcode hot loops thread when a jobque is up
+require dasllama/dasllama_math      // count_inline_run / count_parallel_dispatch_thru (the par macro's emitted counters)
 
 // Generic GGUF (v2/v3) reader: parses the header, typed key-value metadata, and the
 // tensor-info table out of an mmap'd byte buffer, then exposes typed getters. Knows nothing
@@ -873,15 +875,32 @@ def gguf_transcode_q8_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {m.tensors[ti].n_elem} elems")
     }
     let nb = expect_n / 32l
-    var bo = m.data_offset + m.tensors[ti].offset + (src_off / 32l) * 34l
-    for (blk in range64(nb)) {
-        sdst[soff + blk] = f16_to_f32(rd_u16(bytes, bo))
-        bo += 2l
-        for (k in range64(32l)) {
-            let u = int(bytes[bo + k])
-            qdst[qoff + blk * 32l + k] = int8(u < 128 ? u : u - 256)
+    if (nb <= 0l) {
+        return
+    }
+    // pointerized + threaded: the quant copy is a bit-reinterpret (uint8 -> int8, same bits), so a
+    // block is 4 unaligned u64 moves + one f16 scale widen. Blocks are disjoint — bit-exact at any
+    // lane count; jobs are floored to ~1MB of source each so small tensors stay inline.
+    let base = m.data_offset + m.tensors[ti].offset + (src_off / 32l) * 34l
+    unsafe {
+        let srcp = reinterpret<uint8 const?>(addr(bytes[base]))
+        var qdp = addr(qdst[qoff])
+        var sdp = addr(sdst[soff])
+        let njobs = is_job_que_available() ? int(clamp(nb / 32768l, 1l, 64l)) : 1
+        maybe_parallel_for(0, int(nb), njobs) $(rb, re) {
+            unsafe {
+                for (blk in range64(int64(rb), int64(re))) {
+                    let bo = blk * 34l
+                    sdp[blk] = f16_to_f32(uint(srcp[bo]) | (uint(srcp[bo + 1l]) << 8u))
+                    let s64 = reinterpret<uint64 const?>(srcp + bo + 2l)
+                    var d64 = reinterpret<uint64?>(qdp + blk * 32l)
+                    d64[0] = s64[0]
+                    d64[1] = s64[1]
+                    d64[2] = s64[2]
+                    d64[3] = s64[3]
+                }
+            }
         }
-        bo += 32l
     }
 }
 

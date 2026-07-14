@@ -1207,7 +1207,19 @@ def private wscale_convert_f16(var t : Model) {
     }
     t.qscales16 |> resize(int(n))
     unsafe {
-        cvt_f32_to_f16(addr(t.qscales16[0]), addr(t.qscales[0]), n)
+        var dp = addr(t.qscales16[0])
+        let sp = reinterpret<float const?>(addr(t.qscales[0]))
+        // 32-aligned chunks keep any vectorized cvt kernel on whole groups
+        let nch = int(clamp(n / 1048576l, 1l, 64l))
+        maybe_parallel_for(0, int(n / 32l), is_job_que_available() ? nch : 1) $(rb, re) {
+            unsafe {
+                cvt_f32_to_f16(dp + int64(rb) * 32l, sp + int64(rb) * 32l, int64(re - rb) * 32l)
+            }
+        }
+        if (n % 32l != 0l) {
+            let t0 = (n / 32l) * 32l
+            cvt_f32_to_f16(dp + t0, sp + t0, n - t0)
+        }
     }
     delete t.qscales
     t.wscale_f16 = true
@@ -1215,6 +1227,80 @@ def private wscale_convert_f16(var t : Model) {
 }
 
 //! Load a llama-architecture GGUF into the split layout at the requested precision. The big weights
+// A repack work item: one mr-aligned row-chunk of a weight region. fmt: 0 = q8 (qblob/qscales),
+// 1 = mx4 (mxq/mxs), 4/5/6 = the kq plane pairs. Chunking splits huge regions (the classifier) for
+// load balance; 1024 is a multiple of every backend mr, so row groups never straddle a boundary.
+struct private RepackReg {
+    off : int64
+    n : int64
+    d : int64
+    fmt : int
+}
+
+def private push_repack(var regs : array<RepackReg>; fmt : int; off, n, d : int64) {
+    var r0 = 0l
+    while (r0 < d) {
+        let rc = min(1024l, d - r0)
+        regs |> push(RepackReg(off = off + r0 * n, n = n, d = rc, fmt = fmt))
+        r0 += rc
+    }
+}
+
+// Run every collected repack across the jobque — regions are disjoint, so any lane count is
+// bit-exact. Workers touch hoisted raw pointers + the hoisted backend fn values only.
+def private repack_regions(var t : Model; regs : array<RepackReg>) {
+    if (empty(regs)) {
+        return
+    }
+    let rq8 = g_repack_q8q8
+    let rkq = g_repack_kq
+    let rmx = g_repack_mx4
+    unsafe {
+        var qbp : int8? = null
+        var qsp : float? = null
+        var mxqp : uint8? = null
+        var mxsp : uint8? = null
+        var k4qp : uint8? = null
+        var k4sp : uint8? = null
+        var k5qp : uint8? = null
+        var k5sp : uint8? = null
+        var k6qp : uint8? = null
+        var k6sp : uint8? = null
+        if (!empty(t.qblob)) { qbp = addr(t.qblob[0]) }
+        if (!empty(t.qscales)) { qsp = addr(t.qscales[0]) }
+        if (!empty(t.mxq)) { mxqp = addr(t.mxq[0]) }
+        if (!empty(t.mxs)) { mxsp = addr(t.mxs[0]) }
+        if (!empty(t.k4q)) { k4qp = addr(t.k4q[0]) }
+        if (!empty(t.k4s)) { k4sp = addr(t.k4s[0]) }
+        if (!empty(t.k5q)) { k5qp = addr(t.k5q[0]) }
+        if (!empty(t.k5s)) { k5sp = addr(t.k5s[0]) }
+        if (!empty(t.k6q)) { k6qp = addr(t.k6q[0]) }
+        if (!empty(t.k6s)) { k6sp = addr(t.k6s[0]) }
+        let rp = reinterpret<RepackReg const?>(addr(regs[0]))
+        let nr = length(regs)
+        let njobs = is_job_que_available() ? min(nr, 4 * (get_total_hw_jobs() + 1)) : 1
+        maybe_parallel_for(0, nr, njobs) $(rb, re) {
+            unsafe {
+                for (i in range(rb, re)) {
+                    let f = rp[i].fmt
+                    if (f == 0) {
+                        invoke(rq8, qbp + rp[i].off, qsp + rp[i].off / 32l, rp[i].n, rp[i].d)
+                    } elif (f == 1) {
+                        invoke(rmx, mxqp + rp[i].off / 2l, mxsp + rp[i].off / 32l, rp[i].n, rp[i].d)
+                    } else {
+                        let sb = rp[i].off / 256l
+                        let qsb = f == 4 ? 128l : (f == 5 ? 160l : 192l)
+                        let ssb = f == 6 ? 18l : 20l
+                        var kqp = f == 4 ? k4qp : (f == 5 ? k5qp : k6qp)
+                        var ksp = f == 4 ? k4sp : (f == 5 ? k5sp : k6sp)
+                        invoke(rkq, f, kqp + sb * qsb, ksp + sb * ssb, rp[i].n, rp[i].d)
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Repack every Q8 2D weight tensor in qblob/qscales into the active backend's interleaved layout, IN
 // PLACE, once at load. Mirrors forward()'s per-tensor offsets/shapes exactly; the embedding + norms
 // live in fblob and are never touched. Called only after select_matmul_backend_for_load() picks a
@@ -1224,6 +1310,7 @@ def private repack_q8_weights(var t : Model) {
     let c = t.config
     let dim = c.dim
     let hidden = c.hidden_dim
+    var regs : array<RepackReg>
     for (l in range64(c.n_layers)) {
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
@@ -1232,92 +1319,94 @@ def private repack_q8_weights(var t : Model) {
         // Recurrent (deltanet) layers carry no attention projections (offsets -1) — their own
         // matrices repack below.
         if (t.wq_offs[l] >= 0l && fmt_at(t.wq_fmt, l) == KqFmt.q8) {
-            repack_q8q8_weight(t.qblob, t.qscales, t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
+            push_repack(regs, 0, t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
         }
         if (t.wk_offs[l] >= 0l && fmt_at(t.wk_fmt, l) == KqFmt.q8) {   // absent on E-series shared-KV layers
-            repack_q8q8_weight(t.qblob, t.qscales, t.wk_offs[l], dim, kv)
+            push_repack(regs, 0, t.wk_offs[l], dim, kv)
         }
         if (t.wv_offs[l] >= 0l && fmt_at(t.wv_fmt, l) == KqFmt.q8) {
-            repack_q8q8_weight(t.qblob, t.qscales, t.wv_offs[l], dim, kv)
+            push_repack(regs, 0, t.wv_offs[l], dim, kv)
         }
         if (t.wo_offs[l] >= 0l && fmt_at(t.wo_fmt, l) == KqFmt.q8) {
-            repack_q8q8_weight(t.qblob, t.qscales, t.wo_offs[l], qd, dim)
+            push_repack(regs, 0, t.wo_offs[l], qd, dim)
         }
         if (layer_is_recurrent(c, l)) {  // deltanet projections (all q8 in v1 — no kq tags)
             let cd = dn_conv_dim(c)
-            repack_q8q8_weight(t.qblob, t.qscales, t.dnqkv_offs[l], dim, cd)
-            repack_q8q8_weight(t.qblob, t.qscales, t.dngate_offs[l], dim, c.ssm_d_inner)
+            push_repack(regs, 0, t.dnqkv_offs[l], dim, cd)
+            push_repack(regs, 0, t.dngate_offs[l], dim, c.ssm_d_inner)
             if (t.dnbeta_offs[l] >= 0l) {   // -1 when beta/alpha ship F32 (fblob, no repack)
-                repack_q8q8_weight(t.qblob, t.qscales, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
-                repack_q8q8_weight(t.qblob, t.qscales, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
+                push_repack(regs, 0, t.dnbeta_offs[l], dim, c.ssm_dt_rank)
+                push_repack(regs, 0, t.dnalpha_offs[l], dim, c.ssm_dt_rank)
             }
-            repack_q8q8_weight(t.qblob, t.qscales, t.dnout_offs[l], c.ssm_d_inner, dim)
+            push_repack(regs, 0, t.dnout_offs[l], c.ssm_d_inner, dim)
         }
         if (has_ple(c)) {  // gemma-4 E-series per-layer PLE gate/proj (the emb table stays linear, unpacked)
             let ple = c.n_embd_per_layer
-            repack_q8q8_weight(t.qblob, t.qscales, t.ple_gate_off + l * dim * ple, dim, ple)
-            repack_q8q8_weight(t.qblob, t.qscales, t.ple_proj_off + l * ple * dim, ple, dim)
+            push_repack(regs, 0, t.ple_gate_off + l * dim * ple, dim, ple)
+            push_repack(regs, 0, t.ple_proj_off + l * ple * dim, ple, dim)
         }
         if (c.n_expert > 0l) {   // MoE: each expert slice is its own 2D tensor, repacked per its shape
             let ege = dim * c.n_ff_exp
             if (!t.experts_mx4) {   // native-MXFP4 stacks live in mxq/mxs, row-major (no Q8 repack)
                 for (e in range64(c.n_expert)) {
                     if (fmt_at(t.we1_fmt, l) == KqFmt.q8) {
-                        repack_q8q8_weight(t.qblob, t.qscales, t.we1_offs[l] + e * ege, dim, c.n_ff_exp)
+                        push_repack(regs, 0, t.we1_offs[l] + e * ege, dim, c.n_ff_exp)
                     }
                     if (fmt_at(t.we2_fmt, l) == KqFmt.q8) {
-                        repack_q8q8_weight(t.qblob, t.qscales, t.we2_offs[l] + e * ege, c.n_ff_exp, dim)
+                        push_repack(regs, 0, t.we2_offs[l] + e * ege, c.n_ff_exp, dim)
                     }
                     if (fmt_at(t.we3_fmt, l) == KqFmt.q8) {
-                        repack_q8q8_weight(t.qblob, t.qscales, t.we3_offs[l] + e * ege, dim, c.n_ff_exp)
+                        push_repack(regs, 0, t.we3_offs[l] + e * ege, dim, c.n_ff_exp)
                     }
                 }
             }
             if (c.n_ff_shexp > 0l) {
                 let she = dim * c.n_ff_shexp
-                repack_q8q8_weight(t.qblob, t.qscales, t.wsh1_off + l * she, dim, c.n_ff_shexp)
-                repack_q8q8_weight(t.qblob, t.qscales, t.wsh2_off + l * she, c.n_ff_shexp, dim)
-                repack_q8q8_weight(t.qblob, t.qscales, t.wsh3_off + l * she, dim, c.n_ff_shexp)
+                push_repack(regs, 0, t.wsh1_off + l * she, dim, c.n_ff_shexp)
+                push_repack(regs, 0, t.wsh2_off + l * she, c.n_ff_shexp, dim)
+                push_repack(regs, 0, t.wsh3_off + l * she, dim, c.n_ff_shexp)
             }
             if (c.moe_dense_shexp) {  // gemma4: the dense parallel shared expert repacks like a plain FFN
                 if (fmt_at(t.w1_fmt, l) == KqFmt.q8) {
-                    repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, hidden)
+                    push_repack(regs, 0, t.w1_offs[l], dim, hidden)
                 }
                 if (fmt_at(t.w2_fmt, l) == KqFmt.q8) {
-                    repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], hidden, dim)
+                    push_repack(regs, 0, t.w2_offs[l], hidden, dim)
                 }
                 if (fmt_at(t.w3_fmt, l) == KqFmt.q8) {
-                    repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, hidden)
+                    push_repack(regs, 0, t.w3_offs[l], dim, hidden)
                 }
             }
         } else {
             let h = layer_hidden(t, l)
             if (fmt_at(t.w1_fmt, l) == KqFmt.q8) {
-                repack_q8q8_weight(t.qblob, t.qscales, t.w1_offs[l], dim, h)
+                push_repack(regs, 0, t.w1_offs[l], dim, h)
             }
             if (fmt_at(t.w2_fmt, l) == KqFmt.q8) {
-                repack_q8q8_weight(t.qblob, t.qscales, t.w2_offs[l], h, dim)
+                push_repack(regs, 0, t.w2_offs[l], h, dim)
             }
             if (fmt_at(t.w3_fmt, l) == KqFmt.q8) {
-                repack_q8q8_weight(t.qblob, t.qscales, t.w3_offs[l], dim, h)
+                push_repack(regs, 0, t.w3_offs[l], dim, h)
             }
         }
     }
     if ((!c.shared_weights && t.wcls_fmt == KqFmt.q8) || t.cls_q8) {
         // the linear copy at emb_q8_off is deliberately NOT repacked — embedding-row dequant
         // indexes it directly. K-quant classifiers (either tying) stay in their plane, unpacked.
-        repack_q8q8_weight(t.qblob, t.qscales, t.wcls_off, dim, c.vocab_size)
+        push_repack(regs, 0, t.wcls_off, dim, c.vocab_size)
     }
+    repack_regions(t, regs)
+    delete regs
 }
 
 // route one kq-tagged tensor to its format's plane pair (q8 tags no-op — those live in qblob)
-def private repack_kq_tensor(var t : Model; fmt : KqFmt; woff, n, d : int64) {
+def private push_repack_kq(var regs : array<RepackReg>; fmt : KqFmt; woff, n, d : int64) {
     if (fmt == KqFmt.k4) {
-        repack_kq_weight(4, t.k4q, t.k4s, woff, n, d)
+        push_repack(regs, 4, woff, n, d)
     } elif (fmt == KqFmt.k5) {
-        repack_kq_weight(5, t.k5q, t.k5s, woff, n, d)
+        push_repack(regs, 5, woff, n, d)
     } elif (fmt == KqFmt.k6) {
-        repack_kq_weight(6, t.k6q, t.k6s, woff, n, d)
+        push_repack(regs, 6, woff, n, d)
     }
 }
 
@@ -1328,47 +1417,50 @@ def private repack_kq_tensor(var t : Model; fmt : KqFmt; woff, n, d : int64) {
 def private repack_kq_weights(var t : Model) {
     let c = t.config
     let dim = c.dim
+    var regs : array<RepackReg>
     for (l in range64(c.n_layers)) {
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
         // recurrent (deltanet) layers carry no attention projections (offsets -1); their own
         // matrices are untagged q8 in v1, so there is nothing kq to repack on them
         if (t.wq_offs[l] >= 0l) {
-            repack_kq_tensor(t, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
+            push_repack_kq(regs, fmt_at(t.wq_fmt, l), t.wq_offs[l], dim, qd * (c.q_gated ? 2l : 1l))
         }
         if (t.wk_offs[l] >= 0l) {
-            repack_kq_tensor(t, fmt_at(t.wk_fmt, l), t.wk_offs[l], dim, kv)
+            push_repack_kq(regs, fmt_at(t.wk_fmt, l), t.wk_offs[l], dim, kv)
         }
         if (t.wv_offs[l] >= 0l) {
-            repack_kq_tensor(t, fmt_at(t.wv_fmt, l), t.wv_offs[l], dim, kv)
+            push_repack_kq(regs, fmt_at(t.wv_fmt, l), t.wv_offs[l], dim, kv)
         }
         if (t.wo_offs[l] >= 0l) {
-            repack_kq_tensor(t, fmt_at(t.wo_fmt, l), t.wo_offs[l], qd, dim)
+            push_repack_kq(regs, fmt_at(t.wo_fmt, l), t.wo_offs[l], qd, dim)
         }
         if (c.n_expert > 0l) {
             if (!t.experts_mx4) {   // each expert slice grp-repacks independently, like the Q8 loop
                 let ege = dim * c.n_ff_exp
                 for (e in range64(c.n_expert)) {
-                    repack_kq_tensor(t, fmt_at(t.we1_fmt, l), t.we1_offs[l] + e * ege, dim, c.n_ff_exp)
-                    repack_kq_tensor(t, fmt_at(t.we2_fmt, l), t.we2_offs[l] + e * ege, c.n_ff_exp, dim)
-                    repack_kq_tensor(t, fmt_at(t.we3_fmt, l), t.we3_offs[l] + e * ege, dim, c.n_ff_exp)
+                    push_repack_kq(regs, fmt_at(t.we1_fmt, l), t.we1_offs[l] + e * ege, dim, c.n_ff_exp)
+                    push_repack_kq(regs, fmt_at(t.we2_fmt, l), t.we2_offs[l] + e * ege, c.n_ff_exp, dim)
+                    push_repack_kq(regs, fmt_at(t.we3_fmt, l), t.we3_offs[l] + e * ege, dim, c.n_ff_exp)
                 }
             }
             if (c.moe_dense_shexp) {
-                repack_kq_tensor(t, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, c.hidden_dim)
-                repack_kq_tensor(t, fmt_at(t.w2_fmt, l), t.w2_offs[l], c.hidden_dim, dim)
-                repack_kq_tensor(t, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, c.hidden_dim)
+                push_repack_kq(regs, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, c.hidden_dim)
+                push_repack_kq(regs, fmt_at(t.w2_fmt, l), t.w2_offs[l], c.hidden_dim, dim)
+                push_repack_kq(regs, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, c.hidden_dim)
             }
         } else {
             let h = layer_hidden(t, l)
-            repack_kq_tensor(t, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, h)
-            repack_kq_tensor(t, fmt_at(t.w2_fmt, l), t.w2_offs[l], h, dim)
-            repack_kq_tensor(t, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, h)
+            push_repack_kq(regs, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, h)
+            push_repack_kq(regs, fmt_at(t.w2_fmt, l), t.w2_offs[l], h, dim)
+            push_repack_kq(regs, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, h)
         }
     }
     if ((!c.shared_weights && t.wcls_fmt != KqFmt.q8) || cls_kq(t)) {
-        repack_kq_tensor(t, c.shared_weights ? t.emb_fmt : t.wcls_fmt, t.wcls_off, dim, c.vocab_size)
+        push_repack_kq(regs, c.shared_weights ? t.emb_fmt : t.wcls_fmt, t.wcls_off, dim, c.vocab_size)
     }
+    repack_regions(t, regs)
+    delete regs
 }
 
 // Repack the native-MXFP4 expert stacks into the active backend's interleaved mx layout, IN PLACE
@@ -1378,14 +1470,17 @@ def private repack_mx4_stacks(var t : Model) {
     let c = t.config
     let dim = c.dim
     let ege = dim * c.n_ff_exp
+    var regs : array<RepackReg>
     for (l in range64(c.n_layers)) {
         for (e in range64(c.n_expert)) {
             let base = e * ege
-            repack_mx4_weight(t.mxq, t.mxs, t.we1_offs[l] + base, dim, c.n_ff_exp)
-            repack_mx4_weight(t.mxq, t.mxs, t.we2_offs[l] + base, c.n_ff_exp, dim)
-            repack_mx4_weight(t.mxq, t.mxs, t.we3_offs[l] + base, dim, c.n_ff_exp)
+            push_repack(regs, 1, t.we1_offs[l] + base, dim, c.n_ff_exp)
+            push_repack(regs, 1, t.we2_offs[l] + base, c.n_ff_exp, dim)
+            push_repack(regs, 1, t.we3_offs[l] + base, dim, c.n_ff_exp)
         }
     }
+    repack_regions(t, regs)
+    delete regs
 }
 
 //! go straight into `mode`'s storage (pre-quantized tensors transcode block-for-block with no fp32
@@ -1393,8 +1488,23 @@ def private repack_mx4_stacks(var t : Model) {
 //! load never holds the dense fp32 weights. The embedding + norms stay fp32 in fblob regardless.
 //! Config comes from metadata; vocab is derived from token_embd (some files omit llama.vocab_size).
 def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
+    //! The conversion passes (transcode/repack/wscale) thread across the jobque; spin a scoped one
+    //! for the load when the caller hasn't (the server/tools start theirs after the model loads).
+    if (is_job_que_available()) {
+        return <- load_gguf_impl(path, mode)
+    }
+    var t = Model()
+    with_job_que() {
+        t <- load_gguf_impl(path, mode)
+    }
+    return <- t
+}
+
+def private load_gguf_impl(path : string; mode : QuantMode) : Model {
     var t = Model()
     t.quant = mode
+    let ts_load = ref_time_ticks()
+    var ts_stage = ref_time_ticks()
     let f = fopen(path, "rb")
     if (f == null) {
         panic("dasLLAMA: cannot open gguf '{path}'")
@@ -1921,6 +2031,8 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
             gguf_read_tensor_f32(m, bytes, "per_layer_proj_norm.weight", t.fblob, t.ple_pnorm_off, ple)
         }
+        to_log(LOG_INFO, "dasLLAMA: load stage meta+config+smalls: {get_time_usec(ts_stage) / 1000} ms\n")
+        ts_stage = ref_time_ticks()
         // big 2D weights -> active precision. ggml stores them row-major [out x in] = our convention.
         var scratch : array<float>
         for (l in range64(layers)) {
@@ -2064,6 +2176,8 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
             }
         }
         delete scratch
+        to_log(LOG_INFO, "dasLLAMA: load stage weights: {get_time_usec(ts_stage) / 1000} ms\n")
+        ts_stage = ref_time_ticks()
         // arm64: switch to the laneq backend and repack the just-loaded Q8 weights into its interleaved
         // layout. Returns false off-ARM (portable stays, weights stay row-major).
         if (mode == QuantMode.q8 && select_matmul_backend_for_load()) {
@@ -2080,9 +2194,12 @@ def load_gguf(path : string; mode : QuantMode = QuantMode.fp32) : Model {
                 to_log(LOG_INFO, "dasLLAMA: K-quant planes repacked to the '{active_kernel_backend()}' layouts (k4 grp{t.kq_repack_mr4}, k5 grp{t.kq_repack_mr5}, k6 grp{t.kq_repack_mr6})\n")
             }
         }
+        to_log(LOG_INFO, "dasLLAMA: load stage repack: {get_time_usec(ts_stage) / 1000} ms\n")
+        ts_stage = ref_time_ticks()
         if (mode == QuantMode.q8 && g_wscale_f16) {
             wscale_convert_f16(t)
         }
+        to_log(LOG_INFO, "dasLLAMA: load stage wscale: {get_time_usec(ts_stage) / 1000} ms, total {get_time_usec(ts_load) / 1000} ms\n")
     }
     fclose(f)
     return <- t
