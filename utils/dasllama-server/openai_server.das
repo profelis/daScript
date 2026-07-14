@@ -644,7 +644,11 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
                 calls |> reserve(length(tc.value as _array))
                 for (tcall in (tc.value as _array)) {
                     let fv = tcall?["function"]
-                    let cname = fv?["name"] ?? ""
+                    var nv = JV(fv?["name"] ?? "")   // JSON-escape the name (quotes/backslashes)
+                    let cname = write_json_compact(nv)
+                    unsafe {
+                        delete nv
+                    }
                     let av = fv?["arguments"]
                     var argstr = "\{}"
                     if (av != null && av.value is _string) {
@@ -655,7 +659,7 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
                     } elif (av != null && !(av.value is _null)) {
                         argstr = write_json_compact(av)   // tolerated: arguments sent as an object
                     }
-                    calls |> push("\{\"name\": \"{cname}\", \"arguments\": {argstr}}")
+                    calls |> push("\{\"name\": {cname}, \"arguments\": {argstr}}")
                 }
             }
             if (pending) {
