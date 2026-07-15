@@ -6674,6 +6674,14 @@ def private mtp_verify_row0(t : Model; var s : Session) {
     } else {
         mm(s.mtp_logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
     }
+    // mirror the plain classifier tail exactly — `truth` is the invariance contract's load-bearing
+    // edge, so it must match plain decode BY CONSTRUCTION (inert on qwen35: no softcap, no suppress)
+    if (c.final_logit_softcap > 0.0) {
+        softcap4(s.mtp_logits, c.vocab_size, c.final_logit_softcap)
+    }
+    for (id in t.suppress) {
+        s.mtp_logits[id] = -1.0e30
+    }
 }
 
 //! Greedy decode with MTP/NextN depth-1 self-speculation (config.n_layer_nextn == 1; flat KV
