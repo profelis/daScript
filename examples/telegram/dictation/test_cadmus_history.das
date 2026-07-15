@@ -37,9 +37,9 @@ def test_history_migrations_linq_and_fts(t : T?) {
     remove(path)
     ensure_cadmus_database(path)
 
-    t |> run("starts at migration six") @(t : T?) {
+    t |> run("starts at migration seven") @(t : T?) {
         with_sqlite(path) $(db) {
-            t |> equal(db |> current_schema_version(), 6)
+            t |> equal(db |> current_schema_version(), 7)
         }
     }
 
@@ -281,6 +281,7 @@ def test_history_migrations_linq_and_fts(t : T?) {
             t |> equal(first[0].MessageJson, "\{\"message_id\":800,\"caption\":\"new\"}")
             t |> equal(first[0].Attempts, 1)
             t |> equal(first[0].Status, "processing")
+            checkpoint_cadmus_live_transcript(path, first[0], "raw words", "English", 1900l)
             retry_cadmus_live_audio(path, first[0], "server down", 2000l, 2600l)
         }
         t |> success(!has_ready_cadmus_live_audio(path, 2599l))
@@ -289,6 +290,8 @@ def test_history_migrations_linq_and_fts(t : T?) {
         t |> equal(length(second), 1)
         if (length(second) == 1) {
             t |> equal(second[0].Attempts, 2)
+            t |> equal(second[0].RawTranscript, "raw words")
+            t |> equal(second[0].TranscriptLanguage, "English")
             finish_cadmus_live_audio(path, second[0], 2700l)
         }
         t |> success(!has_ready_cadmus_live_audio(path, 9999l))

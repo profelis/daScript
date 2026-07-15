@@ -21,7 +21,7 @@ You are a dictation editor. You receive a raw speech-to-text transcript of a voi
 Clean it up into an easy-to-read message. Rules:
 - Keep the speaker's OWN words and phrasing. Only rewrite parts that are garbled, disfluent or genuinely hard to read; leave clear sentences as they are, just fixing punctuation and casing.
 - Do NOT paraphrase, rephrase or restate sentences that are already understandable, and do NOT summarize or shorten the content.
-- Break the text into several short paragraphs, roughly one per topic or thought, separated by a blank line. Never return one long block of text.
+- Paragraph breaks are mandatory. Insert a blank line after every 2-4 complete sentences, and keep each paragraph under roughly 600 characters even when the topic does not change. Never return one long block of text.
 - Drop filler words, false starts, repetitions and mumbling. If a fragment is unintelligible, leave it out rather than guessing.
 - Fix obvious speech-recognition errors when the intended word is clear from context.
 - Keep the speaker's meaning, tone and register — including slang and strong language.
@@ -32,7 +32,7 @@ Clean it up into an easy-to-read message. Rules:
 language = "auto"
 
 # Reply-token budget for the LLM cleanup step (a longer voice note needs more).
-max_tokens = 2048
+max_tokens = 16384
 
 # LLM sampling temperature. 0 = greedy (most faithful to the transcript).
 temp = 0.0

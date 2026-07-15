@@ -83,6 +83,8 @@ struct CadmusLiveAudio {
     ChatId : int64
     TelegramMessageId : int64
     MessageJson : string
+    RawTranscript : string
+    TranscriptLanguage : string
     Status : string
     Attempts : int
     LastError : string
@@ -221,6 +223,14 @@ def cadmus_migration_006(db : SqlRunner) {
     db |> exec(
         "CREATE INDEX idx_cadmus_live_audio_ready " +
         "ON cadmus_live_audio(Status, NextAttemptAt, EnqueuedAt)")
+}
+
+// ASR is the expensive half of a live job. Preserve a successful raw transcript so a cleanup,
+// Telegram delivery, or bot restart failure never sends the same audio through ASR again.
+[sql_migration(version = 7, description = "checkpoint live Telegram ASR results")]
+def cadmus_migration_007(db : SqlRunner) {
+    db |> exec("ALTER TABLE cadmus_live_audio ADD COLUMN RawTranscript TEXT NOT NULL DEFAULT ''")
+    db |> exec("ALTER TABLE cadmus_live_audio ADD COLUMN TranscriptLanguage TEXT NOT NULL DEFAULT ''")
 }
 
 def with_cadmus_database(path : string; blk : block<(db : SqlRunner) : void>) {
@@ -567,6 +577,20 @@ def retry_cadmus_live_audio(
             _.Id == item.Id,
             (Status = "failed", LastError = error,
              UpdatedAt = now, NextAttemptAt = next_attempt_at))
+    }
+}
+
+def checkpoint_cadmus_live_transcript(
+                                      path : string;
+                                      item : CadmusLiveAudio;
+                                      transcript, language : string;
+                                      now : int64
+                                      ) {
+    with_cadmus_database(path) $(db) {
+        db |> _sql_update(
+            type<CadmusLiveAudio>,
+            _.Id == item.Id,
+            (RawTranscript = transcript, TranscriptLanguage = language, UpdatedAt = now))
     }
 }
 

@@ -50,7 +50,7 @@ struct DictationConfig {
     prompt : string = ""              // legacy name for dictation_prompt
     dictation_prompt : string = ""    // transcript-repair prompt; \{language\} or \{lang\} is replaced
     language : string = "auto"        // ASR language hint ("auto" detects per message)
-    max_tokens : int = 2048           // reply-token budget for the LLM cleanup
+    max_tokens : int = 16384          // reply-token budget for the LLM cleanup
     temp : float = 0.0                // LLM sampling temperature (0 = greedy, faithful)
     asr_timeout : int = 900           // seconds to wait for ASR, including time queued behind bulk work
     llm_timeout : int = 900           // seconds to wait for the LLM cleanup response
@@ -161,8 +161,9 @@ def default_prompt() : string {
             "genuinely hard to read; leave clear sentences as they are, just fixing punctuation and casing.\n" +
             "- Do NOT paraphrase, rephrase or restate sentences that are already understandable, and do NOT " +
             "summarize or shorten the content.\n" +
-            "- Break the text into several short paragraphs, roughly one per topic or thought, separated by " +
-            "a blank line. Never return one long block of text.\n" +
+            "- Paragraph breaks are mandatory. Insert a blank line after every 2-4 complete sentences, " +
+            "and keep each paragraph under roughly 600 characters even when the topic does not change. " +
+            "Never return one long block of text.\n" +
             "- Drop filler words, false starts, repetitions and mumbling. If a fragment is unintelligible, " +
             "leave it out rather than guessing.\n" +
             "- Fix obvious speech-recognition errors when the intended word is clear from context.\n" +
@@ -1384,7 +1385,7 @@ def private send_summary(msg : message; command_text : string) {
 // Download → transcode → server transcribe → server cleanup → reply. Every heavy allocation
 // (download bytes, JSON trees) is a local here and is freed as soon as it's done; anything not
 // deleted on an error path is out of scope on return and reclaimed by main's heap_collect.
-def private process_audio_message(msg : message; var retry_error : string&) : string {
+def private process_audio_message(msg : message; job : CadmusLiveAudio; var retry_error : string&) : string {
     var kind = ""
     let file_id = audio_of(msg, kind)
     if (empty(file_id)) {
@@ -1394,62 +1395,69 @@ def private process_audio_message(msg : message; var retry_error : string&) : st
     logger_info("dictation.msg", "{kind} from {sender_ident(msg)} in chat {chat_id}")
     let t0 = ref_time_ticks()
 
-    // resolve + download the file
-    let finfo <- telegram_getFile(get_file(file_id = file_id))
-    if (!empty(telegram_get_last_error())) {
-        retry_error = "Telegram getFile failed: {telegram_get_last_error()}"
-        logger_error("dictation.msg", retry_error)
-        return ""
-    }
-    var bytes <- telegram_download(finfo)
-    if (empty(bytes)) {
-        retry_error = "Telegram download failed: {telegram_get_last_error()}"
-        logger_error("dictation.msg", retry_error)
-        return ""
-    }
-
-    // stage to temp, transcode to wav
-    let base = path_join(tmpdir(), "dictation_{finfo.file_unique_id}")
-    let src = "{base}.audio"
-    let wav = "{base}.wav"
-    fopen(src, "wb") $(f) {
-        if (f != null) {
-            fwrite(f, bytes)
-        }
-    }
-    // optional archive of the original audio (date + sender id + Telegram's file name, real extension).
-    // archived stays in scope so the transcript line below can link to the exact audio file.
+    var transcript := job.RawTranscript
+    var lang := job.TranscriptLanguage
     var archived = ""
-    if (!empty(g_cfg.keep_audio_dir)) {
-        mkdir_rec(g_cfg.keep_audio_dir)
-        let sid = msg._from != null ? "{msg._from.id}" : "0"
-        archived = path_join(g_cfg.keep_audio_dir, "{msg.date}_{sid}_{base_name(finfo.file_path)}")
-        fopen(archived, "wb") $(f) {
+    if (empty(transcript)) {
+        // resolve + download the file
+        let finfo <- telegram_getFile(get_file(file_id = file_id))
+        if (!empty(telegram_get_last_error())) {
+            retry_error = "Telegram getFile failed: {telegram_get_last_error()}"
+            logger_error("dictation.msg", retry_error)
+            return ""
+        }
+        var bytes <- telegram_download(finfo)
+        if (empty(bytes)) {
+            retry_error = "Telegram download failed: {telegram_get_last_error()}"
+            logger_error("dictation.msg", retry_error)
+            return ""
+        }
+
+        // stage to temp, transcode to wav
+        let base = path_join(tmpdir(), "dictation_{finfo.file_unique_id}")
+        let src = "{base}.audio"
+        let wav = "{base}.wav"
+        fopen(src, "wb") $(f) {
             if (f != null) {
                 fwrite(f, bytes)
             }
         }
-    }
-    delete bytes   // heavy download buffer — done once staged to disk
-    let ok = transcode_to_wav(g_cfg, src, wav)
-    remove(src)
-    if (!ok) {
-        remove(wav)
-        logger_error("dictation.msg", "ffmpeg failed on {kind}")
-        report_error(msg, "Transcription failed: the audio format could not be decoded.")
-        return ""
-    }
+        // optional archive of the original audio (date + sender id + Telegram's file name, real extension).
+        // archived stays in scope so the transcript line below can link to the exact audio file.
+        if (!empty(g_cfg.keep_audio_dir)) {
+            mkdir_rec(g_cfg.keep_audio_dir)
+            let sid = msg._from != null ? "{msg._from.id}" : "0"
+            archived = path_join(g_cfg.keep_audio_dir, "{msg.date}_{sid}_{base_name(finfo.file_path)}")
+            fopen(archived, "wb") $(f) {
+                if (f != null) {
+                    fwrite(f, bytes)
+                }
+            }
+        }
+        delete bytes   // heavy download buffer — done once staged to disk
+        let ok = transcode_to_wav(g_cfg, src, wav)
+        remove(src)
+        if (!ok) {
+            remove(wav)
+            logger_error("dictation.msg", "ffmpeg failed on {kind}")
+            report_error(msg, "Transcription failed: the audio format could not be decoded.")
+            return ""
+        }
 
-    // speech-to-text on the server (verbose_json carries the detected language)
-    var transcript = ""
-    var lang = g_cfg.language
-    var terr = ""
-    let tok = server_transcribe(wav, transcript, lang, terr)
-    remove(wav)
-    if (!tok) {
-        retry_error = "transcription failed: {terr}"
-        logger_error("dictation.msg", retry_error)
-        return ""
+        // speech-to-text on the server (verbose_json carries the detected language)
+        lang = g_cfg.language
+        var terr = ""
+        let tok = server_transcribe(wav, transcript, lang, terr)
+        remove(wav)
+        if (!tok) {
+            retry_error = "transcription failed: {terr}"
+            logger_error("dictation.msg", retry_error)
+            return ""
+        }
+        checkpoint_cadmus_live_transcript(g_db_path, job, transcript, lang, int64(get_clock()))
+        logger_info("dictation.queue", "checkpointed ASR for message {job.TelegramMessageId}")
+    } else {
+        logger_info("dictation.queue", "reusing ASR checkpoint for message {job.TelegramMessageId}")
     }
     // transcript in the full log, linked to its archived audio file (empty audio if archiving is off)
     logger_info("dictation.msg", "transcript: {transcript}", JV((lang = lang, audio = archived)))
@@ -1495,6 +1503,8 @@ def private enqueue_audio_message(msg : message) {
         ChatId = msg.chat.id,
         TelegramMessageId = msg.message_id,
         MessageJson = sprint_json(msg, false),
+        RawTranscript = "",
+        TranscriptLanguage = "",
         Status = "pending",
         Attempts = 0,
         LastError = "",
@@ -1529,7 +1539,7 @@ def private process_next_audio_message() : bool {
     }
 
     var retry_error = ""
-    let cleaned = process_audio_message(msg, retry_error)
+    let cleaned = process_audio_message(msg, job, retry_error)
     if (!empty(retry_error)) {
         let failed_at = int64(get_clock())
         let next_attempt = failed_at + live_audio_retry_delay(job.Attempts)
