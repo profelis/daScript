@@ -3,9 +3,11 @@ options rtti
 
 require daslib/clargs
 require daslib/fio
+require daslib/jobque_boost
 require daslib/strings_boost
 require daslib/strings_convert
 require sqlite/sqlite_migrate
+require math
 require cadmus_history
 require telegram_history_import
 
@@ -46,6 +48,9 @@ struct ImportHistoryArgs {
     @clarg_doc = "curl executable path (used for long-running multipart ASR requests)"
     curl : string = "curl"
 
+    @clarg_doc = "Parallel ASR request threads (default 2; match the server's --asr-workers)"
+    workers : int = 2
+
     @clarg_doc = "Also process the newest export page (normally skipped while Telegram is exporting)"
     include_last_page : bool
 
@@ -56,6 +61,118 @@ struct ImportHistoryArgs {
     @clarg_name = "show-help"
     @clarg_doc = "Show this help and exit"
     help : bool
+}
+
+struct private ImportAsrJob {
+    index : int
+    item : CadmusImportMedia
+    stop : bool
+}
+
+enum private ImportAsrEventKind {
+    completed
+    stopped
+}
+
+struct private ImportAsrEvent {
+    kind : ImportAsrEventKind
+    index : int
+    item : CadmusImportMedia
+    success : bool
+    transcript : string
+    error : string
+}
+
+def private import_asr_worker(
+                              worker_index : int;
+                              cfg : TelegramRawAsrConfig;
+                              root : string;
+                              var jobs : Channel?&;
+                              var events : Channel?&
+                              ) {
+    this_context().name := "cadmus_import_asr_{worker_index}"
+    var stopping = false
+    while (!stopping) {
+        jobs |> pop_with_timeout_clone(250) $(job : ImportAsrJob#) {
+            if (job.stop) {
+                stopping = true
+            } else {
+                var item : CadmusImportMedia
+                item := job.item
+                var transcript = ""
+                var error = ""
+                let success = raw_transcribe_cadmus_import_media(
+                    cfg, root, item, transcript, error)
+                events |> push_clone(ImportAsrEvent(
+                    kind = ImportAsrEventKind.completed, index = job.index,
+                    item = item, success = success, transcript = transcript, error = error))
+                delete item
+            }
+        }
+    }
+    events |> push_clone(ImportAsrEvent(kind = ImportAsrEventKind.stopped))
+    jobs |> release
+    events |> release
+}
+
+def private transcribe_import_queue(
+                                    args : ImportHistoryArgs;
+                                    asr : TelegramRawAsrConfig;
+                                    queue : array<CadmusImportMedia>
+                                    ) : int {
+    if (empty(queue)) {
+        return 0
+    }
+    let worker_count = clamp(args.workers, 1, min(length(queue), 8))
+    var jobs = unsafe(channel_create())
+    var events = unsafe(channel_create())
+    for (worker_index in range(worker_count)) {
+        let index_capture = worker_index
+        let cfg_capture = asr
+        let root_capture = args.root
+        var jobs_capture = jobs
+        var events_capture = events
+        new_thread() <| @capture(= index_capture, = cfg_capture, = root_capture,
+                                = jobs_capture, = events_capture) {
+            import_asr_worker(
+                index_capture, cfg_capture, root_capture, jobs_capture, events_capture)
+        }
+    }
+    for (index in range(length(queue))) {
+        jobs |> push_clone(ImportAsrJob(index = index, item = queue[index]))
+    }
+    for (_worker in range(worker_count)) {
+        jobs |> push_clone(ImportAsrJob(stop = true))
+    }
+    var completed = 0
+    var stopped = 0
+    var failures = 0
+    while (completed < length(queue) || stopped < worker_count) {
+        events |> pop_with_timeout_clone(1000) $(event : ImportAsrEvent#) {
+            if (event.kind == ImportAsrEventKind.stopped) {
+                stopped++
+            } else {
+                var result : ImportAsrEvent
+                result := event
+                completed++
+                print("ASR {completed}/{length(queue)} message {result.item.TelegramMessageId}... ")
+                if (result.success) {
+                    finish_cadmus_import_transcription(args.database, result.item, result.transcript)
+                    print("done ({length(result.transcript)} bytes; source #{result.index + 1})\n")
+                } else {
+                    failures++
+                    fail_cadmus_import_transcription(args.database, result.item, result.error)
+                    print("FAILED: {result.error} (source #{result.index + 1})\n")
+                }
+                delete result
+            }
+        }
+    }
+    unsafe {
+        jobs |> channel_remove
+        events |> channel_remove
+    }
+    return failures
 }
 
 def private export_page_number(path : string) : int {
@@ -203,21 +320,10 @@ def main() : int {
             Language = args.language,
             Ffmpeg = args.ffmpeg,
             Curl = args.curl)
-        print("\nRaw ASR queue: {length(queue)} audio files (no LLM postprocess)\n")
-        for (index in range(length(queue))) {
-            let item = queue[index]
-            var transcript = ""
-            var error = ""
-            print("ASR {index + 1}/{length(queue)} message {item.TelegramMessageId}... ")
-            if (raw_transcribe_cadmus_import_media(asr, args.root, item, transcript, error)) {
-                finish_cadmus_import_transcription(args.database, item, transcript)
-                print("done ({length(transcript)} bytes)\n")
-            } else {
-                transcription_failures++
-                fail_cadmus_import_transcription(args.database, item, error)
-                print("FAILED: {error}\n")
-            }
-        }
+        let worker_count = empty(queue) ? 0 : clamp(args.workers, 1, min(length(queue), 8))
+        print("\nRaw ASR queue: {length(queue)} audio files, {worker_count} request thread(s) " +
+              "(no LLM postprocess)\n")
+        transcription_failures = transcribe_import_queue(args, asr, queue)
         print("Raw ASR complete: {length(queue) - transcription_failures} done, " +
               "{transcription_failures} failed\n")
     }

@@ -23,15 +23,18 @@ require dasllama/dasllama_audio_io   // load_audio_16k_mono: any uploaded audio 
 // run_server's loop drives llm_scheduler (one eval_batch decode step over every live stream + one
 // bounded prefill chunk per tick) and routes SchedEvents back to each request's writer. Streaming
 // and buffered responses both ride the deferred writer ops, so N streams generate concurrently.
-// The buffered holdouts (/v1/models, /v1/embeddings, /v1/audio/*, /shutdown, /v1/stats) still run
-// to completion in-handler and stall generation for their duration.
+// ASR uploads are queued to long-lived new_thread workers, each with its own model/session/context;
+// the small buffered holdouts (/v1/models, /v1/embeddings, /shutdown, /v1/stats) still complete
+// in-handler.
 
 // ===== Served state (set once at startup; handlers run serially on the tick thread) =====
 
 var g_model = Model()
 var g_model_name = ""
-var g_asr = AsrModel()
 var g_has_asr = false
+var g_asr_path = ""
+var g_asr_mmproj = ""
+var g_asr_worker_count = 0
 var g_should_stop = false
 var g_req_counter = 0l
 var g_sched = Scheduler()       // live from run_server on; handlers submit into it
@@ -69,10 +72,13 @@ def set_default_max_tokens(n : int64) {
     g_default_max_new = n
 }
 
-//! Move a loaded ASR model in, enabling ``/v1/audio/transcriptions`` (call once, before run_server).
-def set_asr(var a : AsrModel) {
-    g_asr <- a
-    g_has_asr = true
+//! Configure long-lived ASR worker threads. Each worker loads and owns its model in its cloned
+//! context; model/session pointers never cross context heaps. Call once before ``run_server``.
+def configure_asr_workers(path, mmproj : string; workers : int = 1) {
+    g_asr_path = path
+    g_asr_mmproj = mmproj
+    g_asr_worker_count = clamp(workers, 1, 8)
+    g_has_asr = !empty(path)
 }
 
 //! Ask the tick loop to exit at the next iteration (also wired to ``POST /shutdown``).
@@ -220,6 +226,42 @@ struct private OaiVerboseTranscription {
     text : string
     segments : array<OaiVerboseSegment>
 }
+
+enum private AsrEventKind {
+    ready
+    started
+    completed
+    stopped
+}
+
+struct private AsrJob {
+    id : int64
+    temp_path : string
+    language : string
+    response_format : string
+    translate : bool
+    stop : bool
+}
+
+struct private AsrEvent {
+    kind : AsrEventKind
+    id : int64
+    status : int
+    content_type : string
+    body : string
+}
+
+struct private AsrWire {
+    @do_not_delete writer : HttpResponseWriter?
+}
+
+var g_asr_jobs : Channel?
+var g_asr_events : Channel?
+var g_asr_wires : table<int64; AsrWire>
+var g_asr_ready = 0
+var g_asr_active = 0
+var g_asr_pending = 0
+let ASR_QUEUE_LIMIT = 32
 
 // /v1/embeddings response shapes.
 struct private OaiEmbedding {
@@ -945,6 +987,18 @@ def private reap_disconnected(srv : WebSocketServer) {
             evict(g_sched, id, g_events)
         }
     }
+    var disconnected_asr : array<int64>
+    for (id, w in keys(g_asr_wires), values(g_asr_wires)) {
+        if (!is_writer_connected(srv, w.writer)) {
+            release_writer(srv, w.writer)
+            disconnected_asr |> push(id)
+        }
+    }
+    for (id in disconnected_asr) {
+        delete g_asr_wires[id]
+        g_asr_wires |> erase(id)
+    }
+    delete disconnected_asr
 }
 
 // Tool-capable streaming buffers the model's native envelope until it can be normalized into an
@@ -1080,6 +1134,10 @@ struct private OaiStatsResponse {
     prefix_pages : int64
     max_streams : int64
     chunk_tokens : int64
+    asr_workers : int
+    asr_ready : int
+    asr_active : int
+    asr_pending : int
     mtp_drafted : int64
     mtp_accepted : int64
 }
@@ -1092,15 +1150,130 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         avg_batch = float(g_sched.sum_batch) / float(max(g_sched.decode_steps, 1l)),
         cached_tokens = g_sched.cached_tokens, prefix_pages = prefix_held_groups(g_sched.prefix),
         max_streams = g_sched.max_streams, chunk_tokens = g_sched.chunk_tokens,
+        asr_workers = g_asr_worker_count, asr_ready = g_asr_ready,
+        asr_active = g_asr_active, asr_pending = g_asr_pending,
         mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted)
     return resp |> JSON(sprint_json(out, false), http_status.OK)
 }
 
+def private emit_asr_event(events : Channel?; event : AsrEvent) {
+    events |> push_clone(event)
+}
+
+def private process_asr_job(
+                            model : AsrModel;
+                            var session : AsrSession;
+                            var session_language : string&;
+                            var has_session : bool&;
+                            job : AsrJob;
+                            events : Channel?
+                            ) {
+    emit_asr_event(events, AsrEvent(kind = AsrEventKind.started, id = job.id))
+    defer() {
+        remove(job.temp_path)
+    }
+    var samples <- load_audio_16k_mono(job.temp_path)
+    defer() {
+        delete samples
+    }
+    if (empty(samples)) {
+        emit_asr_event(events, AsrEvent(
+            kind = AsrEventKind.completed, id = job.id, status = int(http_status.BAD_REQUEST),
+            content_type = "application/json",
+            body = error_body("could not decode the uploaded audio", "invalid_request_error")))
+        return
+    }
+    let language = empty(job.language) ? "en" : job.language
+    if (!has_session || session_language != language) {
+        if (has_session) {
+            delete session
+        }
+        session <- create_session(model, language)
+        session_language = language
+        has_session = true
+    }
+    session.translate = job.translate
+    if (job.response_format == "verbose_json") {
+        var vt = OaiVerboseTranscription(
+            task = job.translate ? "translate" : "transcribe",
+            language = language, duration = float(length(samples)) / 16000.0)
+        var full : array<string>
+        var sid = 0
+        transcribe(model, session, samples) $(seg) {
+            vt.segments |> push(OaiVerboseSegment(
+                id = sid, start = float(seg.t0) / 100.0,
+                end = float(seg.t1) / 100.0, text = seg.text))
+            full |> push(seg.text)
+            sid++
+        }
+        vt.text = join(full, "")
+        vt.language = session.detected_lang
+        emit_asr_event(events, AsrEvent(
+            kind = AsrEventKind.completed, id = job.id, status = int(http_status.OK),
+            content_type = "application/json", body = sprint_json(vt, false)))
+        delete full
+        delete vt
+        return
+    }
+    let text = transcribe(model, session, samples)
+    let content_type = job.response_format == "text" ? "text/plain; charset=utf-8" : "application/json"
+    let body = job.response_format == "text" ? text : sprint_json(OaiTranscription(text = text), false)
+    emit_asr_event(events, AsrEvent(
+        kind = AsrEventKind.completed, id = job.id, status = int(http_status.OK),
+        content_type = content_type, body = body))
+}
+
+def private asr_worker_main(
+                            worker_index : int;
+                            model_path, mmproj_path : string;
+                            var jobs : Channel?&;
+                            var events : Channel?&
+                            ) {
+    this_context().name := "dasllama_asr_{worker_index}"
+    var model <- empty(mmproj_path) ? load_asr_model(model_path) : load_asr_model(model_path, mmproj_path)
+    emit_asr_event(events, AsrEvent(kind = AsrEventKind.ready))
+    var session = AsrSession()
+    var session_language = ""
+    var has_session = false
+    var stopping = false
+    while (!stopping) {
+        jobs |> pop_with_timeout_clone(250) $(job : AsrJob#) {
+            if (job.stop) {
+                stopping = true
+            } else {
+                var job_copy : AsrJob
+                job_copy := job
+                process_asr_job(model, session, session_language, has_session, job_copy, events)
+                delete job_copy
+            }
+        }
+    }
+    if (has_session) {
+        delete session
+    }
+    delete model
+    emit_asr_event(events, AsrEvent(kind = AsrEventKind.stopped))
+    jobs |> release
+    events |> release
+}
+
 // /v1/audio/transcriptions (translate=false) and /v1/audio/translations (translate=true, to English).
 // Multipart upload: save the 'file' part to disk (binary-safe), decode to 16 kHz mono f32, transcribe.
-def private handle_transcription(var req : HttpRequest?; var resp : HttpResponse?; translate : bool) : http_status {
-    if (!g_has_asr) {
-        return resp_error(resp, http_status.NOT_FOUND, "no ASR model loaded — start the server with --asr")
+def private queue_transcription(
+                                srv : WebSocketServer;
+                                var req : HttpRequest?;
+                                var writer : HttpResponseWriter?;
+                                translate : bool
+                                ) {
+    if (!g_has_asr || g_asr_ready < g_asr_worker_count) {
+        respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
+                error_body("ASR workers are not ready", "server_error"))
+        return
+    }
+    if (g_asr_pending >= ASR_QUEUE_LIMIT) {
+        respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
+                error_body("the ASR queue is at capacity ({ASR_QUEUE_LIMIT}) — retry shortly", "server_error"))
+        return
     }
     var fname = ""
     each_form_field(req) $(name, _content, filename) {
@@ -1109,42 +1282,94 @@ def private handle_transcription(var req : HttpRequest?; var resp : HttpResponse
         }
     }
     if (empty(fname)) {
-        return resp_error(resp, http_status.BAD_REQUEST, "multipart form must include a 'file' audio upload")
+        bad_request(srv, writer, "multipart form must include a 'file' audio upload")
+        return
     }
-    let temppath = path_join(tmpdir(), "dasllama_upload_{base_name(fname)}")
+    let rid = next_id()
+    let temppath = path_join(tmpdir(), "dasllama_upload_{rid}_{base_name(fname)}")
     save_form_file(req, "file", temppath)
-    let samples <- load_audio_16k_mono(temppath)
-    remove(temppath)
-    if (empty(samples)) {
-        return resp_error(resp, http_status.BAD_REQUEST, "could not decode the uploaded audio")
-    }
     let fmt = get_form_data(req, "response_format")
     var lang = get_form_data(req, "language")
     if (empty(lang)) {
         lang = "en"
     }
-    var session <- create_session(g_asr, lang)
-    session.translate = translate
-    if (fmt == "verbose_json") {
-        var vt = OaiVerboseTranscription(task = translate ? "translate" : "transcribe",
-                                         language = lang, duration = float(length(samples)) / 16000.0)
-        var full : array<string>
-        var sid = 0
-        transcribe(g_asr, session, samples) $(seg) {
-            vt.segments |> push(OaiVerboseSegment(id = sid, start = float(seg.t0) / 100.0,
-                                                  end = float(seg.t1) / 100.0, text = seg.text))
-            full |> push(seg.text)
-            sid ++
+    g_asr_wires[rid] <- AsrWire(writer = writer)
+    g_asr_pending++
+    g_asr_jobs |> push_clone(AsrJob(
+        id = rid, temp_path = temppath, language = lang, response_format = fmt,
+        translate = translate))
+    to_log(LOG_INFO, "[req {rid}] asr: queued (pending={g_asr_pending}, active={g_asr_active})\n")
+}
+
+def private start_asr_worker_threads() {
+    g_asr_ready = 0
+    if (!g_has_asr) {
+        return
+    }
+    to_log(LOG_INFO, "dasllama-server: starting {g_asr_worker_count} asynchronous ASR worker(s)\n")
+    for (index in range(g_asr_worker_count)) {
+        let worker_index = index
+        let model_path = g_asr_path
+        let mmproj_path = g_asr_mmproj
+        var jobs_capture = g_asr_jobs
+        var events_capture = g_asr_events
+        new_thread() <| @capture(= worker_index, = model_path, = mmproj_path,
+                                = jobs_capture, = events_capture) {
+            asr_worker_main(
+                worker_index, model_path, mmproj_path, jobs_capture, events_capture)
         }
-        vt.text = join(full, "")
-        vt.language = session.detected_lang
-        return resp |> JSON(sprint_json(vt, false), http_status.OK)
     }
-    let text = transcribe(g_asr, session, samples)
-    if (fmt == "text") {
-        return resp |> TEXT_PLAIN(text)
+    while (g_asr_ready < g_asr_worker_count) {
+        g_asr_events |> pop_with_timeout_clone(1000) $(event : AsrEvent#) {
+            if (event.kind == AsrEventKind.ready) {
+                g_asr_ready++
+                to_log(LOG_INFO, "dasllama-server: ASR worker ready ({g_asr_ready}/{g_asr_worker_count})\n")
+            }
+        }
     }
-    return resp |> JSON(sprint_json(OaiTranscription(text = text), false), http_status.OK)
+}
+
+def private drain_asr_events(srv : WebSocketServer) {
+    var draining = true
+    while (draining) {
+        draining = g_asr_events |> try_pop_clone() $(event : AsrEvent#) {
+            if (event.kind == AsrEventKind.started) {
+                g_asr_active++
+            } elif (event.kind == AsrEventKind.completed) {
+                g_asr_active = max(g_asr_active - 1, 0)
+                g_asr_pending = max(g_asr_pending - 1, 0)
+                var wire = unsafe(g_asr_wires?[event.id])
+                if (wire != null) {
+                    if (is_writer_connected(srv, wire.writer)) {
+                        respond(srv, wire.writer, event.status, event.content_type, event.body)
+                    } else {
+                        release_writer(srv, wire.writer)
+                    }
+                    delete g_asr_wires[event.id]
+                    g_asr_wires |> erase(event.id)
+                }
+                to_log(LOG_INFO, "[req {event.id}] asr: completed (pending={g_asr_pending}, active={g_asr_active})\n")
+            }
+        }
+    }
+}
+
+def private stop_asr_worker_threads() {
+    if (!g_has_asr) {
+        return
+    }
+    for (_index in range(g_asr_worker_count)) {
+        g_asr_jobs |> push_clone(AsrJob(stop = true))
+    }
+    var stopped = 0
+    while (stopped < g_asr_worker_count) {
+        g_asr_events |> pop_with_timeout_clone(1000) $(event : AsrEvent#) {
+            if (event.kind == AsrEventKind.stopped) {
+                stopped++
+            }
+        }
+    }
+    g_asr_ready = 0
 }
 
 // ===== Server =====
@@ -1161,11 +1386,11 @@ class OpenAiServer : HvWebServer {
         STREAM("/v1/completions") <| @(var req : HttpRequest?; var writer : HttpResponseWriter?) {
             handle_completion(server, req, writer)
         }
-        POST("/v1/audio/transcriptions") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
-            return handle_transcription(req, resp, false)
+        STREAM("/v1/audio/transcriptions") <| @(var req : HttpRequest?; var writer : HttpResponseWriter?) {
+            queue_transcription(server, req, writer, false)
         }
-        POST("/v1/audio/translations") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
-            return handle_transcription(req, resp, true)
+        STREAM("/v1/audio/translations") <| @(var req : HttpRequest?; var writer : HttpResponseWriter?) {
+            queue_transcription(server, req, writer, true)
         }
         POST("/v1/embeddings") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_embeddings(req, resp)
@@ -1201,6 +1426,9 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
     g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once
     with_job_que() {
         setup_dasllama_jobque()
+        g_asr_jobs = unsafe(channel_create())
+        g_asr_events = unsafe(channel_create())
+        start_asr_worker_threads()
         var pfx = prefix_groups
         if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
             pfx = max_streams * ((g_model.config.seq_len + page_rows - 1l) / page_rows)
@@ -1228,6 +1456,7 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
             to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode}{spec_desc})\n")
             while (!g_should_stop) {
                 server->tick()   // drains queued handlers: requests parse + render + submit here
+                drain_asr_events(server.server)
                 reap_disconnected(server.server)
                 let t_step = ref_time_ticks()
                 let busy = scheduler_step(g_model, g_sched, g_events)
@@ -1245,6 +1474,7 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
             }
             server->stop()
         }
+        stop_asr_worker_threads()
         server->cleanup()
         unsafe {
             delete server
@@ -1254,6 +1484,15 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
         }
         delete g_events
         delete g_wires
+        delete g_asr_wires
+        var asr_jobs = g_asr_jobs
+        var asr_events = g_asr_events
+        g_asr_jobs = null
+        g_asr_events = null
+        unsafe {
+            asr_jobs |> channel_remove
+            asr_events |> channel_remove
+        }
         set_mtp_spec(prev_spec)   // a /shutdown + restart in the same context starts from a clean gate
     }
 }

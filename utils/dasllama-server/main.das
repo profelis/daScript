@@ -58,6 +58,9 @@ struct ServerArgs {
     @clarg_doc = "mmproj for the GGUF Qwen3-ASR route (paired with --asr)"
     mmproj : string
 
+    @clarg_doc = "Long-lived asynchronous ASR worker threads (default 1; 2 permits two parallel transcriptions)"
+    asr_workers : int
+
     @clarg_doc = "Context-length cap in tokens (default: the model's trained context_length)"
     ctx : int
 
@@ -157,6 +160,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     }
     if (empty(cfg.mmproj)) {
         cfg.mmproj = root?["mmproj"] ?? ""
+    }
+    if (cfg.asr_workers <= 0) {
+        cfg.asr_workers = int(root?["asr_workers"] ?? 0l)
     }
     if (cfg.ctx <= 0) {
         cfg.ctx = int(root?["ctx"] ?? 0l)
@@ -288,9 +294,7 @@ def main : int {
     set_default_max_tokens(cfg.max_tokens > 0 ? int64(cfg.max_tokens) : 256l)
 
     if (!empty(cfg.asr)) {
-        print("loading ASR {cfg.asr} ...\n")
-        var a <- empty(cfg.mmproj) ? load_asr_model(cfg.asr) : load_asr_model(cfg.asr, cfg.mmproj)
-        set_asr(a)
+        configure_asr_workers(cfg.asr, cfg.mmproj, cfg.asr_workers > 0 ? cfg.asr_workers : 1)
     }
 
     run_server(port, streams, chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix,

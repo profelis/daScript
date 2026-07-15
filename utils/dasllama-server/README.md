@@ -13,7 +13,7 @@ reach into engine internals, the facade is complete.
 
 ```sh
 bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 8080] [--quant q8] \
-                                                    [--asr <asr.bin>] [--mmproj <mmproj.gguf>] [--ctx 4096] \
+                                                    [--asr <asr.bin>] [--asr-workers 2] [--mmproj <mmproj.gguf>] [--ctx 4096] \
                                                     [--streams 4] [--chunk 64] [--page-rows 64] [--prefix N]
 ```
 
@@ -27,6 +27,7 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--quant` | `-q` | `q8` | Weight quantization: `fp32` \| `q8` \| `q4` — plus the loader's file-format spellings `q4_k` \| `q5_k` \| `q6_k` \| `mxfp4` \| `f16` \| `bf16` (all serve on the `q8` kquant-native tier) |
 | `--kv-dtype` | — | `f16` | KV-cache codec: `f32` \| `f16` \| `q8_0` \| `tq4` (rotated 4-bit; needs pow2 head_size) |
 | `--asr` | `-a` | — | ASR model (whisper/parakeet/qwen3-asr) — enables the `/v1/audio/*` routes |
+| `--asr-workers` | — | `1` | Long-lived ASR request threads; each owns a model and reusable session. Set `2` for two parallel transcriptions |
 | `--mmproj` | — | — | mmproj GGUF for the Qwen3-ASR route (paired with `--asr`) |
 | `--ctx` | — | *model* | Context-length cap in tokens (default: the model's trained `context_length`; set it to bound `--flat` KV or trim RAM) |
 | `--max-tokens` | — | `256` | Default reply token budget when a request omits `max_tokens` (clamped to `--ctx` per request) |
@@ -52,6 +53,7 @@ ctx = 4096
 max_tokens = 4096  # default reply budget for clients that omit max_tokens (e.g. `llm chat`)
 streams = 4
 threads = 16       # matmul dispatch lane cap; -1 = all cores
+asr_workers = 2    # two independent transcription requests; each worker owns an ASR model
 ```
 
 Chat and completion requests **batch continuously** (`llm_scheduler.das`): up to `--streams`
@@ -61,10 +63,11 @@ one chunk. Requests beyond `--streams` queue (up to 32; then 503). KV is **paged
 cache memory tracks each stream's actual context, and finished streams donate their pages to a
 **prefix cache**, so a repeated prompt prefix (a shared system prompt, the next turn of the same
 conversation) attaches instead of re-prefilling — time-to-first-token collapses on warm prompts.
-Clients whose connection drops mid-generation are evicted within a tick. The buffered endpoints
-(`/v1/models`, `/v1/embeddings`, `/v1/audio/*`) still run to completion in-handler and pause
-generation for their duration. OpenAI is stateless — the client resends the full transcript each
-turn.
+Clients whose connection drops mid-generation are evicted within a tick. Audio uploads queue to
+long-lived `new_thread` ASR workers and do not block chat generation; `--asr-workers 2` permits two
+transcriptions at once. Each worker owns its model/context and reuses language-specific session
+scratch, so memory settles at the workers' high-water mark. OpenAI is stateless — the client
+resends the full transcript each turn.
 
 ## Deploying (daspkg release)
 
@@ -88,7 +91,7 @@ so the deployed config survives. Stop a running server first — Windows locks t
 | `POST` | `/v1/embeddings` | Mean-pooled, L2-normalized sentence embeddings |
 | `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`) |
 | `POST` | `/v1/audio/translations` | Speech→English text (needs `--asr`) |
-| `GET`  | `/v1/stats` | Scheduler counters: active/queued/peak_active, decode_steps, avg_batch, evicted, cached_tokens, prefix_pages, … |
+| `GET`  | `/v1/stats` | Scheduler counters plus `asr_workers`, `asr_ready`, `asr_active`, and `asr_pending` |
 | `POST` | `/shutdown` | Graceful stop |
 
 ### Chat
@@ -177,6 +180,10 @@ similarity), not a substitute for a dedicated embedding model.
 curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@audio.wav -F response_format=verbose_json
 ```
+
+ASR work is asynchronous with respect to the HTTP tick and LLM scheduler. Requests beyond the
+worker count wait in a bounded queue (32 uploads; further requests receive 503). Use one importer
+request thread per ASR worker to keep the workers occupied without duplicating database work.
 
 ## Testing
 
