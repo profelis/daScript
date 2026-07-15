@@ -1612,6 +1612,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             panic("dasLLAMA: nextn_predict_layers = {nextn} not supported (single NextN head only)")
         }
         let layers = gguf_int(m, bytes, "{arch}.block_count") - nextn
+        if (layers < 1l) {   // fail closed on a malformed file before "blk.-1..." confusion downstream
+            panic("dasLLAMA: {arch}.block_count = {layers + nextn} with nextn_predict_layers = {nextn} leaves no trunk layers")
+        }
         t.config.n_layer_nextn = nextn
         // FFN width: a scalar for uniform arches, or a per-layer array (gemma-4 E2B: the elastic
         // MatFormer sub-model, 6144 for layers 0-14 then 12288). ffn_w holds the per-layer widths;
