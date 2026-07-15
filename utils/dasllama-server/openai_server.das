@@ -35,6 +35,7 @@ var g_has_asr = false
 var g_asr_path = ""
 var g_asr_mmproj = ""
 var g_asr_worker_count = 0
+var g_asr_team_dispatch = false
 var g_should_stop = false
 var g_req_counter = 0l
 var g_sched = Scheduler()       // live from run_server on; handlers submit into it
@@ -262,6 +263,8 @@ var g_asr_ready = 0
 var g_asr_active = 0
 var g_asr_pending = 0
 let ASR_QUEUE_LIMIT = 32
+let ASR_WRITER_KEEPALIVE_MS = 3600000
+let DEFAULT_WRITER_KEEPALIVE_MS = 75000
 
 // /v1/embeddings response shapes.
 struct private OaiEmbedding {
@@ -1226,10 +1229,12 @@ def private process_asr_job(
 def private asr_worker_main(
                             worker_index : int;
                             model_path, mmproj_path : string;
+                            team_dispatch : bool;
                             var jobs : Channel?&;
                             var events : Channel?&
                             ) {
     this_context().name := "dasllama_asr_{worker_index}"
+    set_jobque_thread_team_mode(team_dispatch)
     var model <- empty(mmproj_path) ? load_asr_model(model_path) : load_asr_model(model_path, mmproj_path)
     emit_asr_event(events, AsrEvent(kind = AsrEventKind.ready))
     var session = AsrSession()
@@ -1285,6 +1290,7 @@ def private queue_transcription(
         bad_request(srv, writer, "multipart form must include a 'file' audio upload")
         return
     }
+    set_writer_keepalive_timeout(srv, writer, ASR_WRITER_KEEPALIVE_MS)
     let rid = next_id()
     let temppath = path_join(tmpdir(), "dasllama_upload_{rid}_{base_name(fname)}")
     save_form_file(req, "file", temppath)
@@ -1311,12 +1317,13 @@ def private start_asr_worker_threads() {
         let worker_index = index
         let model_path = g_asr_path
         let mmproj_path = g_asr_mmproj
+        let team_dispatch = g_asr_team_dispatch
         var jobs_capture = g_asr_jobs
         var events_capture = g_asr_events
-        new_thread() <| @capture(= worker_index, = model_path, = mmproj_path,
+        new_thread() <| @capture(= worker_index, = model_path, = mmproj_path, = team_dispatch,
                                 = jobs_capture, = events_capture) {
             asr_worker_main(
-                worker_index, model_path, mmproj_path, jobs_capture, events_capture)
+                worker_index, model_path, mmproj_path, team_dispatch, jobs_capture, events_capture)
         }
     }
     while (g_asr_ready < g_asr_worker_count) {
@@ -1341,6 +1348,7 @@ def private drain_asr_events(srv : WebSocketServer) {
                 var wire = unsafe(g_asr_wires?[event.id])
                 if (wire != null) {
                     if (is_writer_connected(srv, wire.writer)) {
+                        set_writer_keepalive_timeout(srv, wire.writer, DEFAULT_WRITER_KEEPALIVE_MS)
                         respond(srv, wire.writer, event.status, event.content_type, event.body)
                     } else {
                         release_writer(srv, wire.writer)
@@ -1422,10 +1430,14 @@ class OpenAiServer : HvWebServer {
 //! see ``KVDtype`` — ``tq4`` needs a power-of-two head_size). Call after ``set_model``.
 def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
-               mtp : bool = false) {
+               team_dispatch : bool = true; asr_team_dispatch : bool = false; mtp : bool = false) {
     g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once
     with_job_que() {
         setup_dasllama_jobque()
+        set_jobque_team_mode(team_dispatch)
+        g_asr_team_dispatch = asr_team_dispatch
+        let dispatch_mode = !team_dispatch ? "inline" : (asr_team_dispatch ? "team" : "hybrid")
+        to_log(LOG_INFO, "dasllama-server: jobque compute dispatch = {dispatch_mode}\n")
         g_asr_jobs = unsafe(channel_create())
         g_asr_events = unsafe(channel_create())
         start_asr_worker_threads()

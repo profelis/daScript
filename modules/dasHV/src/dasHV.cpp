@@ -729,6 +729,16 @@ int das_writer_end_headers ( Handle<hv::WebSocketServer> h, hv::HttpResponseWrit
     return 0;
 }
 
+// Change the idle keepalive timeout for a retained writer. STREAM handlers that defer their first
+// write for long-running work otherwise inherit libhv's 75-second HTTP keepalive timeout.
+void das_writer_set_keepalive_timeout ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w,
+        int32_t timeout_ms ) {
+    int timeout = timeout_ms;
+    post_writer_op(h, w, [timeout](hv::HttpResponseWriter* wr){
+        wr->setKeepaliveTimeout(timeout);
+    });
+}
+
 // Terminal for a streamed response: end the stream and release the writer.
 void das_writer_close ( Handle<hv::WebSocketServer> h, hv::HttpResponseWriter * w ) {
     auto adapter = lookup_server(h);
@@ -1538,6 +1548,9 @@ public:
         addExtern<DAS_BIND_FUN(das_writer_write_chunked)> (*this, lib, "write_chunked",
             SideEffects::worstDefault, "das_writer_write_chunked")
                 ->args({"server","writer","data"});
+        addExtern<DAS_BIND_FUN(das_writer_set_keepalive_timeout)> (*this, lib, "set_writer_keepalive_timeout",
+            SideEffects::worstDefault, "das_writer_set_keepalive_timeout")
+                ->args({"server","writer","timeout_ms"});
         addExtern<DAS_BIND_FUN(das_writer_close)> (*this, lib, "close_writer",
             SideEffects::worstDefault, "das_writer_close")
                 ->args({"server","writer"});

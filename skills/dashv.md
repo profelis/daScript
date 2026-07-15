@@ -72,6 +72,10 @@ STREAM("/events") <| @(var req : HttpRequest?; var writer : HttpResponseWriter?)
 - One `STREAM` route serves both streaming and non-streaming responses: stream with `sse_event`,
   or return the whole body once via `respond` — same async route.
 - Terminal error on a stream: `respond(server, writer, int(http_status.BAD_REQUEST), "application/json", err)`.
+- A retained `STREAM` writer inherits libhv's 75,000 ms idle keepalive timeout. For deferred work
+  that can run longer, call `set_writer_keepalive_timeout(server, writer, timeout_ms)` before
+  returning from the handler. Restore 75,000 ms immediately before the terminal `respond` or
+  `close_writer`, so a reused HTTP connection does not keep the extended idle lifetime.
 
 ## HTTP client — `GET` / `POST` / `request`, response via a block
 

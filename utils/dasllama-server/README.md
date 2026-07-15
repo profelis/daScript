@@ -33,6 +33,7 @@ Run under `-jit` — interpreted inference is far too slow. Flags:
 | `--max-tokens` | — | `256` | Default reply token budget when a request omits `max_tokens` (clamped to `--ctx` per request) |
 | `--streams` | `-s` | `4` | Max concurrent generation streams |
 | `--threads` | `-t` | `16` | Worker-lane cap for the matmul dispatch (`-1` = all cores) — decode is bandwidth-bound, so an uncapped dispatch just fights the rest of the box |
+| `--team-dispatch` | — | `hybrid` | `hybrid`: LLM uses the worker team while ASR callers run inline; `team`: all callers use serialized team publishes; `inline`: every caller runs independently |
 | `--chunk` | — | `64` | Prefill quantum in tokens — decode stalls at most this per tick |
 | `--page-rows` | — | `64` | KV page size in positions for paged serving |
 | `--prefix` | — | *auto* | Prefix-cache retention cap in pages (auto: one full context per stream; `-1` = unbounded) |
@@ -53,6 +54,7 @@ ctx = 4096
 max_tokens = 4096  # default reply budget for clients that omit max_tokens (e.g. `llm chat`)
 streams = 4
 threads = 16       # matmul dispatch lane cap; -1 = all cores
+team_dispatch = "hybrid" # LLM team dispatch + independent inline ASR caller threads
 asr_workers = 2    # two independent transcription requests; each worker owns an ASR model
 ```
 

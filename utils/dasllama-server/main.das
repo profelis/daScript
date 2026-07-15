@@ -75,6 +75,9 @@ struct ServerArgs {
     @clarg_doc = "Worker-lane cap for the matmul dispatch (default 16; -1 = all cores)"
     threads : int
 
+    @clarg_doc = "Jobque compute dispatch: hybrid (default; LLM team, ASR inline) | team | inline"
+    team_dispatch : string
+
     @clarg_doc = "Worker CPU affinity: 0 = off (default), 1 = ideal-CPU hint, 2 = hard mask (DAS_JOBQUE_AFFINITY env overrides)"
     affinity : int
 
@@ -182,6 +185,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     if (cfg.threads == 0 && !cli_has_flag("--threads")) {
         cfg.threads = int(root?["threads"] ?? 0l)
     }
+    if (empty(cfg.team_dispatch)) {
+        cfg.team_dispatch = root?["team_dispatch"] ?? ""
+    }
     if (cfg.affinity == 0 && !cli_has_flag("--affinity")) {
         cfg.affinity = int(root?["affinity"] ?? 0l)
     }
@@ -270,6 +276,14 @@ def main : int {
     let chunk = cfg.chunk > 0 ? int64(cfg.chunk) : 64l
     let page_rows = cfg.flat ? 0l : (cfg.page_rows > 0 ? int64(cfg.page_rows) : 64l)
     let prefix = int64(cfg.prefix)   // 0 = auto (run_server sizes it), < 0 = unbounded
+    let dispatch_mode = to_lower(cfg.team_dispatch)
+    if (!empty(dispatch_mode) && dispatch_mode != "hybrid"
+        && dispatch_mode != "team" && dispatch_mode != "inline") {
+        print("error: --team-dispatch must be 'hybrid', 'team', or 'inline'\n")
+        return 2
+    }
+    let team_dispatch = dispatch_mode != "inline"
+    let asr_team_dispatch = dispatch_mode == "team"
     // matmul dispatch lane cap: LLM decode saturates memory bandwidth long before big core
     // counts, and an uncapped dispatch fights every other process on the box. -1 = all cores.
     let threads = cfg.threads > 0 ? cfg.threads : (cfg.threads < 0 ? 0 : 16)
@@ -298,6 +312,7 @@ def main : int {
     }
 
     run_server(port, streams, chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix,
-        kv_dtype = pick_kv_dtype(cfg.kv_dtype), mtp = cfg.mtp)
+        kv_dtype = pick_kv_dtype(cfg.kv_dtype), team_dispatch = team_dispatch,
+        asr_team_dispatch = asr_team_dispatch, mtp = cfg.mtp)
     return 0
 }
