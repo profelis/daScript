@@ -6757,7 +6757,9 @@ def private mtp_prefill_warm(t : Model; var s : Session; tokens : array<int64>; 
 def mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool {
     let c = t.config
     let pos = s.n_past
-    if (c.n_layer_nextn <= 0l || t.quant == QuantMode.q4 || s.mtp_h_pos1 != pos
+    // pos < 1: nothing evaled yet — the zero-init mtp_h_pos1 sentinel COLLIDES with pos == 0
+    // (0 != 0 would pass the cold check and draft at row -1), so gate it explicitly
+    if (c.n_layer_nextn <= 0l || t.quant == QuantMode.q4 || pos < 1l || s.mtp_h_pos1 != pos
             || pos + 2l > c.seq_len) {
         forward(t, s, tok, pos)   // plain step (forward re-stashes the handoff for the next tick)
         s.n_past = pos + 1l

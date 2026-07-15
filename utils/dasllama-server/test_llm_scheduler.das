@@ -542,12 +542,13 @@ def test_scheduler_mtp(t : T?) {
             }
             // spec: mtp on — the chunked prefill crosses the warm's seam rows, and the paged
             // sessions ride the pool's draft-block slab (the server default rail)
+            let prev_spec = get_mtp_spec()
             set_mtp_spec(true)
             var sch <- create_scheduler(m, 1l, 4l, 8l, 16l, 0l, KVDtype.f16, true)
             var events : array<SchedEvent>
             t |> success(submit(m, sch, make_req(2l, prompt, greedy, 24l, none)), "spec stream queued")
             drain(m, sch, events)
-            set_mtp_spec(false)
+            set_mtp_spec(prev_spec)
             var got <- toks_of(events, 2l)
             t |> success(same(got, ref_toks), "spec stream tokens ≡ plain scheduler")
             t |> success(sch.mtp_drafted > 0l, "the spec tick actually drafted ({sch.mtp_drafted} drafts)")

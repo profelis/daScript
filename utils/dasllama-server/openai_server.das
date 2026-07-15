@@ -1006,7 +1006,8 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
             to_log(LOG_WARNING, "dasllama-server: --mtp requested but the model has no NextN head — self-spec stays off\n")
             spec = false
         }
-        set_mtp_spec(spec)   // engine gate: prefills maintain the draft head's KV (chunked included)
+        let prev_spec = get_mtp_spec()
+        set_mtp_spec(spec)   // engine gate: prefills maintain the draft head's KV (chunked included); restored at exit
         g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype, spec)
         var server = new OpenAiServer()
         server->init(port)
@@ -1045,5 +1046,6 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
         }
         delete g_events
         delete g_wires
+        set_mtp_spec(prev_spec)   // a /shutdown + restart in the same context starts from a clean gate
     }
 }
