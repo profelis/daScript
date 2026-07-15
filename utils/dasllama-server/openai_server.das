@@ -873,6 +873,8 @@ struct private OaiStatsResponse {
     prefix_pages : int64
     max_streams : int64
     chunk_tokens : int64
+    mtp_drafted : int64
+    mtp_accepted : int64
 }
 
 def private handle_stats(var resp : HttpResponse?) : http_status {
@@ -882,7 +884,8 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         decode_steps = g_sched.decode_steps, gen_tokens = g_sched.gen_tokens,
         avg_batch = float(g_sched.sum_batch) / float(max(g_sched.decode_steps, 1l)),
         cached_tokens = g_sched.cached_tokens, prefix_pages = prefix_held_groups(g_sched.prefix),
-        max_streams = g_sched.max_streams, chunk_tokens = g_sched.chunk_tokens)
+        max_streams = g_sched.max_streams, chunk_tokens = g_sched.chunk_tokens,
+        mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted)
     return resp |> JSON(sprint_json(out, false), http_status.OK)
 }
 
@@ -986,7 +989,8 @@ class OpenAiServer : HvWebServer {
 //! ``--ctx`` slab). ``kv_dtype`` picks the KV-cache codec for every stream (pool-wide when paged;
 //! see ``KVDtype`` — ``tq4`` needs a power-of-two head_size). Call after ``set_model``.
 def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
-               page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16) {
+               page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
+               mtp : bool = false) {
     g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once
     with_job_que() {
         setup_dasllama_jobque()
@@ -997,7 +1001,13 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
         if (pfx < 0l) {
             pfx = 0l   // explicit unbounded
         }
-        g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype)
+        var spec = mtp
+        if (spec && g_model.config.n_layer_nextn <= 0l) {
+            to_log(LOG_WARNING, "dasllama-server: --mtp requested but the model has no NextN head — self-spec stays off\n")
+            spec = false
+        }
+        set_mtp_spec(spec)   // engine gate: prefills maintain the draft head's KV (chunked included)
+        g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype, spec)
         var server = new OpenAiServer()
         server->init(port)
         let rc = server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
@@ -1006,7 +1016,8 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
         } else {
             let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
             let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
-            to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode})\n")
+            let spec_desc = spec ? ", mtp: on" : ""
+            to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode}{spec_desc})\n")
             while (!g_should_stop) {
                 server->tick()   // drains queued handlers: requests parse + render + submit here
                 reap_disconnected(server.server)
