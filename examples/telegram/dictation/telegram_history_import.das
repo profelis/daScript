@@ -153,8 +153,10 @@ def parse_telegram_export_page(
                                var error : string&
                                ) : array<TelegramExportMessage> {
     var result : array<TelegramExportMessage>
+    // Telegram Desktop can emit `<a ="" href="...">` for bot buttons. An empty attribute name is
+    // invalid XML; removing that exact invalid token preserves the anchor and its useful href.
     let xml = replace(
-        replace(replace(html, "&laquo;", "&#171;"), "&raquo;", "&#187;"),
+        replace(replace(replace(html, " =\"\"", ""), "&laquo;", "&#171;"), "&raquo;", "&#187;"),
         "<br>", "<br/>")
     parse_xml(xml) $(doc, ok) {
         if (!ok) {

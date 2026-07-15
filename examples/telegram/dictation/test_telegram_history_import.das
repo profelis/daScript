@@ -42,4 +42,21 @@ def test_telegram_export_parser(t : T?) {
         t |> success(telegram_export_sender_id("Alice") < 0l)
         t |> equal(telegram_export_sender_id(" Alice "), telegram_export_sender_id("alice"))
     }
+
+    t |> run("invalid empty bot-button attribute is ignored") @(t : T?) {
+        let html = ("<!DOCTYPE html><html><body>" +
+                    "<div class='message default clearfix' id='message3'>" +
+                    "<div class='pull_right date details' title='14.06.2022 15:21:58 UTC-08:00'></div>" +
+                    "<div class='from_name'>Alice</div>" +
+                    "<div class='text'><a =\"\" href='https://t.me/proxy'>Proxy</a></div></div>" +
+                    "</body></html>")
+        var sender = ""
+        var error = ""
+        let messages <- parse_telegram_export_page(html, sender, error)
+        t |> equal(error, "")
+        t |> equal(length(messages), 1)
+        if (length(messages) == 1) {
+            t |> equal(messages[0].Text, "Proxy")
+        }
+    }
 }
