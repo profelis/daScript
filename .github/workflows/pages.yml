@@ -345,6 +345,8 @@ jobs:
         cp site/examples.html _site/
         cp site/dasllama.html _site/
         cp site/robots.txt _site/
+        cp site/sitemap.xml _site/
+        cp site/google2cfdec88941bbdfc.html _site/   # Search Console ownership token — must stay deployed
         cp -r site/files _site/files
 
         # Cross-origin isolation worker — must sit at site root so its scope (/) can
