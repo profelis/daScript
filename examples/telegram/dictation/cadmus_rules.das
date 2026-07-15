@@ -107,6 +107,30 @@ def quote_cadmus_history(text : string) : string {
         (text = ">", replacement = "\\u003e")])
 }
 
+def sanitize_cadmus_reply(text : string; var clean, error : string&) : bool {
+    clean = strip(text)
+    error = ""
+    while (starts_with(clean, "<think>")) {
+        let close_at = find(clean, "</think>")
+        if (close_at < 0) {
+            clean = ""
+            error = "model response contained an unterminated thinking block"
+            return false
+        }
+        clean = strip(slice(clean, close_at + length("</think>")))
+    }
+    if (find(clean, "<think>") >= 0 || find(clean, "</think>") >= 0) {
+        clean = ""
+        error = "model response contained a thinking block outside the response preamble"
+        return false
+    }
+    if (empty(clean)) {
+        error = "model response contained thinking but no final answer"
+        return false
+    }
+    return true
+}
+
 def cadmus_rolling_24h(now : int64; var from_time, until_time : int64&) {
     from_time = now - 86400l
     until_time = now + 1l

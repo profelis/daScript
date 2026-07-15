@@ -75,6 +75,18 @@ def test_cadmus_routing_and_dates(t : T?) {
         tt |> success(find(quoted, "\\u003c/history\\u003e") >= 0)
     }
 
+    t |> run("model thinking never reaches Telegram") @(t : T?) {
+        var clean = ""
+        var error = ""
+        t |> success(sanitize_cadmus_reply("<think>private work</think>\n\nFinal answer", clean, error))
+        t |> equal(clean, "Final answer")
+        t |> success(sanitize_cadmus_reply("  Plain answer  ", clean, error))
+        t |> equal(clean, "Plain answer")
+        t |> success(!sanitize_cadmus_reply("<think>unfinished", clean, error))
+        t |> success(!empty(error))
+        t |> success(!sanitize_cadmus_reply("Answer <think>leak</think>", clean, error))
+    }
+
     t |> run("bare summary window is exactly the previous 24 hours") @(t : T?) {
         var from_time = 0l
         var until_time = 0l

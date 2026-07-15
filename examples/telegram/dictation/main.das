@@ -500,7 +500,16 @@ def private server_complete(
                         err = "chat response reached its token/context limit; refusing to post a cut-off answer"
                     } else {
                         let message = choice?["message"]
-                        reply = message?["content"] ?? ""
+                        let raw_reply = message?["content"] ?? ""
+                        if (!empty(raw_reply)) {
+                            var sanitized = ""
+                            var sanitize_error = ""
+                            if (sanitize_cadmus_reply(raw_reply, sanitized, sanitize_error)) {
+                                reply = sanitized
+                            } else {
+                                err = sanitize_error
+                            }
+                        }
                         let calls = message?["tool_calls"]
                         if (calls != null && calls.value is _array) {
                             for (call in (calls.value as _array)) {
@@ -512,8 +521,8 @@ def private server_complete(
                                         arguments = call?["function"]?["arguments"] ?? "\{}")))
                             }
                         }
-                        ok = !empty(reply) || !empty(tool_calls)
-                        if (!ok) {
+                        ok = empty(err) && (!empty(reply) || !empty(tool_calls))
+                        if (!ok && empty(err)) {
                             err = "chat response carried no content or tool calls"
                         }
                     }
