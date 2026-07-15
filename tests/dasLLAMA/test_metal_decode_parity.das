@@ -370,7 +370,8 @@ def private batch_step_gate(t : T?; tr : Model; nb : int; kdt : KVDtype; tol_log
             to_log(LOG_INFO, "metal batch decode {tag}: logits maxd={maxl} (tol {tol_logits}), kv rows maxd={maxkv} (tol {tol_kv})\n")
         }
         delete sa
-        delete sb    }
+        delete sb
+    }
 }
 
 // interleaved-chunk prefill of paged sessions (multi-run mirror gathers), then batched greedy
