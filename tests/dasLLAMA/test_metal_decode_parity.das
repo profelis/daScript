@@ -132,41 +132,45 @@ def private kv_row_max_diff(sa, sb : Session; c : Config; pos : int64) : float {
 // one CPU step and one GPU step from identical prefilled states: logits + stored-KV-row envelope
 def private single_step_gate(t : T?; tr : Model; prompt : array<int64>; kdt : KVDtype;
                              tol_logits, tol_kv : float; tag : string) {
-    let c = tr.config
-    let vocab = c.vocab_size
-    var sa = make_run_state(c, kdt, kdt)
-    var sb = make_run_state(c, kdt, kdt)
-    var served = 0l
-    with_job_que() {
-        setup_dasllama_jobque()
-        eval_(tr, sa, prompt)
-        eval_(tr, sb, prompt)
-        let tok = greedy_top(sa.logits, vocab)
-        var one <- [tok]
-        select_decode_override("")
-        eval_(tr, sa, one)          // the CPU control step
-        t |> success(select_decode_override("metal"), "{tag}: override registered")
-        let before = metal_decode_stats().decodes
-        eval_(tr, sb, one)          // the GPU step
-        served = metal_decode_stats().decodes - before
-        select_decode_override("")
-        delete one
-    }
-    if (served == 0l) {
-        feint("{tag}: metal decode declined; single-step gate skipped\n")
-    } else {
-        var maxd = 0.0
-        for (v in range64(vocab)) {
-            maxd = max(maxd, abs(sa.logits[v] - sb.logits[v]))
+    // whole-body gate: the stats rails only exist with das_metal, and every caller is already
+    // inside the Apple half — off-Apple this helper just needs to compile
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        let c = tr.config
+        let vocab = c.vocab_size
+        var sa = make_run_state(c, kdt, kdt)
+        var sb = make_run_state(c, kdt, kdt)
+        var served = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            eval_(tr, sa, prompt)
+            eval_(tr, sb, prompt)
+            let tok = greedy_top(sa.logits, vocab)
+            var one <- [tok]
+            select_decode_override("")
+            eval_(tr, sa, one)          // the CPU control step
+            t |> success(select_decode_override("metal"), "{tag}: override registered")
+            let before = metal_decode_stats().decodes
+            eval_(tr, sb, one)          // the GPU step
+            served = metal_decode_stats().decodes - before
+            select_decode_override("")
+            delete one
         }
-        t |> success(maxd <= tol_logits, "{tag}: one-step logits within {tol_logits} (max diff {maxd})")
-        let kvd = kv_row_max_diff(sa, sb, c, sa.n_past - 1l)
-        t |> success(kvd <= tol_kv, "{tag}: stored KV row within {tol_kv} (max diff {kvd})")
-        // envelope visibility on green runs too — a diff near the gate means a flaky tolerance
-        to_log(LOG_INFO, "metal decode {tag} single-step: logits maxd={maxd} (tol {tol_logits}), kv row maxd={kvd} (tol {tol_kv})\n")
+        if (served == 0l) {
+            feint("{tag}: metal decode declined; single-step gate skipped\n")
+        } else {
+            var maxd = 0.0
+            for (v in range64(vocab)) {
+                maxd = max(maxd, abs(sa.logits[v] - sb.logits[v]))
+            }
+            t |> success(maxd <= tol_logits, "{tag}: one-step logits within {tol_logits} (max diff {maxd})")
+            let kvd = kv_row_max_diff(sa, sb, c, sa.n_past - 1l)
+            t |> success(kvd <= tol_kv, "{tag}: stored KV row within {tol_kv} (max diff {kvd})")
+            // envelope visibility on green runs too — a diff near the gate means a flaky tolerance
+            to_log(LOG_INFO, "metal decode {tag} single-step: logits maxd={maxd} (tol {tol_logits}), kv row maxd={kvd} (tol {tol_kv})\n")
+        }
+        delete sa
+        delete sb
     }
-    delete sa
-    delete sb
 }
 
 // interleaved-chunk prefill of two paged sessions (their page groups interleave, so the second
@@ -303,68 +307,70 @@ def private streams_match(a, b : array<array<int64>>) : bool {
 // one CPU batch step and one GPU batch step from identical prefilled states: per-row logits +
 // stored-KV-row envelope (the batch twin of single_step_gate)
 def private batch_step_gate(t : T?; tr : Model; nb : int; kdt : KVDtype; tol_logits, tol_kv : float; tag : string) {
-    let c = tr.config
-    let vocab = c.vocab_size
-    var sa : array<Session>
-    var sb : array<Session>
-    var served = 0l
-    with_job_que() {
-        setup_dasllama_jobque()
-        sa |> reserve(nb)
-        sb |> reserve(nb)
-        for (i in range(nb)) {
-            let prompt <- encode(tr, counting_prompt(1 + i, 40 + 7 * i), true, false)
-            sa |> emplace <| make_run_state(c, kdt, kdt)
-            sb |> emplace <| make_run_state(c, kdt, kdt)
-            eval_(tr, sa[i], prompt)
-            eval_(tr, sb[i], prompt)
-        }
-        var wsa <- create_batch_workspace_(tr)
-        var wsb <- create_batch_workspace_(tr)
-        var sessa : array<Session?>
-        var sessb : array<Session?>
-        var cur : array<int64>
-        for (i in range(nb)) {
+    // whole-body gate: see single_step_gate — off-Apple this helper just needs to compile
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        let c = tr.config
+        let vocab = c.vocab_size
+        var sa : array<Session>
+        var sb : array<Session>
+        var served = 0l
+        with_job_que() {
+            setup_dasllama_jobque()
+            sa |> reserve(nb)
+            sb |> reserve(nb)
+            for (i in range(nb)) {
+                let prompt <- encode(tr, counting_prompt(1 + i, 40 + 7 * i), true, false)
+                sa |> emplace <| make_run_state(c, kdt, kdt)
+                sb |> emplace <| make_run_state(c, kdt, kdt)
+                eval_(tr, sa[i], prompt)
+                eval_(tr, sb[i], prompt)
+            }
+            var wsa <- create_batch_workspace_(tr)
+            var wsb <- create_batch_workspace_(tr)
+            var sessa : array<Session?>
+            var sessb : array<Session?>
+            var cur : array<int64>
+            for (i in range(nb)) {
+                unsafe {
+                    sessa |> push(addr(sa[i]))
+                    sessb |> push(addr(sb[i]))
+                }
+                cur |> push(greedy_top(sa[i].logits, vocab))
+            }
+            select_decode_override("")
+            eval_batch_(tr, wsa, sessa, cur)          // the CPU control step
+            let before = metal_batch_decode_stats().steps
+            select_decode_override("metal")
+            eval_batch_(tr, wsb, sessb, cur)          // the GPU step
+            served = metal_batch_decode_stats().steps - before
+            select_decode_override("")
+            sessa |> clear()
+            sessb |> clear()
             unsafe {
-                sessa |> push(addr(sa[i]))
-                sessb |> push(addr(sb[i]))
+                delete wsa
+                delete wsb
+                delete sessa
+                delete sessb
             }
-            cur |> push(greedy_top(sa[i].logits, vocab))
+            delete cur
         }
-        select_decode_override("")
-        eval_batch_(tr, wsa, sessa, cur)          // the CPU control step
-        let before = metal_batch_decode_stats().steps
-        select_decode_override("metal")
-        eval_batch_(tr, wsb, sessb, cur)          // the GPU step
-        served = metal_batch_decode_stats().steps - before
-        select_decode_override("")
-        sessa |> clear()
-        sessb |> clear()
-        unsafe {
-            delete wsa
-            delete wsb
-            delete sessa
-            delete sessb
-        }
-        delete cur
-    }
-    if (served == 0l) {
-        feint("{tag}: metal batch decode declined; batch step gate skipped\n")
-    } else {
-        var maxl = 0.0
-        var maxkv = 0.0
-        for (i in range(nb)) {
-            for (v in range64(vocab)) {
-                maxl = max(maxl, abs(sa[i].logits[v] - sb[i].logits[v]))
+        if (served == 0l) {
+            feint("{tag}: metal batch decode declined; batch step gate skipped\n")
+        } else {
+            var maxl = 0.0
+            var maxkv = 0.0
+            for (i in range(nb)) {
+                for (v in range64(vocab)) {
+                    maxl = max(maxl, abs(sa[i].logits[v] - sb[i].logits[v]))
+                }
+                maxkv = max(maxkv, kv_row_max_diff(sa[i], sb[i], c, sa[i].n_past - 1l))
             }
-            maxkv = max(maxkv, kv_row_max_diff(sa[i], sb[i], c, sa[i].n_past - 1l))
+            t |> success(maxl <= tol_logits, "{tag}: one-batch-step logits within {tol_logits} (max diff {maxl})")
+            t |> success(maxkv <= tol_kv, "{tag}: stored KV rows within {tol_kv} (max diff {maxkv})")
+            to_log(LOG_INFO, "metal batch decode {tag}: logits maxd={maxl} (tol {tol_logits}), kv rows maxd={maxkv} (tol {tol_kv})\n")
         }
-        t |> success(maxl <= tol_logits, "{tag}: one-batch-step logits within {tol_logits} (max diff {maxl})")
-        t |> success(maxkv <= tol_kv, "{tag}: stored KV rows within {tol_kv} (max diff {maxkv})")
-        to_log(LOG_INFO, "metal batch decode {tag}: logits maxd={maxl} (tol {tol_logits}), kv rows maxd={maxkv} (tol {tol_kv})\n")
-    }
-    delete sa
-    delete sb
+        delete sa
+        delete sb    }
 }
 
 // interleaved-chunk prefill of paged sessions (multi-run mirror gathers), then batched greedy
