@@ -397,6 +397,70 @@ def test_parity_qwen3next(t : T?) {
     }
 }
 
+// Qwen3.5-122B-A10B Q4_K_M — the qwen35moe arch at 122B geometry (48L hybrid, dim 3072,
+// 248320 vocab), and the first NATIVE SPLIT fixture: the model ships as 3 shards and loads
+// through gguf_shard_paths / parse_gguf_meta_shards (shard 0 = metadata+vocab only). Huge
+// tier (~71 GB total): DASLLAMA_PARITY_FULL=1.
+[test]
+def test_parity_qwen35moe_122b(t : T?) {
+    t |> run("qwen35moe forward (Qwen3.5-122B-A10B Q4_K_M, 3-shard split gguf)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Qwen3.5-122B-A10B/Q4_K_M/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen35moe-122b token-for-token")
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN, [dn_chunked = true]), "qwen35moe-122b chunked-prefill token-for-token")
+        delete tr
+    }
+}
+
+// Same model, Q8_0 — a 4-shard split riding the q8 transcode rail (>2^31 weight-scale blocks,
+// the wscale int64 regression shape). Huge tier (~130 GB resident): DASLLAMA_PARITY_FULL=1.
+[test]
+def test_parity_qwen35moe_122b_q8(t : T?) {
+    t |> run("qwen35moe forward (Qwen3.5-122B-A10B Q8_0, 4-shard split gguf)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Qwen3.5-122B-A10B/Q8_0/Qwen3.5-122B-A10B-Q8_0-00001-of-00004.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen35moe-122b Q8_0 token-for-token")
+        delete tr
+    }
+}
+
+// Qwen3-Coder-Next again, Q8_0 (merged locally from its 3-part split download) — rides the q8
+// transcode rail instead of the kq/dequant arms the Q4_K_M fixture exercises. Huge tier (~79 GB).
+[test]
+def test_parity_qwen3next_q8(t : T?) {
+    t |> run("qwen3next forward (Qwen3-Coder-Next Q8_0, merged single file)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Qwen3-Coder-Next-Q8_0.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN), "qwen3next Q8_0 token-for-token")
+        t |> success(parity_gen_ok(tr, QWEN3_PROMPT, QWEN3_GEN, [dn_chunked = true]), "qwen3next Q8_0 chunked-prefill token-for-token")
+        delete tr
+    }
+}
+
 // Native K-quant rail: the same counting fixture over the Q4_K_M / Q5_K_M / Q6_K files of the
 // SAME model, forced through kquant_native planes (grp repack + kq kernels + kq embed gather).
 // The oracles were produced per-file by simple_ids (all three continue identically, equal to

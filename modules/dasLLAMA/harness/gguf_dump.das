@@ -2,6 +2,7 @@ options gen2
 
 require daslib/fio
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs
+require daslib/strings_boost
 require dasllama/dasllama_gguf
 require strings
 require math
@@ -17,7 +18,7 @@ def gtype_name(t : int) : string {
     return t >= 0 && t < length(names) ? names[t] : "?{t}"
 }
 
-def dump_kv(m : GGUFMeta; bytes : array<uint8>#; key : string) {
+def dump_kv(m : GGUFMeta; bytes : array<uint8> | #; key : string) {
     if (!gguf_has(m, key)) {
         return
     }
@@ -43,12 +44,36 @@ def main {
         path = args[length(args) - 1]
     }
     print("=== dasllama_gguf parse: {path} ===\n")
+    let shards <- gguf_shard_paths(path)
+    if (length(shards) > 1) {
+        print("split model:  {length(shards)} shards\n")
+        var bases : array<void?>
+        var sizes : array<int64>
+        gguf_map_shards(shards, 0, bases, sizes) {
+            var m <- parse_gguf_meta_shards(bases, sizes)
+            unsafe {
+                dump_meta(m, temp_array(reinterpret<uint8?>(bases[0]), sizes[0], type<uint8>))
+            }
+            delete m
+        }
+        bases |> clear()
+        delete bases
+        delete sizes
+        return
+    }
     let f = fopen(path, "rb")
     if (f == null) {
         panic("cannot open {path}")
     }
     fmap(f) $(var bytes : array<uint8>#) {
-        var m <- parse_gguf_meta(bytes)
+        let m <- parse_gguf_meta(bytes)
+        dump_meta(m, bytes)
+    }
+    fclose(f)
+}
+
+def dump_meta(m : GGUFMeta; bytes : array<uint8> | #) {
+    {
         print("version:     {int(m.version)}\n")
         print("alignment:   {m.alignment}\n")
         print("data offset: {m.data_offset}\n")
@@ -68,13 +93,12 @@ def main {
         if (nt > 0) {
             print("--- first 6 tensors ---\n")
             for (i in range(min(6, nt))) {
-                var dimstr = ""
-                for (d in m.tensors[i].dims) {
-                    dimstr += "{d} "
-                }
-                print("  [{i}] {m.tensors[i].name}  type={m.tensors[i].ggml_type} dims=[{dimstr}] off={m.tensors[i].offset} nelem={m.tensors[i].n_elem}\n")
+                let dimstr = join(m.tensors[i].dims, " ")
+                print("  [{i}] {m.tensors[i].name}  type={m.tensors[i].ggml_type} dims=[{dimstr}] off={m.tensors[i].offset} nelem={m.tensors[i].n_elem} shard={m.tensors[i].shard}\n")
             }
+            print("--- last tensor ---\n")
+            let dimstr = join(m.tensors[nt - 1].dims, " ")
+            print("  [{nt - 1}] {m.tensors[nt - 1].name}  type={m.tensors[nt - 1].ggml_type} dims=[{dimstr}] off={m.tensors[nt - 1].offset} nelem={m.tensors[nt - 1].n_elem} shard={m.tensors[nt - 1].shard}\n")
         }
     }
-    fclose(f)
 }

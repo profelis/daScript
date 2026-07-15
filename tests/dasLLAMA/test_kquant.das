@@ -201,40 +201,37 @@ def private perturb_quants(var blkb : array<uint8>; qoff, qlen : int) {
     }
 }
 
-// Kernel-vs-reference gate core: transcode two distinct superblocks of `fmt`, quantize a smooth
+// Kernel-vs-reference gate core: transcode nsb distinct superblocks of `fmt` (per-superblock
+// LCG over the quant plane so an inter-superblock offset bug can't cancel), quantize a smooth
 // activation with the bs quantizer, and compare the integer-domain kernel dot against the fp64
 // elementwise dot over the plane dequant (the kernels' declared oracle).
-def private kq_dot_gate(t : T?; fmt : int) {
-    let n = 512l
+def private kq_dot_gate(t : T?; fmt : int; n : int64 = 512l) {
+    let nsb = n / 256l
     let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
-    var blk2 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
-    if (fmt == 4) {
-        perturb_quants(blk2, 16, 128)
-    } elif (fmt == 5) {
-        perturb_quants(blk2, 16, 160)   // qh + qs
-    } else {
-        perturb_quants(blk2, 0, 192)    // ql + qh
-    }
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
     let ssb = fmt == 6 ? 18l : 20l
     var kq : array<uint8>
     var ks : array<uint8>
-    kq |> resize(2l * qsb)
-    ks |> resize(2l * ssb)
-    if (fmt == 4) {
-        transcode_q4k_superblock(blk1, 0l, kq, 0l, ks, 0l)
-        transcode_q4k_superblock(blk2, 0l, kq, qsb, ks, ssb)
-    } elif (fmt == 5) {
-        transcode_q5k_superblock(blk1, 0l, kq, 0l, ks, 0l)
-        transcode_q5k_superblock(blk2, 0l, kq, qsb, ks, ssb)
-    } else {
-        transcode_q6k_superblock(blk1, 0l, kq, 0l, ks, 0l)
-        transcode_q6k_superblock(blk2, 0l, kq, qsb, ks, ssb)
+    kq |> resize(nsb * qsb)
+    ks |> resize(nsb * ssb)
+    for (s in range64(nsb)) {
+        if (fmt == 4) {
+            transcode_q4k_superblock(blk1, 0l, kq, s * qsb, ks, s * ssb)
+        } elif (fmt == 5) {
+            transcode_q5k_superblock(blk1, 0l, kq, s * qsb, ks, s * ssb)
+        } else {
+            transcode_q6k_superblock(blk1, 0l, kq, s * qsb, ks, s * ssb)
+        }
+    }
+    var st = 0x12345u
+    for (i in range64(nsb * qsb)) {
+        st = st * 1664525u + 1013904223u
+        kq[i] = uint8(uint(kq[i]) ^ (st >> 16u))
     }
     // plane dequant = the reference weights
     var w : array<float>
     w |> resize(n)
-    for (s in range64(2l)) {
+    for (s in range64(nsb)) {
         if (fmt == 4) {
             dequant_k4_plane_superblock(kq, s * qsb, ks, s * ssb, w, s * 256l)
         } elif (fmt == 5) {
@@ -287,6 +284,15 @@ def test_kq_dots(t : T?) {
     t |> run("dot_k6q8 matches the fp64 plane-dequant reference") @(t : T?) {
         kq_dot_gate(t, 6)
     }
+    // 122B-class row widths: n=3072 (12 superblocks — qwen35moe-122B gate/up/cls) and n=1024
+    // (its k5 down_exps). Every earlier kq model kept n at 512..2560.
+    for (fmt in [4, 5, 6]) {
+        for (nn in [1024l, 3072l]) {
+            t |> run("dot_k{fmt}q8 matches the fp64 reference at n={int(nn)}") @(t : T?) {
+                kq_dot_gate(t, fmt, nn)
+            }
+        }
+    }
 }
 
 // Portable multi-row GEMV gate: matmul_kq (the disk-order kq_gemv_kernel rail — what a
@@ -294,8 +300,7 @@ def test_kq_dots(t : T?) {
 // dots. Guards the k*_rows_kernel PER-ROW plane strides, which the single-superblock dot
 // gate above never exercises (a k4 scale-row stride miss shipped when K4_SSB went 32 -> 20:
 // row 0 dotted clean, every later row read the wrong scale rows).
-def private kq_gemv_rows_gate(t : T?; fmt : int) {
-    let n = 512l
+def private kq_gemv_rows_gate(t : T?; fmt : int; n : int64 = 512l) {
     let d = 8l
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
@@ -376,6 +381,13 @@ def test_kq_gemv_rows(t : T?) {
     t |> run("portable k6 GEMV rows bit-match per-row disk dots") @(t : T?) {
         kq_gemv_rows_gate(t, 6)
     }
+    for (fmt in [4, 5, 6]) {
+        for (nn in [1024l, 3072l]) {
+            t |> run("portable k{fmt} GEMV rows bit-match per-row disk dots at n={int(nn)}") @(t : T?) {
+                kq_gemv_rows_gate(t, fmt, nn)
+            }
+        }
+    }
 }
 
 // Stage-4 repack oracle core: build a d-row disk plane of `fmt` (transcoded synthetic
@@ -384,8 +396,7 @@ def test_kq_gemv_rows(t : T?) {
 // grp<mr> scalar reference (kq_grp_row_dot — the stamped cores' decline body) and the grp row
 // dequant to reproduce them BIT-EXACTLY (same block order, exact integer sub-sums — only the
 // plane layout moved).
-def private kq_repack_gate(t : T?; fmt : int; mr : int64) {
-    let n = 512l
+def private kq_repack_gate(t : T?; fmt : int; mr : int64; n : int64 = 512l) {
     let d = 32l
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
@@ -497,6 +508,11 @@ def test_kq_repack_grp(t : T?) {
                 kq_repack_gate(t, fmt, mr)
             }
         }
+        for (nn in [1024l, 3072l]) {
+            t |> run("repack_k{fmt}_grp mr=8 preserves dots and row dequants at n={int(nn)}") @(t : T?) {
+                kq_repack_gate(t, fmt, 8l, nn)
+            }
+        }
     }
 }
 
@@ -504,8 +520,7 @@ def test_kq_repack_grp(t : T?) {
 // repacked planes (the tile's per-token fold order IS the GEMV's). Repack at the layout
 // companion's mr — the same value the stubs/kernels read, so this holds on the reference
 // bodies (interp) AND the stamped kernels (-jit) alike.
-def private kq_tile_gate(t : T?; fmt : int) {
-    let n = 512l
+def private kq_tile_gate(t : T?; fmt : int; n : int64 = 512l) {
     let d = 32l
     let ntok = 7l   // 4-token tile + a 3-token gemv tail
     let nsb = n / 256l
@@ -633,6 +648,11 @@ def test_kq_tile(t : T?) {
         t |> run("k{fmt} 4-token tile bit-matches per-token GEMVs") @(t : T?) {
             kq_tile_gate(t, fmt)
         }
+        for (nn in [1024l, 3072l]) {
+            t |> run("k{fmt} 4-token tile bit-matches per-token GEMVs at n={int(nn)}") @(t : T?) {
+                kq_tile_gate(t, fmt, nn)
+            }
+        }
     }
 }
 
@@ -641,10 +661,7 @@ def test_kq_tile(t : T?) {
 // per-region grp slices, the per-expert-slice repack shape). Regions carry distinct LCG
 // payloads; both offs forms run — the shared activation image (gate/up, xoff 0) and
 // per-region activation rows (down, xoff = r*n).
-def private kq_groupn_gate(t : T?; fmt : int) {
-    let n = 512l
-    let d = 32l
-    let nreg = 3l
+def private kq_groupn_gate(t : T?; fmt : int; n : int64 = 512l; d : int64 = 32l; nreg : int64 = 3l) {
     let nsb = n / 256l
     let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
     let ssb = fmt == 6 ? 18l : 20l
@@ -805,6 +822,157 @@ def test_kq_groupn(t : T?) {
         t |> run("k{fmt} region-list GEMV bit-matches per-row dots (disk + grp slices)") @(t : T?) {
             kq_groupn_gate(t, fmt)
         }
+        for (nn in [1024l, 3072l]) {
+            t |> run("k{fmt} region-list GEMV bit-matches per-row dots at n={int(nn)}") @(t : T?) {
+                kq_groupn_gate(t, fmt, nn)
+            }
+        }
+    }
+    // the qwen35moe-122B expert slice shapes: gate/up k4 n=3072 d=1024, down k5 n=1024 d=3072,
+    // top-8 regions — the small-d arms above never walk >4 mr-groups per region
+    t |> run("k4 region-list GEMV at the 122B gate/up slice shape (n=3072 d=1024 nreg=8)") @(t : T?) {
+        kq_groupn_gate(t, 4, 3072l, 1024l, 8l)
+    }
+    t |> run("k5 region-list GEMV at the 122B down slice shape (n=1024 d=3072 nreg=8)") @(t : T?) {
+        kq_groupn_gate(t, 5, 1024l, 3072l, 8l)
+    }
+}
+
+// Batch-groupn gate: the fused MoE prefill's kq batch GEMM (matmul_kq_batch_groupn — triple offs
+// (woff, row0, cnt), token-major y over the gathered image) must bit-match per-(region, token)
+// rows-core calls over the same repacked planes. This drives kq_batch_cell_gen's TB/tile/tail
+// walk over bucket-shaped token runs — the rail no per-region gate above reaches.
+def private kq_batch_groupn_gate(t : T?; fmt : int; n : int64 = 512l; d : int64 = 32l) {
+    let prev_backend = active_kernel_backend()
+    // matmul_kq_batch_groupn dispatches through the active backend and only the gen tier carries
+    // the slot; a failed pin (interp, no avx2, declined stamp) keeps the previous backend un-pinned
+    pin_kernel_backend(get_architecture_name() == "arm64" ? "arm64-gen" : "x64-gen")
+    if (!kernel_backend_has_kq_batch_groupn()) {
+        t |> skip("no gen backend registered (kq_batch_groupn is JIT-only)")
+        return
+    }
+    let nsb = n / 256l
+    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
+    let ssb = fmt == 6 ? 18l : 20l
+    let mr = kq_layout_of(fmt)
+    // bucket mix: a 1-row run (pure gemv tail), whole tiles, tile+tail, and a TB-spanning run
+    var cnts <- [1l, 4l, 6l, 13l]
+    let nreg = int64(length(cnts))
+    var nk = 0l
+    for (c in cnts) {
+        nk += c
+    }
+    let blk1 <- fmt == 4 ? build_q4k_block() : (fmt == 5 ? build_q5k_block() : build_q6k_block())
+    var kq : array<uint8>
+    var ks : array<uint8>
+    kq |> resize(int(nreg * d * nsb * qsb))
+    ks |> resize(int(nreg * d * nsb * ssb))
+    for (r in range64(nreg * d)) {
+        for (s in range64(nsb)) {
+            if (fmt == 4) {
+                transcode_q4k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } elif (fmt == 5) {
+                transcode_q5k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            } else {
+                transcode_q6k_superblock(blk1, 0l, kq, (r * nsb + s) * qsb, ks, (r * nsb + s) * ssb)
+            }
+        }
+        var st = 0x7F4A7C15u + uint(r) * 0x85EBCA6Bu
+        for (i in range64(nsb * qsb)) {
+            st = st * 1664525u + 1013904223u
+            kq[r * nsb * qsb + i] = uint8(uint(kq[r * nsb * qsb + i]) ^ (st >> 16u))
+        }
+    }
+    unsafe {
+        for (r in range64(nreg)) {   // per-region grp repack — the per-expert-slice shape
+            if (fmt == 4) {
+                repack_k4_grp(addr(kq[r * d * nsb * qsb]), addr(ks[r * d * nsb * ssb]), n, d, mr)
+            } elif (fmt == 5) {
+                repack_k5_grp(addr(kq[r * d * nsb * qsb]), addr(ks[r * d * nsb * ssb]), n, d, mr)
+            } else {
+                repack_k6_grp(addr(kq[r * d * nsb * qsb]), addr(ks[r * d * nsb * ssb]), n, d, mr)
+            }
+        }
+    }
+    // gathered activation image: nk rows, Q8_K-quantized per row
+    var src : array<float>
+    src |> resize(int(nk * n))
+    for (i in range64(nk * n)) {
+        src[i] = 0.8 * sin(float(i) * 0.29) - 0.4 * cos(float(i) * 0.057)
+    }
+    var xq : array<int8>
+    var xs : array<float>
+    var xbs : array<int>
+    xq |> resize(int(nk * n))
+    xs |> resize(int(nk * n / 256l))
+    xbs |> resize(int(nk * n / 16l))
+    unsafe {
+        for (p in range64(nk)) {
+            quantize_q8_k_into_ptr(addr(src[p * n]), n, addr(xq[0]), addr(xs[0]), addr(xbs[0]), p * n, p * (n / 256l), p * (n / 16l))
+        }
+    }
+    // region triples + per-(region, token) rows-core references
+    var offs : array<int64>
+    offs |> reserve(nreg * 3l)
+    var want : array<float>
+    var y : array<float>
+    want |> resize(int(nk * d))
+    y |> resize(int(nk * d))
+    var row0 = 0l
+    unsafe {
+        for (r in range64(nreg)) {
+            offs |> push(r * d * n)   // nolint:STYLE012 — triple stream, not a collectable comprehension
+            offs |> push(row0)
+            offs |> push(cnts[r])
+            let kqr = addr(kq[r * d * nsb * qsb])
+            let ksr = addr(ks[r * d * nsb * ssb])
+            for (tk in range64(row0, row0 + cnts[r])) {
+                if (fmt == 4) {
+                    k4q8_gemv_gen(addr(want[tk * d]), kqr, ksr, addr(xq[tk * n]), addr(xs[tk * (n / 256l)]), addr(xbs[tk * (n / 16l)]), n, 0l, d)
+                } elif (fmt == 5) {
+                    k5q8_gemv_gen(addr(want[tk * d]), kqr, ksr, addr(xq[tk * n]), addr(xs[tk * (n / 256l)]), addr(xbs[tk * (n / 16l)]), n, 0l, d)
+                } else {
+                    k6q8_gemv_gen(addr(want[tk * d]), kqr, ksr, addr(xq[tk * n]), addr(xs[tk * (n / 256l)]), addr(xbs[tk * (n / 16l)]), n, 0l, d)
+                }
+            }
+            row0 += cnts[r]
+        }
+    }
+    matmul_kq_batch_groupn(fmt, y, kq, ks, offs, nreg, xq, xs, xbs, n, d)
+    var bad = 0
+    for (i in range64(nk * d)) {
+        if (y[i] != want[i]) {
+            bad++
+        }
+    }
+    t |> success(bad == 0, "kq batch groupn bit-matches per-(region, token) rows-core calls")
+    clear_kernel_backend_pin()   // restore without leaving a pin that wasn't there on entry
+    select_kernel_backend(prev_backend)
+    delete cnts
+    delete kq
+    delete ks
+    delete src
+    delete xq
+    delete xs
+    delete xbs
+    delete offs
+    delete want
+    delete y
+}
+
+[test]
+def test_kq_batch_groupn(t : T?) {
+    for (fmt in [4, 5, 6]) {
+        t |> run("k{fmt} batch groupn bit-matches per-token rows-core calls") @(t : T?) {
+            kq_batch_groupn_gate(t, fmt)
+        }
+    }
+    // the qwen35moe-122B fused-prefill slice shapes
+    t |> run("k4 batch groupn at the 122B gate/up slice shape (n=3072 d=1024)") @(t : T?) {
+        kq_batch_groupn_gate(t, 4, 3072l, 1024l)
+    }
+    t |> run("k5 batch groupn at the 122B down slice shape (n=1024 d=3072)") @(t : T?) {
+        kq_batch_groupn_gate(t, 5, 1024l, 3072l)
     }
 }
 

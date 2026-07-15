@@ -1231,7 +1231,7 @@ def private wscale_convert_f16(var t : Model) {
     if (n == 0l) {   // every big weight lives in a native plane (kq/mx4) — nothing to convert
         return
     }
-    t.qscales16 |> resize(int(n))
+    t.qscales16 |> resize(n)   // int64 resize — an 80B-weight Q8 model has >2^31 scales
     unsafe {
         var dp = addr(t.qscales16[0])
         let sp = addr<float const?>(t.qscales[0])
@@ -1530,13 +1530,40 @@ def private load_gguf_impl(path : string; mode : QuantMode) : Model {
     var t = Model()
     t.quant = mode
     let ts_load = ref_time_ticks()
-    var ts_stage = ref_time_ticks()
+    let shards <- gguf_shard_paths(path)
+    if (length(shards) > 1) {
+        to_log(LOG_INFO, "dasLLAMA: split gguf — {length(shards)} shards\n")
+        var bases : array<void?>
+        var sizes : array<int64>
+        gguf_map_shards(shards, 0, bases, sizes) {
+            var m <- parse_gguf_meta_shards(bases, sizes)
+            unsafe {
+                load_gguf_parsed(t, m, temp_array(reinterpret<uint8?>(bases[0]), sizes[0], type<uint8>), mode, ts_load)
+            }
+            delete m
+        }
+        bases |> clear()   // borrowed mapping bases — clear so delete frees only the buffer
+        delete bases
+        delete sizes
+        return <- t
+    }
     let f = fopen(path, "rb")
     if (f == null) {
         panic("dasLLAMA: cannot open gguf '{path}'")
     }
     fmap(f) $(var bytes : array<uint8>#) {
         let m <- parse_gguf_meta(bytes)
+        load_gguf_parsed(t, m, bytes, mode, ts_load)
+    }
+    fclose(f)
+    return <- t
+}
+
+// The load once metadata is parsed and the byte view carrying the KVs (shard 0 for splits) is
+// mapped — config, vocab, plane sizing, tensor reads/transcodes, repack, wscale.
+def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> | #; mode : QuantMode; ts_load : int64) {
+    var ts_stage = ref_time_ticks()
+    {
         let arch = gguf_str(m, bytes, "general.architecture")
         resolve_arch(t, arch)   // registry lookup: apply config flags + bind the arch's block kernels
         if (gguf_has(m, "tokenizer.chat_template")) {
@@ -2227,8 +2254,6 @@ def private load_gguf_impl(path : string; mode : QuantMode) : Model {
         }
         to_log(LOG_INFO, "dasLLAMA: load stage wscale: {get_time_usec(ts_stage) / 1000} ms, total {get_time_usec(ts_load) / 1000} ms\n")
     }
-    fclose(f)
-    return <- t
 }
 
 //! Quantize a fp32-loaded model's big weights to Q8_0 in place and switch forward onto the Q8 path.
@@ -8273,6 +8298,11 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         s.kxsb |> resize(npos * dim / 256l)
         s.kxbsb |> resize(npos * dim / 16l)
         requant_rows_q8k_bs(s.xb_b, dim, npos, s.kxqb, s.kxsb, s.kxbsb)
+        if (nsh > 0l && !c.moe_dense_shexp) {
+            // the q8 shexp batch (step 4) reads the Q8_0 image — without this it consumes whatever
+            // the last quantize left there and the shared expert silently corrupts (#3450's prefill twin)
+            requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
+        }
     } else {
         requant_rows_q8(s.xb_b, dim, npos, s.xqb, s.xsb)
     }

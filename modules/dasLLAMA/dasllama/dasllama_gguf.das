@@ -4,6 +4,9 @@ module dasllama_gguf shared public
 
 require daslib/array_boost // nolint:STYLE030 — temp_array is [template]; STYLE030 misses template-fn refs
 require strings
+require daslib/fio                  // shard-path expansion + mapping (split GGUF)
+require daslib/strings_boost        // trim_suffix / pad_left (split shard names)
+require daslib/strings_convert     // try_to_int (validating shard-index parse)
 require llvm/daslib/f16_cvt public  // f16_to_f32 / f32_to_f16 (re-export: whisper/vad/parakeet/audio callers)
 require dasllama/dasllama_par       // maybe_parallel_for — the transcode hot loops thread when a jobque is up
 require dasllama/dasllama_math      // count_inline_run / count_parallel_dispatch_thru (the par macro's emitted counters)
@@ -108,19 +111,25 @@ struct GGUFKVLoc {
 struct GGUFTensorInfo {
     name : string
     ggml_type : int
-    offset : int64   // relative to the tensor data blob start
+    offset : int64   // relative to the tensor data blob start (of the shard holding it)
     n_elem : int64
     dims : array<int64>
+    shard : int      // which shard's data blob holds this tensor (0 for single-file models)
 }
 
 //! Parsed GGUF metadata: version, alignment, the KV table, the tensor list, and the
-//! absolute byte offset where tensor data begins.
+//! absolute byte offset where tensor data begins. For multi-part (split) models the
+//! shard_* arrays hold one entry per mapped shard (see parse_gguf_meta_shards); empty
+//! for a plain single-file parse — tensor reads then resolve within the caller's bytes.
 struct GGUFMeta {
     version : uint
     alignment : int64
     data_offset : int64
     kv : table<string; GGUFKVLoc>
     tensors : array<GGUFTensorInfo>
+    @do_not_delete shard_base : array<void?>   // borrowed mapped base per shard (owned by gguf_map_shards)
+    shard_size : array<int64>
+    shard_data_off : array<int64>              // per-shard data-blob offset (each shard pads independently)
 }
 
 def private gguf_scalar_size(gtype : int) : int64 {
@@ -217,6 +226,124 @@ def parse_gguf_meta(bytes : array<uint8> | #) : GGUFMeta {
     m.data_offset = off
     if (n_tensors > 0l) {
         m.data_offset = ((off + m.alignment - 1l) / m.alignment) * m.alignment
+    }
+    return <- m
+}
+
+// ===== multi-part (split) GGUF support =====
+
+// Invoke blk with the byte view holding tensor ti plus the tensor's data base offset within that
+// view. Single-file metas resolve within the caller's bytes; sharded metas resolve the tensor's
+// own mapped shard. The one choke point every tensor-data reader goes through.
+def private with_tensor_view(m : GGUFMeta; srcbytes : array<uint8> | #; ti : int; blk : block<(bytes : array<uint8>; tbase : int64) : void>) {
+    if (empty(m.shard_base)) {
+        unsafe {
+            invoke(blk, temp_array(addr<uint8?>(srcbytes[0]), long_length(srcbytes), type<uint8>),
+                m.data_offset + m.tensors[ti].offset)
+        }
+        return
+    }
+    let sh = m.tensors[ti].shard
+    unsafe {
+        invoke(blk, temp_array(reinterpret<uint8?>(m.shard_base[sh]), m.shard_size[sh], type<uint8>),
+            m.shard_data_off[sh] + m.tensors[ti].offset)
+    }
+}
+
+//! Expand a model path into its shard list. A llama.cpp split file name
+//! ("<prefix>-00001-of-00003.gguf") yields every sibling shard (normalized from any shard index,
+//! so pointing at shard 2 works); anything else yields just [path]. A missing sibling panics
+//! (the loader must not run on a partial split), or yields [] with `missing_ok` (presence gates).
+def gguf_shard_paths(path : string; missing_ok : bool = false) : array<string> {
+    var res : array<string>
+    let name = base_name(path)
+    let stem_part = trim_suffix(name, ".gguf")
+    let sl = length(stem_part)
+    // tail shape: "-NNNNN-of-NNNNN" = 15 chars, with at least 1 prefix char before it
+    if (name == stem_part || sl < 16) {
+        res |> push(path)
+        return <- res
+    }
+    let tail = slice(stem_part, sl - 15)
+    if (slice(tail, 0, 1) != "-" || slice(tail, 6, 10) != "-of-") {
+        res |> push(path)
+        return <- res
+    }
+    let ridx = try_to_int(slice(tail, 1, 6))
+    let rcnt = try_to_int(slice(tail, 10, 15))
+    if (!ridx._is_ok || !rcnt._is_ok) {
+        res |> push(path)
+        return <- res
+    }
+    let cnt = rcnt._value
+    if (ridx._value < 1 || cnt < 1 || ridx._value > cnt) {
+        res |> push(path)
+        return <- res
+    }
+    let prefix = slice(stem_part, 0, sl - 15)
+    let dir = dir_name(path)
+    let cnt5 = pad_left("{cnt}", 5, '0')
+    res |> reserve(cnt)
+    for (i in range(1, cnt + 1)) {
+        let i5 = pad_left("{i}", 5, '0')
+        let shard = path_join(dir, "{prefix}-{i5}-of-{cnt5}.gguf")
+        if (!fexist(shard)) {
+            if (missing_ok) {
+                res |> clear()
+                return <- res
+            }
+            panic("gguf: split model '{name}' is missing shard '{shard}'")
+        }
+        res |> push(shard)
+    }
+    return <- res
+}
+
+//! Map every shard and invoke blk once with ALL mappings alive (bases/sizes gain one entry per
+//! shard, in order). The mappings die when blk returns — nothing derived from them may escape.
+def gguf_map_shards(paths : array<string>; idx : int; var bases : array<void?>; var sizes : array<int64>; blk : block<() : void>) {
+    if (idx >= length(paths)) {
+        invoke(blk)
+        return
+    }
+    fopen(paths[idx], "rb") $(f) {
+        if (f == null) {
+            panic("gguf: cannot open shard '{paths[idx]}'")
+        }
+        fmap(f) $(var bytes : array<uint8>#) {
+            unsafe {
+                bases |> push(addr<void?>(bytes[0]))
+            }
+            sizes |> push(long_length(bytes))
+            gguf_map_shards(paths, idx + 1, bases, sizes, blk)
+        }
+    }
+}
+
+//! Parse a mapped shard set into one unified meta: shard 0 carries the model KVs (config, vocab,
+//! chat template — llama.cpp split convention), tensor directories merge across all shards with
+//! each tensor stamped with its shard. Tensor reads then resolve through the shard_* arrays.
+def parse_gguf_meta_shards(bases : array<void?>; sizes : array<int64>) : GGUFMeta {
+    var m : GGUFMeta
+    unsafe {
+        m <- parse_gguf_meta(temp_array(reinterpret<uint8?>(bases[0]), sizes[0], type<uint8>))
+    }
+    m.shard_base := bases
+    m.shard_size := sizes
+    m.shard_data_off |> reserve(length(bases))
+    m.shard_data_off |> push(m.data_offset)
+    for (k in range(1, length(bases))) {
+        var mk : GGUFMeta
+        unsafe {
+            mk <- parse_gguf_meta(temp_array(reinterpret<uint8?>(bases[k]), sizes[k], type<uint8>))
+        }
+        m.shard_data_off |> push(mk.data_offset)
+        m.tensors |> reserve(length(m.tensors) + length(mk.tensors))
+        for (i in range(length(mk.tensors))) {
+            mk.tensors[i].shard = k
+            m.tensors |> emplace(mk.tensors[i])
+        }
+        delete mk
     }
     return <- m
 }
@@ -793,8 +920,8 @@ def private guard_dst(name : string; what : string; off, need, have : int64) {
 }
 
 // Shared header for the three file-level transcodes: locate + type-check + bounds-check, return
-// the superblock-aligned disk cursor.
-def private kq_transcode_base(m : GGUFMeta; name : string; want_type : int; type_name : string; src_off, expect_n, disk_sb : int64) : int64 {
+// the tensor index (the caller resolves its view/base through with_tensor_view).
+def private kq_transcode_check(m : GGUFMeta; name : string; want_type : int; type_name : string; src_off, expect_n : int64) : int {
     let ti = gguf_find_tensor(m, name)
     if (ti < 0) {
         panic("gguf: tensor '{name}' not found")
@@ -808,30 +935,33 @@ def private kq_transcode_base(m : GGUFMeta; name : string; want_type : int; type
     if (src_off + expect_n > m.tensors[ti].n_elem) {
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {m.tensors[ti].n_elem} elems")
     }
-    return m.data_offset + m.tensors[ti].offset + (src_off / 256l) * disk_sb
+    return ti
 }
 
 //! Transcode a Q4_K tensor into the k4 planes at plane-local element offset `eloff` (from the
 //! layout's k4 cursor): quant bytes at (eloff/256)*128, scale blocks at (eloff/256)*20.
-def gguf_transcode_q4k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
-    let bo = kq_transcode_base(m, name, GGML_TYPE_Q4_K, "Q4_K", src_off, expect_n, 144l)
+def gguf_transcode_q4k(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    let ti = kq_transcode_check(m, name, GGML_TYPE_Q4_K, "Q4_K", src_off, expect_n)
     let nb = expect_n / 256l
     if (nb <= 0l) {
         return
     }
     guard_dst(name, "k4 quant plane", (eloff / 256l) * K4_QSB, nb * K4_QSB, long_length(kq))
     guard_dst(name, "k4 scale plane", (eloff / 256l) * K4_SSB, nb * K4_SSB, long_length(ks))
-    unsafe {   // per-superblock byte shuffle (see transcode_q4k_superblock), threaded + pointerized
-        let srcp = addr<uint8 const?>(bytes[bo])
-        var kqp = addr(kq[(eloff / 256l) * K4_QSB])
-        var ksp = addr(ks[(eloff / 256l) * K4_SSB])
-        maybe_parallel_for(0, int(nb), transcode_jobs(nb, 144l)) $(rb, re) {
-            unsafe {
-                for (blk in range64(int64(rb), int64(re))) {
-                    bcopy(ksp + blk * K4_SSB, srcp + blk * 144l, 16l)
-                    var pad = reinterpret<uint?>(ksp + blk * K4_SSB + 16l)
-                    pad[0] = 0u
-                    bcopy(kqp + blk * K4_QSB, srcp + blk * 144l + 16l, 128l)
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        let bo = tbase + (src_off / 256l) * 144l
+        unsafe {   // per-superblock byte shuffle (see transcode_q4k_superblock), threaded + pointerized
+            let srcp = addr<uint8 const?>(bytes[bo])
+            var kqp = addr(kq[(eloff / 256l) * K4_QSB])
+            var ksp = addr(ks[(eloff / 256l) * K4_SSB])
+            maybe_parallel_for(0, int(nb), transcode_jobs(nb, 144l)) $(rb, re) {
+                unsafe {
+                    for (blk in range64(int64(rb), int64(re))) {
+                        bcopy(ksp + blk * K4_SSB, srcp + blk * 144l, 16l)
+                        var pad = reinterpret<uint?>(ksp + blk * K4_SSB + 16l)
+                        pad[0] = 0u
+                        bcopy(kqp + blk * K4_QSB, srcp + blk * 144l + 16l, 128l)
+                    }
                 }
             }
         }
@@ -839,26 +969,29 @@ def gguf_transcode_q4k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
 }
 
 //! Transcode a Q5_K tensor into the k5 planes (see gguf_transcode_q4k; strides 160/20).
-def gguf_transcode_q5k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
-    let bo = kq_transcode_base(m, name, GGML_TYPE_Q5_K, "Q5_K", src_off, expect_n, 176l)
+def gguf_transcode_q5k(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    let ti = kq_transcode_check(m, name, GGML_TYPE_Q5_K, "Q5_K", src_off, expect_n)
     let nb = expect_n / 256l
     if (nb <= 0l) {
         return
     }
     guard_dst(name, "k5 quant plane", (eloff / 256l) * K5_QSB, nb * K5_QSB, long_length(kq))
     guard_dst(name, "k5 scale plane", (eloff / 256l) * K5_SSB, nb * K5_SSB, long_length(ks))
-    unsafe {   // per-superblock byte shuffle (see transcode_q5k_superblock), threaded + pointerized
-        let srcp = addr<uint8 const?>(bytes[bo])
-        var kqp = addr(kq[(eloff / 256l) * K5_QSB])
-        var ksp = addr(ks[(eloff / 256l) * K5_SSB])
-        maybe_parallel_for(0, int(nb), transcode_jobs(nb, 176l)) $(rb, re) {
-            unsafe {
-                for (blk in range64(int64(rb), int64(re))) {
-                    bcopy(ksp + blk * K5_SSB, srcp + blk * 176l, 16l)
-                    var pad = reinterpret<uint?>(ksp + blk * K5_SSB + 16l)
-                    pad[0] = 0u
-                    bcopy(kqp + blk * K5_QSB, srcp + blk * 176l + 48l, 128l)   // qs
-                    bcopy(kqp + blk * K5_QSB + 128l, srcp + blk * 176l + 16l, 32l)   // qh
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        let bo = tbase + (src_off / 256l) * 176l
+        unsafe {   // per-superblock byte shuffle (see transcode_q5k_superblock), threaded + pointerized
+            let srcp = addr<uint8 const?>(bytes[bo])
+            var kqp = addr(kq[(eloff / 256l) * K5_QSB])
+            var ksp = addr(ks[(eloff / 256l) * K5_SSB])
+            maybe_parallel_for(0, int(nb), transcode_jobs(nb, 176l)) $(rb, re) {
+                unsafe {
+                    for (blk in range64(int64(rb), int64(re))) {
+                        bcopy(ksp + blk * K5_SSB, srcp + blk * 176l, 16l)
+                        var pad = reinterpret<uint?>(ksp + blk * K5_SSB + 16l)
+                        pad[0] = 0u
+                        bcopy(kqp + blk * K5_QSB, srcp + blk * 176l + 48l, 128l)   // qs
+                        bcopy(kqp + blk * K5_QSB + 128l, srcp + blk * 176l + 16l, 32l)   // qh
+                    }
                 }
             }
         }
@@ -866,23 +999,26 @@ def gguf_transcode_q5k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
 }
 
 //! Transcode a Q6_K tensor into the k6 planes (see gguf_transcode_q4k; strides 192/18, exact).
-def gguf_transcode_q6k(m : GGUFMeta; bytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
-    let bo = kq_transcode_base(m, name, GGML_TYPE_Q6_K, "Q6_K", src_off, expect_n, 210l)
+def gguf_transcode_q6k(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    let ti = kq_transcode_check(m, name, GGML_TYPE_Q6_K, "Q6_K", src_off, expect_n)
     let nb = expect_n / 256l
     if (nb <= 0l) {
         return
     }
     guard_dst(name, "k6 quant plane", (eloff / 256l) * K6_QSB, nb * K6_QSB, long_length(kq))
     guard_dst(name, "k6 scale plane", (eloff / 256l) * K6_SSB, nb * K6_SSB, long_length(ks))
-    unsafe {   // per-superblock byte shuffle (see transcode_q6k_superblock), threaded + pointerized
-        let srcp = addr<uint8 const?>(bytes[bo])
-        var kqp = addr(kq[(eloff / 256l) * K6_QSB])
-        var ksp = addr(ks[(eloff / 256l) * K6_SSB])
-        maybe_parallel_for(0, int(nb), transcode_jobs(nb, 210l)) $(rb, re) {
-            unsafe {
-                for (blk in range64(int64(rb), int64(re))) {
-                    bcopy(kqp + blk * K6_QSB, srcp + blk * 210l, 192l)   // ql then qh — disk order
-                    bcopy(ksp + blk * K6_SSB, srcp + blk * 210l + 192l, 18l)   // 16 sub-scales + f16 d
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        let bo = tbase + (src_off / 256l) * 210l
+        unsafe {   // per-superblock byte shuffle (see transcode_q6k_superblock), threaded + pointerized
+            let srcp = addr<uint8 const?>(bytes[bo])
+            var kqp = addr(kq[(eloff / 256l) * K6_QSB])
+            var ksp = addr(ks[(eloff / 256l) * K6_SSB])
+            maybe_parallel_for(0, int(nb), transcode_jobs(nb, 210l)) $(rb, re) {
+                unsafe {
+                    for (blk in range64(int64(rb), int64(re))) {
+                        bcopy(kqp + blk * K6_QSB, srcp + blk * 210l, 192l)   // ql then qh — disk order
+                        bcopy(ksp + blk * K6_SSB, srcp + blk * 210l + 192l, 18l)   // 16 sub-scales + f16 d
+                    }
                 }
             }
         }
@@ -892,7 +1028,7 @@ def gguf_transcode_q6k(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
 //! Decode tensor `name` (F32 or F16 on disk) into dst[dst_off ..] as fp32. Panics if the
 //! tensor is missing, has a different element count than expected, or uses a type we don't
 //! yet read (quantized types are wired in a later step).
-def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; var dst : array<float>; dst_off, expect_n : int64; src_off : int64 = 0l) {
+def gguf_read_tensor_f32(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var dst : array<float>; dst_off, expect_n : int64; src_off : int64 = 0l) {
     let ti = gguf_find_tensor(m, name)
     if (ti < 0) {
         panic("gguf: tensor '{name}' not found")
@@ -905,8 +1041,8 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {nelem} elems")
     }
     let gtype = m.tensors[ti].ggml_type
-    let base = m.data_offset + m.tensors[ti].offset
     guard_dst(name, "f32 dst", dst_off, expect_n, long_length(dst))
+    with_tensor_view(m, srcbytes, ti) $(bytes, base) {
     if (gtype == GGML_TYPE_F32) {
         unsafe {   // raw copy, threaded in u64 words (+ one odd-float tail)
             let sp = addr<uint64 const?>(bytes[base + src_off * 4l])
@@ -1020,11 +1156,12 @@ def gguf_read_tensor_f32(m : GGUFMeta; bytes : array<uint8> | #; name : string; 
     } else {
         panic("gguf: tensor '{name}' type {gtype} not supported (have F32/F16/BF16/Q8_0/Q4_0/Q4_K/Q5_K/Q6_K/MXFP4)")
     }
+    }
 }
 
 //! Copy a BF16 tensor's raw halfwords into dst[dst_off..] — no fp32 expand (read kernels widen
 //! in-loop by the exact bit shift). Requires the tensor to be BF16 on disk (check gguf_tensor_type).
-def gguf_transcode_bf16(m : GGUFMeta; bytes : array<uint8> | #; name : string; var dst : array<uint16>; dst_off, expect_n : int64) {
+def gguf_transcode_bf16(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var dst : array<uint16>; dst_off, expect_n : int64) {
     let ti = gguf_find_tensor(m, name)
     if (ti < 0) {
         panic("gguf: tensor '{name}' not found")
@@ -1035,11 +1172,12 @@ def gguf_transcode_bf16(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
     if (expect_n != m.tensors[ti].n_elem) {
         panic("gguf: tensor '{name}' has {m.tensors[ti].n_elem} elems, expected {expect_n}")
     }
-    let base = m.data_offset + m.tensors[ti].offset
-    unsafe {
-        let src = temp_array(addr<uint16?>(bytes[base]), expect_n, type<uint16>)
-        for (i in range64(expect_n)) {
-            dst[dst_off + i] = src[i]
+    with_tensor_view(m, srcbytes, ti) $(bytes, base) {
+        unsafe {
+            let src = temp_array(addr<uint16?>(bytes[base]), expect_n, type<uint16>)
+            for (i in range64(expect_n)) {
+                dst[dst_off + i] = src[i]
+            }
         }
     }
 }
@@ -1055,7 +1193,7 @@ def gguf_tensor_type(m : GGUFMeta; name : string) : int {
 //! copy verbatim to qdst[qoff..]; the per-block fp16 scale widens to fp32 in sdst[soff..]. Requires
 //! the tensor to be Q8_0 on disk (check gguf_tensor_type first). qoff is the weight-element offset,
 //! soff = qoff / 32. This is the memory-honest load of a pre-quantized GGUF.
-def gguf_transcode_q8_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; var qdst : array<int8>; var sdst : array<float>; qoff, soff, expect_n : int64; src_off : int64 = 0l) {
+def gguf_transcode_q8_0(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var qdst : array<int8>; var sdst : array<float>; qoff, soff, expect_n : int64; src_off : int64 = 0l) {
     let ti = gguf_find_tensor(m, name)
     if (ti < 0) {
         panic("gguf: tensor '{name}' not found")
@@ -1077,23 +1215,25 @@ def gguf_transcode_q8_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
     // pointerized + threaded: the quant copy is a bit-reinterpret (uint8 -> int8, same bits), so a
     // block is 4 unaligned u64 moves + one f16 scale widen. Blocks are disjoint — bit-exact at any
     // lane count; jobs are floored to ~1MB of source each so small tensors stay inline.
-    let base = m.data_offset + m.tensors[ti].offset + (src_off / 32l) * 34l
-    unsafe {
-        let srcp = addr<uint8 const?>(bytes[base])
-        var qdp = addr(qdst[qoff])
-        var sdp = addr(sdst[soff])
-        let njobs = is_job_que_available() ? int(clamp(nb / 32768l, 1l, 64l)) : 1
-        maybe_parallel_for(0, int(nb), njobs) $(rb, re) {
-            unsafe {
-                for (blk in range64(int64(rb), int64(re))) {
-                    let bo = blk * 34l
-                    sdp[blk] = f16_to_f32(uint(srcp[bo]) | (uint(srcp[bo + 1l]) << 8u))
-                    let s64 = reinterpret<uint64 const?>(srcp + bo + 2l)
-                    var d64 = reinterpret<uint64?>(qdp + blk * 32l)
-                    d64[0] = s64[0]
-                    d64[1] = s64[1]
-                    d64[2] = s64[2]
-                    d64[3] = s64[3]
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        let base = tbase + (src_off / 32l) * 34l
+        unsafe {
+            let srcp = addr<uint8 const?>(bytes[base])
+            var qdp = addr(qdst[qoff])
+            var sdp = addr(sdst[soff])
+            let njobs = is_job_que_available() ? int(clamp(nb / 32768l, 1l, 64l)) : 1
+            maybe_parallel_for(0, int(nb), njobs) $(rb, re) {
+                unsafe {
+                    for (blk in range64(int64(rb), int64(re))) {
+                        let bo = blk * 34l
+                        sdp[blk] = f16_to_f32(uint(srcp[bo]) | (uint(srcp[bo + 1l]) << 8u))
+                        let s64 = reinterpret<uint64 const?>(srcp + bo + 2l)
+                        var d64 = reinterpret<uint64?>(qdp + blk * 32l)
+                        d64[0] = s64[0]
+                        d64[1] = s64[1]
+                        d64[2] = s64[2]
+                        d64[3] = s64[3]
+                    }
                 }
             }
         }
@@ -1104,7 +1244,7 @@ def gguf_transcode_q8_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
 //! GGML's exact split-half nibble packing, so the 16 packed bytes per block copy verbatim to
 //! qdst[qoff_bytes..] (qoff_bytes = weight-element-offset / 2); the per-block fp16 scale widens to
 //! fp32 in sdst[soff..]. Requires the tensor to be Q4_0 on disk (check gguf_tensor_type first).
-def gguf_transcode_q4_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; var qdst : array<uint8>; var sdst : array<float>; qoff_bytes, soff, expect_n : int64; src_off : int64 = 0l) {
+def gguf_transcode_q4_0(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var qdst : array<uint8>; var sdst : array<float>; qoff_bytes, soff, expect_n : int64; src_off : int64 = 0l) {
     let ti = gguf_find_tensor(m, name)
     if (ti < 0) {
         panic("gguf: tensor '{name}' not found")
@@ -1116,14 +1256,16 @@ def gguf_transcode_q4_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {m.tensors[ti].n_elem} elems")
     }
     let nb = expect_n / 32l
-    var bo = m.data_offset + m.tensors[ti].offset + (src_off / 32l) * 18l
-    for (blk in range64(nb)) {
-        sdst[soff + blk] = f16_to_f32(rd_u16(bytes, bo))
-        bo += 2l
-        for (j in range64(16l)) {
-            qdst[qoff_bytes + blk * 16l + j] = bytes[bo + j]
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        var bo = tbase + (src_off / 32l) * 18l
+        for (blk in range64(nb)) {
+            sdst[soff + blk] = f16_to_f32(rd_u16(bytes, bo))
+            bo += 2l
+            for (j in range64(16l)) {
+                qdst[qoff_bytes + blk * 16l + j] = bytes[bo + j]
+            }
+            bo += 16l
         }
-        bo += 16l
     }
 }
 
@@ -1133,7 +1275,7 @@ def gguf_transcode_q4_0(m : GGUFMeta; bytes : array<uint8> | #; name : string; v
 //! (eoff = offset / 32). Exact by construction (vs the old dequant->requantize-to-Q8 path, which
 //! paid an amax error) and reads 17 bytes/block instead of writing 33+. Requires the tensor to be
 //! MXFP4 on disk (check gguf_tensor_type first).
-def gguf_transcode_mx4(m : GGUFMeta; bytes : array<uint8> | #; name : string; var ndst : array<uint8>; var edst : array<uint8>; noff_bytes, eoff, expect_n : int64; src_off : int64 = 0l) {
+def gguf_transcode_mx4(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var ndst : array<uint8>; var edst : array<uint8>; noff_bytes, eoff, expect_n : int64; src_off : int64 = 0l) {
     let ti = gguf_find_tensor(m, name)
     if (ti < 0) {
         panic("gguf: tensor '{name}' not found")
@@ -1145,13 +1287,15 @@ def gguf_transcode_mx4(m : GGUFMeta; bytes : array<uint8> | #; name : string; va
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {m.tensors[ti].n_elem} elems")
     }
     let nb = expect_n / 32l
-    var bo = m.data_offset + m.tensors[ti].offset + (src_off / 32l) * 17l
-    for (blk in range64(nb)) {
-        edst[eoff + blk] = bytes[bo]
-        bo++
-        for (j in range64(16l)) {
-            ndst[noff_bytes + blk * 16l + j] = bytes[bo + j]
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        var bo = tbase + (src_off / 32l) * 17l
+        for (blk in range64(nb)) {
+            edst[eoff + blk] = bytes[bo]
+            bo++
+            for (j in range64(16l)) {
+                ndst[noff_bytes + blk * 16l + j] = bytes[bo + j]
+            }
+            bo += 16l
         }
-        bo += 16l
     }
 }
