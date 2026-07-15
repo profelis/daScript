@@ -1003,16 +1003,6 @@ def public metal_prefill_stats() : tuple<prefills : int64; declines : int64> {
     return (prefills = g_prefills, declines = g_declines)
 }
 
-//! Add every cached block_q8_0 weight blob to a residency set (the ~3.4GB decode/prefill working
-//! set). Caller commits + requests. Both drivers share this cache, so both pin the same weights.
-def public metal_blob_regions_add_resident(rset : MetalResidencySet?) {
-    for (buf in values(g_blob_regions)) {
-        if (buf != null) {
-            metal_residency_set_add_buffer(rset, buf)
-        }
-    }
-}
-
 //! Release the shared block_q8_0 blob cache — BOTH drivers' shutdowns call this (the batch-decode
 //! driver creates blobs here too, and each shutdown must leave the count at zero for the leak
 //! gates). Blobs lazily rebuild on the next use.
