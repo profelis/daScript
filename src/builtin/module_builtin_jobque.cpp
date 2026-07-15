@@ -643,6 +643,7 @@ namespace das {
     // JobStatus (join is the flush point); a job whose results are consumed BEFORE join would stall.
     static thread_local bool g_batchForkJobs = false;
     static thread_local vector<Job> g_pendingForkJobs;
+    static thread_local bool g_threadTeamMode = true;
 
     void set_jobque_batch_dispatch ( bool batch, Context *, LineInfoArg * ) {
         g_batchForkJobs = batch;
@@ -738,6 +739,16 @@ namespace das {
 
     bool get_jobque_team_mode ( Context *, LineInfoArg * ) {
         return g_jobQue && g_jobQue->getTeamMode();
+    }
+
+    void set_jobque_thread_team_mode ( bool on, Context *, LineInfoArg * ) {
+        // Per-caller override: an inference thread can run team_parallel_* inline while other
+        // callers keep publishing to the shared worker team. New OS threads default to enabled.
+        g_threadTeamMode = on;
+    }
+
+    bool get_jobque_thread_team_mode ( Context *, LineInfoArg * ) {
+        return g_threadTeamMode;
     }
 
     void set_jobque_worker_limit ( int32_t n, Context * context, LineInfoArg * at ) {
@@ -861,7 +872,7 @@ namespace das {
         }
         int actualChunks = numChunks < total ? numChunks : total;
         int nW = g_jobQue->getNumWorkers();
-        if ( actualChunks == 1 || nW == 0 || !g_jobQue->getTeamMode() ) {
+        if ( actualChunks == 1 || nW == 0 || !g_jobQue->getTeamMode() || !g_threadTeamMode ) {
             das_invoke_lambda<void>::invoke(context, lineinfo, lambda, rangeBegin, rangeEnd);
             das_delete<Lambda>::clear(context, lambda);
             return;
@@ -926,7 +937,7 @@ namespace das {
         }
         int actualChunks = numChunks < total ? numChunks : total;
         int nW = g_jobQue->getNumWorkers();
-        if ( actualChunks == 1 || nW == 0 || !g_jobQue->getTeamMode() ) {
+        if ( actualChunks == 1 || nW == 0 || !g_jobQue->getTeamMode() || !g_threadTeamMode ) {
             das_invoke_lambda<void>::invoke(context, lineinfo, lambda, 0, rangeBegin, rangeEnd);
             das_delete<Lambda>::clear(context, lambda);
             return;
@@ -1000,7 +1011,7 @@ namespace das {
             maxChunks = actualChunks[s] > maxChunks ? actualChunks[s] : maxChunks;
         }
         int nW = g_jobQue->getNumWorkers();
-        if ( maxChunks <= 1 || nW == 0 || !g_jobQue->getTeamMode() ) {
+        if ( maxChunks <= 1 || nW == 0 || !g_jobQue->getTeamMode() || !g_threadTeamMode ) {
             // trivial/off: stages in order, one inline invoke per non-empty stage
             for ( int s = 0; s != numStages; ++s ) {
                 if ( actualChunks[s] > 0 ) {
@@ -1481,6 +1492,12 @@ namespace das {
             addExtern<DAS_BIND_FUN(set_jobque_team_mode)>(*this, lib,  "set_jobque_team_mode",
                 SideEffects::modifyExternal, "set_jobque_team_mode")
                     ->args({"on","context","line"});
+            addExtern<DAS_BIND_FUN(set_jobque_thread_team_mode)>(*this, lib,  "set_jobque_thread_team_mode",
+                SideEffects::modifyExternal, "set_jobque_thread_team_mode")
+                    ->args({"on","context","line"});
+            addExtern<DAS_BIND_FUN(get_jobque_thread_team_mode)>(*this, lib,  "get_jobque_thread_team_mode",
+                SideEffects::accessExternal, "get_jobque_thread_team_mode")
+                    ->args({"context","line"});
             addExtern<DAS_BIND_FUN(set_jobque_worker_limit)>(*this, lib,  "set_jobque_worker_limit",
                 SideEffects::modifyExternal, "set_jobque_worker_limit")
                     ->args({"limit","context","line"});

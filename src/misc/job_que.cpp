@@ -756,6 +756,10 @@ namespace das {
                 for ( int c = 0; c != stages[s].numChunks; ++c ) (*stages[s].work)(c, nW);
             return;
         }
+        // The team publish slots are intentionally shared by the whole pool. Multiple inference
+        // contexts may dispatch from different caller threads (for example LLM + ASR); serialize
+        // those publishes while retaining full worker-team parallelism inside each operation.
+        lock_guard<mutex> dispatchLock(mTeamDispatchMutex);
         uint64_t t0 = 0, tp = 0, tc = 0;
         int callerChunks = 0;
         int totalChunks = 0;
