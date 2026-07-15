@@ -6592,6 +6592,9 @@ def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bo
     let c = t.config
     let dim = c.dim
     assert(c.n_layer_nextn > 0l)
+    if (s.kv_pool != null) {   // paged pools size blob_of for trunk layers only — flat sessions only (v1)
+        panic("dasLLAMA: forward_mtp needs a flat-KV session — the paged pool has no slab for the draft block")
+    }
     kv_ensure(s, pos + 1l)
     // eh_proj input: [enorm(embed(token)) ; hnorm(h)] — embedding first (llama.cpp concat order)
     embed_row(t, token, unsafe(addr(s.x[0])))
@@ -6693,6 +6696,9 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
     assert(c.n_layer_nextn > 0l)
     if (t.quant == QuantMode.q4) {   // no batched prefill rail: the 2-row verify (and the warm) need it
         panic("dasLLAMA: MTP self-spec decode needs the batched prefill path — load q8 or fp32, not q4")
+    }
+    if (s.kv_pool != null) {   // paged pools size blob_of for trunk layers only — flat sessions only (v1)
+        panic("dasLLAMA: MTP self-spec decode needs a flat-KV session — the paged pool has no slab for the draft block")
     }
     let np = int64(length(prompt))
     var ids : array<int64>
