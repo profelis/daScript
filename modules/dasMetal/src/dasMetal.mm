@@ -15,6 +15,13 @@
 #error "dasMetal.mm must be compiled with ARC (-fobjc-arc)"
 #endif
 
+// MTLResidencySet is only declared in the macOS 15.0 / iOS 18.0 SDK and newer
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+#define DASMETAL_HAS_RESIDENCY_SETS 1
+#elif defined(__IPHONE_OS_VERSION_MAX_ALLOWED) && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000
+#define DASMETAL_HAS_RESIDENCY_SETS 1
+#endif
+
 MAKE_TYPE_FACTORY(MetalDevice, MetalDevice)
 MAKE_TYPE_FACTORY(MetalCommandQueue, MetalCommandQueue)
 MAKE_TYPE_FACTORY(MetalLibrary, MetalLibrary)
@@ -23,6 +30,8 @@ MAKE_TYPE_FACTORY(MetalComputePipeline, MetalComputePipeline)
 MAKE_TYPE_FACTORY(MetalBuffer, MetalBuffer)
 MAKE_TYPE_FACTORY(MetalCommandBuffer, MetalCommandBuffer)
 MAKE_TYPE_FACTORY(MetalComputeEncoder, MetalComputeEncoder)
+MAKE_TYPE_FACTORY(MetalSharedEvent, MetalSharedEvent)
+MAKE_TYPE_FACTORY(MetalResidencySet, MetalResidencySet)
 
 namespace das {
 
@@ -215,6 +224,100 @@ namespace das {
         }
     }
 
+    // CONCURRENT-dispatch encoder: Metal does no per-dispatch hazard ordering inside the pass —
+    // the CALLER orders dependent dispatches with metal_memory_barrier (the ggml-metal encode
+    // model; measured against the serial encoder's per-dispatch launch gap in the framing lab)
+    MetalComputeEncoder * metal_new_compute_encoder_concurrent ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at ) {
+        if ( !cb ) ctx->throw_error_at(at, "metal_new_compute_encoder_concurrent: null command buffer");
+        @autoreleasepool {
+            id<MTLCommandBuffer> c = (__bridge id<MTLCommandBuffer>)(void *) cb;
+            return retain_handle<MetalComputeEncoder>([c computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]);
+        }
+    }
+
+    // buffer-scope memory barrier: dispatches encoded after it observe writes of dispatches
+    // encoded before it (only meaningful on a concurrent encoder)
+    void metal_memory_barrier ( MetalComputeEncoder * enc, Context * ctx, LineInfoArg * at ) {
+        if ( !enc ) ctx->throw_error_at(at, "metal_memory_barrier: null encoder");
+        [(__bridge id<MTLComputeCommandEncoder>)(void *) enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+
+    // shared event trio — the encode-ahead rail: a pre-encoded command buffer opens with
+    // metal_cb_wait_for_event (encoded BEFORE any encoder on that cb) and commits early; the CPU
+    // pokes the input buffers later and releases the GPU with metal_shared_event_signal. The
+    // signaled value must be non-decreasing over the event's lifetime.
+    MetalSharedEvent * metal_new_shared_event ( MetalDevice * dev, Context * ctx, LineInfoArg * at ) {
+        if ( !dev ) ctx->throw_error_at(at, "metal_new_shared_event: null device");
+        @autoreleasepool {
+            id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
+            return retain_handle<MetalSharedEvent>([d newSharedEvent]);
+        }
+    }
+
+    void metal_cb_wait_for_event ( MetalCommandBuffer * cb, MetalSharedEvent * ev, uint64_t value,
+            Context * ctx, LineInfoArg * at ) {
+        if ( !cb ) ctx->throw_error_at(at, "metal_cb_wait_for_event: null command buffer");
+        if ( !ev ) ctx->throw_error_at(at, "metal_cb_wait_for_event: null event");
+        id<MTLCommandBuffer> c = (__bridge id<MTLCommandBuffer>)(void *) cb;
+        [c encodeWaitForEvent:(__bridge id<MTLSharedEvent>)(void *) ev value:value];
+    }
+
+    void metal_shared_event_signal ( MetalSharedEvent * ev, uint64_t value, Context * ctx, LineInfoArg * at ) {
+        if ( !ev ) ctx->throw_error_at(at, "metal_shared_event_signal: null event");
+        ((__bridge id<MTLSharedEvent>)(void *) ev).signaledValue = value;
+    }
+
+    // ===== residency set (macOS 15+) =====
+    // ggml-metal's residency model: pin a working set globally + persistently — add the
+    // allocations, commit, requestResidency. The set is NEVER bound to an encoder or command
+    // buffer; a committed+requested set keeps its pages wired so per-command-buffer residency
+    // (Metal's default, re-evaluated per commit over the whole referenced working set) is a no-op.
+    MetalResidencySet * metal_new_residency_set ( MetalDevice * dev, Context * ctx, LineInfoArg * at ) {
+        if ( !dev ) ctx->throw_error_at(at, "metal_new_residency_set: null device");
+#if defined(DASMETAL_HAS_RESIDENCY_SETS)
+        if ( @available(macOS 15.0, iOS 18.0, *) ) {
+            @autoreleasepool {
+                id<MTLDevice> d = (__bridge id<MTLDevice>)(void *) dev;
+                MTLResidencySetDescriptor * desc = [MTLResidencySetDescriptor new];
+                desc.label = @"dasllama";
+                NSError * err = nil;
+                id<MTLResidencySet> rset = [d newResidencySetWithDescriptor:desc error:&err];
+                if ( rset == nil ) return nullptr;      // null == "unsupported, skip" on the das side
+                return retain_handle<MetalResidencySet>(rset);
+            }
+        }
+#endif
+        return nullptr;
+    }
+
+    void metal_residency_set_add_buffer ( MetalResidencySet * rset, MetalBuffer * buf, Context * ctx, LineInfoArg * at ) {
+        if ( !rset ) ctx->throw_error_at(at, "metal_residency_set_add_buffer: null residency set");
+        if ( !buf ) ctx->throw_error_at(at, "metal_residency_set_add_buffer: null buffer");
+#if defined(DASMETAL_HAS_RESIDENCY_SETS)
+        if ( @available(macOS 15.0, iOS 18.0, *) ) {
+            [(__bridge id<MTLResidencySet>)(void *) rset addAllocation:(__bridge id<MTLBuffer>)(void *) buf];
+        }
+#endif
+    }
+
+    void metal_residency_set_commit ( MetalResidencySet * rset, Context * ctx, LineInfoArg * at ) {
+        if ( !rset ) ctx->throw_error_at(at, "metal_residency_set_commit: null residency set");
+#if defined(DASMETAL_HAS_RESIDENCY_SETS)
+        if ( @available(macOS 15.0, iOS 18.0, *) ) {
+            [(__bridge id<MTLResidencySet>)(void *) rset commit];
+        }
+#endif
+    }
+
+    void metal_residency_set_request ( MetalResidencySet * rset, Context * ctx, LineInfoArg * at ) {
+        if ( !rset ) ctx->throw_error_at(at, "metal_residency_set_request: null residency set");
+#if defined(DASMETAL_HAS_RESIDENCY_SETS)
+        if ( @available(macOS 15.0, iOS 18.0, *) ) {
+            [(__bridge id<MTLResidencySet>)(void *) rset requestResidency];
+        }
+#endif
+    }
+
     void metal_set_pipeline ( MetalComputeEncoder * enc, MetalComputePipeline * pso, Context * ctx, LineInfoArg * at ) {
         if ( !enc ) ctx->throw_error_at(at, "metal_set_pipeline: null encoder");
         if ( !pso ) ctx->throw_error_at(at, "metal_set_pipeline: null pipeline");
@@ -229,6 +332,20 @@ namespace das {
         if ( index < 0 ) ctx->throw_error_at(at, "metal_set_buffer: negative buffer index %i", index);
         id<MTLComputeCommandEncoder> e = (__bridge id<MTLComputeCommandEncoder>)(void *) enc;
         [e setBuffer:(__bridge id<MTLBuffer>)(void *) buf offset:offset atIndex:NSUInteger(index)];
+    }
+
+    // inline kargs: copies `len` bytes straight into the command stream (no MetalBuffer per
+    // kargs — the ggml-metal model). Metal caps setBytes at 4KB; every LLM kargs struct is < 256B.
+    void metal_set_bytes ( MetalComputeEncoder * enc, void * data, uint64_t len, int32_t index,
+            Context * ctx, LineInfoArg * at ) {
+        if ( !enc ) ctx->throw_error_at(at, "metal_set_bytes: null encoder");
+        if ( !data ) ctx->throw_error_at(at, "metal_set_bytes: null data");
+        if ( index < 0 ) ctx->throw_error_at(at, "metal_set_bytes: negative buffer index %i", index);
+        if ( len == 0 || len > 4096 ) {
+            ctx->throw_error_at(at, "metal_set_bytes: length %llu out of range (1..4096)", (unsigned long long) len);
+        }
+        id<MTLComputeCommandEncoder> e = (__bridge id<MTLComputeCommandEncoder>)(void *) enc;
+        [e setBytes:data length:NSUInteger(len) atIndex:NSUInteger(index)];
     }
 
     void metal_set_threadgroup_memory_length ( MetalComputeEncoder * enc, uint64_t length, int32_t index,
@@ -307,6 +424,16 @@ namespace das {
         return [(__bridge id<MTLCommandBuffer>)(void *) cb GPUEndTime];
     }
 
+    double metal_command_buffer_kernel_start_time ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at ) {
+        if ( !cb ) ctx->throw_error_at(at, "metal_command_buffer_kernel_start_time: null command buffer");
+        return [(__bridge id<MTLCommandBuffer>)(void *) cb kernelStartTime];
+    }
+
+    double metal_command_buffer_kernel_end_time ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at ) {
+        if ( !cb ) ctx->throw_error_at(at, "metal_command_buffer_kernel_end_time: null command buffer");
+        return [(__bridge id<MTLCommandBuffer>)(void *) cb kernelEndTime];
+    }
+
     // ===== lifetime =====
 
     void metal_release_device ( MetalDevice * h ) { release_handle(h); }
@@ -317,6 +444,15 @@ namespace das {
     void metal_release_buffer ( MetalBuffer * h ) { release_handle(h); }
     void metal_release_command_buffer ( MetalCommandBuffer * h ) { release_handle(h); }
     void metal_release_encoder ( MetalComputeEncoder * h ) { release_handle(h); }
+    void metal_release_shared_event ( MetalSharedEvent * h ) { release_handle(h); }
+    void metal_release_residency_set ( MetalResidencySet * h ) {
+#if defined(DASMETAL_HAS_RESIDENCY_SETS)
+        if ( @available(macOS 15.0, iOS 18.0, *) ) {
+            if ( h ) [(__bridge id<MTLResidencySet>)(void *) h endResidency];
+        }
+#endif
+        release_handle(h);
+    }
 
     int64_t metal_live_object_count () {
         return g_metalLiveObjects.load(std::memory_order_relaxed);
@@ -338,6 +474,8 @@ namespace das {
             addAnnotation(new DummyTypeAnnotation("MetalBuffer", "MetalBuffer", 1, 1));
             addAnnotation(new DummyTypeAnnotation("MetalCommandBuffer", "MetalCommandBuffer", 1, 1));
             addAnnotation(new DummyTypeAnnotation("MetalComputeEncoder", "MetalComputeEncoder", 1, 1));
+            addAnnotation(new DummyTypeAnnotation("MetalSharedEvent", "MetalSharedEvent", 1, 1));
+            addAnnotation(new DummyTypeAnnotation("MetalResidencySet", "MetalResidencySet", 1, 1));
 
             addExtern<DAS_BIND_FUN(metal_create_system_default_device)>(*this, lib, "metal_create_system_default_device",
                 SideEffects::modifyExternal, "metal_create_system_default_device");
@@ -386,12 +524,30 @@ namespace das {
             addExtern<DAS_BIND_FUN(metal_new_compute_encoder)>(*this, lib, "metal_new_compute_encoder",
                 SideEffects::modifyExternal, "metal_new_compute_encoder")
                     ->args({"command_buffer", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_new_compute_encoder_concurrent)>(*this, lib, "metal_new_compute_encoder_concurrent",
+                SideEffects::modifyExternal, "metal_new_compute_encoder_concurrent")
+                    ->args({"command_buffer", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_memory_barrier)>(*this, lib, "metal_memory_barrier",
+                SideEffects::modifyExternal, "metal_memory_barrier")
+                    ->args({"encoder", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_new_shared_event)>(*this, lib, "metal_new_shared_event",
+                SideEffects::modifyExternal, "metal_new_shared_event")
+                    ->args({"device", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_cb_wait_for_event)>(*this, lib, "metal_cb_wait_for_event",
+                SideEffects::modifyExternal, "metal_cb_wait_for_event")
+                    ->args({"command_buffer", "event", "value", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_shared_event_signal)>(*this, lib, "metal_shared_event_signal",
+                SideEffects::modifyExternal, "metal_shared_event_signal")
+                    ->args({"event", "value", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_set_pipeline)>(*this, lib, "metal_set_pipeline",
                 SideEffects::modifyExternal, "metal_set_pipeline")
                     ->args({"encoder", "pipeline", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_set_buffer)>(*this, lib, "metal_set_buffer",
                 SideEffects::modifyExternal, "metal_set_buffer")
                     ->args({"encoder", "buffer", "offset", "index", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_set_bytes)>(*this, lib, "metal_set_bytes",
+                SideEffects::modifyExternal, "metal_set_bytes")
+                    ->args({"encoder", "data", "len", "index", "context", "at"});
             addExtern<DAS_BIND_FUN(metal_set_threadgroup_memory_length)>(*this, lib, "metal_set_threadgroup_memory_length",
                 SideEffects::modifyExternal, "metal_set_threadgroup_memory_length")
                     ->args({"encoder", "length", "index", "context", "at"});
@@ -419,6 +575,25 @@ namespace das {
             addExtern<DAS_BIND_FUN(metal_command_buffer_gpu_end_time)>(*this, lib, "metal_command_buffer_gpu_end_time",
                 SideEffects::modifyExternal, "metal_command_buffer_gpu_end_time")
                     ->args({"command_buffer", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_command_buffer_kernel_start_time)>(*this, lib, "metal_command_buffer_kernel_start_time",
+                SideEffects::modifyExternal, "metal_command_buffer_kernel_start_time")
+                    ->args({"command_buffer", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_command_buffer_kernel_end_time)>(*this, lib, "metal_command_buffer_kernel_end_time",
+                SideEffects::modifyExternal, "metal_command_buffer_kernel_end_time")
+                    ->args({"command_buffer", "context", "at"});
+
+            addExtern<DAS_BIND_FUN(metal_new_residency_set)>(*this, lib, "metal_new_residency_set",
+                SideEffects::modifyExternal, "metal_new_residency_set")
+                    ->args({"device", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_residency_set_add_buffer)>(*this, lib, "metal_residency_set_add_buffer",
+                SideEffects::modifyExternal, "metal_residency_set_add_buffer")
+                    ->args({"residency_set", "buffer", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_residency_set_commit)>(*this, lib, "metal_residency_set_commit",
+                SideEffects::modifyExternal, "metal_residency_set_commit")
+                    ->args({"residency_set", "context", "at"});
+            addExtern<DAS_BIND_FUN(metal_residency_set_request)>(*this, lib, "metal_residency_set_request",
+                SideEffects::modifyExternal, "metal_residency_set_request")
+                    ->args({"residency_set", "context", "at"});
 
             addExtern<DAS_BIND_FUN(metal_release_device)>(*this, lib, "metal_release",
                 SideEffects::modifyExternal, "metal_release_device")->args({"handle"});
@@ -436,6 +611,10 @@ namespace das {
                 SideEffects::modifyExternal, "metal_release_command_buffer")->args({"handle"});
             addExtern<DAS_BIND_FUN(metal_release_encoder)>(*this, lib, "metal_release",
                 SideEffects::modifyExternal, "metal_release_encoder")->args({"handle"});
+            addExtern<DAS_BIND_FUN(metal_release_shared_event)>(*this, lib, "metal_release",
+                SideEffects::modifyExternal, "metal_release_shared_event")->args({"handle"});
+            addExtern<DAS_BIND_FUN(metal_release_residency_set)>(*this, lib, "metal_release",
+                SideEffects::modifyExternal, "metal_release_residency_set")->args({"handle"});
 
             addExtern<DAS_BIND_FUN(metal_live_object_count)>(*this, lib, "metal_live_object_count",
                 SideEffects::modifyExternal, "metal_live_object_count");

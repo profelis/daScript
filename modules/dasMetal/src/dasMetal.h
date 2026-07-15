@@ -18,6 +18,8 @@ namespace das {
     struct MetalBuffer;
     struct MetalCommandBuffer;
     struct MetalComputeEncoder;
+    struct MetalSharedEvent;
+    struct MetalResidencySet;
 
     DAS_MOD_API MetalDevice * metal_create_system_default_device ();
     DAS_MOD_API char * metal_device_name ( MetalDevice * dev, Context * ctx, LineInfoArg * at );
@@ -39,8 +41,16 @@ namespace das {
     DAS_MOD_API MetalCommandBuffer * metal_new_command_buffer ( MetalCommandQueue * queue, Context * ctx, LineInfoArg * at );
     DAS_MOD_API MetalCommandBuffer * metal_new_command_buffer_unretained ( MetalCommandQueue * queue, Context * ctx, LineInfoArg * at );
     DAS_MOD_API MetalComputeEncoder * metal_new_compute_encoder ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API MetalComputeEncoder * metal_new_compute_encoder_concurrent ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API void metal_memory_barrier ( MetalComputeEncoder * enc, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API MetalSharedEvent * metal_new_shared_event ( MetalDevice * dev, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API void metal_cb_wait_for_event ( MetalCommandBuffer * cb, MetalSharedEvent * ev, uint64_t value,
+        Context * ctx, LineInfoArg * at );
+    DAS_MOD_API void metal_shared_event_signal ( MetalSharedEvent * ev, uint64_t value, Context * ctx, LineInfoArg * at );
     DAS_MOD_API void metal_set_pipeline ( MetalComputeEncoder * enc, MetalComputePipeline * pso, Context * ctx, LineInfoArg * at );
     DAS_MOD_API void metal_set_buffer ( MetalComputeEncoder * enc, MetalBuffer * buf, uint64_t offset, int32_t index,
+        Context * ctx, LineInfoArg * at );
+    DAS_MOD_API void metal_set_bytes ( MetalComputeEncoder * enc, void * data, uint64_t len, int32_t index,
         Context * ctx, LineInfoArg * at );
     DAS_MOD_API void metal_set_threadgroup_memory_length ( MetalComputeEncoder * enc, uint64_t length, int32_t index,
         Context * ctx, LineInfoArg * at );
@@ -54,8 +64,18 @@ namespace das {
     DAS_MOD_API char * metal_command_buffer_error ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at );
     DAS_MOD_API double metal_command_buffer_gpu_start_time ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at );
     DAS_MOD_API double metal_command_buffer_gpu_end_time ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API double metal_command_buffer_kernel_start_time ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API double metal_command_buffer_kernel_end_time ( MetalCommandBuffer * cb, Context * ctx, LineInfoArg * at );
 
-    // all eight register as das-side `metal_release` overloads; C++ names differ
+    // MTLResidencySet (macOS 15+) — pin a working set resident globally + persistently. Never bound
+    // to an encoder/command buffer (ggml-metal's model): add allocations, commit, requestResidency
+    // once. metal_new_residency_set returns null on older OS — callers treat null as "skip".
+    DAS_MOD_API MetalResidencySet * metal_new_residency_set ( MetalDevice * dev, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API void metal_residency_set_add_buffer ( MetalResidencySet * rset, MetalBuffer * buf, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API void metal_residency_set_commit ( MetalResidencySet * rset, Context * ctx, LineInfoArg * at );
+    DAS_MOD_API void metal_residency_set_request ( MetalResidencySet * rset, Context * ctx, LineInfoArg * at );
+
+    // each registers as a das-side `metal_release` overload; C++ names differ
     // because DAS_BIND_FUN cannot take an overload set
     DAS_MOD_API void metal_release_device ( MetalDevice * h );
     DAS_MOD_API void metal_release_queue ( MetalCommandQueue * h );
@@ -65,6 +85,8 @@ namespace das {
     DAS_MOD_API void metal_release_buffer ( MetalBuffer * h );
     DAS_MOD_API void metal_release_command_buffer ( MetalCommandBuffer * h );
     DAS_MOD_API void metal_release_encoder ( MetalComputeEncoder * h );
+    DAS_MOD_API void metal_release_shared_event ( MetalSharedEvent * h );
+    DAS_MOD_API void metal_release_residency_set ( MetalResidencySet * h );
 
     DAS_MOD_API int64_t metal_live_object_count ();
 }

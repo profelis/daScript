@@ -1,0 +1,1167 @@
+options gen2
+options persistent_heap
+
+require dastest/testing_boost
+require metal/msl_shader
+require ?das_metal metal/das_metal_boost  // nolint:STYLE030 — GPU driver half, Apple builds only
+require dasllama/dasllama_metal_decode  // nolint:STYLE030 — the production batch attention MSL (zero copy drift)
+require daslib/fio
+require math
+require strings
+
+// Single-query decode attention microbench — the emission arc's P1c detector and the one
+// genuinely NEW piece of GPU math (prefill's attention kernels are batch-tiled and read f32
+// pre-codec K/V; decode reads the f16 KV mirror one query at a time). Shape: one threadgroup
+// per (stream, head), 128 threads; pass 1 scores the whole context into a threadgroup slab
+// (depth <= 2048 fits 8KB), pass 2 softmax (simd butterfly + cross-simdgroup reduce), pass 3
+// per-lane V column accumulate. GQA: head h reads kv head h/kv_mul.
+//
+// The oracle is a CPU twin function (NOT the method's width-1 replay — barrier reductions
+// don't replay sequentially), compared under a small absolute tolerance: exp() and the
+// accumulation order differ legitimately between CPU and GPU.
+//
+//   bin/daslang -jit dastest/dastest.das -- --bench --test modules/dasLLAMA/benchmarks/attn/bench_metal_sq_attn.das
+
+class MetalSqAttnLab {
+    @ssbo @binding = 0 kc : array<float16>  // [rows x kv_dim] K, f16 (the mirror contract)
+    @ssbo @binding = 1 vc : array<float16>  // [rows x kv_dim] V, f16
+    @ssbo @binding = 2 q : array<float>     // [B x qd] roped queries (qd = nheads * head_size)
+    @ssbo @binding = 3 yo : array<float>    // [B x qd] attention out
+    @uniform @binding = 4 cnt : uint        // context depth (pos + 1)
+    @uniform @binding = 5 kv_dim : uint
+    @uniform @binding = 6 nheads : uint
+    @uniform @binding = 7 kv_mul : uint
+    @uniform @binding = 8 scale : float
+    @workgroup scores : float[2048]
+    @workgroup red : float[4]
+
+    [metal_kernel(name="metal_sq_attn_msl")]
+    def metal_sq_attn {
+        let head_size = 128u                // == threads per group; lane owns one V column
+        let wg = gl_WorkGroupID.x
+        let h = wg % nheads
+        let bb = wg / nheads
+        let lid = gl_LocalInvocationID.x
+        let khoff = (h / kv_mul) * head_size
+        let qoff = bb * (nheads * head_size) + h * head_size
+        // pass 1: strided score fill — lane j dots q[head] against K row j
+        var j = lid
+        while (j < cnt) {
+            var s = 0.0
+            var e = 0u
+            while (e < head_size) {
+                s += q[qoff + e] * float(kc[j * kv_dim + khoff + e])
+                e++
+            }
+            scores[j] = s * scale
+            j += 128u
+        }
+        barrier()
+        // pass 2a: max — strided local, simd butterfly, cross-simdgroup
+        var m = -3.0e38
+        j = lid
+        while (j < cnt) {
+            m = max(m, scores[j])
+            j += 128u
+        }
+        m = max(m, simd_shuffle_xor(m, 16u))
+        m = max(m, simd_shuffle_xor(m, 8u))
+        m = max(m, simd_shuffle_xor(m, 4u))
+        m = max(m, simd_shuffle_xor(m, 2u))
+        m = max(m, simd_shuffle_xor(m, 1u))
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID] = m
+        }
+        barrier()
+        m = max(max(red[0], red[1]), max(red[2], red[3]))
+        barrier()                           // red[] reused for the sum below
+        // pass 2b: exp in place + sum
+        var l = 0.0
+        j = lid
+        while (j < cnt) {
+            let w = exp(scores[j] - m)
+            scores[j] = w
+            l += w
+            j += 128u
+        }
+        l += simd_shuffle_xor(l, 16u)
+        l += simd_shuffle_xor(l, 8u)
+        l += simd_shuffle_xor(l, 4u)
+        l += simd_shuffle_xor(l, 2u)
+        l += simd_shuffle_xor(l, 1u)
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID] = l
+        }
+        barrier()
+        l = red[0] + red[1] + red[2] + red[3]
+        // pass 3: lane owns V column `lid` — weighted sum over the whole context
+        var acc = 0.0
+        j = 0u
+        while (j < cnt) {
+            acc += scores[j] * float(vc[j * kv_dim + khoff + lid])
+            j++
+        }
+        yo[qoff + lid] = acc / l
+    }
+}
+
+// Pointer-stream rework candidate for the production part kernel (hs == 128 specialization,
+// epl == 4): K reads ONE half4 per lane per position through a walked device pointer (the
+// production form issues 4 scalar half loads + the epl guard chain), q hoists as ONE float4,
+// the V column walk becomes a pointer stream (base + uniform-scaled offsets, one bump per 4
+// positions). Same grid, same tgmem, same part/comb contract.
+// NEGATIVE (2026-07-14): the fully-fused lcpp-shape variant — one sg per 32-position slice,
+// score/softmax/weights all register-resident (keep-select + butterfly max + simd_shuffle
+// broadcast), zero barriers, part entries per-32-slice — reached ISA parity with fa_vec
+// (~15 issues/position vs their 14.7) but measured 15-20% SLOWER than THIS two-phase form at
+// every depth (d512 28.5 vs 23.5us; d2048 83.2 vs 74.5), both as 32-thread tgs and packed 4
+// slices per 128-thread tg. The per-slice prologue (~270 instr re-run per 32 positions vs per
+// 64 here) eats the softmax-pass savings. Issue count is not the limiter at this size.
+class MetalSqAttnPartLabP {
+    @ssbo @binding = 0 kc : array<half4>    // the same f16 mirror buffer, half4 view
+    @ssbo @binding = 1 vc : array<half4>    // ... V too — lane owns a half4 COLUMN GROUP
+    @ssbo @binding = 2 q : array<float4>    // the same q buffer, float4 view
+    @ssbo @binding = 3 part : array<float>
+    @ssbo @binding = 4 rt : array<uint4>
+    @uniform @binding = 5 lay : uint
+    @uniform @binding = 6 kv_dim : uint
+    @uniform @binding = 7 nheads : uint
+    @uniform @binding = 8 kv_mul : uint
+    @uniform @binding = 9 hs : uint
+    @uniform @binding = 10 scale : float
+    @uniform @binding = 11 qstride : uint
+    @uniform @binding = 12 nchmax : uint
+    @workgroup scores : float[64]
+    @workgroup red : float[4]
+    @workgroup vout : float[512]            // 4 per-sg partial planes x 128 columns
+
+    [metal_kernel(name="lab_sq_attn_part_p_msl")]
+    def lab_sq_attn_part_p {
+        let wg = gl_WorkGroupID.x
+        let h = wg % nheads
+        let ci = (wg / nheads) % nchmax
+        let bb = wg / (nheads * nchmax)
+        let rrow = rt[bb]
+        let cnt = rrow.w
+        let c0 = ci * 64u
+        if (c0 >= cnt) {
+            return
+        }
+        let lid = gl_LocalInvocationID.x
+        let nt = gl_WorkGroupSize.x
+        let kb0 = rrow.x + lay * rrow.z * kv_dim
+        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let khoff = (h / kv_mul) * hs
+        let qoff = bb * qstride + h * hs
+        let c1 = min(c0 + 64u, cnt)
+        let nrows = c1 - c0
+        let sg = gl_SubgroupID
+        let sl = gl_SubgroupInvocationID
+        let kv4 = kv_dim / 4u
+        let q4 = float4(q[qoff / 4u + sl])
+        // K: each sg owns a contiguous 16-position slice, straight-line unrolled; lane sl KEEPS
+        // position sl's reduced score via a select (no divergent guard, no per-position store —
+        // the lcpp fa_vec ownership shape), then ONE batch store writes the whole slice.
+        // NEGATIVE (2026-07-14): [unroll_count=4] on the per-position guarded-store form was
+        // neutral — the simd_sum -> lane-0 store chain serialized the back-edge regardless.
+        let base16 = sg * 16u
+        if (base16 + 16u <= nrows) {
+            var kp = unsafe(addr(kc[(kb0 + (c0 + base16) * kv_dim + khoff) / 4u + sl]))
+            var keep = 0.0
+            for [unroll_full] (i in range(16)) {
+                let p = q4 * float4(unsafe(kp[0]))
+                let s = simd_sum(p.x + p.y + p.z + p.w)
+                keep = uint(i) == sl ? s : keep
+                kp = unsafe(kp + kv4)
+            }
+            if (sl < 16u) {
+                scores[base16 + sl] = keep * scale
+            }
+        } elif (base16 < nrows) {
+            // partial tail slice (cnt %64 rows) — the guarded per-position form
+            var kp = unsafe(addr(kc[(kb0 + (c0 + base16) * kv_dim + khoff) / 4u + sl]))
+            var j = base16
+            while (j < nrows) {
+                let p = q4 * float4(unsafe(kp[0]))
+                let s = simd_sum(p.x + p.y + p.z + p.w)
+                if (sl == 0u) {
+                    scores[j] = s * scale
+                }
+                kp = unsafe(kp + kv4)
+                j++
+            }
+        }
+        barrier()
+        var m = -3.0e38
+        var j = lid
+        while (j < nrows) {
+            m = max(m, scores[j])
+            j += nt
+        }
+        m = max(m, simd_shuffle_xor(m, 16u))
+        m = max(m, simd_shuffle_xor(m, 8u))
+        m = max(m, simd_shuffle_xor(m, 4u))
+        m = max(m, simd_shuffle_xor(m, 2u))
+        m = max(m, simd_shuffle_xor(m, 1u))
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID] = m
+        }
+        barrier()
+        var mm = red[0]
+        var sgi = 1u
+        while (sgi < gl_NumSubgroups) {
+            mm = max(mm, red[sgi])
+            sgi++
+        }
+        barrier()                           // red[] reused for the sum below
+        var l = 0.0
+        j = lid
+        while (j < nrows) {
+            let w = exp(scores[j] - mm)
+            scores[j] = w
+            l += w
+            j += nt
+        }
+        l += simd_shuffle_xor(l, 16u)
+        l += simd_shuffle_xor(l, 8u)
+        l += simd_shuffle_xor(l, 4u)
+        l += simd_shuffle_xor(l, 2u)
+        l += simd_shuffle_xor(l, 1u)
+        if (gl_SubgroupInvocationID == 0u) {
+            red[gl_SubgroupID] = l
+        }
+        barrier()
+        var tot = red[0]
+        sgi = 1u
+        while (sgi < gl_NumSubgroups) {
+            tot += red[sgi]
+            sgi++
+        }
+        // V: same ownership shape as K — each sg walks its contiguous 16-position slice, lane sl
+        // owns half4 column group sl (32 x 4 = 128 columns), ONE vector load per position per sg;
+        // the 4 per-sg float4 partials combine through the vout slab once per chunk
+        var acc4 = float4(0.0)
+        if (base16 + 16u <= nrows) {
+            var vp = unsafe(addr(vc[(vb0 + (c0 + base16) * kv_dim + khoff) / 4u + sl]))
+            for [unroll_full] (i in range(16)) {
+                acc4 += scores[base16 + uint(i)] * float4(unsafe(vp[0]))
+                vp = unsafe(vp + kv4)
+            }
+        } elif (base16 < nrows) {
+            var vp = unsafe(addr(vc[(vb0 + (c0 + base16) * kv_dim + khoff) / 4u + sl]))
+            j = base16
+            while (j < nrows) {
+                acc4 += scores[j] * float4(unsafe(vp[0]))
+                vp = unsafe(vp + kv4)
+                j++
+            }
+        }
+        let vo = sg * 128u + sl * 4u
+        vout[vo] = acc4.x
+        vout[vo + 1u] = acc4.y
+        vout[vo + 2u] = acc4.z
+        vout[vo + 3u] = acc4.w
+        barrier()
+        let pbase = ((bb * nheads + h) * nchmax + ci) * (hs + 2u)
+        part[pbase + lid] = vout[lid] + vout[128u + lid] + vout[256u + lid] + vout[384u + lid]
+        if (lid == 0u) {
+            part[pbase + hs] = mm
+            part[pbase + hs + 1u] = tot
+        }
+    }
+}
+
+// Fused single-pass form, take 2 (the lcpp fa_vec shape on our rails): one sg per (row, head,
+// 32-position slice), 4 slices packed per 128-thread tg (no barriers — divergent per-sg exit is
+// safe), score/softmax/weights register-resident. UNLIKE the first fused attempt (recorded
+// negative above), K/V loads use INDEPENDENT indexed offsets (kp[i * kv4]) instead of a walked
+// pointer — the walk built a 32-deep serial address chain every load depended on; lcpp's
+// unrolled body has base+immediate offsets (NS10 is an FC constant), all loads independent.
+class MetalSqAttnPartLabF {
+    @ssbo @binding = 0 kc : array<half4>
+    @ssbo @binding = 1 vc : array<half4>
+    @ssbo @binding = 2 q : array<float4>
+    @ssbo @binding = 3 part : array<float>
+    @ssbo @binding = 4 rt : array<uint4>
+    @uniform @binding = 5 lay : uint
+    @uniform @binding = 6 kv_dim : uint
+    @uniform @binding = 7 nheads : uint
+    @uniform @binding = 8 kv_mul : uint
+    @uniform @binding = 9 hs : uint
+    @uniform @binding = 10 scale : float
+    @uniform @binding = 11 qstride : uint
+    @uniform @binding = 12 nchmax : uint
+
+    [metal_kernel(name="lab_sq_attn_part_f_msl")]
+    def lab_sq_attn_part_f {
+        // 3D grid (head, slice-group, row), HEAD in x: consecutive tgs share the same position
+        // rows (positions are kv_dim-contiguous across heads) — SLC locality at depth
+        let h = gl_WorkGroupID.x
+        let bb = gl_WorkGroupID.z
+        let ci = gl_WorkGroupID.y * 4u + gl_SubgroupID
+        let rrow = rt[bb]
+        let cnt = rrow.w
+        let c0 = ci * 32u
+        if (c0 >= cnt || ci >= nchmax) {
+            return
+        }
+        let sl = gl_SubgroupInvocationID
+        let kb0 = rrow.x + lay * rrow.z * kv_dim
+        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let khoff = (h / kv_mul) * hs
+        let qoff = bb * qstride + h * hs
+        let nrows = min(c0 + 32u, cnt) - c0
+        let kv4 = kv_dim / 4u
+        let q4 = float4(q[qoff / 4u + sl])
+        var keep = -3.0e38
+        var kp = unsafe(addr(kc[(kb0 + c0 * kv_dim + khoff) / 4u + sl]))
+        if (nrows == 32u) {
+            for [unroll_full] (i in range(32)) {
+                let p = q4 * float4(unsafe(kp[uint(i) * kv4]))
+                let s = simd_sum(p.x + p.y + p.z + p.w)
+                keep = uint(i) == sl ? s : keep
+            }
+        } else {
+            var j = 0u
+            while (j < nrows) {
+                let p = q4 * float4(unsafe(kp[0]))
+                let s = simd_sum(p.x + p.y + p.z + p.w)
+                keep = j == sl ? s : keep
+                kp = unsafe(kp + kv4)
+                j++
+            }
+        }
+        keep *= scale   // invalid tail lanes stay hugely negative -> weight 0
+        var mm = keep
+        mm = max(mm, simd_shuffle_xor(mm, 16u))
+        mm = max(mm, simd_shuffle_xor(mm, 8u))
+        mm = max(mm, simd_shuffle_xor(mm, 4u))
+        mm = max(mm, simd_shuffle_xor(mm, 2u))
+        mm = max(mm, simd_shuffle_xor(mm, 1u))
+        let w = exp(keep - mm)
+        let tot = simd_sum(w)
+        var acc4 = float4(0.0)
+        var vp = unsafe(addr(vc[(vb0 + c0 * kv_dim + khoff) / 4u + sl]))
+        if (nrows == 32u) {
+            for [unroll_full] (i in range(32)) {
+                acc4 += simd_shuffle(w, uint(i)) * float4(unsafe(vp[uint(i) * kv4]))
+            }
+        } else {
+            var j = 0u
+            while (j < nrows) {
+                acc4 += simd_shuffle(w, j) * float4(unsafe(vp[0]))
+                vp = unsafe(vp + kv4)
+                j++
+            }
+        }
+        let pbase = ((bb * nheads + h) * nchmax + ci) * (hs + 4u)   // 132: float4-aligned entries
+        let po = pbase + sl * 4u
+        part[po] = acc4.x
+        part[po + 1u] = acc4.y
+        part[po + 2u] = acc4.z
+        part[po + 3u] = acc4.w
+        if (sl == 0u) {
+            part[pbase + hs] = mm
+            part[pbase + hs + 1u] = tot
+        }
+    }
+}
+
+// 64-position slice twin: TWO inlined 32-batches with one branch-free register merge — the
+// prologue amortizes over 64 positions with NO in-sg loop. Entries are 64-wide (comb's
+// min((cnt+31)/32, nchmax) clamp counts them right when nchmax = ceil(cnt/64)).
+// NEGATIVES recorded here (2026-07-14): (a) full-bake twin (kv_dim/hs/kv_mul hardcoded) —
+// neutral, the per-offset imadds are free; (b) slice-group WHILE-loop twin (lcpp nwg
+// discipline, running online merge across strided slices) — 15-30% SLOWER at depth than the
+// loop-free partF even at 1 slice/sg: the loop-carried acc/m/tot state wrecks scheduling and
+// register pressure; amortization must be straight-line. Both removed; see git history.
+class MetalSqAttnPartLabF64 {
+    @ssbo @binding = 0 kc : array<half4>
+    @ssbo @binding = 1 vc : array<half4>
+    @ssbo @binding = 2 q : array<float4>
+    @ssbo @binding = 3 part : array<float>
+    @ssbo @binding = 4 rt : array<uint4>
+    @uniform @binding = 5 lay : uint
+    @uniform @binding = 6 kv_dim : uint
+    @uniform @binding = 7 nheads : uint
+    @uniform @binding = 8 kv_mul : uint
+    @uniform @binding = 9 hs : uint
+    @uniform @binding = 10 scale : float
+    @uniform @binding = 11 qstride : uint
+    @uniform @binding = 12 nchmax : uint
+
+    [metal_kernel(name="lab_sq_attn_part_f64_msl")]
+    def lab_sq_attn_part_f64 {
+        let h = gl_WorkGroupID.x
+        let bb = gl_WorkGroupID.z
+        let ci = gl_WorkGroupID.y * 4u + gl_SubgroupID
+        let rrow = rt[bb]
+        let cnt = rrow.w
+        let c0 = ci * 64u
+        if (ci >= nchmax || c0 >= cnt) {
+            return
+        }
+        let sl = gl_SubgroupInvocationID
+        let kb0 = rrow.x + lay * rrow.z * kv_dim
+        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let khoff = (h / kv_mul) * hs
+        let qoff = bb * qstride + h * hs
+        let kv4 = kv_dim / 4u
+        let q4 = float4(q[qoff / 4u + sl])
+        // batch A: positions [c0, c0+32)
+        let nrowsA = min(c0 + 32u, cnt) - c0
+        var keepA = -3.0e38
+        var kpA = unsafe(addr(kc[(kb0 + c0 * kv_dim + khoff) / 4u + sl]))
+        var vpA = unsafe(addr(vc[(vb0 + c0 * kv_dim + khoff) / 4u + sl]))
+        var accA = float4(0.0)
+        if (nrowsA == 32u) {
+            for [unroll_full] (i in range(32)) {
+                let p = q4 * float4(unsafe(kpA[uint(i) * kv4]))
+                let sc = simd_sum(p.x + p.y + p.z + p.w)
+                keepA = uint(i) == sl ? sc : keepA
+            }
+        } else {
+            var j = 0u
+            while (j < nrowsA) {
+                let p = q4 * float4(unsafe(kpA[0]))
+                let sc = simd_sum(p.x + p.y + p.z + p.w)
+                keepA = j == sl ? sc : keepA
+                kpA = unsafe(kpA + kv4)
+                j++
+            }
+        }
+        keepA *= scale
+        var mA = keepA
+        mA = max(mA, simd_shuffle_xor(mA, 16u))
+        mA = max(mA, simd_shuffle_xor(mA, 8u))
+        mA = max(mA, simd_shuffle_xor(mA, 4u))
+        mA = max(mA, simd_shuffle_xor(mA, 2u))
+        mA = max(mA, simd_shuffle_xor(mA, 1u))
+        let wA = exp(keepA - mA)
+        let totA = simd_sum(wA)
+        if (nrowsA == 32u) {
+            for [unroll_full] (i in range(32)) {
+                accA += simd_shuffle(wA, uint(i)) * float4(unsafe(vpA[uint(i) * kv4]))
+            }
+        } else {
+            var j = 0u
+            while (j < nrowsA) {
+                accA += simd_shuffle(wA, j) * float4(unsafe(vpA[0]))
+                vpA = unsafe(vpA + kv4)
+                j++
+            }
+        }
+        var mm = mA
+        var tot = totA
+        var acc4 = accA
+        // batch B: positions [c0+32, c0+64), absent on the shallow tail
+        let cB = c0 + 32u
+        if (cB < cnt) {
+            let nrowsB = min(cB + 32u, cnt) - cB
+            var keepB = -3.0e38
+            var kpB = unsafe(addr(kc[(kb0 + cB * kv_dim + khoff) / 4u + sl]))
+            var vpB = unsafe(addr(vc[(vb0 + cB * kv_dim + khoff) / 4u + sl]))
+            var accB = float4(0.0)
+            if (nrowsB == 32u) {
+                for [unroll_full] (i in range(32)) {
+                    let p = q4 * float4(unsafe(kpB[uint(i) * kv4]))
+                    let sc = simd_sum(p.x + p.y + p.z + p.w)
+                    keepB = uint(i) == sl ? sc : keepB
+                }
+            } else {
+                var j = 0u
+                while (j < nrowsB) {
+                    let p = q4 * float4(unsafe(kpB[0]))
+                    let sc = simd_sum(p.x + p.y + p.z + p.w)
+                    keepB = j == sl ? sc : keepB
+                    kpB = unsafe(kpB + kv4)
+                    j++
+                }
+            }
+            keepB *= scale
+            var mB = keepB
+            mB = max(mB, simd_shuffle_xor(mB, 16u))
+            mB = max(mB, simd_shuffle_xor(mB, 8u))
+            mB = max(mB, simd_shuffle_xor(mB, 4u))
+            mB = max(mB, simd_shuffle_xor(mB, 2u))
+            mB = max(mB, simd_shuffle_xor(mB, 1u))
+            let wB = exp(keepB - mB)
+            let totB = simd_sum(wB)
+            if (nrowsB == 32u) {
+                for [unroll_full] (i in range(32)) {
+                    accB += simd_shuffle(wB, uint(i)) * float4(unsafe(vpB[uint(i) * kv4]))
+                }
+            } else {
+                var j = 0u
+                while (j < nrowsB) {
+                    accB += simd_shuffle(wB, j) * float4(unsafe(vpB[0]))
+                    vpB = unsafe(vpB + kv4)
+                    j++
+                }
+            }
+            let nm = max(mA, mB)
+            let r1 = exp(mA - nm)
+            let r2 = exp(mB - nm)
+            acc4 = accA * r1 + accB * r2
+            tot = totA * r1 + totB * r2
+            mm = nm
+        }
+        let pbase = ((bb * nheads + h) * nchmax + ci) * (hs + 4u)   // 132: float4-aligned entries
+        let po = pbase + sl * 4u
+        part[po] = acc4.x
+        part[po + 1u] = acc4.y
+        part[po + 2u] = acc4.z
+        part[po + 3u] = acc4.w
+        if (sl == 0u) {
+            part[pbase + hs] = mm
+            part[pbase + hs + 1u] = tot
+        }
+    }
+}
+
+// Deep-context twin: the lcpp nsg-loop shape done RIGHT — a capped budget of min(ceil(cnt/32),
+// 32) sgs per (row, head), each looping strided 32-slices, but the O accumulator lives in a
+// LANE-PRIVATE tgmem slot (their so4 discipline: loop-carried state through memory, registers
+// stay light) with scalar m/tot registers and a branch-free rescale-merge per slice. No
+// barriers — each lane touches only its own 4 floats. The register-resident loop form was the
+// recorded partG negative; tgmem residency is the variable it did not isolate.
+class MetalSqAttnPartLabD {
+    @ssbo @binding = 0 kc : array<half4>
+    @ssbo @binding = 1 vc : array<half4>
+    @ssbo @binding = 2 q : array<float4>
+    @ssbo @binding = 3 part : array<float>
+    @ssbo @binding = 4 rt : array<uint4>
+    @uniform @binding = 5 lay : uint
+    @uniform @binding = 6 kv_dim : uint
+    @uniform @binding = 7 nheads : uint
+    @uniform @binding = 8 kv_mul : uint
+    @uniform @binding = 9 hs : uint
+    @uniform @binding = 10 scale : float
+    @uniform @binding = 11 qstride : uint
+    @uniform @binding = 12 nsgs : uint
+    @workgroup wacc : float[512]
+
+    [metal_kernel(name="lab_sq_attn_part_d_msl")]
+    def lab_sq_attn_part_d {
+        let h = gl_WorkGroupID.x
+        let bb = gl_WorkGroupID.z
+        let gsg = gl_WorkGroupID.y * 4u + gl_SubgroupID
+        let rrow = rt[bb]
+        let cnt = rrow.w
+        if (gsg >= nsgs || gsg * 32u >= cnt) {
+            return
+        }
+        let sl = gl_SubgroupInvocationID
+        let kb0 = rrow.x + lay * rrow.z * kv_dim
+        let vb0 = rrow.y + lay * rrow.z * kv_dim
+        let khoff = (h / kv_mul) * hs
+        let qoff = bb * qstride + h * hs
+        let kv4 = kv_dim / 4u
+        let q4 = float4(q[qoff / 4u + sl])
+        let wo = gl_SubgroupID * 128u + sl * 4u
+        wacc[wo] = 0.0
+        wacc[wo + 1u] = 0.0
+        wacc[wo + 2u] = 0.0
+        wacc[wo + 3u] = 0.0
+        var mm = -3.0e38
+        var tot = 0.0
+        var ss = gsg
+        while (ss * 32u < cnt) {
+            let c0 = ss * 32u
+            let nrows = min(c0 + 32u, cnt) - c0
+            var keep = -3.0e38
+            var kp = unsafe(addr(kc[(kb0 + c0 * kv_dim + khoff) / 4u + sl]))
+            var vp = unsafe(addr(vc[(vb0 + c0 * kv_dim + khoff) / 4u + sl]))
+            var bacc = float4(0.0)
+            if (nrows == 32u) {
+                for [unroll_full] (i in range(32)) {
+                    let p = q4 * float4(unsafe(kp[uint(i) * kv4]))
+                    let sc = simd_sum(p.x + p.y + p.z + p.w)
+                    keep = uint(i) == sl ? sc : keep
+                }
+            } else {
+                var j = 0u
+                while (j < nrows) {
+                    let p = q4 * float4(unsafe(kp[0]))
+                    let sc = simd_sum(p.x + p.y + p.z + p.w)
+                    keep = j == sl ? sc : keep
+                    kp = unsafe(kp + kv4)
+                    j++
+                }
+            }
+            keep *= scale
+            var bm = keep
+            bm = max(bm, simd_shuffle_xor(bm, 16u))
+            bm = max(bm, simd_shuffle_xor(bm, 8u))
+            bm = max(bm, simd_shuffle_xor(bm, 4u))
+            bm = max(bm, simd_shuffle_xor(bm, 2u))
+            bm = max(bm, simd_shuffle_xor(bm, 1u))
+            let w = exp(keep - bm)
+            let btot = simd_sum(w)
+            if (nrows == 32u) {
+                for [unroll_full] (i in range(32)) {
+                    bacc += simd_shuffle(w, uint(i)) * float4(unsafe(vp[uint(i) * kv4]))
+                }
+            } else {
+                var j = 0u
+                while (j < nrows) {
+                    bacc += simd_shuffle(w, j) * float4(unsafe(vp[0]))
+                    vp = unsafe(vp + kv4)
+                    j++
+                }
+            }
+            let nm = max(mm, bm)
+            let r1 = exp(mm - nm)
+            let r2 = exp(bm - nm)
+            wacc[wo] = wacc[wo] * r1 + bacc.x * r2
+            wacc[wo + 1u] = wacc[wo + 1u] * r1 + bacc.y * r2
+            wacc[wo + 2u] = wacc[wo + 2u] * r1 + bacc.z * r2
+            wacc[wo + 3u] = wacc[wo + 3u] * r1 + bacc.w * r2
+            tot = tot * r1 + btot * r2
+            mm = nm
+            ss += nsgs
+        }
+        let pbase = ((bb * nheads + h) * nsgs + gsg) * (hs + 4u)
+        let po = pbase + sl * 4u
+        part[po] = wacc[wo]
+        part[po + 1u] = wacc[wo + 1u]
+        part[po + 2u] = wacc[wo + 2u]
+        part[po + 3u] = wacc[wo + 3u]
+        if (sl == 0u) {
+            part[pbase + hs] = mm
+            part[pbase + hs + 1u] = tot
+        }
+    }
+}
+
+// Comb twin for the fused-arm part entries (132-float, float4-aligned). PARALLEL over entries
+// (the production comb walks them serially — at d2048 that is 64 dependent iterations): the 4
+// sgs each online-merge their entry subset with float4 loads (lane owns a 4-column group; m and
+// l arrive in ONE float4), then a single tgmem cross-sg merge. Mirrors lcpp reduce parallelism.
+class MetalSqAttnCombLabP {
+    @ssbo @binding = 0 part : array<float4>
+    @ssbo @binding = 1 yo : array<float>
+    @ssbo @binding = 2 rt : array<uint4>
+    @uniform @binding = 3 nchmax : uint
+    @uniform @binding = 4 nheads : uint
+    @uniform @binding = 5 hs : uint
+    @workgroup wacc : float[512]
+    @workgroup wml : float[8]
+
+    [metal_kernel(name="lab_sq_attn_comb_p_msl")]
+    def lab_sq_attn_comb_p {
+        let h = gl_WorkGroupID.x
+        let bb = gl_WorkGroupID.y
+        let sg = gl_SubgroupID
+        let sl = gl_SubgroupInvocationID
+        let lid = gl_LocalInvocationID.x
+        let cnt = rt[bb].w
+        let nch = min((cnt + 31u) / 32u, nchmax)
+        let s4 = (hs + 4u) / 4u
+        let base4 = (bb * nheads + h) * nchmax * s4
+        var mm = -3.0e38
+        var tot = 0.0
+        var acc4 = float4(0.0)
+        var e = sg
+        while (e < nch) {
+            let eb = base4 + e * s4
+            let ml = float4(part[eb + hs / 4u])
+            let av = float4(part[eb + sl])
+            let nm = max(mm, ml.x)
+            let r1 = exp(mm - nm)
+            let r2 = exp(ml.x - nm)
+            acc4 = acc4 * r1 + av * r2
+            tot = tot * r1 + ml.y * r2
+            mm = nm
+            e += gl_NumSubgroups
+        }
+        let wo = sg * 128u + sl * 4u
+        wacc[wo] = acc4.x
+        wacc[wo + 1u] = acc4.y
+        wacc[wo + 2u] = acc4.z
+        wacc[wo + 3u] = acc4.w
+        if (sl == 0u) {
+            wml[sg * 2u] = mm
+            wml[sg * 2u + 1u] = tot
+        }
+        barrier()
+        // final 4-way merge, one lane per output column
+        let m0 = wml[0]
+        let m1 = wml[2]
+        let m2 = wml[4]
+        let m3 = wml[6]
+        let gm = max(max(m0, m1), max(m2, m3))
+        let r0 = exp(m0 - gm)
+        let r1 = exp(m1 - gm)
+        let r2 = exp(m2 - gm)
+        let r3 = exp(m3 - gm)
+        let l = wml[1] * r0 + wml[3] * r1 + wml[5] * r2 + wml[7] * r3
+        let acc = wacc[lid] * r0 + wacc[128u + lid] * r1 + wacc[256u + lid] * r2 + wacc[384u + lid] * r3
+        yo[bb * (nheads * hs) + h * hs + lid] = acc / l
+    }
+}
+
+// CPU twin — same math, f32 throughout, natural order
+def private cpu_sq_attn(kc, vc : array<float16>; q : array<float>; nb, cnt, nheads, head_size, kv_dim, kv_mul : int64;
+                        scale : float) : array<float> {
+    var yo : array<float>
+    yo |> resize(int(nb * nheads * head_size))
+    var sc : array<float>
+    sc |> resize(int(cnt))
+    for (bb in range64(nb)) {
+        for (h in range64(nheads)) {
+            let khoff = (h / kv_mul) * head_size
+            let qoff = bb * nheads * head_size + h * head_size
+            var m = -3.0e38
+            for (j in range64(cnt)) {
+                var s = 0.0
+                for (e in range64(head_size)) {
+                    s += q[qoff + e] * float(kc[j * kv_dim + khoff + e])
+                }
+                sc[j] = s * scale
+                m = max(m, sc[j])
+            }
+            var l = 0.0
+            for (j in range64(cnt)) {
+                sc[j] = exp(sc[j] - m)
+                l += sc[j]
+            }
+            for (e in range64(head_size)) {
+                var acc = 0.0
+                for (j in range64(cnt)) {
+                    acc += sc[j] * float(vc[j * kv_dim + khoff + e])
+                }
+                yo[qoff + e] = acc / l
+            }
+        }
+    }
+    delete sc
+    return <- yo
+}
+
+def private env_or(name : string; dflt : int) : int {
+    return has_env_variable(name) ? to_int(get_env_variable(name)) : dflt
+}
+
+def private upload_array(dev; arr; bytes : int64) {
+    var buf = metal_new_buffer(dev, uint64(bytes))
+    unsafe {
+        memcpy(metal_buffer_contents(buf), addr < void? >(arr[0]), int(bytes))
+    }
+    return buf
+}
+
+def private upload_u32(dev; v : uint) {
+    var buf = metal_new_buffer(dev, 4ul)
+    var p = unsafe(reinterpret<uint?>(metal_buffer_contents(buf)))
+    unsafe(p[0]) = v
+    return buf
+}
+
+def private upload_f32(dev; v : float) {
+    var buf = metal_new_buffer(dev, 4ul)
+    var p = unsafe(reinterpret<float?>(metal_buffer_contents(buf)))
+    unsafe(p[0]) = v
+    return buf
+}
+
+def private time_reps(queue; pso; bufs; groups : uint3; reps : int; tgmem : uint64) : double {
+    var err : string
+    var gpu_ms = 0.0lf
+    let ok = with_compute_encoder_timed(queue, err, gpu_ms) $(enc) {
+        metal_set_pipeline(enc, pso)
+        for (bi in range(length(bufs))) {
+            metal_set_buffer(enc, bufs[bi], 0ul, bi)
+        }
+        metal_set_threadgroup_memory_length(enc, tgmem, 0)
+        for (_i in range(reps)) {
+            metal_dispatch_threadgroups(enc, groups, uint3(128u, 1u, 1u))
+        }
+    }
+    if (!ok) {
+        to_log(LOG_ERROR, "dispatch failed: {err}\n")
+        return -1.0lf
+    }
+    return gpu_ms / double(reps)
+}
+
+// two-dispatch rep (every arm is a kernel PAIR: part->comb); the shared
+// intermediate-buffer hazard serializes the pair and the reps, same contract as time_reps
+def private time_pair(queue; pso_a; bufs_a; groups_a : uint3; threads_a : uint; tgmem_a : uint64;
+                      pso_b; bufs_b; groups_b : uint3; threads_b : uint; tgmem_b : uint64; reps : int) : double {
+    var err : string
+    var gpu_ms = 0.0lf
+    let ok = with_compute_encoder_timed(queue, err, gpu_ms) $(enc) {
+        for (_i in range(reps)) {
+            metal_set_pipeline(enc, pso_a)
+            for (bi in range(length(bufs_a))) {
+                metal_set_buffer(enc, bufs_a[bi], 0ul, bi)
+            }
+            if (tgmem_a > 0ul) {
+                metal_set_threadgroup_memory_length(enc, tgmem_a, 0)
+            }
+            metal_dispatch_threadgroups(enc, groups_a, uint3(threads_a, 1u, 1u))
+            metal_set_pipeline(enc, pso_b)
+            for (bi in range(length(bufs_b))) {
+                metal_set_buffer(enc, bufs_b[bi], 0ul, bi)
+            }
+            if (tgmem_b > 0ul) {
+                metal_set_threadgroup_memory_length(enc, tgmem_b, 0)
+            }
+            metal_dispatch_threadgroups(enc, groups_b, uint3(threads_b, 1u, 1u))
+        }
+    }
+    if (!ok) {
+        to_log(LOG_ERROR, "pair dispatch failed: {err}\n")
+        return -1.0lf
+    }
+    return gpu_ms / double(reps)
+}
+
+// B=2 side-by-side at the real decode roster slot: the production chunked pair (the
+// metal_sq_attn_part_b16 + metal_sq_attn_comb_b MSL, verbatim from the decode driver, rt table
+// built flat) vs the lab part/comb variants. Same k/v/q buffers, same CPU oracle,
+// interleaved best-of timing.
+def private run_attn_b2_sidebyside(b) {
+    let rounds = env_or("DASMETAL_LAB_ROUNDS", 3)
+    let nheads = 24l
+    let head_size = 128l
+    let kv_dim = 1024l
+    let kv_mul = 3l
+    let qd = nheads * head_size
+    let nb = 2l
+    let maxrows = 16384l
+    let scale = 1.0 / sqrt(float(head_size))
+    var dev = metal_create_system_default_device()
+    if (dev == null) {
+        to_log(LOG_WARNING, "skipped: no Metal device\n")
+        return
+    }
+    var queue = metal_new_command_queue(dev)
+    var err : string
+    var pso_part = pipeline_from_source(dev, metal_sq_attn_part_b16_msl, metal_sq_attn_part_b16_msl_entry, true, err)
+    b |> success(pso_part != null, "production part kernel compiles")
+    var pso_comb = pipeline_from_source(dev, metal_sq_attn_comb_b_msl, metal_sq_attn_comb_b_msl_entry, true, err)
+    b |> success(pso_comb != null, "production comb kernel compiles")
+    var pso_partp = pipeline_from_source(dev, lab_sq_attn_part_p_msl, lab_sq_attn_part_p_msl_entry, true, err)
+    b |> success(pso_partp != null, "pointer-stream part kernel compiles")
+    if (pso_partp == null) {
+        to_log(LOG_ERROR, "pointer-stream part compile failed: {err}\n")
+    }
+    var pso_partf = pipeline_from_source(dev, lab_sq_attn_part_f_msl, lab_sq_attn_part_f_msl_entry, true, err)
+    b |> success(pso_partf != null, "fused part kernel compiles")
+    if (pso_partf == null) {
+        to_log(LOG_ERROR, "fused part compile failed: {err}\n")
+    }
+    var pso_partg = pipeline_from_source(dev, lab_sq_attn_part_f64_msl, lab_sq_attn_part_f64_msl_entry, true, err)
+    b |> success(pso_partg != null, "64-slice fused part kernel compiles")
+    var pso_partd = pipeline_from_source(dev, lab_sq_attn_part_d_msl, lab_sq_attn_part_d_msl_entry, true, err)
+    b |> success(pso_partd != null, "deep-context part kernel compiles")
+    var pso_combp = pipeline_from_source(dev, lab_sq_attn_comb_p_msl, lab_sq_attn_comb_p_msl_entry, true, err)
+    b |> success(pso_combp != null, "32-slice comb twin compiles")
+    if (pso_part == null || pso_comb == null || pso_partp == null || pso_partf == null ||
+            pso_partg == null || pso_partd == null || pso_combp == null) {
+        metal_release(queue)
+        metal_release(dev)
+        return
+    }
+    // same exact-in-f16 fills as the single-kernel bench
+    var kc : array<float16>
+    var vc : array<float16>
+    kc |> resize(int(maxrows * kv_dim))
+    vc |> resize(int(maxrows * kv_dim))
+    for (i in range64(maxrows * kv_dim)) {
+        kc[i] = float16(float(int((i * 7l + i / 129l) % 9l) - 4))
+        vc[i] = float16(float(int((i * 11l + i / 257l) % 9l) - 4))
+    }
+    var q : array<float>
+    q |> resize(int(nb * qd))
+    for (i in range64(nb * qd)) {
+        q[i] = float(int((i * 13l + i / 61l) % 9l) - 4)
+    }
+    var kbuf = upload_array(dev, kc, maxrows * kv_dim * 2l)
+    var vbuf = upload_array(dev, vc, maxrows * kv_dim * 2l)
+    var qbuf = upload_array(dev, q, nb * qd * 4l)
+    var ybuf = metal_new_buffer(dev, uint64(nb * qd * 4l))
+    // part: [B x nheads x nchmax x entry] — sized at the deepest depth (32-position entries for the fused arms)
+    let nchmax_deep = (maxrows + 31l) / 32l
+    var partbuf = metal_new_buffer(dev, uint64(nb * nheads * nchmax_deep * (head_size + 4l) * 4l))
+    var laybuf = upload_u32(dev, 0u)
+    var kvdimbuf = upload_u32(dev, uint(kv_dim))
+    var nheadsbuf = upload_u32(dev, uint(nheads))
+    var kvmulbuf = upload_u32(dev, uint(kv_mul))
+    var hsbuf = upload_u32(dev, uint(head_size))
+    var scalebuf = upload_f32(dev, scale)
+    var qstridebuf = upload_u32(dev, uint(qd))
+    var ygot : array<float>
+    for (depth in [512l, 640l, 1024l, 2048l, 4096l, 16384l]) {
+        let nch = (depth + 63l) / 64l
+        var nchmaxbuf = upload_u32(dev, uint(nch))
+        let nch32 = (depth + 31l) / 32l
+        var nchmax32buf = upload_u32(dev, uint(nch32))
+        let nch64 = (depth + 63l) / 64l
+        var nsgsbuf = upload_u32(dev, uint(nch64))
+        // fixed sg budget of 16: beats 32 (16k 1.00 vs 1.05) and the depth-doubling heuristic
+        // (64/128 = more entry traffic, shorter loops) — FEWER long-running workers win because
+        // the tgmem-resident accumulator loop amortizes; the knob is for re-sweeps
+        let nsgsd = min(nch32, int64(env_or("DASMETAL_LAB_ATTN_NSGS", 16)))
+        var nsgsdbuf = upload_u32(dev, uint(nsgsd))
+        // rt row: (kbase, vbase, capacity, cnt) — flat single-layer mirror at base 0
+        var rte : array<uint>
+        rte <- [0u, 0u, uint(depth), uint(depth), 0u, 0u, uint(depth), uint(depth)]
+        var rtbuf = upload_array(dev, rte, nb * 16l)
+        var yref <- cpu_sq_attn(kc, vc, q, nb, depth, nheads, head_size, kv_dim, kv_mul, scale)
+        var bufs_part <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nchmaxbuf]
+        var bufs_partf <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nchmax32buf]
+        var bufs_partg <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nsgsbuf]
+        var bufs_partd <- [kbuf, vbuf, qbuf, partbuf, rtbuf, laybuf, kvdimbuf, nheadsbuf, kvmulbuf, hsbuf, scalebuf, qstridebuf, nsgsdbuf]
+        var bufs_comb <- [partbuf, ybuf, rtbuf, nchmaxbuf, nheadsbuf, hsbuf]
+        var bufs_combp <- [partbuf, ybuf, rtbuf, nchmax32buf, nheadsbuf, hsbuf]
+        var bufs_combg <- [partbuf, ybuf, rtbuf, nsgsbuf, nheadsbuf, hsbuf]
+        var bufs_combd <- [partbuf, ybuf, rtbuf, nsgsdbuf, nheadsbuf, hsbuf]
+        let groups_part = uint3(uint(nheads * nch * nb), 1u, 1u)
+        let groups_partf = uint3(uint(nheads), uint((nch32 + 3l) / 4l), uint(nb))
+        let groups_partg = uint3(uint(nheads), uint((nch64 + 3l) / 4l), uint(nb))
+        let groups_partd = uint3(uint(nheads), uint((nsgsd + 3l) / 4l), uint(nb))
+        let groups_comb = uint3(uint(nheads * nb), 1u, 1u)
+        let groups_combp = uint3(uint(nheads), uint(nb), 1u)
+        var best : array<double>
+        var est : array<double>
+        best <- [1.0e30lf, 1.0e30lf, 1.0e30lf, 1.0e30lf]
+        est <- [0.0lf, 0.0lf, 0.0lf, 0.0lf]
+        var names <- ["part+comb", "partD+combG", "partF+comb32", "partF64+combG"]
+        // warmup + correctness, each arm against the CPU oracle
+        for (arm in range(4)) {
+            var ms0 = 0.0lf
+            if (arm == 0) {
+                ms0 = time_pair(queue, pso_part, bufs_part, groups_part, 128u, metal_sq_attn_part_b16_msl_tgmem,
+                    pso_comb, bufs_comb, groups_comb, 128u, 0ul, 1)
+            } elif (arm == 1) {
+                ms0 = time_pair(queue, pso_partd, bufs_partd, groups_partd, 128u, lab_sq_attn_part_d_msl_tgmem,
+                    pso_combp, bufs_combd, groups_combp, 128u, lab_sq_attn_comb_p_msl_tgmem, 1)
+            } elif (arm == 2) {
+                ms0 = time_pair(queue, pso_partf, bufs_partf, groups_partf, 128u, 0ul,
+                    pso_combp, bufs_combp, groups_combp, 128u, lab_sq_attn_comb_p_msl_tgmem, 1)
+            } else {
+                ms0 = time_pair(queue, pso_partg, bufs_partg, groups_partg, 128u, 0ul,
+                    pso_combp, bufs_combg, groups_combp, 128u, lab_sq_attn_comb_p_msl_tgmem, 1)
+            }
+            if (ms0 < 0.0lf) {
+                b |> success(false, "{names[arm]} d{depth}: dispatch")
+                continue
+            }
+            est[arm] = ms0
+            ygot |> resize(int(nb * qd))
+            unsafe {
+                memcpy(addr < void? >(ygot[0]), metal_buffer_contents(ybuf), int(nb * qd * 4l))
+            }
+            var maxd = 0.0
+            for (i in range64(nb * qd)) {
+                maxd = max(maxd, abs(ygot[i] - yref[i]))
+            }
+            b |> success(maxd < 5.0e-3, "{names[arm]} d{depth}: matches CPU twin (maxd {maxd})")
+        }
+        // interleaved best-of rounds
+        for (_round in range(rounds)) {
+            for (arm in range(4)) {
+                let reps = clamp(int(5.0lf / max(est[arm], 0.005lf)) + 1, 1, 256)
+                var ms = 0.0lf
+                if (arm == 0) {
+                    ms = time_pair(queue, pso_part, bufs_part, groups_part, 128u, metal_sq_attn_part_b16_msl_tgmem,
+                        pso_comb, bufs_comb, groups_comb, 128u, 0ul, reps)
+                } elif (arm == 1) {
+                    ms = time_pair(queue, pso_partd, bufs_partd, groups_partd, 128u, lab_sq_attn_part_d_msl_tgmem,
+                        pso_combp, bufs_combd, groups_combp, 128u, lab_sq_attn_comb_p_msl_tgmem, reps)
+                } elif (arm == 2) {
+                    ms = time_pair(queue, pso_partf, bufs_partf, groups_partf, 128u, 0ul,
+                        pso_combp, bufs_combp, groups_combp, 128u, lab_sq_attn_comb_p_msl_tgmem, reps)
+                } else {
+                    ms = time_pair(queue, pso_partg, bufs_partg, groups_partg, 128u, 0ul,
+                        pso_combp, bufs_combg, groups_combp, 128u, lab_sq_attn_comb_p_msl_tgmem, reps)
+                }
+                if (ms > 0.0lf && ms < best[arm]) {
+                    best[arm] = ms
+                }
+            }
+        }
+        let kvbytes = double(nb * nheads * depth * head_size * 2l * 2l)
+        to_log(LOG_INFO, "attn_b2 d{depth}: old {best[0]} | partD {best[1]} | partF {best[2]} | partF64 {best[3]} ms ({kvbytes / (best[1] * 1.0e6lf)} KV GB/s) | D/old {best[1] / best[0]} | F/old {best[2] / best[0]} | F64/old {best[3] / best[0]}\n")
+        delete best
+        delete est
+        delete names
+        bufs_part |> clear()
+        bufs_partf |> clear()
+        bufs_partg |> clear()
+        bufs_partd |> clear()
+        bufs_comb |> clear()
+        bufs_combp |> clear()
+        bufs_combg |> clear()
+        bufs_combd |> clear()
+        unsafe {
+            delete bufs_part
+            delete bufs_partf
+            delete bufs_partg
+            delete bufs_partd
+            delete bufs_comb
+            delete bufs_combp
+            delete bufs_combg
+            delete bufs_combd
+        }
+        metal_release(nchmaxbuf)
+        metal_release(nchmax32buf)
+        metal_release(nsgsbuf)
+        metal_release(nsgsdbuf)
+        metal_release(rtbuf)
+        delete rte
+        delete yref
+    }
+    metal_release(kbuf)
+    metal_release(vbuf)
+    metal_release(qbuf)
+    metal_release(ybuf)
+    metal_release(partbuf)
+    metal_release(laybuf)
+    metal_release(kvdimbuf)
+    metal_release(nheadsbuf)
+    metal_release(kvmulbuf)
+    metal_release(hsbuf)
+    metal_release(scalebuf)
+    metal_release(qstridebuf)
+    metal_release(pso_part)
+    metal_release(pso_comb)
+    metal_release(pso_partp)
+    metal_release(pso_partf)
+    metal_release(pso_partg)
+    metal_release(pso_partd)
+    metal_release(pso_combp)
+    metal_release(queue)
+    metal_release(dev)
+    delete kc
+    delete vc
+    delete q
+    delete ygot
+    assert_no_metal_leaks()
+}
+
+def private run_sq_attn(b) {   // untyped param = generic — non-Apple builds never compile the Metal-typed body
+    let rounds = env_or("DASMETAL_LAB_ROUNDS", 3)
+    // llama-3B geometry
+    let nheads = 24l
+    let head_size = 128l
+    let kv_dim = 1024l
+    let kv_mul = 3l
+    let qd = nheads * head_size
+    let maxrows = 2048l
+    let scale = 1.0 / sqrt(float(head_size))
+    var dev = metal_create_system_default_device()
+    if (dev == null) {
+        to_log(LOG_WARNING, "skipped: no Metal device\n")
+        return
+    }
+    to_log(LOG_INFO, "device={metal_device_name(dev)} rounds={rounds}\n")
+    var queue = metal_new_command_queue(dev)
+    var err : string
+    var pso = pipeline_from_source(dev, metal_sq_attn_msl, metal_sq_attn_msl_entry, true, err)
+    b |> success(pso != null, "sq attention kernel compiles")
+    if (pso == null) {
+        to_log(LOG_ERROR, "compile failed: {err}\n")
+        metal_release(queue)
+        metal_release(dev)
+        return
+    }
+    // exact-in-f16 fills: small ints for K/V, small ints for q
+    var kc : array<float16>
+    var vc : array<float16>
+    kc |> resize(int(maxrows * kv_dim))
+    vc |> resize(int(maxrows * kv_dim))
+    for (i in range64(maxrows * kv_dim)) {
+        kc[i] = float16(float(int((i * 7l + i / 129l) % 9l) - 4))
+        vc[i] = float16(float(int((i * 11l + i / 257l) % 9l) - 4))
+    }
+    var q : array<float>
+    q |> resize(int(16l * qd))
+    for (i in range64(16l * qd)) {
+        q[i] = float(int((i * 13l + i / 61l) % 9l) - 4)
+    }
+    var kbuf = upload_array(dev, kc, maxrows * kv_dim * 2l)
+    var vbuf = upload_array(dev, vc, maxrows * kv_dim * 2l)
+    var qbuf = upload_array(dev, q, 16l * qd * 4l)
+    var ybuf = metal_new_buffer(dev, uint64(16l * qd * 4l))
+    var kvdimbuf = upload_u32(dev, uint(kv_dim))
+    var nheadsbuf = upload_u32(dev, uint(nheads))
+    var kvmulbuf = upload_u32(dev, uint(kv_mul))
+    var scalebuf = upload_f32(dev, scale)
+    var ygot : array<float>
+    for (depth in [512l, 2048l]) {
+        var cntbuf = upload_u32(dev, uint(depth))
+        var yref <- cpu_sq_attn(kc, vc, q, 8l, depth, nheads, head_size, kv_dim, kv_mul, scale)
+        for (nb in [1, 8]) {
+            var bufs <- [kbuf, vbuf, qbuf, ybuf, cntbuf, kvdimbuf, nheadsbuf, kvmulbuf, scalebuf]
+            let groups = uint3(uint(nb * int(nheads)), 1u, 1u)
+            let ms0 = time_reps(queue, pso, bufs, groups, 1, metal_sq_attn_msl_tgmem)
+            if (ms0 < 0.0lf) {
+                b |> success(false, "sq_attn d{depth} B{nb}: dispatch")
+                bufs |> clear()
+                unsafe {
+                    delete bufs
+                }
+                continue
+            }
+            ygot |> resize(int(16l * qd))
+            unsafe {
+                memcpy(addr < void? >(ygot[0]), metal_buffer_contents(ybuf), int(int64(nb) * qd * 4l))
+            }
+            var maxd = 0.0
+            for (i in range64(int64(nb) * qd)) {
+                maxd = max(maxd, abs(ygot[i] - yref[i]))
+            }
+            b |> success(maxd < 5.0e-3, "sq_attn d{depth} B{nb}: matches CPU twin (maxd {maxd})")
+            var best = 1.0e30lf
+            for (_round in range(rounds)) {
+                let reps = clamp(int(5.0lf / max(ms0, 0.005lf)) + 1, 1, 256)
+                let ms = time_reps(queue, pso, bufs, groups, reps, metal_sq_attn_msl_tgmem)
+                if (ms > 0.0lf && ms < best) {
+                    best = ms
+                }
+            }
+            // logical KV traffic: every head reads its kv head's K+V over the context (GQA re-reads counted)
+            let kvbytes = double(int64(nb) * nheads * depth * head_size * 2l * 2l)
+            let gbs = kvbytes / (best * 1.0e6lf)
+            to_log(LOG_INFO, "sq_attn  d{depth} B{nb}  {best} ms  {gbs} KV GB/s (logical)\n")
+            bufs |> clear()
+            unsafe {
+                delete bufs
+            }
+        }
+        metal_release(cntbuf)
+        delete yref
+    }
+    metal_release(kbuf)
+    metal_release(vbuf)
+    metal_release(qbuf)
+    metal_release(ybuf)
+    metal_release(kvdimbuf)
+    metal_release(nheadsbuf)
+    metal_release(kvmulbuf)
+    metal_release(scalebuf)
+    metal_release(pso)
+    metal_release(queue)
+    metal_release(dev)
+    delete kc
+    delete vc
+    delete q
+    delete ygot
+    assert_no_metal_leaks()
+}
+
+[benchmark, unused_argument(b)]   // b is consumed only inside the Apple static_if half
+def bench_metal_sq_attn(b : B?) {
+    if (!jit_enabled()) {
+        to_log(LOG_WARNING, "skipped: interpreted (dasLLAMA benchmarks are JIT-only)\n")
+        return
+    }
+    static_if (typeinfo builtin_module_exists(das_metal)) {
+        run_sq_attn(b)
+        run_attn_b2_sidebyside(b)
+    }
+}

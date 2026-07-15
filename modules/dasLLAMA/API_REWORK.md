@@ -547,6 +547,33 @@ what it costs today and what the fix would change.
   savings wherever an intrinsic tier ever beats tuned-portable at decode. Cost today: none on
   the campaign boxes (both run backends that carry the core). (Spotted during the fused-dispatch
   work, 2026-07-03.)
+- **Metal batched decode's skinny-M kernel valley — the P4 chase (emission arc, 2026-07-14).**
+  The 3B d512 engineering curve (Parsec-on, fixed-token protocol) is 101/103/148/270 t/s at
+  B=2/4/8/16 vs llama-batched-bench Metal's 134/219/250/363 — steps are GPU-bound (CPU side
+  < 1.5ms), so the whole gap is skinny-M GEMM efficiency: the fixed-B batched GEMV forms
+  ALU-saturate (~340-540 GMAC/s — the B=4 valley's 35.9ms step), and gemm32's M-pad-32 staging
+  floor is ~51-54ms/step (~2900 GMAC/s padded) regardless of B, while lcpp's mul_mv sustains
+  near-weight-stream rates to ne11~8. Chase candidates, LAB ROWS FIRST (bench_metal_gemv_kernels
+  grows variants): (a) x-staged batched GEMV — stage the B-row X panel slice in threadgroup
+  memory per k-chunk so per-lane device x loads (the ALU-bound form's limiter) become tgmem
+  reads; (b) a gemm16 twin (16-row M tile — halves the pad waste and A-staging at B <= 16);
+  (c) the production 34B-blob mul_mm at M-pad-64 (f32-X, no quant dispatches — costs blob
+  residency next to the decode driver's planar regions). Smaller shavings on the same row: a
+  cls-specific GEMM crossover (the lab says the 128256-row classifier flips at B~4, the uniform
+  policy switches at 5); per-row KV writeback + logits scatter memcpys (~2.3ms at B=16) could
+  thread; llama-8B (dim 4096) declines batch at B >= 5 (the add+rms+quant row slab caps at
+  3072 — an unfused rms+quant pair would re-admit it); GPU-side per-row greedy argmax for the
+  batch (the single-stream spec chain already carries the kernel) if greedy batch serving ever
+  matters. Sized honestly: closing to lcpp's curve is worth up to ~2.1x at B=4, ~1.7x at B=8,
+  ~1.34x at B=16 on M1. UPDATE (2026-07-14 late): (a) LANDED as the x-staged fixed-B forms —
+  lab b2x 326-363 wGB/s (+40-88%), b4x 188-217 (~2x, above lcpp's ~186 at ne11=4); driver
+  same-window A/B B=4 +19.2%, B=2 +1.8% (B=2's step is residual/dispatch-bound: knockout says
+  GEMV+cls is 11.7ms of the 16.7ms gpu step at B=2, 21.4 of 27.6 at B=4 — the rest is the
+  per-step kernel residual + ~141 serialized dispatch tails, the encode-ahead/fusion rounds'
+  territory). (b)/(c) were settled by the GemmB v2 + per-site split-K rounds (32x32 occupancy
+  beats 64-wide at M-pad-32; mul_mm rail kept opt-in). NEW smaller shaving measured en route:
+  the in-loop s16 scale select costs ~3% at B=2-4 (wscale-f16 0 vs 1 driver A/B) — the per-PSO
+  s16 bake stays on the ranked list.
 - **Fused-chain follow-ups: MoE FFN chain + norm/quantize as a stage.** The 2026-07-03 fused
   decode covers the attention block (all q8 arches, head_size %% 32 == 0) and the DENSE FFN;
   gpt-oss's routed-expert FFN keeps its per-op groupn dispatches (3/layer) — a 2-stage MoE chain
