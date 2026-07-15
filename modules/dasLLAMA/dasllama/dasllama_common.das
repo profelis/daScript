@@ -2506,8 +2506,9 @@ struct KVPool {
 
 //! Per-step scratch buffers and the KV cache (allocated once, reused every token).
 struct Session {
-    // Stable identity for device-side mirrors (the Metal decode KV mirror keys on it): globally
-    // monotonic, assigned once in make_run_state, travels with the session through moves. Address
+    // Stable identity for device-side mirrors (the Metal decode KV mirror keys on it): monotonic
+    // per context (see g_session_uid — the mirrors only ever meet main-context sessions),
+    // assigned once in make_run_state, travels with the session through moves. Address
     // keying is unsound — schedulers churn same-geometry sessions (ABA), paged sessions have no
     // flat base, and Stream erase memmoves Sessions. 0 = never assigned (scratch/default value).
     uid : uint64
