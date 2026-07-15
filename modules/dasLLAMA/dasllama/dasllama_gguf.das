@@ -1115,6 +1115,9 @@ def gguf_read_tensor_f32(m : GGUFMeta; srcbytes : array<uint8> | #; name : strin
     } elif (gtype == GGML_TYPE_Q5_0) {
         // block of 32: fp16 scale d (2 bytes) + 4 bytes of high bits + 16 bytes (split-half
         // nibbles); x = ((nibble | high_bit << 4) - 16) * d
+        if (src_off % 32l != 0l || expect_n % 32l != 0l) {
+            panic("gguf: tensor '{name}' Q5_0 slice [{src_off}, +{expect_n}) is not block-aligned")
+        }
         let nb = expect_n / 32l
         var bo = base + (src_off / 32l) * 22l
         for (blk in range64(nb)) {
@@ -1272,6 +1275,9 @@ def gguf_transcode_q5_0_to_q8(m : GGUFMeta; srcbytes : array<uint8> | #; name : 
     }
     if (src_off + expect_n > m.tensors[ti].n_elem) {
         panic("gguf: tensor '{name}' slice [{src_off}, {src_off + expect_n}) exceeds {m.tensors[ti].n_elem} elems")
+    }
+    if (src_off % 32l != 0l || expect_n % 32l != 0l) {
+        panic("gguf: tensor '{name}' Q5_0 slice [{src_off}, +{expect_n}) is not block-aligned")
     }
     let nb = expect_n / 32l
     if (nb <= 0l) {
