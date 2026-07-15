@@ -19,7 +19,7 @@ The single most common antipattern in this codebase is opening `peek_data` and w
 | If you want to | Use | Don't |
 |---|---|---|
 | Find a char or substring | `find(s, '*')` / `find(s, "foo")` (returns -1 on miss) | byte loop with `c == uint8('*')` |
-| Find from the right | `rfind(s, '/')` / `rfind(s, "ab")` | reverse byte loop |
+| Find from the right | `rfind(s, "/")` / `rfind(s, "ab")` | reverse byte loop |
 | "Does it contain X" | `contains(s, "foo")` (boost) or `find(s, "foo") >= 0` | byte loop |
 | "Does it start/end with X" | `starts_with(s, "foo")` / `ends_with(s, ".das")` | `slice(s, 0, n) == "foo"` |
 | Replace all `a` with `b` | `replace(s, "a", "b")` | `modify_data` byte loop |
@@ -161,8 +161,13 @@ Use for "did you mean" suggestions. The `_fast` variant is meaningfully faster f
 
 ## Common gotchas
 
+- **Escape a literal opening brace in an interpolated string as `\{`.** An unescaped `{` starts an
+  interpolation expression even in JSON-looking text such as `"{\"action\":...}"`; this can produce
+  misleading downstream errors (for example, a following local declaration appears not to exist).
+  Write `"\{\"action\":...}"`, or preferably serialize a struct with `sprint_json` when the value is
+  not a fixed test fixture.
 - **`replace(s, "*", "")` is a fast "is every char X" probe** — collapses to a one-line `empty(replace(s, ch, ""))`. Beats hand-rolled byte loops.
-- **`find(s, '*')` accepts a char (int) directly** — no need to wrap as `"*"`. Same for `rfind`. Mixing the int and string overloads is fine.
+- **`find(s, '*')` accepts a char (int) directly; `rfind` does not.** Use `rfind(s, "*")` with a string substring.
 - **`find` returns `int`, not `int?`** — `< 0` means not found, **never** compare `find(...) == false`.
 - **`split` (boost) returns `array<string>`** — non-copyable, so move-receive: `let parts <- split(s, ",")`. The `split_by_chars` block-form generic is the no-allocation choice when you only need to iterate.
 - **`replace_multiple` (boost) does ONE pass** — replacements don't see each other's output. Its replacement array uses named tuples: `replace_multiple(s, [(text="a", replacement="b"), (text="b", replacement="a")])` swaps `a`↔`b`; nested `replace` calls would not.

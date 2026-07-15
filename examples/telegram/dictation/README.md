@@ -24,6 +24,10 @@ attribution to the speaker and never trigger Cadmus.
 Cadmus has four current-chat-only history tools: full-text search, first/last/count timelines,
 message context, and chronological browsing. Results include Telegram message IDs and post links.
 The runtime supplies the current chat ID, so the model cannot request another channel's history.
+Each addressed question uses two stages: a small retrieval-controller prompt returns one validated
+JSON action, the bot executes that action, and a tool-disabled completion writes the final answer
+from the returned evidence. This avoids relying on optional model-native tool-call formats and makes
+failure to consult required chat history deterministic.
 Grounded answers retain their source message IDs. A follow-up such as "what were we discussing
 there?" automatically loads five messages before and after those sources before generation.
 When `BRAVE_SEARCH_API_KEY` is set, Cadmus also has a compact Brave web-search tool for current or

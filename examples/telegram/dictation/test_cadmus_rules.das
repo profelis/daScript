@@ -44,6 +44,14 @@ def test_cadmus_routing_and_dates(t : T?) {
         t |> equal(should_cadmus_reply(false, true, false, false, false), true)
     }
 
+    t |> run("only actual legacy transcript posts suppress replies") @(t : T?) {
+        t |> equal(is_legacy_cadmus_transcript_reply(true, false, "🎙 Boris\n\nTranscript"), true)
+        t |> equal(is_legacy_cadmus_transcript_reply(true, false, "⚠ Reply failed."), false)
+        t |> equal(is_legacy_cadmus_transcript_reply(true, false, "Help text"), false)
+        t |> equal(is_legacy_cadmus_transcript_reply(true, true, "🎙 Boris\n\nTranscript"), false)
+        t |> equal(is_legacy_cadmus_transcript_reply(false, false, "🎙 Boris\n\nTranscript"), false)
+    }
+
     t |> run("explicit history questions require fresh database tools") @(t : T?) {
         t |> equal(requires_cadmus_history_tools("Who first mentioned LLVM in this chat?"), true)
         t |> equal(requires_cadmus_history_tools("What did we decide in the chat?"), true)

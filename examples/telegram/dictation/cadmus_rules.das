@@ -71,6 +71,13 @@ def should_cadmus_reply(
     return replies_enabled && is_addressed
 }
 
+def is_legacy_cadmus_transcript_reply(
+                                      replied_by_bot, remembered_assistant : bool;
+                                      replied_text : string
+                                      ) : bool {
+    return replied_by_bot && !remembered_assistant && starts_with(strip(replied_text), "🎙 ")
+}
+
 def requires_cadmus_history_tools(text : string) : bool {
     let lower = to_lower(strip(text))
     return (lower |> contains("in this chat") || lower |> contains("in the chat") ||
