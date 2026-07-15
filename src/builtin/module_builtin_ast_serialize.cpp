@@ -161,7 +161,7 @@ namespace das {
         try {
             cb(*this);
             return true;
-        } catch ( const dasException & ) {
+        } catch ( ... ) {
             failed = true;
             return false;
         }
@@ -413,12 +413,19 @@ namespace das {
         return ptr->module == thisModule;
     }
 
+    // A module-less struct/enum (e.g. a local/anonymous type reached through a
+    // Variable's type or init) has no identification to write -- treat it as
+    // in-this-module so it goes through the id/patch path instead of
+    // writeIdentifications, which would dereference the null module. Mirrors the
+    // isInThisModule(Variable*&) overload below. Defence-in-depth for the
+    // serializePointer(parent/classParent) sites; the TypeDecl struct/enum cases
+    // route module-less types through the inline path before reaching here.
     bool AstSerializer::isInThisModule ( Enumeration * & ptr ) {
-        return ptr->module == thisModule;
+        return ptr->module == thisModule || ptr->module == nullptr;
     }
 
     bool AstSerializer::isInThisModule ( Structure * & ptr ) {
-        return ptr->module == thisModule;
+        return ptr->module == thisModule || ptr->module == nullptr;
     }
 
     bool AstSerializer::isInThisModule ( Variable * & ptr ) {
@@ -538,26 +545,38 @@ namespace das {
 
     void AstSerializer::findExternal ( Enumeration * & ptr ) {
         auto [mod, mangledNameHash] = readModuleAndNameHash();
+        // under ignoreEmptyExternal (function arguments / field inits) a missing external
+        // module reaches here as mod==nullptr. Unlike a function (which infer re-resolves
+        // by name when the default expr is cloned at a call site), a null type pointer is
+        // never re-resolved and crashes later -- so fail the read; the boundary catches
+        // the exception and the caller falls back to text parsing
+        SERIALIZER_VERIFYF(mod, "module for enumeration '%llu' is not found", mangledNameHash);
         ptr = mod->findEnumByMangledNameHash(mangledNameHash);
         SERIALIZER_VERIFYF(ptr!=nullptr, "enumeration '%llu' is not found", mangledNameHash);
     }
 
     void AstSerializer::findExternal ( Structure * & ptr ) {
         auto [mod, mangledNameHash] = readModuleAndNameHash();
+        // missing external module under ignoreEmptyExternal - see findExternal(Enumeration*&)
+        SERIALIZER_VERIFYF(mod, "module for structure '%llu' is not found", mangledNameHash);
         ptr = mod->findStructureByMangledNameHash(mangledNameHash);
         SERIALIZER_VERIFYF(ptr!=nullptr, "structure '%llu' is not found", mangledNameHash);
     }
 
     void AstSerializer::findExternal ( Variable * & ptr ) {
         auto [mod, mangledName] = readModuleAndName();
+        // missing external module under ignoreEmptyExternal - see findExternal(Enumeration*&)
+        SERIALIZER_VERIFYF(mod, "module for variable '%s' is not found", mangledName.c_str());
         ptr = mod->findVariable(mangledName);
         SERIALIZER_VERIFYF(ptr!=nullptr, "variable '%s' is not found", mangledName.c_str());
     }
 
     void AstSerializer::findExternal ( TypeInfoMacro * & ptr ) {
         auto [mod, mangledName] = readModuleAndName();
+        // missing external module under ignoreEmptyExternal - see findExternal(Enumeration*&)
+        SERIALIZER_VERIFYF(mod, "module for type info macro '%s' is not found", mangledName.c_str());
         ptr = mod->findTypeInfoMacro(mangledName);
-        SERIALIZER_VERIFYF(ptr!=nullptr, "variable '%s' is not found", mangledName.c_str());
+        SERIALIZER_VERIFYF(ptr!=nullptr, "type info macro '%s' is not found", mangledName.c_str());
     }
 
     template<typename TT>
@@ -1237,11 +1256,25 @@ namespace das {
                 DAS_VERIFYF_MULTI(!annotation, !structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
-            case tStructure:
-                ser << alias << structType;
+            case tStructure: {
+                ser << alias;
+                // A genuinely cross-module struct is referenced by name (serializePointer):
+                // the plain smart-map operator would materialize a per-stream COPY on read,
+                // breaking type identity when a parsed module infers against cached
+                // signatures (mixed compiles after a partial cache invalidation) -- see
+                // Structure::serialize (parent). A same-module OR module-less struct (e.g. a
+                // local/anonymous type reached through a Variable's type) has no external
+                // identity to write, so keep the inline smart-map path, which serializes its
+                // content once and preserves identity within this stream. The chosen path is
+                // stamped into the stream so read takes the matching branch.
+                bool crossModule = ser.writing && structType && structType->module && structType->module != ser.thisModule;
+                ser << crossModule;
+                if ( crossModule ) ser.serializePointer(structType);
+                else               ser << structType;
                 DAS_VERIFYF_MULTI(!annotation, !!structType, !enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
+            }
             case tHandle:
                 ser << alias << annotation;
                 DAS_VERIFYF_MULTI(!!annotation, !structType, !enumType, !firstType, !secondType,
@@ -1255,11 +1288,17 @@ namespace das {
             case tEnumeration:
             case tEnumeration8:
             case tEnumeration16:
-            case tEnumeration64:
-                ser << alias << enumType;
+            case tEnumeration64: {
+                ser << alias;
+                // cross-module by name, else inline smart-map — see tStructure above
+                bool crossModule = ser.writing && enumType && enumType->module && enumType->module != ser.thisModule;
+                ser << crossModule;
+                if ( crossModule ) ser.serializePointer(enumType);
+                else               ser << enumType;
                 DAS_VERIFYF_MULTI(!annotation, !structType, !!enumType, !firstType, !secondType,
                                 argTypes.empty(), argNames.empty());
                 break;
+            }
             case tBitfield:
             case tBitfield8:
             case tBitfield16:
@@ -1374,9 +1413,17 @@ namespace das {
         ser << at     << module;
         ser << fields << fieldLookup;
         ser << aliases;
-        ser << parent // parent could be in the current module or in some other
-                      // module
-            << flags
+        // A cross-module parent may live in another module whose content is NOT in this
+        // stream; serializePointer binds it by name to the real library structure, avoiding
+        // a private COPY on read that would break pointer-identity checks (is_subclass_of
+        // walks parent pointers). A same-module or module-less parent has no external
+        // identity, so keep the inline smart-map path -- see the tStructure case in
+        // TypeDecl::serialize.
+        bool parentCross = ser.writing && parent && parent->module && parent->module != ser.thisModule;
+        ser << parentCross;
+        if ( parentCross ) ser.serializePointer(parent);
+        else               ser << parent;
+        ser << flags
             << ownSemanticHash;
         serializeAnnotationList(ser, annotations);
     }
@@ -1413,7 +1460,11 @@ namespace das {
         ser.ignoreEmptyExternal = false;
         ser << result;
         ser << body;
-        ser << classParent;
+        // cross-module by name, else inline smart-map — see Structure::serialize (parent)
+        bool classParentCross = ser.writing && classParent && classParent->module && classParent->module != ser.thisModule;
+        ser << classParentCross;
+        if ( classParentCross ) ser.serializePointer(classParent);
+        else                    ser << classParent;
         //ser << fromGeneric;
         ser << index         << totalStackSize  << totalGenLabel;
         ser << at            << atDecl          << module;
@@ -1839,7 +1890,15 @@ namespace das {
 
     void SerializeVisitor::preVisit ( ExprConstEnumeration * expr ) {
         serializeConst(expr);
-        ser << expr->enumType << expr->text;
+        // cross-module enum by name (serializePointer avoids a per-stream COPY that breaks
+        // identity and leaves dangling pointers in deserialized const expressions); a
+        // same-module or module-less enum keeps the inline smart-map path -- see the
+        // tStructure/tEnumeration cases in TypeDecl::serialize.
+        bool crossModule = ser.writing && expr->enumType && expr->enumType->module && expr->enumType->module != ser.thisModule;
+        ser << crossModule;
+        if ( crossModule ) ser.serializePointer(expr->enumType);
+        else               ser << expr->enumType;
+        ser << expr->text;
     }
 
     void SerializeVisitor::preVisit ( ExprConstBitfield * expr ) {
@@ -2157,7 +2216,8 @@ namespace das {
             uint64_t sz = f->useFunctions.size();
             ser << sz;
             for ( auto & usedFun : f->useFunctions ) {
-                bool builtin = usedFun->module->builtIn;
+                // cross-module refs by module+mangled-name-hash — see serializeUseVariables(FunctionPtr)
+                bool builtin = usedFun->module->builtIn || usedFun->module != f->module;
                 ser << builtin;
                 if ( builtin ) {
                     uint64_t module = usedFun->module->nameHash;
@@ -2165,6 +2225,9 @@ namespace das {
                     ser << module << mnh;
                 } else {
                     auto fid = ser.getSerializeId(usedFun);
+                    if ( ser.smartFunctionMap.find(fid) == ser.smartFunctionMap.end() )
+                        LOG(LogLevel::warning) << "das: serialize: [write] unregistered id for function '" << usedFun->name
+                            << "' of module '" << usedFun->module->name << "' in use-set of fn '" << f->name << "' - will be unresolvable on read\n";
                     ser << fid;
                 }
             }
@@ -2181,14 +2244,17 @@ namespace das {
                     uint64_t mnh = 0;
                     ser << module << mnh;
                     auto pModule = ser.moduleLibrary->findModuleByMangledNameHash(module);
-                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu'", module);
+                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu' (useFunctions[%llu/%llu] of function '%s')",
+                        (unsigned long long) module, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     auto fun = pModule->findFunctionByMangledNameHash(mnh);
-                    SERIALIZER_VERIFYF(fun, "expected to find function");
+                    SERIALIZER_VERIFYF(fun, "expected to find function (mnh %llu in module '%s', useFunctions[%llu/%llu] of function '%s')",
+                        (unsigned long long) mnh, pModule->name.c_str(), (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     f->useFunctions.emplace(fun);
                 } else {
                     SerializeNodeId fid; ser << fid;
                     auto fun = ser.smartFunctionMap[fid];
-                    SERIALIZER_VERIFYF(fun, "expected to find function");
+                    SERIALIZER_VERIFYF(fun, "expected to find function (id %p:%llu, useFunctions[%llu/%llu] of function '%s')",
+                        fid.ptr, (unsigned long long) fid.epoch, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     f->useFunctions.emplace(fun);
                 }
             }
@@ -2202,7 +2268,8 @@ namespace das {
             uint64_t sz = f->useFunctions.size();
             ser << sz;
             for ( auto & usedFun : f->useFunctions ) {
-                bool builtin = usedFun->module->builtIn;
+                // cross-module refs by module+mangled-name-hash — see serializeUseVariables(FunctionPtr)
+                bool builtin = usedFun->module->builtIn || usedFun->module != f->module;
                 ser << builtin;
                 if ( builtin ) {
                     uint64_t module = usedFun->module->nameHash;
@@ -2210,6 +2277,9 @@ namespace das {
                     ser << module << mnh;
                 } else {
                     auto fid = ser.getSerializeId(usedFun);
+                    if ( ser.smartFunctionMap.find(fid) == ser.smartFunctionMap.end() )
+                        LOG(LogLevel::warning) << "das: serialize: [write] unregistered id for function '" << usedFun->name
+                            << "' of module '" << usedFun->module->name << "' in use-set of global '" << f->name << "' - will be unresolvable on read\n";
                     ser << fid;
                 }
             }
@@ -2226,14 +2296,17 @@ namespace das {
                     uint64_t mnh = 0;
                     ser << module << mnh;
                     auto pModule = ser.moduleLibrary->findModuleByMangledNameHash(module);
-                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu'", module);
+                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu' (useFunctions[%llu/%llu] of global '%s')",
+                        (unsigned long long) module, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     auto fun = pModule->findFunctionByMangledNameHash(mnh);
-                    SERIALIZER_VERIFYF(fun, "expected to find function");
+                    SERIALIZER_VERIFYF(fun, "expected to find function (mnh %llu in module '%s', useFunctions[%llu/%llu] of global '%s')",
+                        (unsigned long long) mnh, pModule->name.c_str(), (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     f->useFunctions.emplace(fun);
                 } else {
                     SerializeNodeId fid; ser << fid;
                     auto fun = ser.smartFunctionMap[fid];
-                    SERIALIZER_VERIFYF(fun, "expected to find function");
+                    SERIALIZER_VERIFYF(fun, "expected to find function (id %p:%llu, useFunctions[%llu/%llu] of global '%s')",
+                        fid.ptr, (unsigned long long) fid.epoch, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     f->useFunctions.emplace(fun);
                 }
             }
@@ -2247,7 +2320,11 @@ namespace das {
             uint64_t sz = f->useGlobalVariables.size();
             ser << sz;
             for ( auto & use : f->useGlobalVariables ) {
-                bool builtin = use->module->builtIn;
+                // cross-module refs must resolve by module+name: the owning module's content
+                // is NOT re-serialized in this program's stream (isNew=false skips it), so a
+                // SerializeNodeId written here would be unresolvable on read. The id branch is
+                // only valid for the function's own module, whose content is in this stream.
+                bool builtin = use->module->builtIn || use->module != f->module;
                 ser << builtin;
                 if ( builtin ) {
                     uint64_t module = use->module->nameHash;
@@ -2255,6 +2332,9 @@ namespace das {
                     ser << module << varname;
                 } else {
                     auto vid = ser.getSerializeId(use);
+                    if ( ser.smartVariableMap.find(vid) == ser.smartVariableMap.end() )
+                        LOG(LogLevel::warning) << "das: serialize: [write] unregistered id for variable '" << use->name
+                            << "' of module '" << use->module->name << "' in use-set of fn '" << f->name << "' - will be unresolvable on read\n";
                     ser << vid;
                 }
             }
@@ -2271,14 +2351,17 @@ namespace das {
                     string varname;
                     ser << module << varname;
                     auto pModule = ser.moduleLibrary->findModuleByMangledNameHash(module);
-                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu'", module);
+                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu' (useGlobalVariables[%llu/%llu] of function '%s')",
+                        (unsigned long long) module, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     auto var = pModule->findVariable(varname);
-                    SERIALIZER_VERIFYF(var, "expected to find variable '%s::%s'", pModule->name.c_str(), varname.c_str());
+                    SERIALIZER_VERIFYF(var, "expected to find variable '%s::%s' (useGlobalVariables[%llu/%llu] of function '%s')",
+                        pModule->name.c_str(), varname.c_str(), (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     f->useGlobalVariables.emplace(var);
                 } else {
                     SerializeNodeId vid; ser << vid;
                     auto var = ser.smartVariableMap[vid];
-                    SERIALIZER_VERIFYF(var, "expected to find variable");
+                    SERIALIZER_VERIFYF(var, "expected to find variable (id %p:%llu, useGlobalVariables[%llu/%llu] of function '%s')",
+                        vid.ptr, (unsigned long long) vid.epoch, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     f->useGlobalVariables.emplace(var);
                 }
             }
@@ -2292,7 +2375,8 @@ namespace das {
             uint64_t sz = f->useGlobalVariables.size();
             ser << sz;
             for ( auto & use : f->useGlobalVariables ) {
-                bool builtin = use->module->builtIn;
+                // cross-module refs by module+name — see serializeUseVariables(FunctionPtr)
+                bool builtin = use->module->builtIn || use->module != f->module;
                 ser << builtin;
                 if ( builtin ) {
                     uint64_t module = use->module->nameHash;
@@ -2300,6 +2384,9 @@ namespace das {
                     ser << module << varname;
                 } else {
                     auto vid = ser.getSerializeId(use);
+                    if ( ser.smartVariableMap.find(vid) == ser.smartVariableMap.end() )
+                        LOG(LogLevel::warning) << "das: serialize: [write] unregistered id for variable '" << use->name
+                            << "' of module '" << use->module->name << "' in use-set of global '" << f->name << "' - will be unresolvable on read\n";
                     ser << vid;
                 }
             }
@@ -2316,14 +2403,17 @@ namespace das {
                     string varname;
                     ser << module << varname;
                     auto pModule = ser.moduleLibrary->findModuleByMangledNameHash(module);
-                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu'", module);
+                    SERIALIZER_VERIFYF(pModule, "expected to find module '%llu' (useGlobalVariables[%llu/%llu] of global '%s')",
+                        (unsigned long long) module, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     auto var = pModule->findVariable(varname);
-                    SERIALIZER_VERIFYF(var, "expected to find variable '%s::%s'", pModule->name.c_str(), varname.c_str());
+                    SERIALIZER_VERIFYF(var, "expected to find variable '%s::%s' (useGlobalVariables[%llu/%llu] of global '%s')",
+                        pModule->name.c_str(), varname.c_str(), (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     f->useGlobalVariables.emplace(var);
                 } else {
                     SerializeNodeId vid; ser << vid;
                     auto var = ser.smartVariableMap[vid];
-                    SERIALIZER_VERIFYF(var, "expected to find variable");
+                    SERIALIZER_VERIFYF(var, "expected to find variable (id %p:%llu, useGlobalVariables[%llu/%llu] of global '%s')",
+                        vid.ptr, (unsigned long long) vid.epoch, (unsigned long long) i, (unsigned long long) size, f->name.c_str());
                     f->useGlobalVariables.emplace(var);
                 }
             }
@@ -2692,9 +2782,31 @@ namespace das {
         }
     };
 
-    // NOT noexcept: the header reads above the module loop can throw on a truncated
-    // stream — both callers (trySerializeProgramModule, the rtti wrapper) catch
-    void AstSerializer::serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) {
+    // embedders are built without exception handling, so nothing may escape this
+    // rail: contain dasException here (truncated/corrupt cache streams throw from
+    // the stream readers) and report failure through the failed/failToCompile flags
+    void AstSerializer::serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept {
+        try {
+            serializeProgramImpl(program, libGroup);
+        } catch ( const dasException & r ) {
+            LOG(LogLevel::warning) << "das: serialize: program " << (writing ? "write" : "read") << " failed: " << r.what() << "\n";
+            failed = true;
+            seenNewModule = true;
+            if ( program ) program->failToCompile = true;
+            // scope guards in the impl repointed the active gc root during unwind;
+            // the caller replaces the (now gutted) program via replaceProgramKeepGcRootValid
+        } catch ( ... ) {
+            // this method is noexcept for embedders built without EH; a non-das
+            // exception (e.g. std::bad_alloc deep in deserialization) escaping here
+            // would std::terminate. Contain it the same way and report failure.
+            LOG(LogLevel::warning) << "das: serialize: program " << (writing ? "write" : "read") << " failed: unknown exception\n";
+            failed = true;
+            seenNewModule = true;
+            if ( program ) program->failToCompile = true;
+        }
+    }
+
+    void AstSerializer::serializeProgramImpl ( ProgramPtr program, ModuleGroup & libGroup ) {
         auto & ser = *this;
         // version gate — the module-cache path (trySerializeProgramModule) checks only
         // mtime+filename before this; a cache written by a different serializer version must
@@ -2817,9 +2929,19 @@ namespace das {
                 } catch ( const dasException & r ) {
                     if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
                     delete deser;
-                    LOG(LogLevel::warning) << "das: serialize: " << r.what();
+                    LOG(LogLevel::warning) << "das: serialize: reading module '" << name << "' (" << i << "/" << size
+                                           << (existing ? ", already exists" : ", new") << "): " << r.what() << "\n";
                     program->failToCompile = true;
                     return;
+                } catch ( ... ) {
+                    // a non-das exception (e.g. std::bad_alloc) escaping ser << *deser would
+                    // otherwise leave the thread active root pointing at deser's root, which
+                    // dies with the replaced program (the ActiveRootGuard only tracks
+                    // throwaway_root). Restore the thread root and rethrow to the noexcept
+                    // serializeProgram boundary, which reports failure.
+                    if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
+                    delete deser;
+                    throw;
                 }
             }
 
@@ -2847,6 +2969,12 @@ namespace das {
         } catch ( const dasException & r ) {
             program->failToCompile = true;
             LOG(LogLevel::warning) << "das: serialize:" << r.what();
+            return false;
+        } catch ( ... ) {
+            // noexcept for embedders built without EH: a non-das exception (e.g.
+            // std::bad_alloc deep in serialize) would std::terminate here. Contain it.
+            program->failToCompile = true;
+            LOG(LogLevel::warning) << "das: serialize: unknown exception\n";
             return false;
         }
     }
@@ -2923,11 +3051,11 @@ namespace das {
 
         // parseDaScript runs with the placeholder thisModule's gc root as the
         // thread-active root; library.reset() below deletes that module (and its
-        // root) — without repointing, every node deserialized after this line would
+        // root) - without repointing, every node deserialized after this line would
         // gc_link through a dangling root pointer into freed memory
         auto & activeRoot = gc_root::gc_get_active_root();
         const bool activeWasThisModule = thisModule && activeRoot == thisModule->module_gc_root.get();
-        // throwaway already-exists reads park nodes here — they may be referenced
+        // throwaway already-exists reads park nodes here - they may be referenced
         // through the patch maps until all modules are read, then sweep with scope
         gc_root throwaway_root;
         ActiveRootGuard throwaway_guard { &throwaway_root };
@@ -2967,7 +3095,16 @@ namespace das {
                     } else {
                         library.addModule(mod);
                         if ( activeWasThisModule ) activeRoot = mod->module_gc_root.get();
-                        ser.serializeModule(*mod, /*already_exists*/false);
+                        // the active root points at mod's root while it is read; if the read
+                        // throws, mod dies with the replaced program, so drop the active root
+                        // back to the permanent thread root before the exception propagates
+                        // (the ActiveRootGuard only tracks throwaway_root, not this one)
+                        try {
+                            ser.serializeModule(*mod, /*already_exists*/false);
+                        } catch ( ... ) {
+                            if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
+                            throw;
+                        }
                         if ( activeWasThisModule ) activeRoot = &throwaway_root;
                         mod->builtIn = false; // suppress assert
                         mod->promoteToBuiltin(nullptr, promotedRequire);
@@ -2982,7 +3119,14 @@ namespace das {
                 mod->fileName = fileName;
                 library.addModule(mod);
                 if ( activeWasThisModule ) activeRoot = mod->module_gc_root.get();
-                ser << *mod;
+                // see the promoted-new branch above: restore the thread root if the read
+                // throws, so a dangling mod->module_gc_root never stays the active root
+                try {
+                    ser << *mod;
+                } catch ( ... ) {
+                    if ( activeWasThisModule ) activeRoot = &gc_root::gc_get_thread_root();
+                    throw;
+                }
                 if ( activeWasThisModule ) activeRoot = &throwaway_root;
             }
         }

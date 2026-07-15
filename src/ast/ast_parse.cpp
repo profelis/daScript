@@ -575,31 +575,37 @@ namespace das {
         }
 
         int64_t file_mtime = access->getFileMtime(fileName.c_str());
-        // a truncated or corrupt cache stream throws dasException from the stream
-        // readers — contain it here and fall back to parsing, don't crash the embedder
-        try {
-            int64_t saved_mtime = 0; *serializer_read << saved_mtime;
-            string saved_filename{}; *serializer_read << saved_filename;
-
-            if ( saved_filename != fileName || file_mtime != saved_mtime ) {
-                serializer_read->seenNewModule = true;
-                if (saved_filename != fileName) {
-                    logs << "ser: file name mismatch. Expected '" << saved_filename << "', got '" << fileName << "'\n";
-                }
-                if (file_mtime != saved_mtime) {
-                    logs << "ser: file mtime mismatch. Expected " << saved_mtime << ", got " << file_mtime << "\n";
-                }
-                serializer_read->failed = true;
-                return false;
+        // The serializer module owns the exception boundary. This parser module is
+        // also built in configurations where exception handling is disabled.
+        int64_t saved_mtime = 0;
+        string saved_filename{};
+        bool header_mismatch = false;
+        if ( !serializer_read->trySerialize([&](AstSerializer & serializer) {
+            serializer << saved_mtime;
+            serializer << saved_filename;
+            header_mismatch = saved_filename != fileName || file_mtime != saved_mtime;
+            if ( header_mismatch ) {
+                return;
             }
+            LOG(LogLevel::debug) << "das: serialize: read program '" << fileName << "' epoch " << (unsigned long long)(serializer.epoch + 1) << "\n";
+            serializer.thisModuleGroup = &libGroup;
+            serializer.serializeProgram(program, libGroup);
+        }) ) {
+            serializer_read->seenNewModule = true;
+            replaceProgramKeepGcRootValid(program);
+            logs << "ser: read failed '" << fileName << "'\n";
+            return false;
+        }
 
-            serializer_read->thisModuleGroup = &libGroup;
-            serializer_read->serializeProgram(program, libGroup);
-        } catch ( const dasException & ex ) {
+        if ( header_mismatch ) {
             serializer_read->seenNewModule = true;
             serializer_read->failed = true;
-            replaceProgramKeepGcRootValid(program);
-            logs << "ser: read failed '" << fileName << "': " << ex.what() << "\n";
+            if (saved_filename != fileName) {
+                logs << "ser: file name mismatch. Expected '" << saved_filename << "', got '" << fileName << "'\n";
+            }
+            if (file_mtime != saved_mtime) {
+                logs << "ser: file mtime mismatch. Expected " << saved_mtime << ", got " << file_mtime << "\n";
+            }
             return false;
         }
 

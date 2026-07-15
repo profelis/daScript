@@ -220,11 +220,12 @@ namespace das {
         AstSerializer & operator << ( Module & module );
         AstSerializer & serializeModule ( Module & module, bool already_exists );
 
-        static constexpr uint32_t getVersion () {
-            return 103;   // 103: ExprWith::moduleName (102: auto_inline policies + neverInline, 101: 16/8-bit lattice)
+        static constexpr uint32_t getVersion () { 
+            return 104;   // 104: valid GC roots (103: ExprWith::moduleName, 102: auto_inline policies + neverInline, 101: 16/8-bit lattice)
         }
 
-        void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup );
+        void serializeProgram ( ProgramPtr program, ModuleGroup & libGroup ) noexcept;
+        void serializeProgramImpl ( ProgramPtr program, ModuleGroup & libGroup ); // throws dasException; called via the noexcept wrapper above
         bool serializeScript ( ProgramPtr program ) noexcept;
 
         template <uint64_t n>
