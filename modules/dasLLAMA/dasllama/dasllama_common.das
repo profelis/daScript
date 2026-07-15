@@ -4381,6 +4381,9 @@ def layer_hidden(t : Model; l : int64) : int64 => (empty(t.ffn_w) ? t.config.hid
 //! shared layer (l >= n_layer_kv_from_start) reuses the last own-KV layer of its class — sliding
 //! reads kv_from_start-2, global reads kv_from_start-1 (those two straddle the boundary by pattern).
 def layer_kv_source(c : Config; l : int64) : int64 {
+    if (l >= c.n_layers) {   // the MTP/NextN draft block never shares KV (no arch combines kv_from_start with nextn today — fail safe if one ever does)
+        return l
+    }
     let kvfs = c.n_layer_kv_from_start
     if (kvfs <= 0l || l < kvfs) {
         return l
@@ -6708,15 +6711,13 @@ def private mtp_verify_row0(t : Model; var s : Session) {
     }
 }
 
-// Write the draft head's KV rows for a just-prefilled [start_pos, start_pos+npos) window. Row p
-// pairs (h_p, x_{p+1}): in-chunk pairs cover rows start_pos..start_pos+npos-2 — one batched
-// eh_proj GEMM + the arch's batched blocks at l = n_layers, riding the trunk prefill's rope
-// table and batch scratch — and the seam row start_pos-1 = (the PREVIOUS window's tail hidden,
-// tokens[0]) closes chunked prefill / verify-batch boundaries whenever the mtp_h handoff is
-// fresh (a cold/foreign session skips it — a stale draft row only lowers the accept rate; the
-// next draft at that row rewrites it). x_b is saved/restored around the block pass: its
-// post-prefill contents are load-bearing for mtp_verify_row0 and embed_forward. KV only —
-// no head norm / classifier.
+// Write the draft head's IN-CHUNK KV rows for a just-prefilled [start_pos, start_pos+npos)
+// window. Row p pairs (h_p, x_{p+1}), so rows start_pos..start_pos+npos-2 ride one batched
+// eh_proj GEMM + the arch's batched blocks at l = n_layers, reusing the trunk prefill's rope
+// table and batch scratch. (The SEAM row start_pos-1 is forward_prefill's job, BEFORE the trunk
+// body — it needs the previous window's mtp_h handoff, which the body's tail overwrites.)
+// x_b is saved/restored around the block pass: its post-prefill contents are load-bearing for
+// mtp_verify_row0 and embed_forward. KV only — no head norm / classifier.
 def private mtp_prefill_warm(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
     let c = t.config
     let dim = c.dim
@@ -6738,10 +6739,8 @@ def private mtp_prefill_warm(t : Model; var s : Session; tokens : array<int64>; 
         t.blocks.ffn_prefill(t, s, c.n_layers, npos - 1l)
         copy_floats(s.mtp_xb_save, 0l, s.x_b, 0l, npos * dim)
     }
-    // the seam row LAST — its single-row rope rebuild would clobber the table the batch pass rides
-    if (start_pos > 0l && s.mtp_h_pos1 == start_pos) {
-        forward_mtp(t, s, tokens[0], start_pos - 1l, false)
-    }
+    // (the SEAM row start_pos-1 is written by forward_prefill BEFORE the trunk body — the body's
+    // tail overwrites the mtp_h handoff this row needs, so it cannot be done here)
 }
 
 //! One greedy self-speculative eval step at the session cursor (the engine primitive behind
@@ -9197,6 +9196,15 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
         prof_add("ple", ts_ple)
     }
 
+    // spec on: the draft head's SEAM row (start_pos-1, pairing the PREVIOUS window's tail hidden
+    // with this window's first token) must be written BEFORE the body — the body's own tail
+    // overwrites the mtp_h handoff with THIS window's last hidden (review round 2 caught the
+    // ordering: checking after the body could never fire, silently costing accept rate on every
+    // chunked-prefill seam). A cold/foreign handoff skips it — stale rows only cost accept rate
+    // and the next draft at that row rewrites it.
+    if (g_mtp_spec && c.n_layer_nextn > 0l && start_pos > 0l && s.mtp_h_pos1 == start_pos) {
+        forward_mtp(t, s, tokens[0], start_pos - 1l, false)
+    }
     forward_prefill_body(t, s, npos, start_pos)
     if (g_mtp_spec && c.n_layer_nextn > 0l) {   // spec on: maintain the draft head's KV alongside the trunk's
         mtp_prefill_warm(t, s, tokens, npos, start_pos)
