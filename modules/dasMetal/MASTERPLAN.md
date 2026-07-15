@@ -984,3 +984,57 @@ call). CLEAN ROUND (best-of-3, process-fresh): 3B pp512 GPU window **367.5-372.0
 1299.3 t/s, median 1287.5 (spread = commit-wait slack). Parity token-for-token; all gates
 green. NEXT: pre-PR scrub (delete both verbatim modules + lab lcpp variants, squash to one
 fresh commit off origin/master, delete the old remote branch) -> final clean round -> reopen PR.
+
+**2026-07-14 — Phase 8 (emission arc P3): GPU decode hits the llama.cpp bar — 3B tg128
+87.1-87.3 t/s (clean Parsec-off round, best-of-3 process-fresh, ≥ lcpp Metal's 87.0).**
+Deep row: ctx 512 -> 640 at 80.4-80.7 t/s. Protocol: decode_prof, DASLLAMA_PIN_DECODE=metal +
+portable backend, wscale-f16 1, f16 KV, -p 8 -n 128. From P2's 69.9/46.3 baseline via the P3
+chase (attribution harness `benchmarks/decode_metal_chase.das`, knockout arms + per-stage
+driver split): (1) coalesced simdgroup-cooperative attention scoring + hoisted q + 4-row-ILP V
+pass + 64-row chunked split-K above depth 64 (deep attention 7.5ms -> ~0.8ms/token); (2) layer
+dispatch set 15 -> 7 levels: concat-region fused QKV and W1|W3 GEMVs, then 2-ROWS-PER-SIMDGROUP
+epilogue fusion — element pairs (2r, 2r+1) ARE weight-row pairs, so rope+KV-store rides the QKV
+dispatch (q ropes to the buffer, k ropes straight into the mirror, v stores raw) and
+silu(gate)·up rides the W1|W3 dispatch (gate row r + up row r+hidden in one simdgroup); fused
+add+rms feeding the NEXT layer's norm; (3) f16 weight-scale GEMV twins (qscales16, lcpp q8_0
+byte parity, -5.6% stream); (4) 1024-wide 1-tg rms/addrms; (5) SPECULATIVE GREEDY CHAINING —
+the predicted next step's cb commits during the current GPU run and OPENS with GPU argmax
+(CPU tie-break) + the winner's embed gather (cls_q8 linear plane) + a driver-built rope row
+(`build_decode_rope_row` seam), so the GPU flows cb-to-cb with no CPU in the gap; mispredicts
+verify against the caller's token and rerun through the watermark/rewind contract (exponential
+backoff, `set_metal_decode_speculate` rail); unretained cbs. Negative results on record:
+concurrent-encoder+per-dispatch-barriers LOSES to the serial encoder on M1 (framing lab
+barrier mode — ggml wins by eliding, our chain can't); uint4 wide-load GEMV +0.5ms vs byte4;
+single-tg attention above depth 64 loses to the chunked pair. All parity gates green
+(test_metal_decode_parity 8 arms incl. wscale16 + hybrid + paged + rewind + churn + leak).
+
+**2026-07-14 — Phase 8 (emission arc P4): BATCHED GPU decode — eval_batch rides the resident
+driver. CLEAN ROUND (Parsec-off, best-of-3 process-fresh): 3B d512 batch curve
+105.9/106.5/150.5/280.9 t/s at B=2/4/8/16 (vs llama-batched-bench Metal 134/219/250/363 =
+0.79/0.49/0.60/0.77x; B=1 fixed-token 74.9 vs 85); single-stream tg128 re-confirmed at
+88.36-88.37 t/s (UP from the P3 gate's 87.1-87.3 — the watchdog fix below deleted the event
+machinery) with deep ctx512 80.2-80.7 unchanged.** The batch override claims the whole layer
+stack + logits: KV mirrors became slices of ONE arena buffer (first-fit free list; LRU +
+batch-uid pinning), so per-row attention and rope+KV-store reach every row's slice through one
+bind + a per-row element-offset table (rt[b] = k/v base, cap, cnt — per-row capacities differ,
+the layer index is a uniform); GEMV sites pick FIXED-B batched GEMV forms (B <= 4 — the P1a
+lab winners; scale planes via dual-view binds, one kernel for f32 + wscale16) or the M-pad-32
+GEMM twin (B >= 5, B-independent ~51-54ms step floor, rides the prefill quant tails
+add+rms+quant / swiglu+quant); batched final rms + classifier on the same cb (the CPU tail's
+classifier was ~6ms of every small-B step — eval_batch grew
+`batch_decode_override_logits_done`, the decode seam's batch twin). Protocol: batch_decode_perf
+`--fixed-token 100` (llama-batched-bench feeds fixed tokens; our greedy argmax is
+~0.25ms/row/step of harness cost), -p 512 -n 128, f16 KV, wscale-f16 1,
+DASLLAMA_METAL_KV_MIRROR_MB=3072 for 16 streams at depth. Steps are GPU-BOUND (CPU side
+< 1.5ms incl. per-row KV writeback): gpu/step 17.5 (B=2, gemv_b2) / 35.9 (B=4, gemv_b4 — the
+ALU-ceiling valley) / 51.3 (B=8) / 54.4ms (B=16, gemm32 floor) — all matching the P1a lab site
+costs, so the remaining gap is pure skinny-M kernel efficiency (lcpp mul_mv at ne11 2-8) — the
+P4-chase ledger row in API_REWORK (x-staged GEMV / gemm16 / mul_mm@64, lab rows first). FOUND
++ FIXED en route: a pre-encoded next-step cb parked COMMITTED across an idle gap (stream
+switch, interactive pause) trips the GPU watchdog and the OS then ignores the process's
+submissions — pre-steps now stay uncommitted until poked (spec steps still commit at encode;
+the event-park mode measured ~neutral in P3 and is deleted). Gates: test_metal_decode_parity
+grew the batch arms — B=3 GEMV + mid-run shrink, B=6 GEMM, mixed batch/single schedule (arena
+handoff), one-step logits+KV tolerance x {B3,B6}x{f16,f32}, paged multi-run gathers, wscale16
+both paths, leak gate; CPU batch suite 18/18.
+NEXT: P4 batched decode (gemm32 crossover, batch seam driver), P5 ship.

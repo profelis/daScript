@@ -101,6 +101,7 @@ def llm_catalog() : array<LlmModel> {
         LlmModel(file="Qwen2.5-1.5B-Instruct-Q8_0.gguf", display="Qwen2.5-1.5B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="SmolLM2-1.7B-Instruct-Q8_0.gguf", display="SmolLM2-1.7B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gemma-2-2b-it-Q8_0.gguf", display="gemma-2-2B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="Llama-3.2-3B-Instruct-Q8_0.gguf", display="Llama-3.2-3B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Phi-3.5-mini-instruct-Q8_0.gguf", display="Phi-3.5-mini", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gemma-3-4b-it-Q8_0.gguf", display="gemma-3-4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen3-4B-Instruct-2507-Q8_0.gguf", display="Qwen3-4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),

@@ -308,6 +308,16 @@ def main() {
         set_kquant_native(cfg.kquant_native != 0)
         print("kquant_native override: {cfg.kquant_native != 0}\n")
     }
+    // the resident whole-decode override (dasMetal emission arc): claims the ENTIRE layer stack
+    // per token; needs the f32 scale plane + a row-major backend (like DASLLAMA_PIN_PREFILL)
+    if (has_env_variable("DASLLAMA_PIN_DECODE")) {
+        let dv = get_env_variable("DASLLAMA_PIN_DECODE")
+        if (!select_decode_override(dv)) {
+            print("decode override `{dv}` not registered on this build\n")
+        } else {
+            print("decode override: {dv}\n")
+        }
+    }
     print("loading {cfg.model}\n")
     var t <- load_gguf(cfg.model, cfg.quant)
     let ctx_cap = max(2048l, max(p, p2) + n + 8l)

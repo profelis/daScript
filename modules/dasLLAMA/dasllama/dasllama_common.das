@@ -252,6 +252,96 @@ def prefill_override_logits_done {
     g_prefill_logits_done = true
 }
 
+//! The decode twin of PrefillOverrideFn (e.g. the dasMetal GPU-resident path): claims the ENTIRE
+//! per-layer stack of one single-token forward — the rope table row is already built, s.x holds
+//! the embedded token; on true the KV row is stored for `pos` and s.x holds the final residual
+//! (the final norm + classifier stay with the caller UNLESS the override calls
+//! decode_override_logits_done after filling s.logits itself). false = declined — the caller runs
+//! the ordinary per-layer CPU loop. NOTE: forward() also serves 1-token prefill chunks, so `pos`
+//! is arbitrary — an override must never assume pos tracks a generation step.
+typedef DecodeOverrideFn = function<(t : Model; var s : Session; token, pos : int64) : bool>
+
+//! The batched-decode twin, invoked in eval_batch_ after the embed + per-row rope tables:
+//! stack contract — on true every row's KV is stored and ws.scr.x_b holds the final residuals;
+//! the CPU tail (final rms, classifier, softcap/scatter — skipped when the override calls
+//! batch_decode_override_logits_done after filling every sessions[i].logits itself — then
+//! suppress, n_past++) stays with the caller, and the override NEVER touches n_past.
+typedef BatchDecodeOverrideFn = function<(t : Model; var ws : BatchWorkspace; var sessions : array<Session?>; nrows : int64) : bool>
+
+// The decode-override registries (see DecodeOverrideFn / BatchDecodeOverrideFn). Name-keyed like
+// the prefill registry; nothing activates by default — an empty active name keeps the CPU loops.
+var private g_decode_overrides : table<string; DecodeOverrideFn>
+var private g_decode_override : DecodeOverrideFn
+var private g_decode_override_name = ""
+var private g_batch_decode_overrides : table<string; BatchDecodeOverrideFn>
+var private g_batch_decode_override : BatchDecodeOverrideFn
+var private g_batch_decode_override_name = ""
+
+def register_decode_override(name : string; fn : DecodeOverrideFn) {
+    g_decode_overrides[name] = fn
+}
+
+def register_batch_decode_override(name : string; fn : BatchDecodeOverrideFn) {
+    g_batch_decode_overrides[name] = fn
+}
+
+//! Activate a registered whole-decode override by name ("" deactivates). The batch twin
+//! registered under the same name (if any) activates alongside — a name with only the
+//! single-stream form keeps eval_batch_ on the CPU path. false = unknown name.
+def select_decode_override(name : string) : bool {
+    if (empty(name)) {
+        g_decode_override_name = ""
+        g_batch_decode_override_name = ""
+        return true
+    }
+    if (!key_exists(g_decode_overrides, name)) {
+        to_log(LOG_ERROR, "dasLLAMA: unknown decode override `{name}`\n")
+        return false
+    }
+    g_decode_override = g_decode_overrides[name]
+    g_decode_override_name = name
+    if (key_exists(g_batch_decode_overrides, name)) {
+        g_batch_decode_override = g_batch_decode_overrides[name]
+        g_batch_decode_override_name = name
+    } else {
+        g_batch_decode_override_name = ""
+    }
+    return true
+}
+
+def active_decode_override : string {
+    return g_decode_override_name
+}
+
+// set by an override that ALSO produced this position's logits; reset before every invocation
+var private g_decode_logits_done = false
+
+//! A whole-decode override that computed s.logits itself (final norm + classifier on its device)
+//! calls this from inside its forward — forward() then skips the CPU final-norm/classifier step.
+def decode_override_logits_done {
+    g_decode_logits_done = true
+}
+
+// the batch twin — reset before every eval_batch_ invocation
+var private g_batch_decode_logits_done = false
+
+//! A batch-decode override that filled EVERY sessions[i].logits itself (final norm + classifier
+//! on its device, softcap semantics preserved or declined) calls this from inside its forward —
+//! eval_batch_ then skips the CPU final-norm/classifier/scatter step (suppress pins and the
+//! n_past advance still run there).
+def batch_decode_override_logits_done {
+    g_batch_decode_logits_done = true
+}
+
+//! Build one position's RoPE cos/sin row into caller arrays — bit-identical to the row forward()
+//! hands the decode override (an encode-ahead driver pre-builds the NEXT position's row; the
+//! global-rope class only — dual-rope configs carry a second row this does not cover).
+def public build_decode_rope_row(t : Model; pos : int64; var cos_tab, sin_tab : array<float>) {
+    let c = t.config
+    build_rope_table(cos_tab, sin_tab, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l,
+                     c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
+}
+
 //! The copyable hot-path block pointers, resolved onto the Model at load and called per layer.
 struct ArchBlocks {
     attn_decode : AttnDecodeFn
@@ -2416,6 +2506,11 @@ struct KVPool {
 
 //! Per-step scratch buffers and the KV cache (allocated once, reused every token).
 struct Session {
+    // Stable identity for device-side mirrors (the Metal decode KV mirror keys on it): globally
+    // monotonic, assigned once in make_run_state, travels with the session through moves. Address
+    // keying is unsound — schedulers churn same-geometry sessions (ABA), paged sessions have no
+    // flat base, and Stream erase memmoves Sessions. 0 = never assigned (scratch/default value).
+    uid : uint64
     n_past : int64            // absolute position of the next token to eval (0 at session start); advanced by eval()
     rng : int4                // sampling RNG state (seeded in make_run_state; reseed via set_seed)
     recent : array<int64>     // recently generated tokens, for the repetition penalty
@@ -2638,12 +2733,19 @@ def private kv_validate_q8(c : Config; kdt, vdt : KVDtype) {
     }
 }
 
+// Session-uid source (see Session.uid). Per-context counter: fork-worker contexts clone module
+// globals, so uniqueness holds within a context — the device mirrors that key on uid live on the
+// main context only, which is the only place sessions meet them.
+var private g_session_uid : uint64
+
 //! Allocate the run state sized to a model. `kdt`/`vdt` pick the KV-cache codec for THIS session
 //! (no process-global state — sessions with different codecs coexist, models run in parallel).
 //! `alloc_cache = false` skips the flat cache slabs (paged sessions and cache-less scratch).
 def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDtype.f32; alloc_cache : bool = true) : Session {
     kv_validate_q8(c, kdt, vdt)
     var s : Session
+    g_session_uid++
+    s.uid = g_session_uid
     // qd = n_heads * head_size, the query / attention-output width. == dim for the llama family,
     // but Gemma2 has qd (2048) != dim (2304), so q and the attention scratch xb size to max(dim, qd).
     // Heterogeneous arches (gemma4) size to the larger layer class; the KV cache packs each layer's
@@ -6545,11 +6647,22 @@ def forward(t : Model; var s : Session; token, pos : int64) {
         prof_add("rope_build", ts_rope_build)
     }
 
-    // per-layer transformer stack — attention then FFN, each through the arch's registered block
-    for (l in range64(c.n_layers)) {
-        t.blocks.attn_decode(t, s, l, pos)
-        t.blocks.ffn_decode(t, s, l)
+    // per-layer transformer stack — attention then FFN, each through the arch's registered block.
+    // An active whole-decode override (select_decode_override) may claim the entire stack; it
+    // returns false to decline (unsupported shape/config), which falls back to the CPU loop.
+    var stack_done = false
+    g_decode_logits_done = false
+    if (!empty(g_decode_override_name)) {
+        stack_done = invoke(g_decode_override, t, s, token, pos)
     }
+    if (!stack_done) {
+        for (l in range64(c.n_layers)) {
+            t.blocks.attn_decode(t, s, l, pos)
+            t.blocks.ffn_decode(t, s, l)
+        }
+    }
+
+    return if (stack_done && g_decode_logits_done)   // the override already produced s.logits
 
     // final rmsnorm (into xb to avoid aliasing x as both in/out), then classifier
     let ts_final = ref_time_ticks()
@@ -9721,44 +9834,56 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
             c.rope_freq_scale_swa, ws.positions, nrows, swa_hs, !c.rope_ff_global_only)
     }
     prof_add("rope_build", ts_rope_build)
-    // layer stack: batched attention (per-row cache scatter) + the arch's batched FFN (position-free)
-    for (l in range64(c.n_layers)) {
-        attention_batch_decode(t, ws, sessions, l, nrows)
-        t.blocks.ffn_prefill(t, ws.scr, l, nrows)
+    // layer stack: batched attention (per-row cache scatter) + the arch's batched FFN (position-free).
+    // An active batch-decode override may claim the whole stack (the CPU tail below still runs,
+    // minus the classifier when the override produced every row's logits itself); false =
+    // declined, fall back to the CPU loop.
+    var stack_done = false
+    g_batch_decode_logits_done = false
+    if (!empty(g_batch_decode_override_name)) {
+        stack_done = invoke(g_batch_decode_override, t, ws, sessions, nrows)
+    }
+    if (!stack_done) {
+        for (l in range64(c.n_layers)) {
+            attention_batch_decode(t, ws, sessions, l, nrows)
+            t.blocks.ffn_prefill(t, ws.scr, l, nrows)
+        }
     }
     // final rmsnorm + classifier over ALL rows, then per-row softcap/pins scattered per session
     let ts_final = ref_time_ticks()
     let vocab = c.vocab_size
-    rms_batch(ws.scr.xb_b, ws.scr.x_b, t, t.rms_final_off, dim, nrows)
-    ws.logits_b |> resize(nrows * vocab)
-    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
-    if (c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) {
-        // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
-        mm_fblob_b(ws.logits_b, t, t.tok_emb_off, ws.scr.xb_b, dim, vocab, nrows)
-    } elif (cls_fmt != KqFmt.q8) {
-        mm_b_kq(ws.scr, ws.logits_b, t, cls_fmt, t.wcls_off, ws.scr.xb_b, dim, vocab, nrows)
-    } else {
-        mm_b(ws.logits_b, t, t.wcls_off, ws.scr.xb_b, ws.scr.xqb, ws.scr.xsb, dim, vocab, nrows)
-    }
-    // per-row softcap + scatter into each session's logits + suppress pins, ONE row-parallel
-    // dispatch — the serial tail here was most of a ~6ms all-lane hole every step at B=8
-    // (B x vocab ≈ 5MB of copy). Rows are disjoint (row i writes only sessions[i].logits).
-    ws.lrow |> resize(int(nrows))
-    unsafe {
-        for (i in range64(nrows)) {
-            ws.lrow[i] = addr(sessions[i].logits[0])
+    if (!(stack_done && g_batch_decode_logits_done)) {
+        rms_batch(ws.scr.xb_b, ws.scr.x_b, t, t.rms_final_off, dim, nrows)
+        ws.logits_b |> resize(nrows * vocab)
+        let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+        if (c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8) {
+            // tied weights (fp32/q4 loads): the classifier IS the fp32 embedding table
+            mm_fblob_b(ws.logits_b, t, t.tok_emb_off, ws.scr.xb_b, dim, vocab, nrows)
+        } elif (cls_fmt != KqFmt.q8) {
+            mm_b_kq(ws.scr, ws.logits_b, t, cls_fmt, t.wcls_off, ws.scr.xb_b, dim, vocab, nrows)
+        } else {
+            mm_b(ws.logits_b, t, t.wcls_off, ws.scr.xb_b, ws.scr.xqb, ws.scr.xsb, dim, vocab, nrows)
         }
-        var lbp = addr(ws.logits_b[0])
-        var lrp = addr(ws.lrow[0])
-        let softcap = c.final_logit_softcap
-        maybe_parallel_for(0, int(nrows), min(int(nrows), get_dispatch_lanes())) $(rb, re) {
-            unsafe {
-                for (i in range(rb, re)) {
-                    var src = lbp + int64(i) * vocab
-                    if (softcap > 0.0) {  // Gemma2: soft-cap the output logits per row
-                        softcap4(src, vocab, softcap)
+        // per-row softcap + scatter into each session's logits + suppress pins, ONE row-parallel
+        // dispatch — the serial tail here was most of a ~6ms all-lane hole every step at B=8
+        // (B x vocab ≈ 5MB of copy). Rows are disjoint (row i writes only sessions[i].logits).
+        ws.lrow |> resize(int(nrows))
+        unsafe {
+            for (i in range64(nrows)) {
+                ws.lrow[i] = addr(sessions[i].logits[0])
+            }
+            var lbp = addr(ws.logits_b[0])
+            var lrp = addr(ws.lrow[0])
+            let softcap = c.final_logit_softcap
+            maybe_parallel_for(0, int(nrows), min(int(nrows), get_dispatch_lanes())) $(rb, re) {
+                unsafe {
+                    for (i in range(rb, re)) {
+                        var src = lbp + int64(i) * vocab
+                        if (softcap > 0.0) {  // Gemma2: soft-cap the output logits per row
+                            softcap4(src, vocab, softcap)
+                        }
+                        copy_floats(lrp[i], src, vocab)
                     }
-                    copy_floats(lrp[i], src, vocab)
                 }
             }
         }

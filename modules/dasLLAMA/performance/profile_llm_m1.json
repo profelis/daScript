@@ -8,7 +8,7 @@
     "date":"2026-07-13",
     "box_profile":"gen_profile.tune.json",
     "parsec_off":true,
-    "tune":"k4q8_tile_gen=mr4 (manifest); k5q8_tile_gen=mr4 (manifest); k6q8_tile_gen=mr4 (manifest); q8q8_tile_gen=kstep2 (manifest)"
+    "tune":"k4q8_tile_gen=mr4 (fallback); k5q8_tile_gen=mr4 (fallback); k6q8_tile_gen=mr4 (fallback); q8q8_tile_gen=kstep2 (fallback)"
   },
   "tests":[
     {
@@ -345,6 +345,22 @@
         "context":128,
         "das_tok_s":32.579308982675443,
         "llama_cpp_tok_s":29.754365
+      }
+    },
+    {
+      "model":"Llama-3.2-3B",
+      "arch":"llama",
+      "quant":"q8",
+      "active_b":3.2125747200000001,
+      "prefill":{
+        "context":512,
+        "das_tok_s":314.64571322870137,
+        "llama_cpp_tok_s":289.65947499999999
+      },
+      "emission":{
+        "context":128,
+        "das_tok_s":29.767698001122337,
+        "llama_cpp_tok_s":31.986651999999999
       }
     }
   ]
