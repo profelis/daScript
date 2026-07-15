@@ -130,6 +130,7 @@ def private kv_row_max_diff(sa, sb : Session; c : Config; pos : int64) : float {
 }
 
 // one CPU step and one GPU step from identical prefilled states: logits + stored-KV-row envelope
+[unused_argument(t, tr, prompt, kdt, tol_logits, tol_kv, tag)]   // off-Apple the gated body is empty
 def private single_step_gate(t : T?; tr : Model; prompt : array<int64>; kdt : KVDtype;
                              tol_logits, tol_kv : float; tag : string) {
     // whole-body gate: the stats rails only exist with das_metal, and every caller is already
@@ -306,6 +307,7 @@ def private streams_match(a, b : array<array<int64>>) : bool {
 
 // one CPU batch step and one GPU batch step from identical prefilled states: per-row logits +
 // stored-KV-row envelope (the batch twin of single_step_gate)
+[unused_argument(t, tr, nb, kdt, tol_logits, tol_kv, tag)]   // off-Apple the gated body is empty
 def private batch_step_gate(t : T?; tr : Model; nb : int; kdt : KVDtype; tol_logits, tol_kv : float; tag : string) {
     // whole-body gate: see single_step_gate — off-Apple this helper just needs to compile
     static_if (typeinfo builtin_module_exists(das_metal)) {
