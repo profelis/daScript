@@ -1732,7 +1732,10 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 if (gguf_find_tensor(m, "blk.0.attn_norm.weight") < 0) {
                     panic("dasLLAMA: MTP-only sidecar GGUF (no trunk tensors) is not supported — use the full -MTP file")
                 }
-            } elif (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") >= 0) {
+            } elif (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") >= 0
+                    || gguf_find_tensor(m, "blk.{layers - 1l}.nextn.eh_proj.weight") >= 0) {
+                // the second probe catches a malformed file whose block_count already counts the
+                // draft block — its nextn tensors sit one below the first probe's index
                 panic("dasLLAMA: file ships NextN tensors but no nextn_predict_layers key — refusing to guess")
             }
         }
