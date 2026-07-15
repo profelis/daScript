@@ -179,6 +179,54 @@ def test_history_migrations_linq_and_fts(t : T?) {
         }
     }
 
+    t |> run("multilingual strict search preserves authorship and excludes current answers") @(t : T?) {
+        var russian = test_message(40l, 1l, 11l, 100l, "шведский маузер и оптика")
+        russian.SenderName = "Boris"
+        russian.SenderUsername = "boris"
+        upsert_cadmus_message(path, russian)
+        var english = test_message(40l, 2l, 12l, 200l, "Swedish Mauser optics")
+        english.SenderName = "Greg Cohen"
+        english.SenderUsername = "greg"
+        upsert_cadmus_message(path, english)
+        var partial_name = test_message(40l, 3l, 12l, 300l, "Swedish rifle")
+        partial_name.SenderName = "Greg Cohen"
+        partial_name.SenderUsername = "greg"
+        upsert_cadmus_message(path, partial_name)
+        upsert_cadmus_message(path, test_message(40l, 4l, 13l, 400l, "Mauser optics"))
+        var assistant = test_message(40l, 5l, 100l, 500l, "Swedish Mauser answer")
+        assistant.Role = CADMUS_ROLE_ASSISTANT
+        upsert_cadmus_message(path, assistant)
+        upsert_cadmus_message(path, test_message(40l, 6l, 14l, 600l, "Swedish Mauser?"))
+
+        let queries <- ["шведск маузер", "swedish mauser"]
+        let rows <- search_cadmus_message_variants(path, 40l, queries, 0l, 6l, 10)
+        t |> equal(length(rows), 2)
+        if (length(rows) == 2) {
+            t |> equal(rows[0].TelegramMessageId, 1l)
+            t |> equal(rows[1].TelegramMessageId, 2l)
+        }
+        let greg_id = find_cadmus_sender(path, 40l, "Greg Cohen")
+        t |> equal(greg_id, 12l)
+        let greg_rows <- search_cadmus_message_variants(path, 40l, queries, greg_id, 6l, 10)
+        t |> equal(length(greg_rows), 1)
+        if (length(greg_rows) == 1) {
+            t |> equal(greg_rows[0].TelegramMessageId, 2l)
+        }
+    }
+
+    t |> run("strict prefix variants require every topic term") @(t : T?) {
+        upsert_cadmus_message(path, test_message(41l, 1l, 7l, 100l, "alpha only"))
+        upsert_cadmus_message(path, test_message(41l, 2l, 8l, 200l, "beta only"))
+        upsert_cadmus_message(path, test_message(41l, 3l, 9l, 300l, "обсуждали оптику"))
+        let mixed <- search_cadmus_message_variants(path, 41l, ["alpha beta"], 0l, 0l, 10)
+        t |> equal(length(mixed), 0)
+        let inflected <- search_cadmus_message_variants(path, 41l, ["оптик"], 0l, 0l, 10)
+        t |> equal(length(inflected), 1)
+        if (length(inflected) == 1) {
+            t |> equal(inflected[0].TelegramMessageId, 3l)
+        }
+    }
+
     t |> run("import media checkpoint preserves unchanged completed work") @(t : T?) {
         with_cadmus_database(path) $(db) {
             db |> with_transaction(SqliteTxnMode.Immediate) {

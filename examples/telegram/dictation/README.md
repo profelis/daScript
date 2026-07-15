@@ -113,6 +113,7 @@ Commands work without registering them, but the Telegram command menu is configu
 | `assistant_prompt` | Editable conversational personality, separate from trusted runtime rules |
 | `database` | Local SQLite history path |
 | `recent_messages`, `history_search_results` | Recent context and per-tool FTS result limits |
+| `history_search_languages` | Comma-separated languages for independent strict FTS query variants; this does not translate or embed stored messages |
 | `web_search_enabled`, `web_search_results`, `web_search_timeout`, `web_search_max_calls` | Brave Search controls; key comes from the environment |
 | `summary_chunk_messages`, `summary_max_messages` | Summary reduction limits |
 | `max_tokens`, `temp` | Dictation cleanup generation settings |

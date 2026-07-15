@@ -36,7 +36,7 @@ var g_asr_path = ""
 var g_asr_mmproj = ""
 var g_asr_worker_count = 0
 var g_asr_team_dispatch = false
-var g_should_stop = false
+var g_shutdown_requested = false
 var g_req_counter = 0l
 var g_sched = Scheduler()       // live from run_server on; handlers submit into it
 var g_events : array<SchedEvent>
@@ -82,9 +82,10 @@ def configure_asr_workers(path, mmproj : string; workers : int = 1) {
     g_has_asr = !empty(path)
 }
 
-//! Ask the tick loop to exit at the next iteration (also wired to ``POST /shutdown``).
+//! Stop admitting new inference/ASR work and exit after all accepted work finishes. Also wired to
+//! ``POST /shutdown``.
 def request_stop() {
-    g_should_stop = true
+    g_shutdown_requested = true
 }
 
 // ===== OpenAI wire shapes (response) =====
@@ -264,6 +265,7 @@ var g_asr_active = 0
 var g_asr_pending = 0
 let ASR_QUEUE_LIMIT = 32
 let ASR_WRITER_KEEPALIVE_MS = 3600000
+let LLM_WRITER_KEEPALIVE_MS = 3600000
 let DEFAULT_WRITER_KEEPALIVE_MS = 75000
 
 // /v1/embeddings response shapes.
@@ -308,6 +310,18 @@ def private bad_request(srv : WebSocketServer; var writer : HttpResponseWriter?;
     to_log(LOG_WARNING, "dasllama-server: 400 rejected: {msg}\n")
     respond(srv, writer, int(http_status.BAD_REQUEST), "application/json",
             error_body(msg, "invalid_request_error"))
+}
+
+def private reject_deferred_while_draining(
+                                           srv : WebSocketServer;
+                                           var writer : HttpResponseWriter?
+                                           ) : bool {
+    if (!g_shutdown_requested) {
+        return false
+    }
+    respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
+            error_body("the server is draining for shutdown — retry shortly", "server_error"))
+    return true
 }
 
 // Bytes of an INCOMPLETE trailing UTF-8 sequence (0 = the string ends on a character boundary).
@@ -709,6 +723,7 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
                 error_body("the server is at capacity ({g_sched.max_queue} requests queued) — retry shortly", "server_error"))
         return
     }
+    set_writer_keepalive_timeout(srv, writer, LLM_WRITER_KEEPALIVE_MS)
     to_log(LOG_INFO, "[req {rid}] {prefix}: prompt={np} tok, stream={streaming}, max_new={max_new}\n")
     var wire <- StreamWire(writer = writer, streaming = streaming, is_chat = is_chat,
                            id = cid, created = created,
@@ -837,6 +852,9 @@ def private next_user_start(msgs_v : JsonValue?; start : int) : int {
 }
 
 def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
+    if (reject_deferred_while_draining(srv, writer)) {
+        return
+    }
     var perr = ""
     var js = read_json(string(req.body), perr)
     if (js == null) {
@@ -955,6 +973,9 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
 }
 
 def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
+    if (reject_deferred_while_draining(srv, writer)) {
+        return
+    }
     var perr = ""
     var js = read_json(string(req.body), perr)
     if (js == null) {
@@ -1057,6 +1078,7 @@ def private flush_events(srv : WebSocketServer) {
         if (e.finish == "evicted") {
             release_writer(srv, w.writer)
         } elif (w.streaming) {
+            set_writer_keepalive_timeout(srv, w.writer, DEFAULT_WRITER_KEEPALIVE_MS)
             if (!empty(w.utf8_tail)) {
                 // generation ended mid-character (max-tokens cut): the held bytes can never
                 // complete, and emitting them would put invalid UTF-8 on the wire — drop loudly
@@ -1104,6 +1126,7 @@ def private flush_events(srv : WebSocketServer) {
                                              finish_reason = finish))
             out.usage = OaiUsage(prompt_tokens = e.n_prompt, completion_tokens = e.n_gen,
                                  total_tokens = e.n_prompt + e.n_gen)
+            set_writer_keepalive_timeout(srv, w.writer, DEFAULT_WRITER_KEEPALIVE_MS)
             respond(srv, w.writer, int(http_status.OK), "application/json", sprint_json(out, false))
             delete out
         } else {
@@ -1111,6 +1134,7 @@ def private flush_events(srv : WebSocketServer) {
             out.choices |> push(OaiComplChoice(index = 0, text = join(w.reply_parts, ""), finish_reason = e.finish))
             out.usage = OaiUsage(prompt_tokens = e.n_prompt, completion_tokens = e.n_gen,
                                  total_tokens = e.n_prompt + e.n_gen)
+            set_writer_keepalive_timeout(srv, w.writer, DEFAULT_WRITER_KEEPALIVE_MS)
             respond(srv, w.writer, int(http_status.OK), "application/json", sprint_json(out, false))
             delete out
         }
@@ -1270,6 +1294,9 @@ def private queue_transcription(
                                 var writer : HttpResponseWriter?;
                                 translate : bool
                                 ) {
+    if (reject_deferred_while_draining(srv, writer)) {
+        return
+    }
     if (!g_has_asr || g_asr_ready < g_asr_worker_count) {
         respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
                 error_body("ASR workers are not ready", "server_error"))
@@ -1401,14 +1428,24 @@ class OpenAiServer : HvWebServer {
             queue_transcription(server, req, writer, true)
         }
         POST("/v1/embeddings") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (g_shutdown_requested) {
+                return resp |> JSON(
+                    error_body("the server is draining for shutdown — retry shortly", "server_error"),
+                    http_status.SERVICE_UNAVAILABLE)
+            }
             return handle_embeddings(req, resp)
         }
         GET("/v1/stats") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_stats(resp)
         }
         POST("/shutdown") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
-            g_should_stop = true
-            return resp |> JSON("\{\"ok\":true}", http_status.OK)
+            if (!g_shutdown_requested) {
+                to_log(
+                    LOG_INFO,
+                    "dasllama-server: graceful shutdown requested; draining llm_active={n_active(g_sched)}, llm_queued={n_queued(g_sched)}, asr_pending={g_asr_pending}\n")
+            }
+            g_shutdown_requested = true
+            return resp |> JSON("\{\"ok\":true,\"draining\":true}", http_status.OK)
         }
         ANY("*") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_unknown(req, resp)
@@ -1416,7 +1453,8 @@ class OpenAiServer : HvWebServer {
     }
 }
 
-//! Run the server on the calling thread until ``request_stop`` (or ``POST /shutdown``). Sets up the
+//! Run the server on the calling thread until ``request_stop`` (or ``POST /shutdown``) requests a
+//! graceful drain. Sets up the
 //! job queue, then drives the serve loop: pump HTTP (handlers parse + render + submit), evict
 //! streams whose client disconnected, one scheduler step (continuous batching over every live
 //! stream), flush events to the writers.
@@ -1431,7 +1469,7 @@ class OpenAiServer : HvWebServer {
 def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
                team_dispatch : bool = true; asr_team_dispatch : bool = false; mtp : bool = false) {
-    g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once
+    g_shutdown_requested = false   // reset so a restart in the same context after /shutdown doesn't drain at once
     with_job_que() {
         setup_dasllama_jobque()
         set_jobque_team_mode(team_dispatch)
@@ -1466,7 +1504,7 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
             let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
             let spec_desc = spec ? ", mtp: on" : ""
             to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode}{spec_desc})\n")
-            while (!g_should_stop) {
+            while (true) {
                 server->tick()   // drains queued handlers: requests parse + render + submit here
                 drain_asr_events(server.server)
                 reap_disconnected(server.server)
@@ -1480,6 +1518,11 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
                 }
                 flush_events(server.server)
                 flush_tool_keepalives(server.server)
+                if (g_shutdown_requested && n_active(g_sched) == 0l && n_queued(g_sched) == 0l &&
+                    g_asr_pending == 0) {
+                    to_log(LOG_INFO, "dasllama-server: graceful shutdown drain complete\n")
+                    break
+                }
                 if (!busy) {
                     sleep(2u)
                 }

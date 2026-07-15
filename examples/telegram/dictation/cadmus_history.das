@@ -7,6 +7,7 @@ require daslib/sql_linq
 require daslib/linq_das
 require daslib/strings_boost
 require daslib/strings_convert
+require math
 
 let CADMUS_ROLE_USER = "user"
 let CADMUS_ROLE_ASSISTANT = "assistant"
@@ -520,13 +521,18 @@ def load_recent_cadmus_messages(path : string; chat_id : int64; count : int) : a
     return <- result
 }
 
-def private cadmus_fts_query(text : string; require_all : bool = false) : string {
+def private cadmus_fts_query(
+                             text : string;
+                             require_all : bool = false;
+                             prefix_terms : bool = false
+                             ) : string {
     let words <- split_by_chars(to_lower(text), " \t\r\n.,!?;:()[]<>/\\|@#$%^&*+=~")
     var terms : array<string>
     for (word in words) {
         let clean = strip(word)
         if (length(clean) >= 3 && length(terms) < 12) {
-            terms |> push("\"{replace(clean, "\"", "\"\"")}\"")
+            let suffix = prefix_terms ? "*" : ""
+            terms |> push("\"{replace(clean, "\"", "\"\"")}\"{suffix}")
         }
     }
     return terms |> join(require_all ? " AND " : " OR ")
@@ -565,6 +571,103 @@ def search_cadmus_messages(path : string; chat_id : int64; question : string; co
             if (!empty(rows)) {
                 result |> push(rows[0])
             }
+        }
+    }
+    return <- result
+}
+
+def private append_unique_cadmus_messages(
+                                          rows : array<CadmusMessage>;
+                                          count : int;
+                                          var result : array<CadmusMessage>&
+                                          ) {
+    for (row in rows) {
+        var known = false
+        for (existing in result) {
+            if (existing.ChatId == row.ChatId &&
+                existing.TelegramMessageId == row.TelegramMessageId) {
+                known = true
+                break
+            }
+        }
+        if (!known) {
+            result |> push(row)
+            if (length(result) >= count) {
+                return
+            }
+        }
+    }
+}
+
+def private search_cadmus_message_variant(
+                                          path : string;
+                                          chat_id : int64;
+                                          query : string;
+                                          sender_id, before_message_id : int64;
+                                          count : int
+                                          ) : array<CadmusMessage> {
+    var result : array<CadmusMessage>
+    let query_text = cadmus_fts_query(query, true, true)
+    if (empty(query_text) || count <= 0) {
+        return <- result
+    }
+    with_cadmus_database(path) $(db) {
+        let chat_key = "{chat_id}"
+        let candidate_count = clamp(count * 6, 24, 100)
+        let hits <- _sql(
+            db |> select_from(type<CadmusSearchRow>)
+               |> _where(_.ChatId == chat_key && _.Body |> text_match(query_text))
+               |> _order_by(_.Rank)
+               |> take(candidate_count))
+        for (hit in hits) {
+            var message_id = 0l
+            if (!parse_stored_int64(hit.TelegramMessageId, message_id)) {
+                continue
+            }
+            let rows <- %linq! from m : CadmusMessage in db
+                               where m.ChatId == chat_id && m.TelegramMessageId == message_id &&
+                                     m.Role == CADMUS_ROLE_USER && !m.Deleted &&
+                                     (sender_id == 0l || m.SenderId == sender_id) &&
+                                     (before_message_id == 0l ||
+                                      m.TelegramMessageId < before_message_id)
+                               select m %%
+            if (!empty(rows)) {
+                result |> push(rows[0])
+                if (length(result) >= count) {
+                    break
+                }
+            }
+        }
+    }
+    return <- result
+}
+
+def search_cadmus_message_variants(
+                                   path : string;
+                                   chat_id : int64;
+                                   queries : array<string>;
+                                   sender_id, before_message_id : int64;
+                                   count : int
+                                   ) : array<CadmusMessage> {
+    var result : array<CadmusMessage>
+    if (empty(queries) || count <= 0) {
+        return <- result
+    }
+    let per_query = max(1, (count + length(queries) - 1) / length(queries))
+    for (query in queries) {
+        let rows <- search_cadmus_message_variant(
+            path, chat_id, query, sender_id, before_message_id, per_query)
+        append_unique_cadmus_messages(rows, count, result)
+        if (length(result) >= count) {
+            return <- result
+        }
+    }
+    for (query in queries) {
+        let rows <- search_cadmus_message_variant(
+            path, chat_id, query, sender_id, before_message_id, count)
+        append_unique_cadmus_messages(rows, count, result)
+        if (length(result) >= count) {
+            break
         }
     }
     return <- result
@@ -763,13 +866,15 @@ def load_cadmus_messages_for_sender(
 
 def find_cadmus_sender(path : string; chat_id : int64; username : string) : int64 {
     var sender_id = 0l
-    let bare_username = to_lower(strip(trim_prefix(strip(username), "@")))
-    if (empty(bare_username)) {
+    let identity = to_lower(strip(trim_prefix(strip(username), "@")))
+    if (empty(identity)) {
         return 0l
     }
     with_cadmus_database(path) $(db) {
         let rows <- %linq! from m : CadmusMessage in db
-                           where m.ChatId == chat_id && m.SenderUsername |> to_lower == bare_username
+                           where m.ChatId == chat_id &&
+                                 (m.SenderUsername |> to_lower == identity ||
+                                  m.SenderName |> to_lower == identity)
                            orderby m.MessageDate descending
                            select m.SenderId %%
         if (!empty(rows)) {

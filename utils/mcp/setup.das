@@ -158,15 +158,29 @@ def ensure_sgconfig(root : string) {
 // stages these, and building just the `daslang` target skips it — so without this a fresh
 // worktree binary silently falls back to the interpreter (`-jit` fails: "can't load LLVM.dll").
 // Copy them from the source tree of the daslang running this setup (get_das_root()), which is a
-// JIT-capable build; skip when a file is already present or we're setting up that source tree.
+// JIT-capable build. When setup itself runs under the target worktree's binary, use DASLANG as a
+// fallback SDK binary: a worktree-local root cannot supply a backend file that it is missing.
 // Windows-only for now (the codegen dll name / linker differ on posix — staging there is TBD).
+def root_from_daslang_binary(binary : string) : string {
+    let executable_dir = dir_name(get_full_file_name(binary))
+    let leaf = base_name(executable_dir)
+    if (leaf == "Release" || leaf == "Debug" || leaf == "RelWithDebInfo" || leaf == "MinSizeRel") {
+        return dir_name(dir_name(executable_dir))
+    }
+    return dir_name(executable_dir)
+}
+
 def stage_jit_backend(root : string) {
     if (get_platform_name() != "windows") {
         return
     }
     let src_root = get_das_root()
-    if (get_full_file_name(src_root) == get_full_file_name(root)) {
-        return
+    var fallback_root = ""
+    if (has_env_variable("DASLANG")) {
+        let sdk_binary = get_env_variable("DASLANG")
+        if (fexist(sdk_binary)) {
+            fallback_root = root_from_daslang_binary(sdk_binary)
+        }
     }
     let jit_files = ["lib/LLVM.dll", "bin/lld-link.exe"]
     for (rel in jit_files) {
@@ -174,9 +188,12 @@ def stage_jit_backend(root : string) {
         if (fexist(dst)) {
             continue
         }
-        let src = path_join(src_root, rel)
-        if (!fexist(src)) {
-            print("WARNING: JIT backend file '{rel}' not found in source tree {src_root}; worktree -jit may be unavailable\n")
+        var src = path_join(src_root, rel)
+        if ((!fexist(src) || get_full_file_name(src) == get_full_file_name(dst)) && !empty(fallback_root)) {
+            src = path_join(fallback_root, rel)
+        }
+        if (!fexist(src) || get_full_file_name(src) == get_full_file_name(dst)) {
+            print("WARNING: JIT backend file '{rel}' has no external source (checked {src_root} and DASLANG); worktree -jit may be unavailable\n")
             continue
         }
         let dstdir = dir_name(dst)

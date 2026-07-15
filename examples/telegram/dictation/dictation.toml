@@ -37,8 +37,11 @@ max_tokens = 2048
 # LLM sampling temperature. 0 = greedy (most faithful to the transcript).
 temp = 0.0
 
+# Seconds to wait for speech recognition, including time queued behind bulk ASR imports.
+asr_timeout = 900
+
 # Seconds to wait for the LLM cleanup response (a long note at low tok/s needs headroom).
-llm_timeout = 300
+llm_timeout = 900
 
 # ffmpeg executable — on PATH, or an absolute path. Used to transcode OGG/Opus voice notes to WAV.
 ffmpeg = "ffmpeg"
@@ -97,11 +100,13 @@ Attribute statements when that matters. A little wit is welcome; forced jokes ar
 '''
 
 # Generation/tool limits. These do not delete or truncate on-disk history.
-assistant_max_tokens = 512
+assistant_max_tokens = 4096
 assistant_temp = 0.2
 recent_messages = 40
 # Maximum user-message matches returned by the current-chat FTS5 search tool.
 history_search_results = 12
+# Comma-separated languages used to generate independent strict FTS query variants.
+history_search_languages = "ru,en"
 
 # Public web search through Brave Search API. The API key is read only from
 # BRAVE_SEARCH_API_KEY; it is never stored in this file or sent to the LLM.

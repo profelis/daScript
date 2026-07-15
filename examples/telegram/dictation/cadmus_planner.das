@@ -8,22 +8,34 @@ require strings
 require daslib/strings_boost
 
 struct CadmusRetrievalPlan {
+    @rename = "action"
     Action : string
+    @optional
+    @rename = "query"
     Query : string
+    @optional
+    @rename = "queries"
+    Queries : array<string>
+    @optional
+    @rename = "sender"
+    Sender : string
+    @rename = "answer_language"
+    AnswerLanguage : string
+    @optional
+    @rename = "limit"
     Limit : int
+    @optional
+    @rename = "message_id"
     MessageId : int64
+    @optional
+    @rename = "before"
     Before : int = 5
+    @optional
+    @rename = "after"
     After : int = 5
+    @optional
+    @rename = "before_message_id"
     BeforeMessageId : int64
-}
-
-struct CadmusRetrievalArguments {
-    @optional query : string
-    @optional limit : int
-    @optional message_id : int64
-    @optional before : int
-    @optional after : int
-    @optional before_message_id : int64
 }
 
 def private cadmus_plan_json(response : string) : string {
@@ -40,6 +52,19 @@ def private is_cadmus_plan_action(action : string) : bool {
     return (action == "answer" || action == "search_messages" ||
             action == "message_timeline" || action == "get_message_context" ||
             action == "list_messages" || action == "search_web")
+}
+
+def private append_cadmus_query(var queries : array<string>&; value : string) {
+    let query = strip(value)
+    if (empty(query) || length(queries) >= 6) {
+        return
+    }
+    for (existing in queries) {
+        if (existing == query) {
+            return
+        }
+    }
+    queries |> push_clone(query)
 }
 
 def parse_cadmus_retrieval_plan(
@@ -64,17 +89,35 @@ def parse_cadmus_retrieval_plan(
         error = "unknown planner action '{action}'"
         return false
     }
-    plan = CadmusRetrievalPlan(
-        Action = action,
-        Query = strip(js?["query"] ?? ""),
-        Limit = js?["limit"] ?? 0,
-        MessageId = js?["message_id"] ?? 0l,
-        Before = js?["before"] ?? 5,
-        After = js?["after"] ?? 5,
-        BeforeMessageId = js?["before_message_id"] ?? 0l)
+    delete plan.Queries
+    plan.Action := action
+    plan.Query := strip(js?["query"] ?? "")
+    plan.Sender := strip(js?["sender"] ?? "")
+    plan.AnswerLanguage := to_lower(strip(js?["answer_language"] ?? ""))
+    plan.Limit = js?["limit"] ?? 0
+    plan.MessageId = js?["message_id"] ?? 0l
+    plan.Before = js?["before"] ?? 5
+    plan.After = js?["after"] ?? 5
+    plan.BeforeMessageId = js?["before_message_id"] ?? 0l
+    let queries_json = js?["queries"]
+    if (queries_json != null && queries_json.value is _array) {
+        for (item in queries_json.value as _array) {
+            if (item != null && item.value is _string) {
+                append_cadmus_query(plan.Queries, item.value as _string)
+            }
+        }
+    }
+    append_cadmus_query(plan.Queries, plan.Query)
+    if (empty(plan.Query) && !empty(plan.Queries)) {
+        plan.Query := plan.Queries[0]
+    }
     if ((action == "search_messages" || action == "message_timeline" || action == "search_web") &&
         empty(plan.Query)) {
         error = "planner action '{action}' requires a query"
+        return false
+    }
+    if (length(plan.AnswerLanguage) != 2) {
+        error = "planner requires a two-letter ISO answer_language"
         return false
     }
     if (action == "get_message_context" && plan.MessageId <= 0l) {
@@ -86,11 +129,5 @@ def parse_cadmus_retrieval_plan(
 }
 
 def cadmus_retrieval_arguments_json(plan : CadmusRetrievalPlan) : string {
-    return sprint_json(CadmusRetrievalArguments(
-        query = plan.Query,
-        limit = plan.Limit,
-        message_id = plan.MessageId,
-        before = plan.Before,
-        after = plan.After,
-        before_message_id = plan.BeforeMessageId), false)
+    return sprint_json(plan, false)
 }

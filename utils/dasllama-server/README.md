@@ -94,7 +94,7 @@ so the deployed config survives. Stop a running server first — Windows locks t
 | `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`) |
 | `POST` | `/v1/audio/translations` | Speech→English text (needs `--asr`) |
 | `GET`  | `/v1/stats` | Scheduler counters plus `asr_workers`, `asr_ready`, `asr_active`, and `asr_pending` |
-| `POST` | `/shutdown` | Graceful stop |
+| `POST` | `/shutdown` | Stop admitting new LLM/ASR work, drain accepted work, then exit |
 
 ### Chat
 
