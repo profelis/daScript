@@ -1192,7 +1192,9 @@ def private upload_region(src : void?; bytes : uint64) : MetalBuffer? {
 //! `s16` reads the plane as raw f16 bits (wscale_f16 models); the f32 -> f16 narrowing is exact
 //! for GGUF-q8_0-sourced weights (the loader widened the file's native f16 scales).
 def public metal_blob_region(dev : MetalDevice?; qsrc, ssrc : void?; rows, k : int64; s16 : bool) : MetalBuffer? {
-    let key = intptr(qsrc)
+    // the scale encoding is part of the identity: the same quant region blobbed under f32 vs raw
+    // f16 scales must not share a cache slot (the top bit is never set in a user-space address)
+    let key = intptr(qsrc) | (s16 ? 0x8000000000000000ul : 0ul)
     if (key_exists(g_blob_regions, key)) {
         return g_blob_regions[key]
     }
