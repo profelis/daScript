@@ -67,7 +67,7 @@
 
   /* diverging ratio bars (LLM) */
   .dl-bars { display: flex; flex-direction: column; gap: 7px; }
-  .dl-bar { display: grid; grid-template-columns: 150px 1fr 58px; align-items: center; gap: 14px; }
+  .dl-bar { display: grid; grid-template-columns: 172px 1fr 58px; align-items: center; gap: 14px; }
   .dl-bar__label { font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim); text-align: right; }
   .dl-bar__track { position: relative; height: 20px; background: var(--bg-2); border: 1px solid var(--rule); border-radius: 4px; }
   .dl-bar__center { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 1px; background: var(--fg-faint); opacity: 0.7; }
@@ -80,7 +80,7 @@
   .dl-bar--tie .dl-bar__fill { background: var(--fg-faint); }
   .dl-bar--tie .dl-bar__val { color: var(--fg-dim); }
   .dl-caption { font-family: var(--font-mono); font-size: 12px; color: var(--fg-dim); margin-top: 18px; }
-  .dl-axis { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 10px; color: var(--fg-faint); margin: 10px 0 0; padding: 0 58px 0 150px; }
+  .dl-axis { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 10px; color: var(--fg-faint); margin: 10px 0 0; padding: 0 58px 0 172px; }
 
   .dl-win { color: var(--amber); }
   .dl-loss { color: var(--fg-dim); }
@@ -208,7 +208,7 @@
                 </div>
                 <div class="forge-stats">
                     <div class="forge-stat"><div class="forge-stat__n" id="stat-prefill-n">up to 1.74×</div><div class="forge-stat__l" id="stat-prefill-l">LLM prefill vs llama.cpp · gpt-oss-20b, Apple M1 Max</div></div>
-                    <div class="forge-stat"><div class="forge-stat__n" id="stat-wins-n">40 / 42</div><div class="forge-stat__l" id="stat-wins-l">runs das ≥ llama.cpp · 21 models × both phases, 3990X</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n" id="stat-wins-n">54 / 56</div><div class="forge-stat__l" id="stat-wins-l">runs das ≥ llama.cpp · 28 models × both phases, 3990X</div></div>
                     <div class="forge-stat"><div class="forge-stat__n" id="stat-audio-n">~6×</div><div class="forge-stat__l">Qwen3-Omni audio vs mtmd, CPU-only (M1)</div></div>
                 </div>
             </div>
@@ -260,8 +260,8 @@ def main() {
             <div class="dl-toggles">
                 <span class="dl-seg__caption">machine</span>
                 <div class="dl-seg">
-                    <button class="js-llm-box is-active" data-box="m1" type="button">Apple M1 Max</button>
-                    <button class="js-llm-box" data-box="zen2" type="button">Threadripper 3990X</button>
+                    <button class="js-llm-box" data-box="m1" type="button">Apple M1 Max</button>
+                    <button class="js-llm-box is-active" data-box="zen2" type="button">Threadripper 3990X</button>
                 </div>
                 <span class="dl-seg__caption">phase</span>
                 <div class="dl-seg">
@@ -300,8 +300,8 @@ def main() {
             <div class="dl-toggles">
                 <span class="dl-seg__caption">machine</span>
                 <div class="dl-seg">
-                    <button class="js-asr-box is-active" data-box="m1" type="button">Apple M1 Max</button>
-                    <button class="js-asr-box" data-box="zen2" type="button">Threadripper 3990X</button>
+                    <button class="js-asr-box" data-box="m1" type="button">Apple M1 Max</button>
+                    <button class="js-asr-box is-active" data-box="zen2" type="button">Threadripper 3990X</button>
                 </div>
             </div>
 
