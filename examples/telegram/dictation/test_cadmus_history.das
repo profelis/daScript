@@ -37,9 +37,9 @@ def test_history_migrations_linq_and_fts(t : T?) {
     remove(path)
     ensure_cadmus_database(path)
 
-    t |> run("starts at migration five") @(t : T?) {
+    t |> run("starts at migration six") @(t : T?) {
         with_sqlite(path) $(db) {
-            t |> equal(db |> current_schema_version(), 5)
+            t |> equal(db |> current_schema_version(), 6)
         }
     }
 
@@ -263,6 +263,44 @@ def test_history_migrations_linq_and_fts(t : T?) {
     t |> run("Telegram offset persists") @(t : T?) {
         save_cadmus_offset(path, 42l)
         t |> equal(load_cadmus_offset(path), 42l)
+    }
+
+    t |> run("live audio queue claims, retries, and recovers durably") @(t : T?) {
+        enqueue_cadmus_live_audio(path, CadmusLiveAudio(
+            Id = 0, ChatId = 10l, TelegramMessageId = 800l,
+            MessageJson = "\{\"message_id\":800}", Status = "pending", Attempts = 0,
+            LastError = "", EnqueuedAt = 100l, UpdatedAt = 100l, NextAttemptAt = 0l))
+        enqueue_cadmus_live_audio(path, CadmusLiveAudio(
+            Id = 0, ChatId = 10l, TelegramMessageId = 800l,
+            MessageJson = "\{\"message_id\":800,\"caption\":\"new\"}", Status = "pending", Attempts = 0,
+            LastError = "", EnqueuedAt = 101l, UpdatedAt = 101l, NextAttemptAt = 0l))
+        t |> success(has_ready_cadmus_live_audio(path, 1000l))
+        let first <- claim_cadmus_live_audio(path, 1000l)
+        t |> equal(length(first), 1)
+        if (length(first) == 1) {
+            t |> equal(first[0].MessageJson, "\{\"message_id\":800,\"caption\":\"new\"}")
+            t |> equal(first[0].Attempts, 1)
+            t |> equal(first[0].Status, "processing")
+            retry_cadmus_live_audio(path, first[0], "server down", 2000l, 2600l)
+        }
+        t |> success(!has_ready_cadmus_live_audio(path, 2599l))
+        t |> success(has_ready_cadmus_live_audio(path, 2600l))
+        let second <- claim_cadmus_live_audio(path, 2600l)
+        t |> equal(length(second), 1)
+        if (length(second) == 1) {
+            t |> equal(second[0].Attempts, 2)
+            finish_cadmus_live_audio(path, second[0], 2700l)
+        }
+        t |> success(!has_ready_cadmus_live_audio(path, 9999l))
+
+        enqueue_cadmus_live_audio(path, CadmusLiveAudio(
+            Id = 0, ChatId = 10l, TelegramMessageId = 801l,
+            MessageJson = "\{\"message_id\":801}", Status = "pending", Attempts = 0,
+            LastError = "", EnqueuedAt = 200l, UpdatedAt = 200l, NextAttemptAt = 0l))
+        let interrupted <- claim_cadmus_live_audio(path, 3000l)
+        t |> equal(length(interrupted), 1)
+        recover_cadmus_live_audio(path, 3100l)
+        t |> success(has_ready_cadmus_live_audio(path, 3100l))
     }
 
     remove(path)

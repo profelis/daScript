@@ -75,6 +75,22 @@ struct CadmusImportMedia {
     PipelineVersion : int
 }
 
+[sql_table(name = "cadmus_live_audio"),
+ sql_index(fields = ("ChatId", "TelegramMessageId"), unique = true),
+ sql_index(fields = ("Status", "NextAttemptAt", "EnqueuedAt"))]
+struct CadmusLiveAudio {
+    @sql_primary_key Id : int
+    ChatId : int64
+    TelegramMessageId : int64
+    MessageJson : string
+    Status : string
+    Attempts : int
+    LastError : string
+    EnqueuedAt : int64
+    UpdatedAt : int64
+    NextAttemptAt : int64
+}
+
 [sql_fts5(name = "cadmus_message_fts")]
 struct CadmusSearchRow {
     ChatId : string
@@ -185,6 +201,28 @@ def cadmus_migration_005(db : SqlRunner) {
         "ON cadmus_assistant_sources(ChatId, AssistantMessageId)")
 }
 
+// Live Telegram audio is acknowledged only after this durable record exists. The serialized
+// message retains the file_id and reply/sender metadata needed to finish after a restart.
+[sql_migration(version = 6, description = "add durable live Telegram audio queue")]
+def cadmus_migration_006(db : SqlRunner) {
+    db |> exec(
+        "CREATE TABLE cadmus_live_audio (" +
+        "Id INTEGER PRIMARY KEY AUTOINCREMENT," +
+        "ChatId INTEGER NOT NULL," +
+        "TelegramMessageId INTEGER NOT NULL," +
+        "MessageJson TEXT NOT NULL," +
+        "Status TEXT NOT NULL," +
+        "Attempts INTEGER NOT NULL," +
+        "LastError TEXT NOT NULL," +
+        "EnqueuedAt INTEGER NOT NULL," +
+        "UpdatedAt INTEGER NOT NULL," +
+        "NextAttemptAt INTEGER NOT NULL," +
+        "UNIQUE(ChatId, TelegramMessageId))")
+    db |> exec(
+        "CREATE INDEX idx_cadmus_live_audio_ready " +
+        "ON cadmus_live_audio(Status, NextAttemptAt, EnqueuedAt)")
+}
+
 def with_cadmus_database(path : string; blk : block<(db : SqlRunner) : void>) {
     with_latest_sqlite(path) $(db) {
         db |> set_pragma("busy_timeout", 120000l)
@@ -199,6 +237,7 @@ def ensure_cadmus_database(path : string) {
         db |> check_schema(type<CadmusTranscriptDelivery>)
         db |> check_schema(type<CadmusAssistantSource>)
         db |> check_schema(type<CadmusImportMedia>)
+        db |> check_schema(type<CadmusLiveAudio>)
     }
 }
 
@@ -446,6 +485,106 @@ def fail_cadmus_import_transcription(
             type<CadmusImportMedia>,
             _.ChatId == item.ChatId && _.TelegramMessageId == item.TelegramMessageId,
             (Status = "failed", Attempts = item.Attempts + 1, LastError = error))
+    }
+}
+
+def enqueue_cadmus_live_audio(path : string; item : CadmusLiveAudio) {
+    with_cadmus_database(path) $(db) {
+        db |> with_transaction(SqliteTxnMode.Immediate) {
+            let rows <- %linq! from old : CadmusLiveAudio in db
+                               where old.ChatId == item.ChatId &&
+                                     old.TelegramMessageId == item.TelegramMessageId
+                               select old %%
+            if (empty(rows)) {
+                db |> insert(item)
+            } elif (rows[0].Status != "done") {
+                db |> _sql_update(
+                    type<CadmusLiveAudio>,
+                    _.Id == rows[0].Id,
+                    (MessageJson = item.MessageJson,
+                     Status = "pending",
+                     LastError = "",
+                     UpdatedAt = item.UpdatedAt,
+                     NextAttemptAt = 0l))
+            }
+        }
+    }
+}
+
+def has_ready_cadmus_live_audio(path : string; now : int64) : bool {
+    var ready = false
+    with_cadmus_database(path) $(db) {
+        let rows <- _sql(
+            db |> select_from(type<CadmusLiveAudio>)
+               |> _where(
+                    _.Status == "pending" ||
+                    (_.Status == "failed" && _.NextAttemptAt <= now))
+               |> take(1))
+        ready = !empty(rows)
+    }
+    return ready
+}
+
+def claim_cadmus_live_audio(path : string; now : int64) : array<CadmusLiveAudio> {
+    var result : array<CadmusLiveAudio>
+    with_cadmus_database(path) $(db) {
+        db |> with_transaction(SqliteTxnMode.Immediate) {
+            result <- _sql(
+                db |> select_from(type<CadmusLiveAudio>)
+                   |> _where(
+                        _.Status == "pending" ||
+                        (_.Status == "failed" && _.NextAttemptAt <= now))
+                   |> _order_by((_.EnqueuedAt, _.Id))
+                   |> take(1))
+            if (!empty(result)) {
+                result[0].Status = "processing"
+                result[0].Attempts++
+                result[0].UpdatedAt = now
+                let claimed_id = result[0].Id
+                let claimed_status = result[0].Status
+                let claimed_attempts = result[0].Attempts
+                db |> _sql_update(
+                    type<CadmusLiveAudio>,
+                    _.Id == claimed_id,
+                    (Status = claimed_status,
+                     Attempts = claimed_attempts,
+                     UpdatedAt = now))
+            }
+        }
+    }
+    return <- result
+}
+
+def retry_cadmus_live_audio(
+                            path : string;
+                            item : CadmusLiveAudio;
+                            error : string;
+                            now, next_attempt_at : int64
+                            ) {
+    with_cadmus_database(path) $(db) {
+        db |> _sql_update(
+            type<CadmusLiveAudio>,
+            _.Id == item.Id,
+            (Status = "failed", LastError = error,
+             UpdatedAt = now, NextAttemptAt = next_attempt_at))
+    }
+}
+
+def finish_cadmus_live_audio(path : string; item : CadmusLiveAudio; now : int64) {
+    with_cadmus_database(path) $(db) {
+        db |> _sql_update(
+            type<CadmusLiveAudio>,
+            _.Id == item.Id,
+            (Status = "done", LastError = "", UpdatedAt = now, NextAttemptAt = 0l))
+    }
+}
+
+def recover_cadmus_live_audio(path : string; now : int64) {
+    with_cadmus_database(path) $(db) {
+        db |> _sql_update(
+            type<CadmusLiveAudio>,
+            _.Status == "processing",
+            (Status = "pending", UpdatedAt = now, NextAttemptAt = 0l))
     }
 }
 

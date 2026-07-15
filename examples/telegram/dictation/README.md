@@ -13,6 +13,10 @@ For each voice message the bot downloads the audio, converts it to 16 kHz mono W
 calls `/v1/audio/transcriptions`, then applies the editable `dictation_prompt` through
 `/v1/chat/completions`. The cleaned transcript is recorded as the user's message. The bot's
 transcript-delivery reply is deliberately not recorded as an assistant turn.
+Before acknowledging a live Telegram audio update, the bot serializes it into a durable SQLite
+queue. It then processes that queue one message at a time, with capped exponential retry backoff;
+an interrupted job returns to pending when the bot restarts. This queue is independent of the
+Telegram Desktop export backlog and the server's transient ASR request queue.
 
 Every inbound text, caption, voice, and audio message visible to the bot is retained in local SQLite.
 Real Cadmus answers are retained in the same history. Conversational answers are disabled by default;
@@ -33,8 +37,9 @@ there?" automatically loads five messages before and after those sources before 
 When `BRAVE_SEARCH_API_KEY` is set, Cadmus also has a compact Brave web-search tool for current or
 external facts, including details needed to supplement freshly retrieved chat context. Web excerpts
 are marked as untrusted, and source links are appended to the answer.
-Failures in transcription, cleanup, summaries, or conversational generation are reported in the
-originating Telegram chat with a `⚠` marker.
+Permanent audio-format failures and summary/conversation failures are reported in the originating
+Telegram chat with a `⚠` marker. Transient live-audio download or inference failures stay in the
+durable queue, are logged under `dictation.queue`, and retry without spamming the chat.
 
 ## Requirements
 
@@ -58,7 +63,7 @@ development.
 The database is created automatically. Migration 1 creates message/state storage, migration 2 adds
 the FTS5 index, migration 3 records outgoing transcript-delivery IDs, migration 4 adds resumable
 Telegram-export media checkpoints, and migration 5 records the database sources behind Cadmus
-answers. Telegram update offsets are persisted, and
+answers. Migration 6 adds the durable live-audio queue. Telegram update offsets are persisted, and
 `(chat_id, message_id)` makes replayed updates and edits idempotent. History is retained indefinitely.
 
 Before sending an answer, Cadmus validates every model-written HTTP(S) link against exact URLs
@@ -153,9 +158,10 @@ bin/daslang examples/telegram/dictation/import_history.das -- \
   --apply --transcribe --server http://127.0.0.1:8080
 ```
 
-Raw ASR runs one file at a time, smallest first. It stores the result in both `Content` and
+Raw ASR runs two concurrent requests by default, smallest files first. It stores the result in both `Content` and
 `RawTranscript`, updates FTS immediately, and records `pending`, `done`, or `failed` durably. Use
-`--retry-failed` to retry failures and `--max-audio N` for a bounded batch. Re-run the same command as
+`--workers N` to match the server's ASR worker count, `--retry-failed` to retry failures, and
+`--max-audio N` for a bounded batch. Re-run the same command as
 Telegram Desktop produces more pages; use `--include-last-page` only after the export has finished.
 
 ## Release

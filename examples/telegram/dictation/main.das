@@ -1384,7 +1384,7 @@ def private send_summary(msg : message; command_text : string) {
 // Download → transcode → server transcribe → server cleanup → reply. Every heavy allocation
 // (download bytes, JSON trees) is a local here and is freed as soon as it's done; anything not
 // deleted on an error path is out of scope on return and reclaimed by main's heap_collect.
-def private process_audio_message(msg : message) : string {
+def private process_audio_message(msg : message; var retry_error : string&) : string {
     var kind = ""
     let file_id = audio_of(msg, kind)
     if (empty(file_id)) {
@@ -1397,14 +1397,14 @@ def private process_audio_message(msg : message) : string {
     // resolve + download the file
     let finfo <- telegram_getFile(get_file(file_id = file_id))
     if (!empty(telegram_get_last_error())) {
-        logger_error("dictation.msg", "getFile failed: {telegram_get_last_error()}")
-        report_error(msg, "Transcription failed: Telegram could not fetch the audio.")
+        retry_error = "Telegram getFile failed: {telegram_get_last_error()}"
+        logger_error("dictation.msg", retry_error)
         return ""
     }
     var bytes <- telegram_download(finfo)
     if (empty(bytes)) {
-        logger_error("dictation.msg", "download failed: {telegram_get_last_error()}")
-        report_error(msg, "Transcription failed: Telegram could not download the audio.")
+        retry_error = "Telegram download failed: {telegram_get_last_error()}"
+        logger_error("dictation.msg", retry_error)
         return ""
     }
 
@@ -1447,8 +1447,8 @@ def private process_audio_message(msg : message) : string {
     let tok = server_transcribe(wav, transcript, lang, terr)
     remove(wav)
     if (!tok) {
-        logger_error("dictation.msg", "transcription failed: {terr}")
-        report_error(msg, "Transcription failed: the speech model is unavailable.")
+        retry_error = "transcription failed: {terr}"
+        logger_error("dictation.msg", retry_error)
         return ""
     }
     // transcript in the full log, linked to its archived audio file (empty audio if archiving is off)
@@ -1467,8 +1467,8 @@ def private process_audio_message(msg : message) : string {
     var reply = ""
     var cerr = ""
     if (!server_cleanup(transcript, lang, reply, cerr)) {
-        logger_error("dictation.msg", "cleanup failed: {cerr}")
-        report_error(msg, "Transcript cleanup failed. Raw transcript:\n\n{transcript}")
+        retry_error = "cleanup failed: {cerr}"
+        logger_error("dictation.msg", retry_error)
         return ""
     }
     logger_info("dictation.msg", "reply: {reply}")
@@ -1488,6 +1488,68 @@ def private process_audio_message(msg : message) : string {
     return reply
 }
 
+def private enqueue_audio_message(msg : message) {
+    let now = int64(get_clock())
+    enqueue_cadmus_live_audio(g_db_path, CadmusLiveAudio(
+        Id = 0,
+        ChatId = msg.chat.id,
+        TelegramMessageId = msg.message_id,
+        MessageJson = sprint_json(msg, false),
+        Status = "pending",
+        Attempts = 0,
+        LastError = "",
+        EnqueuedAt = now,
+        UpdatedAt = now,
+        NextAttemptAt = 0l))
+    logger_info("dictation.queue", "queued audio message {msg.message_id} in chat {msg.chat.id}")
+}
+
+def private live_audio_retry_delay(attempts : int) : int64 {
+    var delay = 15l
+    for (_ in range(clamp(attempts - 1, 0, 6))) {
+        delay *= 2l
+    }
+    return min(delay, 900l)
+}
+
+def private process_next_audio_message() : bool {
+    let now = int64(get_clock())
+    let jobs <- claim_cadmus_live_audio(g_db_path, now)
+    if (empty(jobs)) {
+        return false
+    }
+    let job = jobs[0]
+    var msg : message
+    if (!sscan_json(job.MessageJson, msg)) {
+        let error = "could not restore queued Telegram message JSON"
+        retry_cadmus_live_audio(
+            g_db_path, job, error, now, now + live_audio_retry_delay(job.Attempts))
+        logger_error("dictation.queue", "message {job.TelegramMessageId}: {error}")
+        return true
+    }
+
+    var retry_error = ""
+    let cleaned = process_audio_message(msg, retry_error)
+    if (!empty(retry_error)) {
+        let failed_at = int64(get_clock())
+        let next_attempt = failed_at + live_audio_retry_delay(job.Attempts)
+        retry_cadmus_live_audio(g_db_path, job, retry_error, failed_at, next_attempt)
+        logger_warning(
+            "dictation.queue",
+            "message {job.TelegramMessageId} attempt {job.Attempts} failed; retry after {next_attempt}: {retry_error}")
+        return true
+    }
+
+    finish_cadmus_live_audio(g_db_path, job, int64(get_clock()))
+    let transcript_reply = is_reply_to_transcript(msg)
+    if (!empty(cleaned) && should_cadmus_reply(
+            g_cfg.reply_when_mentioned, false, false, transcript_reply,
+            is_directly_addressed(msg, cleaned))) {
+        answer_from_history(msg, cleaned)
+    }
+    return true
+}
+
 def process_message(msg : message; is_edit : bool = false) {
     if (msg._from != null && msg._from.id == g_bot_id) {
         return
@@ -1502,13 +1564,7 @@ def process_message(msg : message; is_edit : bool = false) {
                 g_db_path, msg.chat.id, msg.message_id, strip(msg.caption), msg.edit_date)
             return
         }
-        let cleaned = process_audio_message(msg)
-        let transcript_reply = is_reply_to_transcript(msg)
-        if (!empty(cleaned) && should_cadmus_reply(
-                g_cfg.reply_when_mentioned, false, is_edit, transcript_reply,
-                is_directly_addressed(msg, cleaned))) {
-            answer_from_history(msg, cleaned)
-        }
+        enqueue_audio_message(msg)
         return
     }
     let content = !empty(strip(msg.text)) ? strip(msg.text) : strip(msg.caption)
@@ -1535,8 +1591,8 @@ def process_message(msg : message; is_edit : bool = false) {
 }
 
 // One long-poll round: fetch updates, process each message. offset is threaded back so we ack them.
-def poll_once(var offset : int64&) {
-    let updates <- telegram_getUpdates(get_updates(offset = offset, timeout = int64(g_cfg.poll_timeout), limit = 100l))
+def poll_once(var offset : int64&; timeout : int) {
+    let updates <- telegram_getUpdates(get_updates(offset = offset, timeout = int64(timeout), limit = 100l))
     let err = telegram_get_last_error()
     if (!empty(err)) {
         logger_error("dictation", "getUpdates failed: {err}")
@@ -1688,6 +1744,7 @@ def init(var out_rc : int&) : bool {
     }
     g_bot_id = me.id
     g_bot_username := me.username
+    recover_cadmus_live_audio(g_db_path, int64(get_clock()))
     logger_info("dictation", "bot started (server={g_cfg.server}, llm={llm_id}, asr=yes, name={g_cfg.assistant_name}, telegram=@{g_bot_username}, database={g_db_path})")
     logger_flush()
     return true
@@ -1702,7 +1759,9 @@ def main : int {
     // The loop holds NO collectable locals — only `offset` (an int) — so heap_collect is safe.
     var offset = load_cadmus_offset(g_db_path)
     while (true) {
-        poll_once(offset)
+        let has_ready_audio = has_ready_cadmus_live_audio(g_db_path, int64(get_clock()))
+        poll_once(offset, has_ready_audio ? 0 : g_cfg.poll_timeout)
+        process_next_audio_message()
         unsafe(heap_collect(true, true))   // reclaim this round's string + object garbage; globals survive
     }
     return 0
