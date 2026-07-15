@@ -48,6 +48,16 @@ struct CadmusTranscriptDelivery {
     SourceMessageId : int64
 }
 
+[sql_table(name = "cadmus_assistant_sources"),
+ sql_index(fields = ("ChatId", "AssistantMessageId", "SourceMessageId"), unique = true),
+ sql_index(fields = ("ChatId", "AssistantMessageId"))]
+struct CadmusAssistantSource {
+    @sql_primary_key Id : int
+    ChatId : int64
+    AssistantMessageId : int64
+    SourceMessageId : int64
+}
+
 [sql_table(name = "cadmus_import_media"),
  sql_index(fields = ("ChatId", "TelegramMessageId"), unique = true),
  sql_index(fields = ("Status", "ChatId", "TelegramMessageId"))]
@@ -158,6 +168,22 @@ def cadmus_migration_004(db : SqlRunner) {
         "length(trim(Content || Caption || RawTranscript)) > 0")
 }
 
+// Grounded answers retain their database evidence independently of rendered citations. Follow-up
+// questions can therefore retrieve the same anchors and expand them into surrounding conversation.
+[sql_migration(version = 5, description = "track Cadmus answer source messages")]
+def cadmus_migration_005(db : SqlRunner) {
+    db |> exec(
+        "CREATE TABLE cadmus_assistant_sources (" +
+        "Id INTEGER PRIMARY KEY AUTOINCREMENT," +
+        "ChatId INTEGER NOT NULL," +
+        "AssistantMessageId INTEGER NOT NULL," +
+        "SourceMessageId INTEGER NOT NULL," +
+        "UNIQUE(ChatId, AssistantMessageId, SourceMessageId))")
+    db |> exec(
+        "CREATE INDEX idx_cadmus_assistant_sources_answer " +
+        "ON cadmus_assistant_sources(ChatId, AssistantMessageId)")
+}
+
 def with_cadmus_database(path : string; blk : block<(db : SqlRunner) : void>) {
     with_latest_sqlite(path) $(db) {
         db |> set_pragma("busy_timeout", 120000l)
@@ -170,6 +196,7 @@ def ensure_cadmus_database(path : string) {
         db |> check_schema(type<CadmusMessage>)
         db |> check_schema(type<CadmusState>)
         db |> check_schema(type<CadmusTranscriptDelivery>)
+        db |> check_schema(type<CadmusAssistantSource>)
         db |> check_schema(type<CadmusImportMedia>)
     }
 }
@@ -218,6 +245,62 @@ def is_cadmus_assistant_message(path : string; chat_id, message_id : int64) : bo
         found = !empty(rows)
     }
     return found
+}
+
+def remember_cadmus_assistant_sources(
+                                      path : string;
+                                      chat_id, assistant_message_id : int64;
+                                      sources : array<CadmusMessage>
+                                      ) {
+    if (assistant_message_id == 0l || empty(sources)) {
+        return
+    }
+    with_cadmus_database(path) $(db) {
+        db |> with_transaction(SqliteTxnMode.Immediate) {
+            for (source in sources) {
+                if (source.ChatId != chat_id || source.TelegramMessageId == 0l) {
+                    continue
+                }
+                let existing <- %linq! from item : CadmusAssistantSource in db
+                                       where item.ChatId == chat_id &&
+                                             item.AssistantMessageId == assistant_message_id &&
+                                             item.SourceMessageId == source.TelegramMessageId
+                                       select item.Id %%
+                if (empty(existing)) {
+                    db |> insert(CadmusAssistantSource(
+                        Id = 0,
+                        ChatId = chat_id,
+                        AssistantMessageId = assistant_message_id,
+                        SourceMessageId = source.TelegramMessageId))
+                }
+            }
+        }
+    }
+}
+
+def load_cadmus_assistant_sources(
+                                  path : string;
+                                  chat_id, assistant_message_id : int64
+                                  ) : array<CadmusMessage> {
+    var result : array<CadmusMessage>
+    if (assistant_message_id == 0l) {
+        return <- result
+    }
+    var source_ids : array<int64>
+    with_cadmus_database(path) $(db) {
+        source_ids <- %linq! from item : CadmusAssistantSource in db
+                              where item.ChatId == chat_id &&
+                                    item.AssistantMessageId == assistant_message_id
+                              select item.SourceMessageId %%
+    }
+    for (source_id in source_ids) {
+        let rows <- load_cadmus_message(path, chat_id, source_id)
+        if (!empty(rows)) {
+            result |> push(rows[0])
+        }
+    }
+    delete source_ids
+    return <- result
 }
 
 // FTS5 v1 has typed INSERT + SELECT but no typed UPDATE/DELETE. Keep that narrow
@@ -437,7 +520,7 @@ def load_recent_cadmus_messages(path : string; chat_id : int64; count : int) : a
     return <- result
 }
 
-def private cadmus_fts_query(text : string) : string {
+def private cadmus_fts_query(text : string; require_all : bool = false) : string {
     let words <- split_by_chars(to_lower(text), " \t\r\n.,!?;:()[]<>/\\|@#$%^&*+=~")
     var terms : array<string>
     for (word in words) {
@@ -446,7 +529,7 @@ def private cadmus_fts_query(text : string) : string {
             terms |> push("\"{replace(clean, "\"", "\"\"")}\"")
         }
     }
-    return terms |> join(" OR ")
+    return terms |> join(require_all ? " AND " : " OR ")
 }
 
 def private parse_stored_int64(value : string; var result : int64&) : bool {
@@ -487,9 +570,32 @@ def search_cadmus_messages(path : string; chat_id : int64; question : string; co
     return <- result
 }
 
+def search_cadmus_messages_chronological(
+                                         path : string;
+                                         chat_id : int64;
+                                         question : string;
+                                         count : int
+                                         ) : array<CadmusMessage> {
+    var result : array<CadmusMessage>
+    let query_text = cadmus_fts_query(question, true)
+    if (empty(query_text)) {
+        return <- result
+    }
+    with_cadmus_database(path) $(db) {
+        result <- db |> query(
+            "SELECT m.* FROM cadmus_message_fts f JOIN cadmus_messages m " +
+            "ON m.ChatId = CAST(f.ChatId AS INTEGER) " +
+            "AND m.TelegramMessageId = CAST(f.TelegramMessageId AS INTEGER) " +
+            "WHERE f.ChatId = ? AND f.Body MATCH ? AND m.Deleted = 0 " +
+            "ORDER BY m.MessageDate ASC, m.TelegramMessageId ASC LIMIT ?",
+            type<CadmusMessage>, "{chat_id}", query_text, count)
+    }
+    return <- result
+}
+
 def cadmus_mention_stats(path : string; chat_id : int64; question : string) : CadmusMentionStats {
     var result = CadmusMentionStats()
-    let query_text = cadmus_fts_query(question)
+    let query_text = cadmus_fts_query(question, true)
     if (empty(query_text)) {
         return result
     }
@@ -690,4 +796,49 @@ def cadmus_message_link(chat_id, message_id : int64; chat_username : string = ""
         return "https://t.me/c/{slice(chat_key, 4)}/{message_id}"
     }
     return ""
+}
+
+def private has_cadmus_source_message(
+                                      source : CadmusMessage;
+                                      sources : array<CadmusMessage>
+                                      ) : bool {
+    for (known in sources) {
+        if (known.ChatId == source.ChatId && known.TelegramMessageId == source.TelegramMessageId) {
+            return true
+        }
+    }
+    return false
+}
+
+def append_cadmus_sources(
+                          reply : string;
+                          sources : array<CadmusMessage>;
+                          chat_username : string = "";
+                          max_sources : int = 5
+                          ) : string {
+    var emitted : array<CadmusMessage>
+    for (source in sources) {
+        let link = cadmus_message_link(source.ChatId, source.TelegramMessageId, chat_username)
+        if (length(emitted) >= max_sources || empty(link) || reply |> contains(link) ||
+            has_cadmus_source_message(source, emitted)) {
+            continue
+        }
+        emitted |> push(source)
+    }
+    if (empty(emitted)) {
+        delete emitted
+        return reply
+    }
+    let result = build_string() $(var writer) {
+        writer |> write(reply)
+        writer |> write("\n\nChat sources:\n")
+        for (source in emitted) {
+            let link = cadmus_message_link(source.ChatId, source.TelegramMessageId, chat_username)
+            let stamp = format_time(unsafe(reinterpret<clock>(source.MessageDate)), "%Y-%m-%d %H:%M")
+            let who = empty(source.SenderName) ? source.Role : source.SenderName
+            writer |> write("- [{stamp}] {who}: {link}\n")
+        }
+    }
+    delete emitted
+    return result
 }

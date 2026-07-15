@@ -71,6 +71,28 @@ def should_cadmus_reply(
     return replies_enabled && is_addressed
 }
 
+def requires_cadmus_history_tools(text : string) : bool {
+    let lower = to_lower(strip(text))
+    return (lower |> contains("in this chat") || lower |> contains("in the chat") ||
+            lower |> contains("chat history") || lower |> contains("who first") ||
+            lower |> contains("who last") || lower |> contains("when did we") ||
+            lower |> contains("в чате") || lower |> contains("из чата") ||
+            lower |> contains("переписк") || lower |> contains("кто первый") ||
+            lower |> contains("кто последний") || lower |> contains("когда мы") ||
+            lower |> contains("упомянул") || lower |> contains("упоминал"))
+}
+
+def is_cadmus_source_followup(text : string) : bool {
+    let lower = to_lower(strip(text))
+    return (lower |> contains("there") || lower |> contains("that message") ||
+            lower |> contains("that discussion") || lower |> contains("around it") ||
+            lower |> contains("what were we discussing") || lower |> contains("what was discussed") ||
+            lower |> contains("the context") || lower |> contains("там") ||
+            lower |> contains("в том сообщении") || lower |> contains("вокруг этого") ||
+            lower |> contains("что мы обсуждали") || lower |> contains("что там обсуждали") ||
+            lower |> contains("контекст"))
+}
+
 def quote_cadmus_history(text : string) : string {
     let json = sprint_json(text, false)
     return replace_multiple(json, [

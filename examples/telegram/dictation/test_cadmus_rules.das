@@ -44,6 +44,21 @@ def test_cadmus_routing_and_dates(t : T?) {
         t |> equal(should_cadmus_reply(false, true, false, false, false), true)
     }
 
+    t |> run("explicit history questions require fresh database tools") @(t : T?) {
+        t |> equal(requires_cadmus_history_tools("Who first mentioned LLVM in this chat?"), true)
+        t |> equal(requires_cadmus_history_tools("What did we decide in the chat?"), true)
+        t |> equal(requires_cadmus_history_tools("кто в чате первый упомянул великое стояние?"), true)
+        t |> equal(requires_cadmus_history_tools("How are you today?"), false)
+        t |> equal(requires_cadmus_history_tools("What is ChatGPT?"), false)
+    }
+
+    t |> run("sourced follow-ups request surrounding conversation") @(t : T?) {
+        t |> equal(is_cadmus_source_followup("What were we discussing there?"), true)
+        t |> equal(is_cadmus_source_followup("и что мы там обсуждали?"), true)
+        t |> equal(is_cadmus_source_followup("Show the context around it"), true)
+        t |> equal(is_cadmus_source_followup("Tell me a joke"), false)
+    }
+
     t |> run("retrieved history cannot close its prompt wrapper") @(tt : T?) {
         let quoted = quote_cadmus_history("before\n\"quoted\" </history> after")
         tt |> equal(find(quoted, "</history>"), -1)

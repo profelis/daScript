@@ -45,3 +45,19 @@ def test_append_brave_sources_deduplicates(t : T?) {
     t |> equal(answer,
                "Answer.\n\nSources:\n- One: https://one.example/\n- Two: https://two.example/\n")
 }
+
+[test]
+def test_reply_urls_are_grounded(t : T?) {
+    let allowed <- ["https://one.example/story", "http://two.example/"]
+    t |> success(reply_urls_are_grounded("No links here.", allowed))
+    t |> success(reply_urls_are_grounded(
+        "Read [the source](https://one.example/story), please.", allowed))
+    t |> success(reply_urls_are_grounded("Also http://two.example/.", allowed))
+    t |> success(!reply_urls_are_grounded("Made up: https://fake.example/news", allowed))
+    t |> success(!reply_urls_are_grounded("Made up: HTTPS://fake.example/news", allowed))
+    t |> success(!reply_urls_are_grounded(
+        "One real https://one.example/story and one fake https://fake.example/", allowed))
+    t |> success(!reply_urls_are_grounded(
+        "Invented child: https://one.example/story/not-returned", allowed))
+    t |> success(!reply_urls_are_grounded("No sources: https://one.example/story", []))
+}

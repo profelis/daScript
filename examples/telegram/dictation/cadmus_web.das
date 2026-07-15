@@ -133,6 +133,80 @@ def private has_source_url(url : string; sources : array<string>) : bool {
     return false
 }
 
+def private is_reply_url_boundary(ch : int) : bool {
+    return is_white_space(ch) || find(".,;:!?)]}>\"'", ch) >= 0
+}
+
+def private ascii_letter_is(ch : uint8; lower : int) : bool {
+    return int(ch) == lower || int(ch) == lower - ('a' - 'A')
+}
+
+def private next_reply_url(reply : string; start : int) : int {
+    var result = -1
+    peek_data(reply) $(bytes) {
+        let total = length(bytes)
+        for (at in range(start, total)) {
+            if (at + 7 > total ||
+                !ascii_letter_is(bytes[at], 'h') ||
+                !ascii_letter_is(bytes[at + 1], 't') ||
+                !ascii_letter_is(bytes[at + 2], 't') ||
+                !ascii_letter_is(bytes[at + 3], 'p')) {
+                continue
+            }
+            let is_http = (bytes[at + 4] == uint8(':') &&
+                           bytes[at + 5] == uint8('/') && bytes[at + 6] == uint8('/'))
+            let is_https = (at + 8 <= total && ascii_letter_is(bytes[at + 4], 's') &&
+                            bytes[at + 5] == uint8(':') &&
+                            bytes[at + 6] == uint8('/') && bytes[at + 7] == uint8('/'))
+            if (is_http || is_https) {
+                result = at
+                break
+            }
+        }
+    }
+    return result
+}
+
+def private reply_url_is_allowed(
+                                 reply : string;
+                                 url_at, reply_length : int;
+                                 allowed_urls : array<string>
+                                 ) : bool {
+    for (allowed in allowed_urls) {
+        if (empty(allowed) || find(reply, allowed, url_at) != url_at) {
+            continue
+        }
+        let end_at = url_at + length(allowed)
+        if (end_at == reply_length) {
+            return true
+        }
+        var boundary = false
+        peek_data(reply) $(bytes) {
+            boundary = is_reply_url_boundary(int(bytes[end_at]))
+        }
+        if (boundary) {
+            return true
+        }
+    }
+    return false
+}
+
+def reply_urls_are_grounded(reply : string; allowed_urls : array<string>) : bool {
+    var start = 0
+    let reply_length = length(reply)
+    while (start < reply_length) {
+        let url_at = next_reply_url(reply, start)
+        if (url_at < 0) {
+            return true
+        }
+        if (!reply_url_is_allowed(reply, url_at, reply_length, allowed_urls)) {
+            return false
+        }
+        start = url_at + 1
+    }
+    return true
+}
+
 def append_brave_sources(reply : string; sources : array<BraveSearchResult>; max_sources : int = 5) : string {
     if (empty(sources)) {
         return reply

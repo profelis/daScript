@@ -37,9 +37,9 @@ def test_history_migrations_linq_and_fts(t : T?) {
     remove(path)
     ensure_cadmus_database(path)
 
-    t |> run("starts at migration four") @(t : T?) {
+    t |> run("starts at migration five") @(t : T?) {
         with_sqlite(path) $(db) {
-            t |> equal(db |> current_schema_version(), 4)
+            t |> equal(db |> current_schema_version(), 5)
         }
     }
 
@@ -120,6 +120,18 @@ def test_history_migrations_linq_and_fts(t : T?) {
         t |> equal(is_cadmus_transcript_delivery(path, 10l, 500l), true)
     }
 
+    t |> run("assistant source provenance persists and stays chat-local") @(t : T?) {
+        let sources <- load_cadmus_message(path, 10l, 22l)
+        remember_cadmus_assistant_sources(path, 10l, 20l, sources)
+        remember_cadmus_assistant_sources(path, 10l, 20l, sources)
+        let loaded <- load_cadmus_assistant_sources(path, 10l, 20l)
+        t |> equal(length(loaded), 1)
+        if (length(loaded) == 1) {
+            t |> equal(loaded[0].TelegramMessageId, 22l)
+        }
+        t |> equal(length(load_cadmus_assistant_sources(path, 20l, 20l)), 0)
+    }
+
     t |> run("timeline context and links stay chat-local") @(t : T?) {
         let stats = cadmus_mention_stats(path, 10l, "needle")
         t |> equal(stats.Total, 2)
@@ -134,6 +146,37 @@ def test_history_migrations_linq_and_fts(t : T?) {
         t |> equal(cadmus_message_link(-1001234567890l, 42l, "@public_chat"),
                    "https://t.me/public_chat/42")
         t |> equal(cadmus_message_link(123l, 42l), "")
+        let chronological <- search_cadmus_messages_chronological(path, 10l, "needle", 10)
+        t |> equal(length(chronological), 2)
+        if (length(chronological) == 2) {
+            t |> equal(chronological[0].TelegramMessageId, 20l)
+            t |> equal(chronological[1].TelegramMessageId, 22l)
+        }
+        let sources <- [
+            test_message(-1001234567890l, 42l, 7l, 1500l, "first"),
+            test_message(-1001234567890l, 42l, 7l, 1500l, "duplicate")]
+        let source_stamp = format_time(unsafe(reinterpret<clock>(1500l)), "%Y-%m-%d %H:%M")
+        t |> equal(
+            append_cadmus_sources("Answer.", sources),
+            "Answer.\n\nChat sources:\n- [{source_stamp}] Tester: https://t.me/c/1234567890/42\n")
+        t |> equal(
+            append_cadmus_sources("Already linked: https://t.me/c/1234567890/42", sources),
+            "Already linked: https://t.me/c/1234567890/42")
+    }
+
+    t |> run("timeline matching requires every query term") @(t : T?) {
+        upsert_cadmus_message(path, test_message(30l, 1l, 7l, 100l, "alpha only"))
+        upsert_cadmus_message(path, test_message(30l, 2l, 7l, 200l, "alpha and beta"))
+        upsert_cadmus_message(path, test_message(30l, 3l, 7l, 300l, "beta only"))
+        let stats = cadmus_mention_stats(path, 30l, "alpha beta")
+        t |> equal(stats.Total, 1)
+        t |> equal(stats.FirstDate, 200l)
+        t |> equal(stats.LastDate, 200l)
+        let chronological <- search_cadmus_messages_chronological(path, 30l, "alpha beta", 10)
+        t |> equal(length(chronological), 1)
+        if (length(chronological) == 1) {
+            t |> equal(chronological[0].TelegramMessageId, 2l)
+        }
     }
 
     t |> run("import media checkpoint preserves unchanged completed work") @(t : T?) {

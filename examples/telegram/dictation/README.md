@@ -24,8 +24,11 @@ attribution to the speaker and never trigger Cadmus.
 Cadmus has four current-chat-only history tools: full-text search, first/last/count timelines,
 message context, and chronological browsing. Results include Telegram message IDs and post links.
 The runtime supplies the current chat ID, so the model cannot request another channel's history.
+Grounded answers retain their source message IDs. A follow-up such as "what were we discussing
+there?" automatically loads five messages before and after those sources before generation.
 When `BRAVE_SEARCH_API_KEY` is set, Cadmus also has a compact Brave web-search tool for current or
-external facts. Web excerpts are marked as untrusted, and source links are appended to the answer.
+external facts, including details needed to supplement freshly retrieved chat context. Web excerpts
+are marked as untrusted, and source links are appended to the answer.
 Failures in transcription, cleanup, summaries, or conversational generation are reported in the
 originating Telegram chat with a `⚠` marker.
 
@@ -49,9 +52,15 @@ database and log paths resolve beside the executable in a release and beside `ma
 development.
 
 The database is created automatically. Migration 1 creates message/state storage, migration 2 adds
-the FTS5 index, migration 3 records outgoing transcript-delivery IDs, and migration 4 adds resumable
-Telegram-export media checkpoints. Telegram update offsets are persisted, and
+the FTS5 index, migration 3 records outgoing transcript-delivery IDs, migration 4 adds resumable
+Telegram-export media checkpoints, and migration 5 records the database sources behind Cadmus
+answers. Telegram update offsets are persisted, and
 `(chat_id, message_id)` makes replayed updates and edits idempotent. History is retained indefinitely.
+
+Before sending an answer, Cadmus validates every model-written HTTP(S) link against exact URLs
+returned by Brave Search or chat-history tools in the current turn. An unverified link triggers up to
+two corrected completion attempts; if it remains ungrounded, Cadmus sends an error instead of the
+answer. Successful Brave calls are recorded under the `cadmus.web` log category.
 
 ## Conversation and summary commands
 
