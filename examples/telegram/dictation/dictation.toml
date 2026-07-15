@@ -102,5 +102,13 @@ assistant_temp = 0.2
 recent_messages = 40
 # Maximum user-message matches returned by the current-chat FTS5 search tool.
 history_search_results = 12
+
+# Public web search through Brave Search API. The API key is read only from
+# BRAVE_SEARCH_API_KEY; it is never stored in this file or sent to the LLM.
+web_search_enabled = true
+web_search_results = 5
+web_search_timeout = 15
+web_search_max_calls = 2
+
 summary_chunk_messages = 80
 summary_max_messages = 4000

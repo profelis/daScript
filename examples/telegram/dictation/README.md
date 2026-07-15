@@ -24,6 +24,8 @@ attribution to the speaker and never trigger Cadmus.
 Cadmus has four current-chat-only history tools: full-text search, first/last/count timelines,
 message context, and chronological browsing. Results include Telegram message IDs and post links.
 The runtime supplies the current chat ID, so the model cannot request another channel's history.
+When `BRAVE_SEARCH_API_KEY` is set, Cadmus also has a compact Brave web-search tool for current or
+external facts. Web excerpts are marked as untrusted, and source links are appended to the answer.
 Failures in transcription, cleanup, summaries, or conversational generation are reported in the
 originating Telegram chat with a `⚠` marker.
 
@@ -32,6 +34,7 @@ originating Telegram chat with a `⚠` marker.
 - A running `dasllama-server` with both an instruct model and an ASR model.
 - ffmpeg on `PATH`, or an absolute `ffmpeg` path in `dictation.toml`.
 - A Telegram token from `@BotFather`.
+- Optional: a Brave Search API key in `BRAVE_SEARCH_API_KEY` for public web search.
 
 ## Setup and run from source
 
@@ -41,8 +44,9 @@ bin/daslang -project_root examples/telegram/dictation examples/telegram/dictatio
 ```
 
 The bot itself does not require JIT. Edit `dictation.toml` first. `TELEGRAM_BOT_TOKEN` overrides
-`bot_token`. Relative database and log paths resolve beside the executable in a release and beside
-`main.das` during development.
+`bot_token`; `BRAVE_SEARCH_API_KEY` enables Brave Search and has no config-file fallback. Relative
+database and log paths resolve beside the executable in a release and beside `main.das` during
+development.
 
 The database is created automatically. Migration 1 creates message/state storage, migration 2 adds
 the FTS5 index, migration 3 records outgoing transcript-delivery IDs, and migration 4 adds resumable
@@ -96,6 +100,7 @@ Commands work without registering them, but the Telegram command menu is configu
 | `assistant_prompt` | Editable conversational personality, separate from trusted runtime rules |
 | `database` | Local SQLite history path |
 | `recent_messages`, `history_search_results` | Recent context and per-tool FTS result limits |
+| `web_search_enabled`, `web_search_results`, `web_search_timeout`, `web_search_max_calls` | Brave Search controls; key comes from the environment |
 | `summary_chunk_messages`, `summary_max_messages` | Summary reduction limits |
 | `max_tokens`, `temp` | Dictation cleanup generation settings |
 | `assistant_max_tokens`, `assistant_temp` | Conversational generation settings |
