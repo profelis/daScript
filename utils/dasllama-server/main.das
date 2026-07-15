@@ -87,6 +87,9 @@ struct ServerArgs {
     @clarg_doc = "Flat preallocated KV sessions — disables paged serving and the prefix cache"
     flat : bool
 
+    @clarg_doc = "MTP/NextN self-speculative decode for greedy requests (needs a model with an in-file NextN head, e.g. the -MTP- GGUFs; pays on the dense qwen35 models)"
+    mtp : bool
+
     @clarg_doc = "Re-tune this box's dasLLAMA kernels, then relaunch (handled before arg parsing)"
     tune : bool
 
@@ -183,6 +186,9 @@ def apply_config(var cfg : ServerArgs) : bool {
     }
     if (!cfg.flat) {
         cfg.flat = root?["flat"] ?? false
+    }
+    if (!cfg.mtp) {
+        cfg.mtp = root?["mtp"] ?? false
     }
     unsafe {
         delete root
@@ -288,6 +294,6 @@ def main : int {
     }
 
     run_server(port, streams, chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix,
-        kv_dtype = pick_kv_dtype(cfg.kv_dtype))
+        kv_dtype = pick_kv_dtype(cfg.kv_dtype), mtp = cfg.mtp)
     return 0
 }

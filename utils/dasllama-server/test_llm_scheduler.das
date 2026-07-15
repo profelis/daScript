@@ -499,3 +499,73 @@ def test_scheduler_evict_and_context_length(t : T?) {
         }
     }
 }
+
+// ===== scheduler mtp: greedy self-spec ticks are output-invariant vs the plain scheduler =====
+
+let MTP_MODEL_PATH = path_join(models_dir(), "Qwen3.5-0.8B-MTP-Q8_0.gguf")
+
+[test]
+def test_scheduler_mtp(t : T?) {
+    t |> run("scheduler mtp: self-spec greedy stream ≡ plain scheduler, chunked prefill + paged (needs Qwen3.5-0.8B-MTP)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> success(true, "skipped: interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        if (!stat(MTP_MODEL_PATH).is_valid) {
+            t |> success(true, "skipped: {MTP_MODEL_PATH} not present")
+            return
+        }
+        // pin the bit-exact kernels (same reasoning as test_mtp): the spec arm's verify rides the
+        // BATCH kernels while the plain arm decodes per-token — near-tie flips are not bugs, so the
+        // token-exact gate must not ride them. Both arms run paged/f16 so only spec mechanics differ.
+        let prev_attn = get_prefill_attn_mode()
+        set_prefill_attn_mode(AttnPrefillMode.classic)
+        let prev_act = get_act_vec()
+        set_act_vec(false)
+        let prev_dn = get_deltanet_prefill_mode()
+        set_deltanet_prefill_mode(DnPrefillMode.recurrent)
+        with_job_que() {
+            setup_dasllama_jobque()
+            var m <- load_model(MTP_MODEL_PATH, QuantMode.q8)
+            m.config.seq_len = min(m.config.seq_len, 512l)
+            var prompt <- encode(m, "Count from one to twenty: one, two, three,", true, false)
+            var none : array<int64>
+            let greedy = SamplingParams()
+            // reference: the PLAIN scheduler (mtp off), paged, 8-token prefill quanta
+            var sch0 <- create_scheduler(m, 1l, 4l, 8l, 16l)
+            var events0 : array<SchedEvent>
+            t |> success(submit(m, sch0, make_req(1l, prompt, greedy, 24l, none)), "plain stream queued")
+            drain(m, sch0, events0)
+            var ref_toks <- toks_of(events0, 1l)
+            unsafe {
+                delete sch0
+            }
+            // spec: mtp on — the chunked prefill crosses the warm's seam rows, and the paged
+            // sessions ride the pool's draft-block slab (the server default rail)
+            let prev_spec = get_mtp_spec()
+            set_mtp_spec(true)
+            var sch <- create_scheduler(m, 1l, 4l, 8l, 16l, 0l, KVDtype.f16, true)
+            var events : array<SchedEvent>
+            t |> success(submit(m, sch, make_req(2l, prompt, greedy, 24l, none)), "spec stream queued")
+            drain(m, sch, events)
+            set_mtp_spec(prev_spec)
+            var got <- toks_of(events, 2l)
+            t |> success(same(got, ref_toks), "spec stream tokens ≡ plain scheduler")
+            t |> success(sch.mtp_drafted > 0l, "the spec tick actually drafted ({sch.mtp_drafted} drafts)")
+            t |> success(sch.mtp_accepted > 0l, "some drafts accepted ({sch.mtp_accepted} of {sch.mtp_drafted})")
+            t |> equal(finished_of(events, 2l).n_gen, 24l)
+            delete got
+            delete events
+            unsafe {
+                delete sch
+            }
+            delete ref_toks
+            delete events0
+            delete prompt
+            delete m
+        }
+        set_prefill_attn_mode(prev_attn)
+        set_act_vec(prev_act)
+        set_deltanet_prefill_mode(prev_dn)
+    }
+}

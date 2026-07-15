@@ -89,6 +89,7 @@ struct Scheduler {
     pool : KVPool
     prefix : PrefixCache
     kv_dtype : KVDtype = KVDtype.f16        // KV codec for every stream (pool-wide when paged)
+    mtp : bool                              // MTP/NextN self-spec ticks for greedy streams (the server also sets the engine's prefill-warm gate)
     // per-step gather scratch. @do_not_delete is load-bearing: delete of a plain array<T?>
     // CASCADES to the pointees — these are borrowed rows into streams[i].session
     @do_not_delete batch_rows : array<Session?>
@@ -105,6 +106,8 @@ struct Scheduler {
     sum_batch : int64                       // Σ decode batch size (avg batch = sum_batch / decode_steps)
     peak_active : int64
     cached_tokens : int64                   // prefix-cache hits (tokens attached instead of prefilled)
+    mtp_drafted : int64                     // self-spec telemetry across streams (drafts attempted / accepted)
+    mtp_accepted : int64
 }
 
 //! Create a scheduler over `model`: `max_streams` concurrent sessions, `max_queue` waiting
@@ -115,10 +118,11 @@ struct Scheduler {
 //! live sessions, the pool, and the workspace go with it.
 def create_scheduler(model : Model; max_streams : int64 = 4l; max_queue : int64 = 32l;
                      chunk_tokens : int64 = 64l; page_rows : int64 = 0l;
-                     prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16) : Scheduler {
+                     prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
+                     mtp : bool = false) : Scheduler {
     var sch <- Scheduler(ws <- create_batch_workspace(model), max_streams = max(1l, max_streams),
                          max_queue = max(1l, max_queue), chunk_tokens = max(1l, chunk_tokens),
-                         kv_dtype = kv_dtype)
+                         kv_dtype = kv_dtype, mtp = mtp && model.config.n_layer_nextn > 0l)
     if (page_rows > 0l) {
         sch.paged = true
         sch.pool <- create_kv_pool(model, page_rows, kv_dtype)
@@ -174,8 +178,9 @@ def private finish_stream(var st : Stream; finish : string; var events : array<S
 // Sample the next token from st.session's fresh logits and run the emit protocol — stop-id check,
 // piece event, recent push, budget check — identical for the inline first token and every decode
 // step (generate_'s ordering). Returns true when a piece was emitted (the caller counts it).
-def private sample_advance(m : Model; var st : Stream; var events : array<SchedEvent>) : bool {
-    let tok = sample(st.session, st.params)
+// Shared emit bookkeeping for one FINAL token (freshly sampled, or a verified spec draft):
+// ttft stamp, stop-token finish, event + repetition window + budget accounting.
+def private advance_with(m : Model; var st : Stream; tok : int64; var events : array<SchedEvent>) : bool {
     if (st.t_first == 0l) {
         st.t_first = ref_time_ticks()
         st.ttft_us = int64(get_time_usec(st.t_admit))
@@ -195,6 +200,10 @@ def private sample_advance(m : Model; var st : Stream; var events : array<SchedE
         finish_stream(st, "length", events)
     }
     return true
+}
+
+def private sample_advance(m : Model; var st : Stream; var events : array<SchedEvent>) : bool {
+    return advance_with(m, st, sample(st.session, st.params), events)
 }
 
 //! Evict a stream (the client disconnected): an active stream finishes "evicted" (its finished
@@ -270,6 +279,32 @@ def scheduler_step(m : Model; var sch : Scheduler; var events : array<SchedEvent
         }
         if (sch.streams[i].session.n_past + 1l > m.config.seq_len) {   // pre-check: never reach the eval_batch panic
             finish_stream(sch.streams[i], "length", events)
+            continue
+        }
+        if (sch.mtp && sch.streams[i].params.temp <= 0.0 && sch.streams[i].params.penalty == 1.0) {
+            // greedy self-spec tick: draft + 2-row batched verify on this stream's own session
+            // (the stream trades its cross-stream batch row for up to two positions per tick;
+            // sampled/penalized streams stay on the batch — the greedy verify wouldn't match them).
+            // Donation-side note: an accepted token is already evaled, so a "length" finish here
+            // makes donate_stream's pending-eval redundant — harmless, and unreachable anyway:
+            // every MTP-capable arch is a deltanet hybrid, which the prefix cache refuses.
+            let d0 = sch.streams[i].session.mtp_drafted
+            let a0 = sch.streams[i].session.mtp_accepted
+            var acc = 0l
+            if (mtp_spec_eval(m, sch.streams[i].session, sch.streams[i].cur_tok, acc)) {
+                if (advance_with(m, sch.streams[i], acc, events)) {
+                    sch.gen_tokens ++
+                }
+            }
+            sch.mtp_drafted += sch.streams[i].session.mtp_drafted - d0
+            sch.mtp_accepted += sch.streams[i].session.mtp_accepted - a0
+            if (sch.streams[i].state == StreamState.decoding) {
+                if (sample_advance(m, sch.streams[i], events)) {
+                    sch.gen_tokens ++
+                }
+            }
+            sch.decode_steps ++
+            sch.sum_batch ++
             continue
         }
         sch.batch_rows |> push(unsafe(addr(sch.streams[i].session)))
