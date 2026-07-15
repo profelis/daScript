@@ -235,6 +235,13 @@ jobs:
           - target: windows
             architecture: arm64 # todo https://github.com/actions/partner-runner-images/tree/main?tab=readme-ov-file#available-images
 
+          # win32 Debug outgrew its test budgets (the interpreter sweep double-times-out at
+          # 1800s + 5400s on master's own scheduled runs, ~2.5h wall before failing) and the
+          # 32-bit rail is legacy — win32 Release stays as the 32-bit compile+test gate.
+          - target: windows
+            architecture: 32
+            cmake_preset: Debug
+
     steps:
     - name: "SCM Checkout"
       uses: actions/checkout@v4
