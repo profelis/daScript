@@ -75,7 +75,7 @@ namespace das {
     DAS_MOD_API void metal_residency_set_commit ( MetalResidencySet * rset, Context * ctx, LineInfoArg * at );
     DAS_MOD_API void metal_residency_set_request ( MetalResidencySet * rset, Context * ctx, LineInfoArg * at );
 
-    // all eight register as das-side `metal_release` overloads; C++ names differ
+    // each registers as a das-side `metal_release` overload; C++ names differ
     // because DAS_BIND_FUN cannot take an overload set
     DAS_MOD_API void metal_release_device ( MetalDevice * h );
     DAS_MOD_API void metal_release_queue ( MetalCommandQueue * h );
