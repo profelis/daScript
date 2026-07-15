@@ -2605,12 +2605,19 @@ struct Session {
     dn_cws : array<float>          // per-v-head chunk workspace slabs (dt_rank x dn_cws_head_size)
     // MTP/NextN self-spec state (empty unless config.n_layer_nextn > 0). mtp_h is the trunk's
     // post-output-norm hidden of the LAST evaluated position — llama.cpp's t_h_nextn handoff,
-    // stashed by forward()/forward_prefill() right after the final rms_at.
+    // stashed by forward()/forward_prefill() right after the final rms_at; mtp_h_pos1 is the
+    // position it belongs to PLUS ONE (0 = cold: fresh session, or the draft head's recursive
+    // overwrite — the +1 keeps Session zero-init-safe). The warm's seam row and mtp_spec_eval's
+    // cold-handoff fallback key off it.
     mtp_h : array<float>           // h_nextn (dim)
+    mtp_h_pos1 : int64
     mtp_cat : array<float>         // eh_proj input [enorm(embed(tok)) ; hnorm(h)] (2*dim)
-    mtp_cat_b : array<float>       // prompt-warm eh_proj concat image ((np-1) x 2*dim, scratch-sized per warm)
-    mtp_h0 : array<float>          // verify-batch row-0 h_nextn (dim) — the accept-path MTP backfill pair
+    mtp_cat_b : array<float>       // prompt-warm eh_proj concat image ((npos-1) x 2*dim, scratch-sized per warm)
+    mtp_xb_save : array<float>     // prompt-warm x_b preservation (the warm's eh_proj output rides x_b for the arch blocks; consumers like mtp_verify_row0 / embed_forward need the trunk hiddens back)
     mtp_logits : array<float>      // verify-batch row-0 logits (vocab; the draft check reads its argmax)
+    mtp_vbatch : array<int64>      // the 2-row verify batch [tok, draft] (persistent — no per-step alloc)
+    mtp_drafted : int64            // session-lifetime telemetry: drafts attempted / accepted
+    mtp_accepted : int64
     // deltanet rollback for a rejected verify batch (sized lazily on first snapshot)
     mtp_snap_conv : array<float>
     mtp_snap_state : array<float>
@@ -2721,8 +2728,8 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
     if (c.n_layer_nextn > 0l) {   // MTP/NextN: h_nextn handoff + eh_proj concat input + verify row-0 outputs
         s.mtp_h |> resize(c.dim)
         s.mtp_cat |> resize(2l * c.dim)
-        s.mtp_h0 |> resize(c.dim)
         s.mtp_logits |> resize(c.vocab_size)
+        s.mtp_vbatch |> resize(2)
     }
     s.ffn_offs |> resize(4)
     s.ffn_gu |> resize(2l * ffw)
@@ -2796,10 +2803,11 @@ def create_session_(model : Model; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = 
 //! come from `pool` on demand (kv_ensure), so KV memory tracks actual context. The pool must
 //! outlive the session and stay in place; release the pages (release_kv_pages_) when done.
 def make_run_state_paged(c : Config; var pool : KVPool) : Session {
-    if (int64(length(pool.blob_of)) != c.n_layers) {
-        panic("make_run_state_paged: pool was built for a different model ({length(pool.blob_of)} layers vs {c.n_layers})")
+    let kv_layers = c.n_layers + c.n_layer_nextn   // + the MTP/NextN draft block's slab
+    if (int64(length(pool.blob_of)) != kv_layers) {
+        panic("make_run_state_paged: pool was built for a different model ({length(pool.blob_of)} layers vs {kv_layers})")
     }
-    for (l in range64(c.n_layers)) {
+    for (l in range64(kv_layers)) {
         if (pool.krow_bytes[pool.blob_of[l]] != kv_row_bytes(pool.kdt, layer_kv_dim(c, l))) {
             panic("make_run_state_paged: pool row bytes mismatch at layer {l} — pool built for a different geometry")
         }
@@ -3252,8 +3260,11 @@ def create_kv_pool_(c : Config; page_rows : int64; kdt, vdt : KVDtype) : KVPool 
     }
     kv_validate_q8(c, kdt, vdt)
     var p = KVPool(page_rows = page_rows, kdt = kdt, vdt = vdt)
-    p.blob_of |> reserve(int(c.n_layers))
-    for (l in range64(c.n_layers)) {
+    // + the MTP/NextN draft block's slab (index n_layers) — one attention layer's rows, so the
+    // self-spec rails work on paged sessions too (pages only allocate when rows are written)
+    let kv_layers = c.n_layers + c.n_layer_nextn
+    p.blob_of |> reserve(int(kv_layers))
+    for (l in range64(kv_layers)) {
         let src = layer_kv_source(c, l)
         if (src != l) {
             p.blob_of |> push(p.blob_of[src])   // shared-KV layer: alias the source's blob
@@ -6557,6 +6568,7 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
     if (c.n_layer_nextn > 0l) {   // stash h_nextn (llama.cpp t_h_nextn) for the MTP draft head
         copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)
+        s.mtp_h_pos1 = pos + 1l
     }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
@@ -6591,13 +6603,25 @@ def forward(t : Model; var s : Session; token, pos : int64) {
 //! is position-delta-invariant, so shifting every MTP row down by one is mathematically
 //! identical and leaves no garbage row. Overwrites s.mtp_h with the head's own h_nextn
 //! (the recursive-drafting handoff) and s.logits/s.x/s.xb scratch.
+// the engine-rail gate: warm-in-prefill + the schedulers' spec ticks key off it (per-process,
+// like the kernel-mode toggles); generate_mtp_greedy force-enables around itself
+var private g_mtp_spec = false
+
+//! Enable MTP/NextN self-speculative greedy decode on the engine rails: `forward_prefill`
+//! maintains the draft head's KV incrementally (chunked prefill included), and spec-aware
+//! drivers (`generate_mtp_greedy`, the server scheduler) draft + verify via [[mtp_spec_eval]].
+//! No effect on models without a NextN head; greedy-only (a sampling verify is future work).
+def set_mtp_spec(on : bool) {
+    g_mtp_spec = on
+}
+
+//! Current state of the [[set_mtp_spec]] gate.
+def get_mtp_spec() : bool => g_mtp_spec
+
 def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bool = true) {
     let c = t.config
     let dim = c.dim
     assert(c.n_layer_nextn > 0l)
-    if (s.kv_pool != null) {   // paged pools size blob_of for trunk layers only — flat sessions only (v1)
-        panic("dasLLAMA: forward_mtp needs a flat-KV session — the paged pool has no slab for the draft block")
-    }
     kv_ensure(s, pos + 1l)
     // eh_proj input: [enorm(embed(token)) ; hnorm(h)] — embedding first (llama.cpp concat order)
     embed_row(t, token, unsafe(addr(s.x[0])))
@@ -6625,6 +6649,7 @@ def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bo
     // head norm (shared_head_norm when shipped, else output_norm) + the trunk classifier
     rms_at(s.xb, t, t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off, s.x, dim)
     copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)   // the head's own h_nextn — recursive drafting handoff
+    s.mtp_h_pos1 = 0l   // NOT a trunk hidden: the warm's seam row must not consume it
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
     if (tied_f32) {
@@ -6664,7 +6689,6 @@ def private mtp_verify_row0(t : Model; var s : Session) {
     let c = t.config
     let dim = c.dim
     rms_at(s.xb, t, t.rms_final_off, s.x_b, 0l, dim)
-    copy_floats(s.xb, 0l, s.mtp_h0, 0l, dim)
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
     if (tied_f32) {
@@ -6684,8 +6708,90 @@ def private mtp_verify_row0(t : Model; var s : Session) {
     }
 }
 
-//! Greedy decode with MTP/NextN depth-1 self-speculation (config.n_layer_nextn == 1; flat KV
-//! cache only). Mirrors generate()'s contract — returns prompt[1..] echoed, then the greedy
+// Write the draft head's KV rows for a just-prefilled [start_pos, start_pos+npos) window. Row p
+// pairs (h_p, x_{p+1}): in-chunk pairs cover rows start_pos..start_pos+npos-2 — one batched
+// eh_proj GEMM + the arch's batched blocks at l = n_layers, riding the trunk prefill's rope
+// table and batch scratch — and the seam row start_pos-1 = (the PREVIOUS window's tail hidden,
+// tokens[0]) closes chunked prefill / verify-batch boundaries whenever the mtp_h handoff is
+// fresh (a cold/foreign session skips it — a stale draft row only lowers the accept rate; the
+// next draft at that row rewrites it). x_b is saved/restored around the block pass: its
+// post-prefill contents are load-bearing for mtp_verify_row0 and embed_forward. KV only —
+// no head norm / classifier.
+def private mtp_prefill_warm(t : Model; var s : Session; tokens : array<int64>; npos, start_pos : int64) {
+    let c = t.config
+    let dim = c.dim
+    if (npos > 1l) {
+        s.mtp_xb_save |> scratch_resize(npos * dim)
+        copy_floats(s.x_b, 0l, s.mtp_xb_save, 0l, npos * dim)
+        s.mtp_cat_b |> scratch_resize((npos - 1l) * 2l * dim)
+        for (p in range64(npos - 1l)) {
+            embed_row(t, tokens[p + 1l], unsafe(addr(s.x[0])))
+            rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
+            copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim, dim)
+            rms_at(s.xb, t, t.rms_final_off, s.x_b, p * dim, dim)   // h_{start_pos+p}
+            copy_floats(s.xb, 0l, s.x, 0l, dim)
+            rms_at(s.xb, t, t.mtp_hnorm_off, s.x, dim)
+            copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim + dim, dim)
+        }
+        mm_b_f(s, s.x_b, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat_b, 2l * dim, dim, npos - 1l)
+        t.blocks.attn_prefill(t, s, c.n_layers, npos - 1l, start_pos)
+        t.blocks.ffn_prefill(t, s, c.n_layers, npos - 1l)
+        copy_floats(s.mtp_xb_save, 0l, s.x_b, 0l, npos * dim)
+    }
+    // the seam row LAST — its single-row rope rebuild would clobber the table the batch pass rides
+    if (start_pos > 0l && s.mtp_h_pos1 == start_pos) {
+        forward_mtp(t, s, tokens[0], start_pos - 1l, false)
+    }
+}
+
+//! One greedy self-speculative eval step at the session cursor (the engine primitive behind
+//! [[generate_mtp_greedy]] and the server scheduler): evals `tok`, drafting one token ahead with
+//! the NextN head and verifying it with a 2-row batched trunk forward. On accept TWO positions
+//! are consumed — `accepted` = the draft (now final; emit it) and ``s.logits`` holds the SECOND
+//! position's logits — else one position, plain-eval semantics. Advances ``n_past``; telemetry
+//! accumulates in ``mtp_drafted``/``mtp_accepted``. Output-invariant vs plain greedy decode by
+//! construction: the draft only gates acceptance. Falls back to a plain eval step (returning
+//! false) when the model has no head, the handoff is cold (fresh/foreign session), q4 mode has
+//! no batch rail, or the context can't fit two rows. Requires [[set_mtp_spec]] ON so prefills
+//! maintain the head's KV.
+def mtp_spec_eval(t : Model; var s : Session; tok : int64; var accepted : int64&) : bool {
+    let c = t.config
+    let pos = s.n_past
+    if (c.n_layer_nextn <= 0l || t.quant == QuantMode.q4 || s.mtp_h_pos1 != pos
+            || pos + 2l > c.seq_len) {
+        forward(t, s, tok, pos)   // plain step (forward re-stashes the handoff for the next tick)
+        s.n_past = pos + 1l
+        return false
+    }
+    // draft x_{pos+1} from (h_{pos-1}, tok) at row pos-1 (rewrites that row's draft KV in place)
+    forward_mtp(t, s, tok, pos - 1l)
+    let d = parallel_argmax(s.logits, c.vocab_size)
+    s.mtp_drafted++
+    // batched verify: trunk over [tok@pos, d@pos+1] — weights stream once for both rows; the
+    // warm inside this prefill writes the head's row pos = (h_pos, d), which doubles as the
+    // accept-path backfill (a reject leaves it stale; the next draft at that row rewrites it)
+    mtp_state_snapshot(s)
+    s.mtp_vbatch[0] = tok
+    s.mtp_vbatch[1] = d
+    forward_prefill(t, s, s.mtp_vbatch, 2l, pos)
+    mtp_verify_row0(t, s)
+    let truth = parallel_argmax(s.mtp_logits, c.vocab_size)
+    if (truth == d) {
+        s.mtp_accepted++
+        accepted = d
+        s.n_past = pos + 2l
+        return true
+    }
+    // reject: the accepted row's KV from the verify batch is already correct; roll the recurrent
+    // state back and re-advance it through tok alone (s.logits = plain logits, like forward)
+    mtp_state_restore(s)
+    forward(t, s, tok, pos)
+    s.n_past = pos + 1l
+    return false
+}
+
+//! Greedy decode with MTP/NextN depth-1 self-speculation (config.n_layer_nextn == 1; flat or
+//! paged sessions). Mirrors generate()'s contract — returns prompt[1..] echoed, then the greedy
 //! continuation, `total` ids overall — and is OUTPUT-INVARIANT vs plain greedy decode: the
 //! draft only decides whether two tokens ride one batched trunk forward (weights read once)
 //! or one token rides a plain forward after a state rollback. Accept telemetry in the returns.
@@ -6695,9 +6801,6 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
     assert(c.n_layer_nextn > 0l)
     if (t.quant == QuantMode.q4) {   // no batched prefill rail: the 2-row verify (and the warm) need it
         panic("dasLLAMA: MTP self-spec decode needs the batched prefill path — load q8 or fp32, not q4")
-    }
-    if (s.kv_pool != null) {   // paged pools size blob_of for trunk layers only — flat sessions only (v1)
-        panic("dasLLAMA: MTP self-spec decode needs a flat-KV session — the paged pool has no slab for the draft block")
     }
     let np = int64(length(prompt))
     var ids : array<int64>
@@ -6711,79 +6814,30 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
         }
         ids |> push(prompt[i])
     }
-    // batched trunk prefill (stashes h_{np-1}); the prompt's next token BEFORE the warm pass
-    // clobbers s.logits
-    forward_prefill(t, s, prompt, np, 0l)
+    // this API is explicit spec — force the engine gate on (the prompt prefill's warm and the
+    // verify batches inside mtp_spec_eval both key off it), restore on the way out
+    let prev_spec = g_mtp_spec
+    g_mtp_spec = true
+    forward_prefill(t, s, prompt, np, 0l)   // trunk prefill + head warm; stashes h_{np-1}
+    s.n_past = np
     var tok = parallel_argmax(s.logits, c.vocab_size)
-    let dim = c.dim
-    if (np > 1l) {
-        // MTP prompt warm, batched: rows 0..np-2 hold (h_p, x_{p+1}) — every position's trunk
-        // hidden is still in s.x_b, so build the np-1 eh_proj concat rows, run ONE batched
-        // eh_proj GEMM back into s.x_b (row np-1 stays untouched), then the draft block through
-        // the arch's batched prefill blocks at l = n_layers. This pass only writes the head's KV
-        // rows (no head norm / classifier), and s.mtp_h — h_{np-1}, stashed by the trunk prefill
-        // tail — deliberately survives it to feed the first draft. The trunk prefill's rope table
-        // ([0, np) at start_pos 0) and batch scratch (sized for np rows) cover the np-1-row pass.
-        s.mtp_cat_b |> scratch_resize((np - 1l) * 2l * dim)
-        for (p in range64(np - 1l)) {
-            embed_row(t, prompt[p + 1l], unsafe(addr(s.x[0])))
-            rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
-            copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim, dim)
-            rms_at(s.xb, t, t.rms_final_off, s.x_b, p * dim, dim)   // h_p
-            copy_floats(s.xb, 0l, s.mtp_h0, 0l, dim)
-            rms_at(s.xb, t, t.mtp_hnorm_off, s.mtp_h0, dim)
-            copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim + dim, dim)
-        }
-        mm_b_f(s, s.x_b, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat_b, 2l * dim, dim, np - 1l)
-        t.blocks.attn_prefill(t, s, c.n_layers, np - 1l, 0l)
-        t.blocks.ffn_prefill(t, s, c.n_layers, np - 1l)
-    }
-    var htmp : array<float>
-    htmp |> resize(dim)
-    var pos = np
-    n_drafted = 0l
-    n_accepted = 0l
-    var vbatch : array<int64>
-    vbatch |> resize(2)
+    let d0 = s.mtp_drafted
+    let a0 = s.mtp_accepted
     while (int64(length(ids)) < total) {
         break if (tok == 1l)   // BOS delimits sequences (generate()'s contract)
         ids |> push(tok)
         break if (int64(length(ids)) >= total)
-        // draft x_{pos+1} from (h_{pos-1}, tok) at row pos-1
-        forward_mtp(t, s, tok, pos - 1l)
-        let d = parallel_argmax(s.logits, c.vocab_size)
-        n_drafted++
-        // batched verify: trunk over [tok@pos, d@pos+1] — weights stream once for both rows
-        mtp_state_snapshot(s)
-        vbatch[0] = tok
-        vbatch[1] = d
-        forward_prefill(t, s, vbatch, 2l, pos)
-        mtp_verify_row0(t, s)
-        let truth = parallel_argmax(s.mtp_logits, c.vocab_size)
-        if (truth == d) {
-            n_accepted++
-            break if (d == 1l)   // BOS: generate() stops before emitting it — mirror that
-            // both rows commit: emit d, take the continuation from row 1's logits.
-            // Backfill MTP row pos with the pair (h_pos = mtp_h0, d) — preserve row 1's h first.
-            copy_floats(s.mtp_h, 0l, htmp, 0l, c.dim)
-            copy_floats(s.mtp_h0, 0l, s.mtp_h, 0l, c.dim)
-            let next = parallel_argmax(s.logits, c.vocab_size)
-            forward_mtp(t, s, d, pos, false)   // KV backfill only — no draft here
-            copy_floats(htmp, 0l, s.mtp_h, 0l, c.dim)
-            ids |> push(d)
-            tok = next
-            pos += 2l
-        } else {
-            // reject: the accepted row's KV is already correct; roll the recurrent state back
-            // and re-advance it through tok alone (also re-stashes h_pos for the next draft)
-            mtp_state_restore(s)
-            forward(t, s, tok, pos)
-            tok = truth
-            pos++
+        var acc = 0l
+        if (mtp_spec_eval(t, s, tok, acc)) {
+            break if (acc == 1l)   // BOS: generate() stops before emitting it — mirror that
+            ids |> push(acc)
+            break if (int64(length(ids)) >= total)
         }
+        tok = parallel_argmax(s.logits, c.vocab_size)
     }
-    delete htmp
-    delete vbatch
+    n_drafted = s.mtp_drafted - d0
+    n_accepted = s.mtp_accepted - a0
+    g_mtp_spec = prev_spec
     return <- ids
 }
 
@@ -9142,6 +9196,9 @@ def forward_prefill(t : Model; var s : Session; tokens : array<int64>; npos, sta
     }
 
     forward_prefill_body(t, s, npos, start_pos)
+    if (g_mtp_spec && c.n_layer_nextn > 0l) {   // spec on: maintain the draft head's KV alongside the trunk's
+        mtp_prefill_warm(t, s, tokens, npos, start_pos)
+    }
 }
 
 //! Batched prefill from PRE-BUILT embeddings (npos × dim, token-major) instead of token ids —
@@ -9386,6 +9443,7 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
     if (c.n_layer_nextn > 0l) {   // stash the last position's h_nextn for the MTP draft head
         copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)
+        s.mtp_h_pos1 = start_pos + last + 1l
     }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
