@@ -600,6 +600,9 @@ struct ChatTemplate {
     system : ChatTurn = ChatTurn()
     user : ChatTurn = ChatTurn()
     assistant_open : ChatTurn = ChatTurn()
+    // Optional generation-prompt suffix used by templates that expose an `enable_thinking`
+    // switch. Empty means the template has no known no-thinking form.
+    thinking_disabled : ChatTurn = ChatTurn()
     assistant_close : ChatTurn = ChatTurn()   // empty = derive from the user turn's tail parts
     think_suppress : ChatTurn = ChatTurn()    // appended to the generation prompt when thinking is off
                                               // (Qwen3-style empty think block; empty = no suppress form)
