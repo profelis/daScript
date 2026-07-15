@@ -112,6 +112,10 @@ def llm_catalog() : array<LlmModel> {
         LlmModel(file="Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", display="Llama-3.1-8B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gpt-oss-20b-mxfp4.gguf", display="gpt-oss-20b", quant=QuantMode.q8, quant_label="mxfp4", prefill_ctx=512, emission_ctx=128),
         LlmModel(file="gemma-4-26B-A4B-it-Q8_0.gguf", display="gemma-4-26B-A4B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
+        LlmModel(file="gemma-4-26B-A4B-it-Q4_K_M.gguf", display="gemma-4-26B-A4B-q4k", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
+        // gemma-4-26B_q4_0-it.gguf (QAT) intentionally NOT listed: QuantMode.q4 has no batched MoE
+        // prefill rail (falls back to the generic path — measured 9.5 pp / 9.7 tg vs llama.cpp
+        // 146.6 / 18.8 on 2026-07-15); re-add once the q4 MoE kernels land
         LlmModel(file="Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf", display="Qwen3-30B-A3B", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", display="Qwen3.6-35B-A3B", quant=QuantMode.q8, quant_label="q4_k_m", prefill_ctx=512, emission_ctx=128),
         LlmModel(file="Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf", display="Qwen3-Coder-30B", quant=QuantMode.q8, prefill_ctx=512, emission_ctx=128),
