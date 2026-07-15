@@ -28,6 +28,22 @@ def test_cadmus_routing_and_dates(t : T?) {
         t |> equal(starts_with_cadmus_alias("cadmussy", aliases), false)
     }
 
+    t |> run("bot username must directly address Cadmus") @(t : T?) {
+        t |> equal(starts_with_cadmus_username("@DaslangTestBot what changed?", "DaslangTestBot"), true)
+        t |> equal(starts_with_cadmus_username("  @daslangtestbot: summarize", "@DaslangTestBot"), true)
+        t |> equal(starts_with_cadmus_username("Ask @DaslangTestBot what changed", "DaslangTestBot"), false)
+        t |> equal(starts_with_cadmus_username("@OtherUser ask @DaslangTestBot", "DaslangTestBot"), false)
+        t |> equal(starts_with_cadmus_username("@DaslangTestBotExtra hello", "DaslangTestBot"), false)
+    }
+
+    t |> run("conversation replies are opt-in and transcript replies are ignored") @(t : T?) {
+        t |> equal(should_cadmus_reply(false, false, false, false, true), false)
+        t |> equal(should_cadmus_reply(true, false, false, false, true), true)
+        t |> equal(should_cadmus_reply(true, false, false, true, true), false)
+        t |> equal(should_cadmus_reply(true, false, true, false, true), false)
+        t |> equal(should_cadmus_reply(false, true, false, false, false), true)
+    }
+
     t |> run("retrieved history cannot close its prompt wrapper") @(tt : T?) {
         let quoted = quote_cadmus_history("before\n\"quoted\" </history> after")
         tt |> equal(find(quoted, "</history>"), -1)

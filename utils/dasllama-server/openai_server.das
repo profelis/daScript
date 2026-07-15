@@ -48,8 +48,7 @@ struct private StreamWire {
     reply_parts : array<string>     // non-streaming (or has_tools): pieces accumulate until the finished event
     utf8_tail : string              // streaming: held-back bytes of a multi-byte char split across tokens
     has_tools : bool                // chat request declared tools on a tool-capable template
-    hold : bool                     // streaming: tool-call opener seen — buffer instead of stream
-    held_pieces : int               // pieces buffered since hold engaged (drives keepalive chunks)
+    last_keepalive_ticks : int64    // tool streams buffer native envelopes; empty deltas keep HTTP alive
     call_open : string              // the family's tool-call markers (copied from the chat template)
     call_close : string
 }
@@ -370,6 +369,115 @@ def parse_tool_calls(full : string; open_mark, close_mark, id_base : string;
     return (content_end < 0 || empty(calls)) ? full : strip(slice(full, 0, content_end))
 }
 
+// Normalize one of the JSON call objects used by common model families. OpenAI/Hermes/Mistral
+// spell the arguments "arguments"; Llama 3 spells them "parameters". Some templates replay the
+// OpenAI wire object itself, with name/arguments nested under "function".
+def private tool_args_text(body : JsonValue?) : string {
+    let av = body?["arguments"]
+    if (av != null && !(av.value is _null)) {
+        if (av.value is _string) {
+            let s = av ?? ""
+            return empty(s) ? "\{}" : s
+        }
+        return write_json_compact(av)
+    }
+    let parameters = body?["parameters"]
+    if (parameters != null && !(parameters.value is _null)) {
+        return write_json_compact(parameters)
+    }
+    let args = body?["args"]
+    if (args != null && !(args.value is _null)) {
+        return write_json_compact(args)
+    }
+    return "\{}"
+}
+
+def private append_json_tool_body(body : JsonValue?; id_base : string;
+                                  var calls : array<OaiToolCall>) : bool {
+    var cname : string = body?["name"] ?? ""
+    if (empty(cname)) {
+        let fn = body?["function"]
+        if (fn != null && fn.value is _string) {
+            cname = fn ?? ""
+        }
+    }
+    if (empty(cname)) {
+        return false
+    }
+    calls |> push(OaiToolCall(id = "{id_base}_{length(calls)}", _type = "function",
+                              _function = OaiToolCallFn(name = cname, arguments = tool_args_text(body))))
+    return true
+}
+
+def private append_json_tool_call(cjs : JsonValue?; id_base : string;
+                                  var calls : array<OaiToolCall>) : bool {
+    if (cjs == null || !(cjs.value is _object)) {
+        return false
+    }
+    let fv = cjs?["function"]
+    if (fv != null && fv.value is _object) {
+        return append_json_tool_body(fv, id_base, calls)
+    }
+    return append_json_tool_body(cjs, id_base, calls)
+}
+
+def private parse_tool_json(body : string; id_base : string; var calls : array<OaiToolCall>) : bool {
+    var perr = ""
+    var js = read_json(strip(body), perr)
+    if (js == null) {
+        return false
+    }
+    defer() {
+        unsafe {
+            delete js
+        }
+    }
+    let before = length(calls)
+    if (js.value is _array) {
+        for (cjs in (js.value as _array)) {
+            append_json_tool_call(cjs, id_base, calls)
+        }
+    } else {
+        append_json_tool_call(js, id_base, calls)
+    }
+    return length(calls) > before
+}
+
+//! Normalize the output envelopes used by the model families most often served through an
+//! OpenAI-compatible endpoint. The template-declared wrapper wins; the remaining probes cover
+//! Hermes/Qwen XML, Mistral's array marker, Llama 3's python tag, and strict bare JSON. Bare JSON
+//! is accepted only when it is entirely a valid named call, so ordinary JSON answers stay content.
+def parse_tool_calls_auto(full : string; declared_open, declared_close, id_base : string;
+                          var calls : array<OaiToolCall>) : string {
+    if (!empty(declared_open) && !empty(declared_close) && find(full, declared_open) >= 0) {
+        let content = parse_tool_calls(full, declared_open, declared_close, id_base, calls)
+        if (!empty(calls)) {
+            return content
+        }
+    }
+    if ((declared_open != "<tool_call>" || declared_close != "</tool_call>") &&
+        find(full, "<tool_call>") >= 0) {
+        let content = parse_tool_calls(full, "<tool_call>", "</tool_call>", id_base, calls)
+        if (!empty(calls)) {
+            return content
+        }
+    }
+    let mistral = find(full, "[TOOL_CALLS]")
+    if (mistral >= 0 &&
+        parse_tool_json(slice(full, mistral + length("[TOOL_CALLS]")), id_base, calls)) {
+        return strip(slice(full, 0, mistral))
+    }
+    let llama = find(full, "<|python_tag|>")
+    if (llama >= 0 &&
+        parse_tool_json(slice(full, llama + length("<|python_tag|>")), id_base, calls)) {
+        return strip(slice(full, 0, llama))
+    }
+    if (parse_tool_json(full, id_base, calls)) {
+        return ""
+    }
+    return full
+}
+
 def private send_compl_chunk(srv : WebSocketServer; var writer : HttpResponseWriter?;
                              id : string; created : int64; text, finish : string) {
     var chunk = OaiComplStreamChunk(id = id, _object = "text_completion", created = created, model = g_model_name)
@@ -401,7 +509,7 @@ def private tmpdir() : string {
 let CHAT_FIELDS : table<string> <- { "model", "messages", "stream", "temperature", "top_k", "top_p", "min_p",
                                      "presence_penalty", "frequency_penalty", "repeat_penalty", "seed",
                                      "max_tokens", "max_completion_tokens", "tools", "tool_choice",
-                                     "enable_thinking", "chat_template_kwargs" }
+                                     "enable_thinking", "chat_template_kwargs", "truncation" }
 let COMPL_FIELDS : table<string> <- { "model", "prompt", "stream", "temperature", "top_k", "top_p", "min_p",
                                      "presence_penalty", "frequency_penalty", "repeat_penalty", "seed",
                                      "max_tokens" }
@@ -560,6 +668,7 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
     var wire <- StreamWire(writer = writer, streaming = streaming, is_chat = is_chat,
                            id = cid, created = created,
                            has_tools = tools_declared && !empty(call_open),
+                           last_keepalive_ticks = ref_time_ticks(),
                            call_open = call_open, call_close = call_close)
     g_wires[rid] <- wire
     if (streaming && is_chat) {
@@ -570,6 +679,118 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
 // Parse + validate + render + register, then return — no generation in the handler. The prompt is
 // rendered through the S1 render seam (tokens only, no KV), so a queued request holds no cache
 // memory; the session exists only once the scheduler admits the stream.
+// Render a user-led suffix of the transcript. System messages are always retained (they were
+// folded into `system`); `start` applies only to conversational messages in the original array.
+def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : array<string>;
+                               max_new : int64; start : int; thinking : bool;
+                               var prompt, stop_ids, close : array<int64>&;
+                               var call_open, call_close : string&) : string {
+    var chat <- create_chat_renderer(g_model, system, max_new)
+    defer() { delete chat }
+    if (!thinking) {
+        set_thinking(chat, false)
+    }
+    if (!empty(tools)) {
+        if (empty(chat.tmpl.tool_call_open)) {
+            return "'tools' is not supported: the {g_model_name} chat template declares no tool-call format"
+        }
+        var render_tools <- [for (tool in tools); tool]
+        set_tools(chat, render_tools)
+        delete render_tools
+    }
+
+    var rendered : array<int64>
+    var pending = false
+    var tool_results : array<string>
+    defer() { delete tool_results }
+    for (i in range(length(msgs_v.value as _array))) {
+        let mv = (msgs_v.value as _array)[i]
+        let role = mv?["role"] ?? ""
+        if (role != "system" && i < start) {
+            continue
+        }
+        let content = message_text(mv, "/v1/chat/completions")
+        if (role != "tool" && !empty(tool_results)) {
+            add_tool_results(chat, tool_results)
+            tool_results |> clear()
+            pending = true
+        }
+        if (role == "user") {
+            add_user(chat, content)
+            pending = true
+        } elif (role == "assistant") {
+            var calls : array<string>
+            let tc = mv?["tool_calls"]
+            if (tc != null && tc.value is _array) {
+                calls |> reserve(length(tc.value as _array))
+                for (tcall in (tc.value as _array)) {
+                    let fv = tcall?["function"]
+                    var nv = JV(fv?["name"] ?? "")
+                    let cname = write_json_compact(nv)
+                    unsafe {
+                        delete nv
+                    }
+                    let av = fv?["arguments"]
+                    var argstr = "\{}"
+                    if (av != null && av.value is _string) {
+                        let s = av ?? ""
+                        if (!empty(s)) {
+                            argstr = s
+                        }
+                    } elif (av != null && !(av.value is _null)) {
+                        argstr = write_json_compact(av)
+                    }
+                    calls |> push("\{\"name\": {cname}, \"arguments\": {argstr}}")
+                }
+            }
+            if (pending) {
+                if (!empty(calls)) {
+                    render_assistant_calls(g_model, chat, content, calls, rendered)
+                } else {
+                    render_assistant(g_model, chat, content, rendered)
+                }
+                pending = false
+            }
+            delete calls
+        } elif (role == "tool") {
+            tool_results |> push(content)
+        } elif (role != "system") {
+            to_log(LOG_WARNING, "/v1/chat/completions: dropping message with unsupported role '{role}'\n")
+        }
+    }
+    if (!empty(tool_results)) {
+        add_tool_results(chat, tool_results)
+        pending = true
+    }
+    if (!pending) {
+        delete rendered
+        return "the last message must be a user or tool message"
+    }
+    var turn <- render_turn(g_model, chat)
+    rendered |> push_from(turn)
+    delete turn
+    prompt <- rendered
+    stop_ids <- chat.stop_ids
+    close <- render_close(g_model, chat)
+    call_open := chat.tmpl.tool_call_open
+    call_close := chat.tmpl.tool_call_close
+    return ""
+}
+
+// Move to the next user-led suffix, dropping a complete oldest user/assistant/tool exchange.
+def private next_user_start(msgs_v : JsonValue?; start : int) : int {
+    var saw_user = false
+    for (i in range(start, length(msgs_v.value as _array))) {
+        if (((msgs_v.value as _array)[i]?["role"] ?? "") == "user") {
+            if (saw_user) {
+                return i
+            }
+            saw_user = true
+        }
+    }
+    return -1
+}
+
 def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
     var perr = ""
     var js = read_json(string(req.body), perr)
@@ -592,6 +813,11 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
         req_max = js?["max_completion_tokens"] ?? g_default_max_new   // the newer OpenAI spelling
     }
     let max_new = clamp_max(req_max)
+    let truncation = js?["truncation"] ?? "disabled"
+    if (truncation != "disabled" && truncation != "auto") {
+        bad_request(srv, writer, "'truncation' must be 'disabled' or 'auto'")
+        return
+    }
 
     // tools: each tools[] entry re-serialized verbatim into the system turn's tool block.
     // tool_choice: "none" drops them; the object form (forced function) is not honored.
@@ -632,8 +858,6 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
             system = empty(system) ? sc : "{system}\n{sc}"
         }
     }
-    var chat <- create_chat_renderer(g_model, system, max_new)
-    defer() { delete chat }
     // top-level enable_thinking, or the llama.cpp-server spelling chat_template_kwargs.enable_thinking;
     // other kwargs keys warn like any unsupported field instead of vanishing
     let ctk = js?["chat_template_kwargs"]
@@ -648,90 +872,41 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     }
     var think = js?["enable_thinking"] ?? true
     think = think && (ctk?["enable_thinking"] ?? true)
-    if (!think) {
-        set_thinking(chat, false)
-    }
     let has_tools = !empty(tools)
-    if (has_tools) {
-        if (empty(chat.tmpl.tool_call_open)) {
-            bad_request(srv, writer, "'tools' is not supported: the {g_model_name} chat template declares no tool-call format")
-            return
-        }
-        set_tools(chat, tools)   // moved in; `tools` is empty from here
-    }
     var prompt : array<int64>
     defer() { delete prompt }
-    var pending = false
-    var tool_results : array<string>
-    defer() { delete tool_results }
-    for (mv in (msgs_v.value as _array)) {
-        let role = mv?["role"] ?? ""
-        let content = message_text(mv, "/v1/chat/completions")
-        if (role != "tool" && !empty(tool_results)) {
-            add_tool_results(chat, tool_results)   // flush the consecutive tool-result run
-            tool_results |> clear()
-            pending = true
+    var stop_ids : array<int64>
+    defer() { delete stop_ids }
+    var close : array<int64>
+    defer() { delete close }
+    var call_open = ""
+    var call_close = ""
+    var start = 0
+    while (true) {
+        let render_error = render_chat_suffix(msgs_v, system, tools, max_new, start, think,
+                                              prompt, stop_ids, close, call_open, call_close)
+        if (!empty(render_error)) {
+            bad_request(srv, writer, render_error)
+            return
         }
-        if (role == "user") {
-            add_user(chat, content)
-            pending = true
-        } elif (role == "assistant") {
-            // rebuild any tool calls this turn made as the {"name","arguments"} objects the
-            // template renders (the wire carries arguments as JSON text — spliced verbatim)
-            var calls : array<string>
-            let tc = mv?["tool_calls"]
-            if (tc != null && tc.value is _array) {
-                calls |> reserve(length(tc.value as _array))
-                for (tcall in (tc.value as _array)) {
-                    let fv = tcall?["function"]
-                    var nv = JV(fv?["name"] ?? "")   // JSON-escape the name (quotes/backslashes)
-                    let cname = write_json_compact(nv)
-                    unsafe {
-                        delete nv
-                    }
-                    let av = fv?["arguments"]
-                    var argstr = "\{}"
-                    if (av != null && av.value is _string) {
-                        let s = av ?? ""
-                        if (!empty(s)) {
-                            argstr = s
-                        }
-                    } elif (av != null && !(av.value is _null)) {
-                        argstr = write_json_compact(av)   // tolerated: arguments sent as an object
-                    }
-                    calls |> push("\{\"name\": {cname}, \"arguments\": {argstr}}")
-                }
-            }
-            if (pending) {
-                if (!empty(calls)) {
-                    render_assistant_calls(g_model, chat, content, calls, prompt)
-                } else {
-                    render_assistant(g_model, chat, content, prompt)
-                }
-                pending = false
-            }
-            delete calls
-        } elif (role == "tool") {
-            tool_results |> push(content)
-        } elif (role != "system") {
-            to_log(LOG_WARNING, "/v1/chat/completions: dropping message with unsupported role '{role}'\n")
+        let required = int64(length(prompt)) + (truncation == "auto" ? max_new : 1l)
+        if (required <= g_model.config.seq_len || truncation != "auto") {
+            break
         }
+        let next = next_user_start(msgs_v, start)
+        if (next < 0) {
+            bad_request(srv, writer,
+                        "the system prompt, tools, and latest turn need {required} tokens including the requested output; the model context is {g_model.config.seq_len} - shorten the request, lower max_tokens, or raise --ctx")
+            return
+        }
+        to_log(LOG_INFO, "/v1/chat/completions: auto truncation dropped messages [0, {next}) to reserve {max_new} output tokens\n")
+        start = next
+        delete prompt
+        delete stop_ids
+        delete close
     }
-    if (!empty(tool_results)) {
-        add_tool_results(chat, tool_results)   // trailing tool results: generation continues from them
-        pending = true
-    }
-    if (!pending) {
-        bad_request(srv, writer, "the last message must be a user or tool message")
-        return
-    }
-    var turn <- render_turn(g_model, chat)
-    prompt |> push_from(turn)
-    delete turn
-    var close <- render_close(g_model, chat)
-    defer() { delete close }   // register_request moves it on success; the 400/503 paths leave it here
-    register_request(srv, writer, prompt, chat.stop_ids, close, params, max_new, streaming, true, "chatcmpl",
-                     has_tools, chat.tmpl.tool_call_open, chat.tmpl.tool_call_close, seed)
+    register_request(srv, writer, prompt, stop_ids, close, params, max_new, streaming, true, "chatcmpl",
+                     has_tools, call_open, call_close, seed)
 }
 
 def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
@@ -772,6 +947,21 @@ def private reap_disconnected(srv : WebSocketServer) {
     }
 }
 
+// Tool-capable streaming buffers the model's native envelope until it can be normalized into an
+// OpenAI tool_calls delta. Slow CPU inference can otherwise leave the socket silent beyond libhv's
+// keep-alive window during prefill or generation. Emit a valid empty delta at least every 10s;
+// scheduler steps may be long, so this is intentionally time-based rather than token-count-based.
+def private flush_tool_keepalives(srv : WebSocketServer) {
+    for (id in keys(g_wires)) {
+        var w = unsafe(g_wires?[id])
+        if (w != null && w.streaming && w.has_tools &&
+            get_time_usec(w.last_keepalive_ticks) >= 10000000) {
+            send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "")
+            w.last_keepalive_ticks = ref_time_ticks()
+        }
+    }
+}
+
 // Route drained SchedEvents to their writers: streaming wires emit SSE chunks, buffered wires
 // accumulate pieces and respond once at finish. "evicted" releases the writer with no bytes —
 // the client is gone (reap_disconnected produced it). Finished wires unregister.
@@ -786,33 +976,13 @@ def private flush_events(srv : WebSocketServer) {
             if (!w.streaming || w.has_tools) {
                 w.reply_parts |> push(e.text)   // buffered reply, and/or the finish-time tool-call parse
             }
-            if (w.streaming && w.hold) {
-                // a long tool-call body buffers for minutes at decode speed; with no bytes on the
-                // wire the client's idle timeout kills the stream (pi: "terminated" + retry loop).
-                // An empty delta {} is protocol-legal liveness every ~16 tokens.
-                w.held_pieces ++
-                if (w.held_pieces % 16 == 0) {
-                    send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "")
-                }
+            if (w.streaming && w.has_tools) {
+                // Buffer all tool-capable output until finish so native model envelopes never leak
+                // onto the OpenAI wire. flush_tool_keepalives covers slow prefill and generation.
             } elif (w.streaming) {
                 // re-join any held-back partial character, then hold the new incomplete tail
                 // so every delta on the wire is valid UTF-8 by itself
                 let whole = "{w.utf8_tail}{e.text}"
-                if (w.has_tools) {
-                    // the ChatML tool-call opener is one vocab token, so per-piece detection is
-                    // exact; from the opener on the reply is tool-call body — buffer, don't stream
-                    let o = find(whole, w.call_open)
-                    if (o >= 0) {
-                        w.hold = true
-                        w.utf8_tail = ""
-                        to_log(LOG_INFO, "stream {w.id}: tool-call opener — buffering the call body (keepalives on)\n")
-                        let head = slice(whole, 0, o)   // the opener starts on a char boundary (ascii)
-                        if (!empty(head)) {
-                            send_chat_chunk(srv, w.writer, w.id, w.created, "", head, "")
-                        }
-                        continue
-                    }
-                }
                 let hold = utf8_hold_bytes(whole)
                 let cut = length(whole) - hold
                 let emit_now = hold > 0 ? slice(whole, 0, cut) : whole
@@ -836,17 +1006,18 @@ def private flush_events(srv : WebSocketServer) {
                 to_log(LOG_WARNING, "dasllama-server: stream {w.id} ended mid-UTF-8-sequence; dropped {length(w.utf8_tail)} byte(s)\n")
             }
             var finish = e.finish
-            if (w.hold) {
-                // the buffered tail is tool-call body: parse it into a tool_calls delta (the
-                // pre-opener content already streamed); nothing parseable => release it as text
+            if (w.has_tools) {
+                // Normalize the complete reply, then send content and calls in OpenAI framing.
                 let full = join(w.reply_parts, "")
                 var calls : array<OaiToolCall>
-                parse_tool_calls(full, w.call_open, w.call_close, "call_{e.stream}", calls)
+                let content = parse_tool_calls_auto(full, w.call_open, w.call_close,
+                                                    "call_{e.stream}", calls)
+                if (!empty(content)) {
+                    send_chat_chunk(srv, w.writer, w.id, w.created, "", content, "")
+                }
                 if (!empty(calls)) {
                     send_chat_tool_calls_chunk(srv, w.writer, w.id, w.created, calls)
                     finish = "tool_calls"
-                } else {
-                    send_chat_chunk(srv, w.writer, w.id, w.created, "", slice(full, find(full, w.call_open)), "")
                 }
                 delete calls
             }
@@ -862,8 +1033,9 @@ def private flush_events(srv : WebSocketServer) {
             var content = full
             var finish = e.finish
             var calls : array<OaiToolCall>
-            if (w.has_tools && find(full, w.call_open) >= 0) {
-                content = parse_tool_calls(full, w.call_open, w.call_close, "call_{e.stream}", calls)
+            if (w.has_tools) {
+                content = parse_tool_calls_auto(full, w.call_open, w.call_close,
+                                                "call_{e.stream}", calls)
                 if (!empty(calls)) {
                     finish = "tool_calls"
                 }
@@ -1066,6 +1238,7 @@ def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; ch
                     to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms (active={n_active(g_sched)}, queued={n_queued(g_sched)})\n")
                 }
                 flush_events(server.server)
+                flush_tool_keepalives(server.server)
                 if (!busy) {
                     sleep(2u)
                 }

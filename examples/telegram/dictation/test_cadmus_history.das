@@ -2,6 +2,8 @@ options gen2
 
 require dastest/testing_boost public
 require daslib/fio
+require daslib/sql_linq
+require daslib/linq_das
 require sqlite/sqlite_migrate
 require cadmus_history
 
@@ -35,9 +37,15 @@ def test_history_migrations_linq_and_fts(t : T?) {
     remove(path)
     ensure_cadmus_database(path)
 
-    t |> run("starts at migration two") @(t : T?) {
+    t |> run("starts at migration four") @(t : T?) {
         with_sqlite(path) $(db) {
-            t |> equal(db |> current_schema_version(), 2)
+            t |> equal(db |> current_schema_version(), 4)
+        }
+    }
+
+    t |> run("Cadmus connections tolerate long-running import writers") @(t : T?) {
+        with_cadmus_database(path) $(db) {
+            t |> equal(db |> query_scalar("PRAGMA busy_timeout", type<int64>), 120000l)
         }
     }
 
@@ -84,6 +92,73 @@ def test_history_migrations_linq_and_fts(t : T?) {
         t |> equal(length(chat_rows), 3)
         t |> equal(length(user_rows), 2)
         t |> equal(user_rows[0].ChatId, 10l)
+    }
+
+    t |> run("tool search returns only user messages from the requested chat") @(t : T?) {
+        var assistant = test_message(10l, 20l, 100l, 1500l, "private assistant needle")
+        assistant.Role = CADMUS_ROLE_ASSISTANT
+        upsert_cadmus_message(path, assistant)
+        t |> equal(is_cadmus_assistant_message(path, 10l, 20l), true)
+        t |> equal(is_cadmus_assistant_message(path, 20l, 20l), false)
+        upsert_cadmus_message(path, test_message(20l, 21l, 7l, 1501l, "other chat needle"))
+        upsert_cadmus_message(path, test_message(10l, 22l, 8l, 1502l, "local user needle"))
+        let rows <- search_cadmus_user_messages(path, 10l, "needle", 20)
+        t |> equal(length(rows), 1)
+        if (length(rows) == 1) {
+            t |> equal(rows[0].TelegramMessageId, 22l)
+            t |> equal(rows[0].Role, CADMUS_ROLE_USER)
+            t |> equal(rows[0].ChatId, 10l)
+        }
+    }
+
+    t |> run("transcript delivery ids persist and stay chat-local") @(t : T?) {
+        remember_cadmus_transcript_delivery(path, 10l, 500l, 3l)
+        t |> equal(is_cadmus_transcript_delivery(path, 10l, 500l), true)
+        t |> equal(is_cadmus_transcript_delivery(path, 20l, 500l), false)
+        t |> equal(is_cadmus_transcript_delivery(path, 10l, 501l), false)
+        remember_cadmus_transcript_delivery(path, 10l, 500l, 4l)
+        t |> equal(is_cadmus_transcript_delivery(path, 10l, 500l), true)
+    }
+
+    t |> run("timeline context and links stay chat-local") @(t : T?) {
+        let stats = cadmus_mention_stats(path, 10l, "needle")
+        t |> equal(stats.Total, 2)
+        t |> equal(stats.FirstDate, 1500l)
+        t |> equal(stats.LastDate, 1502l)
+        let context <- load_cadmus_message_context(path, 10l, 20l, 1, 1)
+        t |> equal(length(context), 3)
+        if (length(context) == 3) {
+            t |> equal(context[1].TelegramMessageId, 20l)
+        }
+        t |> equal(cadmus_message_link(-1001234567890l, 42l), "https://t.me/c/1234567890/42")
+        t |> equal(cadmus_message_link(-1001234567890l, 42l, "@public_chat"),
+                   "https://t.me/public_chat/42")
+        t |> equal(cadmus_message_link(123l, 42l), "")
+    }
+
+    t |> run("import media checkpoint preserves unchanged completed work") @(t : T?) {
+        with_cadmus_database(path) $(db) {
+            db |> with_transaction(SqliteTxnMode.Immediate) {
+                upsert_cadmus_import_media_db(db, CadmusImportMedia(
+                    Id = 0, ChatId = 10l, TelegramMessageId = 700l,
+                    RelativePath = "voice_messages/audio.ogg", FileSize = 100l,
+                    ModifiedAt = 200l, Status = "done", Attempts = 1,
+                    LastError = "", PipelineVersion = 1))
+                upsert_cadmus_import_media_db(db, CadmusImportMedia(
+                    Id = 0, ChatId = 10l, TelegramMessageId = 700l,
+                    RelativePath = "voice_messages/audio.ogg", FileSize = 100l,
+                    ModifiedAt = 200l, Status = "pending", Attempts = 0,
+                    LastError = "", PipelineVersion = 1))
+            }
+            let rows <- %linq! from media : CadmusImportMedia in db
+                               where media.ChatId == 10l && media.TelegramMessageId == 700l
+                               select media %%
+            t |> equal(length(rows), 1)
+            if (length(rows) == 1) {
+                t |> equal(rows[0].Status, "done")
+                t |> equal(rows[0].Attempts, 1)
+            }
+        }
     }
 
     t |> run("empty username never resolves to an anonymous sender") @(t : T?) {

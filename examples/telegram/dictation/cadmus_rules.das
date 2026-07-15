@@ -51,6 +51,26 @@ def starts_with_cadmus_alias(text, aliases_csv : string) : bool {
     return false
 }
 
+def starts_with_cadmus_username(text, bot_username : string) : bool {
+    let target = to_lower(strip(trim_prefix(bot_username, "@")))
+    return !empty(target) && has_alias_boundary(to_lower(strip(text)), "@{target}")
+}
+
+def should_cadmus_reply(
+                        replies_enabled, is_command, is_edit, is_transcript_reply, is_addressed : bool
+                        ) : bool {
+    if (is_edit) {
+        return false
+    }
+    if (is_command) {
+        return true
+    }
+    if (is_transcript_reply) {
+        return false
+    }
+    return replies_enabled && is_addressed
+}
+
 def quote_cadmus_history(text : string) : string {
     let json = sprint_json(text, false)
     return replace_multiple(json, [

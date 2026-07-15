@@ -4,15 +4,28 @@ Cadmus transcribes Telegram voice notes through a local `dasllama-server`, clean
 and answers questions using the current chat's locally stored history. The Telegram bot contains no
 models; the server owns ASR and LLM inference.
 
+Cadmus requests automatic oldest-turn truncation from the chat endpoint, which preserves the system
+prompt, database tools, and newest turns while reserving the configured output budget. It refuses
+to post a response returned with `finish_reason: "length"`, so a cut-off answer is never presented
+as complete.
+
 For each voice message the bot downloads the audio, converts it to 16 kHz mono WAV with ffmpeg,
 calls `/v1/audio/transcriptions`, then applies the editable `dictation_prompt` through
 `/v1/chat/completions`. The cleaned transcript is recorded as the user's message. The bot's
 transcript-delivery reply is deliberately not recorded as an assistant turn.
 
 Every inbound text, caption, voice, and audio message visible to the bot is retained in local SQLite.
-Real Cadmus answers are retained in the same history. In private chats Cadmus answers every message;
-in groups it answers mentions, replies to the bot, commands, and configured wake-name prefixes.
-Retrieval and summaries never cross the current Telegram chat.
+Real Cadmus answers are retained in the same history. Conversational answers are disabled by default;
+set `reply_when_mentioned = true` to answer a leading `@bot` username or wake name, replies to real
+answers, and private-chat messages. A reference to Cadmus later in a message is ignored. `/help` and
+`/summary` remain available either way. Replies to bot-authored transcript deliveries are treated as
+attribution to the speaker and never trigger Cadmus.
+
+Cadmus has four current-chat-only history tools: full-text search, first/last/count timelines,
+message context, and chronological browsing. Results include Telegram message IDs and post links.
+The runtime supplies the current chat ID, so the model cannot request another channel's history.
+Failures in transcription, cleanup, summaries, or conversational generation are reported in the
+originating Telegram chat with a `⚠` marker.
 
 ## Requirements
 
@@ -31,9 +44,10 @@ The bot itself does not require JIT. Edit `dictation.toml` first. `TELEGRAM_BOT_
 `bot_token`. Relative database and log paths resolve beside the executable in a release and beside
 `main.das` during development.
 
-The database is created automatically. Migration 1 creates message/state storage; migration 2 adds
-the FTS5 retrieval index. Telegram update offsets are persisted, and `(chat_id, message_id)` makes
-replayed updates and edits idempotent. History is retained indefinitely.
+The database is created automatically. Migration 1 creates message/state storage, migration 2 adds
+the FTS5 index, migration 3 records outgoing transcript-delivery IDs, and migration 4 adds resumable
+Telegram-export media checkpoints. Telegram update offsets are persisted, and
+`(chat_id, message_id)` makes replayed updates and edits idempotent. History is retained indefinitely.
 
 ## Conversation and summary commands
 
@@ -77,9 +91,11 @@ Commands work without registering them, but the Telegram command menu is configu
 | `bot_token` | BotFather token; the environment variable wins |
 | `dictation_prompt` | Transcript-repair prompt; `{language}` is replaced per message |
 | `assistant_name`, `assistant_aliases` | Display identity and comma-separated group wake names |
+| `reply_when_mentioned` | Reply when directly addressed at the start, replied to, or in private; default `false` |
+| `history_chat_username` | Optional public chat username for post links; private chats use `t.me/c` links |
 | `assistant_prompt` | Editable conversational personality, separate from trusted runtime rules |
 | `database` | Local SQLite history path |
-| `recent_messages`, `history_search_results` | Recent and FTS context sizes |
+| `recent_messages`, `history_search_results` | Recent context and per-tool FTS result limits |
 | `summary_chunk_messages`, `summary_max_messages` | Summary reduction limits |
 | `max_tokens`, `temp` | Dictation cleanup generation settings |
 | `assistant_max_tokens`, `assistant_temp` | Conversational generation settings |
@@ -90,6 +106,38 @@ Commands work without registering them, but the Telegram command menu is configu
 The legacy `prompt` key is still accepted for deployed configs, but new configs should use
 `dictation_prompt`. Keeping it separate from `assistant_prompt` prevents conversational personality
 from changing dictation.
+
+## Importing older Telegram history
+
+The HTTP Bot API cannot fetch arbitrary pre-existing chat or channel history. `getUpdates` exposes
+only the pending update queue, and Telegram may remove older bot messages after processing. The
+MTProto `messages.getHistory` method does provide history, but Telegram marks it as user-only, so the
+bot token cannot use it.
+
+A practical backfill therefore uses Telegram Desktop's HTML export. The importer is incremental:
+completed `messages*.html` pages are safe to re-run, the newest page is skipped while the export is
+growing, and message upserts are idempotent. HTML exports expose display names but not stable Telegram
+sender IDs, so imported senders receive deterministic negative IDs based on their display names.
+
+Dry-run the current stable pages:
+
+```text
+bin/daslang examples/telegram/dictation/import_history.das -- \
+  --root <telegram-export> --database cadmus.db --chat-id <telegram-chat-id>
+```
+
+Catalog them, then raw-transcribe queued audio without LLM cleanup:
+
+```text
+bin/daslang examples/telegram/dictation/import_history.das -- \
+  --root <telegram-export> --database cadmus.db --chat-id <telegram-chat-id> \
+  --apply --transcribe --server http://127.0.0.1:8080
+```
+
+Raw ASR runs one file at a time, smallest first. It stores the result in both `Content` and
+`RawTranscript`, updates FTS immediately, and records `pending`, `done`, or `failed` durably. Use
+`--retry-failed` to retry failures and `--max-audio N` for a bounded batch. Re-run the same command as
+Telegram Desktop produces more pages; use `--include-last-page` only after the export has finished.
 
 ## Release
 

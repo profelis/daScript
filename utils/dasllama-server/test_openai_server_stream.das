@@ -104,9 +104,15 @@ struct private RespChoice {
     message : RespMsg
     finish_reason : string
 }
+struct private RespUsage {
+    prompt_tokens : int64
+    completion_tokens : int64
+    total_tokens : int64
+}
 struct private ChatResp {
     @rename = "object" _object : string
     choices : array<RespChoice>
+    usage : RespUsage
 }
 
 // one concurrent client's verdict, shipped back over the channel (asserts live on the main thread)
@@ -183,6 +189,33 @@ def test_openai_server_stream(t : T?) {
                 t |> success(js != null, "error body parses")
                 if (js != null) {
                     t |> equal(string(js?["error"]?["type"] ?? ""), "invalid_request_error")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+        }
+        t |> run("auto truncation drops oldest turns and reserves output space") @(t : T?) {
+            let old_turn = build_string() $(w) {
+                for (_i in range(1400)) {
+                    w |> write("obsolete ")
+                }
+            }
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"messages\":[\{\"role\":\"user\",\"content\":\"{old_turn}\"}," +
+                 "\{\"role\":\"assistant\",\"content\":\"Understood.\"}," +
+                 "\{\"role\":\"user\",\"content\":\"Answer with OK.\"}]," +
+                 "\"max_tokens\":4,\"truncation\":\"auto\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var perr = ""
+                var js = read_json(string(resp.body), perr)
+                t |> success(js != null, "response body parses")
+                if (js != null) {
+                    let cr = from_JV(js, type<ChatResp>)
+                    t |> equal(cr._object, "chat.completion")
+                    t |> equal(length(cr.choices), 1)
+                    t |> success(cr.usage.prompt_tokens < 128l,
+                                 "old turn was removed from the rendered prompt ({cr.usage.prompt_tokens} tokens remain)")
                     unsafe {
                         delete js
                     }

@@ -96,7 +96,7 @@ so the deployed config survives. Stop a running server first — Windows locks t
 ```sh
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "messages": [{"role": "user", "content": "Say hello in one word."}],
-  "max_tokens": 16, "stream": false
+  "max_tokens": 16, "stream": false, "truncation": "auto"
 }'
 ```
 
@@ -129,6 +129,13 @@ Hybrid thinking models (the Qwen3/Qwen3.6 family) reason in a `<think>` block by
 empty think block (`<think>\n\n</think>\n\n`) to the generation prompt — the model answers
 directly, matching the family Jinja's `enable_thinking=false` form. A no-op for models whose
 vocab has no think tokens.
+
+### Context truncation
+
+By default, an over-context rendered prompt returns HTTP 400. Set `truncation: "auto"` to preserve
+system messages and tools while dropping the oldest complete user-led turns until the prompt plus
+the requested `max_tokens` output budget fits. If the system/tools/latest turn cannot fit, the
+request still returns 400. `finish_reason: "length"` means generation consumed its output budget.
 
 ### Tool / function calling
 

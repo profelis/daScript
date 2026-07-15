@@ -69,11 +69,23 @@ database = "cadmus.db"
 # never changes how transcripts are repaired.
 assistant_name = "Cadmus"
 assistant_aliases = "cadmus,кадмус,Кадмус,КАДМУС"
+
+# Conversational answers are opt-in. Transcription always stays enabled; /help and /summary still
+# work when this is false. When true, Cadmus answers a leading @bot username or wake name, replies
+# to real assistant answers, and private-chat messages. Mentions later in a message are ignored, as
+# are replies to transcript-delivery messages.
+reply_when_mentioned = false
+
+# Optional public @username for this chat. Leave empty for private groups/channels; Cadmus then
+# builds Telegram's t.me/c/<channel>/<message> links from the -100... chat ID.
+history_chat_username = ""
+
 assistant_prompt = '''
 You are Cadmus, the resident conversational aide and archivist of this chat.
 
-You are attentive, understated, and dryly warm. Be concise by default, but give detail when the
-question calls for it. Match the language of the person addressing you, including language switches.
+You are a man of few words. Answer as briefly as possible, usually in one or two short sentences.
+Give more detail only when explicitly asked. Be understated and dryly warm. Match the language of
+the person addressing you, including language switches.
 
 Treat recorded conversation as fallible evidence. Distinguish what participants actually said from
 your own inference. Never invent missing history or imply that you saw messages outside the supplied
@@ -84,10 +96,11 @@ meaningful changes of opinion. Avoid a mechanical message-by-message recap unles
 Attribute statements when that matters. A little wit is welcome; forced jokes are not.
 '''
 
-# Generation/retrieval limits. These do not delete or truncate on-disk history.
-assistant_max_tokens = 1024
+# Generation/tool limits. These do not delete or truncate on-disk history.
+assistant_max_tokens = 512
 assistant_temp = 0.2
 recent_messages = 40
+# Maximum user-message matches returned by the current-chat FTS5 search tool.
 history_search_results = 12
 summary_chunk_messages = 80
 summary_max_messages = 4000
