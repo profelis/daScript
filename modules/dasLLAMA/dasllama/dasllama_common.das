@@ -970,8 +970,11 @@ def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var 
     } elif (fmt == KqFmt.k6) {
         gguf_transcode_q6k(m, bytes, name, t.k6q, t.k6s, woff, n, src_off)
     } elif (t.quant == QuantMode.q8) {
-        if (gguf_tensor_type(m, name) == GGML_TYPE_Q8_0) {
+        let gt = gguf_tensor_type(m, name)
+        if (gt == GGML_TYPE_Q8_0) {
             gguf_transcode_q8_0(m, bytes, name, t.qblob, t.qscales, woff, woff / 32l, n, src_off)
+        } elif (gt == GGML_TYPE_Q5_0) {
+            gguf_transcode_q5_0_to_q8(m, bytes, name, t.qblob, t.qscales, woff, woff / 32l, n, src_off)
         } else {
             scratch |> resize(n)
             gguf_read_tensor_f32(m, bytes, name, scratch, 0l, n, src_off)

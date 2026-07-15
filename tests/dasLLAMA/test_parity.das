@@ -759,6 +759,29 @@ def test_parity_gemma4_26b(t : T?) {
     }
 }
 
+// gemma-4-26B-A4B-it Q4_K_M — the Q5_0 loader gate: the llama.cpp Q4_K_M MoE recipe bumps
+// ffn_down / ffn_down_exps on layers 3+ to Q5_0 (32 tensors), which load via the exact
+// Q5_0->Q8 transcode (byte-level gates in test_gguf_quant.das); the Q4_K/Q6_K rest ride the
+// native kq planes. Oracle simple_ids per-file (harness/parity.sh, 2026-07-15). Capped at 15
+// tokens — the same irreducible top-8 router near-tie as the Q8_0 arm above: at step 15 the
+// oracle derails out of the counting pattern while dasLLAMA keeps counting, so the divergence
+// sits on the oracle's own coin-flip, not a forward bug.
+let GEMMA4_26B_Q4KM_GEN <- [236743l, 236800l, 236778l, 236770l, 236764l, 236743l, 236800l, 236778l, 236778l, 236764l,
+                            236743l, 236800l, 236778l, 236800l, 236764l]
+
+[test]
+def test_parity_gemma4_26b_q4km(t : T?) {
+    t |> run("gemma4 MoE forward (gemma-4-26B-A4B-it Q4_K_M: Q5_0 ffn_down tensors via exact q8 transcode)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "gemma-4-26B-A4B-it-Q4_K_M.gguf")
+        if (!model_available(t, path)) return
+        t |> success(parity_text_ok(path, QuantMode.q8, gemma4_counting_prompt(), GEMMA4_26B_Q4KM_GEN), "gemma4-26b q4km token-for-token")
+    }
+}
+
 // gemma-4-E4B-it Q8 — the gemma4 arch's edge member (42 layers, embd 2560, 8Q/2KV heads;
 // PLE on with per_layer=256, cross-layer KV sharing over the last 18 layers, 5-local:1-global SWA,
 // window 512, softcap 30). Two features beyond the dense 12B/31B:
