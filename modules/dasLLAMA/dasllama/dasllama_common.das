@@ -6673,18 +6673,6 @@ def private mtp_verify_row0(t : Model; var s : Session) {
     }
 }
 
-def private mtp_argmax(a : array<float>; n : int64) : int64 {
-    var best = 0l
-    var bestv = a[0]
-    for (i in range64(n)) {
-        if (a[i] > bestv) {
-            bestv = a[i]
-            best = i
-        }
-    }
-    return best
-}
-
 //! Greedy decode with MTP/NextN depth-1 self-speculation (config.n_layer_nextn == 1; flat KV
 //! cache only). Mirrors generate()'s contract — returns prompt[1..] echoed, then the greedy
 //! continuation, `total` ids overall — and is OUTPUT-INVARIANT vs plain greedy decode: the
@@ -6715,7 +6703,7 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
     // batched trunk prefill (stashes h_{np-1}); the prompt's next token BEFORE the warm pass
     // clobbers s.logits
     forward_prefill(t, s, prompt, np, 0l)
-    var tok = mtp_argmax(s.logits, c.vocab_size)
+    var tok = parallel_argmax(s.logits, c.vocab_size)
     let dim = c.dim
     if (np > 1l) {
         // MTP prompt warm, batched: rows 0..np-2 hold (h_p, x_{p+1}) — every position's trunk
@@ -6752,7 +6740,7 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
         break if (int64(length(ids)) >= total)
         // draft x_{pos+1} from (h_{pos-1}, tok) at row pos-1
         forward_mtp(t, s, tok, pos - 1l)
-        let d = mtp_argmax(s.logits, c.vocab_size)
+        let d = parallel_argmax(s.logits, c.vocab_size)
         n_drafted++
         // batched verify: trunk over [tok@pos, d@pos+1] — weights stream once for both rows
         mtp_state_snapshot(s)
@@ -6760,7 +6748,7 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
         vbatch[1] = d
         forward_prefill(t, s, vbatch, 2l, pos)
         mtp_verify_row0(t, s)
-        let truth = mtp_argmax(s.mtp_logits, c.vocab_size)
+        let truth = parallel_argmax(s.mtp_logits, c.vocab_size)
         if (truth == d) {
             n_accepted++
             break if (d == 1l)   // BOS: generate() stops before emitting it — mirror that
@@ -6768,7 +6756,7 @@ def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total
             // Backfill MTP row pos with the pair (h_pos = mtp_h0, d) — preserve row 1's h first.
             copy_floats(s.mtp_h, 0l, htmp, 0l, c.dim)
             copy_floats(s.mtp_h0, 0l, s.mtp_h, 0l, c.dim)
-            let next = mtp_argmax(s.logits, c.vocab_size)
+            let next = parallel_argmax(s.logits, c.vocab_size)
             forward_mtp(t, s, d, pos, false)   // KV backfill only — no draft here
             copy_floats(htmp, 0l, s.mtp_h, 0l, c.dim)
             ids |> push(d)
