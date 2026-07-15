@@ -5,7 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>dasLLAMA — CPU inference benchmarks · daslang</title>
     <meta name="description" content="dasLLAMA — a CPU LLM + speech-to-text inference engine written in daslang and JIT-compiled. Measured CPU-only benchmarks vs llama.cpp, whisper.cpp, parakeet, ONNX-Runtime and NeMo, on Apple M1 and AMD Threadripper." />
-    <meta name="keywords" content="daslang, dasLLAMA, llama.cpp, CPU inference, LLM benchmark, whisper, parakeet, speech to text, ASR" />
+    <meta name="keywords" content="daslang, dasLLAMA, llama.cpp, CPU inference, local LLM, LLM benchmark, whisper, parakeet, speech to text, ASR, omni model" />
+    <link rel="canonical" href="https://daslang.io/dasllama.html" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://daslang.io/dasllama.html" />
+    <meta property="og:site_name" content="daslang" />
+    <meta property="og:title" content="dasLLAMA — local LLMs with audio in, up to 6× faster on CPU" />
+    <meta property="og:description" content="A CPU LLM + speech-to-text stack written in daslang, JIT-compiled. Auto-tuned kernels beat llama.cpp's on most LLMs; audio/omni workloads run up to ~6× faster. Measured CPU-only benchmarks, methodology included." />
+    <meta name="twitter:card" content="summary" />
 
     <link rel="icon" type="image/svg+xml" href="files/daslang-favicon.svg" />
     <link rel="alternate icon" type="image/x-icon" href="files/daslang.ico" />
@@ -186,22 +193,23 @@
         <div class="forge-container forge-hero__grid">
             <div>
                 <span class="dl-hero__badge"><span class="dot"></span>dasLLAMA · CPU inference</span>
-                <h1>A scripting language that <em>holds its own on CPU.</em></h1>
+                <h1>Local LLMs with audio in — <em>up to 6× faster on CPU.</em></h1>
                 <p class="forge-hero__lede">
                     dasLLAMA is an LLM + speech-to-text stack written entirely in daslang and
-                    JIT-compiled — no hand-written assembly. These are CPU-only comparisons. llama.cpp
-                    is a broader, more mature engine with GPU backends we don't try to match; on the
-                    CPU path alone, das is ahead on prompt processing across the board and trades
-                    blows on generation.
+                    JIT-compiled — no hand-written assembly. Its auto-tuned JIT kernels consistently
+                    outperform llama.cpp's hand-written universal kernels — up to 30% faster on most
+                    LLMs — and the advantage grows with batching and with audio input (Whisper,
+                    Parakeet) or omni models (Gemma, Qwen), reaching ~6× llama.cpp. CPU-only
+                    comparisons; llama.cpp's GPU backends are out of scope here.
                 </p>
                 <div class="forge-hero__ctas">
                     <a class="forge-btn-primary" href="#llm">$ view the scoreboard →</a>
                     <a class="forge-btn-secondary" href="#method">methodology</a>
                 </div>
                 <div class="forge-stats">
-                    <div class="forge-stat"><div class="forge-stat__n" id="stat-prefill-n">up to 1.69×</div><div class="forge-stat__l" id="stat-prefill-l">LLM prefill vs llama.cpp · gemma-4 E4B, M1</div></div>
-                    <div class="forge-stat"><div class="forge-stat__n" id="stat-wins-n">35 / 36</div><div class="forge-stat__l" id="stat-wins-l">runs das ≥ llama.cpp · 18 models × both phases, 3990X</div></div>
-                    <div class="forge-stat"><div class="forge-stat__n" id="stat-audio-n">~5×</div><div class="forge-stat__l">Qwen3-Omni audio vs mtmd, CPU-only (M1)</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n" id="stat-prefill-n">up to 1.74×</div><div class="forge-stat__l" id="stat-prefill-l">LLM prefill vs llama.cpp · gpt-oss-20b, Apple M1 Max</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n" id="stat-wins-n">40 / 42</div><div class="forge-stat__l" id="stat-wins-l">runs das ≥ llama.cpp · 21 models × both phases, 3990X</div></div>
+                    <div class="forge-stat"><div class="forge-stat__n" id="stat-audio-n">~6×</div><div class="forge-stat__l">Qwen3-Omni audio vs mtmd, CPU-only (M1)</div></div>
                 </div>
             </div>
 

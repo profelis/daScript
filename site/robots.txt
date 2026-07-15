@@ -1,4 +1,5 @@
 User-agent: *
 Allow: /
 
+Sitemap: https://daslang.io/sitemap.xml
 Sitemap: https://daslang.io/doc/sitemap.xml

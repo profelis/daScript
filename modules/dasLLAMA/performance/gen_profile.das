@@ -1,5 +1,5 @@
 options gen2
-options stack = 65536   // the forward/prefill chain + generated kernels need more than the 16K default on arm64
+options stack = 524288   // the forward/prefill chain needs more than the 16K default; the 122B/Coder-Next hybrid eval frames outgrew the old 64K (scratch probes needed 512K)
 options _jit_fast_math = true   // ggml-parity FP laxity (non-bit-exact, ~+10%); the profile is a speed measurement
 
 // The das-side half of the profiling suite: for each tier-selected model it measures prefill (one

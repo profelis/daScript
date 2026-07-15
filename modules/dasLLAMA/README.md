@@ -1,12 +1,66 @@
 # dasLLAMA
 
-daslang-native **CPU** LLM inference (Llama / Qwen / Phi / Gemma dense + MoE transformers,
-Qwen3.5/3.6 hybrid-DeltaNet, gpt-oss). Loads GGUF (or llama2.c `.bin`), runs the forward
-pass + KV cache, tokenizes, and decodes — all in daslang, JIT tier. Verified token-for-token
-against `llama.cpp` / `llama2.c`.
+dasLLAMA is a **CPU LLM + speech stack written entirely in daslang** — no C++ kernels, no
+hand-written assembly. The daslang JIT compiles the whole engine, and a per-box auto-tuner
+picks the kernel forms for *your* machine, so the same source ships tuned code on an M1 and
+a Threadripper alike. It loads stock GGUF files (llama.cpp's format — single-file or
+multi-shard splits, F32/F16/Q8_0/Q4_0/MXFP4 and native Q4_K/Q5_K/Q6_K planes), runs text
+LLMs, audio-input "omni" chat models, speech-to-text, and voice-activity detection, and it
+is fast: consistently ahead of llama.cpp's CPU inference on prompt processing (up to ~1.7×),
+trading blows on generation, and up to ~6× ahead on audio/omni workloads — live scoreboard +
+methodology at [daslang.io/dasllama.html](https://daslang.io/dasllama.html). Every supported
+model is **verified token-for-token** against its reference implementation before it lands
+in the support table.
 
-Run a model: `bin/daslang -jit examples/dasLLAMA/run.das -- <model.gguf>`
-Chat: `bin/daslang -jit examples/dasLLAMA/chat.das -- <model.gguf>`
+## Quick start
+
+**Serve it over HTTP** — `utils/dasllama-server/` is a drop-in OpenAI-compatible server
+(chat/completions with streaming + tool calling, embeddings, audio transcription); point
+opencode, Open WebUI, or the `openai` SDK at `http://127.0.0.1:8080/v1`:
+
+```sh
+bin/daslang -jit utils/dasllama-server/main.das -- --model <model.gguf> [--port 8080] \
+    [--asr <asr-model>] [--streams 4] [--ctx 4096]
+```
+
+Flag table, TOML config, and the scheduler/paged-KV details live in
+[utils/dasllama-server/README.md](../../utils/dasllama-server/README.md).
+
+Or drive it from the command line:
+
+```sh
+# greedy/sampled completion + tok/s stats
+bin/daslang -jit examples/dasLLAMA/run.das -- <model.gguf>
+
+# interactive chat REPL — the arch registry picks the template + stop tokens
+bin/daslang -jit examples/dasLLAMA/chat.das -- <model.gguf>
+
+# audio chat (omni models: decoder GGUF + audio mmproj)
+bin/daslang -jit examples/dasLLAMA/audio.das -- <decoder.gguf> <mmproj.gguf> <audio-file> [prompt]
+
+# speech-to-text: whisper / parakeet / canary ggml bins, or qwen3-asr GGUF pairs
+bin/daslang -jit examples/dasLLAMA/transcribe.das -- <ggml-model.bin | decoder.gguf mmproj.gguf> <audio-file>
+
+# live dictation from the microphone
+bin/daslang -jit examples/dasLLAMA/dictate.das -- <asr-model.bin>
+```
+
+## Supported model families
+
+- **Text LLMs** (GGUF, arch auto-detected): Llama-2 / Llama-3 (incl. TinyLlama, SmolLM2,
+  Mistral-7B), Qwen2.5, Qwen3, Qwen-MoE (Qwen1.5-MoE, Qwen3-30B-A3B), the Qwen3.5 / Qwen3.6
+  hybrid-DeltaNet family — dense 0.8B–27B and MoE 35B-A3B / 122B-A10B, including the `-MTP-`
+  files' NextN head for **self-speculative decode** (~1.4× decode on the 27B, output-invariant) —
+  Qwen3-Coder-Next (80B-A3B), Phi-3.5, Gemma-2, Gemma-3, Gemma-4 (dense 12B/31B, 26B-A4B MoE,
+  and the E2B/E4B edge models with per-layer embeddings + cross-layer KV sharing), gpt-oss-20b.
+- **Audio-in chat (omni)**: Qwen2-Audio, Qwen2.5-Omni, Qwen3-Omni-30B-A3B, Ultravox v0.5,
+  Voxtral-Mini-3B, Gemma-4 E-series audio.
+- **Speech-to-text**: the whole Whisper family (tiny → large-v3-turbo, stock whisper.cpp bins),
+  Parakeet-TDT 0.6b v2/v3, Qwen3-ASR 0.6B/1.7B, Canary-Qwen 2.5B.
+- **Voice activity detection**: Silero-VAD v6 (weights checked in — works with zero setup).
+
+The full per-model table — exact files tested, arch notes, and the token-for-token oracle
+evidence — is in [Supported models](#supported-models--what-runs-for-sure) below.
 
 ---
 
@@ -29,6 +83,8 @@ modules/dasLLAMA/
     dasllama_math.das         #   numeric primitives + matmul/dot kernels (fp32, Q8, Q4) + Q8·Q8 kernel-backend registry
     dasllama_math_default.das #   the portable Q8·Q8 kernel backend (the fallback; platform backends out-rank it)
     dasllama_math_aarch64_neon.das # arm64 SDOT row-major Q8·Q8 backend + the laneq dot leaves the gen tier composes ([init]-registered; no-op off-ARM)
+    dasllama_math_metal.das   #   Metal GPU prefill-GEMM backend (batch-only donor; decode GEMV stays CPU)
+    dasllama_metal_prefill.das #  Metal full-GPU-resident prefill kernel set (requant, rmsnorm, rope, attention)
     dasllama_math_gen.das     #   the generated GEMM tier — registers "arm64-gen"/"x64-gen" (load-select repack backends; traversals read the stamped layout)
     dasllama_gemm_schema.das  #   tune_perm grid + layout schema shared by the generator and the runtime
     dasllama_gemm_gen.das     #   the GEMM tile generator (emits per-perm kernels under llvm_tune)
@@ -40,9 +96,13 @@ modules/dasLLAMA/
     dasllama_unicode.das      #   Unicode classification + UTF-8 codec
     dasllama_tokenizer.das    #   SentencePiece tokenizer (Llama-2 family, Phi-3, Gemma)
     dasllama_bpe.das          #   byte-level BPE / tiktoken tokenizer (Llama-3 + Qwen2 pre-tokenizers)
-    dasllama_common.das       #   engine core — Config / Model / Session, load + forward + generate + sample
+    dasllama_common.das       #   engine core — Config / Model / Session, load + forward + generate + sample (incl. MTP/NextN self-spec decode)
+    dasllama_prefix.das       #   vLLM-style page-granular prefix cache over the paged KV pool
+    dasllama_audio_io.das     #   miniaudio decode (wav/mp3/flac/ogg -> 16 kHz mono f32) + mic capture
     dasllama_audio.das        #   audio tower — whisper mel frontends + encoder core + qwen2a projector (soft-token splice)
     dasllama_whisper.das      #   whisper-proper ASR — ggml-bin loader, cross-attn decoder, greedy driver, transcribe API
+    dasllama_parakeet.das     #   Parakeet-TDT ASR — FastConformer + LSTM predictor + duration-skip transducer
+    dasllama_canary.das       #   Canary-Qwen ASR — FastConformer-32 encoder + projector over a stock Qwen3 decoder
     dasllama_qwen3a.das       #   Qwen3-ASR audio encoder — conv2d chunk frontend, windowed transformer, MLP projector
     dasllama_gemma4a.das      #   Gemma-4 E-series audio encoder — gemma4a Conformer (macaron FFN, chunked-local RPE attn, conv module, per-op activation clamps) + mm embedder
     dasllama_asr.das          #   uniform ASR surface — load_asr_model (format-sniffed), caps(), family-free verbs
@@ -50,6 +110,7 @@ modules/dasLLAMA/
     dasllama_arch_llama.das   #   Llama / Llama-2 / Llama-3 / TinyLlama arch (config + chat template)
     dasllama_arch_qwen2.das   #   Qwen2 arch  (per-arch: config setter + [init] registration)
     dasllama_arch_qwen3.das   #   Qwen3 arch (QK-norm)
+    dasllama_arch_qwen35.das  #   Qwen3.5/3.6 + Qwen3-Next hybrid arches (Gated-DeltaNet + gated attention; qwen35 / qwen35moe / qwen3next)
     dasllama_arch_phi3.das    #   Phi-3 arch
     dasllama_arch_gemma2.das  #   Gemma-2 arch
     dasllama_arch_gemma3.das  #   Gemma-3 arch (SWA pattern + dual rope θ)
@@ -192,6 +253,7 @@ What a model needs to "just work" today:
 | Attention biases | **Qwen2** — Q/K/V projection biases; **gpt-oss** — Q/K/V + output-projection biases |
 | Sampling | greedy, temperature, top-k, repetition penalty (`SamplingParams`; greedy = temp 0, bit-identical to argmax) |
 | Chat | per-arch data-driven templates in the registry + one segment-accumulation renderer (`dasllama_chat`) — reproduces the reference prefills token-for-token (`test_chat.das`); the template is auto-detected by sniffing the GGUF's embedded `tokenizer.chat_template` (never executed), falling back to the arch heuristic; Qwen3-style `<think>` blocks are stripped from chat history (`strip_think`); Gemma-4 uses its channel-based turn format (`<|turn>` / `<turn|>`, non-thinking opener closes an empty `thought` channel); gpt-oss uses the Harmony-lite template (`<|start|>role<|message|>...<|end|>`, replies end at `<|return|>` / `<|call|>`, channel markers render in decoded text as in llama.cpp) |
+| Self-speculative decode (MTP/NextN) | qwen35-family `-MTP-` GGUFs load natively (`nextn_predict_layers == 1`): the in-file NextN draft block — one trunk-shaped attention layer at index `n_layers` plus `nextn.eh_proj/enorm/hnorm/shared_head_norm` — drafts one token ahead and a 2-row batched trunk forward verifies it, so accepted steps stream the weights once for two tokens. **Output-invariant vs plain greedy** (`generate_mtp_greedy`, gated by `tests/dasLLAMA/test_mtp.das`); 1.39× decode on Qwen3.6-27B Q8 (zen2, ~94% accept on list continuation). The prompt warm runs the draft block batched (same prefill blocks at `l = n_layers`). Greedy-only v1; the DeltaNet recurrent state snapshots and rolls back around rejected drafts; `mtp_only` sidecar files and per-head `nextn.embed_tokens`/`shared_head_head` panic honestly |
 | Performance | KV cache, SIMD + JobQue-threaded matmul, activation-quant Q8·Q8 behind a pluggable kernel-backend registry (ARM SDOT/laneq + the generated x64 AVX2 maddubs/vpdpbusd tier — `x64_arch.md`), flash-attention batched prefill, per-box kernel tuning (`tune_for_this_box.md`) |
 
 ## Optimization guidelines

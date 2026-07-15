@@ -51,6 +51,20 @@ still calls jitted workers). Beware Release-blind divergence: memory bugs (doubl
 reuse-after-collect) only trip the Debug memory_model.h assert, so a green local Release
 sweep does NOT prove a lifted skip is sound — Debug CI is the oracle.
 
+## Deep-engine model tests (dasLLAMA and friends)
+
+Two hard-won rules for tests that drive a deep JIT engine chain (`forward`/`forward_prefill`/
+`generate`):
+
+1. **The test file is the program root under dastest**, so `options stack = 524288` in the test
+   file DOES apply (the "main-module-only" rule works in your favor). Without it, driving the
+   engine directly trips `stack overflow` deep in the module (reported at some engine function's
+   entry line).
+2. **Keep heavy helpers free of `T?`** — a `T?` param keeps the helper off the JIT (dastest's
+   class), so its engine calls run on the interpreter stack. Structure like `test_parity.das`:
+   plain private functions do the model work and return values/arrays; the `[test]` run-lambda
+   only asserts. (`tests/dasLLAMA/test_mtp.das` hit both failure modes before landing on this.)
+
 ## Test file structure
 
 ```das

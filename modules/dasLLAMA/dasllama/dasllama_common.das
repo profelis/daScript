@@ -189,6 +189,9 @@ struct Config {
     ssm_n_group : int64 = 0            // deltanet k-head count (16)
     ssm_dt_rank : int64 = 0            // deltanet v-head count (0.8B: 16, 35B: 32)
     ssm_d_inner : int64 = 0            // deltanet value width = ssm_dt_rank * ssm_d_state
+    // MTP/NextN (qwen35 family -MTP files): block_count includes the appended draft block(s).
+    // n_layers stays the TRUNK count everywhere; the MTP block lives at layer index n_layers.
+    n_layer_nextn : int64 = 0          // 0 = no MTP block; 1 = single NextN head (only value supported)
 }
 
 // Swappable block kernels — one per (attention|ffn) × (decode|prefill). Decode is the fused
@@ -459,6 +462,14 @@ struct Model {
     // qwen3next-layout file (detected via fused ssm_ba): v-indexed tensors ship in HF GROUPED
     // v-head order; the loader permutes them to the TILED order the kernels (and qwen35 files) use
     dn_grouped : bool = false
+    // MTP/NextN extras (config.n_layer_nextn == 1). The draft block's standard attention/FFN
+    // tensors ride the per-layer arrays above at index n_layers; only the nextn-specific ones
+    // need their own slots. -1 = absent; mtp_headnorm_off falls back to rms_final_off.
+    mtp_ehproj_off : int64 = -1     // nextn.eh_proj (quant plane): 2*dim -> dim
+    mtp_ehproj_fmt : KqFmt = KqFmt.q8
+    mtp_enorm_off : int64 = -1      // fblob: nextn.enorm (token-embedding RMS weight), dim
+    mtp_hnorm_off : int64 = -1      // fblob: nextn.hnorm (trunk-hidden RMS weight), dim
+    mtp_headnorm_off : int64 = -1   // fblob: nextn.shared_head_norm, dim (-1 = output_norm)
 }
 
 // ===== Arch registry: per-architecture blocks + chat template =====
@@ -594,7 +605,10 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     let c = t.config
     let dim = c.dim
     let hidden = c.hidden_dim
-    let layers = c.n_layers
+    // The MTP/NextN draft block is one extra trunk-shaped attention layer at index n_layers
+    // (both arches: dense FFN on qwen35, expert stacks on qwen35moe) — every per-layer walk
+    // here covers it; its recr_mask bit is unset so the standard attention arm applies.
+    let layers = c.n_layers + c.n_layer_nextn
     var fo = 0l
     var bf16 = 0l
     if (t.cls_q8 || cls_kq(t)) {
@@ -745,8 +759,9 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     t.wv_offs |> clear()
     t.wv_offs |> reserve(layers)
     for (l in range64(layers)) {
-        // -1 marks a V-from-K layer (gemma4 global), a shared-KV layer (E-series), or a deltanet layer
-        if (t.kv_src[l] != l || ((c.v_from_k_mask >> uint64(l)) & 1ul) != 0ul || layer_is_recurrent(c, l)) {
+        // -1 marks a V-from-K layer (gemma4 global), a shared-KV layer (E-series), or a deltanet
+        // layer. The l < n_layers guard kills the shift-by-64 wrap at the MTP index (27B: l=64)
+        if (t.kv_src[l] != l || (l < c.n_layers && ((c.v_from_k_mask >> uint64(l)) & 1ul) != 0ul) || layer_is_recurrent(c, l)) {
             t.wv_offs |> push(-1l)
         } else {
             t.wv_offs |> push(kq_take(cur, fmt_at(t.wv_fmt, l), dim * layer_kv_dim(c, l)))
@@ -834,6 +849,15 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         }
     } else {
         t.wcls_off = kq_take(cur, t.wcls_fmt, c.vocab_size * dim)
+    }
+    if (c.n_layer_nextn > 0l) {   // MTP/NextN extras (the block's standard tensors rode the walks above)
+        t.mtp_ehproj_off = kq_take(cur, t.mtp_ehproj_fmt, 2l * dim * dim)
+        t.mtp_enorm_off = fo
+        fo += dim
+        t.mtp_hnorm_off = fo
+        fo += dim
+        t.mtp_headnorm_off = fo   // loaded only when the tensor exists; reads fall back to rms_final_off
+        fo += dim
     }
     return LayoutSizes(fblob_n = fo, wblob_n = cur.wo, mx_n = mx, bf16_n = bf16,
                        k4_n = cur.k4, k5_n = cur.k5, k6_n = cur.k6)
@@ -1130,7 +1154,7 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
             || (t.config.fused_qkv && t.config.dim % 256l != 0l)) {   // fused slice offsets are dim-multiples
         return
     }
-    let layers = t.config.n_layers
+    let layers = t.config.n_layers + t.config.n_layer_nextn   // + the MTP block's tags at index n_layers
     t.wq_fmt |> resize(layers)
     t.wk_fmt |> resize(layers)
     t.wv_fmt |> resize(layers)
@@ -1190,6 +1214,10 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
     } else {
         t.wcls_fmt = kq_fmt_of(gguf_tensor_type(m, "output.weight"))
         any ||= t.wcls_fmt != KqFmt.q8
+    }
+    if (t.config.n_layer_nextn > 0l) {
+        t.mtp_ehproj_fmt = kq_fmt_of(gguf_tensor_type(m, "blk.{t.config.n_layers}.nextn.eh_proj.weight"))
+        any ||= t.mtp_ehproj_fmt != KqFmt.q8
     }
     // E-series PLE token table: gather-only whole rows of layers*ple — row length must be
     // superblock-aligned for the plane walk (256 % holds on E2B/E4B: ple 256)
@@ -1337,7 +1365,7 @@ def private repack_q8_weights(var t : Model) {
     let dim = c.dim
     let hidden = c.hidden_dim
     var regs : array<RepackReg>
-    for (l in range64(c.n_layers)) {
+    for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP/NextN block at index n_layers
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
         // K-quant-tagged weights live in the kq planes (disk order, never repacked) — their
@@ -1421,6 +1449,9 @@ def private repack_q8_weights(var t : Model) {
         // indexes it directly. K-quant classifiers (either tying) stay in their plane, unpacked.
         push_repack(regs, 0, t.wcls_off, dim, c.vocab_size)
     }
+    if (c.n_layer_nextn > 0l && t.mtp_ehproj_fmt == KqFmt.q8) {   // NextN eh_proj: 2*dim -> dim
+        push_repack(regs, 0, t.mtp_ehproj_off, 2l * dim, dim)
+    }
     repack_regions(t, regs)
     delete regs
 }
@@ -1444,7 +1475,7 @@ def private repack_kq_weights(var t : Model) {
     let c = t.config
     let dim = c.dim
     var regs : array<RepackReg>
-    for (l in range64(c.n_layers)) {
+    for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP/NextN block at index n_layers
         let kv = layer_kv_dim(c, l)
         let qd = layer_qd(c, l)
         // recurrent (deltanet) layers carry no attention projections (offsets -1); their own
@@ -1484,6 +1515,9 @@ def private repack_kq_weights(var t : Model) {
     }
     if ((!c.shared_weights && t.wcls_fmt != KqFmt.q8) || cls_kq(t)) {
         push_repack_kq(regs, c.shared_weights ? t.emb_fmt : t.wcls_fmt, t.wcls_off, dim, c.vocab_size)
+    }
+    if (c.n_layer_nextn > 0l) {   // NextN eh_proj (no-op for q8 tags)
+        push_repack_kq(regs, t.mtp_ehproj_fmt, t.mtp_ehproj_off, 2l * dim, dim)
     }
     repack_regions(t, regs)
     delete regs
@@ -1571,7 +1605,17 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         }
         // GGUF uses the architecture name as the metadata key prefix (llama.*, qwen2.*, gemma2.*, ...)
         let dim = gguf_int(m, bytes, "{arch}.embedding_length")
-        let layers = gguf_int(m, bytes, "{arch}.block_count")
+        // MTP/NextN: block_count INCLUDES the appended draft block(s) (llama.cpp n_layer_all);
+        // `layers` below is the TRUNK count — every per-layer validation/mask walks the trunk only.
+        let nextn = gguf_has(m, "{arch}.nextn_predict_layers") ? gguf_int(m, bytes, "{arch}.nextn_predict_layers") : 0l
+        if (nextn < 0l || nextn > 1l) {
+            panic("dasLLAMA: nextn_predict_layers = {nextn} not supported (single NextN head only)")
+        }
+        let layers = gguf_int(m, bytes, "{arch}.block_count") - nextn
+        if (layers < 1l) {   // fail closed on a malformed file before "blk.-1..." confusion downstream
+            panic("dasLLAMA: {arch}.block_count = {layers + nextn} with nextn_predict_layers = {nextn} leaves no trunk layers")
+        }
+        t.config.n_layer_nextn = nextn
         // FFN width: a scalar for uniform arches, or a per-layer array (gemma-4 E2B: the elastic
         // MatFormer sub-model, 6144 for layers 0-14 then 12288). ffn_w holds the per-layer widths;
         // hidden_dim is the MAX (scratch sizing). Set before layout_offsets so the offsets vary per layer.
@@ -1679,10 +1723,20 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             if (dn_conv_dim(t.config) % 4l != 0l) {   // the batched conv reads float4 rows (validate-at-load, kv_validate_q8 precedent)
                 panic("dasLLAMA: deltanet conv_dim {dn_conv_dim(t.config)} must be a multiple of 4")
             }
-            // MTP/NextN decoder blocks are not modeled — refuse files that ship the tensors
-            // (regular GGUFs strip them; the metadata key alone is tolerated and ignored)
-            if (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") >= 0) {
-                panic("dasLLAMA: MTP/NextN layers are not supported — use a non-MTP GGUF")
+            // MTP/NextN consistency: the metadata and the tensor directory must agree, and an
+            // MTP-only sidecar (trunk stripped, llama.cpp mtp_only) is not loadable standalone
+            if (t.config.n_layer_nextn > 0l) {
+                if (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") < 0) {
+                    panic("dasLLAMA: nextn_predict_layers = {t.config.n_layer_nextn} but blk.{layers}.nextn.eh_proj.weight is missing")
+                }
+                if (gguf_find_tensor(m, "blk.0.attn_norm.weight") < 0) {
+                    panic("dasLLAMA: MTP-only sidecar GGUF (no trunk tensors) is not supported — use the full -MTP file")
+                }
+            } elif (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") >= 0
+                    || gguf_find_tensor(m, "blk.{layers - 1l}.nextn.eh_proj.weight") >= 0) {
+                // the second probe catches a malformed file whose block_count already counts the
+                // draft block — its nextn tensors sit one below the first probe's index
+                panic("dasLLAMA: file ships NextN tensors but no nextn_predict_layers key — refusing to guess")
             }
         }
         // KV-head count: scalar (uniform), or gemma4's per-layer array — which must collapse to the
@@ -1928,7 +1982,8 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         // detected from the tensor table so layout_offsets can skip their V slot
         if (!t.config.fused_qkv) {
             for (l in range64(layers)) {
-                if (gguf_find_tensor(m, "blk.{l}.attn_v.weight") < 0) {
+                // recurrent (deltanet) layers legitimately have no attn_v — they are NOT V-from-K
+                if (gguf_find_tensor(m, "blk.{l}.attn_v.weight") < 0 && !layer_is_recurrent(t.config, l)) {
                     if (l >= 64l) {
                         panic("dasLLAMA: V-from-K layers need n_layers <= 64 (got layer {l})")
                     }
@@ -2003,7 +2058,10 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         }
         // gpt-oss names its pre-FFN norm post_attention_norm (same graph role as ffn_norm)
         let ffn_norm_name = t.config.post_attn_is_ffn_norm ? "post_attention_norm" : "ffn_norm"
-        for (l in range64(layers)) {
+        // per-layer walks below include the MTP/NextN block (index n_layers) — a trunk-shaped
+        // attention layer whose norms/weights load through the standard arms
+        let layers_ld = layers + t.config.n_layer_nextn
+        for (l in range64(layers_ld)) {
             gguf_read_tensor_f32(m, bytes, "blk.{l}.attn_norm.weight", t.fblob, t.rms_att_off + l * dim, dim)
             gguf_read_tensor_f32(m, bytes, "blk.{l}.{ffn_norm_name}.weight", t.fblob, t.rms_ffn_off + l * dim, dim)
             if (t.config.pre_post_norm) {  // Gemma2: post-attn + post-FFN norms (already +1-baked in the GGUF)
@@ -2088,7 +2146,7 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         ts_stage = ref_time_ticks()
         // big 2D weights -> active precision. ggml stores them row-major [out x in] = our convention.
         var scratch : array<float>
-        for (l in range64(layers)) {
+        for (l in range64(layers_ld)) {
             let kv_l = layer_kv_dim(t.config, l)
             let qd_l = layer_qd(t.config, l)
             if (layer_is_recurrent(t.config, l)) {
@@ -2194,6 +2252,21 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 let ple = t.config.n_embd_per_layer
                 load_big(m, bytes, "blk.{l}.inp_gate.weight", t, t.ple_gate_off + l * dim * ple, dim * ple, scratch)
                 load_big(m, bytes, "blk.{l}.proj.weight", t, t.ple_proj_off + l * ple * dim, ple * dim, scratch)
+            }
+        }
+        if (t.config.n_layer_nextn > 0l) {   // MTP/NextN extras (block index n_layers = `layers`)
+            load_big(m, bytes, "blk.{layers}.nextn.eh_proj.weight", t, t.mtp_ehproj_off, 2l * dim * dim, scratch, 0l, t.mtp_ehproj_fmt)
+            gguf_read_tensor_f32(m, bytes, "blk.{layers}.nextn.enorm.weight", t.fblob, t.mtp_enorm_off, dim)
+            gguf_read_tensor_f32(m, bytes, "blk.{layers}.nextn.hnorm.weight", t.fblob, t.mtp_hnorm_off, dim)
+            if (gguf_find_tensor(m, "blk.{layers}.nextn.shared_head_norm.weight") >= 0) {
+                gguf_read_tensor_f32(m, bytes, "blk.{layers}.nextn.shared_head_norm.weight", t.fblob, t.mtp_headnorm_off, dim)
+            } else {
+                t.mtp_headnorm_off = -1l   // reads fall back to output_norm (rms_final_off)
+            }
+            // optional per-head embedding/classifier: no known qwen35 file ships them — fail closed
+            if (gguf_find_tensor(m, "blk.{layers}.nextn.embed_tokens.weight") >= 0
+                    || gguf_find_tensor(m, "blk.{layers}.nextn.shared_head_head.weight") >= 0) {
+                panic("dasLLAMA: NextN per-head embed_tokens/shared_head_head are not supported yet")
             }
         }
         if (has_ple(t.config)) {  // the per-layer token-embedding table [vocab x (ple*layers)], gathered per token, never repacked
@@ -2530,6 +2603,18 @@ struct Session {
     dn_conv_b : array<float>       // batched conv + SiLU output (npos x conv_dim)
     dn_wtap : array<float>         // conv weights transposed tap-major for the batched form (d_conv x conv_dim)
     dn_cws : array<float>          // per-v-head chunk workspace slabs (dt_rank x dn_cws_head_size)
+    // MTP/NextN self-spec state (empty unless config.n_layer_nextn > 0). mtp_h is the trunk's
+    // post-output-norm hidden of the LAST evaluated position — llama.cpp's t_h_nextn handoff,
+    // stashed by forward()/forward_prefill() right after the final rms_at.
+    mtp_h : array<float>           // h_nextn (dim)
+    mtp_cat : array<float>         // eh_proj input [enorm(embed(tok)) ; hnorm(h)] (2*dim)
+    mtp_cat_b : array<float>       // prompt-warm eh_proj concat image ((np-1) x 2*dim, scratch-sized per warm)
+    mtp_h0 : array<float>          // verify-batch row-0 h_nextn (dim) — the accept-path MTP backfill pair
+    mtp_logits : array<float>      // verify-batch row-0 logits (vocab; the draft check reads its argmax)
+    // deltanet rollback for a rejected verify batch (sized lazily on first snapshot)
+    mtp_snap_conv : array<float>
+    mtp_snap_state : array<float>
+    mtp_snap_pos : int64
 }
 
 // Block-codec KV (q8_0 / tq4) needs whole 32-blocks everywhere the cache is sliced: rows (kv_dim)
@@ -2541,7 +2626,7 @@ def private kv_validate_q8(c : Config; kdt, vdt : KVDtype) {
     if (kdt != KVDtype.q8_0 && vdt != KVDtype.q8_0 && !tq4) {
         return
     }
-    for (l in range64(c.n_layers)) {
+    for (l in range64(c.n_layers + c.n_layer_nextn)) {   // + the MTP/NextN block's KV slab
         let kvd = layer_kv_dim(c, l)
         let hs = layer_head_size(c, l)
         if (kvd % 32l != 0l || hs % 32l != 0l) {
@@ -2633,9 +2718,17 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
         s.dn_qg |> resize(2l * qd)
         s.dn_qgate |> resize(qd)
     }
+    if (c.n_layer_nextn > 0l) {   // MTP/NextN: h_nextn handoff + eh_proj concat input + verify row-0 outputs
+        s.mtp_h |> resize(c.dim)
+        s.mtp_cat |> resize(2l * c.dim)
+        s.mtp_h0 |> resize(c.dim)
+        s.mtp_logits |> resize(c.vocab_size)
+    }
     s.ffn_offs |> resize(4)
     s.ffn_gu |> resize(2l * ffw)
-    let maxn = max(xdim, ffw)   // the Q8·Q8 path quantizes whichever activation feeds a matmul
+    // the Q8·Q8 path quantizes whichever activation feeds a matmul; the MTP eh_proj feeds a
+    // 2*dim concat row (don't rely on qd/ffw happening to cover it — 35B-A3B's qd == 2*dim is luck)
+    let maxn = max(max(xdim, ffw), c.n_layer_nextn > 0l ? 2l * c.dim : 0l)
     s.xq |> resize(maxn)
     s.xs |> resize(maxn / 32l)
     s.xq2 |> resize(ffw)        // fused-FFN chain requant (see the Session field comment)
@@ -2665,11 +2758,13 @@ def make_run_state(c : Config; kdt : KVDtype = KVDtype.f32; vdt : KVDtype = KVDt
     // (which counted shared layers) at identical addresses.
     s.kv_dtype_k = kdt
     s.kv_dtype_v = vdt
-    s.kv_bprefix_k |> reserve(int(c.n_layers))
-    s.kv_bprefix_v |> reserve(int(c.n_layers))
+    // + the MTP/NextN draft block's slab (index n_layers) — one attention layer's rows
+    let kv_layers = c.n_layers + c.n_layer_nextn
+    s.kv_bprefix_k |> reserve(int(kv_layers))
+    s.kv_bprefix_v |> reserve(int(kv_layers))
     var krow = 0l
     var vrow = 0l
-    for (l in range64(c.n_layers)) {
+    for (l in range64(kv_layers)) {
         let src = layer_kv_source(c, l)
         if (src != l) {
             s.kv_bprefix_k |> push(s.kv_bprefix_k[src])
@@ -4237,7 +4332,7 @@ def private mm_b(var y : array<float>; t : Model; woff : int64; x : array<float>
 //! Per-layer attention pattern: with SWA on, an explicit per-layer mask (gemma4's GGUF bool array)
 //! wins; otherwise every swa_pattern-th layer (l % p == p-1) is global and the rest slide — Gemma2
 //! alternates (p=2, even layers slide), Gemma3 runs 5 local : 1 global (p=6).
-def layer_is_sliding(c : Config; l : int64) : bool => (c.sliding_window > 0l
+def layer_is_sliding(c : Config; l : int64) : bool => (c.sliding_window > 0l && l < c.n_layers
     && (c.swa_mask != 0ul ? ((c.swa_mask >> uint64(l)) & 1ul) != 0ul : l % c.swa_pattern != c.swa_pattern - 1l))
 
 // ===== Per-layer attention geometry (gemma4: sliding vs global layer classes differ) =====
@@ -4248,7 +4343,9 @@ def layer_is_sliding(c : Config; l : int64) : bool => (c.sliding_window > 0l
 def has_ple(c : Config) : bool => c.n_embd_per_layer > 0l
 
 //! Layer `l` runs the Gated-DeltaNet recurrent block instead of attention (qwen35 hybrid).
-def layer_is_recurrent(c : Config; l : int64) : bool => ((c.recr_mask >> uint64(l)) & 1ul) != 0ul
+// the l < n_layers guard is load-bearing: the MTP/NextN block sits at index n_layers, which on
+// a 64-trunk-layer model (27B) means a shift by 64 — x86 wraps that to bit 0 (a recurrent layer)
+def layer_is_recurrent(c : Config; l : int64) : bool => l < c.n_layers && ((c.recr_mask >> uint64(l)) & 1ul) != 0ul
 
 //! deltanet q/k projection width (n_group heads of d_state each).
 def dn_key_dim(c : Config) : int64 => c.ssm_n_group * c.ssm_d_state
@@ -6458,6 +6555,9 @@ def forward(t : Model; var s : Session; token, pos : int64) {
     let ts_final = ref_time_ticks()
     trace_tag(TRACE_TAG_CLS)
     rms_at(s.xb, t, t.rms_final_off, s.x, dim)
+    if (c.n_layer_nextn > 0l) {   // stash h_nextn (llama.cpp t_h_nextn) for the MTP draft head
+        copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)
+    }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
     if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
@@ -6482,6 +6582,209 @@ def forward(t : Model; var s : Session; token, pos : int64) {
         s.logits[id] = -1.0e30
     }
     prof_add("final", ts_final)
+}
+
+//! One MTP/NextN draft step (config.n_layer_nextn == 1): from the stashed trunk hidden `s.mtp_h`
+//! (h_p) and `token` (x_{p+1}), produce draft logits for x_{p+2} in s.logits. `pos` is the MTP
+//! KV row p — one BELOW llama.cpp's convention: their draft context ropes this row at p+1 and
+//! masks the missing row 0 by cache occupancy; our flat cache can't mask, and rotary attention
+//! is position-delta-invariant, so shifting every MTP row down by one is mathematically
+//! identical and leaves no garbage row. Overwrites s.mtp_h with the head's own h_nextn
+//! (the recursive-drafting handoff) and s.logits/s.x/s.xb scratch.
+def forward_mtp(t : Model; var s : Session; token, pos : int64; want_logits : bool = true) {
+    let c = t.config
+    let dim = c.dim
+    assert(c.n_layer_nextn > 0l)
+    if (s.kv_pool != null) {   // paged pools size blob_of for trunk layers only — flat sessions only (v1)
+        panic("dasLLAMA: forward_mtp needs a flat-KV session — the paged pool has no slab for the draft block")
+    }
+    kv_ensure(s, pos + 1l)
+    // eh_proj input: [enorm(embed(token)) ; hnorm(h)] — embedding first (llama.cpp concat order)
+    embed_row(t, token, unsafe(addr(s.x[0])))
+    rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
+    copy_floats(s.xb, 0l, s.mtp_cat, 0l, dim)
+    rms_at(s.xb, t, t.mtp_hnorm_off, s.mtp_h, dim)
+    copy_floats(s.xb, 0l, s.mtp_cat, dim, dim)
+    // eh_proj: 2*dim -> dim into the residual stream (xq/xs cover 2*dim — sized max(xdim, ffw))
+    if (t.mtp_ehproj_fmt != KqFmt.q8) {
+        mm_kq(s.x, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat, s.xq, s.xs, s.xbs, 2l * dim, dim)
+    } else {
+        mm(s.x, t, t.mtp_ehproj_off, s.mtp_cat, s.xq, s.xs, 2l * dim, dim)
+    }
+    // this row's RoPE table (partial rotary span, like forward)
+    if (g_use_rope_table) {
+        build_rope_table(s.rope_cos, s.rope_sin, t, c.rope_freq_base, c.rope_freq_scale, pos, 1l,
+                         c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
+    }
+    // the draft block IS one trunk-shaped attention layer at index n_layers — reuse the arch blocks
+    t.blocks.attn_decode(t, s, c.n_layers, pos)
+    t.blocks.ffn_decode(t, s, c.n_layers)
+    // warm/backfill calls only need the KV row written — the head norm + classifier (a large
+    // share of the head's cost on small models: vocab x dim) run only when drafting
+    return if (!want_logits)
+    // head norm (shared_head_norm when shipped, else output_norm) + the trunk classifier
+    rms_at(s.xb, t, t.mtp_headnorm_off >= 0l ? t.mtp_headnorm_off : t.rms_final_off, s.x, dim)
+    copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)   // the head's own h_nextn — recursive drafting handoff
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
+    if (tied_f32) {
+        mm_fblob(s.logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+    } elif (cls_fmt != KqFmt.q8) {
+        mm_kq(s.logits, t, cls_fmt, t.wcls_off, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
+    } else {
+        mm(s.logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
+    }
+}
+
+//! Snapshot / restore the deltanet recurrent state (conv history + S + dn_pos) around a
+//! speculative verify batch: a rejected draft has already advanced the state past itself.
+//! The MTP head itself is stateless attention — only the TRUNK verify needs this. A rejected
+//! batch's KV row for the accepted token is CORRECT (its input was right); only the recurrent
+//! state rolls back, then one plain forward re-advances it.
+def mtp_state_snapshot(var s : Session) {
+    let nc = int64(length(s.dn_conv_state))
+    let ns = int64(length(s.dn_state))
+    s.mtp_snap_conv |> resize(nc)   // no-op after the first call
+    s.mtp_snap_state |> resize(ns)
+    copy_floats(s.dn_conv_state, 0l, s.mtp_snap_conv, 0l, nc)
+    copy_floats(s.dn_state, 0l, s.mtp_snap_state, 0l, ns)
+    s.mtp_snap_pos = s.dn_pos
+}
+
+def mtp_state_restore(var s : Session) {
+    copy_floats(s.mtp_snap_conv, 0l, s.dn_conv_state, 0l, int64(length(s.mtp_snap_conv)))
+    copy_floats(s.mtp_snap_state, 0l, s.dn_state, 0l, int64(length(s.mtp_snap_state)))
+    s.dn_pos = s.mtp_snap_pos
+}
+
+// After a 2-row verify forward_prefill([tok, draft], 2, pos): row 0's post-norm hidden and
+// logits (forward_prefill's own tail only produced row 1's). Reads s.x_b row 0 — still intact,
+// the prefill tail never overwrites the batch residual stream.
+def private mtp_verify_row0(t : Model; var s : Session) {
+    let c = t.config
+    let dim = c.dim
+    rms_at(s.xb, t, t.rms_final_off, s.x_b, 0l, dim)
+    copy_floats(s.xb, 0l, s.mtp_h0, 0l, dim)
+    let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
+    let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
+    if (tied_f32) {
+        mm_fblob(s.mtp_logits, t, t.tok_emb_off, s.xb, dim, c.vocab_size)
+    } elif (cls_fmt != KqFmt.q8) {
+        mm_kq(s.mtp_logits, t, cls_fmt, t.wcls_off, s.xb, s.xq, s.xs, s.xbs, dim, c.vocab_size)
+    } else {
+        mm(s.mtp_logits, t, t.wcls_off, s.xb, s.xq, s.xs, dim, c.vocab_size)
+    }
+    // mirror the plain classifier tail exactly — `truth` is the invariance contract's load-bearing
+    // edge, so it must match plain decode BY CONSTRUCTION (inert on qwen35: no softcap, no suppress)
+    if (c.final_logit_softcap > 0.0) {
+        softcap4(s.mtp_logits, c.vocab_size, c.final_logit_softcap)
+    }
+    for (id in t.suppress) {
+        s.mtp_logits[id] = -1.0e30
+    }
+}
+
+//! Greedy decode with MTP/NextN depth-1 self-speculation (config.n_layer_nextn == 1; flat KV
+//! cache only). Mirrors generate()'s contract — returns prompt[1..] echoed, then the greedy
+//! continuation, `total` ids overall — and is OUTPUT-INVARIANT vs plain greedy decode: the
+//! draft only decides whether two tokens ride one batched trunk forward (weights read once)
+//! or one token rides a plain forward after a state rollback. Accept telemetry in the returns.
+def generate_mtp_greedy(t : Model; var s : Session; prompt : array<int64>; total : int64;
+                        var n_drafted, n_accepted : int64&) : array<int64> {
+    let c = t.config
+    assert(c.n_layer_nextn > 0l)
+    if (t.quant == QuantMode.q4) {   // no batched prefill rail: the 2-row verify (and the warm) need it
+        panic("dasLLAMA: MTP self-spec decode needs the batched prefill path — load q8 or fp32, not q4")
+    }
+    if (s.kv_pool != null) {   // paged pools size blob_of for trunk layers only — flat sessions only (v1)
+        panic("dasLLAMA: MTP self-spec decode needs a flat-KV session — the paged pool has no slab for the draft block")
+    }
+    let np = int64(length(prompt))
+    var ids : array<int64>
+    if (total <= 0l || np <= 0l) {
+        return <- ids
+    }
+    ids |> reserve(total)
+    for (i in range64(1l, np)) {   // generate()'s echo convention (incl. budget + BOS delimiter)
+        if (int64(length(ids)) >= total || prompt[i] == 1l) {
+            return <- ids
+        }
+        ids |> push(prompt[i])
+    }
+    // batched trunk prefill (stashes h_{np-1}); the prompt's next token BEFORE the warm pass
+    // clobbers s.logits
+    forward_prefill(t, s, prompt, np, 0l)
+    var tok = parallel_argmax(s.logits, c.vocab_size)
+    let dim = c.dim
+    if (np > 1l) {
+        // MTP prompt warm, batched: rows 0..np-2 hold (h_p, x_{p+1}) — every position's trunk
+        // hidden is still in s.x_b, so build the np-1 eh_proj concat rows, run ONE batched
+        // eh_proj GEMM back into s.x_b (row np-1 stays untouched), then the draft block through
+        // the arch's batched prefill blocks at l = n_layers. This pass only writes the head's KV
+        // rows (no head norm / classifier), and s.mtp_h — h_{np-1}, stashed by the trunk prefill
+        // tail — deliberately survives it to feed the first draft. The trunk prefill's rope table
+        // ([0, np) at start_pos 0) and batch scratch (sized for np rows) cover the np-1-row pass.
+        s.mtp_cat_b |> scratch_resize((np - 1l) * 2l * dim)
+        for (p in range64(np - 1l)) {
+            embed_row(t, prompt[p + 1l], unsafe(addr(s.x[0])))
+            rms_at(s.xb, t, t.mtp_enorm_off, s.x, dim)
+            copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim, dim)
+            rms_at(s.xb, t, t.rms_final_off, s.x_b, p * dim, dim)   // h_p
+            copy_floats(s.xb, 0l, s.mtp_h0, 0l, dim)
+            rms_at(s.xb, t, t.mtp_hnorm_off, s.mtp_h0, dim)
+            copy_floats(s.xb, 0l, s.mtp_cat_b, p * 2l * dim + dim, dim)
+        }
+        mm_b_f(s, s.x_b, t, t.mtp_ehproj_fmt, t.mtp_ehproj_off, s.mtp_cat_b, 2l * dim, dim, np - 1l)
+        t.blocks.attn_prefill(t, s, c.n_layers, np - 1l, 0l)
+        t.blocks.ffn_prefill(t, s, c.n_layers, np - 1l)
+    }
+    var htmp : array<float>
+    htmp |> resize(dim)
+    var pos = np
+    n_drafted = 0l
+    n_accepted = 0l
+    var vbatch : array<int64>
+    vbatch |> resize(2)
+    while (int64(length(ids)) < total) {
+        break if (tok == 1l)   // BOS delimits sequences (generate()'s contract)
+        ids |> push(tok)
+        break if (int64(length(ids)) >= total)
+        // draft x_{pos+1} from (h_{pos-1}, tok) at row pos-1
+        forward_mtp(t, s, tok, pos - 1l)
+        let d = parallel_argmax(s.logits, c.vocab_size)
+        n_drafted++
+        // batched verify: trunk over [tok@pos, d@pos+1] — weights stream once for both rows
+        mtp_state_snapshot(s)
+        vbatch[0] = tok
+        vbatch[1] = d
+        forward_prefill(t, s, vbatch, 2l, pos)
+        mtp_verify_row0(t, s)
+        let truth = parallel_argmax(s.mtp_logits, c.vocab_size)
+        if (truth == d) {
+            n_accepted++
+            break if (d == 1l)   // BOS: generate() stops before emitting it — mirror that
+            // both rows commit: emit d, take the continuation from row 1's logits.
+            // Backfill MTP row pos with the pair (h_pos = mtp_h0, d) — preserve row 1's h first.
+            copy_floats(s.mtp_h, 0l, htmp, 0l, c.dim)
+            copy_floats(s.mtp_h0, 0l, s.mtp_h, 0l, c.dim)
+            let next = parallel_argmax(s.logits, c.vocab_size)
+            forward_mtp(t, s, d, pos, false)   // KV backfill only — no draft here
+            copy_floats(htmp, 0l, s.mtp_h, 0l, c.dim)
+            ids |> push(d)
+            tok = next
+            pos += 2l
+        } else {
+            // reject: the accepted row's KV is already correct; roll the recurrent state back
+            // and re-advance it through tok alone (also re-stashes h_pos for the next draft)
+            mtp_state_restore(s)
+            forward(t, s, tok, pos)
+            tok = truth
+            pos++
+        }
+    }
+    delete htmp
+    delete vbatch
+    return <- ids
 }
 
 // ----- forward section profiler (decode AND prefill feed the same buckets) -----
@@ -9081,6 +9384,9 @@ def private forward_prefill_body(t : Model; var s : Session; npos, start_pos : i
     let ts_final = ref_time_ticks()
     let last = npos - 1l
     rms_at(s.xb, t, t.rms_final_off, s.x_b, last * dim, dim)
+    if (c.n_layer_nextn > 0l) {   // stash the last position's h_nextn for the MTP draft head
+        copy_floats(s.xb, 0l, s.mtp_h, 0l, dim)
+    }
     let cls_fmt = c.shared_weights ? t.emb_fmt : t.wcls_fmt
     let tied_f32 = c.shared_weights && !t.cls_q8 && cls_fmt == KqFmt.q8
     if (c.final_logit_softcap > 0.0 && !tied_f32 && fused_cls_ok(t)) {
