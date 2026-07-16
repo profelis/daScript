@@ -252,6 +252,32 @@ def test_history_migrations_linq_and_fts(t : T?) {
         }
     }
 
+    t |> run("idle import work spans chats and requeues prior failures once") @(t : T?) {
+        with_cadmus_database(path) $(db) {
+            upsert_cadmus_import_media_db(db, CadmusImportMedia(
+                Id = 0, ChatId = 10l, TelegramMessageId = 710l,
+                RelativePath = "voice_messages/failed.ogg", FileSize = 50l,
+                ModifiedAt = 200l, Status = "failed", Attempts = 1,
+                LastError = "server unavailable", PipelineVersion = 1))
+            upsert_cadmus_import_media_db(db, CadmusImportMedia(
+                Id = 0, ChatId = 20l, TelegramMessageId = 711l,
+                RelativePath = "voice_messages/pending.ogg", FileSize = 100l,
+                ModifiedAt = 200l, Status = "pending", Attempts = 0,
+                LastError = "", PipelineVersion = 1))
+        }
+        let pending <- load_next_cadmus_import_media(path)
+        t |> equal(length(pending), 1)
+        if (length(pending) == 1) {
+            t |> equal(pending[0].TelegramMessageId, 711l)
+        }
+        requeue_failed_cadmus_import_media(path)
+        let retried <- load_next_cadmus_import_media(path)
+        t |> equal(length(retried), 1)
+        if (length(retried) == 1) {
+            t |> equal(retried[0].TelegramMessageId, 710l)
+        }
+    }
+
     t |> run("empty username never resolves to an anonymous sender") @(t : T?) {
         var anonymous = test_message(10l, 4l, 99l, 1400l, "anonymous message")
         anonymous.SenderUsername = ""
@@ -282,7 +308,7 @@ def test_history_migrations_linq_and_fts(t : T?) {
         let first <- claim_cadmus_live_audio(path, 1000l)
         t |> equal(length(first), 1)
         if (length(first) == 1) {
-            t |> equal(first[0].MessageJson, "\{\"message_id\":800,\"caption\":\"new\"}")
+            t |> equal(first[0].TelegramMessageId, 799l)
             t |> equal(first[0].Attempts, 1)
             t |> equal(first[0].Status, "processing")
             checkpoint_cadmus_live_transcript(path, first[0], "raw words", "English", 1900l)
@@ -291,7 +317,7 @@ def test_history_migrations_linq_and_fts(t : T?) {
         let older <- claim_cadmus_live_audio(path, 2001l)
         t |> equal(length(older), 1)
         if (length(older) == 1) {
-            t |> equal(older[0].TelegramMessageId, 799l)
+            t |> equal(older[0].MessageJson, "\{\"message_id\":800,\"caption\":\"new\"}")
             finish_cadmus_live_audio(path, older[0], 2002l)
         }
         t |> success(!has_ready_cadmus_live_audio(path, 2599l))

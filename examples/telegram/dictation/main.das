@@ -62,6 +62,7 @@ struct DictationConfig {
     min_chars : int = 0               // skip the LLM if the stripped transcript is <= this many bytes
     keep_audio_dir : string = ""      // if set, archive each received audio here ("" = don't keep)
     database : string = "cadmus.db"    // local SQLite history
+    history_media_root : string = ""  // Telegram Desktop export root; idle ASR only ("" = disabled)
     assistant_name : string = "Cadmus"
     assistant_aliases : string = "cadmus,кадмус,Кадмус,КАДМУС"
     assistant_prompt : string = ""
@@ -276,6 +277,7 @@ def load_config(path : string; var err : string&) : DictationConfig {
     cfg.min_chars     = js?["min_chars"] ?? cfg.min_chars
     cfg.keep_audio_dir = js?["keep_audio_dir"] ?? cfg.keep_audio_dir
     cfg.database = js?["database"] ?? cfg.database
+    cfg.history_media_root = js?["history_media_root"] ?? cfg.history_media_root
     cfg.assistant_name = js?["assistant_name"] ?? cfg.assistant_name
     cfg.assistant_aliases = js?["assistant_aliases"] ?? cfg.assistant_aliases
     cfg.assistant_prompt = js?["assistant_prompt"] ?? cfg.assistant_prompt
@@ -1577,6 +1579,74 @@ def private process_next_audio_message() : bool {
     return true
 }
 
+// Imported Telegram Desktop media is strictly background ASR. It updates the local history row,
+// but deliberately skips transcript cleanup, Telegram delivery, and conversational follow-up.
+def private process_next_import_media() : bool {
+    if (empty(g_cfg.history_media_root)) {
+        return false
+    }
+    let jobs <- load_next_cadmus_import_media(g_db_path)
+    if (empty(jobs)) {
+        return false
+    }
+    let job = jobs[0]
+    let relative = to_generic_path(job.RelativePath)
+    var error = ""
+    if (is_absolute(job.RelativePath) || relative == ".." || starts_with(relative, "../")) {
+        error = "unsafe media path: {job.RelativePath}"
+    }
+    let source = empty(error) ? normalize(path_join(g_cfg.history_media_root, job.RelativePath)) : ""
+    if (empty(error) && !stat(source).is_reg) {
+        error = "media file not found: {source}"
+    }
+
+    var wav = ""
+    if (empty(error)) {
+        var temp_error = ""
+        wav = create_temp_file("cadmus_import_", ".wav", temp_error)
+        if (empty(wav)) {
+            error = "could not create temporary WAV: {temp_error}"
+        }
+    }
+    defer() {
+        if (!empty(wav)) {
+            remove(wav)
+        }
+    }
+    let t0 = ref_time_ticks()
+    logger_info(
+        "dictation.import",
+        "ASR history message {job.TelegramMessageId} in chat {job.ChatId}: {job.RelativePath}")
+    if (empty(error) && !transcode_to_wav(g_cfg, source, wav)) {
+        error = "ffmpeg could not decode {job.RelativePath}"
+    }
+
+    var transcript = ""
+    var language = g_cfg.language
+    if (empty(error) && !server_transcribe(wav, transcript, language, error)) {
+        error = "transcription failed: {error}"
+    }
+    if (empty(error) && empty(strip(transcript))) {
+        error = "ASR returned an empty transcript"
+    }
+    if (!empty(error)) {
+        fail_cadmus_import_transcription(g_db_path, job, error)
+        logger_warning(
+            "dictation.import",
+            "history message {job.TelegramMessageId} attempt {job.Attempts + 1} failed: {error}")
+        logger_flush()
+        return true
+    }
+
+    finish_cadmus_import_transcription(g_db_path, job, transcript)
+    let dt = double(get_time_usec(t0)) / 1.0e6lf
+    logger_info(
+        "dictation.import",
+        "history message {job.TelegramMessageId} done ({length(transcript)} bytes, {dt}s; no LLM/reply)")
+    logger_flush()
+    return true
+}
+
 def process_message(msg : message; is_edit : bool = false) {
     if (msg._from != null && msg._from.id == g_bot_id) {
         return
@@ -1797,15 +1867,28 @@ def init() {
     g_bot_id = me.id
     g_bot_username := me.username
     recover_cadmus_live_audio(g_db_path, int64(get_clock()))
+    if (!empty(g_cfg.history_media_root)) {
+        g_cfg.history_media_root = resolve_data_path(g_cfg.history_media_root, "")
+        if (!stat(g_cfg.history_media_root).is_dir) {
+            logger_warning(
+                "dictation.import",
+                "history media root is unavailable; idle import ASR disabled: {g_cfg.history_media_root}")
+            g_cfg.history_media_root = ""
+        } else {
+            requeue_failed_cadmus_import_media(g_db_path)
+            logger_info(
+                "dictation.import",
+                "idle import ASR enabled (root={g_cfg.history_media_root}; failed rows requeued once)")
+        }
+    }
     g_offset = load_cadmus_offset(g_db_path)
     g_bot_ready = true
     logger_info("dictation", "bot started (server={g_cfg.server}, llm={llm_id}, asr=yes, name={g_cfg.assistant_name}, telegram=@{g_bot_username}, database={g_db_path})")
     logger_flush()
 }
 
-// One update first ingests every currently visible Telegram update, then claims one newest-ready
-// audio row. A message arriving while ASR/LLM is busy therefore becomes the next job, ahead of
-// older backlog, without preempting the request already in flight.
+// One update first ingests every currently visible Telegram update, then claims the earliest ready
+// live audio row. Imported history is strictly idle work and runs only when no live row is ready.
 [export]
 def update() {
     if (!g_bot_ready) {
@@ -1817,8 +1900,11 @@ def update() {
         return
     }
     let has_ready_audio = has_ready_cadmus_live_audio(g_db_path, int64(get_clock()))
-    poll_once(g_offset, has_ready_audio ? 0 : g_cfg.poll_timeout)
-    process_next_audio_message()
+    let has_ready_import = !empty(g_cfg.history_media_root) && has_pending_cadmus_import_media(g_db_path)
+    poll_once(g_offset, (has_ready_audio || has_ready_import) ? 0 : g_cfg.poll_timeout)
+    if (!process_next_audio_message()) {
+        process_next_import_media()
+    }
     if (!empty(g_stop_file) && stat(g_stop_file).is_valid) {
         request_exit()
     }

@@ -460,6 +460,41 @@ def load_cadmus_import_media(
     return <- result
 }
 
+// The bot uses imported media only as idle work, across every chat represented in the export.
+// Failed rows are explicitly requeued once at startup, so a permanent failure cannot spin here.
+def load_next_cadmus_import_media(path : string) : array<CadmusImportMedia> {
+    var result : array<CadmusImportMedia>
+    with_cadmus_database(path) $(db) {
+        result <- _sql(
+            db |> select_from(type<CadmusImportMedia>)
+               |> _where(_.Status == "pending")
+               |> _order_by((_.FileSize, _.TelegramMessageId, _.Id))
+               |> take(1))
+    }
+    return <- result
+}
+
+def has_pending_cadmus_import_media(path : string) : bool {
+    var ready = false
+    with_cadmus_database(path) $(db) {
+        let rows <- _sql(
+            db |> select_from(type<CadmusImportMedia>)
+               |> _where(_.Status == "pending")
+               |> take(1))
+        ready = !empty(rows)
+    }
+    return ready
+}
+
+def requeue_failed_cadmus_import_media(path : string) {
+    with_cadmus_database(path) $(db) {
+        db |> _sql_update(
+            type<CadmusImportMedia>,
+            _.Status == "failed",
+            (Status = "pending", LastError = ""))
+    }
+}
+
 def finish_cadmus_import_transcription(
                                        path : string;
                                        item : CadmusImportMedia;
@@ -544,9 +579,8 @@ def claim_cadmus_live_audio(path : string; now : int64) : array<CadmusLiveAudio>
                    |> _where(
                         _.Status == "pending" ||
                         (_.Status == "failed" && _.NextAttemptAt <= now))
-                   // Live voice notes are user-facing: after the current transcription finishes,
-                   // service the newest waiting message before working backward through backlog.
-                   |> _order_by_descending((_.EnqueuedAt, _.Id))
+                   // Preserve conversation order: finish the earliest ready voice note first.
+                   |> _order_by((_.EnqueuedAt, _.Id))
                    |> take(1))
             if (!empty(result)) {
                 result[0].Status = "processing"

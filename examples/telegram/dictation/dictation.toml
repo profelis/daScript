@@ -68,6 +68,11 @@ keep_audio_dir = ""
 # automatically; history is retained indefinitely.
 database = "cadmus.db"
 
+# Optional Telegram Desktop export root. While no live audio is waiting, Cadmus raw-transcribes
+# one pending imported media file at a time into local history. This never invokes the LLM or sends
+# a Telegram reply. Failed import rows are retried once per bot start. Empty = disabled.
+history_media_root = ""
+
 # Cadmus's conversational identity. This prompt is separate from dictation_prompt so personality
 # never changes how transcripts are repaired.
 assistant_name = "Cadmus"
