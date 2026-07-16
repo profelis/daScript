@@ -12,6 +12,7 @@ require ?llvm/daslib/llvm_tune llvm/daslib/llvm_tune public  // re-export ONLY l
 require ?das_metal dasllama/dasllama_math_metal  // nolint:STYLE030 — [init]-only: registers "metal" (the GPU prefill-GEMM batch donor). STRICT guard: the C++ das_metal module exists on Apple builds only, so non-Apple lanes never compile the Metal driver
 require dasllama/dasllama_quant
 require dasllama/dasllama_gguf
+require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id plane strides
 require dasllama/dasllama_tokenizer  // Model owns its tokenizer; load_model populates it
 require dasllama/dasllama_par  // maybe_parallel_for (+ get_total_hw_jobs): thread the prefill attention over heads
 require dasllama/dasllama_tune  // box_profile_path: the runtime half of the app tune sidecar applies at load_model
@@ -39,11 +40,14 @@ enum QuantMode {
 //! q8 = qblob/qscales as always; k4/k5/k6 = the tensor's element offset indexes that format's
 //! plane pair (Model.k4q/k4s etc). A Q4_K_M file mixes formats PER TENSOR (attn_v/ffn_down and
 //! the tied embedding go Q6_K), so the tag rides per layer next to each offset array.
+//! q40 = native Q4_0 (the QAT-file format): the k4 nibble pairing with per-32 f16 d scales —
+//! same superblock walkers, the −8 offset correction rides the Q8_K bsum pairs.
 enum KqFmt : uint8 {
     q8
     k4
     k5
     k6
+    q40
 }
 
 //! FFN gate activation: silu = SwiGLU (Llama family), gelu = GeGLU (Gemma), swiglu_oai = the
@@ -448,6 +452,9 @@ struct Model {
     k5s : array<uint8>
     k6q : array<uint8>
     k6s : array<uint8>
+    // the q40 tier's plane pair (128B nibbles — the k4 pairing — + 16B of f16 d per superblock)
+    q40q : array<uint8>
+    q40s : array<uint8>
     kquant_native : bool = false
     // kq stage 4: the kq planes were repacked at load into the active backend's grp<mr> layout
     // (kernel_backend_has_kq at load time). From then on every kq matmul MUST run the backend
@@ -457,6 +464,7 @@ struct Model {
     kq_repack_mr4 : int64 = 4l   // per-FORMAT repack interleaves (kq v2: the families tune separately)
     kq_repack_mr5 : int64 = 4l
     kq_repack_mr6 : int64 = 4l
+    kq_repack_mr40 : int64 = 4l
     // per-layer weight format tags (KqFmt; empty = all q8). Filled by detect_kq_formats before
     // layout_offsets so the layout walks each tensor into its format's cursor.
     wq_fmt : array<KqFmt>
@@ -645,6 +653,7 @@ struct private LayoutSizes {
     k4_n : int64      // element counts of the native K-quant planes (0 unless kquant_native)
     k5_n : int64
     k6_n : int64
+    q40_n : int64
 }
 
 // The big-weight layout cursors: one element cursor per storage plane. kq_take advances the
@@ -654,6 +663,7 @@ struct private KqCursors {
     k4 : int64
     k5 : int64
     k6 : int64
+    q40 : int64
 }
 
 def private kq_take(var cur : KqCursors; f : KqFmt; n : int64) : int64 {
@@ -670,6 +680,11 @@ def private kq_take(var cur : KqCursors; f : KqFmt; n : int64) : int64 {
     if (f == KqFmt.k6) {
         let o = cur.k6
         cur.k6 += n
+        return o
+    }
+    if (f == KqFmt.q40) {
+        let o = cur.q40
+        cur.q40 += n
         return o
     }
     let o = cur.wo
@@ -967,7 +982,7 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         fo += dim
     }
     return LayoutSizes(fblob_n = fo, wblob_n = cur.wo, mx_n = mx, bf16_n = bf16,
-                       k4_n = cur.k4, k5_n = cur.k5, k6_n = cur.k6)
+                       k4_n = cur.k4, k5_n = cur.k5, k6_n = cur.k6, q40_n = cur.q40)
 }
 
 // Reserve exact capacity then size — avoids the array allocator's power-of-2 rounding on big arrays.
@@ -1076,6 +1091,8 @@ def private load_big(m : GGUFMeta; bytes : array<uint8> | #; name : string; var 
         gguf_transcode_q5k(m, bytes, name, t.k5q, t.k5s, woff, n, src_off)
     } elif (fmt == KqFmt.k6) {
         gguf_transcode_q6k(m, bytes, name, t.k6q, t.k6s, woff, n, src_off)
+    } elif (fmt == KqFmt.q40) {
+        gguf_transcode_q40(m, bytes, name, t.q40q, t.q40s, woff, n, src_off)
     } elif (t.quant == QuantMode.q8) {
         let gt = gguf_tensor_type(m, name)
         if (gt == GGML_TYPE_Q8_0) {
@@ -1239,6 +1256,19 @@ def public get_kquant_native() : bool {
     return g_kquant_native
 }
 
+// The q40 tier's bring-up knob (like kquant_native had): OFF keeps Q4_0 tensors on the
+// q8-requant fallback (2x memory, exact) — the zero-risk A/B rail while the tier proves out.
+var private g_kq_q40_native = true
+
+//! Enable/disable the native Q4_0 plane tier for subsequent loads (A/B rail; default ON —
+//! flipped after the QAT parity gate; requires kquant_native).
+def public set_kq_q40_native(on : bool) {
+    g_kq_q40_native = on
+}
+def public get_kq_q40_native() : bool {
+    return g_kq_q40_native
+}
+
 // GGML disk type -> plane format tag (non-K-quant types ride the classic q8 path)
 def private kq_fmt_of(gt : int) : KqFmt {
     if (gt == GGML_TYPE_Q4_K) {
@@ -1250,8 +1280,16 @@ def private kq_fmt_of(gt : int) : KqFmt {
     if (gt == GGML_TYPE_Q6_K) {
         return KqFmt.k6
     }
+    if (gt == GGML_TYPE_Q4_0 && g_kq_q40_native) {
+        return KqFmt.q40
+    }
     return KqFmt.q8
 }
+
+// q40 demotion: Q4_0 guarantees rows % 32 only (K-quants are % 256 by construction), and the
+// kq tier's superblock walkers/activation image need % 256 — a misaligned tensor falls back to
+// the q8 requant path per tensor. `n` = the tensor's ROW length (the matmul's input dim).
+def private kq_fmt_row_ok(f : KqFmt; n : int64) : KqFmt => f == KqFmt.q40 && n % 256l != 0l ? KqFmt.q8 : f
 
 // Fill the per-kind weight format tags from the file's tensor types (q8-mode loads with the
 // kquant_native knob on). Fused-projection arches (Phi3) split attn_qkv / ffn_up ([gate; up])
@@ -1273,24 +1311,26 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
     t.w2_fmt |> resize(layers)
     t.w3_fmt |> resize(layers)
     var any = false
+    // q40 tags additionally demote per tensor when the row length isn't % 256 (kq_fmt_row_ok) —
+    // Q4_0 only guarantees % 32, unlike the K-quants
     for (l in range64(layers)) {
         if (t.config.fused_qkv) {
-            let fqkv = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_qkv.weight"))
+            let fqkv = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_qkv.weight")), t.config.dim)
             t.wq_fmt[l] = fqkv
             t.wk_fmt[l] = fqkv
             t.wv_fmt[l] = fqkv
-            let fgu = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up.weight"))
+            let fgu = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up.weight")), t.config.dim)
             t.w1_fmt[l] = fgu
             t.w3_fmt[l] = fgu
         } else {
-            t.wq_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_q.weight"))
-            t.wk_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_k.weight"))
-            t.wv_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_v.weight"))
-            t.w1_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate.weight"))
-            t.w3_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up.weight"))
+            t.wq_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_q.weight")), t.config.dim)
+            t.wk_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_k.weight")), t.config.dim)
+            t.wv_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_v.weight")), t.config.dim)
+            t.w1_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate.weight")), t.config.dim)
+            t.w3_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up.weight")), t.config.dim)
         }
-        t.wo_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_output.weight"))
-        t.w2_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_down.weight"))
+        t.wo_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.attn_output.weight")), layer_qd(t.config, l))
+        t.w2_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_down.weight")), layer_hidden(t, l))
         any ||= t.wq_fmt[l] != KqFmt.q8 || t.wk_fmt[l] != KqFmt.q8 || t.wv_fmt[l] != KqFmt.q8
         any ||= t.wo_fmt[l] != KqFmt.q8 || t.w1_fmt[l] != KqFmt.q8 || t.w2_fmt[l] != KqFmt.q8
         any ||= t.w3_fmt[l] != KqFmt.q8
@@ -1307,26 +1347,26 @@ def private detect_kq_formats(var t : Model; m : GGUFMeta) {
         let fused_gu = t.config.moe_dense_shexp   // gemma4: experts ship fused as ffn_gate_up_exps
         for (l in range64(layers)) {
             if (fused_gu) {
-                let f = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate_up_exps.weight"))
+                let f = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate_up_exps.weight")), t.config.dim)
                 t.we1_fmt[l] = f
                 t.we3_fmt[l] = f
             } else {
-                t.we1_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate_exps.weight"))
-                t.we3_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up_exps.weight"))
+                t.we1_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_gate_exps.weight")), t.config.dim)
+                t.we3_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_up_exps.weight")), t.config.dim)
             }
-            t.we2_fmt[l] = kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_down_exps.weight"))
+            t.we2_fmt[l] = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{l}.ffn_down_exps.weight")), t.config.n_ff_exp)
             any ||= t.we1_fmt[l] != KqFmt.q8 || t.we2_fmt[l] != KqFmt.q8 || t.we3_fmt[l] != KqFmt.q8
         }
     }
     if (t.config.shared_weights) {
-        t.emb_fmt = kq_fmt_of(gguf_tensor_type(m, "token_embd.weight"))
+        t.emb_fmt = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "token_embd.weight")), t.config.dim)
         any ||= t.emb_fmt != KqFmt.q8
     } else {
-        t.wcls_fmt = kq_fmt_of(gguf_tensor_type(m, "output.weight"))
+        t.wcls_fmt = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "output.weight")), t.config.dim)
         any ||= t.wcls_fmt != KqFmt.q8
     }
     if (t.config.n_layer_nextn > 0l) {
-        t.mtp_ehproj_fmt = kq_fmt_of(gguf_tensor_type(m, "blk.{t.config.n_layers}.nextn.eh_proj.weight"))
+        t.mtp_ehproj_fmt = kq_fmt_row_ok(kq_fmt_of(gguf_tensor_type(m, "blk.{t.config.n_layers}.nextn.eh_proj.weight")), 2l * t.config.dim)
         any ||= t.mtp_ehproj_fmt != KqFmt.q8
     }
     // E-series PLE token table: gather-only whole rows of layers*ple — row length must be
@@ -1430,6 +1470,8 @@ def private repack_regions(var t : Model; regs : array<RepackReg>) {
         var k5sp : uint8? = null
         var k6qp : uint8? = null
         var k6sp : uint8? = null
+        var q40qp : uint8? = null
+        var q40sp : uint8? = null
         if (!empty(t.qblob)) { qbp = addr(t.qblob[0]) }
         if (!empty(t.qscales)) { qsp = addr(t.qscales[0]) }
         if (!empty(t.mxq)) { mxqp = addr(t.mxq[0]) }
@@ -1440,6 +1482,8 @@ def private repack_regions(var t : Model; regs : array<RepackReg>) {
         if (!empty(t.k5s)) { k5sp = addr(t.k5s[0]) }
         if (!empty(t.k6q)) { k6qp = addr(t.k6q[0]) }
         if (!empty(t.k6s)) { k6sp = addr(t.k6s[0]) }
+        if (!empty(t.q40q)) { q40qp = addr(t.q40q[0]) }
+        if (!empty(t.q40s)) { q40sp = addr(t.q40s[0]) }
         let rp = addr<RepackReg const?>(regs[0])
         let nr = length(regs)
         let njobs = is_job_que_available() ? min(nr, 4 * (get_total_hw_jobs() + 1)) : 1
@@ -1453,10 +1497,10 @@ def private repack_regions(var t : Model; regs : array<RepackReg>) {
                         invoke(rmx, mxqp + rp[i].off / 2l, mxsp + rp[i].off / 32l, rp[i].n, rp[i].d)
                     } else {
                         let sb = rp[i].off / 256l
-                        let qsb = f == 4 ? 128l : (f == 5 ? 160l : 192l)
-                        let ssb = f == 6 ? 18l : 20l
-                        var kqp = f == 4 ? k4qp : (f == 5 ? k5qp : k6qp)
-                        var ksp = f == 4 ? k4sp : (f == 5 ? k5sp : k6sp)
+                        let qsb = kq_qsb(f)
+                        let ssb = kq_ssb(f)
+                        var kqp = f == 4 ? k4qp : (f == 5 ? k5qp : (f == 6 ? k6qp : q40qp))
+                        var ksp = f == 4 ? k4sp : (f == 5 ? k5sp : (f == 6 ? k6sp : q40sp))
                         invoke(rkq, f, kqp + sb * qsb, ksp + sb * ssb, rp[i].n, rp[i].d)
                     }
                 }
@@ -1576,6 +1620,8 @@ def private push_repack_kq(var regs : array<RepackReg>; fmt : KqFmt; woff, n, d 
         push_repack(regs, 5, woff, n, d)
     } elif (fmt == KqFmt.k6) {
         push_repack(regs, 6, woff, n, d)
+    } elif (fmt == KqFmt.q40) {
+        push_repack(regs, 40, woff, n, d)
     }
 }
 
@@ -2211,6 +2257,12 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             t.k6s |> reserve((sz.k6_n / 256l) * K6_SSB)
             t.k6s |> resize((sz.k6_n / 256l) * K6_SSB)
         }
+        if (sz.q40_n > 0l) {
+            t.q40q |> reserve((sz.q40_n / 256l) * Q40_QSB)
+            t.q40q |> resize((sz.q40_n / 256l) * Q40_QSB)
+            t.q40s |> reserve((sz.q40_n / 256l) * Q40_SSB)
+            t.q40s |> resize((sz.q40_n / 256l) * Q40_SSB)
+        }
         if (mode == QuantMode.q8) {
             t.qblob |> reserve(sz.wblob_n)
             t.qblob |> resize(sz.wblob_n)
@@ -2496,7 +2548,8 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 t.kq_repack_mr4 = active_kq_layout_mr(4)
                 t.kq_repack_mr5 = active_kq_layout_mr(5)
                 t.kq_repack_mr6 = active_kq_layout_mr(6)
-                to_log(LOG_INFO, "dasLLAMA: K-quant planes repacked to the '{active_kernel_backend()}' layouts (k4 grp{t.kq_repack_mr4}, k5 grp{t.kq_repack_mr5}, k6 grp{t.kq_repack_mr6})\n")
+                t.kq_repack_mr40 = active_kq_layout_mr(40)
+                to_log(LOG_INFO, "dasLLAMA: K-quant planes repacked to the '{active_kernel_backend()}' layouts (k4 grp{t.kq_repack_mr4}, k5 grp{t.kq_repack_mr5}, k6 grp{t.kq_repack_mr6}, q40 grp{t.kq_repack_mr40})\n")
             }
         }
         to_log(LOG_INFO, "dasLLAMA: load stage repack: {get_time_usec(ts_stage) / 1000} ms\n")
@@ -2548,8 +2601,8 @@ struct MemFootprint {
     q4_scale_bytes : int64
     mx4_bytes : int64
     mx4_scale_bytes : int64
-    kq_bytes : int64         // native K-quant planes: quant payloads (k4q+k5q+k6q)
-    kq_scale_bytes : int64   // ... and their scale planes (k4s+k5s+k6s)
+    kq_bytes : int64         // native K-quant planes: quant payloads (k4q+k5q+k6q+q40q)
+    kq_scale_bytes : int64   // ... and their scale planes (k4s+k5s+k6s+q40s)
     total : int64
 }
 
@@ -2564,8 +2617,8 @@ def footprint(t : Model) : MemFootprint {
     let q4s = long_length(t.q4scales) * 4l
     let mx4 = long_length(t.mxq)                  // uint8 (two nibbles) -> 1 byte each
     let mx4s = long_length(t.mxs)                 // raw E8M0 -> 1 byte per 32-block
-    let kq = long_length(t.k4q) + long_length(t.k5q) + long_length(t.k6q)
-    let kqs = long_length(t.k4s) + long_length(t.k5s) + long_length(t.k6s)
+    let kq = long_length(t.k4q) + long_length(t.k5q) + long_length(t.k6q) + long_length(t.q40q)
+    let kqs = long_length(t.k4s) + long_length(t.k5s) + long_length(t.k6s) + long_length(t.q40s)
     return MemFootprint(aux_fp32_bytes = aux, weight_fp32_bytes = wf, q8_bytes = q8, q8_scale_bytes = q8s,
                         q4_bytes = q4, q4_scale_bytes = q4s, mx4_bytes = mx4, mx4_scale_bytes = mx4s,
                         kq_bytes = kq, kq_scale_bytes = kqs,
@@ -4276,6 +4329,12 @@ def private mm_at_mx4_groupn(var y : array<float>; t : Model; offs, boffs : arra
 
 // ===== native K-quant dispatch (kquant_native; fmt != q8 tags) =====
 
+// KqFmt -> the kernel-layer format id (matmul_kq*/kq_rows_fn/kq_qsb take the int form).
+// q8 deliberately maps to 0, a poison id no kq kernel accepts — the fused-chain hoists call
+// this for EVERY tag (kq_rows_for) and their q8 branches never read the result, so it must
+// stay total; only q40 claims the 40 slot.
+def private kq_fi(fmt : KqFmt) : int => fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : (fmt == KqFmt.k6 ? 6 : (fmt == KqFmt.q40 ? 40 : 0)))
+
 // K-quant GEMV against a PRE-quantized activation (xq/xs/xbs already filled by the bs quantizer).
 // kq_repacked loads run the backend's stamped cores; disk-order loads run the portable kernels.
 def private mm_at_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; n, d : int64; yoff : int64 = 0l) {
@@ -4284,15 +4343,23 @@ def private mm_at_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : in
             matmul_kq_active(4, y, t.k4q, t.k4s, woff, xq, xs, xbs, n, d, yoff)
         } elif (fmt == KqFmt.k5) {
             matmul_kq_active(5, y, t.k5q, t.k5s, woff, xq, xs, xbs, n, d, yoff)
-        } else {
+        } elif (fmt == KqFmt.k6) {
             matmul_kq_active(6, y, t.k6q, t.k6s, woff, xq, xs, xbs, n, d, yoff)
+        } elif (fmt == KqFmt.q40) {
+            matmul_kq_active(40, y, t.q40q, t.q40s, woff, xq, xs, xbs, n, d, yoff)
+        } else {
+            panic("mm_at_kq_pre: '{fmt}' has no kq plane pair")   // a new KqFmt must claim its arm, never ride q40's
         }
     } elif (fmt == KqFmt.k4) {
         matmul_kq(4, y, t.k4q, t.k4s, woff, xq, xs, xbs, n, d, yoff)
     } elif (fmt == KqFmt.k5) {
         matmul_kq(5, y, t.k5q, t.k5s, woff, xq, xs, xbs, n, d, yoff)
-    } else {
+    } elif (fmt == KqFmt.k6) {
         matmul_kq(6, y, t.k6q, t.k6s, woff, xq, xs, xbs, n, d, yoff)
+    } elif (fmt == KqFmt.q40) {
+        matmul_kq(40, y, t.q40q, t.q40s, woff, xq, xs, xbs, n, d, yoff)
+    } else {
+        panic("mm_at_kq_pre: '{fmt}' has no kq plane pair")
     }
 }
 
@@ -4312,13 +4379,16 @@ def private mm_b_kq(var s : Session; var y : array<float>; t : Model; fmt : KqFm
     if (t.kq_repacked && kernel_backend_has_kq_batch()) {
         requant_rows_q8k_bs(x, n, npos, s.xqb, s.xsb, s.xbsb)   // kq v2: Q8_K-form image
         let ts_gemm = ref_time_ticks()
-        let fi = fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : 6)
         if (fmt == KqFmt.k4) {
-            matmul_kq_batch(fi, y, t.k4q, t.k4s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+            matmul_kq_batch(4, y, t.k4q, t.k4s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
         } elif (fmt == KqFmt.k5) {
-            matmul_kq_batch(fi, y, t.k5q, t.k5s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+            matmul_kq_batch(5, y, t.k5q, t.k5s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+        } elif (fmt == KqFmt.k6) {
+            matmul_kq_batch(6, y, t.k6q, t.k6s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+        } elif (fmt == KqFmt.q40) {
+            matmul_kq_batch(40, y, t.q40q, t.q40s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
         } else {
-            matmul_kq_batch(fi, y, t.k6q, t.k6s, woff, s.xqb, s.xsb, s.xbsb, n, d, npos)
+            panic("mm_b_kq: '{fmt}' has no kq plane pair")
         }
         prof_add("mm_gemm", ts_gemm)
         return
@@ -4338,34 +4408,44 @@ def private mm_b_kq(var s : Session; var y : array<float>; t : Model; fmt : KqFm
 // Repacked loads run the backend's kq_groupn (registered with the other kq slots — a kq
 // backend without one panics via the stub); disk-order loads run the portable region walk.
 def private mm_at_kq_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; n, d : int64) {
-    let fi = fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : 6)
     if (t.kq_repacked) {
         if (fmt == KqFmt.k4) {
-            matmul_kq_groupn_active(fi, y, t.k4q, t.k4s, offs, nregions, xq, xs, xbs, n, d)
+            matmul_kq_groupn_active(4, y, t.k4q, t.k4s, offs, nregions, xq, xs, xbs, n, d)
         } elif (fmt == KqFmt.k5) {
-            matmul_kq_groupn_active(fi, y, t.k5q, t.k5s, offs, nregions, xq, xs, xbs, n, d)
+            matmul_kq_groupn_active(5, y, t.k5q, t.k5s, offs, nregions, xq, xs, xbs, n, d)
+        } elif (fmt == KqFmt.k6) {
+            matmul_kq_groupn_active(6, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
+        } elif (fmt == KqFmt.q40) {
+            matmul_kq_groupn_active(40, y, t.q40q, t.q40s, offs, nregions, xq, xs, xbs, n, d)
         } else {
-            matmul_kq_groupn_active(fi, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
+            panic("mm_at_kq_groupn: '{fmt}' has no kq plane pair")
         }
     } elif (fmt == KqFmt.k4) {
-        matmul_kq_groupn(fi, y, t.k4q, t.k4s, offs, nregions, xq, xs, xbs, n, d)
+        matmul_kq_groupn(4, y, t.k4q, t.k4s, offs, nregions, xq, xs, xbs, n, d)
     } elif (fmt == KqFmt.k5) {
-        matmul_kq_groupn(fi, y, t.k5q, t.k5s, offs, nregions, xq, xs, xbs, n, d)
+        matmul_kq_groupn(5, y, t.k5q, t.k5s, offs, nregions, xq, xs, xbs, n, d)
+    } elif (fmt == KqFmt.k6) {
+        matmul_kq_groupn(6, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
+    } elif (fmt == KqFmt.q40) {
+        matmul_kq_groupn(40, y, t.q40q, t.q40s, offs, nregions, xq, xs, xbs, n, d)
     } else {
-        matmul_kq_groupn(fi, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
+        panic("mm_at_kq_groupn: '{fmt}' has no kq plane pair")
     }
 }
 
 // Fused batched region-list kq GEMM (the fused MoE prefill's kq twin of the mx4 batch groupn;
 // triple offs). Callers guard with kq_repacked && kernel_backend_has_kq_batch_groupn().
 def private mm_b_kq_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs : array<int64>; nregions : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; n, d : int64) {
-    let fi = fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : 6)
     if (fmt == KqFmt.k4) {
-        matmul_kq_batch_groupn(fi, y, t.k4q, t.k4s, offs, nregions, xq, xs, xbs, n, d)
+        matmul_kq_batch_groupn(4, y, t.k4q, t.k4s, offs, nregions, xq, xs, xbs, n, d)
     } elif (fmt == KqFmt.k5) {
-        matmul_kq_batch_groupn(fi, y, t.k5q, t.k5s, offs, nregions, xq, xs, xbs, n, d)
+        matmul_kq_batch_groupn(5, y, t.k5q, t.k5s, offs, nregions, xq, xs, xbs, n, d)
+    } elif (fmt == KqFmt.k6) {
+        matmul_kq_batch_groupn(6, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
+    } elif (fmt == KqFmt.q40) {
+        matmul_kq_batch_groupn(40, y, t.q40q, t.q40s, offs, nregions, xq, xs, xbs, n, d)
     } else {
-        matmul_kq_batch_groupn(fi, y, t.k6q, t.k6s, offs, nregions, xq, xs, xbs, n, d)
+        panic("mm_b_kq_groupn: '{fmt}' has no kq plane pair")
     }
 }
 
@@ -4373,13 +4453,16 @@ def private mm_b_kq_groupn(var y : array<float>; t : Model; fmt : KqFmt; offs : 
 // mm_b_q8_pre). Callers guard with kq_repacked && kernel_backend_has_kq_batch() — the prefill
 // gate routes kq-expert layers to the per-position reference path otherwise.
 def private mm_b_kq_pre(var y : array<float>; t : Model; fmt : KqFmt; woff : int64; xq : array<int8>; xs : array<float>; xbs : array<int>; n, d, ntok : int64) {
-    let fi = fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : 6)
     if (fmt == KqFmt.k4) {
-        matmul_kq_batch(fi, y, t.k4q, t.k4s, woff, xq, xs, xbs, n, d, ntok)
+        matmul_kq_batch(4, y, t.k4q, t.k4s, woff, xq, xs, xbs, n, d, ntok)
     } elif (fmt == KqFmt.k5) {
-        matmul_kq_batch(fi, y, t.k5q, t.k5s, woff, xq, xs, xbs, n, d, ntok)
+        matmul_kq_batch(5, y, t.k5q, t.k5s, woff, xq, xs, xbs, n, d, ntok)
+    } elif (fmt == KqFmt.k6) {
+        matmul_kq_batch(6, y, t.k6q, t.k6s, woff, xq, xs, xbs, n, d, ntok)
+    } elif (fmt == KqFmt.q40) {
+        matmul_kq_batch(40, y, t.q40q, t.q40s, woff, xq, xs, xbs, n, d, ntok)
     } else {
-        matmul_kq_batch(fi, y, t.k6q, t.k6s, woff, xq, xs, xbs, n, d, ntok)
+        panic("mm_b_kq_pre: '{fmt}' has no kq plane pair")
     }
 }
 
@@ -4388,6 +4471,7 @@ def private kq_plane_q(t : Model; fmt : KqFmt; woff : int64) : uint8 const? {
     if (fmt == KqFmt.k4) return unsafe(addr<uint8 const?>(t.k4q[sb * K4_QSB]))
     if (fmt == KqFmt.k5) return unsafe(addr<uint8 const?>(t.k5q[sb * K5_QSB]))
     if (fmt == KqFmt.k6) return unsafe(addr<uint8 const?>(t.k6q[sb * K6_QSB]))
+    if (fmt == KqFmt.q40) return unsafe(addr<uint8 const?>(t.q40q[sb * Q40_QSB]))
     return null
 }
 
@@ -4396,11 +4480,12 @@ def private kq_plane_s(t : Model; fmt : KqFmt; woff : int64) : uint8 const? {
     if (fmt == KqFmt.k4) return unsafe(addr<uint8 const?>(t.k4s[sb * K4_SSB]))
     if (fmt == KqFmt.k5) return unsafe(addr<uint8 const?>(t.k5s[sb * K5_SSB]))
     if (fmt == KqFmt.k6) return unsafe(addr<uint8 const?>(t.k6s[sb * K6_SSB]))
+    if (fmt == KqFmt.q40) return unsafe(addr<uint8 const?>(t.q40s[sb * Q40_SSB]))
     return null
 }
 
 def private kq_rows_for(fmt : KqFmt) : MatmulKqRowsFn {
-    return kq_rows_fn(fmt == KqFmt.k4 ? 4 : (fmt == KqFmt.k5 ? 5 : 6))
+    return kq_rows_fn(kq_fi(fmt))
 }
 
 // Can the fused chains serve a weight of this format? q8 always; kq only off a repacked load
@@ -6420,8 +6505,12 @@ def private ple_gather_row(t : Model; row : int64; var dst : array<float>; doff 
             dequant_k4_plane_superblock(t.k4q, sb * K4_QSB, t.k4s, sb * K4_SSB, dst, doff + blk * 256l)
         } elif (t.ple_emb_fmt == KqFmt.k5) {
             dequant_k5_plane_superblock(t.k5q, sb * K5_QSB, t.k5s, sb * K5_SSB, dst, doff + blk * 256l)
-        } else {
+        } elif (t.ple_emb_fmt == KqFmt.k6) {
             dequant_k6_plane_superblock(t.k6q, sb * K6_QSB, t.k6s, sb * K6_SSB, dst, doff + blk * 256l)
+        } elif (t.ple_emb_fmt == KqFmt.q40) {
+            dequant_q40_plane_superblock(t.q40q, sb * Q40_QSB, t.q40s, sb * Q40_SSB, dst, doff + blk * 256l)
+        } else {
+            panic("ple_gather_row: '{t.ple_emb_fmt}' has no kq plane pair")
         }
     }
 }
@@ -6667,21 +6756,27 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
     if (t.cls_q8) {
         dequant_q8_row(t, t.emb_q8_off + token * dim, dim, dst)
     } elif (cls_kq(t)) {
-        let mr = t.emb_fmt == KqFmt.k4 ? t.kq_repack_mr4 : (t.emb_fmt == KqFmt.k5 ? t.kq_repack_mr5 : t.kq_repack_mr6)
+        let mr = (t.emb_fmt == KqFmt.k4 ? t.kq_repack_mr4
+            : (t.emb_fmt == KqFmt.k5 ? t.kq_repack_mr5
+            : (t.emb_fmt == KqFmt.k6 ? t.kq_repack_mr6 : t.kq_repack_mr40)))
         if (t.kq_repacked && token < (t.config.vocab_size / mr) * mr) {
             // repacked plane: gather the row through the grp<mr> layout (tail rows below stay
             // disk-order — the repack leaves them verbatim)
             unsafe {
                 let nsb = dim / 256l
                 let g = token / mr
-                let fmt = t.emb_fmt == KqFmt.k4 ? 4l : (t.emb_fmt == KqFmt.k5 ? 5l : 6l)
+                let fmt = int64(kq_fi(t.emb_fmt))
                 let sb0t = t.wcls_off / 256l
                 if (t.emb_fmt == KqFmt.k4) {
                     dequant_kq_row_grp(fmt, addr(t.k4q[(sb0t + g * mr * nsb) * K4_QSB]), addr(t.k4s[(sb0t + g * mr * nsb) * K4_SSB]), token % mr, mr, dim, dst)
                 } elif (t.emb_fmt == KqFmt.k5) {
                     dequant_kq_row_grp(fmt, addr(t.k5q[(sb0t + g * mr * nsb) * K5_QSB]), addr(t.k5s[(sb0t + g * mr * nsb) * K5_SSB]), token % mr, mr, dim, dst)
-                } else {
+                } elif (t.emb_fmt == KqFmt.k6) {
                     dequant_kq_row_grp(fmt, addr(t.k6q[(sb0t + g * mr * nsb) * K6_QSB]), addr(t.k6s[(sb0t + g * mr * nsb) * K6_SSB]), token % mr, mr, dim, dst)
+                } elif (t.emb_fmt == KqFmt.q40) {
+                    dequant_kq_row_grp(fmt, addr(t.q40q[(sb0t + g * mr * nsb) * Q40_QSB]), addr(t.q40s[(sb0t + g * mr * nsb) * Q40_SSB]), token % mr, mr, dim, dst)
+                } else {
+                    panic("embed_row: '{t.emb_fmt}' has no kq plane pair")
                 }
             }
         } else {
@@ -6693,8 +6788,12 @@ def private embed_row(t : Model; token : int64; var dst : float?) {
                         dequant_k4_plane_superblock(t.k4q, (sb0 + s) * K4_QSB, t.k4s, (sb0 + s) * K4_SSB, row, s * 256l)
                     } elif (t.emb_fmt == KqFmt.k5) {
                         dequant_k5_plane_superblock(t.k5q, (sb0 + s) * K5_QSB, t.k5s, (sb0 + s) * K5_SSB, row, s * 256l)
-                    } else {
+                    } elif (t.emb_fmt == KqFmt.k6) {
                         dequant_k6_plane_superblock(t.k6q, (sb0 + s) * K6_QSB, t.k6s, (sb0 + s) * K6_SSB, row, s * 256l)
+                    } elif (t.emb_fmt == KqFmt.q40) {
+                        dequant_q40_plane_superblock(t.q40q, (sb0 + s) * Q40_QSB, t.q40s, (sb0 + s) * Q40_SSB, row, s * 256l)
+                    } else {
+                        panic("embed_row: '{t.emb_fmt}' has no kq plane pair")
                     }
                 }
             }

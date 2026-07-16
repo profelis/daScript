@@ -4,6 +4,7 @@ module dasllama_math_default shared public
 
 require dasllama/dasllama_math       // KernelBackend + register_kernel_backend + the matmul_chunks shapers + repack_q8q8_identity
 require dasllama/dasllama_tune       // [tuned]: reconstitute dot_q8q8 from its template with per-box loop hints
+require dasllama/dasllama_gemm_schema  // kq_qsb/kq_ssb — the fmt-id kq plane strides
 require llvm/daslib/f16_cvt          // dot_q8q8_f16s widens the binary16 weight scale in-loop
 require daslib/jobque_boost public   // parallel_for / notify_and_release (the kernels expand parallel_for)
 require dasllama/dasllama_par        // maybe_parallel_for
@@ -437,6 +438,40 @@ def dot_k6q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp 
     return acc
 }
 
+// q40 (native Q4_0): Q8_K-form activations like the K-quants; w = d·(q − 8) with a PER-32 f16
+// d, so the fold is per BLOCK — facc accumulates float(ilo + ihi − 8·Σa32)·d over the
+// superblock's 8 blocks (Σa32 = the two per-16 bsums), closed by ONE ·d8. Ints exact; the
+// float order (per-block fma into facc, per-superblock fma into acc) is the contract every
+// q40 kernel reproduces.
+[hint(unsafe_range_check, noalias = kqrow, noalias = ksrow, noalias = xqp, noalias = xsp, noalias = xbsp)]
+def dot_q40q8(kqrow : uint8 const?; ksrow : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n : int64) : float {
+    var acc = 0.0
+    unsafe {
+        for (sb in range64(n / 256l)) {
+            let kqo = sb * 128l
+            let kso = sb * 16l
+            var facc = 0.0
+            for (blk in range64(8l)) {
+                let qb = kqo + 16l * blk
+                let b = sb * 8l + blk
+                let ab = b * 32l
+                var ilo = 0
+                var ihi = 0
+                for (l in range64(16l)) {
+                    let q = int(kqrow[qb + l])
+                    ilo += (q & 15) * int(xqp[ab + l])
+                    ihi += (q >> 4) * int(xqp[ab + 16l + l])
+                }
+                let isub = ilo + ihi - 8 * (xbsp[b * 2l] + xbsp[b * 2l + 1l])
+                let d = f16_to_f32(uint(ksrow[kso + 2l * blk]) | (uint(ksrow[kso + 2l * blk + 1l]) << 8u))
+                facc += float(isub) * d
+            }
+            acc += facc * xsp[sb]
+        }
+    }
+    return acc
+}
+
 // Row-range cores + full GEMVs per format. Not `private`: invoked through hoisted function
 // pointers from lifted worker lambdas (the fused chains) and the dispatch wrappers in common.
 def k4_rows_kernel(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) {
@@ -466,6 +501,15 @@ def k6_rows_kernel(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp 
     }
 }
 
+def q40_rows_kernel(var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, rb, re : int64) {
+    let nsb = n / 256l
+    unsafe {
+        for (i in range64(rb, re)) {
+            yp[i] = dot_q40q8(kqp + i * nsb * 128l, ksp + i * nsb * 16l, xqp, xsp, xbsp, n)
+        }
+    }
+}
+
 def private kq_gemv_kernel(fmt : int; var yp : float?; kqp : uint8 const?; ksp : uint8 const?; xqp : int8 const?; xsp : float const?; xbsp : int const?; n, d : int64) {
     var myp = yp
     maybe_parallel_for(0, int(d), matmul_chunks_gemv(int(d), 1, n * d)) $(rb, re) {
@@ -473,6 +517,8 @@ def private kq_gemv_kernel(fmt : int; var yp : float?; kqp : uint8 const?; ksp :
             k4_rows_kernel(myp, kqp, ksp, xqp, xsp, xbsp, n, int64(rb), int64(re))
         } elif (fmt == 5) {
             k5_rows_kernel(myp, kqp, ksp, xqp, xsp, xbsp, n, int64(rb), int64(re))
+        } elif (fmt == 40) {
+            q40_rows_kernel(myp, kqp, ksp, xqp, xsp, xbsp, n, int64(rb), int64(re))
         } else {
             k6_rows_kernel(myp, kqp, ksp, xqp, xsp, xbsp, n, int64(rb), int64(re))
         }
@@ -485,8 +531,29 @@ def private kq_gemv_kernel(fmt : int; var yp : float?; kqp : uint8 const?; ksp :
 //! per-token, so scalar is fine.
 def dequant_kq_row_grp(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, mr, n : int64; var dst : float?) {
     let nsb = n / 256l
-    let qsb = fmt == 4l ? 128l : (fmt == 5l ? 160l : 192l)
-    let ssb = fmt == 6l ? 18l : 20l
+    let qsb = kq_qsb(int(fmt))
+    let ssb = kq_ssb(int(fmt))
+    if (fmt == 40l) {
+        // q40 grp: the k4 nibble tiling with a per-block f16 d plane — w = d·(q − 8)
+        unsafe {
+            for (sbi in range64(nsb)) {
+                let qb = sbi * qsb * mr
+                let sb = sbi * ssb * mr
+                for (blk in range64(8l)) {
+                    let kb = sbi * 256l + blk * 32l
+                    let d = f16_to_f32(uint(ksg[sb + blk * 2l * mr + 2l * r]) | (uint(ksg[sb + blk * 2l * mr + 2l * r + 1l]) << 8u))
+                    for (j in range64(4l)) {
+                        for (t in range64(4l)) {
+                            let nib = uint(kqg[qb + ((blk * 4l + j) * mr + r) * 4l + t])
+                            dst[kb + j * 4l + t] = d * float(int(nib & 15u) - 8)
+                            dst[kb + 16l + j * 4l + t] = d * float(int(nib >> 4u) - 8)
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
     unsafe {
         for (sbi in range64(nsb)) {
             let qb = sbi * qsb * mr
@@ -544,8 +611,8 @@ def dequant_kq_row_grp(fmt : int64; kqg : uint8 const?; ksg : uint8 const?; r, m
 //! y[yoff .. yoff+d) (batched callers pass the token row base).
 def matmul_kq(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; woff : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64; yoff : int64 = 0l) {
     let sb = woff / 256l
-    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 20l
+    let qsb = kq_qsb(fmt)
+    let ssb = kq_ssb(fmt)
     unsafe {
         kq_gemv_kernel(fmt, addr(y[yoff]), addr(kq[sb * qsb]), addr(ks[sb * ssb]),
                        addr(xq[0]), addr(xs[0]), addr(xbs[0]), n, d)
@@ -558,8 +625,8 @@ def matmul_kq(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : a
 //! stack is one tensor. No bias form (the only biased-experts arch, gpt-oss, is mx4).
 def matmul_kq_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #; ks : array<uint8> | #; offs : array<int64> | #; nregions : int64; xq : array<int8> | #; xs : array<float> | #; xbs : array<int> | #; n, d : int64) {
     let nsb = n / 256l
-    let qsb = fmt == 4 ? 128l : (fmt == 5 ? 160l : 192l)
-    let ssb = fmt == 6 ? 18l : 20l
+    let qsb = kq_qsb(fmt)
+    let ssb = kq_ssb(fmt)
     unsafe {
         let kqp = addr<uint8 const?>(kq[0])
         let ksp = addr<uint8 const?>(ks[0])
@@ -580,6 +647,8 @@ def matmul_kq_groupn(fmt : int; var y : array<float> | #; kq : array<uint8> | #;
                         myp[ii] = dot_k4q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 256l, xbsp + xoff / 16l, n)
                     } elif (fmt == 5) {
                         myp[ii] = dot_k5q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 256l, xbsp + xoff / 16l, n)
+                    } elif (fmt == 40) {
+                        myp[ii] = dot_q40q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 256l, xbsp + xoff / 16l, n)
                     } else {
                         myp[ii] = dot_k6q8(kqp + sb * qsb, ksp + sb * ssb, xqp + xoff, xsp + xoff / 256l, xbsp + xoff / 16l, n)
                     }

@@ -880,6 +880,31 @@ def dequant_k6_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<u
     }
 }
 
+//! Transcode one Q4_0 superblock (8 x 18-byte disk blocks at `bo`) into the q40 planes: per
+//! block the f16 d halfword to ks[kso + 2*blk), the 16 nibble bytes verbatim to kq (exact).
+def transcode_q40_superblock(bytes : array<uint8> | #; bo : int64; var kq : array<uint8>; kqo : int64; var ks : array<uint8>; kso : int64) {
+    for (blk in range64(8l)) {
+        ks[kso + blk * 2l] = bytes[bo + blk * 18l]
+        ks[kso + blk * 2l + 1l] = bytes[bo + blk * 18l + 1l]
+        for (i in range64(16l)) {
+            kq[kqo + blk * 16l + i] = bytes[bo + blk * 18l + 2l + i]
+        }
+    }
+}
+
+//! Reference dequant of one q40-plane superblock: w = d * (q - 8) per 32-block, q = nibble
+//! (low = k, high = k+16 — the disk pairing, kept verbatim by the transcode).
+def dequant_q40_plane_superblock(kq : array<uint8> | #; kqo : int64; ks : array<uint8> | #; kso : int64; var dst : array<float> | #; doff : int64) {
+    for (blk in range64(8l)) {
+        let d = f16_to_f32(rd_u16(ks, kso + blk * 2l))
+        for (l in range64(16l)) {
+            let b = int(kq[kqo + blk * 16l + l])
+            dst[doff + blk * 32l + l] = d * float((b & 15) - 8)
+            dst[doff + blk * 32l + 16l + l] = d * float((b >> 4) - 8)
+        }
+    }
+}
+
 // K-quant plane strides (bytes per 256-weight superblock)
 let K4_QSB = 128l
 let K4_SSB = 20l   // kq v2: 16B verbatim disk scale block + 4B pad (repack decodes in place)
@@ -887,6 +912,8 @@ let K5_QSB = 160l
 let K5_SSB = 20l   // kq v2: 16B verbatim disk scale block + 4B pad (the k4 form)
 let K6_QSB = 192l
 let K6_SSB = 18l
+let Q40_QSB = 128l   // q40 tier: 8 x 16 nibble bytes (the k4 pairing, k / k+16 per 32-block)
+let Q40_SSB = 16l    // 8 x f16 d, verbatim disk halfwords
 
 // Raw byte copy via unaligned u64 moves + byte tail — the workhorse of the pointerized transcode
 // loops (uint8 source and destination regions never overlap).
@@ -1019,6 +1046,38 @@ def gguf_transcode_q6k(m : GGUFMeta; srcbytes : array<uint8> | #; name : string;
                     for (blk in range64(int64(rb), int64(re))) {
                         bcopy(kqp + blk * K6_QSB, srcp + blk * 210l, 192l)   // ql then qh — disk order
                         bcopy(ksp + blk * K6_SSB, srcp + blk * 210l + 192l, 18l)   // 16 sub-scales + f16 d
+                    }
+                }
+            }
+        }
+    }
+}
+
+//! Transcode a Q4_0 tensor into the q40 planes (see gguf_transcode_q4k; strides 128/16, exact):
+//! per 32-block the 18 disk bytes split into 2B f16 d (scale plane) + 16B nibbles (quant plane).
+def gguf_transcode_q40(m : GGUFMeta; srcbytes : array<uint8> | #; name : string; var kq : array<uint8>; var ks : array<uint8>; eloff, expect_n : int64; src_off : int64 = 0l) {
+    let ti = kq_transcode_check(m, name, GGML_TYPE_Q4_0, "Q4_0", src_off, expect_n)
+    let nb = expect_n / 256l
+    if (nb <= 0l) {
+        return
+    }
+    guard_dst(name, "q40 quant plane", (eloff / 256l) * Q40_QSB, nb * Q40_QSB, long_length(kq))
+    guard_dst(name, "q40 scale plane", (eloff / 256l) * Q40_SSB, nb * Q40_SSB, long_length(ks))
+    with_tensor_view(m, srcbytes, ti) $(bytes, tbase) {
+        let bo = tbase + (src_off / 256l) * 144l   // 8 x 18B disk blocks per superblock
+        unsafe {
+            let srcp = addr<uint8 const?>(bytes[bo])
+            var kqp = addr(kq[(eloff / 256l) * Q40_QSB])
+            var ksp = addr(ks[(eloff / 256l) * Q40_SSB])
+            maybe_parallel_for(0, int(nb), transcode_jobs(nb, 144l)) $(rb, re) {
+                unsafe {
+                    for (sb in range64(int64(rb), int64(re))) {
+                        for (blk in range64(8l)) {
+                            let src = srcp + sb * 144l + blk * 18l
+                            ksp[sb * Q40_SSB + blk * 2l] = src[0]        // f16 d
+                            ksp[sb * Q40_SSB + blk * 2l + 1l] = src[1]
+                            bcopy(kqp + sb * Q40_QSB + blk * 16l, src + 2l, 16l)
+                        }
                     }
                 }
             }
