@@ -30,7 +30,12 @@ from urllib.request import Request, urlopen
 
 IS_WINDOWS = os.name == "nt"
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent.parent
+SOURCE_REPO_ROOT = SCRIPT_DIR.parent.parent
+DEFAULT_CWD = (
+    SOURCE_REPO_ROOT
+    if (SOURCE_REPO_ROOT / "utils/dasllama-server/main.das").is_file()
+    else SCRIPT_DIR
+)
 TUNE_RESTART_EXIT = 3
 JIT_ARTIFACT_SUFFIXES = {".dll", ".exp", ".lib", ".map", ".o", ".obj", ".pdb"}
 WER_LOCAL_DUMPS = r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
@@ -45,10 +50,16 @@ def find_daslang() -> Path:
         "build/daslang",
     )
     for name in names:
-        candidate = REPO_ROOT / name
+        candidate = SOURCE_REPO_ROOT / name
         if candidate.is_file():
             return candidate
     return Path("daslang.exe" if IS_WINDOWS else "daslang")
+
+
+def resolve_from(path: Path, base: Path) -> Path:
+    if path.is_absolute():
+        return path.resolve()
+    return (base / path).resolve()
 
 
 def make_logger(path: Path) -> logging.Logger:
@@ -375,6 +386,15 @@ def collect_crash_bundle(
     root = args.crash_dir.resolve()
     bundle = root / f"{args.name}-{stamp}-pid{child_pid}"
     bundle.mkdir(parents=True, exist_ok=False)
+    program_artifacts: list[Path] = []
+    if args.program is not None:
+        for source in (
+            args.program,
+            args.program.with_suffix(".map"),
+            args.program.with_suffix(".pdb"),
+        ):
+            if source.is_file():
+                program_artifacts.append(source)
     metadata = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "pid": child_pid,
@@ -386,6 +406,7 @@ def collect_crash_bundle(
         "wer_report": wer_report or "",
         "dump": dump_path.name if dump_path is not None else "",
         "jit_dlls": [str(path) for path in sorted(jit_dlls)],
+        "program_artifacts": [path.name for path in program_artifacts],
     }
     (bundle / "crash.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
@@ -395,7 +416,13 @@ def collect_crash_bundle(
         shutil.copy2(args.log, bundle / args.log.name)
     if dump_path is not None and dump_path.is_file():
         shutil.copy2(dump_path, bundle / dump_path.name)
-    tune_file = args.script.with_suffix(".tune.json")
+    for source in program_artifacts:
+        shutil.copy2(source, bundle / source.name)
+    tune_file = (
+        args.program.with_suffix(".tune.json")
+        if args.program is not None
+        else args.script.with_suffix(".tune.json")
+    )
     if tune_file.is_file():
         shutil.copy2(tune_file, bundle / tune_file.name)
     jit_dir = args.jit_dir.resolve()
@@ -470,13 +497,13 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument(
         "--program",
         type=Path,
-        help="Run this standalone program instead of daslang -jit <script>",
+        help="Run this standalone program instead of daslang -jit <script>; relative paths use --cwd",
     )
     parser.add_argument("--daslang", type=Path, default=find_daslang())
     parser.add_argument("--script", type=Path, default=SCRIPT_DIR / "main.das")
-    parser.add_argument("--cwd", type=Path, default=REPO_ROOT)
-    parser.add_argument("--log", type=Path, default=REPO_ROOT / "logs/dasllama-watchdog.log")
-    parser.add_argument("--pid-file", type=Path, default=REPO_ROOT / "logs/dasllama-watchdog.pid")
+    parser.add_argument("--cwd", type=Path, default=DEFAULT_CWD)
+    parser.add_argument("--log", type=Path, default=Path("logs/dasllama-watchdog.log"))
+    parser.add_argument("--pid-file", type=Path, default=Path("logs/dasllama-watchdog.pid"))
     parser.add_argument("--health-url", default="http://127.0.0.1:8080/v1/models")
     parser.add_argument("--shutdown-url", default="http://127.0.0.1:8080/shutdown")
     parser.add_argument("--no-health", action="store_true")
@@ -500,7 +527,7 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument(
         "--dump-dir",
         type=Path,
-        default=REPO_ROOT / "logs/dumps",
+        default=Path("logs/dumps"),
         help="Expected WER LocalDumps output folder",
     )
     parser.add_argument(
@@ -517,14 +544,14 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument(
         "--crash-dir",
         type=Path,
-        default=REPO_ROOT / "logs/crashes",
+        default=Path("logs/crashes"),
         help="Crash bundle destination",
     )
     parser.add_argument("--crash-bundles", type=int, default=10)
     parser.add_argument(
         "--jit-dir",
         type=Path,
-        default=REPO_ROOT / ".jitted_scripts",
+        default=Path(".jitted_scripts"),
         help="JIT artifact cache copied into each crash bundle",
     )
     parser.add_argument("--no-crash-bundle", action="store_true")
@@ -538,17 +565,21 @@ def parse_cli() -> argparse.Namespace:
 def main() -> int:
     args = parse_cli()
     args.cwd = args.cwd.resolve()
-    args.log = args.log.resolve()
-    args.pid_file = args.pid_file.resolve()
-    args.script = args.script.resolve()
-    args.dump_dir = args.dump_dir.resolve()
-    args.crash_dir = args.crash_dir.resolve()
-    args.jit_dir = args.jit_dir.resolve()
-    logger = make_logger(args.log)
-    daslang = args.daslang.resolve() if args.daslang.is_file() else args.daslang
+    args.log = resolve_from(args.log, args.cwd)
+    args.pid_file = resolve_from(args.pid_file, args.cwd)
+    args.script = resolve_from(args.script, args.cwd)
+    args.dump_dir = resolve_from(args.dump_dir, args.cwd)
+    args.crash_dir = resolve_from(args.crash_dir, args.cwd)
+    args.jit_dir = resolve_from(args.jit_dir, args.cwd)
     if args.program is not None:
-        program = args.program.resolve() if args.program.is_file() else args.program
-        command = [str(program)]
+        args.program = resolve_from(args.program, args.cwd)
+    if args.stop_file is not None:
+        args.stop_file = resolve_from(args.stop_file, args.cwd)
+    logger = make_logger(args.log)
+    daslang_candidate = resolve_from(args.daslang, args.cwd)
+    daslang = daslang_candidate if daslang_candidate.is_file() else args.daslang
+    if args.program is not None:
+        command = [str(args.program)]
     else:
         command = [str(daslang), "-jit"]
         if args.jit_stack:
@@ -624,7 +655,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop_handler)
     failures = 0
     recovery_pending = False
-    stop_file = args.stop_file.resolve() if args.stop_file is not None else None
+    stop_file = args.stop_file
     child_env = os.environ.copy()
     if stop_file is not None:
         child_env[args.stop_env] = str(stop_file)

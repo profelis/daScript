@@ -133,7 +133,7 @@ def pick_kv_dtype(s : string) : KVDtype {
 }
 
 def private cli_has_flag(flag : string) : bool {
-    var args <- get_cli_arguments()
+    var args <- get_user_args()
     let eqform = "{flag}="
     for (a in args) {
         if (a == flag || a |> starts_with(eqform)) {

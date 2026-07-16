@@ -71,6 +71,29 @@ transcriptions at once. Each worker owns its model/context and reuses language-s
 scratch, so memory settles at the workers' high-water mark. OpenAI is stateless — the client
 resends the full transcript each turn.
 
+## Supervised release executable
+
+`daspkg release` ships `watchdog.py` beside `dasllama-server.exe`. Relative watchdog paths resolve
+against `--cwd`, so the release directory owns its logs, PID file, dumps, crash bundles, config,
+and tune sidecar:
+
+```powershell
+Set-Location E:/dasllama-server
+
+# Run once from an elevated PowerShell for this executable name.
+python ./watchdog.py --program ./dasllama-server.exe --install-local-dumps
+
+# Normal day-to-day launch. dasllama-server.toml is auto-loaded from this directory.
+$env:DAS_JOBQUE_THREADS = "16"
+python ./watchdog.py --program ./dasllama-server.exe --require-dumps
+```
+
+The watchdog polls `/v1/models`, records process memory once a minute, shows a Windows notification
+after a crash, collects the executable's WER minidump plus the exact executable, compact `.map`,
+optional `.pdb`, and `dasllama-server.tune.json`, then restarts with bounded exponential backoff.
+Exit 0, including a drained `POST /shutdown`, stops the watchdog. Use `--health-url` and
+`--shutdown-url` when serving on a non-default port.
+
 ## Supervised `.das` canary
 
 For a long-running diagnostic deployment, supervise the JIT script directly instead of using the
@@ -86,15 +109,14 @@ python utils/dasllama-server/watchdog.py --jit-stack --require-dumps -- `
   --config E:/dictation-bot/release/dasllama-server/dasllama-server.toml
 ```
 
-The first start on an untuned box writes the tune sidecar and exits with code 3; the watchdog
+The first JIT start on an untuned box writes the tune sidecar and exits with code 3; the watchdog
 recognizes that bootstrap exit and launches the script again. It writes rotating JSON-line logs to
 `logs/dasllama-watchdog.log`, samples process memory once a minute, and polls `/v1/models`.
 `--jit-stack` records every generated daslang call in the logical stack; Windows JIT links also
 retain a compact `.map` beside the `.dll/.o`. After a crash, the watchdog waits for the WER
 minidump, copies it together with the matching JIT artifacts, tune manifest, metadata, and log into
 `logs/crashes/`, displays a Windows notification, and restarts with bounded exponential backoff.
-The ten newest bundles are retained by default. Exit 0 (including a completed `POST /shutdown`)
-stops the watchdog. Use `--health-url` and `--shutdown-url` when serving on a non-default port.
+The ten newest bundles are retained by default.
 
 ## Deploying (daspkg release)
 
@@ -102,11 +124,12 @@ stops the watchdog. Use `--health-url` and `--shutdown-url` when serving on a no
 bin/daslang utils/daspkg/main.das -- release --root utils/dasllama-server --out <target>
 ```
 
-Produces `<target>/dasllama-server/` — the standalone exe, the shared-module dylibs (dasHV,
-dasAudio), the runtime DLLs, and the `[tune]` sidecar (`dasllama-server.tune.json`; incomplete
-scopes are tuned and baked during the release build). Re-releasing over an existing bundle is the
-upgrade path: a `dasllama-server.toml` living in the bundle is NOT part of the release manifest,
-so the deployed config survives. Stop a running server first — Windows locks the exe.
+Produces `<target>/dasllama-server/` — the standalone exe, `watchdog.py`, the shared-module dylibs
+(dasHV, dasAudio), the runtime DLLs, and the `[tune]` sidecar
+(`dasllama-server.tune.json`; incomplete scopes are tuned and baked during the release build).
+Re-releasing over an existing bundle is the upgrade path: a `dasllama-server.toml` living in the
+bundle is NOT part of the release manifest, so the deployed config survives. Stop a running server
+first — Windows locks the exe.
 
 ## Endpoints
 
