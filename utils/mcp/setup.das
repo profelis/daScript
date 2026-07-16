@@ -176,10 +176,14 @@ def stage_jit_backend(root : string) {
     }
     let src_root = get_das_root()
     var fallback_root = ""
+    var fallback_source = "DASLANG is unset"
     if (has_env_variable("DASLANG")) {
         let sdk_binary = get_env_variable("DASLANG")
         if (fexist(sdk_binary)) {
             fallback_root = root_from_daslang_binary(sdk_binary)
+            fallback_source = "DASLANG root {fallback_root}"
+        } else {
+            fallback_source = "DASLANG does not name an existing binary"
         }
     }
     let jit_files = ["lib/LLVM.dll", "bin/lld-link.exe"]
@@ -193,7 +197,7 @@ def stage_jit_backend(root : string) {
             src = path_join(fallback_root, rel)
         }
         if (!fexist(src) || get_full_file_name(src) == get_full_file_name(dst)) {
-            print("WARNING: JIT backend file '{rel}' has no external source (checked {src_root} and DASLANG); worktree -jit may be unavailable\n")
+            print("WARNING: JIT backend file '{rel}' has no external source (checked {src_root}; {fallback_source}); worktree -jit may be unavailable\n")
             continue
         }
         let dstdir = dir_name(dst)
