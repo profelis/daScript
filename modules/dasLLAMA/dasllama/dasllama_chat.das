@@ -41,7 +41,6 @@ struct ChatSession {
     has_pending : bool = false
     pending_is_tool : bool = false  // pending is a tool-results block: marker-split at render
     first : bool = true             // first turn emits add_bos + the system turn
-    enable_thinking : bool = true   // false renders the template's no-thinking generation suffix
     max_new : int64 = 256l          // per-reply token budget
     enable_thinking : bool = true   // false + a template with a think_suppress form => instruct mode
     history : array<Message>
@@ -124,13 +123,6 @@ def private detect_chat_template(m : Model; var out : ChatTemplate) : bool {
         out <- zephyr_chat_template()
     } else {
         return false
-    }
-    // Qwen thinking templates close an empty reasoning block when thinking is disabled. This is
-    // the exact generation suffix emitted by their embedded Jinja for
-    // `chat_template_kwargs.enable_thinking=false` (the llama.cpp-compatible request switch).
-    if (contains(src, "enable_thinking is defined and enable_thinking is false") &&
-        contains(src, "<think>")) {
-        out.thinking_disabled.parts <- [chat_text("<think>\n\n</think>\n\n")]
     }
     return true
 }
@@ -284,9 +276,6 @@ def private render_prompt(m : Model; c : ChatSession; var out : array<int64>) {
         render_parts(m, c.tmpl.user.parts, user_content, out)
     }
     render_parts(m, c.tmpl.assistant_open.parts, "", out)
-    if (!c.enable_thinking && !empty(c.tmpl.thinking_disabled.parts)) {
-        render_parts(m, c.tmpl.thinking_disabled.parts, "", out)
-    }
 }
 
 // Render an AUDIO turn's prefill as two token spans around the soft-token splice point:
@@ -329,9 +318,6 @@ def private render_prompt_audio(m : Model; c : ChatSession; var head : array<int
     var tail_parts := c.tmpl.audio_post.parts
     tail_parts |> push(chat_content())
     tail_parts |> push_from(after, c.tmpl.assistant_open.parts)
-    if (!c.enable_thinking && !empty(c.tmpl.thinking_disabled.parts)) {
-        tail_parts |> push_from(c.tmpl.thinking_disabled.parts)
-    }
     render_parts(m, tail_parts, user_content, tail)
 }
 
@@ -490,12 +476,6 @@ def add_user_(var c : ChatSession; text : string) {
 //! turn. Families with no tool format (``tmpl.tool_call_open`` empty) ignore them.
 def set_tools_(var c : ChatSession; var tools : array<string>) {
     c.tools_json <- tools
-}
-
-//! Enable or disable reasoning for templates that declare a no-thinking generation suffix.
-//! Unsupported templates keep their normal prompt shape.
-def set_thinking_(var c : ChatSession; enabled : bool) {
-    c.enable_thinking = enabled
 }
 
 //! Queue TOOL RESULTS as the next pending turn — the reply to an assistant turn that called

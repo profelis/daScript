@@ -438,14 +438,6 @@ def private detected_special(src : string) : string {
     return first_user_special(ct)
 }
 
-def private detected_thinking_disabled(src : string) : string {
-    var m = Model()
-    m.arch = "qwen35moe"
-    m.chat_template_str = src
-    let ct <- chat_template(m)
-    return empty(ct.thinking_disabled.parts) ? "" : ct.thinking_disabled.parts[0].s
-}
-
 [test]
 def test_chat_template_detection(t : T?) {
     t |> run("template sniffed from GGUF tokenizer.chat_template") @(t : T?) {
@@ -487,11 +479,6 @@ def test_chat_template_detection(t : T?) {
         m3.arch = "qwen3"
         let ct3 <- chat_template(m3)
         t |> equal(first_user_special(ct3), "<|im_start|>")   // Qwen3 registry template is ChatML too
-    }
-    t |> run("Qwen enable_thinking template declares its exact disabled generation suffix") @(t : T?) {
-        let qwen = "xx <|im_start|> yy enable_thinking is defined and enable_thinking is false yy <think> zz"
-        t |> equal(detected_thinking_disabled(qwen), "<think>\n\n</think>\n\n")
-        t |> equal(detected_thinking_disabled("xx <|im_start|> yy <think> zz"), "")
     }
 }
 

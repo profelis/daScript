@@ -191,10 +191,6 @@ system messages and tools while dropping the oldest complete user-led turns unti
 the requested `max_tokens` output budget fits. If the system/tools/latest turn cannot fit, the
 request still returns 400. `finish_reason: "length"` means generation consumed its output budget.
 
-Models whose embedded chat template exposes a thinking switch accept the llama.cpp-compatible
-`"chat_template_kwargs": {"enable_thinking": false}`. The default is `true`; templates without a
-known no-thinking generation suffix are unchanged.
-
 ### Tool / function calling
 
 `/v1/chat/completions` speaks the OpenAI function-calling protocol: pass `tools` (and optionally

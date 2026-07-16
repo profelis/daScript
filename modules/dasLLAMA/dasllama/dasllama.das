@@ -308,12 +308,6 @@ def set_tools(var chat : ChatSession; var tools : array<string>) {
     set_tools_(chat, tools)
 }
 
-def set_thinking(var chat : ChatSession; enabled : bool) {
-    //! Toggle reasoning for chat templates that support it. When disabled, the renderer emits the
-    //! model template's no-thinking generation suffix; unsupported templates are unchanged.
-    set_thinking_(chat, enabled)
-}
-
 def add_tool_results(var chat : ChatSession; results : array<string>) {
     //! Queue tool results as the next pending turn — the reply to an assistant turn that called
     //! tools. Call in place of ``add_user``, then ``respond``/``render_turn`` as usual.
