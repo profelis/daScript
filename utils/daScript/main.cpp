@@ -42,6 +42,7 @@ enum class JitMode {
 };
 static JitMode jitEnabled = JitMode::None; // Disabled by default.
 static bool jitNoCache = false; // -jit-no-cache: bypass DLL-cache path, run in-memory.
+static bool jitStack = false; // -jit-stack: retain every generated call in the logical das stack.
 static string jitOutPath = ""; // Empty, JIT module will choose default.
 
 static bool noDynamicModules = false;
@@ -393,6 +394,7 @@ int compile_and_run ( const string & fn, const string & mainFnName, bool outputP
             default: break;
         }
         if ( jitNoCache ) policies.jit_dll_mode = false;
+        policies.jit_emit_prologue = jitStack;
         access->addExtraModule("just_in_time", getDasRoot() + "/daslib/just_in_time.das");
         policies.jit_output_path = jitOutPath;
         policies.dll_search_paths.emplace_back(getDasRoot() + "/lib");
@@ -562,6 +564,7 @@ void print_help() {
         << "    -jit        enable Just-In-Time compilation\n"
         << "    -jit-no-cache  with -jit: skip the per-script DLL cache, codegen direct in-memory.\n"
         << "                Useful when the cached .jitted_scripts/ DLL is stale or unwanted.\n"
+        << "    -jit-stack  with -jit: retain every generated call in the logical daslang stack.\n"
         << "    -exe        JIT compile to standalone executable (implies -dry-run)\n"
         << "    -output <path> set JIT output path\n"
         << "    --list-shared-modules <path> with -exe: write JSON describing the program's shared modules and daspkg-package .das module sources to <path>\n"
@@ -701,6 +704,8 @@ int MAIN_FUNC_NAME ( int argc, char * argv[] ) {
                 jitEnabled = JitMode::Direct;
             } else if ( cmd=="jit-no-cache") {
                 jitNoCache = true;
+            } else if ( cmd=="jit-stack") {
+                jitStack = true;
             } else if ( cmd=="use-aot") {
                 useAot = true;
             } else if ( cmd=="aot-macros") {

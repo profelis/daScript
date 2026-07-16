@@ -17,6 +17,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,6 +32,8 @@ IS_WINDOWS = os.name == "nt"
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
 TUNE_RESTART_EXIT = 3
+JIT_ARTIFACT_SUFFIXES = {".dll", ".exp", ".lib", ".map", ".o", ".obj", ".pdb"}
+WER_LOCAL_DUMPS = r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
 
 
 def find_daslang() -> Path:
@@ -249,6 +253,180 @@ def latest_wer_report(started_at: float) -> str | None:
     return str(max(candidates, key=lambda path: path.stat().st_mtime))
 
 
+def windows_local_dump_config(exe_name: str) -> tuple[int | None, Path | None]:
+    """Return the effective WER dump type/folder for an executable."""
+    if not IS_WINDOWS:
+        return None, None
+    import winreg
+
+    for subkey, app_specific in (
+        (f"{WER_LOCAL_DUMPS}\\{exe_name}", True),
+        (WER_LOCAL_DUMPS, False),
+    ):
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                subkey,
+                0,
+                winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+            ) as key:
+                # A root LocalDumps key that only contains application subkeys is not a global
+                # policy. Treat it as configured only when it carries at least one policy value.
+                if not app_specific:
+                    policy_value = False
+                    for name in ("DumpFolder", "DumpCount", "DumpType", "CustomDumpFlags"):
+                        try:
+                            winreg.QueryValueEx(key, name)
+                            policy_value = True
+                            break
+                        except FileNotFoundError:
+                            pass
+                    if not policy_value:
+                        continue
+                try:
+                    dump_type = int(winreg.QueryValueEx(key, "DumpType")[0])
+                except FileNotFoundError:
+                    dump_type = 1
+                try:
+                    folder_text = str(winreg.QueryValueEx(key, "DumpFolder")[0])
+                    folder = Path(os.path.expandvars(folder_text))
+                except FileNotFoundError:
+                    folder = Path(os.environ["LOCALAPPDATA"]) / "CrashDumps"
+                return dump_type, folder
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None, None
+    return None, None
+
+
+def install_windows_local_dumps(exe_name: str, dump_dir: Path, count: int) -> None:
+    """Install an application-specific normal-minidump policy (requires elevation)."""
+    if not IS_WINDOWS:
+        raise OSError("WER LocalDumps is available only on Windows")
+    import winreg
+
+    dump_dir = dump_dir.resolve()
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    subkey = f"{WER_LOCAL_DUMPS}\\{exe_name}"
+    with winreg.CreateKeyEx(
+        winreg.HKEY_LOCAL_MACHINE,
+        subkey,
+        0,
+        winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY,
+    ) as key:
+        winreg.SetValueEx(key, "DumpFolder", 0, winreg.REG_EXPAND_SZ, str(dump_dir))
+        winreg.SetValueEx(key, "DumpCount", 0, winreg.REG_DWORD, max(count, 1))
+        winreg.SetValueEx(key, "DumpType", 0, winreg.REG_DWORD, 1)
+
+
+def wait_for_recent_dump(
+    dump_dir: Path,
+    exe_name: str,
+    started_at: float,
+    timeout: float = 15.0,
+) -> Path | None:
+    """Wait for WER to finish publishing the newest dump for this child."""
+    deadline = time.monotonic() + timeout
+    exe_prefix = exe_name.lower()
+    while time.monotonic() < deadline:
+        candidates: list[Path] = []
+        try:
+            for path in dump_dir.glob("*.dmp"):
+                if path.name.lower().startswith(exe_prefix) and path.stat().st_mtime >= started_at - 5.0:
+                    candidates.append(path)
+        except OSError:
+            candidates = []
+        if candidates:
+            newest = max(candidates, key=lambda path: path.stat().st_mtime)
+            try:
+                with newest.open("rb"):
+                    pass
+                return newest
+            except OSError:
+                pass
+        time.sleep(0.25)
+    return None
+
+
+def prune_crash_bundles(root: Path, name: str, keep: int) -> None:
+    if keep <= 0 or not root.is_dir():
+        return
+    bundles = sorted(
+        (path for path in root.glob(f"{name}-*") if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in bundles[keep:]:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def collect_crash_bundle(
+    args: argparse.Namespace,
+    command: list[str],
+    child_pid: int,
+    return_code: int,
+    started_at: float,
+    wer_report: str | None,
+    dump_path: Path | None,
+    jit_dlls: set[Path],
+) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    root = args.crash_dir.resolve()
+    bundle = root / f"{args.name}-{stamp}-pid{child_pid}"
+    bundle.mkdir(parents=True, exist_ok=False)
+    metadata = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "pid": child_pid,
+        "exit_code": return_code,
+        "exit_code_hex": f"0x{return_code & 0xFFFFFFFF:08X}",
+        "started_at": started_at,
+        "command": command,
+        "cwd": str(args.cwd.resolve()),
+        "wer_report": wer_report or "",
+        "dump": dump_path.name if dump_path is not None else "",
+        "jit_dlls": [str(path) for path in sorted(jit_dlls)],
+    }
+    (bundle / "crash.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    if args.log.is_file():
+        shutil.copy2(args.log, bundle / args.log.name)
+    if dump_path is not None and dump_path.is_file():
+        shutil.copy2(dump_path, bundle / dump_path.name)
+    tune_file = args.script.with_suffix(".tune.json")
+    if tune_file.is_file():
+        shutil.copy2(tune_file, bundle / tune_file.name)
+    jit_dir = args.jit_dir.resolve()
+    if jit_dir.is_dir():
+        artifact_root = bundle / "jitted_scripts"
+        resolved_dlls: set[Path] = set()
+        for path in jit_dlls:
+            source = path if path.is_absolute() else args.cwd / path
+            source = source.resolve()
+            try:
+                source.relative_to(jit_dir)
+            except ValueError:
+                continue
+            if source.is_file():
+                resolved_dlls.add(source)
+        if not resolved_dlls:
+            cached = [path for path in jit_dir.rglob("*.dll") if path.is_file()]
+            if cached:
+                resolved_dlls.add(max(cached, key=lambda path: path.stat().st_mtime))
+        for dll in resolved_dlls:
+            for suffix in JIT_ARTIFACT_SUFFIXES:
+                source = dll.with_suffix(suffix)
+                if not source.is_file():
+                    continue
+                target = artifact_root / source.relative_to(jit_dir)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+    prune_crash_bundles(root, args.name, args.crash_bundles)
+    return bundle
+
+
 def health_ok(url: str) -> bool:
     try:
         with urlopen(url, timeout=2.0) as response:
@@ -270,12 +448,19 @@ def stream_child(
     proc: subprocess.Popen[str],
     logger: logging.Logger,
     tune_restart_seen: threading.Event,
+    jit_dlls: set[Path],
 ) -> None:
     assert proc.stdout is not None
     for line in proc.stdout:
         message = line.rstrip("\r\n")
         if "llvm_tune: restart to apply the winners" in message:
             tune_restart_seen.set()
+        match = re.search(
+            r"LLVM JIT: DLL cache (?:hit |miss, codegen for )(.+\.dll)$",
+            message,
+        )
+        if match is not None:
+            jit_dlls.add(Path(match.group(1)))
         emit(logger, "child", pid=proc.pid, message=message)
 
 
@@ -307,6 +492,42 @@ def parse_cli() -> argparse.Namespace:
     parser.add_argument("--health-interval", type=float, default=5.0)
     parser.add_argument("--stable-seconds", type=float, default=300.0)
     parser.add_argument("--max-restart-delay", type=float, default=60.0)
+    parser.add_argument(
+        "--jit-stack",
+        action="store_true",
+        help="Pass pre-compile -jit-stack to daslang so every generated call has a logical stack frame",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        type=Path,
+        default=REPO_ROOT / "logs/dumps",
+        help="Expected WER LocalDumps output folder",
+    )
+    parser.add_argument(
+        "--install-local-dumps",
+        action="store_true",
+        help="Install an app-specific WER normal-minidump policy and exit (Windows, elevated)",
+    )
+    parser.add_argument("--dump-count", type=int, default=10)
+    parser.add_argument(
+        "--require-dumps",
+        action="store_true",
+        help="Refuse to start unless an app-specific/global WER normal-minidump policy is active",
+    )
+    parser.add_argument(
+        "--crash-dir",
+        type=Path,
+        default=REPO_ROOT / "logs/crashes",
+        help="Crash bundle destination",
+    )
+    parser.add_argument("--crash-bundles", type=int, default=10)
+    parser.add_argument(
+        "--jit-dir",
+        type=Path,
+        default=REPO_ROOT / ".jitted_scripts",
+        help="JIT artifact cache copied into each crash bundle",
+    )
+    parser.add_argument("--no-crash-bundle", action="store_true")
     parser.add_argument("server_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     if args.server_args[:1] == ["--"]:
@@ -316,7 +537,81 @@ def parse_cli() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_cli()
-    logger = make_logger(args.log.resolve())
+    args.cwd = args.cwd.resolve()
+    args.log = args.log.resolve()
+    args.pid_file = args.pid_file.resolve()
+    args.script = args.script.resolve()
+    args.dump_dir = args.dump_dir.resolve()
+    args.crash_dir = args.crash_dir.resolve()
+    args.jit_dir = args.jit_dir.resolve()
+    logger = make_logger(args.log)
+    daslang = args.daslang.resolve() if args.daslang.is_file() else args.daslang
+    if args.program is not None:
+        program = args.program.resolve() if args.program.is_file() else args.program
+        command = [str(program)]
+    else:
+        command = [str(daslang), "-jit"]
+        if args.jit_stack:
+            command.append("-jit-stack")
+        command.extend((str(args.script), "--"))
+    command.extend(args.server_args)
+    child_exe_name = Path(command[0]).name
+
+    if args.install_local_dumps:
+        try:
+            install_windows_local_dumps(child_exe_name, args.dump_dir, args.dump_count)
+        except OSError as error:
+            emit(
+                logger,
+                "wer_install_failed",
+                executable=child_exe_name,
+                dump_dir=str(args.dump_dir),
+                error=str(error),
+            )
+            windows_balloon(
+                f"{args.name} dump setup failed",
+                f"Run the LocalDumps install from an elevated terminal: {error}",
+                True,
+            )
+            return 2
+        emit(
+            logger,
+            "wer_installed",
+            executable=child_exe_name,
+            dump_dir=str(args.dump_dir),
+            dump_type="minidump",
+            dump_count=max(args.dump_count, 1),
+        )
+        return 0
+
+    dump_type, configured_dump_dir = windows_local_dump_config(child_exe_name)
+    if configured_dump_dir is not None:
+        args.dump_dir = configured_dump_dir
+    if dump_type == 1:
+        emit(
+            logger,
+            "wer_ready",
+            executable=child_exe_name,
+            dump_dir=str(args.dump_dir),
+            dump_type="minidump",
+        )
+    else:
+        reason = "not configured" if dump_type is None else f"unsafe dump type {dump_type}"
+        emit(
+            logger,
+            "wer_not_ready",
+            executable=child_exe_name,
+            dump_dir=str(args.dump_dir),
+            reason=reason,
+        )
+        if args.require_dumps:
+            windows_balloon(
+                f"{args.name} watchdog not started",
+                f"WER normal minidumps are {reason}; run --install-local-dumps elevated",
+                True,
+            )
+            return 2
+
     args.pid_file.parent.mkdir(parents=True, exist_ok=True)
     args.pid_file.write_text(str(os.getpid()), encoding="ascii")
     stopping = threading.Event()
@@ -329,13 +624,6 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop_handler)
     failures = 0
     recovery_pending = False
-    daslang = args.daslang.resolve() if args.daslang.is_file() else args.daslang
-    if args.program is not None:
-        program = args.program.resolve() if args.program.is_file() else args.program
-        command = [str(program)]
-    else:
-        command = [str(daslang), "-jit", str(args.script.resolve()), "--"]
-    command.extend(args.server_args)
     stop_file = args.stop_file.resolve() if args.stop_file is not None else None
     child_env = os.environ.copy()
     if stop_file is not None:
@@ -371,9 +659,10 @@ def main() -> int:
 
             emit(logger, "child_started", pid=child.pid)
             tune_restart_seen = threading.Event()
+            jit_dlls: set[Path] = set()
             output = threading.Thread(
                 target=stream_child,
-                args=(child, logger, tune_restart_seen),
+                args=(child, logger, tune_restart_seen, jit_dlls),
                 daemon=True,
             )
             output.start()
@@ -418,10 +707,11 @@ def main() -> int:
                     recovery_pending = False
                 time.sleep(0.25)
 
+            child_pid = child.pid
             return_code = child.wait()
             output.join(timeout=2.0)
             uptime = time.time() - started_at
-            emit(logger, "child_exited", pid=child.pid, code=return_code, uptime_seconds=uptime)
+            emit(logger, "child_exited", pid=child_pid, code=return_code, uptime_seconds=uptime)
             child = None
             if stopping.is_set():
                 return 0
@@ -435,6 +725,11 @@ def main() -> int:
                 continue
 
             wer = latest_wer_report(started_at)
+            dump_path = (
+                wait_for_recent_dump(args.dump_dir, child_exe_name, started_at)
+                if dump_type == 1
+                else None
+            )
             failures = 0 if uptime >= args.stable_seconds else failures + 1
             delay = min(2.0 ** min(failures, 6), args.max_restart_delay)
             emit(
@@ -444,10 +739,29 @@ def main() -> int:
                 uptime_seconds=uptime,
                 restart_delay_seconds=delay,
                 wer=wer or "",
+                dump=str(dump_path) if dump_path is not None else "",
             )
+            bundle_path: Path | None = None
+            if not args.no_crash_bundle:
+                try:
+                    bundle_path = collect_crash_bundle(
+                        args,
+                        command,
+                        child_pid,
+                        return_code,
+                        started_at,
+                        wer,
+                        dump_path,
+                        jit_dlls,
+                    )
+                    emit(logger, "crash_bundle", path=str(bundle_path))
+                except OSError as error:
+                    emit(logger, "crash_bundle_failed", error=str(error))
             windows_balloon(
                 f"{args.name} crashed",
-                f"Exit {return_code}; restarting in {delay:.0f}s" + (f"\nWER: {wer}" if wer else ""),
+                f"Exit {return_code}; restarting in {delay:.0f}s"
+                + (f"\nDump: {dump_path}" if dump_path is not None else "\nNo minidump produced")
+                + (f"\nBundle: {bundle_path}" if bundle_path is not None else ""),
                 True,
             )
             recovery_pending = True

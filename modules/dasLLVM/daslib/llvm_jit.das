@@ -288,7 +288,6 @@ class public LlvmJitVisitor : AstVisitor {
     // function pulls in libDaScript_runtime.
     has_externals : bool = false
     flags : LlvmJitFlags
-    emit_prologue : bool = false
     own_di : bool = false
     ldu_hint : bool
     attributes : Attributes?
@@ -783,6 +782,9 @@ class public LlvmJitVisitor : AstVisitor {
                              bodyId : uint64; need_prologue : bool;
                              var totalStackSize : uint;
                              var arguments : dasvector`ptr`Variable) {
+        if (need_prologue && totalStackSize < SIZE_OF_PROLOGUE) {
+            totalStackSize = SIZE_OF_PROLOGUE
+        }
         // now write to regular function
         function_entry = append_basic_block("entry")
         LLVMPositionBuilderAtEnd(g_builder, function_entry)
@@ -842,7 +844,7 @@ class public LlvmJitVisitor : AstVisitor {
         // build wrapper function
         build_wrapper_function(fnmna, fun.arguments, fun.result, isCMRES(fun), null, fun.at)
         build_function_entry(fun.at, hash(get_mangled_name(fun)),
-                             fun.flags.hasMakeBlock || emit_prologue,
+                             fun.flags.hasMakeBlock || flags.emit_prologue,
                              fun.totalStackSize, fun.arguments)
         process_function_hints(fun.annotations, fun.arguments)
         process_labels(fun.body)
@@ -6354,7 +6356,7 @@ class public LlvmJitVisitor : AstVisitor {
         // build wrapper function
         build_wrapper_function(fnmna, thisBlock.arguments, thisBlock.returnType, isCmres, captureType, thisBlock.at)
         build_function_entry(expr.at, hash(fnmna),
-            thisBlock.blockFlags.hasMakeBlock || emit_prologue,
+            thisBlock.blockFlags.hasMakeBlock || flags.emit_prologue,
             SIZE_OF_PROLOGUE, thisBlock.arguments)
         process_function_hints(thisBlock.annotations, thisBlock.arguments)
         process_labels(expr)

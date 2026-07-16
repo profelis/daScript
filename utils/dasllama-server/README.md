@@ -77,15 +77,23 @@ For a long-running diagnostic deployment, supervise the JIT script directly inst
 released executable:
 
 ```powershell
-python utils/dasllama-server/watchdog.py -- `
+# Run once from an elevated PowerShell. This installs an app-specific WER normal-minidump policy;
+# it does not dump the model weights/private heap.
+python utils/dasllama-server/watchdog.py --install-local-dumps
+
+# The day-to-day watchdog does not need elevation.
+python utils/dasllama-server/watchdog.py --jit-stack --require-dumps -- `
   --config E:/dictation-bot/release/dasllama-server/dasllama-server.toml
 ```
 
 The first start on an untuned box writes the tune sidecar and exits with code 3; the watchdog
 recognizes that bootstrap exit and launches the script again. It writes rotating JSON-line logs to
-`logs/dasllama-watchdog.log`, samples process memory once a minute, polls `/v1/models`, reports the
-newest matching Windows Error Reporting directory after a crash, displays a Windows notification,
-and restarts with bounded exponential backoff. Exit 0 (including a completed `POST /shutdown`)
+`logs/dasllama-watchdog.log`, samples process memory once a minute, and polls `/v1/models`.
+`--jit-stack` records every generated daslang call in the logical stack; Windows JIT links also
+retain a compact `.map` beside the `.dll/.o`. After a crash, the watchdog waits for the WER
+minidump, copies it together with the matching JIT artifacts, tune manifest, metadata, and log into
+`logs/crashes/`, displays a Windows notification, and restarts with bounded exponential backoff.
+The ten newest bundles are retained by default. Exit 0 (including a completed `POST /shutdown`)
 stops the watchdog. Use `--health-url` and `--shutdown-url` when serving on a non-default port.
 
 ## Deploying (daspkg release)

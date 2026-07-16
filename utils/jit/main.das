@@ -102,7 +102,7 @@ let WORKER_CHUNK_SIZE = 1000
 // walk on explicit files), and tool.output (would collide across files).
 def build_worker_argv(exe_path : string; chunk : array<string>; tool : JitToolArgs; jit : JitCliOptions) : array<string> {
     var w : array<string>
-    w |> reserve(2 + length(chunk) + 8)
+    w |> reserve(2 + length(chunk) + 10)
     w |> push(exe_path)
     w |> push_from(chunk)
     if (tool.exe) {
@@ -119,6 +119,10 @@ def build_worker_argv(exe_path : string; chunk : array<string>; tool : JitToolAr
     if (jit.debug_info |> is_some) {
         w |> push("--jit-debug")
         w |> push(jit.debug_info |> unwrap ? "true" : "false")
+    }
+    if (jit.stack_frames |> is_some) {
+        w |> push("--jit-stack")
+        w |> push(jit.stack_frames |> unwrap ? "true" : "false")
     }
     if (jit.path_to_linker |> is_some) {
         w |> push("--jit-path-to-linker")
@@ -270,6 +274,7 @@ def jit_compile_one(input : string; tool : JitToolArgs; jit : JitCliOptions) : b
                 cop.jit_opt_level = jit.opt_level |> unwrap_or(cop.jit_opt_level)
                 cop.jit_size_level = jit.size_level |> unwrap_or(cop.jit_size_level)
                 cop.jit_debug_info = jit.debug_info |> unwrap_or(cop.jit_debug_info)
+                cop.emit_prologue = jit.stack_frames |> unwrap_or(cop.emit_prologue)
                 let ptl = jit.path_to_linker |> unwrap_or("")
                 if (!empty(ptl)) {
                     cop.jit_path_to_linker := ptl
