@@ -107,13 +107,16 @@ def private wbytes(q : QuantMode; wscale16 : bool = false) : double {
 // 256-weight superblock) when kq-tagged, else the model-wide q8 figure.
 def private kq_wbytes(f : KqFmt; q8wb : double) : double {
     if (f == KqFmt.k4) {
-        return (128.0lf + 32.0lf) / 256.0lf   // nibbles + f16 (d*sc, dmin*m) pairs per 32
+        return (128.0lf + 20.0lf) / 256.0lf   // nibbles + kq v2 scale rows (16B disk block + pad)
     }
     if (f == KqFmt.k5) {
-        return (160.0lf + 32.0lf) / 256.0lf   // nibbles + high-bit plane + scale pairs
+        return (160.0lf + 20.0lf) / 256.0lf   // nibbles + high-bit plane + kq v2 scale rows
     }
     if (f == KqFmt.k6) {
         return (192.0lf + 18.0lf) / 256.0lf   // ql + qh + native int8 sub-scales + f16 d
+    }
+    if (f == KqFmt.q40) {
+        return (128.0lf + 16.0lf) / 256.0lf   // nibbles + 8 x f16 d
     }
     return q8wb
 }

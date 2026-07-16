@@ -38,3 +38,24 @@ def q8q8_repack_type(mr : int; wbias : int = 0; kgroup : int = 4) : Q8RepackType
 //! the tile generator emits the grp<mr> kernel and the layout companion reports mr to the
 //! runtime repack — stamped from one manifest entry, declining in lockstep (M4).
 let GEMM_REFERENCE_MR = 4
+
+//! Quant-plane bytes per 256-weight superblock per row for a kq format id (4/5/6 = Q4_K/Q5_K/
+//! Q6_K, 40 = Q4_0). The ONE stride source for every fmt-branched kq walker/kernel/repack —
+//! an unknown id panics instead of silently walking another format's stride.
+def kq_qsb(fmt : int) : int64 {
+    if (fmt == 4 || fmt == 40) return 128l
+    if (fmt == 5) return 160l
+    if (fmt == 6) return 192l
+    panic("kq_qsb: unknown kq format id {fmt}")
+    return 0l
+}
+
+//! Scale-plane bytes per 256-weight superblock per row (see kq_qsb): k4/k5 20 (16B disk block
+//! + 4B pad, decoded in place at repack), k6 18 (native), q40 16 (8 x f16 d, verbatim).
+def kq_ssb(fmt : int) : int64 {
+    if (fmt == 4 || fmt == 5) return 20l
+    if (fmt == 6) return 18l
+    if (fmt == 40) return 16l
+    panic("kq_ssb: unknown kq format id {fmt}")
+    return 0l
+}
