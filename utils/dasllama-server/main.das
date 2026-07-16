@@ -1,4 +1,5 @@
 options gen2
+options gc               // standalone JIT loop collects between update calls
 options stack = 262144   // the forward chain runs deep under the HTTP tick + C++->das handler bridge
 
 // dasllama-server — an OpenAI-compatible HTTP server over the dasLLAMA facade.
@@ -12,8 +13,8 @@ options stack = 262144   // the forward chain runs deep under the HTTP tick + C+
 //
 // Then point any OpenAI client at http://127.0.0.1:<port>/v1 (opencode, Open WebUI, the `llm` CLI, …).
 //
-// Per-box tuning: the first start on an untuned box runs the dasLLAMA kernel tuner and relaunches
-// itself with the winners (missing = "auto"); `--tune` forces a re-tune. Set DAS_TUNE_POLICY=error
+// Per-box tuning: the first start on an untuned box runs the dasLLAMA kernel tuner and exits so the
+// watchdog can restart with the winners (missing = "restart"); `--tune` forces a re-tune. Set DAS_TUNE_POLICY=error
 // while developing to skip per-start tuning (it prints the tuner command instead). The winners live
 // at <das_root>/dasllama.tune.json, shared by every dasLLAMA app on this box.
 
@@ -27,6 +28,7 @@ require daslib/json_boost
 require daslib/module_path
 require daslib/logger
 require daslib/fio
+require live_host               // init/update/shutdown lifecycle + standalone exit_requested
 require math
 require strings                 // to_lower / starts_with (pick_quant's file-quant spellings)
 
@@ -104,6 +106,17 @@ struct ServerArgs {
     @clarg_doc = "Show this help and exit"
     help : bool
 }
+
+// Lifecycle state is global: JIT heap collection cannot see ordinary stack locals as GC roots.
+// main therefore keeps no collectable value alive across maybe_collect_gc().
+var private g_cfg = ServerArgs()
+var private g_args_parsed = false
+var private g_args_ready = false
+var private g_server_ready = false
+var private g_exit_code = 0
+var private g_last_memory_log_at = 0l
+var private g_last_gc_at = 0l
+let GC_MIN_INTERVAL_SECONDS = 60l
 
 def pick_kv_dtype(s : string) : KVDtype {
     let l = to_lower(s)   // same normalization as pick_quant — F16/Q8_0/TQ4 spellings accepted
@@ -226,93 +239,215 @@ def pick_quant(s : string) : QuantMode {
     return QuantMode.q8
 }
 
-// missing = "auto": on the first start of an untuned box the injected guard runs the dasLLAMA
-// tuner and relaunches; thereafter it serves directly. DAS_TUNE_POLICY=error (or =fallback)
-// overrides while developing — no per-start tuning. --tune forces a re-tune + relaunch.
-[export, tune_policy(missing = "auto")]
-def main : int {
-    // inference on the interpreter is uselessly slow — require the JIT (or a jit -exe build)
+// Parse into global lifecycle state. The no-argument overload intentionally wraps clargs'
+// parse_args(type<T>) so standalone main has no collectable config local across the GC point.
+def parse_args() {
+    g_args_parsed = true
+    g_args_ready = false
+    g_exit_code = 0
     if (!jit_enabled() && !is_standalone_exe()) {
         to_log(LOG_ERROR, "dasllama-server: run under the JIT — bin/daslang -jit utils/dasllama-server/main.das -- ...\n")
-        return 1
+        g_exit_code = 1
+        request_exit()
+        return
     }
     var r <- parse_args(type<ServerArgs>)
     if (r |> is_err) {
         print("error: {r |> unwrap_err}\n\n")
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
-        return 1
+        g_exit_code = 1
+        request_exit()
+        return
     }
-    var cfg <- r |> move_unwrap
-    if (cfg.help) {
+    g_cfg <- r |> move_unwrap
+    if (g_cfg.help) {
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
-        return 0
+        request_exit()
+        return
     }
-    if (empty(cfg.config)) {
+    if (empty(g_cfg.config)) {
         // dictation-bot convention: a same-name config next to the program (or in cwd) loads
         // automatically, so a release bundle configures itself with no flags at all
         let here = "dasllama-server.toml"
         let beside = path_join(get_this_module_dir(), "dasllama-server.toml")
         if (stat(here).is_valid) {
-            cfg.config = here
+            g_cfg.config = here
         } elif (stat(beside).is_valid) {
-            cfg.config = beside
+            g_cfg.config = beside
         }
-        if (!empty(cfg.config)) {
-            print("using config {cfg.config}\n")
+        if (!empty(g_cfg.config)) {
+            print("using config {g_cfg.config}\n")
         }
     }
-    if (!empty(cfg.config) && !apply_config(cfg)) {
-        return 1
+    if (!empty(g_cfg.config) && !apply_config(g_cfg)) {
+        g_exit_code = 1
+        request_exit()
+        return
     }
-    if (empty(cfg.model)) {
+    if (empty(g_cfg.model)) {
         print("error: no model — pass --model or set model = in --config\n\n")
         print_help(get_command_info(type<ServerArgs>), "dasllama-server")
-        return 1
+        g_exit_code = 1
+        request_exit()
+        return
     }
+    g_args_ready = true
+}
 
-    let port = cfg.port > 0 ? cfg.port : 8080     // non-positive (incl. a stray negative) -> default
-    let ctx = cfg.ctx > 0 ? int64(cfg.ctx) : 0l   // 0 = keep the model's trained context_length
-    let streams = cfg.streams > 0 ? int64(cfg.streams) : 4l
-    let chunk = cfg.chunk > 0 ? int64(cfg.chunk) : 64l
-    let page_rows = cfg.flat ? 0l : (cfg.page_rows > 0 ? int64(cfg.page_rows) : 64l)
-    let prefix = int64(cfg.prefix)   // 0 = auto (run_server sizes it), < 0 = unbounded
-    let dispatch_mode = to_lower(cfg.team_dispatch)
+// Log das-managed memory separately from the watchdog's process RSS/private-byte report. This
+// function never collects; its formatted-string temporary is dead before maybe_collect_gc runs.
+def private log_memory_if_due() {
+    let now = int64(get_clock())
+    if (g_last_memory_log_at != 0l && now - g_last_memory_log_at < 60l) {
+        return
+    }
+    g_last_memory_log_at = now
+    let heap_used = heap_bytes_allocated()
+    let heap_total = heap_total_allocated()
+    let string_used = string_heap_bytes_allocated()
+    let string_total = string_heap_total_allocated()
+    to_log(
+        LOG_INFO,
+        "dasllama-server: memory das_heap={heap_used}/{heap_total} string_heap={string_used}/{string_total} allocations={heap_allocation_count()} string_allocations={string_heap_allocation_count()}\n")
+}
+
+// Standalone-loop GC. Every collectable request-local value lived inside update() and is dead by
+// the time main calls this function. daslang-live already collects between update calls.
+def maybe_collect_gc() {
+    let forced = take_gc_request()
+    return if (is_live_mode() && !forced)
+    let now = int64(get_clock())
+    if (!forced && g_last_gc_at != 0l && now - g_last_gc_at < GC_MIN_INTERVAL_SECONDS) {
+        return
+    }
+    if (forced) {
+        g_last_gc_at = now
+        let gc_started = ref_time_ticks()
+        to_log(
+            LOG_INFO,
+            "dasllama-server: GC begin reason=forced_endpoint validate=true das_heap={heap_bytes_allocated()}/{heap_total_allocated()} string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
+        unsafe(heap_collect(true, true))
+        to_log(
+            LOG_INFO,
+            "dasllama-server: GC end reason=forced_endpoint elapsed_ms={int64(get_time_usec(gc_started)) / 1000l} das_heap={heap_bytes_allocated()}/{heap_total_allocated()} string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
+        return
+    }
+    let string_used = string_heap_bytes_allocated()
+    let string_total = string_heap_total_allocated()
+    if (string_total > 0ul && string_used * 3ul < string_total * 2ul) {
+        g_last_gc_at = now
+        let gc_started = ref_time_ticks()
+        to_log(
+            LOG_INFO,
+            "dasllama-server: GC begin reason=string_fragmentation validate=true das_heap={heap_bytes_allocated()}/{heap_total_allocated()} string_heap={string_used}/{string_total}\n")
+        unsafe(heap_collect(true, true))
+        to_log(
+            LOG_INFO,
+            "dasllama-server: GC end reason=string_fragmentation elapsed_ms={int64(get_time_usec(gc_started)) / 1000l} das_heap={heap_bytes_allocated()}/{heap_total_allocated()} string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
+        return
+    }
+    let heap_used = heap_bytes_allocated()
+    let heap_total = heap_total_allocated()
+    if (heap_total > 0ul && heap_used * 3ul < heap_total) {
+        g_last_gc_at = now
+        let gc_started = ref_time_ticks()
+        to_log(
+            LOG_INFO,
+            "dasllama-server: GC begin reason=heap_fragmentation validate=true das_heap={heap_used}/{heap_total} string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
+        unsafe(heap_collect(true, true))
+        to_log(
+            LOG_INFO,
+            "dasllama-server: GC end reason=heap_fragmentation elapsed_ms={int64(get_time_usec(gc_started)) / 1000l} das_heap={heap_bytes_allocated()}/{heap_total_allocated()} string_heap={string_heap_bytes_allocated()}/{string_heap_total_allocated()}\n")
+    }
+}
+
+[export]
+def init() {
+    if (!g_args_parsed) {
+        parse_args()   // daslang-live calls init directly; standalone main parsed already
+    }
+    if (!g_args_ready) {
+        return
+    }
+    let port = g_cfg.port > 0 ? g_cfg.port : 8080     // non-positive (incl. a stray negative) -> default
+    let ctx = g_cfg.ctx > 0 ? int64(g_cfg.ctx) : 0l   // 0 = keep the model's trained context_length
+    let streams = g_cfg.streams > 0 ? int64(g_cfg.streams) : 4l
+    let chunk = g_cfg.chunk > 0 ? int64(g_cfg.chunk) : 64l
+    let page_rows = g_cfg.flat ? 0l : (g_cfg.page_rows > 0 ? int64(g_cfg.page_rows) : 64l)
+    let prefix = int64(g_cfg.prefix)   // 0 = auto (init_server sizes it), < 0 = unbounded
+    let dispatch_mode = to_lower(g_cfg.team_dispatch)
     if (!empty(dispatch_mode) && dispatch_mode != "hybrid"
         && dispatch_mode != "team" && dispatch_mode != "inline") {
         print("error: --team-dispatch must be 'hybrid', 'team', or 'inline'\n")
-        return 2
+        g_exit_code = 2
+        request_exit()
+        return
     }
     let team_dispatch = dispatch_mode != "inline"
     let asr_team_dispatch = dispatch_mode == "team"
     // matmul dispatch lane cap: LLM decode saturates memory bandwidth long before big core
     // counts, and an uncapped dispatch fights every other process on the box. -1 = all cores.
-    let threads = cfg.threads > 0 ? cfg.threads : (cfg.threads < 0 ? 0 : 16)
+    let threads = g_cfg.threads > 0 ? g_cfg.threads : (g_cfg.threads < 0 ? 0 : 16)
     set_dispatch_worker_limit(threads)
     // worker CPU affinity — must land before the jobque exists (applied at worker spawn)
-    set_jobque_affinity(cfg.affinity)
+    set_jobque_affinity(g_cfg.affinity)
     let lanes_desc = threads > 0 ? "{threads}" : "all"
-    print("dispatch: {lanes_desc} worker lanes, affinity {cfg.affinity}\n")
+    print("dispatch: {lanes_desc} worker lanes, affinity {g_cfg.affinity}\n")
     // tee every to_log/print to logs/dasllama-server.log (timestamped ndjson) AND the console
     logger_init_tee("dasllama-server")
     to_log(LOG_INFO, "dasllama-server: logging to {get_das_root()}/logs/dasllama-server.log\n")
 
     log_tune_status("dasllama-server")
-    print("loading {cfg.model} ...\n")
-    var m <- load_model(cfg.model, pick_quant(cfg.quant))
+    print("loading {g_cfg.model} ...\n")
+    var m <- load_model(g_cfg.model, pick_quant(g_cfg.quant))
     if (ctx > 0l) {
         m.config.seq_len = min(m.config.seq_len, ctx)
     }
     let ctx_note = ctx > 0l ? "" : " (model default)"
     to_log(LOG_INFO, "dasllama-server: ctx {m.config.seq_len}{ctx_note}\n")
-    set_model(m, base_name(cfg.model))
-    set_default_max_tokens(cfg.max_tokens > 0 ? int64(cfg.max_tokens) : 256l)
+    set_model(m, base_name(g_cfg.model))
+    set_default_max_tokens(g_cfg.max_tokens > 0 ? int64(g_cfg.max_tokens) : 256l)
 
-    if (!empty(cfg.asr)) {
-        configure_asr_workers(cfg.asr, cfg.mmproj, cfg.asr_workers > 0 ? cfg.asr_workers : 1)
+    if (!empty(g_cfg.asr)) {
+        configure_asr_workers(g_cfg.asr, g_cfg.mmproj, g_cfg.asr_workers > 0 ? g_cfg.asr_workers : 1)
     }
 
-    run_server(port, streams, chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix,
-        kv_dtype = pick_kv_dtype(cfg.kv_dtype), team_dispatch = team_dispatch,
-        asr_team_dispatch = asr_team_dispatch, mtp = cfg.mtp)
-    return 0
+    g_server_ready = init_server(
+        port, streams,
+        [chunk_tokens = chunk, page_rows = page_rows, prefix_groups = prefix,
+         kv_dtype = pick_kv_dtype(g_cfg.kv_dtype), team_dispatch = team_dispatch,
+         asr_team_dispatch = asr_team_dispatch, mtp = g_cfg.mtp])
+    if (!g_server_ready) {
+        g_exit_code = 2
+        request_exit()
+    }
+}
+
+[export]
+def update() {
+    if (!g_server_ready || !update_server()) {
+        request_exit()
+    }
+    log_memory_if_due()
+}
+
+[export]
+def shutdown() {
+    shutdown_server()
+    g_server_ready = false
+    logger_flush()
+}
+
+// missing = "restart": an untuned first start writes the tune sidecar and returns 3 before
+// parse_args/init can create the JobQue, load the model, or bind the port. The watchdog relaunches.
+[export, tune_policy(missing = "restart")]
+def main : int {
+    parse_args()
+    init()
+    while (!exit_requested()) {
+        update()
+        maybe_collect_gc()
+    }
+    shutdown()
+    return g_exit_code
 }

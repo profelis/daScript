@@ -267,6 +267,10 @@ def test_history_migrations_linq_and_fts(t : T?) {
 
     t |> run("live audio queue claims, retries, and recovers durably") @(t : T?) {
         enqueue_cadmus_live_audio(path, CadmusLiveAudio(
+            Id = 0, ChatId = 10l, TelegramMessageId = 799l,
+            MessageJson = "\{\"message_id\":799}", Status = "pending", Attempts = 0,
+            LastError = "", EnqueuedAt = 90l, UpdatedAt = 90l, NextAttemptAt = 0l))
+        enqueue_cadmus_live_audio(path, CadmusLiveAudio(
             Id = 0, ChatId = 10l, TelegramMessageId = 800l,
             MessageJson = "\{\"message_id\":800}", Status = "pending", Attempts = 0,
             LastError = "", EnqueuedAt = 100l, UpdatedAt = 100l, NextAttemptAt = 0l))
@@ -283,6 +287,12 @@ def test_history_migrations_linq_and_fts(t : T?) {
             t |> equal(first[0].Status, "processing")
             checkpoint_cadmus_live_transcript(path, first[0], "raw words", "English", 1900l)
             retry_cadmus_live_audio(path, first[0], "server down", 2000l, 2600l)
+        }
+        let older <- claim_cadmus_live_audio(path, 2001l)
+        t |> equal(length(older), 1)
+        if (length(older) == 1) {
+            t |> equal(older[0].TelegramMessageId, 799l)
+            finish_cadmus_live_audio(path, older[0], 2002l)
         }
         t |> success(!has_ready_cadmus_live_audio(path, 2599l))
         t |> success(has_ready_cadmus_live_audio(path, 2600l))

@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Supervise dasllama-server under JIT, or a standalone program such as Cadmus.
+
+The first untuned invocation exits with code 3 after writing the tune sidecar;
+that is an expected bootstrap event and is relaunched immediately. Exit 0 is an
+intentional shutdown. Other exits are reported, notified, and restarted with
+bounded exponential backoff. Standalone programs can use a stop-file handshake
+to finish their current update and run shutdown before exiting.
+"""
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.wintypes as wt
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import threading
+import time
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
+
+IS_WINDOWS = os.name == "nt"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
+TUNE_RESTART_EXIT = 3
+
+
+def find_daslang() -> Path:
+    names = (
+        "bin/Release/daslang.exe",
+        "bin/daslang.exe",
+        "bin/Release/daslang",
+        "bin/daslang",
+        "build/daslang",
+    )
+    for name in names:
+        candidate = REPO_ROOT / name
+        if candidate.is_file():
+            return candidate
+    return Path("daslang.exe" if IS_WINDOWS else "daslang")
+
+
+def make_logger(path: Path) -> logging.Logger:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("dasllama-watchdog")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(message)s")
+    rotating = RotatingFileHandler(
+        path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    rotating.setFormatter(formatter)
+    logger.addHandler(rotating)
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    logger.addHandler(console)
+    return logger
+
+
+def emit(logger: logging.Logger, event: str, **fields) -> None:
+    payload = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "event": event,
+        **fields,
+    }
+    logger.info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def windows_balloon(title: str, message: str, error: bool = False) -> None:
+    """Show a dependency-free notification in the interactive Windows session."""
+    if not IS_WINDOWS:
+        return
+    icon = "Error" if error else "Info"
+    safe_title = title.replace("'", "''")
+    safe_message = message.replace("'", "''")
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "Add-Type -AssemblyName System.Drawing;"
+        "$n=New-Object System.Windows.Forms.NotifyIcon;"
+        f"$n.Icon=[System.Drawing.SystemIcons]::{icon};"
+        "$n.Visible=$true;"
+        f"$n.ShowBalloonTip(10000,'{safe_title}','{safe_message}',"
+        f"[System.Windows.Forms.ToolTipIcon]::{icon});"
+        "Start-Sleep -Seconds 11;"
+        "$n.Dispose()"
+    )
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    except OSError:
+        pass
+
+
+class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+    _fields_ = [
+        ("cb", wt.DWORD),
+        ("PageFaultCount", wt.DWORD),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+        ("PrivateUsage", ctypes.c_size_t),
+    ]
+
+
+class FILETIME(ctypes.Structure):
+    _fields_ = [("low", wt.DWORD), ("high", wt.DWORD)]
+
+    def ticks(self) -> int:
+        return (int(self.high) << 32) | int(self.low)
+
+
+class THREADENTRY32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wt.DWORD),
+        ("cntUsage", wt.DWORD),
+        ("th32ThreadID", wt.DWORD),
+        ("th32OwnerProcessID", wt.DWORD),
+        ("tpBasePri", wt.LONG),
+        ("tpDeltaPri", wt.LONG),
+        ("dwFlags", wt.DWORD),
+    ]
+
+
+def windows_thread_count(pid: int) -> int | None:
+    if not IS_WINDOWS:
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+    kernel32.Thread32First.argtypes = [wt.HANDLE, ctypes.POINTER(THREADENTRY32)]
+    kernel32.Thread32First.restype = wt.BOOL
+    kernel32.Thread32Next.argtypes = [wt.HANDLE, ctypes.POINTER(THREADENTRY32)]
+    kernel32.Thread32Next.restype = wt.BOOL
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    kernel32.CloseHandle.restype = wt.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)
+    invalid = ctypes.c_void_p(-1).value
+    if snapshot == invalid:
+        return None
+    entry = THREADENTRY32()
+    entry.dwSize = ctypes.sizeof(entry)
+    count = 0
+    try:
+        ok = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while ok:
+            if entry.th32OwnerProcessID == pid:
+                count += 1
+            ok = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return count
+
+
+def windows_process_metrics(pid: int) -> dict[str, int | float] | None:
+    if not IS_WINDOWS:
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    kernel32.OpenProcess.restype = wt.HANDLE
+    kernel32.CloseHandle.argtypes = [wt.HANDLE]
+    kernel32.CloseHandle.restype = wt.BOOL
+    kernel32.GetProcessHandleCount.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+    kernel32.GetProcessHandleCount.restype = wt.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wt.HANDLE,
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+        ctypes.POINTER(FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wt.BOOL
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wt.HANDLE,
+        ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
+        wt.DWORD,
+    ]
+    psapi.GetProcessMemoryInfo.restype = wt.BOOL
+    handle = kernel32.OpenProcess(0x1000 | 0x0010, False, pid)
+    if not handle:
+        return None
+    try:
+        memory = PROCESS_MEMORY_COUNTERS_EX()
+        memory.cb = ctypes.sizeof(memory)
+        if not psapi.GetProcessMemoryInfo(
+            handle, ctypes.byref(memory), ctypes.sizeof(memory)
+        ):
+            return None
+        handles = wt.DWORD()
+        kernel32.GetProcessHandleCount(handle, ctypes.byref(handles))
+        created = FILETIME()
+        exited = FILETIME()
+        kernel = FILETIME()
+        user = FILETIME()
+        kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        )
+        return {
+            "working_set": int(memory.WorkingSetSize),
+            "peak_working_set": int(memory.PeakWorkingSetSize),
+            "private_bytes": int(memory.PrivateUsage),
+            "peak_pagefile": int(memory.PeakPagefileUsage),
+            "page_faults": int(memory.PageFaultCount),
+            "handles": int(handles.value),
+            "threads": windows_thread_count(pid) or 0,
+            "cpu_seconds": (kernel.ticks() + user.ticks()) / 10_000_000.0,
+        }
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def latest_wer_report(started_at: float) -> str | None:
+    if not IS_WINDOWS:
+        return None
+    root = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Microsoft/Windows/WER"
+    candidates: list[Path] = []
+    for directory in (root / "ReportArchive", root / "ReportQueue"):
+        if not directory.is_dir():
+            continue
+        try:
+            for path in directory.glob("AppCrash_*"):
+                if path.stat().st_mtime >= started_at - 5.0:
+                    candidates.append(path)
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    return str(max(candidates, key=lambda path: path.stat().st_mtime))
+
+
+def health_ok(url: str) -> bool:
+    try:
+        with urlopen(url, timeout=2.0) as response:
+            return 200 <= response.status < 300
+    except (OSError, URLError):
+        return False
+
+
+def request_shutdown(url: str, logger: logging.Logger) -> None:
+    try:
+        request = Request(url, data=b"", method="POST")
+        with urlopen(request, timeout=5.0) as response:
+            emit(logger, "shutdown_requested", status=response.status)
+    except (OSError, URLError) as error:
+        emit(logger, "shutdown_request_failed", error=str(error))
+
+
+def stream_child(
+    proc: subprocess.Popen[str],
+    logger: logging.Logger,
+    tune_restart_seen: threading.Event,
+) -> None:
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        message = line.rstrip("\r\n")
+        if "llvm_tune: restart to apply the winners" in message:
+            tune_restart_seen.set()
+        emit(logger, "child", pid=proc.pid, message=message)
+
+
+def parse_cli() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--name", default="dasllama")
+    parser.add_argument(
+        "--program",
+        type=Path,
+        help="Run this standalone program instead of daslang -jit <script>",
+    )
+    parser.add_argument("--daslang", type=Path, default=find_daslang())
+    parser.add_argument("--script", type=Path, default=SCRIPT_DIR / "main.das")
+    parser.add_argument("--cwd", type=Path, default=REPO_ROOT)
+    parser.add_argument("--log", type=Path, default=REPO_ROOT / "logs/dasllama-watchdog.log")
+    parser.add_argument("--pid-file", type=Path, default=REPO_ROOT / "logs/dasllama-watchdog.pid")
+    parser.add_argument("--health-url", default="http://127.0.0.1:8080/v1/models")
+    parser.add_argument("--shutdown-url", default="http://127.0.0.1:8080/shutdown")
+    parser.add_argument("--no-health", action="store_true")
+    parser.add_argument("--no-shutdown", action="store_true")
+    parser.add_argument(
+        "--stop-file",
+        type=Path,
+        help="Create this file to request a lifecycle-safe standalone shutdown",
+    )
+    parser.add_argument("--stop-env", default="CADMUS_STOP_FILE")
+    parser.add_argument("--stop-timeout", type=float, default=1200.0)
+    parser.add_argument("--memory-interval", type=float, default=60.0)
+    parser.add_argument("--health-interval", type=float, default=5.0)
+    parser.add_argument("--stable-seconds", type=float, default=300.0)
+    parser.add_argument("--max-restart-delay", type=float, default=60.0)
+    parser.add_argument("server_args", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.server_args[:1] == ["--"]:
+        args.server_args = args.server_args[1:]
+    return args
+
+
+def main() -> int:
+    args = parse_cli()
+    logger = make_logger(args.log.resolve())
+    args.pid_file.parent.mkdir(parents=True, exist_ok=True)
+    args.pid_file.write_text(str(os.getpid()), encoding="ascii")
+    stopping = threading.Event()
+    child: subprocess.Popen[str] | None = None
+
+    def stop_handler(_signum, _frame) -> None:
+        stopping.set()
+
+    signal.signal(signal.SIGINT, stop_handler)
+    signal.signal(signal.SIGTERM, stop_handler)
+    failures = 0
+    recovery_pending = False
+    daslang = args.daslang.resolve() if args.daslang.is_file() else args.daslang
+    if args.program is not None:
+        program = args.program.resolve() if args.program.is_file() else args.program
+        command = [str(program)]
+    else:
+        command = [str(daslang), "-jit", str(args.script.resolve()), "--"]
+    command.extend(args.server_args)
+    stop_file = args.stop_file.resolve() if args.stop_file is not None else None
+    child_env = os.environ.copy()
+    if stop_file is not None:
+        child_env[args.stop_env] = str(stop_file)
+    emit(logger, "watchdog_started", pid=os.getpid(), command=command, cwd=str(args.cwd))
+
+    try:
+        while not stopping.is_set():
+            if stop_file is not None:
+                try:
+                    stop_file.unlink()
+                except FileNotFoundError:
+                    pass
+            started_at = time.time()
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if IS_WINDOWS else 0
+            try:
+                child = subprocess.Popen(
+                    command,
+                    cwd=args.cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    creationflags=creationflags,
+                    env=child_env,
+                )
+            except OSError as error:
+                emit(logger, "spawn_failed", error=str(error))
+                windows_balloon(f"{args.name} watchdog", f"Could not start child: {error}", True)
+                return 2
+
+            emit(logger, "child_started", pid=child.pid)
+            tune_restart_seen = threading.Event()
+            output = threading.Thread(
+                target=stream_child,
+                args=(child, logger, tune_restart_seen),
+                daemon=True,
+            )
+            output.start()
+            next_memory = time.monotonic()
+            next_health = time.monotonic()
+            shutdown_sent = False
+            shutdown_requested_at = 0.0
+            while child.poll() is None:
+                now = time.monotonic()
+                if stopping.is_set() and not shutdown_sent:
+                    if stop_file is not None:
+                        stop_file.parent.mkdir(parents=True, exist_ok=True)
+                        stop_file.write_text("stop\n", encoding="ascii")
+                        emit(logger, "stop_file_requested", path=str(stop_file))
+                    elif args.no_shutdown:
+                        child.terminate()
+                        emit(logger, "terminate_requested")
+                    else:
+                        request_shutdown(args.shutdown_url, logger)
+                    shutdown_sent = True
+                    shutdown_requested_at = time.monotonic()
+                if (stopping.is_set() and shutdown_sent and
+                        time.monotonic() - shutdown_requested_at > args.stop_timeout):
+                    child.terminate()
+                if now >= next_memory:
+                    metrics = windows_process_metrics(child.pid)
+                    if metrics is not None:
+                        emit(logger, "memory", pid=child.pid, **metrics)
+                    next_memory = now + max(args.memory_interval, 1.0)
+                if not args.no_health and now >= next_health:
+                    healthy = health_ok(args.health_url)
+                    emit(logger, "health", pid=child.pid, ok=healthy)
+                    if healthy and recovery_pending:
+                        windows_balloon(f"{args.name} recovered", f"Server is healthy (pid {child.pid})")
+                        emit(logger, "recovered", pid=child.pid)
+                        recovery_pending = False
+                    next_health = now + max(args.health_interval, 1.0)
+                elif (args.no_health and recovery_pending and
+                      time.time() - started_at >= min(args.stable_seconds, 10.0)):
+                    windows_balloon(f"{args.name} recovered", f"Process is running (pid {child.pid})")
+                    emit(logger, "recovered", pid=child.pid)
+                    recovery_pending = False
+                time.sleep(0.25)
+
+            return_code = child.wait()
+            output.join(timeout=2.0)
+            uptime = time.time() - started_at
+            emit(logger, "child_exited", pid=child.pid, code=return_code, uptime_seconds=uptime)
+            child = None
+            if stopping.is_set():
+                return 0
+            if return_code == 0:
+                emit(logger, "intentional_shutdown")
+                return 0
+            if (args.program is None and return_code == TUNE_RESTART_EXIT and
+                    tune_restart_seen.is_set()):
+                emit(logger, "tune_bootstrap_complete")
+                failures = 0
+                continue
+
+            wer = latest_wer_report(started_at)
+            failures = 0 if uptime >= args.stable_seconds else failures + 1
+            delay = min(2.0 ** min(failures, 6), args.max_restart_delay)
+            emit(
+                logger,
+                "crash",
+                code=return_code,
+                uptime_seconds=uptime,
+                restart_delay_seconds=delay,
+                wer=wer or "",
+            )
+            windows_balloon(
+                f"{args.name} crashed",
+                f"Exit {return_code}; restarting in {delay:.0f}s" + (f"\nWER: {wer}" if wer else ""),
+                True,
+            )
+            recovery_pending = True
+            stopping.wait(delay)
+    finally:
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=10.0)
+        try:
+            args.pid_file.unlink()
+        except OSError:
+            pass
+        if stop_file is not None:
+            try:
+                stop_file.unlink()
+            except OSError:
+                pass
+        emit(logger, "watchdog_stopped")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

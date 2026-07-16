@@ -173,3 +173,23 @@ bin/daslang utils/daspkg/main.das -- release --root examples/telegram/dictation 
 
 The release contains a standalone executable, runtime DLLs, required shared modules, and the config
 template. Preserve deployed `dictation.toml` and `cadmus.db` when re-releasing.
+
+For a supervised deployment, the shared watchdog can run the released bot without an HTTP health
+probe. It records process memory, shows a Windows notification after a crash, and restarts with
+bounded backoff. On watchdog shutdown it creates the stop file; Cadmus finishes its current poll or
+request, observes the file between work items, flushes its logger, and exits normally.
+
+```powershell
+python utils/dasllama-server/watchdog.py `
+  --name cadmus `
+  --program E:/dictation-bot/dictation-bot.exe `
+  --cwd E:/dictation-bot `
+  --log logs/cadmus-watchdog.log `
+  --pid-file logs/cadmus-watchdog.pid `
+  --no-health `
+  --stop-file logs/cadmus.stop `
+  -- --config E:/dictation-bot/dictation.toml
+```
+
+Creating `logs/cadmus.stop` also requests the same lifecycle-safe shutdown directly. The watchdog
+treats the bot's resulting exit code 0 as intentional and stops instead of restarting it.

@@ -37,6 +37,7 @@ var g_asr_mmproj = ""
 var g_asr_worker_count = 0
 var g_asr_team_dispatch = false
 var g_shutdown_requested = false
+var g_gc_requested = false
 var g_req_counter = 0l
 var g_sched = Scheduler()       // live from run_server on; handlers submit into it
 var g_events : array<SchedEvent>
@@ -86,6 +87,14 @@ def configure_asr_workers(path, mmproj : string; workers : int = 1) {
 //! ``POST /shutdown``.
 def request_stop() {
     g_shutdown_requested = true
+}
+
+//! Consume a coalesced request from POST /gc. The lifecycle loop calls this only after update()
+//! returns, when no request-local values remain on its stack.
+def take_gc_request() : bool {
+    let requested = g_gc_requested
+    g_gc_requested = false
+    return requested
 }
 
 // ===== OpenAI wire shapes (response) =====
@@ -1447,17 +1456,32 @@ class OpenAiServer : HvWebServer {
             g_shutdown_requested = true
             return resp |> JSON("\{\"ok\":true,\"draining\":true}", http_status.OK)
         }
+        POST("/gc") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            let coalesced = g_gc_requested
+            g_gc_requested = true
+            to_log(LOG_INFO, "dasllama-server: GC requested via POST /gc (coalesced={coalesced})\n")
+            return resp |> JSON(
+                "\{\"ok\":true,\"scheduled\":true,\"coalesced\":{coalesced}}",
+                http_status.ACCEPTED)
+        }
         ANY("*") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_unknown(req, resp)
         }
     }
 }
 
-//! Run the server on the calling thread until ``request_stop`` (or ``POST /shutdown``) requests a
-//! graceful drain. Sets up the
-//! job queue, then drives the serve loop: pump HTTP (handlers parse + render + submit), evict
-//! streams whose client disconnected, one scheduler step (continuous batching over every live
-//! stream), flush events to the writers.
+// Lifecycle-owned state. Keeping it global is required by both daslang-live (which calls
+// init/update/shutdown independently) and standalone JIT heap collection: collectable state that
+// survives an update must be visible to the collector as a global root, never a main-loop local.
+var private g_server : OpenAiServer?
+var private g_server_started = false
+var private g_jobque_owned = false
+var private g_prev_mtp_spec = false
+var private g_mtp_spec_changed = false
+
+//! Initialize the server lifecycle. Creates a persistent JobQue explicitly so the pool spans
+//! externally-driven update calls; ``shutdown_server`` destroys it after every worker and owned
+//! queue object has stopped. Call after ``set_model``.
 //! ``max_streams`` concurrent generation streams, ``max_queue`` waiting requests (503 beyond),
 //! ``chunk_tokens`` the prefill quantum (decode stalls at most this many tokens per tick).
 //! ``page_rows`` > 0 (the default) serves PAGED: KV memory tracks actual context and a prefix
@@ -1465,89 +1489,152 @@ class OpenAiServer : HvWebServer {
 //! skip their prefill; ``prefix_groups`` caps the cache (0 = auto: one full context per stream
 //! slot, < 0 = unbounded). ``page_rows`` = 0 restores flat preallocated sessions (each the full
 //! ``--ctx`` slab). ``kv_dtype`` picks the KV-cache codec for every stream (pool-wide when paged;
-//! see ``KVDtype`` — ``tq4`` needs a power-of-two head_size). Call after ``set_model``.
+//! see ``KVDtype`` — ``tq4`` needs a power-of-two head_size).
+def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
+                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
+                team_dispatch : bool = true; asr_team_dispatch : bool = false; mtp : bool = false) : bool {
+    if (g_server != null || g_jobque_owned) {
+        to_log(LOG_ERROR, "dasllama-server: init_server called while already initialized\n")
+        return false
+    }
+    g_shutdown_requested = false   // reset so a restart in the same context after /shutdown doesn't drain at once
+    g_gc_requested = false
+    create_job_que()
+    g_jobque_owned = true
+    setup_dasllama_jobque()
+    set_jobque_team_mode(team_dispatch)
+    g_asr_team_dispatch = asr_team_dispatch
+    let dispatch_mode = !team_dispatch ? "inline" : (asr_team_dispatch ? "team" : "hybrid")
+    to_log(LOG_INFO, "dasllama-server: jobque compute dispatch = {dispatch_mode}\n")
+    g_asr_jobs = unsafe(channel_create())
+    g_asr_events = unsafe(channel_create())
+    start_asr_worker_threads()
+    var pfx = prefix_groups
+    if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
+        pfx = max_streams * ((g_model.config.seq_len + page_rows - 1l) / page_rows)
+    }
+    if (pfx < 0l) {
+        pfx = 0l   // explicit unbounded
+    }
+    var spec = mtp
+    if (spec && g_model.config.n_layer_nextn <= 0l) {
+        to_log(LOG_WARNING, "dasllama-server: --mtp requested but the model has no NextN head — self-spec stays off\n")
+        spec = false
+    }
+    g_prev_mtp_spec = get_mtp_spec()
+    g_mtp_spec_changed = true
+    set_mtp_spec(spec)   // engine gate: prefills maintain the draft head's KV (chunked included); restored at exit
+    g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype, spec)
+    g_server = new OpenAiServer()
+    g_server->init(port)
+    let rc = g_server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
+    if (rc != 0) {
+        to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
+        return false
+    }
+    g_server_started = true
+    let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
+    let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
+    let spec_desc = spec ? ", mtp: on" : ""
+    to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode}{spec_desc})\n")
+    return true
+}
+
+//! Drive one non-blocking server iteration. False means the graceful drain completed (or the
+//! server never started); an external lifecycle host should then exit and call shutdown.
+def update_server() : bool {
+    if (!g_server_started || g_server == null) {
+        return false
+    }
+    g_server->tick()   // drains queued handlers: requests parse + render + submit here
+    drain_asr_events(g_server.server)
+    reap_disconnected(g_server.server)
+    let t_step = ref_time_ticks()
+    let busy = scheduler_step(g_model, g_sched, g_events)
+    let step_ms = int64(get_time_usec(t_step)) / 1000l
+    if (step_ms > 3000l) {
+        // the "why does it pause" catcher: one decode step / prefill chunk should be
+        // well under a second — anything slower means contention or a stall
+        to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms (active={n_active(g_sched)}, queued={n_queued(g_sched)})\n")
+    }
+    flush_events(g_server.server)
+    flush_tool_keepalives(g_server.server)
+    if (g_shutdown_requested && n_active(g_sched) == 0l && n_queued(g_sched) == 0l &&
+        g_asr_pending == 0) {
+        to_log(LOG_INFO, "dasllama-server: graceful shutdown drain complete\n")
+        return false
+    }
+    if (!busy) {
+        sleep(2u)
+    }
+    return true
+}
+
+//! Release every lifecycle-owned object in dependency order. Safe after a partially failed init.
+def shutdown_server() {
+    if (g_server_started && g_server != null) {
+        g_server->stop()
+    }
+    g_server_started = false
+    if (g_asr_jobs != null && g_asr_events != null) {
+        stop_asr_worker_threads()
+    }
+    if (g_server != null) {
+        g_server->cleanup()
+        unsafe {
+            delete g_server
+        }
+        g_server = null
+    }
+    unsafe {
+        delete g_sched   // live sessions + workspace go with it (writers already died with the server)
+    }
+    g_sched = Scheduler()
+    delete g_events
+    delete g_wires
+    delete g_asr_wires
+    var asr_jobs = g_asr_jobs
+    var asr_events = g_asr_events
+    g_asr_jobs = null
+    g_asr_events = null
+    unsafe {
+        if (asr_jobs != null) {
+            asr_jobs |> channel_remove
+        }
+        if (asr_events != null) {
+            asr_events |> channel_remove
+        }
+    }
+    if (g_mtp_spec_changed) {
+        set_mtp_spec(g_prev_mtp_spec)   // a /shutdown + restart in the same context starts from a clean gate
+        g_mtp_spec_changed = false
+    }
+    delete g_model
+    g_model = Model()
+    g_model_name = ""
+    g_has_asr = false
+    g_asr_path = ""
+    g_asr_mmproj = ""
+    g_asr_worker_count = 0
+    g_asr_ready = 0
+    g_asr_active = 0
+    g_asr_pending = 0
+    if (g_jobque_owned) {
+        destroy_job_que()
+        g_jobque_owned = false
+    }
+    g_shutdown_requested = false
+}
+
+//! Compatibility wrapper for tests and simple callers. Lifecycle hosts should call
+//! ``init_server`` / ``update_server`` / ``shutdown_server`` directly.
 def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
                team_dispatch : bool = true; asr_team_dispatch : bool = false; mtp : bool = false) {
-    g_shutdown_requested = false   // reset so a restart in the same context after /shutdown doesn't drain at once
-    with_job_que() {
-        setup_dasllama_jobque()
-        set_jobque_team_mode(team_dispatch)
-        g_asr_team_dispatch = asr_team_dispatch
-        let dispatch_mode = !team_dispatch ? "inline" : (asr_team_dispatch ? "team" : "hybrid")
-        to_log(LOG_INFO, "dasllama-server: jobque compute dispatch = {dispatch_mode}\n")
-        g_asr_jobs = unsafe(channel_create())
-        g_asr_events = unsafe(channel_create())
-        start_asr_worker_threads()
-        var pfx = prefix_groups
-        if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
-            pfx = max_streams * ((g_model.config.seq_len + page_rows - 1l) / page_rows)
+    if (init_server(port, max_streams, max_queue, chunk_tokens, page_rows, prefix_groups, kv_dtype,
+            team_dispatch, asr_team_dispatch, mtp)) {
+        while (update_server()) {
         }
-        if (pfx < 0l) {
-            pfx = 0l   // explicit unbounded
-        }
-        var spec = mtp
-        if (spec && g_model.config.n_layer_nextn <= 0l) {
-            to_log(LOG_WARNING, "dasllama-server: --mtp requested but the model has no NextN head — self-spec stays off\n")
-            spec = false
-        }
-        let prev_spec = get_mtp_spec()
-        set_mtp_spec(spec)   // engine gate: prefills maintain the draft head's KV (chunked included); restored at exit
-        g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype, spec)
-        var server = new OpenAiServer()
-        server->init(port)
-        let rc = server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
-        if (rc != 0) {
-            to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
-        } else {
-            let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
-            let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
-            let spec_desc = spec ? ", mtp: on" : ""
-            to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode}{spec_desc})\n")
-            while (true) {
-                server->tick()   // drains queued handlers: requests parse + render + submit here
-                drain_asr_events(server.server)
-                reap_disconnected(server.server)
-                let t_step = ref_time_ticks()
-                let busy = scheduler_step(g_model, g_sched, g_events)
-                let step_ms = int64(get_time_usec(t_step)) / 1000l
-                if (step_ms > 3000l) {
-                    // the "why does it pause" catcher: one decode step / prefill chunk should be
-                    // well under a second — anything slower means contention or a stall
-                    to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms (active={n_active(g_sched)}, queued={n_queued(g_sched)})\n")
-                }
-                flush_events(server.server)
-                flush_tool_keepalives(server.server)
-                if (g_shutdown_requested && n_active(g_sched) == 0l && n_queued(g_sched) == 0l &&
-                    g_asr_pending == 0) {
-                    to_log(LOG_INFO, "dasllama-server: graceful shutdown drain complete\n")
-                    break
-                }
-                if (!busy) {
-                    sleep(2u)
-                }
-            }
-            server->stop()
-        }
-        stop_asr_worker_threads()
-        server->cleanup()
-        unsafe {
-            delete server
-        }
-        unsafe {
-            delete g_sched   // live sessions + workspace go with it (writers already died with the server)
-        }
-        delete g_events
-        delete g_wires
-        delete g_asr_wires
-        var asr_jobs = g_asr_jobs
-        var asr_events = g_asr_events
-        g_asr_jobs = null
-        g_asr_events = null
-        unsafe {
-            asr_jobs |> channel_remove
-            asr_events |> channel_remove
-        }
-        set_mtp_spec(prev_spec)   // a /shutdown + restart in the same context starts from a clean gate
     }
+    shutdown_server()
 }

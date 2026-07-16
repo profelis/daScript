@@ -27,6 +27,7 @@ require cadmus_history                // migrated SQLite history + FTS5 retrieva
 require cadmus_planner                // validated JSON retrieval controller
 require cadmus_rules                  // command, alias, and summary-window rules
 require cadmus_web                    // Brave Search API and source-link formatting
+require live_host                     // init/update/shutdown lifecycle + exit_requested
 
 // ===== command line =====
 
@@ -145,6 +146,13 @@ var g_db_path : string
 var g_bot_id : int64
 var g_bot_username : string
 var g_brave_search_key : string
+var private g_cli_config : string
+var private g_args_parsed = false
+var private g_args_ready = false
+var private g_bot_ready = false
+var private g_offset : int64
+var private g_exit_code = 0
+var private g_stop_file : string
 
 // The built-in dictation system prompt (proven on the sample voice notes) — the default when the
 // config declares no `prompt`. Rewrite the raw transcript into a clean, easy-to-read message
@@ -1682,25 +1690,44 @@ def private check_server(var out_llm : string&; var out_asr : bool&; var err : s
     return ok
 }
 
-// One-time startup: parse args, load config into g_cfg, set up logging, check the server,
-// connect to Telegram. Returns false to exit with *out_rc.
-def init(var out_rc : int&) : bool {
+// Parse into global lifecycle state. main deliberately owns no collectable locals so standalone
+// JIT collection can run between update calls just like the server canary.
+def parse_args() {
+    g_args_parsed = true
+    g_args_ready = false
+    g_exit_code = 0
     var r <- parse_args(type<DictationArgs>)
     if (r |> is_err) {
         print("error: {r |> unwrap_err}\n\n")
         print_help(get_command_info(type<DictationArgs>), "dictation")
-        out_rc = 1
-        return false
+        g_exit_code = 1
+        request_exit()
+        return
     }
     let args <- r |> move_unwrap
     if (args.help) {
         print_help(get_command_info(type<DictationArgs>), "dictation")
-        out_rc = 0
-        return false
+        request_exit()
+        return
     }
+    g_cli_config := args.config
+    g_args_ready = true
+}
 
+// One-time startup: load config, set up logging, check the server, connect to Telegram, and recover
+// interrupted durable work. Every value which survives this call is stored in a global GC root.
+[export]
+def init() {
+    g_bot_ready = false
+    if (!g_args_parsed) {
+        parse_args()
+    }
+    if (!g_args_ready) {
+        return
+    }
+    g_stop_file := get_env_variable("CADMUS_STOP_FILE")
     var cerr = ""
-    g_cfg = load_config(resolve_config_path(args.config), cerr)
+    g_cfg = load_config(resolve_config_path(g_cli_config), cerr)
 
     // Set up logging FIRST so every fatal startup error below is written to the log file as
     // well as the console — not silently dropped. On a config failure g_cfg is defaulted, so
@@ -1712,13 +1739,15 @@ def init(var out_rc : int&) : bool {
 
     if (!empty(cerr)) {
         fatal(cerr)
-        out_rc = 1
-        return false
+        g_exit_code = 1
+        request_exit()
+        return
     }
     if (empty(g_cfg.bot_token)) {
         fatal("no bot token — set TELEGRAM_BOT_TOKEN or bot_token in the config")
-        out_rc = 1
-        return false
+        g_exit_code = 1
+        request_exit()
+        return
     }
     g_brave_search_key := get_env_variable("BRAVE_SEARCH_API_KEY")
     if (g_cfg.web_search_enabled) {
@@ -1733,13 +1762,15 @@ def init(var out_rc : int&) : bool {
     var serr = ""
     if (!check_server(llm_id, has_asr, serr)) {
         fatal(serr)
-        out_rc = 1
-        return false
+        g_exit_code = 1
+        request_exit()
+        return
     }
     if (!has_asr) {
         fatal("dasllama-server at {g_cfg.server} has no ASR model — add asr = <parakeet/whisper ggml> to ITS config and restart it")
-        out_rc = 1
-        return false
+        g_exit_code = 1
+        request_exit()
+        return
     }
     g_db_path := resolve_data_path(g_cfg.database, "cadmus.db")
     var database_failed = false
@@ -1750,38 +1781,70 @@ def init(var out_rc : int&) : bool {
         database_failed = true
     }
     if (database_failed) {
-        out_rc = 1
-        return false
+        g_exit_code = 1
+        request_exit()
+        return
     }
 
     telegram_set_configuration(configuration(token = g_cfg.bot_token))
     let me <- telegram_getMe()
     if (!empty(telegram_get_last_error())) {
         fatal("Telegram getMe failed: {telegram_get_last_error()}")
-        out_rc = 1
-        return false
+        g_exit_code = 1
+        request_exit()
+        return
     }
     g_bot_id = me.id
     g_bot_username := me.username
     recover_cadmus_live_audio(g_db_path, int64(get_clock()))
+    g_offset = load_cadmus_offset(g_db_path)
+    g_bot_ready = true
     logger_info("dictation", "bot started (server={g_cfg.server}, llm={llm_id}, asr=yes, name={g_cfg.assistant_name}, telegram=@{g_bot_username}, database={g_db_path})")
     logger_flush()
-    return true
+}
+
+// One update first ingests every currently visible Telegram update, then claims one newest-ready
+// audio row. A message arriving while ASR/LLM is busy therefore becomes the next job, ahead of
+// older backlog, without preempting the request already in flight.
+[export]
+def update() {
+    if (!g_bot_ready) {
+        request_exit()
+        return
+    }
+    if (!empty(g_stop_file) && stat(g_stop_file).is_valid) {
+        request_exit()
+        return
+    }
+    let has_ready_audio = has_ready_cadmus_live_audio(g_db_path, int64(get_clock()))
+    poll_once(g_offset, has_ready_audio ? 0 : g_cfg.poll_timeout)
+    process_next_audio_message()
+    if (!empty(g_stop_file) && stat(g_stop_file).is_valid) {
+        request_exit()
+    }
+}
+
+def maybe_collect_gc() {
+    unsafe(heap_collect(true, true))
+}
+
+[export]
+def shutdown() {
+    if (g_bot_ready) {
+        logger_info("dictation", "bot stopped")
+    }
+    g_bot_ready = false
+    logger_flush()
 }
 
 [export]
 def main : int {
-    var rc = 0
-    if (!init(rc)) {
-        return rc
+    parse_args()
+    init()
+    while (!exit_requested()) {
+        update()
+        maybe_collect_gc()
     }
-    // The loop holds NO collectable locals — only `offset` (an int) — so heap_collect is safe.
-    var offset = load_cadmus_offset(g_db_path)
-    while (true) {
-        let has_ready_audio = has_ready_cadmus_live_audio(g_db_path, int64(get_clock()))
-        poll_once(offset, has_ready_audio ? 0 : g_cfg.poll_timeout)
-        process_next_audio_message()
-        unsafe(heap_collect(true, true))   // reclaim this round's string + object garbage; globals survive
-    }
-    return 0
+    shutdown()
+    return g_exit_code
 }

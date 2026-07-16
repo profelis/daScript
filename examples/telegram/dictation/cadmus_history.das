@@ -544,7 +544,9 @@ def claim_cadmus_live_audio(path : string; now : int64) : array<CadmusLiveAudio>
                    |> _where(
                         _.Status == "pending" ||
                         (_.Status == "failed" && _.NextAttemptAt <= now))
-                   |> _order_by((_.EnqueuedAt, _.Id))
+                   // Live voice notes are user-facing: after the current transcription finishes,
+                   // service the newest waiting message before working backward through backlog.
+                   |> _order_by_descending((_.EnqueuedAt, _.Id))
                    |> take(1))
             if (!empty(result)) {
                 result[0].Status = "processing"

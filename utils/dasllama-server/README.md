@@ -71,6 +71,23 @@ transcriptions at once. Each worker owns its model/context and reuses language-s
 scratch, so memory settles at the workers' high-water mark. OpenAI is stateless — the client
 resends the full transcript each turn.
 
+## Supervised `.das` canary
+
+For a long-running diagnostic deployment, supervise the JIT script directly instead of using the
+released executable:
+
+```powershell
+python utils/dasllama-server/watchdog.py -- `
+  --config E:/dictation-bot/release/dasllama-server/dasllama-server.toml
+```
+
+The first start on an untuned box writes the tune sidecar and exits with code 3; the watchdog
+recognizes that bootstrap exit and launches the script again. It writes rotating JSON-line logs to
+`logs/dasllama-watchdog.log`, samples process memory once a minute, polls `/v1/models`, reports the
+newest matching Windows Error Reporting directory after a crash, displays a Windows notification,
+and restarts with bounded exponential backoff. Exit 0 (including a completed `POST /shutdown`)
+stops the watchdog. Use `--health-url` and `--shutdown-url` when serving on a non-default port.
+
 ## Deploying (daspkg release)
 
 ```sh
@@ -94,6 +111,7 @@ so the deployed config survives. Stop a running server first — Windows locks t
 | `POST` | `/v1/audio/transcriptions` | Speech→text (multipart upload; needs `--asr`) |
 | `POST` | `/v1/audio/translations` | Speech→English text (needs `--asr`) |
 | `GET`  | `/v1/stats` | Scheduler counters plus `asr_workers`, `asr_ready`, `asr_active`, and `asr_pending` |
+| `POST` | `/gc` | Schedule a validated collection at the next lifecycle safe point; concurrent requests coalesce |
 | `POST` | `/shutdown` | Stop admitting new LLM/ASR work, drain accepted work, then exit |
 
 ### Chat
