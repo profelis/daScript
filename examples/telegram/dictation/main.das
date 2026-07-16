@@ -731,6 +731,15 @@ def private report_error(msg : message; text : string) {
     }
 }
 
+// Long-running commands should acknowledge the request before blocking on one or more LLM calls.
+// This is deliberately not remembered as conversation history; the final answer is.
+def private acknowledge_long_command(msg : message; text : string) {
+    send_reply(msg, text)
+    if (!empty(telegram_get_last_error())) {
+        logger_error("cadmus", "could not acknowledge long command: {telegram_get_last_error()}")
+    }
+}
+
 // ===== sender identity =====
 
 // "First Last (@username)" — used to attribute the reply in group chats.
@@ -1367,6 +1376,7 @@ def private send_summary(msg : message; command_text : string) {
         send_reply(msg, no_history, true)
         return
     }
+    acknowledge_long_command(msg, "Working on it — preparing the summary…")
     let chunk_size = g_cfg.summary_chunk_messages > 0 ? g_cfg.summary_chunk_messages : 1
     var partials : array<string>
     var first = 0
