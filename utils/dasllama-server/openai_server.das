@@ -10,6 +10,7 @@ require dashv/dashv_boost public
 require daslib/json_boost
 require daslib/defer            // defer() { delete js } — free the parsed request JSON on every exit path
 require daslib/jobque_boost
+require daslib/rtti             // this_context().last_exception inside ASR worker recovery
 require daslib/strings_boost    // join()
 require daslib/fio              // sleep(), path_join, base_name, remove, get_env_variable
 require strings
@@ -1196,6 +1197,17 @@ def private emit_asr_event(events : Channel?; event : AsrEvent) {
     events |> push_clone(event)
 }
 
+def private catch_asr_panic(var failure : string&; blk : block<() : void>) : bool {
+    var caught = false
+    try {
+        invoke(blk)
+    } recover {
+        caught = true
+        failure = this_context().last_exception |> rtrim
+    }
+    return caught
+}
+
 def private process_asr_job(
                             model : AsrModel;
                             var session : AsrSession;
@@ -1281,7 +1293,23 @@ def private asr_worker_main(
             } else {
                 var job_copy : AsrJob
                 job_copy := job
-                process_asr_job(model, session, session_language, has_session, job_copy, events)
+                var failure = ""
+                let failed = catch_asr_panic(failure) {
+                    process_asr_job(model, session, session_language, has_session, job_copy, events)
+                }
+                if (failed) {
+                    if (has_session) {
+                        delete session
+                        has_session = false
+                    }
+                    session_language = ""
+                    to_log(LOG_ERROR, "[req {job_copy.id}] asr: failed: {failure}\n")
+                    emit_asr_event(events, AsrEvent(
+                        kind = AsrEventKind.completed, id = job_copy.id,
+                        status = int(http_status.INTERNAL_SERVER_ERROR),
+                        content_type = "application/json",
+                        body = error_body(failure, "server_error")))
+                }
                 delete job_copy
             }
         }

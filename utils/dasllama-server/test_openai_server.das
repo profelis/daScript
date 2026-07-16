@@ -216,6 +216,34 @@ def test_openai_server(t : T?) {
     }
 }
 
+[test]
+def test_asr_worker_panic_boundary(t : T?) {
+    t |> run("ASR worker boundary returns normally after a panic") @(t : T?) {
+        var failure = ""
+        var failed = false
+        with (module openai_server) {
+            failed = catch_asr_panic(failure) {
+                panic("forced ASR worker failure")
+            }
+        }
+        t |> success(failed, "panic was caught")
+        t |> equal(failure, "forced ASR worker failure")
+    }
+    t |> run("ASR worker boundary preserves successful execution") @(t : T?) {
+        var invoked = false
+        var failure = ""
+        var failed = true
+        with (module openai_server) {
+            failed = catch_asr_panic(failure) {
+                invoked = true
+            }
+        }
+        t |> success(invoked, "work block ran")
+        t |> success(!failed, "successful work was not reported as failed")
+        t |> equal(failure, "")
+    }
+}
+
 // ===== parse_tool_calls (model-free) =====
 
 [test]
