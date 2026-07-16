@@ -59,4 +59,25 @@ def test_telegram_export_parser(t : T?) {
             t |> equal(messages[0].Text, "Proxy")
         }
     }
+
+    t |> run("one malformed timestamp does not discard the page") @(t : T?) {
+        let html = ("<!DOCTYPE html><html><body>" +
+                    "<div class='message default clearfix' id='message4'>" +
+                    "<div class='pull_right date details' title='not a timestamp'></div>" +
+                    "<div class='from_name'>Alice</div>" +
+                    "<div class='text'>Broken date</div></div>" +
+                    "<div class='message default clearfix joined' id='message5'>" +
+                    "<div class='pull_right date details' title='14.06.2022 15:21:58 UTC-08:00'></div>" +
+                    "<div class='text'>Valid date</div></div>" +
+                    "</body></html>")
+        var sender = ""
+        var error = ""
+        let messages <- parse_telegram_export_page(html, sender, error)
+        t |> equal(error, "")
+        t |> equal(length(messages), 2)
+        if (length(messages) == 2) {
+            t |> equal(messages[0].MessageDate, 0l)
+            t |> equal(messages[1].MessageDate, 1655248918l)
+        }
+    }
 }
