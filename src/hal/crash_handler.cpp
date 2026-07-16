@@ -24,6 +24,7 @@ namespace das {
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <werapi.h>
 #include <dbghelp.h>
 #include <process.h>
 #pragma comment(lib, "dbghelp.lib")
@@ -146,13 +147,13 @@ namespace das {
             return EXCEPTION_CONTINUE_SEARCH;
         static volatile long in_handler = 0;
         if (InterlockedExchange(&in_handler, 1)) {
-            _exit(3);
+            return EXCEPTION_CONTINUE_SEARCH;
         }
         if (code == EXCEPTION_STACK_OVERFLOW) {
             static const char msg[] = "\nCRASH: EXCEPTION_STACK_OVERFLOW (0xC00000FD)\n"
                                       "  (stack overflow - stack trace unavailable)\n";
             WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, sizeof(msg) - 1, NULL, NULL);
-            _exit(3);
+            return EXCEPTION_CONTINUE_SEARCH;
         }
         fprintf(stderr, "\nCRASH: %s (0x%08lX) at address 0x%llx\n",
                 exception_code_to_string(code), (unsigned long)code,
@@ -164,12 +165,15 @@ namespace das {
         }
         print_stack_trace(ep->ContextRecord);
         fflush(stderr);
-        _exit(3);
-        return EXCEPTION_EXECUTE_HANDLER;
+        // Let Windows Error Reporting collect the configured local dump before terminating.
+        return EXCEPTION_CONTINUE_SEARCH;
     }
 
     void install_crash_handler() {
-        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+        // SEM_NOGPFAULTERRORBOX suppresses Windows Error Reporting itself, including
+        // app-local dumps. Keep WER active and disable only its interactive UI.
+        SetErrorMode(SEM_FAILCRITICALERRORS);
+        WerSetFlags(WER_FAULT_REPORTING_NO_UI);
         ULONG stackGuarantee = 32 * 1024;
         SetThreadStackGuarantee(&stackGuarantee);
         SetUnhandledExceptionFilter(crash_handler_callback);
