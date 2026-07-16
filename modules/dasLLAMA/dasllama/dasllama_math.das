@@ -2838,7 +2838,7 @@ def rope(var vec : array<float> | #; pos, head_size, n : int64) {
 //! Pointer core (see softmax) — the threaded prefill ropes q_b/k_b in fork contexts on raw addresses.
 //! `has_ff` gates the `ff` freq-factors pointer (empty() can't test a pointer); pass null when false.
 [hint(noalias = v, noalias = ff)]
-def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float; has_ff : bool; ff : float const?) {
+def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float; has_ff : bool; ff : float const?; mscale : float = 1.0) {
     unsafe {
         let posf = float(pos) * fscale
         for (p in range64(n / 2l)) {
@@ -2849,8 +2849,10 @@ def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float
                 freq /= ff[head_dim / 2l]
             }
             let angle = posf * freq
-            let fcr = cos(angle)
-            let fci = sin(angle)
+            // mscale (YaRN/LongRoPE attn_factor) scales cos/sin — ggml applies it to NORM and NEOX
+            // alike (mistral3 YaRN = 1.416); the 1.0 default multiplies out bit-exactly elsewhere
+            let fcr = cos(angle) * mscale
+            let fci = sin(angle) * mscale
             let v0 = v[i]
             let v1 = v[i + 1]
             v[i] = v0 * fcr - v1 * fci
@@ -2858,11 +2860,11 @@ def rope_scaled(var v : float?; pos, head_size, n : int64; theta, fscale : float
         }
     }
 }
-def rope_scaled(var vec : array<float> | #; pos, head_size, n : int64; theta, fscale : float; freq_factors : array<float> | #) {
+def rope_scaled(var vec : array<float> | #; pos, head_size, n : int64; theta, fscale : float; freq_factors : array<float> | #; mscale : float = 1.0) {
     let has_ff = !empty(freq_factors)
     unsafe {
         let ff = has_ff ? addr<float const?>(freq_factors[0]) : null
-        rope_scaled(addr<float?>(vec[0]), pos, head_size, n, theta, fscale, has_ff, ff)
+        rope_scaled(addr<float?>(vec[0]), pos, head_size, n, theta, fscale, has_ff, ff, mscale)
     }
 }
 
@@ -3006,13 +3008,14 @@ def rope_scaled_neox_tab_part(var v : float?; head_size, rot, n : int64; cosrow 
 }
 
 //! Dispatch RoPE by the model's convention: NEOX (Qwen2/Phi3/Gemma2) or the default NORM (Llama).
-//! mscale is the LongRoPE magnitude factor (1.0 for everything but Phi3); only the NEOX path uses it.
+//! mscale is the YaRN/LongRoPE magnitude factor (1.0 outside Phi3 LongRoPE and YaRN models); both
+//! paths apply it — ggml scales cos/sin for NORM and NEOX alike (mistral3 = NORM + YaRN mscale).
 //! Pointer core (see rope_scaled) — fork-callable rope dispatch on a raw address.
 def rope_apply(var vec : float?; pos, head_size, n : int64; theta, fscale : float; has_ff : bool; ff : float const?; neox : bool; mscale : float = 1.0) {
     if (neox) {
         rope_scaled_neox(vec, pos, head_size, n, theta, fscale, has_ff, ff, mscale)
     } else {
-        rope_scaled(vec, pos, head_size, n, theta, fscale, has_ff, ff)
+        rope_scaled(vec, pos, head_size, n, theta, fscale, has_ff, ff, mscale)
     }
 }
 //! `use_ff = false` drops the freq-factors for this call even when they're loaded — p-RoPE arches

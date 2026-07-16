@@ -113,6 +113,8 @@ def private detect_chat_template(m : Model; var out : ChatTemplate) : bool {
         out <- arch_chat("phi3")
     } elif (contains(src, "v7-tekken")) {         // Mistral v7-tekken BY NAME (Voxtral GGUFs store
         out <- mistral_v7_tekken_template()       // the llama.cpp template alias, not Jinja)
+    } elif (contains(src, "[SYSTEM_PROMPT]")) {   // Mistral v7-tekken SHAPE by Jinja source (Medium 3.5):
+        out <- mistral_v7_tekken_template()       // [SYSTEM_PROMPT] system role, unspaced [INST]
     } elif (contains(src, "[INST]")) {            // Mistral instruct
         out <- mistral_instruct_template()
     } elif (contains(src, "<|user|>")) {          // Zephyr / TinyLlama-chat

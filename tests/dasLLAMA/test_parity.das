@@ -461,6 +461,60 @@ def test_parity_qwen3next_q8(t : T?) {
     }
 }
 
+// Mistral-Medium-3.5-128B Q4_K_M — arch `mistral3` (the llama dense shape at 88 layers / dim
+// 12288 / 96Q 8KV heads) and the first YaRN fixture with non-default betas (factor 64 over a
+// 4096 original context, beta_fast 4 from metadata — the correction band starts at pair 23, not
+// the default-32 band's 13). pixtral pre-tokenizer (= the default llama3 splitter; verified
+// id-for-id vs the oracle on this prompt). 3-shard split, huge tier (~75 GB):
+// DASLLAMA_PARITY_FULL=1. Oracle simple_ids, counting prompt "1, 2, 3, 4, 5, 6, 7," (BOS=1),
+// frozen 2026-07-15.
+let MISTRAL35_PROMPT <- [1l, 1049l, 1044l, 1032l, 1050l, 1044l, 1032l, 1051l, 1044l, 1032l,
+                         1052l, 1044l, 1032l, 1053l, 1044l, 1032l, 1054l, 1044l, 1032l, 1055l,
+                         1044l]
+let MISTRAL35_GEN <- [1032l, 1056l, 1044l, 1032l, 1057l, 1044l, 1032l, 1049l, 1048l, 1044l,
+                      1032l, 1049l, 1049l, 1044l, 1032l, 1049l, 1050l, 1044l, 1032l, 1049l,
+                      1051l, 1044l, 1032l, 1049l, 1052l, 1044l, 1032l, 1049l, 1053l, 1044l,
+                      1032l, 1049l, 1054l, 1044l, 1032l, 1049l, 1055l, 1044l, 1032l, 1049l]
+
+[test]
+def test_parity_mistral35_q4k(t : T?) {
+    t |> run("mistral3 forward (Mistral-Medium-3.5-128B Q4_K_M, 3-shard split gguf)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Mistral-Medium-3.5-128B/Q4_K_M/Mistral-Medium-3.5-128B-Q4_K_M-00001-of-00003.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, MISTRAL35_PROMPT, MISTRAL35_GEN), "mistral3-128b Q4_K_M token-for-token")
+        delete tr
+    }
+}
+
+// Same model, Q8_0 — a 4-shard split riding the q8 transcode rail instead of the native kq
+// planes. Its own simple_ids oracle continues identically to the Q4_K_M file, so the id arrays
+// are shared. Huge tier (~130 GB resident): DASLLAMA_PARITY_FULL=1.
+[test]
+def test_parity_mistral35_q8(t : T?) {
+    t |> run("mistral3 forward (Mistral-Medium-3.5-128B Q8_0, 4-shard split gguf)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "Mistral-Medium-3.5-128B/Q8_0/Mistral-Medium-3.5-128B-Q8_0-00001-of-00004.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, MISTRAL35_PROMPT, MISTRAL35_GEN), "mistral3-128b Q8_0 token-for-token")
+        delete tr
+    }
+}
+
 // Native K-quant rail: the same counting fixture over the Q4_K_M / Q5_K_M / Q6_K files of the
 // SAME model, forced through kquant_native planes (grp repack + kq kernels + kq embed gather).
 // The oracles were produced per-file by simple_ids (all three continue identically, equal to

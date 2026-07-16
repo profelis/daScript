@@ -1980,6 +1980,12 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         // attention output-projection bias + per-head sink logits (gpt-oss) — tensor-detected
         t.config.attn_out_bias = gguf_find_tensor(m, "blk.0.attn_output.bias") >= 0
         t.config.attn_sinks = gguf_find_tensor(m, "blk.0.attn_sinks.weight") >= 0
+        // llama4-style per-position attention temperature tuning (mistral3 carries the key, shipped
+        // as 0 = disabled) — no Q-scaling path here, fail closed rather than silently mis-attend
+        let tskey = "{arch}.attention.temperature_scale"
+        if (gguf_has(m, tskey) && gguf_f32(m, bytes, tskey) != 0.0) {
+            panic("dasLLAMA: {arch}.attention.temperature_scale != 0 (attention temperature tuning) is not supported")
+        }
         // RoPE base frequency (θ): default 10000, but Llama-3 uses 500000
         t.config.rope_freq_base = gguf_has(m, "{arch}.rope.freq_base") ? gguf_f32(m, bytes, "{arch}.rope.freq_base") : 10000.0
         // linear RoPE position scaling (Gemma3-4B: factor 8 on global layers); YaRN / LongRoPE
@@ -2022,16 +2028,31 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             if (!empty(t.rope_freqs)) {
                 panic("dasLLAMA: YaRN combined with per-pair rope factors is not supported")
             }
+            // yarn_log_multiplier replaces the 0.1 in the mscale correction (DeepSeek-2 lineage);
+            // mistral3 files carry it as 0, where llama.cpp's cancel-and-reapply dance nets out to
+            // the plain 1 + 0.1·ln(factor) below — any other value needs that dance, fail closed
+            let lmkey = "{arch}.rope.scaling.yarn_log_multiplier"
+            if (gguf_has(m, lmkey) && gguf_f32(m, bytes, lmkey) != 0.0) {
+                panic("dasLLAMA: {arch} YaRN yarn_log_multiplier != 0 is not supported")
+            }
             let yfactor = gguf_f32(m, bytes, "{arch}.rope.scaling.factor")
             let yorig = (gguf_has(m, "{arch}.rope.scaling.original_context_length")
                 ? gguf_int(m, bytes, "{arch}.rope.scaling.original_context_length") : seq_len)
             let fscale = 1.0 / yfactor
-            // NTK-by-parts correction band (ggml_rope_yarn_corr_dims; beta_fast/slow defaults 32/1):
-            // pairs below `lo` rotate at full frequency (extrapolate), above `hi` fully interpolate
+            // NTK-by-parts correction band (ggml_rope_yarn_corr_dims; beta_fast/slow from metadata,
+            // llama.cpp defaults 32/1): pairs below `lo` rotate at full frequency (extrapolate),
+            // above `hi` fully interpolate (mistral3: beta_fast 4 widens the band vs gpt-oss's 32)
+            let bfkey = "{arch}.rope.scaling.yarn_beta_fast"
+            let bskey = "{arch}.rope.scaling.yarn_beta_slow"
+            let beta_fast = gguf_has(m, bfkey) ? gguf_f32(m, bytes, bfkey) : 32.0
+            let beta_slow = gguf_has(m, bskey) ? gguf_f32(m, bytes, bskey) : 1.0
+            if (beta_fast <= 0.0 || beta_slow <= 0.0) {   // divisors inside log() below — fail closed on a malformed file
+                panic("dasLLAMA: YaRN beta_fast/beta_slow must be > 0 (got {beta_fast}/{beta_slow})")
+            }
             let hs = t.config.head_size
             let denom = 2.0 * log(t.config.rope_freq_base)
-            let lo = max(0.0, floor(float(hs) * log(float(yorig) / (32.0 * 2.0 * PI)) / denom))
-            let hi = min(float(hs - 1l), ceil(float(hs) * log(float(yorig) / (2.0 * PI)) / denom))
+            let lo = max(0.0, floor(float(hs) * log(float(yorig) / (beta_fast * 2.0 * PI)) / denom))
+            let hi = min(float(hs - 1l), ceil(float(hs) * log(float(yorig) / (beta_slow * 2.0 * PI)) / denom))
             t.rope_freqs |> resize(hs / 2l)
             for (j in range64(hs / 2l)) {
                 let ramp = 1.0 - clamp((float(j) - lo) / max(0.001, hi - lo), 0.0, 1.0)  // = rope_yarn_ramp(lo, hi, i0 = 2j): ggml halves i0, and lo/hi are already pair-unit
@@ -3143,8 +3164,8 @@ def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model
                         rope_scaled_neox(qp + pp * qd, ap, head_size, qd, theta, fscale, has_ff, ffp, mscale)
                         rope_scaled_neox(kp + pp * kv_dim, ap, head_size, kv_dim, theta, fscale, has_ff, ffp, mscale)
                     } else {
-                        rope_scaled(qp + pp * qd, ap, head_size, qd, theta, fscale, has_ff, ffp)
-                        rope_scaled(kp + pp * kv_dim, ap, head_size, kv_dim, theta, fscale, has_ff, ffp)
+                        rope_scaled(qp + pp * qd, ap, head_size, qd, theta, fscale, has_ff, ffp, mscale)
+                        rope_scaled(kp + pp * kv_dim, ap, head_size, kv_dim, theta, fscale, has_ff, ffp, mscale)
                     }
                 }
             }
@@ -3155,13 +3176,13 @@ def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model
 // Precompute the prefill RoPE cos/sin table once: cos_tab[pi*half + j] = cos((start_pos+pi)*freq[j]),
 // sin likewise, for every position pi in [0,npos) and frequency-pair j in [0, head_size/2). freq[j] is
 // position-independent (one pow per pair, hoisted out of the position loop) and identical for NORM and
-// NEOX; the NEOX mscale magnitude factor is folded in here so the tab leaves just look up. Built once
+// NEOX; the mscale magnitude factor is folded in here so the tab leaves just look up. Built once
 // before the layer loop, then reused by rope_batch_tab across all heads and layers (the redundancy the
 // table removes). Bit-identical to the classic leaves — the same float expressions, just deduplicated.
 def private build_rope_table(var cos_tab : array<float>; var sin_tab : array<float>; t : Model; theta, fscale : float; start_pos, npos, head_size : int64; use_ff : bool = true) {
     let c = t.config
     let half = head_size / 2l
-    let scale = c.rope_neox ? c.rope_mscale : 1.0   // NEOX scales cos/sin by mscale; NORM leaves it 1.0
+    let scale = c.rope_mscale   // scales cos/sin — ggml applies mscale to NORM and NEOX alike (mistral3 YaRN)
     let has_ff = use_ff && !empty(t.rope_freqs)
     cos_tab |> resize(npos * half)
     sin_tab |> resize(npos * half)
@@ -3191,7 +3212,7 @@ def private build_rope_table_rows(var cos_tab : array<float>; var sin_tab : arra
                                   use_ff : bool = true) {
     let c = t.config
     let half = head_size / 2l
-    let scale = c.rope_neox ? c.rope_mscale : 1.0
+    let scale = c.rope_mscale
     let has_ff = use_ff && !empty(t.rope_freqs)
     cos_tab |> resize(nrows * half)
     sin_tab |> resize(nrows * half)
