@@ -609,8 +609,19 @@ def private plan_cadmus_retrieval(
         var reply = ""
         var completion_error = ""
         var tool_calls : array<CadmusToolCall>
-        if (!server_complete(messages, 192, 0.0, false, reply, completion_error, tool_calls)) {
+        let token_budget = attempt == 0 ? 256 : 512
+        if (!server_complete(messages, token_budget, 0.0, false, reply, completion_error, tool_calls)) {
             delete tool_calls
+            if (attempt == 0 && find(completion_error, "token/context limit") >= 0) {
+                logger_warning(
+                    "cadmus.plan",
+                    "planner exceeded {token_budget} tokens; retrying with a strict compact-output reminder")
+                messages |> emplace(CadmusChatMessage(
+                    role = "system",
+                    content = ("Your previous response exceeded its output budget. Return only the required " +
+                               "single-line JSON object, under 100 tokens, with no reasoning or explanation.")))
+                continue
+            }
             error = "retrieval planner failed: {completion_error}"
             return false
         }
