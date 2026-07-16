@@ -515,6 +515,60 @@ def test_parity_mistral35_q8(t : T?) {
     }
 }
 
+// GLM-4.5-Air 106B-A12B — arch `glm4moe`: leading dense layer + 45 routed-MoE layers (128
+// experts top-8, sigmoid gating with the exp_probs_b selection bias, UNGATED shared expert),
+// QKV bias, NEOX partial rotary (64 of head 128 — the first partial-rope model on the STD
+// attention path), pre-FFN norm named post_attention_norm, and a NextN draft block with its
+// OWN embed_tokens/shared_head_head (loader disables the MTP head, trunk = 46 layers — the
+// llama.cpp forward exactly). glm4 pre-tokenizer = the llama3 splitter (verified id-for-id,
+// no BOS: glm4 nulls it). 2-shard split, huge tier (~63 GB): DASLLAMA_PARITY_FULL=1. Oracle
+// simple_ids, counting prompt "1, 2, 3, 4, 5, 6, 7,", frozen 2026-07-15.
+let GLM45AIR_PROMPT <- [16l, 11l, 220l, 17l, 11l, 220l, 18l, 11l, 220l, 19l,
+                        11l, 220l, 20l, 11l, 220l, 21l, 11l, 220l, 22l, 11l]
+let GLM45AIR_GEN <- [220l, 23l, 11l, 220l, 24l, 11l, 220l, 98668l, 11l, 220l,
+                     98965l, 11l, 220l, 98886l, 11l, 220l, 99366l, 11l, 220l, 99367l,
+                     11l, 220l, 99082l, 11l, 220l, 99317l, 11l, 220l, 99419l, 11l,
+                     220l, 99243l, 11l, 220l, 98729l, 11l, 220l, 98360l, 11l, 220l]
+
+[test]
+def test_parity_glm45air_q4km(t : T?) {
+    t |> run("glm4moe forward (GLM-4.5-Air Q4_K_M, 2-shard split gguf)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "GLM-4.5-Air/Q4_K_M/GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, GLM45AIR_PROMPT, GLM45AIR_GEN), "glm4moe-air Q4_K_M token-for-token")
+        delete tr
+    }
+}
+
+// Same model, Q8_0 — a 3-shard split on the q8 transcode rail. Its own simple_ids oracle
+// continues identically to the Q4_K_M file, so the id arrays are shared. Huge tier (~110 GB
+// resident): DASLLAMA_PARITY_FULL=1.
+[test]
+def test_parity_glm45air_q8(t : T?) {
+    t |> run("glm4moe forward (GLM-4.5-Air Q8_0, 3-shard split gguf)") @(t : T?) {
+        if (!jit_enabled()) {
+            t |> skip("interpreted (dasLLAMA model tests are JIT-only)")
+            return
+        }
+        let path = path_join(models_dir(), "GLM-4.5-Air/Q8_0/GLM-4.5-Air-Q8_0-00001-of-00003.gguf")
+        if (!model_available(t, path)) return
+        var tr <- load_gguf(path, QuantMode.q8)
+        if (tr.config.seq_len > 2048l) {   // KV RAM cap, same as parity_ok
+            tr.config.seq_len = 2048l
+        }
+        t |> success(parity_gen_ok(tr, GLM45AIR_PROMPT, GLM45AIR_GEN), "glm4moe-air Q8_0 token-for-token")
+        delete tr
+    }
+}
+
 // Native K-quant rail: the same counting fixture over the Q4_K_M / Q5_K_M / Q6_K files of the
 // SAME model, forced through kquant_native planes (grp repack + kq kernels + kq embed gather).
 // The oracles were produced per-file by simple_ids (all three continue identically, equal to
