@@ -181,7 +181,9 @@ def parse_telegram_export_page(
             var message_date = 0l
             var date_error = ""
             if (!parse_telegram_export_timestamp(timestamp, message_date, date_error)) {
-                error = date_error
+                // A bad timestamp is local to this message. Keep the page importable and let the
+                // caller's InvalidDate accounting report MessageDate == 0.
+                message_date = 0l
             }
             let reply_href = selected_attribute(
                 node, ".//div[contains(concat(' ',normalize-space(@class),' '),' reply_to ')]//a[1]/@href")
