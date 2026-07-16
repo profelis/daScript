@@ -752,7 +752,7 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
 // Render a user-led suffix of the transcript. System messages are always retained (they were
 // folded into `system`); `start` applies only to conversational messages in the original array.
 def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : array<string>;
-    max_new : int64; start : int; thinking : bool;
+                               max_new : int64; start : int; thinking : bool;
                                var prompt, stop_ids, close : array<int64>&;
                                var call_open, call_close : string&) : string {
     var chat <- create_chat_renderer(g_model, system, max_new)
