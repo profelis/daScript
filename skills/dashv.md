@@ -125,6 +125,10 @@ with_test_server(type<MyServer>, PORT_X) $(base_url) {
 
 ## Gotchas
 
+- **Keep native-retained route lambdas GC-visible.** `HvWebServer` stores every buffered and
+  streaming route callback in das-visible arrays because libhv's native `std::function` copies are
+  opaque to the das GC. Retain callbacks with `push` (copy/alias semantics), never `emplace`
+  (move semantics would consume the handler before native route registration).
 - **Module-global state is per-context.** A server started on `new_thread()` runs in its own
   context, so any `var g_… ` module global (loaded model, config, stop flag) must be set **inside
   the server thread** — a value set on the main thread is invisible to the handlers. Corollary:
