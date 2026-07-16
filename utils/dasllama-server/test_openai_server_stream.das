@@ -16,7 +16,8 @@ require math                                            // min
 // S3/S4 conformance for the continuous-batching server wiring: SSE chunk framing on a streaming
 // chat, the mandatory 400 on a prompt that cannot fit the context (the scheduler would panic), two
 // client THREADS batching on one server (proven by /v1/stats peak_active >= 2), and disconnect
-// eviction (an abandoned client's stream finishes "evicted", proven via stats). Same skip contract
+// eviction (an abandoned client's stream finishes "evicted", proven via stats), and graceful
+// shutdown draining accepted work while rejecting new work. Same skip contract
 // as test_openai_server; SmolLM2-135M — small, chatml template (real stop ids). In-dir like its
 // siblings: a require path can't contain the '-' of "dasllama-server".
 
@@ -104,9 +105,15 @@ struct private RespChoice {
     message : RespMsg
     finish_reason : string
 }
+struct private RespUsage {
+    prompt_tokens : int64
+    completion_tokens : int64
+    total_tokens : int64
+}
 struct private ChatResp {
     @rename = "object" _object : string
     choices : array<RespChoice>
+    usage : RespUsage
 }
 
 // one concurrent client's verdict, shipped back over the channel (asserts live on the main thread)
@@ -183,6 +190,33 @@ def test_openai_server_stream(t : T?) {
                 t |> success(js != null, "error body parses")
                 if (js != null) {
                     t |> equal(string(js?["error"]?["type"] ?? ""), "invalid_request_error")
+                    unsafe {
+                        delete js
+                    }
+                }
+            }
+        }
+        t |> run("auto truncation drops oldest turns and reserves output space") @(t : T?) {
+            let old_turn = build_string() $(w) {
+                for (_i in range(1400)) {
+                    w |> write("obsolete ")
+                }
+            }
+            POST("{base_url}/v1/chat/completions",
+                 "\{\"messages\":[\{\"role\":\"user\",\"content\":\"{old_turn}\"}," +
+                 "\{\"role\":\"assistant\",\"content\":\"Understood.\"}," +
+                 "\{\"role\":\"user\",\"content\":\"Answer with OK.\"}]," +
+                 "\"max_tokens\":4,\"truncation\":\"auto\"}") $(resp) {
+                t |> equal(int(resp.status_code), int(http_status.OK))
+                var perr = ""
+                var js = read_json(string(resp.body), perr)
+                t |> success(js != null, "response body parses")
+                if (js != null) {
+                    let cr = from_JV(js, type<ChatResp>)
+                    t |> equal(cr._object, "chat.completion")
+                    t |> equal(length(cr.choices), 1)
+                    t |> success(cr.usage.prompt_tokens < 128l,
+                                 "old turn was removed from the rendered prompt ({cr.usage.prompt_tokens} tokens remain)")
                     unsafe {
                         delete js
                     }
@@ -333,6 +367,56 @@ def test_openai_server_stream(t : T?) {
                 }
             }
             delete replies
+        }
+        t |> run("graceful shutdown drains accepted work and rejects new work") @(t : T?) {
+            with_channel(1) $(ch) {
+                new_thread() @() {
+                    var result = ClientResult()
+                    POST("{base_url}/v1/completions",
+                         "\{\"prompt\":\"Once upon a time\",\"max_tokens\":900}") $(resp) {
+                        if (resp != null) {
+                            result.status = int(resp.status_code)
+                            result.ok = !empty(resp.body) ? 1 : 0
+                        }
+                    }
+                    ch |> push_clone(result)
+                    ch |> notify_and_release
+                }
+                var active = 0l
+                for (_attempt in range(300)) {
+                    GET("{base_url}/v1/stats") $(resp) {
+                        if (resp != null && resp.status_code == http_status.OK) {
+                            var perr = ""
+                            var js = read_json(string(resp.body), perr)
+                            if (js != null) {
+                                active = int64(js?["active"] ?? 0l)
+                                unsafe {
+                                    delete js
+                                }
+                            }
+                        }
+                    }
+                    if (active >= 1l) {
+                        break
+                    }
+                    sleep(100u)
+                }
+                t |> success(active >= 1l, "a completion was active before shutdown")
+                POST("{base_url}/shutdown", "") $(resp) {
+                    t |> equal(int(resp.status_code), int(http_status.OK))
+                }
+                POST("{base_url}/v1/completions",
+                     "\{\"prompt\":\"new work\",\"max_tokens\":4}") $(resp) {
+                    t |> equal(int(resp.status_code), int(http_status.SERVICE_UNAVAILABLE))
+                }
+                var completed = 0
+                ch |> for_each_clone() $(result : ClientResult#) {
+                    completed++
+                    t |> equal(result.status, int(http_status.OK))
+                    t |> equal(result.ok, 1)
+                }
+                t |> equal(completed, 1)
+            }
         }
     }
 }

@@ -51,6 +51,31 @@ Scripts in lifecycle mode must export:
 [export] def shutdown() { ... }  // Called on exit and before each reload
 ```
 
+### Standalone lifecycle wrapper and JIT GC
+
+When the same lifecycle program also runs under `daslang -jit`, keep the standalone
+`main` loop free of collectable locals across a heap collection. The JIT does not expose
+ordinary stack locals as GC roots. Put all per-frame/request collectable temporaries in
+`update()` so they are dead when it returns; keep persistent collectable state in globals.
+The safe shape is:
+
+```das
+[export]
+def main() {
+    parse_args()
+    init()
+    while (!exit_requested()) {
+        update()              // all collectable temporaries die on return
+        maybe_collect_gc()    // a separate call with no live collectable main-loop locals
+    }
+    shutdown()
+}
+```
+
+Do not move `heap_collect` into `update()` unless that function has been specifically
+audited to hold no collectable locals at the call site. The live host collects between
+frames for the same reason.
+
 ## Core Module: `live_host`
 
 `require live_host` — provides the lifecycle API:

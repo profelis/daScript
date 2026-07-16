@@ -70,6 +70,8 @@ class HvWebServer {
     //! ``GET``, ``POST``, ``PUT``, ``DELETE``, ``PATCH``, ``HEAD``, or ``ANY``.
     @safe_when_uninitialized
     server : WebSocketServer
+    private http_route_handlers : array<lambda<(var req : HttpRequest?; var resp : HttpResponse?) : http_status>>
+    private stream_route_handlers : array<lambda<(var req : HttpRequest?; var writer : HttpResponseWriter?) : void>>
     def init(port : int) {
         //! Initializes an HTTP/WebSocket server on the specified port.
         server = make_web_socket_server(port, 0, "", unsafe(addr(self)), class_info(self))
@@ -88,6 +90,8 @@ class HvWebServer {
             destroy_web_socket_server(server)
             server = default<WebSocketServer>
         }
+        http_route_handlers |> clear()
+        stream_route_handlers |> clear()
     }
     def operator delete {
         cleanup()
@@ -116,30 +120,37 @@ class HvWebServer {
         //! Called during server initialization, after the low-level server is created. Override to register routes.
     def GET(uri : string; lmb : lambda<(var req : HttpRequest?; var resp : HttpResponse?) : http_status>) : void {
         //! Registers a handler for HTTP GET requests matching ``uri``.
+        http_route_handlers |> push(lmb)
         unsafe(GET(server, uri, lmb))
     }
     def POST(uri : string; lmb : lambda<(var req : HttpRequest?; var resp : HttpResponse?) : http_status>) : void {
         //! Registers a handler for HTTP POST requests matching ``uri``.
+        http_route_handlers |> push(lmb)
         unsafe(POST(server, uri, lmb))
     }
     def PUT(uri : string; lmb : lambda<(var req : HttpRequest?; var resp : HttpResponse?) : http_status>) : void {
         //! Registers a handler for HTTP PUT requests matching ``uri``.
+        http_route_handlers |> push(lmb)
         unsafe(PUT(server, uri, lmb))
     }
     def DELETE(uri : string; lmb : lambda<(var req : HttpRequest?; var resp : HttpResponse?) : http_status>) : void {
         //! Registers a handler for HTTP DELETE requests matching ``uri``.
+        http_route_handlers |> push(lmb)
         unsafe(DELETE(server, uri, lmb))
     }
     def PATCH(uri : string; lmb : lambda<(var req : HttpRequest?; var resp : HttpResponse?) : http_status>) : void {
         //! Registers a handler for HTTP PATCH requests matching ``uri``.
+        http_route_handlers |> push(lmb)
         unsafe(PATCH(server, uri, lmb))
     }
     def HEAD(uri : string; lmb : lambda<(var req : HttpRequest?; var resp : HttpResponse?) : http_status>) : void {
         //! Registers a handler for HTTP HEAD requests matching ``uri``.
+        http_route_handlers |> push(lmb)
         unsafe(HEAD(server, uri, lmb))
     }
     def ANY(uri : string; lmb : lambda<(var req : HttpRequest?; var resp : HttpResponse?) : http_status>) : void {
         //! Registers a handler for any HTTP method matching ``uri``.
+        http_route_handlers |> push(lmb)
         unsafe(ANY(server, uri, lmb))
     }
     def STATIC(path, dir : string) : void {
@@ -170,6 +181,7 @@ class HvWebServer {
         //! Registers an SSE (Server-Sent Events) handler for ``uri``.
         //! Same signature as GET/POST — set SSE headers and write events to the response.
         //! Uses ``ANY`` method matching so any HTTP method reaches this handler.
+        http_route_handlers |> push(lmb)
         unsafe(SSE(server, uri, lmb))
     }
     def STREAM(uri : string; lmb : lambda<(var req : HttpRequest?; var writer : HttpResponseWriter?) : void>) : void {
@@ -178,6 +190,7 @@ class HvWebServer {
         //! thread; drive it with ``respond`` (whole body) or ``sse_event`` + ``close_writer`` (Server-
         //! Sent Events) — each call marshals the actual socket write onto the server's event loop, so
         //! tokens flush to the client as they are produced. Pass ``server`` (the field) to those ops.
+        stream_route_handlers |> push(lmb)
         unsafe(STREAM(server, uri, lmb))
     }
 }

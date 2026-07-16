@@ -33,7 +33,7 @@ var LINK_WHOLE_LIB = false // when true, standalone exe links against the whole 
 // invalidates cached DLLs (e.g. edits to llvm_jit.das, llvm_macro.das, llvm_jit_common.das,
 // runtime helper ABI, default target triple). Cache filenames fold this in, so a bump
 // makes every previously written DLL miss the cache on the next run and get GC'd.
-let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x41ul   // kq maddubs i16 lattice: bounded pair-sum chains, one widen per chain (0x40: kq mem-broadcast)
+let LLVM_JIT_CODEGEN_VERSION : uint64 = 0x42ul   // full-stack prologue emission reads LlvmJitFlags (0x41: bounded kq i16 pair-sum chains)
 
 let JIT_FNV_PRIME : uint64 = 1099511628211ul
 
@@ -344,6 +344,7 @@ def public run_jit(prog : Program?; var ctx : Context?) : bool {
     let use_dll = prog.policies.jit_dll_mode && das_is_dll_build() && !gen_exe && !compile_only
     let opt_level = cli_opts.opt_level |> unwrap_or(prog.policies.jit_opt_level)
     let size_level = cli_opts.size_level |> unwrap_or(prog.policies.jit_size_level)
+    // This policy must be set before compilation so stack-frame sizes include the prologue.
     let emit_prologue = prog.policies.emit_prologue
     // If you're sure `dynamic` functions is not reachable set this flag
     // to `true` and fail in runtime on `jit_trap` if they turns

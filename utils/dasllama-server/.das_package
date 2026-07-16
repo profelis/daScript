@@ -12,4 +12,5 @@ def package() {
 def release() {
     release_main("main.das")
     release_name("dasllama-server")
+    release_include("watchdog.py")
 }

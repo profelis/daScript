@@ -123,7 +123,9 @@ namespace das {
         // like ggml's --poll: workers spin only for the setWorkerSpin window, then park; a publish
         // that finds parked workers takes the fifo mutex and notifies (zero mutex traffic while
         // everyone spins). Pair with setWorkerSpin — with a 0 window every publish pays the wake.
-        // Single dispatcher at a time.
+        // Concurrent callers are serialized at the published-operation boundary. The worker team
+        // still executes each operation in parallel; only one dispatcher may own the shared
+        // publish slots at once.
         void setTeamMode ( bool on );
         bool getTeamMode () const { return mTeamMode.load(std::memory_order_relaxed) != 0; }
         // Worker-pool limit (runtime dial): workers with threadIndex >= limit go DORMANT — they
@@ -257,6 +259,7 @@ namespace das {
         // claim's pending remaining-decrement blocks that stage's barrier, which keeps
         // mTeamWorkS (the dispatcher's stack) alive while dereferenced.
         atomic<int32_t>  mTeamMode{0};
+        mutex            mTeamDispatchMutex;
         atomic<uint32_t> mTeamSeq{0};
         atomic<int32_t>  mTeamInFlight{0};
         int              mTeamStageCount = 0;

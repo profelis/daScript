@@ -21,7 +21,7 @@ You are a dictation editor. You receive a raw speech-to-text transcript of a voi
 Clean it up into an easy-to-read message. Rules:
 - Keep the speaker's OWN words and phrasing. Only rewrite parts that are garbled, disfluent or genuinely hard to read; leave clear sentences as they are, just fixing punctuation and casing.
 - Do NOT paraphrase, rephrase or restate sentences that are already understandable, and do NOT summarize or shorten the content.
-- Break the text into several short paragraphs, roughly one per topic or thought, separated by a blank line. Never return one long block of text.
+- Paragraph breaks are mandatory. Insert a blank line after every 2-4 complete sentences, and keep each paragraph under roughly 600 characters even when the topic does not change. Never return one long block of text.
 - Drop filler words, false starts, repetitions and mumbling. If a fragment is unintelligible, leave it out rather than guessing.
 - Fix obvious speech-recognition errors when the intended word is clear from context.
 - Keep the speaker's meaning, tone and register — including slang and strong language.
@@ -32,13 +32,16 @@ Clean it up into an easy-to-read message. Rules:
 language = "auto"
 
 # Reply-token budget for the LLM cleanup step (a longer voice note needs more).
-max_tokens = 2048
+max_tokens = 16384
 
 # LLM sampling temperature. 0 = greedy (most faithful to the transcript).
 temp = 0.0
 
+# Seconds to wait for speech recognition, including time queued behind bulk ASR imports.
+asr_timeout = 900
+
 # Seconds to wait for the LLM cleanup response (a long note at low tok/s needs headroom).
-llm_timeout = 300
+llm_timeout = 900
 
 # ffmpeg executable — on PATH, or an absolute path. Used to transcode OGG/Opus voice notes to WAV.
 ffmpeg = "ffmpeg"
@@ -65,15 +68,32 @@ keep_audio_dir = ""
 # automatically; history is retained indefinitely.
 database = "cadmus.db"
 
+# Optional Telegram Desktop export root. While no live audio is waiting, Cadmus raw-transcribes
+# one pending imported media file at a time into local history. This never invokes the LLM or sends
+# a Telegram reply. Failed import rows are retried once per bot start. Empty = disabled.
+history_media_root = ""
+
 # Cadmus's conversational identity. This prompt is separate from dictation_prompt so personality
 # never changes how transcripts are repaired.
 assistant_name = "Cadmus"
 assistant_aliases = "cadmus,кадмус,Кадмус,КАДМУС"
+
+# Conversational answers are opt-in. Transcription always stays enabled; /help and /summary still
+# work when this is false. When true, Cadmus answers a leading @bot username or wake name, replies
+# to real assistant answers, and private-chat messages. Mentions later in a message are ignored, as
+# are replies to transcript-delivery messages.
+reply_when_mentioned = false
+
+# Optional public @username for this chat. Leave empty for private groups/channels; Cadmus then
+# builds Telegram's t.me/c/<channel>/<message> links from the -100... chat ID.
+history_chat_username = ""
+
 assistant_prompt = '''
 You are Cadmus, the resident conversational aide and archivist of this chat.
 
-You are attentive, understated, and dryly warm. Be concise by default, but give detail when the
-question calls for it. Match the language of the person addressing you, including language switches.
+You are a man of few words. Answer as briefly as possible, usually in one or two short sentences.
+Give more detail only when explicitly asked. Be understated and dryly warm. Match the language of
+the person addressing you, including language switches.
 
 Treat recorded conversation as fallible evidence. Distinguish what participants actually said from
 your own inference. Never invent missing history or imply that you saw messages outside the supplied
@@ -84,10 +104,21 @@ meaningful changes of opinion. Avoid a mechanical message-by-message recap unles
 Attribute statements when that matters. A little wit is welcome; forced jokes are not.
 '''
 
-# Generation/retrieval limits. These do not delete or truncate on-disk history.
-assistant_max_tokens = 1024
+# Generation/tool limits. These do not delete or truncate on-disk history.
+assistant_max_tokens = 4096
 assistant_temp = 0.2
 recent_messages = 40
+# Maximum user-message matches returned by the current-chat FTS5 search tool.
 history_search_results = 12
+# Comma-separated languages used to generate independent strict FTS query variants.
+history_search_languages = "ru,en"
+
+# Public web search through Brave Search API. The API key is read only from
+# BRAVE_SEARCH_API_KEY; it is never stored in this file or sent to the LLM.
+web_search_enabled = true
+web_search_results = 5
+web_search_timeout = 15
+web_search_max_calls = 2
+
 summary_chunk_messages = 80
 summary_max_messages = 4000

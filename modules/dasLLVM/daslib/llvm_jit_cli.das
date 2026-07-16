@@ -25,6 +25,10 @@ struct public JitCliOptions {
     @clarg_doc = "JIT: emit debug info / symbols"
     debug_info : Option<bool>
 
+    @clarg_name = "jit-stack"
+    @clarg_doc = "JIT: retain a logical daslang stack frame for every generated function and block"
+    stack_frames : Option<bool>
+
     @clarg_short = "d"
     @clarg_name = "jit-dump"
     @clarg_doc = "JIT: dump generated LLVM IR"

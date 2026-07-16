@@ -12,6 +12,14 @@ CMake-based build, supported on Windows / Linux / macOS / iOS / Android / WASM (
 
 Full reference (per-platform generator commands, build flags, AOT debugging, exit code meanings, runtime crash diagnostics): **`skills/build_and_debug.md`**.
 
+## Workspace Hygiene
+
+Clean up files created for diagnostics, staging, and one-off tests before handing work back. This
+includes temporary release trees, formatter backups, extracted audio, generated `__pycache__`
+directories, and ad-hoc stdout/stderr logs. Keep intentional application logs, databases, configs,
+rollback bundles, and user-owned artifacts. In deployed application directories, do not leave
+unrelated diagnostic files beside the program.
+
 ## GitHub Operations
 
 - **Use GitHub MCP tools** (`mcp__github__*`) for all GitHub operations (creating PRs, listing issues, reading PRs, etc.) — they avoid shell escaping issues entirely
@@ -118,7 +126,9 @@ When you discover something new about daslang syntax, semantics, or conventions 
 - **Table literals:** `{ "k" => v, "k2" => v2 }` — NOT `{{ "k" => v; "k2" => v2 }}`
 - **Bare blocks:** `{ var x = 1; ... }` at statement level creates a lexical scope (NOT a table literal). Supports `finally`: `{ ... } finally { ... }`
 - **`with (module foo/bar) { ... }`:** compile-time resolution scope — names inside resolve as if written in module foo/bar (incl. its PRIVATES + its require graph; the enclosing module's own symbols are NOT visible inside); `_::name` escapes back to the enclosing module; locals stay lexical and win; nested forms don't combine — innermost wins outright; erased after infer, zero runtime. Policy `with_module_is_unsafe` (or `.das_project` `with_module_unsafe(mod, file)`) makes user-written ones require `unsafe`
-- **Named arguments:** `foo([name = value])` with square brackets
+- **Named arguments:** `foo([name = value])` with square brackets. Multiple named arguments share
+  one bracket group: `foo(positional, [first = a, second = b])`; separate groups such as
+  `foo([first = a], [second = b])` are a syntax error
 - **Block arguments:** block/lambda after `func()` pipes as last arg. No `$` for parameterless blocks: `defer() { ... }`. With params: `build_string() $(var writer) { ... }`. Lambdas: `emplace() @(x : int) { ... }`. **Arrow shorthand for single-expression blocks:** `arr |> sort() $(a, b) => a < b`. Defaulted parameters sitting between the explicit args and a trailing block are padded automatically — don't spell them out
 - **Lambda:** `@(args) { body }` or `@@(args) { body }` (no-capture). **Inline arrow form:** `@(x) => expr` (capture lambda) and `@@(x) => expr` (no-capture function pointer) — preferred for short transforms passed as arguments: `sometimes(pat, @@(x) => fast(x, 2.0lf))`
 - **Function/method arrow body:** `def add(a, b : int) : int => a + b` — single-expression body, return type optional (`def add(a, b : int) => a + b` infers). Works on class methods too: `def get() : int => count + 2`. The body must START on the `=>` line — `def f() : int64 =>` followed by a newline is `error[30151]` (probe-verified 2026-07-12); wrap a long body by opening `(` on the `=>` line and breaking inside the parens

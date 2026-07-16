@@ -1135,9 +1135,20 @@ extern "C" {
                 // whole command for cmd.exe because the linker path itself
                 // contains spaces on Program Files installs.
                 const auto linkerParam = isShared ? "/DLL" : "";
+                // Keep a compact linker map beside every JIT PE. A normal minidump deliberately
+                // omits the process heap (and therefore model weights), while the map plus the
+                // retained COFF object resolves generated module+RVA frames after a crash.
+                std::string mapPath = libraryName;
+                const auto slash = mapPath.find_last_of("/\\");
+                const auto dot = mapPath.find_last_of('.');
+                if ( dot == std::string::npos || (slash != std::string::npos && dot < slash) ) {
+                    mapPath += ".map";
+                } else {
+                    mapPath.replace(dot, std::string::npos, ".map");
+                }
                 cmd = compilerLibrary.empty()
-                    ? fmt::format(FMT_STRING("\"\"{}\" \"{}\" \"{}\" msvcrt.lib {} {} /OUT:\"{}\" 2>&1\""), linker.c_str(), objFilePath, runtimeLibrary.c_str(), extra, linkerParam, libraryName)
-                    : fmt::format(FMT_STRING("\"\"{}\" \"{}\" \"{}\" \"{}\" msvcrt.lib {} {} /OUT:\"{}\" 2>&1\""), linker.c_str(), objFilePath, runtimeLibrary.c_str(), compilerLibrary.c_str(), extra, linkerParam, libraryName);
+                    ? fmt::format(FMT_STRING("\"\"{}\" \"{}\" \"{}\" msvcrt.lib {} {} /OUT:\"{}\" /MAP:\"{}\" 2>&1\""), linker.c_str(), objFilePath, runtimeLibrary.c_str(), extra, linkerParam, libraryName, mapPath.c_str())
+                    : fmt::format(FMT_STRING("\"\"{}\" \"{}\" \"{}\" \"{}\" msvcrt.lib {} {} /OUT:\"{}\" /MAP:\"{}\" 2>&1\""), linker.c_str(), objFilePath, runtimeLibrary.c_str(), compilerLibrary.c_str(), extra, linkerParam, libraryName, mapPath.c_str());
             #else
                 // mingw clang/gcc: Unix-flavored driver, -shared/-o syntax.
                 // No rpath on Windows (DLLs resolve via PATH / LoadLibrary

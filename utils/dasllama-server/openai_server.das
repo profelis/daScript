@@ -10,6 +10,7 @@ require dashv/dashv_boost public
 require daslib/json_boost
 require daslib/defer            // defer() { delete js } — free the parsed request JSON on every exit path
 require daslib/jobque_boost
+require daslib/rtti             // this_context().last_exception inside ASR worker recovery
 require daslib/strings_boost    // join()
 require daslib/fio              // sleep(), path_join, base_name, remove, get_env_variable
 require strings
@@ -23,16 +24,21 @@ require dasllama/dasllama_audio_io   // load_audio_16k_mono: any uploaded audio 
 // run_server's loop drives llm_scheduler (one eval_batch decode step over every live stream + one
 // bounded prefill chunk per tick) and routes SchedEvents back to each request's writer. Streaming
 // and buffered responses both ride the deferred writer ops, so N streams generate concurrently.
-// The buffered holdouts (/v1/models, /v1/embeddings, /v1/audio/*, /shutdown, /v1/stats) still run
-// to completion in-handler and stall generation for their duration.
+// ASR uploads are queued to long-lived new_thread workers, each with its own model/session/context;
+// the small buffered holdouts (/v1/models, /v1/embeddings, /shutdown, /v1/stats) still complete
+// in-handler.
 
 // ===== Served state (set once at startup; handlers run serially on the tick thread) =====
 
 var g_model = Model()
 var g_model_name = ""
-var g_asr = AsrModel()
 var g_has_asr = false
-var g_should_stop = false
+var g_asr_path = ""
+var g_asr_mmproj = ""
+var g_asr_worker_count = 0
+var g_asr_team_dispatch = false
+var g_shutdown_requested = false
+var g_gc_requested = false
 var g_req_counter = 0l
 var g_sched = Scheduler()       // live from run_server on; handlers submit into it
 var g_events : array<SchedEvent>
@@ -48,8 +54,7 @@ struct private StreamWire {
     reply_parts : array<string>     // non-streaming (or has_tools): pieces accumulate until the finished event
     utf8_tail : string              // streaming: held-back bytes of a multi-byte char split across tokens
     has_tools : bool                // chat request declared tools on a tool-capable template
-    hold : bool                     // streaming: tool-call opener seen — buffer instead of stream
-    held_pieces : int               // pieces buffered since hold engaged (drives keepalive chunks)
+    last_keepalive_ticks : int64    // tool streams buffer native envelopes; empty deltas keep HTTP alive
     call_open : string              // the family's tool-call markers (copied from the chat template)
     call_close : string
 }
@@ -70,15 +75,27 @@ def set_default_max_tokens(n : int64) {
     g_default_max_new = n
 }
 
-//! Move a loaded ASR model in, enabling ``/v1/audio/transcriptions`` (call once, before run_server).
-def set_asr(var a : AsrModel) {
-    g_asr <- a
-    g_has_asr = true
+//! Configure long-lived ASR worker threads. Each worker loads and owns its model in its cloned
+//! context; model/session pointers never cross context heaps. Call once before ``run_server``.
+def configure_asr_workers(path, mmproj : string; workers : int = 1) {
+    g_asr_path = path
+    g_asr_mmproj = mmproj
+    g_asr_worker_count = clamp(workers, 1, 8)
+    g_has_asr = !empty(path)
 }
 
-//! Ask the tick loop to exit at the next iteration (also wired to ``POST /shutdown``).
+//! Stop admitting new inference/ASR work and exit after all accepted work finishes. Also wired to
+//! ``POST /shutdown``.
 def request_stop() {
-    g_should_stop = true
+    g_shutdown_requested = true
+}
+
+//! Consume a coalesced request from POST /gc. The lifecycle loop calls this only after update()
+//! returns, when no request-local values remain on its stack.
+def take_gc_request() : bool {
+    let requested = g_gc_requested
+    g_gc_requested = false
+    return requested
 }
 
 // ===== OpenAI wire shapes (response) =====
@@ -222,6 +239,45 @@ struct private OaiVerboseTranscription {
     segments : array<OaiVerboseSegment>
 }
 
+enum private AsrEventKind {
+    ready
+    started
+    completed
+    stopped
+}
+
+struct private AsrJob {
+    id : int64
+    temp_path : string
+    language : string
+    response_format : string
+    translate : bool
+    stop : bool
+}
+
+struct private AsrEvent {
+    kind : AsrEventKind
+    id : int64
+    status : int
+    content_type : string
+    body : string
+}
+
+struct private AsrWire {
+    @do_not_delete writer : HttpResponseWriter?
+}
+
+var g_asr_jobs : Channel?
+var g_asr_events : Channel?
+var g_asr_wires : table<int64; AsrWire>
+var g_asr_ready = 0
+var g_asr_active = 0
+var g_asr_pending = 0
+let ASR_QUEUE_LIMIT = 32
+let ASR_WRITER_KEEPALIVE_MS = 3600000
+let LLM_WRITER_KEEPALIVE_MS = 3600000
+let DEFAULT_WRITER_KEEPALIVE_MS = 75000
+
 // /v1/embeddings response shapes.
 struct private OaiEmbedding {
     @rename = "object" _object : string
@@ -264,6 +320,18 @@ def private bad_request(srv : WebSocketServer; var writer : HttpResponseWriter?;
     to_log(LOG_WARNING, "dasllama-server: 400 rejected: {msg}\n")
     respond(srv, writer, int(http_status.BAD_REQUEST), "application/json",
             error_body(msg, "invalid_request_error"))
+}
+
+def private reject_deferred_while_draining(
+                                           srv : WebSocketServer;
+                                           var writer : HttpResponseWriter?
+                                           ) : bool {
+    if (!g_shutdown_requested) {
+        return false
+    }
+    respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
+            error_body("the server is draining for shutdown — retry shortly", "server_error"))
+    return true
 }
 
 // Bytes of an INCOMPLETE trailing UTF-8 sequence (0 = the string ends on a character boundary).
@@ -370,6 +438,115 @@ def parse_tool_calls(full : string; open_mark, close_mark, id_base : string;
     return (content_end < 0 || empty(calls)) ? full : strip(slice(full, 0, content_end))
 }
 
+// Normalize one of the JSON call objects used by common model families. OpenAI/Hermes/Mistral
+// spell the arguments "arguments"; Llama 3 spells them "parameters". Some templates replay the
+// OpenAI wire object itself, with name/arguments nested under "function".
+def private tool_args_text(body : JsonValue?) : string {
+    let av = body?["arguments"]
+    if (av != null && !(av.value is _null)) {
+        if (av.value is _string) {
+            let s = av ?? ""
+            return empty(s) ? "\{}" : s
+        }
+        return write_json_compact(av)
+    }
+    let parameters = body?["parameters"]
+    if (parameters != null && !(parameters.value is _null)) {
+        return write_json_compact(parameters)
+    }
+    let args = body?["args"]
+    if (args != null && !(args.value is _null)) {
+        return write_json_compact(args)
+    }
+    return "\{}"
+}
+
+def private append_json_tool_body(body : JsonValue?; id_base : string;
+                                  var calls : array<OaiToolCall>) : bool {
+    var cname : string = body?["name"] ?? ""
+    if (empty(cname)) {
+        let fn = body?["function"]
+        if (fn != null && fn.value is _string) {
+            cname = fn ?? ""
+        }
+    }
+    if (empty(cname)) {
+        return false
+    }
+    calls |> push(OaiToolCall(id = "{id_base}_{length(calls)}", _type = "function",
+                              _function = OaiToolCallFn(name = cname, arguments = tool_args_text(body))))
+    return true
+}
+
+def private append_json_tool_call(cjs : JsonValue?; id_base : string;
+                                  var calls : array<OaiToolCall>) : bool {
+    if (cjs == null || !(cjs.value is _object)) {
+        return false
+    }
+    let fv = cjs?["function"]
+    if (fv != null && fv.value is _object) {
+        return append_json_tool_body(fv, id_base, calls)
+    }
+    return append_json_tool_body(cjs, id_base, calls)
+}
+
+def private parse_tool_json(body : string; id_base : string; var calls : array<OaiToolCall>) : bool {
+    var perr = ""
+    var js = read_json(strip(body), perr)
+    if (js == null) {
+        return false
+    }
+    defer() {
+        unsafe {
+            delete js
+        }
+    }
+    let before = length(calls)
+    if (js.value is _array) {
+        for (cjs in (js.value as _array)) {
+            append_json_tool_call(cjs, id_base, calls)
+        }
+    } else {
+        append_json_tool_call(js, id_base, calls)
+    }
+    return length(calls) > before
+}
+
+//! Normalize the output envelopes used by the model families most often served through an
+//! OpenAI-compatible endpoint. The template-declared wrapper wins; the remaining probes cover
+//! Hermes/Qwen XML, Mistral's array marker, Llama 3's python tag, and strict bare JSON. Bare JSON
+//! is accepted only when it is entirely a valid named call, so ordinary JSON answers stay content.
+def parse_tool_calls_auto(full : string; declared_open, declared_close, id_base : string;
+                          var calls : array<OaiToolCall>) : string {
+    if (!empty(declared_open) && !empty(declared_close) && find(full, declared_open) >= 0) {
+        let content = parse_tool_calls(full, declared_open, declared_close, id_base, calls)
+        if (!empty(calls)) {
+            return content
+        }
+    }
+    if ((declared_open != "<tool_call>" || declared_close != "</tool_call>") &&
+        find(full, "<tool_call>") >= 0) {
+        let content = parse_tool_calls(full, "<tool_call>", "</tool_call>", id_base, calls)
+        if (!empty(calls)) {
+            return content
+        }
+    }
+    let mistral = find(full, "[TOOL_CALLS]")
+    if (mistral >= 0 &&
+        parse_tool_json(slice(full, mistral + length("[TOOL_CALLS]")), id_base, calls)) {
+        return strip(slice(full, 0, mistral))
+    }
+    let llama = find(full, "<|python_tag|>")
+    if (llama >= 0 &&
+        parse_tool_json(slice(full, llama + length("<|python_tag|>")), id_base, calls)) {
+        return strip(slice(full, 0, llama))
+    }
+    if (parse_tool_json(full, id_base, calls)) {
+        return ""
+    }
+    return full
+}
+
 def private send_compl_chunk(srv : WebSocketServer; var writer : HttpResponseWriter?;
                              id : string; created : int64; text, finish : string) {
     var chunk = OaiComplStreamChunk(id = id, _object = "text_completion", created = created, model = g_model_name)
@@ -401,7 +578,7 @@ def private tmpdir() : string {
 let CHAT_FIELDS : table<string> <- { "model", "messages", "stream", "temperature", "top_k", "top_p", "min_p",
                                      "presence_penalty", "frequency_penalty", "repeat_penalty", "seed",
                                      "max_tokens", "max_completion_tokens", "tools", "tool_choice",
-                                     "enable_thinking", "chat_template_kwargs" }
+                                     "enable_thinking", "chat_template_kwargs", "truncation" }
 let COMPL_FIELDS : table<string> <- { "model", "prompt", "stream", "temperature", "top_k", "top_p", "min_p",
                                      "presence_penalty", "frequency_penalty", "repeat_penalty", "seed",
                                      "max_tokens" }
@@ -556,10 +733,12 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
                 error_body("the server is at capacity ({g_sched.max_queue} requests queued) — retry shortly", "server_error"))
         return
     }
+    set_writer_keepalive_timeout(srv, writer, LLM_WRITER_KEEPALIVE_MS)
     to_log(LOG_INFO, "[req {rid}] {prefix}: prompt={np} tok, stream={streaming}, max_new={max_new}\n")
     var wire <- StreamWire(writer = writer, streaming = streaming, is_chat = is_chat,
                            id = cid, created = created,
                            has_tools = tools_declared && !empty(call_open),
+                           last_keepalive_ticks = ref_time_ticks(),
                            call_open = call_open, call_close = call_close)
     g_wires[rid] <- wire
     if (streaming && is_chat) {
@@ -570,7 +749,122 @@ def private register_request(srv : WebSocketServer; var writer : HttpResponseWri
 // Parse + validate + render + register, then return — no generation in the handler. The prompt is
 // rendered through the S1 render seam (tokens only, no KV), so a queued request holds no cache
 // memory; the session exists only once the scheduler admits the stream.
+// Render a user-led suffix of the transcript. System messages are always retained (they were
+// folded into `system`); `start` applies only to conversational messages in the original array.
+def private render_chat_suffix(msgs_v : JsonValue?; system : string; tools : array<string>;
+                               max_new : int64; start : int; thinking : bool;
+                               var prompt, stop_ids, close : array<int64>&;
+                               var call_open, call_close : string&) : string {
+    var chat <- create_chat_renderer(g_model, system, max_new)
+    defer() { delete chat }
+    if (!thinking) {
+        set_thinking(chat, false)
+    }
+    if (!empty(tools)) {
+        if (empty(chat.tmpl.tool_call_open)) {
+            return "'tools' is not supported: the {g_model_name} chat template declares no tool-call format"
+        }
+        var render_tools <- [for (tool in tools); tool]
+        set_tools(chat, render_tools)
+        delete render_tools
+    }
+
+    var rendered : array<int64>
+    var pending = false
+    var tool_results : array<string>
+    defer() { delete tool_results }
+    for (i in range(length(msgs_v.value as _array))) {
+        let mv = (msgs_v.value as _array)[i]
+        let role = mv?["role"] ?? ""
+        if (role != "system" && i < start) {
+            continue
+        }
+        let content = message_text(mv, "/v1/chat/completions")
+        if (role != "tool" && !empty(tool_results)) {
+            add_tool_results(chat, tool_results)
+            tool_results |> clear()
+            pending = true
+        }
+        if (role == "user") {
+            add_user(chat, content)
+            pending = true
+        } elif (role == "assistant") {
+            var calls : array<string>
+            let tc = mv?["tool_calls"]
+            if (tc != null && tc.value is _array) {
+                calls |> reserve(length(tc.value as _array))
+                for (tcall in (tc.value as _array)) {
+                    let fv = tcall?["function"]
+                    var nv = JV(fv?["name"] ?? "")
+                    let cname = write_json_compact(nv)
+                    unsafe {
+                        delete nv
+                    }
+                    let av = fv?["arguments"]
+                    var argstr = "\{}"
+                    if (av != null && av.value is _string) {
+                        let s = av ?? ""
+                        if (!empty(s)) {
+                            argstr = s
+                        }
+                    } elif (av != null && !(av.value is _null)) {
+                        argstr = write_json_compact(av)
+                    }
+                    calls |> push("\{\"name\": {cname}, \"arguments\": {argstr}}")
+                }
+            }
+            if (pending) {
+                if (!empty(calls)) {
+                    render_assistant_calls(g_model, chat, content, calls, rendered)
+                } else {
+                    render_assistant(g_model, chat, content, rendered)
+                }
+                pending = false
+            }
+            delete calls
+        } elif (role == "tool") {
+            tool_results |> push(content)
+        } elif (role != "system") {
+            to_log(LOG_WARNING, "/v1/chat/completions: dropping message with unsupported role '{role}'\n")
+        }
+    }
+    if (!empty(tool_results)) {
+        add_tool_results(chat, tool_results)
+        pending = true
+    }
+    if (!pending) {
+        delete rendered
+        return "the last message must be a user or tool message"
+    }
+    var turn <- render_turn(g_model, chat)
+    rendered |> push_from(turn)
+    delete turn
+    prompt <- rendered
+    stop_ids <- chat.stop_ids
+    close <- render_close(g_model, chat)
+    call_open := chat.tmpl.tool_call_open
+    call_close := chat.tmpl.tool_call_close
+    return ""
+}
+
+// Move to the next user-led suffix, dropping a complete oldest user/assistant/tool exchange.
+def private next_user_start(msgs_v : JsonValue?; start : int) : int {
+    var saw_user = false
+    for (i in range(start, length(msgs_v.value as _array))) {
+        if (((msgs_v.value as _array)[i]?["role"] ?? "") == "user") {
+            if (saw_user) {
+                return i
+            }
+            saw_user = true
+        }
+    }
+    return -1
+}
+
 def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
+    if (reject_deferred_while_draining(srv, writer)) {
+        return
+    }
     var perr = ""
     var js = read_json(string(req.body), perr)
     if (js == null) {
@@ -592,6 +886,11 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
         req_max = js?["max_completion_tokens"] ?? g_default_max_new   // the newer OpenAI spelling
     }
     let max_new = clamp_max(req_max)
+    let truncation = js?["truncation"] ?? "disabled"
+    if (truncation != "disabled" && truncation != "auto") {
+        bad_request(srv, writer, "'truncation' must be 'disabled' or 'auto'")
+        return
+    }
 
     // tools: each tools[] entry re-serialized verbatim into the system turn's tool block.
     // tool_choice: "none" drops them; the object form (forced function) is not honored.
@@ -632,8 +931,6 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
             system = empty(system) ? sc : "{system}\n{sc}"
         }
     }
-    var chat <- create_chat_renderer(g_model, system, max_new)
-    defer() { delete chat }
     // top-level enable_thinking, or the llama.cpp-server spelling chat_template_kwargs.enable_thinking;
     // other kwargs keys warn like any unsupported field instead of vanishing
     let ctk = js?["chat_template_kwargs"]
@@ -648,93 +945,47 @@ def private handle_chat(srv : WebSocketServer; var req : HttpRequest?; var write
     }
     var think = js?["enable_thinking"] ?? true
     think = think && (ctk?["enable_thinking"] ?? true)
-    if (!think) {
-        set_thinking(chat, false)
-    }
     let has_tools = !empty(tools)
-    if (has_tools) {
-        if (empty(chat.tmpl.tool_call_open)) {
-            bad_request(srv, writer, "'tools' is not supported: the {g_model_name} chat template declares no tool-call format")
-            return
-        }
-        set_tools(chat, tools)   // moved in; `tools` is empty from here
-    }
     var prompt : array<int64>
     defer() { delete prompt }
-    var pending = false
-    var tool_results : array<string>
-    defer() { delete tool_results }
-    for (mv in (msgs_v.value as _array)) {
-        let role = mv?["role"] ?? ""
-        let content = message_text(mv, "/v1/chat/completions")
-        if (role != "tool" && !empty(tool_results)) {
-            add_tool_results(chat, tool_results)   // flush the consecutive tool-result run
-            tool_results |> clear()
-            pending = true
+    var stop_ids : array<int64>
+    defer() { delete stop_ids }
+    var close : array<int64>
+    defer() { delete close }
+    var call_open = ""
+    var call_close = ""
+    var start = 0
+    while (true) {
+        let render_error = render_chat_suffix(msgs_v, system, tools, max_new, start, think,
+                                              prompt, stop_ids, close, call_open, call_close)
+        if (!empty(render_error)) {
+            bad_request(srv, writer, render_error)
+            return
         }
-        if (role == "user") {
-            add_user(chat, content)
-            pending = true
-        } elif (role == "assistant") {
-            // rebuild any tool calls this turn made as the {"name","arguments"} objects the
-            // template renders (the wire carries arguments as JSON text — spliced verbatim)
-            var calls : array<string>
-            let tc = mv?["tool_calls"]
-            if (tc != null && tc.value is _array) {
-                calls |> reserve(length(tc.value as _array))
-                for (tcall in (tc.value as _array)) {
-                    let fv = tcall?["function"]
-                    var nv = JV(fv?["name"] ?? "")   // JSON-escape the name (quotes/backslashes)
-                    let cname = write_json_compact(nv)
-                    unsafe {
-                        delete nv
-                    }
-                    let av = fv?["arguments"]
-                    var argstr = "\{}"
-                    if (av != null && av.value is _string) {
-                        let s = av ?? ""
-                        if (!empty(s)) {
-                            argstr = s
-                        }
-                    } elif (av != null && !(av.value is _null)) {
-                        argstr = write_json_compact(av)   // tolerated: arguments sent as an object
-                    }
-                    calls |> push("\{\"name\": {cname}, \"arguments\": {argstr}}")
-                }
-            }
-            if (pending) {
-                if (!empty(calls)) {
-                    render_assistant_calls(g_model, chat, content, calls, prompt)
-                } else {
-                    render_assistant(g_model, chat, content, prompt)
-                }
-                pending = false
-            }
-            delete calls
-        } elif (role == "tool") {
-            tool_results |> push(content)
-        } elif (role != "system") {
-            to_log(LOG_WARNING, "/v1/chat/completions: dropping message with unsupported role '{role}'\n")
+        let required = int64(length(prompt)) + (truncation == "auto" ? max_new : 1l)
+        if (required <= g_model.config.seq_len || truncation != "auto") {
+            break
         }
+        let next = next_user_start(msgs_v, start)
+        if (next < 0) {
+            bad_request(srv, writer,
+                        "the system prompt, tools, and latest turn need {required} tokens including the requested output; the model context is {g_model.config.seq_len} - shorten the request, lower max_tokens, or raise --ctx")
+            return
+        }
+        to_log(LOG_INFO, "/v1/chat/completions: auto truncation dropped messages [0, {next}) to reserve {max_new} output tokens\n")
+        start = next
+        delete prompt
+        delete stop_ids
+        delete close
     }
-    if (!empty(tool_results)) {
-        add_tool_results(chat, tool_results)   // trailing tool results: generation continues from them
-        pending = true
-    }
-    if (!pending) {
-        bad_request(srv, writer, "the last message must be a user or tool message")
-        return
-    }
-    var turn <- render_turn(g_model, chat)
-    prompt |> push_from(turn)
-    delete turn
-    var close <- render_close(g_model, chat)
-    defer() { delete close }   // register_request moves it on success; the 400/503 paths leave it here
-    register_request(srv, writer, prompt, chat.stop_ids, close, params, max_new, streaming, true, "chatcmpl",
-                     has_tools, chat.tmpl.tool_call_open, chat.tmpl.tool_call_close, seed)
+    register_request(srv, writer, prompt, stop_ids, close, params, max_new, streaming, true, "chatcmpl",
+                     has_tools, call_open, call_close, seed)
 }
 
 def private handle_completion(srv : WebSocketServer; var req : HttpRequest?; var writer : HttpResponseWriter?) {
+    if (reject_deferred_while_draining(srv, writer)) {
+        return
+    }
     var perr = ""
     var js = read_json(string(req.body), perr)
     if (js == null) {
@@ -770,6 +1021,33 @@ def private reap_disconnected(srv : WebSocketServer) {
             evict(g_sched, id, g_events)
         }
     }
+    var disconnected_asr : array<int64>
+    for (id, w in keys(g_asr_wires), values(g_asr_wires)) {
+        if (!is_writer_connected(srv, w.writer)) {
+            release_writer(srv, w.writer)
+            disconnected_asr |> push(id)
+        }
+    }
+    for (id in disconnected_asr) {
+        delete g_asr_wires[id]
+        g_asr_wires |> erase(id)
+    }
+    delete disconnected_asr
+}
+
+// Tool-capable streaming buffers the model's native envelope until it can be normalized into an
+// OpenAI tool_calls delta. Slow CPU inference can otherwise leave the socket silent beyond libhv's
+// keep-alive window during prefill or generation. Emit a valid empty delta at least every 10s;
+// scheduler steps may be long, so this is intentionally time-based rather than token-count-based.
+def private flush_tool_keepalives(srv : WebSocketServer) {
+    for (id in keys(g_wires)) {
+        var w = unsafe(g_wires?[id])
+        if (w != null && w.streaming && w.has_tools &&
+            get_time_usec(w.last_keepalive_ticks) >= 10000000) {
+            send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "")
+            w.last_keepalive_ticks = ref_time_ticks()
+        }
+    }
 }
 
 // Route drained SchedEvents to their writers: streaming wires emit SSE chunks, buffered wires
@@ -786,33 +1064,13 @@ def private flush_events(srv : WebSocketServer) {
             if (!w.streaming || w.has_tools) {
                 w.reply_parts |> push(e.text)   // buffered reply, and/or the finish-time tool-call parse
             }
-            if (w.streaming && w.hold) {
-                // a long tool-call body buffers for minutes at decode speed; with no bytes on the
-                // wire the client's idle timeout kills the stream (pi: "terminated" + retry loop).
-                // An empty delta {} is protocol-legal liveness every ~16 tokens.
-                w.held_pieces ++
-                if (w.held_pieces % 16 == 0) {
-                    send_chat_chunk(srv, w.writer, w.id, w.created, "", "", "")
-                }
+            if (w.streaming && w.has_tools) {
+                // Buffer all tool-capable output until finish so native model envelopes never leak
+                // onto the OpenAI wire. flush_tool_keepalives covers slow prefill and generation.
             } elif (w.streaming) {
                 // re-join any held-back partial character, then hold the new incomplete tail
                 // so every delta on the wire is valid UTF-8 by itself
                 let whole = "{w.utf8_tail}{e.text}"
-                if (w.has_tools) {
-                    // the ChatML tool-call opener is one vocab token, so per-piece detection is
-                    // exact; from the opener on the reply is tool-call body — buffer, don't stream
-                    let o = find(whole, w.call_open)
-                    if (o >= 0) {
-                        w.hold = true
-                        w.utf8_tail = ""
-                        to_log(LOG_INFO, "stream {w.id}: tool-call opener — buffering the call body (keepalives on)\n")
-                        let head = slice(whole, 0, o)   // the opener starts on a char boundary (ascii)
-                        if (!empty(head)) {
-                            send_chat_chunk(srv, w.writer, w.id, w.created, "", head, "")
-                        }
-                        continue
-                    }
-                }
                 let hold = utf8_hold_bytes(whole)
                 let cut = length(whole) - hold
                 let emit_now = hold > 0 ? slice(whole, 0, cut) : whole
@@ -830,23 +1088,25 @@ def private flush_events(srv : WebSocketServer) {
         if (e.finish == "evicted") {
             release_writer(srv, w.writer)
         } elif (w.streaming) {
+            set_writer_keepalive_timeout(srv, w.writer, DEFAULT_WRITER_KEEPALIVE_MS)
             if (!empty(w.utf8_tail)) {
                 // generation ended mid-character (max-tokens cut): the held bytes can never
                 // complete, and emitting them would put invalid UTF-8 on the wire — drop loudly
                 to_log(LOG_WARNING, "dasllama-server: stream {w.id} ended mid-UTF-8-sequence; dropped {length(w.utf8_tail)} byte(s)\n")
             }
             var finish = e.finish
-            if (w.hold) {
-                // the buffered tail is tool-call body: parse it into a tool_calls delta (the
-                // pre-opener content already streamed); nothing parseable => release it as text
+            if (w.has_tools) {
+                // Normalize the complete reply, then send content and calls in OpenAI framing.
                 let full = join(w.reply_parts, "")
                 var calls : array<OaiToolCall>
-                parse_tool_calls(full, w.call_open, w.call_close, "call_{e.stream}", calls)
+                let content = parse_tool_calls_auto(full, w.call_open, w.call_close,
+                                                    "call_{e.stream}", calls)
+                if (!empty(content)) {
+                    send_chat_chunk(srv, w.writer, w.id, w.created, "", content, "")
+                }
                 if (!empty(calls)) {
                     send_chat_tool_calls_chunk(srv, w.writer, w.id, w.created, calls)
                     finish = "tool_calls"
-                } else {
-                    send_chat_chunk(srv, w.writer, w.id, w.created, "", slice(full, find(full, w.call_open)), "")
                 }
                 delete calls
             }
@@ -862,8 +1122,9 @@ def private flush_events(srv : WebSocketServer) {
             var content = full
             var finish = e.finish
             var calls : array<OaiToolCall>
-            if (w.has_tools && find(full, w.call_open) >= 0) {
-                content = parse_tool_calls(full, w.call_open, w.call_close, "call_{e.stream}", calls)
+            if (w.has_tools) {
+                content = parse_tool_calls_auto(full, w.call_open, w.call_close,
+                                                "call_{e.stream}", calls)
                 if (!empty(calls)) {
                     finish = "tool_calls"
                 }
@@ -875,6 +1136,7 @@ def private flush_events(srv : WebSocketServer) {
                                              finish_reason = finish))
             out.usage = OaiUsage(prompt_tokens = e.n_prompt, completion_tokens = e.n_gen,
                                  total_tokens = e.n_prompt + e.n_gen)
+            set_writer_keepalive_timeout(srv, w.writer, DEFAULT_WRITER_KEEPALIVE_MS)
             respond(srv, w.writer, int(http_status.OK), "application/json", sprint_json(out, false))
             delete out
         } else {
@@ -882,6 +1144,7 @@ def private flush_events(srv : WebSocketServer) {
             out.choices |> push(OaiComplChoice(index = 0, text = join(w.reply_parts, ""), finish_reason = e.finish))
             out.usage = OaiUsage(prompt_tokens = e.n_prompt, completion_tokens = e.n_gen,
                                  total_tokens = e.n_prompt + e.n_gen)
+            set_writer_keepalive_timeout(srv, w.writer, DEFAULT_WRITER_KEEPALIVE_MS)
             respond(srv, w.writer, int(http_status.OK), "application/json", sprint_json(out, false))
             delete out
         }
@@ -908,6 +1171,10 @@ struct private OaiStatsResponse {
     prefix_pages : int64
     max_streams : int64
     chunk_tokens : int64
+    asr_workers : int
+    asr_ready : int
+    asr_active : int
+    asr_pending : int
     mtp_drafted : int64
     mtp_accepted : int64
 }
@@ -920,15 +1187,162 @@ def private handle_stats(var resp : HttpResponse?) : http_status {
         avg_batch = float(g_sched.sum_batch) / float(max(g_sched.decode_steps, 1l)),
         cached_tokens = g_sched.cached_tokens, prefix_pages = prefix_held_groups(g_sched.prefix),
         max_streams = g_sched.max_streams, chunk_tokens = g_sched.chunk_tokens,
+        asr_workers = g_asr_worker_count, asr_ready = g_asr_ready,
+        asr_active = g_asr_active, asr_pending = g_asr_pending,
         mtp_drafted = g_sched.mtp_drafted, mtp_accepted = g_sched.mtp_accepted)
     return resp |> JSON(sprint_json(out, false), http_status.OK)
 }
 
+def private emit_asr_event(events : Channel?; event : AsrEvent) {
+    events |> push_clone(event)
+}
+
+def private catch_asr_panic(var failure : string&; blk : block<() : void>) : bool {
+    var caught = false
+    try {
+        invoke(blk)
+    } recover {
+        caught = true
+        failure = this_context().last_exception |> rtrim
+    }
+    return caught
+}
+
+def private process_asr_job(
+                            model : AsrModel;
+                            var session : AsrSession;
+                            var session_language : string&;
+                            var has_session : bool&;
+                            job : AsrJob;
+                            events : Channel?
+                            ) {
+    emit_asr_event(events, AsrEvent(kind = AsrEventKind.started, id = job.id))
+    defer() {
+        remove(job.temp_path)
+    }
+    var samples <- load_audio_16k_mono(job.temp_path)
+    defer() {
+        delete samples
+    }
+    if (empty(samples)) {
+        emit_asr_event(events, AsrEvent(
+            kind = AsrEventKind.completed, id = job.id, status = int(http_status.BAD_REQUEST),
+            content_type = "application/json",
+            body = error_body("could not decode the uploaded audio", "invalid_request_error")))
+        return
+    }
+    let language = empty(job.language) ? "en" : job.language
+    if (!has_session || session_language != language) {
+        if (has_session) {
+            delete session
+        }
+        session <- create_session(model, language)
+        session_language = language
+        has_session = true
+    }
+    session.translate = job.translate
+    if (job.response_format == "verbose_json") {
+        var vt = OaiVerboseTranscription(
+            task = job.translate ? "translate" : "transcribe",
+            language = language, duration = float(length(samples)) / 16000.0)
+        var full : array<string>
+        var sid = 0
+        transcribe(model, session, samples) $(seg) {
+            vt.segments |> push(OaiVerboseSegment(
+                id = sid, start = float(seg.t0) / 100.0,
+                end = float(seg.t1) / 100.0, text = seg.text))
+            full |> push(seg.text)
+            sid++
+        }
+        vt.text = join(full, "")
+        vt.language = session.detected_lang
+        emit_asr_event(events, AsrEvent(
+            kind = AsrEventKind.completed, id = job.id, status = int(http_status.OK),
+            content_type = "application/json", body = sprint_json(vt, false)))
+        delete full
+        delete vt
+        return
+    }
+    let text = transcribe(model, session, samples)
+    let content_type = job.response_format == "text" ? "text/plain; charset=utf-8" : "application/json"
+    let body = job.response_format == "text" ? text : sprint_json(OaiTranscription(text = text), false)
+    emit_asr_event(events, AsrEvent(
+        kind = AsrEventKind.completed, id = job.id, status = int(http_status.OK),
+        content_type = content_type, body = body))
+}
+
+def private asr_worker_main(
+                            worker_index : int;
+                            model_path, mmproj_path : string;
+                            team_dispatch : bool;
+                            var jobs : Channel?&;
+                            var events : Channel?&
+                            ) {
+    this_context().name := "dasllama_asr_{worker_index}"
+    set_jobque_thread_team_mode(team_dispatch)
+    var model <- empty(mmproj_path) ? load_asr_model(model_path) : load_asr_model(model_path, mmproj_path)
+    emit_asr_event(events, AsrEvent(kind = AsrEventKind.ready))
+    var session = AsrSession()
+    var session_language = ""
+    var has_session = false
+    var stopping = false
+    while (!stopping) {
+        jobs |> pop_with_timeout_clone(250) $(job : AsrJob#) {
+            if (job.stop) {
+                stopping = true
+            } else {
+                var job_copy : AsrJob
+                job_copy := job
+                var failure = ""
+                let failed = catch_asr_panic(failure) {
+                    process_asr_job(model, session, session_language, has_session, job_copy, events)
+                }
+                if (failed) {
+                    if (has_session) {
+                        delete session
+                        has_session = false
+                    }
+                    session_language = ""
+                    to_log(LOG_ERROR, "[req {job_copy.id}] asr: failed: {failure}\n")
+                    emit_asr_event(events, AsrEvent(
+                        kind = AsrEventKind.completed, id = job_copy.id,
+                        status = int(http_status.INTERNAL_SERVER_ERROR),
+                        content_type = "application/json",
+                        body = error_body(failure, "server_error")))
+                }
+                delete job_copy
+            }
+        }
+    }
+    if (has_session) {
+        delete session
+    }
+    delete model
+    emit_asr_event(events, AsrEvent(kind = AsrEventKind.stopped))
+    jobs |> release
+    events |> release
+}
+
 // /v1/audio/transcriptions (translate=false) and /v1/audio/translations (translate=true, to English).
 // Multipart upload: save the 'file' part to disk (binary-safe), decode to 16 kHz mono f32, transcribe.
-def private handle_transcription(var req : HttpRequest?; var resp : HttpResponse?; translate : bool) : http_status {
-    if (!g_has_asr) {
-        return resp_error(resp, http_status.NOT_FOUND, "no ASR model loaded — start the server with --asr")
+def private queue_transcription(
+                                srv : WebSocketServer;
+                                var req : HttpRequest?;
+                                var writer : HttpResponseWriter?;
+                                translate : bool
+                                ) {
+    if (reject_deferred_while_draining(srv, writer)) {
+        return
+    }
+    if (!g_has_asr || g_asr_ready < g_asr_worker_count) {
+        respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
+                error_body("ASR workers are not ready", "server_error"))
+        return
+    }
+    if (g_asr_pending >= ASR_QUEUE_LIMIT) {
+        respond(srv, writer, int(http_status.SERVICE_UNAVAILABLE), "application/json",
+                error_body("the ASR queue is at capacity ({ASR_QUEUE_LIMIT}) — retry shortly", "server_error"))
+        return
     }
     var fname = ""
     each_form_field(req) $(name, _content, filename) {
@@ -937,42 +1351,97 @@ def private handle_transcription(var req : HttpRequest?; var resp : HttpResponse
         }
     }
     if (empty(fname)) {
-        return resp_error(resp, http_status.BAD_REQUEST, "multipart form must include a 'file' audio upload")
+        bad_request(srv, writer, "multipart form must include a 'file' audio upload")
+        return
     }
-    let temppath = path_join(tmpdir(), "dasllama_upload_{base_name(fname)}")
+    set_writer_keepalive_timeout(srv, writer, ASR_WRITER_KEEPALIVE_MS)
+    let rid = next_id()
+    let temppath = path_join(tmpdir(), "dasllama_upload_{rid}_{base_name(fname)}")
     save_form_file(req, "file", temppath)
-    let samples <- load_audio_16k_mono(temppath)
-    remove(temppath)
-    if (empty(samples)) {
-        return resp_error(resp, http_status.BAD_REQUEST, "could not decode the uploaded audio")
-    }
     let fmt = get_form_data(req, "response_format")
     var lang = get_form_data(req, "language")
     if (empty(lang)) {
         lang = "en"
     }
-    var session <- create_session(g_asr, lang)
-    session.translate = translate
-    if (fmt == "verbose_json") {
-        var vt = OaiVerboseTranscription(task = translate ? "translate" : "transcribe",
-                                         language = lang, duration = float(length(samples)) / 16000.0)
-        var full : array<string>
-        var sid = 0
-        transcribe(g_asr, session, samples) $(seg) {
-            vt.segments |> push(OaiVerboseSegment(id = sid, start = float(seg.t0) / 100.0,
-                                                  end = float(seg.t1) / 100.0, text = seg.text))
-            full |> push(seg.text)
-            sid ++
+    g_asr_wires[rid] <- AsrWire(writer = writer)
+    g_asr_pending++
+    g_asr_jobs |> push_clone(AsrJob(
+        id = rid, temp_path = temppath, language = lang, response_format = fmt,
+        translate = translate))
+    to_log(LOG_INFO, "[req {rid}] asr: queued (pending={g_asr_pending}, active={g_asr_active})\n")
+}
+
+def private start_asr_worker_threads() {
+    g_asr_ready = 0
+    if (!g_has_asr) {
+        return
+    }
+    to_log(LOG_INFO, "dasllama-server: starting {g_asr_worker_count} asynchronous ASR worker(s)\n")
+    for (index in range(g_asr_worker_count)) {
+        let worker_index = index
+        let model_path = g_asr_path
+        let mmproj_path = g_asr_mmproj
+        let team_dispatch = g_asr_team_dispatch
+        var jobs_capture = g_asr_jobs
+        var events_capture = g_asr_events
+        new_thread() <| @capture(= worker_index, = model_path, = mmproj_path, = team_dispatch,
+                                = jobs_capture, = events_capture) {
+            asr_worker_main(
+                worker_index, model_path, mmproj_path, team_dispatch, jobs_capture, events_capture)
         }
-        vt.text = join(full, "")
-        vt.language = session.detected_lang
-        return resp |> JSON(sprint_json(vt, false), http_status.OK)
     }
-    let text = transcribe(g_asr, session, samples)
-    if (fmt == "text") {
-        return resp |> TEXT_PLAIN(text)
+    while (g_asr_ready < g_asr_worker_count) {
+        g_asr_events |> pop_with_timeout_clone(1000) $(event : AsrEvent#) {
+            if (event.kind == AsrEventKind.ready) {
+                g_asr_ready++
+                to_log(LOG_INFO, "dasllama-server: ASR worker ready ({g_asr_ready}/{g_asr_worker_count})\n")
+            }
+        }
     }
-    return resp |> JSON(sprint_json(OaiTranscription(text = text), false), http_status.OK)
+}
+
+def private drain_asr_events(srv : WebSocketServer) {
+    var draining = true
+    while (draining) {
+        draining = g_asr_events |> try_pop_clone() $(event : AsrEvent#) {
+            if (event.kind == AsrEventKind.started) {
+                g_asr_active++
+            } elif (event.kind == AsrEventKind.completed) {
+                g_asr_active = max(g_asr_active - 1, 0)
+                g_asr_pending = max(g_asr_pending - 1, 0)
+                var wire = unsafe(g_asr_wires?[event.id])
+                if (wire != null) {
+                    if (is_writer_connected(srv, wire.writer)) {
+                        set_writer_keepalive_timeout(srv, wire.writer, DEFAULT_WRITER_KEEPALIVE_MS)
+                        respond(srv, wire.writer, event.status, event.content_type, event.body)
+                    } else {
+                        release_writer(srv, wire.writer)
+                    }
+                    delete g_asr_wires[event.id]
+                    g_asr_wires |> erase(event.id)
+                }
+                to_log(LOG_INFO, "[req {event.id}] asr: completed (pending={g_asr_pending}, active={g_asr_active})\n")
+            }
+        }
+    }
+}
+
+def private stop_asr_worker_threads() {
+    if (!g_has_asr) {
+        return
+    }
+    for (_index in range(g_asr_worker_count)) {
+        g_asr_jobs |> push_clone(AsrJob(stop = true))
+    }
+    var stopped = 0
+    while (stopped < g_asr_worker_count) {
+        g_asr_events |> pop_with_timeout_clone(1000) $(event : AsrEvent#) {
+            if (event.kind == AsrEventKind.stopped) {
+                stopped++
+            }
+        }
+    }
+    g_asr_ready = 0
 }
 
 // ===== Server =====
@@ -989,21 +1458,39 @@ class OpenAiServer : HvWebServer {
         STREAM("/v1/completions") <| @(var req : HttpRequest?; var writer : HttpResponseWriter?) {
             handle_completion(server, req, writer)
         }
-        POST("/v1/audio/transcriptions") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
-            return handle_transcription(req, resp, false)
+        STREAM("/v1/audio/transcriptions") <| @(var req : HttpRequest?; var writer : HttpResponseWriter?) {
+            queue_transcription(server, req, writer, false)
         }
-        POST("/v1/audio/translations") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
-            return handle_transcription(req, resp, true)
+        STREAM("/v1/audio/translations") <| @(var req : HttpRequest?; var writer : HttpResponseWriter?) {
+            queue_transcription(server, req, writer, true)
         }
         POST("/v1/embeddings") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            if (g_shutdown_requested) {
+                return resp |> JSON(
+                    error_body("the server is draining for shutdown — retry shortly", "server_error"),
+                    http_status.SERVICE_UNAVAILABLE)
+            }
             return handle_embeddings(req, resp)
         }
         GET("/v1/stats") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_stats(resp)
         }
         POST("/shutdown") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
-            g_should_stop = true
-            return resp |> JSON("\{\"ok\":true}", http_status.OK)
+            if (!g_shutdown_requested) {
+                to_log(
+                    LOG_INFO,
+                    "dasllama-server: graceful shutdown requested; draining llm_active={n_active(g_sched)}, llm_queued={n_queued(g_sched)}, asr_pending={g_asr_pending}\n")
+            }
+            g_shutdown_requested = true
+            return resp |> JSON("\{\"ok\":true,\"draining\":true}", http_status.OK)
+        }
+        POST("/gc") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
+            let coalesced = g_gc_requested
+            g_gc_requested = true
+            to_log(LOG_INFO, "dasllama-server: GC requested via POST /gc (coalesced={coalesced})\n")
+            return resp |> JSON(
+                "\{\"ok\":true,\"scheduled\":true,\"coalesced\":{coalesced}}",
+                http_status.ACCEPTED)
         }
         ANY("*") <| @(var req : HttpRequest?; var resp : HttpResponse?) : http_status {
             return handle_unknown(req, resp)
@@ -1011,10 +1498,18 @@ class OpenAiServer : HvWebServer {
     }
 }
 
-//! Run the server on the calling thread until ``request_stop`` (or ``POST /shutdown``). Sets up the
-//! job queue, then drives the serve loop: pump HTTP (handlers parse + render + submit), evict
-//! streams whose client disconnected, one scheduler step (continuous batching over every live
-//! stream), flush events to the writers.
+// Lifecycle-owned state. Keeping it global is required by both daslang-live (which calls
+// init/update/shutdown independently) and standalone JIT heap collection: collectable state that
+// survives an update must be visible to the collector as a global root, never a main-loop local.
+var private g_server : OpenAiServer?
+var private g_server_started = false
+var private g_jobque_owned = false
+var private g_prev_mtp_spec = false
+var private g_mtp_spec_changed = false
+
+//! Initialize the server lifecycle. Creates a persistent JobQue explicitly so the pool spans
+//! externally-driven update calls; ``shutdown_server`` destroys it after every worker and owned
+//! queue object has stopped. Call after ``set_model``.
 //! ``max_streams`` concurrent generation streams, ``max_queue`` waiting requests (503 beyond),
 //! ``chunk_tokens`` the prefill quantum (decode stalls at most this many tokens per tick).
 //! ``page_rows`` > 0 (the default) serves PAGED: KV memory tracks actual context and a prefix
@@ -1022,65 +1517,152 @@ class OpenAiServer : HvWebServer {
 //! skip their prefill; ``prefix_groups`` caps the cache (0 = auto: one full context per stream
 //! slot, < 0 = unbounded). ``page_rows`` = 0 restores flat preallocated sessions (each the full
 //! ``--ctx`` slab). ``kv_dtype`` picks the KV-cache codec for every stream (pool-wide when paged;
-//! see ``KVDtype`` — ``tq4`` needs a power-of-two head_size). Call after ``set_model``.
+//! see ``KVDtype`` — ``tq4`` needs a power-of-two head_size).
+def init_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
+                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
+                team_dispatch : bool = true; asr_team_dispatch : bool = false; mtp : bool = false) : bool {
+    if (g_server != null || g_jobque_owned) {
+        to_log(LOG_ERROR, "dasllama-server: init_server called while already initialized\n")
+        return false
+    }
+    g_shutdown_requested = false   // reset so a restart in the same context after /shutdown doesn't drain at once
+    g_gc_requested = false
+    create_job_que()
+    g_jobque_owned = true
+    setup_dasllama_jobque()
+    set_jobque_team_mode(team_dispatch)
+    g_asr_team_dispatch = asr_team_dispatch
+    let dispatch_mode = !team_dispatch ? "inline" : (asr_team_dispatch ? "team" : "hybrid")
+    to_log(LOG_INFO, "dasllama-server: jobque compute dispatch = {dispatch_mode}\n")
+    g_asr_jobs = unsafe(channel_create())
+    g_asr_events = unsafe(channel_create())
+    start_asr_worker_threads()
+    var pfx = prefix_groups
+    if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
+        pfx = max_streams * ((g_model.config.seq_len + page_rows - 1l) / page_rows)
+    }
+    if (pfx < 0l) {
+        pfx = 0l   // explicit unbounded
+    }
+    var spec = mtp
+    if (spec && g_model.config.n_layer_nextn <= 0l) {
+        to_log(LOG_WARNING, "dasllama-server: --mtp requested but the model has no NextN head — self-spec stays off\n")
+        spec = false
+    }
+    g_prev_mtp_spec = get_mtp_spec()
+    g_mtp_spec_changed = true
+    set_mtp_spec(spec)   // engine gate: prefills maintain the draft head's KV (chunked included); restored at exit
+    g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype, spec)
+    g_server = new OpenAiServer()
+    g_server->init(port)
+    let rc = g_server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
+    if (rc != 0) {
+        to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
+        return false
+    }
+    g_server_started = true
+    let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
+    let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
+    let spec_desc = spec ? ", mtp: on" : ""
+    to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode}{spec_desc})\n")
+    return true
+}
+
+//! Drive one non-blocking server iteration. False means the graceful drain completed (or the
+//! server never started); an external lifecycle host should then exit and call shutdown.
+def update_server() : bool {
+    if (!g_server_started || g_server == null) {
+        return false
+    }
+    g_server->tick()   // drains queued handlers: requests parse + render + submit here
+    drain_asr_events(g_server.server)
+    reap_disconnected(g_server.server)
+    let t_step = ref_time_ticks()
+    let busy = scheduler_step(g_model, g_sched, g_events)
+    let step_ms = int64(get_time_usec(t_step)) / 1000l
+    if (step_ms > 3000l) {
+        // the "why does it pause" catcher: one decode step / prefill chunk should be
+        // well under a second — anything slower means contention or a stall
+        to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms (active={n_active(g_sched)}, queued={n_queued(g_sched)})\n")
+    }
+    flush_events(g_server.server)
+    flush_tool_keepalives(g_server.server)
+    if (g_shutdown_requested && n_active(g_sched) == 0l && n_queued(g_sched) == 0l &&
+        g_asr_pending == 0) {
+        to_log(LOG_INFO, "dasllama-server: graceful shutdown drain complete\n")
+        return false
+    }
+    if (!busy) {
+        sleep(2u)
+    }
+    return true
+}
+
+//! Release every lifecycle-owned object in dependency order. Safe after a partially failed init.
+def shutdown_server() {
+    if (g_server_started && g_server != null) {
+        g_server->stop()
+    }
+    g_server_started = false
+    if (g_asr_jobs != null && g_asr_events != null) {
+        stop_asr_worker_threads()
+    }
+    if (g_server != null) {
+        g_server->cleanup()
+        unsafe {
+            delete g_server
+        }
+        g_server = null
+    }
+    unsafe {
+        delete g_sched   // live sessions + workspace go with it (writers already died with the server)
+    }
+    g_sched = Scheduler()
+    delete g_events
+    delete g_wires
+    delete g_asr_wires
+    var asr_jobs = g_asr_jobs
+    var asr_events = g_asr_events
+    g_asr_jobs = null
+    g_asr_events = null
+    unsafe {
+        if (asr_jobs != null) {
+            asr_jobs |> channel_remove
+        }
+        if (asr_events != null) {
+            asr_events |> channel_remove
+        }
+    }
+    if (g_mtp_spec_changed) {
+        set_mtp_spec(g_prev_mtp_spec)   // a /shutdown + restart in the same context starts from a clean gate
+        g_mtp_spec_changed = false
+    }
+    delete g_model
+    g_model = Model()
+    g_model_name = ""
+    g_has_asr = false
+    g_asr_path = ""
+    g_asr_mmproj = ""
+    g_asr_worker_count = 0
+    g_asr_ready = 0
+    g_asr_active = 0
+    g_asr_pending = 0
+    if (g_jobque_owned) {
+        destroy_job_que()
+        g_jobque_owned = false
+    }
+    g_shutdown_requested = false
+}
+
+//! Compatibility wrapper for tests and simple callers. Lifecycle hosts should call
+//! ``init_server`` / ``update_server`` / ``shutdown_server`` directly.
 def run_server(port : int; max_streams : int64 = 4l; max_queue : int64 = 32l; chunk_tokens : int64 = 64l;
                page_rows : int64 = 64l; prefix_groups : int64 = 0l; kv_dtype : KVDtype = KVDtype.f16;
-               mtp : bool = false) {
-    g_should_stop = false   // reset so a restart in the same context after /shutdown doesn't exit at once
-    with_job_que() {
-        setup_dasllama_jobque()
-        var pfx = prefix_groups
-        if (page_rows > 0l && pfx == 0l) {   // auto: retain up to one full context per stream slot
-            pfx = max_streams * ((g_model.config.seq_len + page_rows - 1l) / page_rows)
+               team_dispatch : bool = true; asr_team_dispatch : bool = false; mtp : bool = false) {
+    if (init_server(port, max_streams, max_queue, chunk_tokens, page_rows, prefix_groups, kv_dtype,
+            team_dispatch, asr_team_dispatch, mtp)) {
+        while (update_server()) {
         }
-        if (pfx < 0l) {
-            pfx = 0l   // explicit unbounded
-        }
-        var spec = mtp
-        if (spec && g_model.config.n_layer_nextn <= 0l) {
-            to_log(LOG_WARNING, "dasllama-server: --mtp requested but the model has no NextN head — self-spec stays off\n")
-            spec = false
-        }
-        let prev_spec = get_mtp_spec()
-        set_mtp_spec(spec)   // engine gate: prefills maintain the draft head's KV (chunked included); restored at exit
-        g_sched <- create_scheduler(g_model, max_streams, max_queue, chunk_tokens, page_rows, pfx, kv_dtype, spec)
-        var server = new OpenAiServer()
-        server->init(port)
-        let rc = server->start()   // 0 on success; non-zero = bind/listen failed (e.g. port in use)
-        if (rc != 0) {
-            to_log(LOG_ERROR, "dasllama-server: could not start on port {port} (start rc {rc}; is the port already in use?)\n")
-        } else {
-            let pfx_desc = pfx > 0l ? "{pfx}" : "unbounded"
-            let kv_mode = page_rows > 0l ? "{kv_dtype} paged P={page_rows}, prefix cache {pfx_desc} pages" : "{kv_dtype} flat"
-            let spec_desc = spec ? ", mtp: on" : ""
-            to_log(LOG_INFO, "dasllama-server listening on http://127.0.0.1:{port}/v1  (model: {g_model_name}, streams: {max_streams}, prefill chunk: {chunk_tokens}, kv: {kv_mode}{spec_desc})\n")
-            while (!g_should_stop) {
-                server->tick()   // drains queued handlers: requests parse + render + submit here
-                reap_disconnected(server.server)
-                let t_step = ref_time_ticks()
-                let busy = scheduler_step(g_model, g_sched, g_events)
-                let step_ms = int64(get_time_usec(t_step)) / 1000l
-                if (step_ms > 3000l) {
-                    // the "why does it pause" catcher: one decode step / prefill chunk should be
-                    // well under a second — anything slower means contention or a stall
-                    to_log(LOG_WARNING, "dasllama-server: slow scheduler step: {step_ms}ms (active={n_active(g_sched)}, queued={n_queued(g_sched)})\n")
-                }
-                flush_events(server.server)
-                if (!busy) {
-                    sleep(2u)
-                }
-            }
-            server->stop()
-        }
-        server->cleanup()
-        unsafe {
-            delete server
-        }
-        unsafe {
-            delete g_sched   // live sessions + workspace go with it (writers already died with the server)
-        }
-        delete g_events
-        delete g_wires
-        set_mtp_spec(prev_spec)   // a /shutdown + restart in the same context starts from a clean gate
     }
+    shutdown_server()
 }

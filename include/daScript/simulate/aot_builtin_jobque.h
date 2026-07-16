@@ -190,6 +190,8 @@ namespace das {
     DAS_API void set_jobque_join_spin ( int32_t level, Context * context, LineInfoArg * at );
     DAS_API void set_jobque_team_mode ( bool on, Context * context, LineInfoArg * at );
     DAS_API bool get_jobque_team_mode ( Context * context, LineInfoArg * at );
+    DAS_API void set_jobque_thread_team_mode ( bool on, Context * context, LineInfoArg * at );
+    DAS_API bool get_jobque_thread_team_mode ( Context * context, LineInfoArg * at );
     DAS_API void set_jobque_team_prof ( bool on, Context * context, LineInfoArg * at );
     DAS_API void reset_jobque_team_prof ( Context * context, LineInfoArg * at );
     DAS_API float4 get_jobque_team_prof ( Context * context, LineInfoArg * at );

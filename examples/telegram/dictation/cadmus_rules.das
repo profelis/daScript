@@ -51,11 +51,84 @@ def starts_with_cadmus_alias(text, aliases_csv : string) : bool {
     return false
 }
 
+def starts_with_cadmus_username(text, bot_username : string) : bool {
+    let target = to_lower(strip(trim_prefix(bot_username, "@")))
+    return !empty(target) && has_alias_boundary(to_lower(strip(text)), "@{target}")
+}
+
+def should_cadmus_reply(
+                        replies_enabled, is_command, is_edit, is_transcript_reply, is_addressed : bool
+                        ) : bool {
+    if (is_edit) {
+        return false
+    }
+    if (is_command) {
+        return true
+    }
+    if (is_transcript_reply) {
+        return false
+    }
+    return replies_enabled && is_addressed
+}
+
+def is_legacy_cadmus_transcript_reply(
+                                      replied_by_bot, remembered_assistant : bool;
+                                      replied_text : string
+                                      ) : bool {
+    return replied_by_bot && !remembered_assistant && starts_with(strip(replied_text), "🎙 ")
+}
+
+def requires_cadmus_history_tools(text : string) : bool {
+    let lower = to_lower(strip(text))
+    return (lower |> contains("in this chat") || lower |> contains("in the chat") ||
+            lower |> contains("chat history") || lower |> contains("who first") ||
+            lower |> contains("who last") || lower |> contains("when did we") ||
+            lower |> contains("в чате") || lower |> contains("из чата") ||
+            lower |> contains("переписк") || lower |> contains("кто первый") ||
+            lower |> contains("кто последний") || lower |> contains("когда мы") ||
+            lower |> contains("упомянул") || lower |> contains("упоминал"))
+}
+
+def is_cadmus_source_followup(text : string) : bool {
+    let lower = to_lower(strip(text))
+    return (lower |> contains("there") || lower |> contains("that message") ||
+            lower |> contains("that discussion") || lower |> contains("around it") ||
+            lower |> contains("what were we discussing") || lower |> contains("what was discussed") ||
+            lower |> contains("the context") || lower |> contains("там") ||
+            lower |> contains("в том сообщении") || lower |> contains("вокруг этого") ||
+            lower |> contains("что мы обсуждали") || lower |> contains("что там обсуждали") ||
+            lower |> contains("контекст"))
+}
+
 def quote_cadmus_history(text : string) : string {
     let json = sprint_json(text, false)
     return replace_multiple(json, [
         (text = "<", replacement = "\\u003c"),
         (text = ">", replacement = "\\u003e")])
+}
+
+def sanitize_cadmus_reply(text : string; var clean, error : string&) : bool {
+    clean = strip(text)
+    error = ""
+    while (starts_with(clean, "<think>")) {
+        let close_at = find(clean, "</think>")
+        if (close_at < 0) {
+            clean = ""
+            error = "model response contained an unterminated thinking block"
+            return false
+        }
+        clean = strip(slice(clean, close_at + length("</think>")))
+    }
+    if (find(clean, "<think>") >= 0 || find(clean, "</think>") >= 0) {
+        clean = ""
+        error = "model response contained a thinking block outside the response preamble"
+        return false
+    }
+    if (empty(clean)) {
+        error = "model response contained thinking but no final answer"
+        return false
+    }
+    return true
 }
 
 def cadmus_rolling_24h(now : int64; var from_time, until_time : int64&) {

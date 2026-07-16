@@ -216,6 +216,34 @@ def test_openai_server(t : T?) {
     }
 }
 
+[test]
+def test_asr_worker_panic_boundary(t : T?) {
+    t |> run("ASR worker boundary returns normally after a panic") @(t : T?) {
+        var failure = ""
+        var failed = false
+        with (module openai_server) {
+            failed = catch_asr_panic(failure) {
+                panic("forced ASR worker failure")
+            }
+        }
+        t |> success(failed, "panic was caught")
+        t |> equal(failure, "forced ASR worker failure")
+    }
+    t |> run("ASR worker boundary preserves successful execution") @(t : T?) {
+        var invoked = false
+        var failure = ""
+        var failed = true
+        with (module openai_server) {
+            failed = catch_asr_panic(failure) {
+                invoked = true
+            }
+        }
+        t |> success(invoked, "work block ran")
+        t |> success(!failed, "successful work was not reported as failed")
+        t |> equal(failure, "")
+    }
+}
+
 // ===== parse_tool_calls (model-free) =====
 
 [test]
@@ -268,6 +296,49 @@ def test_parse_tool_calls(t : T?) {
         if (length(calls) == 1) {
             t |> equal(calls[0]._function.arguments, "\{\"x\": 1}")
         }
+        delete calls
+    }
+}
+
+[test]
+def test_parse_tool_calls_auto(t : T?) {
+    t |> run("Mistral TOOL_CALLS array normalizes to OpenAI calls") @(t : T?) {
+        var calls : array<OaiToolCall>
+        let pre = parse_tool_calls_auto("checking\n[TOOL_CALLS][\{\"name\":\"search_messages\",\"arguments\":\{\"query\":\"zephyr\"}}]",
+                                        "", "", "m", calls)
+        t |> equal(pre, "checking")
+        t |> equal(length(calls), 1)
+        if (length(calls) == 1) {
+            t |> equal(calls[0]._function.name, "search_messages")
+            t |> equal(calls[0]._function.arguments, "\{\"query\": \"zephyr\"}")
+        }
+        delete calls
+    }
+    t |> run("Llama python tag maps parameters to arguments") @(t : T?) {
+        var calls : array<OaiToolCall>
+        let pre = parse_tool_calls_auto("<|python_tag|>\{\"name\":\"message_timeline\",\"parameters\":\{\"query\":\"x\"}}",
+                                        "", "", "l", calls)
+        t |> equal(pre, "")
+        t |> equal(length(calls), 1)
+        if (length(calls) == 1) {
+            t |> equal(calls[0]._function.name, "message_timeline")
+            t |> equal(calls[0]._function.arguments, "\{\"query\": \"x\"}")
+        }
+        delete calls
+    }
+    t |> run("strict bare OpenAI call object is accepted") @(t : T?) {
+        var calls : array<OaiToolCall>
+        let pre = parse_tool_calls_auto("\{\"function\":\{\"name\":\"get_message_context\",\"arguments\":\{\"message_id\":7}}}",
+                                        "", "", "b", calls)
+        t |> equal(pre, "")
+        t |> equal(length(calls), 1)
+        delete calls
+    }
+    t |> run("ordinary JSON remains assistant content") @(t : T?) {
+        var calls : array<OaiToolCall>
+        let full = "\{\"answer\":42}"
+        t |> equal(parse_tool_calls_auto(full, "", "", "n", calls), full)
+        t |> equal(length(calls), 0)
         delete calls
     }
 }
