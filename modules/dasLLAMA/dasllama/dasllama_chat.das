@@ -117,6 +117,8 @@ def private detect_chat_template(m : Model; var out : ChatTemplate) : bool {
         out <- mistral_v7_tekken_template()       // [SYSTEM_PROMPT] system role, unspaced [INST]
     } elif (contains(src, "[INST]")) {            // Mistral instruct
         out <- mistral_instruct_template()
+    } elif (contains(src, "[gMASK]<sop>")) {      // GLM-4.5 family (spells <|user|> too — before Zephyr)
+        out <- arch_chat("glm4moe")
     } elif (contains(src, "<|user|>")) {          // Zephyr / TinyLlama-chat
         out <- zephyr_chat_template()
     } else {
@@ -242,6 +244,9 @@ def private render_prompt(m : Model; c : ChatSession; var out : array<int64>) {
     if (c.first && c.tmpl.add_bos) {
         out |> push(bos_id(m))
     }
+    if (c.first && !empty(c.tmpl.prelude.parts)) {   // conversation-start prelude (glm4moe: [gMASK]<sop>)
+        render_parts(m, c.tmpl.prelude.parts, "", out)
+    }
     var user_content = c.pending
     if (c.first) {
         let sys = system_content(c)
@@ -281,6 +286,9 @@ def private render_prompt(m : Model; c : ChatSession; var out : array<int64>) {
 def private render_prompt_audio(m : Model; c : ChatSession; var head : array<int64>; var tail : array<int64>) {
     if (c.first && c.tmpl.add_bos) {
         head |> push(bos_id(m))
+    }
+    if (c.first && !empty(c.tmpl.prelude.parts)) {   // conversation-start prelude (glm4moe: [gMASK]<sop>)
+        render_parts(m, c.tmpl.prelude.parts, "", head)
     }
     var user_content = c.pending
     if (c.first) {

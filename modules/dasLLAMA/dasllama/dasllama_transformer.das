@@ -18,5 +18,6 @@ require dasllama/dasllama_arch_qwen3moe  // nolint:STYLE030 — side-effect requ
 require dasllama/dasllama_arch_qwen35  // nolint:STYLE030 — side-effect require: fires the arch's [init] registration
 require dasllama/dasllama_arch_gptoss  // nolint:STYLE030 — side-effect require: fires the arch's [init] registration
 require dasllama/dasllama_arch_mistral3  // nolint:STYLE030 — side-effect require: fires the arch's [init] registration
+require dasllama/dasllama_arch_glm4moe  // nolint:STYLE030 — side-effect require: fires the arch's [init] registration
 require ?das_metal dasllama/dasllama_metal_prefill  // nolint:STYLE030 — [init]-only: registers prefill override "metal" (the dasMetal GPU-resident path). STRICT guard: Apple builds only; it lives here (not dasllama_common) because it requires the engine back — the umbrella breaks the cycle
 require ?das_metal dasllama/dasllama_metal_decode  // nolint:STYLE030 — [init]-only: registers decode override "metal" (same contract as the prefill line above)

@@ -165,6 +165,10 @@ struct Config {
     moe_gate : MoeGate = MoeGate.softmax  // router probability function
     norm_topk_prob : bool = false      // renormalize the selected top-k weights to sum 1 ({arch}.expert_weights_norm)
     expert_weights_scale : float = 0.0 // scale on the routed weights; 0/1 = off (DeepSeek {arch}.expert_weights_scale)
+    // glm4moe (DeepSeek-V3 lineage): dense lead + selection bias + ungated shared expert
+    n_layer_dense_lead : int64 = 0     // leading DENSE FFN layers before MoE starts ({arch}.leading_dense_block_count; glm4moe-Air: 1)
+    moe_exp_probs : bool = false       // exp_probs_b per-expert SELECTION bias — biased top-k pick, unbiased mixing (loader-detected)
+    moe_shexp_gated : bool = true      // shared expert scaled by σ(gate_vec·x) (qwen2moe); glm4moe's shexp is UNGATED (loader-detected)
     // gemma4 MoE (a dense/routed hybrid): the arch is MoE only when the file ships experts (12B/31B
     // are dense, 26B-A4B is MoE) and its shape differs from qwen2moe — a parallel DENSE shared expert,
     // fused gate_up expert stacks, three extra sandwich norms, and a custom-normalized router. Both
@@ -502,6 +506,8 @@ struct Model {
     // gpt-oss MoE biases (fblob, valid per the config.moe_*_bias flags): router logits bias +
     // per-expert gate/down/up biases (expert-major within each layer, like the we* stacks)
     router_b_off : int64    // fblob: layers x n_expert
+    // DeepSeek-V3/glm4moe expert-selection bias (fblob, valid when config.moe_exp_probs; dense-lead slots unused)
+    exp_probs_off : int64   // exp_probs_b.bias: layers x n_expert
     web1_off : int64        // ffn_gate_exps.bias: layers x n_expert x n_ff_exp
     web2_off : int64        // ffn_down_exps.bias: layers x n_expert x dim
     web3_off : int64        // ffn_up_exps.bias:   layers x n_expert x n_ff_exp
@@ -590,6 +596,7 @@ struct ChatTurn {
 //! ultravox shape); they render only when a turn actually carries audio.
 struct ChatTemplate {
     add_bos : bool = false                    // prepend the tokenizer BOS at conversation start
+    prelude : ChatTurn = ChatTurn()           // conversation-start parts after BOS (glm4moe: [gMASK]<sop>)
     system : ChatTurn = ChatTurn()
     user : ChatTurn = ChatTurn()
     assistant_open : ChatTurn = ChatTurn()
@@ -680,13 +687,14 @@ def cls_kq(t : Model) : bool => t.kquant_native && t.config.shared_weights && t.
 // Fill the dense FFN offset tables (w1/w2/w3), each a contiguous per-layer region, advancing the
 // cursor each weight's format selects. Per-layer FFN width (gemma-4 E2B) reads t.ffn_w; empty =
 // uniform `hidden`. Keeping w1/w2/w3 as separate contiguous regions preserves the llama2.c block copy.
-def private fill_dense_ffn_offsets(var t : Model; var cur : KqCursors; layers, dim, hidden : int64) {
+// dense_below >= 0 limits the dense slots to layers below it (glm4moe leading dense; routed layers get -1)
+def private fill_dense_ffn_offsets(var t : Model; var cur : KqCursors; layers, dim, hidden : int64; dense_below : int64 = -1l) {
     t.w1_offs |> clear(); t.w1_offs |> reserve(layers)
-    for (l in range64(layers)) { t.w1_offs |> push(kq_take(cur, fmt_at(t.w1_fmt, l), dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]))) }
+    for (l in range64(layers)) { t.w1_offs |> push(dense_below >= 0l && l >= dense_below ? -1l : kq_take(cur, fmt_at(t.w1_fmt, l), dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]))) }
     t.w2_offs |> clear(); t.w2_offs |> reserve(layers)
-    for (l in range64(layers)) { t.w2_offs |> push(kq_take(cur, fmt_at(t.w2_fmt, l), (empty(t.ffn_w) ? hidden : t.ffn_w[l]) * dim)) }
+    for (l in range64(layers)) { t.w2_offs |> push(dense_below >= 0l && l >= dense_below ? -1l : kq_take(cur, fmt_at(t.w2_fmt, l), (empty(t.ffn_w) ? hidden : t.ffn_w[l]) * dim)) }
     t.w3_offs |> clear(); t.w3_offs |> reserve(layers)
-    for (l in range64(layers)) { t.w3_offs |> push(kq_take(cur, fmt_at(t.w3_fmt, l), dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]))) }
+    for (l in range64(layers)) { t.w3_offs |> push(dense_below >= 0l && l >= dense_below ? -1l : kq_take(cur, fmt_at(t.w3_fmt, l), dim * (empty(t.ffn_w) ? hidden : t.ffn_w[l]))) }
 }
 
 // Fill both offset tables from the config; return the element counts of each region. The big-weight
@@ -764,12 +772,16 @@ def private layout_offsets(var t : Model) : LayoutSizes {
     if (c.n_expert > 0l) {  // MoE: per-layer router matrices + shared-expert gate vectors, fp32
         t.router_off = fo
         fo += layers * c.n_expert * dim
-        if (c.n_ff_shexp > 0l) {
+        if (c.n_ff_shexp > 0l && c.moe_shexp_gated) {
             t.shexp_gate_off = fo
             fo += layers * dim
         }
         if (c.moe_router_bias) {  // gpt-oss: router logits bias
             t.router_b_off = fo
+            fo += layers * c.n_expert
+        }
+        if (c.moe_exp_probs) {  // DeepSeek-V3/glm4moe: per-expert selection bias
+            t.exp_probs_off = fo
             fo += layers * c.n_expert
         }
         if (c.moe_exps_bias) {  // gpt-oss: per-expert gate/down/up biases (expert-major per layer)
@@ -896,9 +908,10 @@ def private layout_offsets(var t : Model) : LayoutSizes {
             for (_l in range64(layers)) { t.we2_offs |> push(mx); mx += c.n_expert * ege }
             for (_l in range64(layers)) { t.we3_offs |> push(mx); mx += c.n_expert * ege }
         } else {
-            for (l in range64(layers)) { t.we1_offs |> push(kq_take(cur, fmt_at(t.we1_fmt, l), c.n_expert * ege)) }
-            for (l in range64(layers)) { t.we2_offs |> push(kq_take(cur, fmt_at(t.we2_fmt, l), c.n_expert * ege)) }
-            for (l in range64(layers)) { t.we3_offs |> push(kq_take(cur, fmt_at(t.we3_fmt, l), c.n_expert * ege)) }
+            // dense-lead layers (glm4moe) carry no expert stacks: -1, no plane space
+            for (l in range64(layers)) { t.we1_offs |> push(l < c.n_layer_dense_lead ? -1l : kq_take(cur, fmt_at(t.we1_fmt, l), c.n_expert * ege)) }
+            for (l in range64(layers)) { t.we2_offs |> push(l < c.n_layer_dense_lead ? -1l : kq_take(cur, fmt_at(t.we2_fmt, l), c.n_expert * ege)) }
+            for (l in range64(layers)) { t.we3_offs |> push(l < c.n_layer_dense_lead ? -1l : kq_take(cur, fmt_at(t.we3_fmt, l), c.n_expert * ege)) }
         }
         if (c.n_ff_shexp > 0l) {
             let she = dim * c.n_ff_shexp
@@ -911,6 +924,8 @@ def private layout_offsets(var t : Model) : LayoutSizes {
         }
         if (c.moe_dense_shexp) {  // gemma4: the DENSE parallel shared expert (plain ffn gate/up/down)
             fill_dense_ffn_offsets(t, cur, layers, dim, hidden)
+        } elif (c.n_layer_dense_lead > 0l) {  // glm4moe: plain dense FFN on the leading layer(s) only
+            fill_dense_ffn_offsets(t, cur, layers, dim, hidden, c.n_layer_dense_lead)
         }
     } else {
         fill_dense_ffn_offsets(t, cur, layers, dim, hidden)
@@ -1494,7 +1509,7 @@ def private repack_q8_weights(var t : Model) {
             push_repack(regs, 0, t.ple_gate_off + l * dim * ple, dim, ple)
             push_repack(regs, 0, t.ple_proj_off + l * ple * dim, ple, dim)
         }
-        if (c.n_expert > 0l) {   // MoE: each expert slice is its own 2D tensor, repacked per its shape
+        if (c.n_expert > 0l && l >= c.n_layer_dense_lead) {   // MoE: each expert slice is its own 2D tensor, repacked per its shape
             let ege = dim * c.n_ff_exp
             if (!t.experts_mx4) {   // native-MXFP4 stacks live in mxq/mxs, row-major (no Q8 repack)
                 for (e in range64(c.n_expert)) {
@@ -1527,6 +1542,8 @@ def private repack_q8_weights(var t : Model) {
                 }
             }
         } else {
+            // dense arch layer OR a glm4moe dense-lead layer (a plain FFN, no expert stacks);
+            // pure-MoE arches never reach here (n_layer_dense_lead 0 keeps every layer routed)
             let h = layer_hidden(t, l)
             if (fmt_at(t.w1_fmt, l) == KqFmt.q8) {
                 push_repack(regs, 0, t.w1_offs[l], dim, h)
@@ -1587,7 +1604,7 @@ def private repack_kq_weights(var t : Model) {
         if (t.wo_offs[l] >= 0l) {
             push_repack_kq(regs, fmt_at(t.wo_fmt, l), t.wo_offs[l], qd, dim)
         }
-        if (c.n_expert > 0l) {
+        if (c.n_expert > 0l && l >= c.n_layer_dense_lead) {
             if (!t.experts_mx4) {   // each expert slice grp-repacks independently, like the Q8 loop
                 let ege = dim * c.n_ff_exp
                 for (e in range64(c.n_expert)) {
@@ -1602,6 +1619,7 @@ def private repack_kq_weights(var t : Model) {
                 push_repack_kq(regs, fmt_at(t.w3_fmt, l), t.w3_offs[l], dim, c.hidden_dim)
             }
         } else {
+            // dense arch layer OR a glm4moe dense-lead layer; pure-MoE arches never reach here
             let h = layer_hidden(t, l)
             push_repack_kq(regs, fmt_at(t.w1_fmt, l), t.w1_offs[l], dim, h)
             push_repack_kq(regs, fmt_at(t.w2_fmt, l), t.w2_offs[l], h, dim)
@@ -1818,21 +1836,32 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             if (dn_conv_dim(t.config) % 4l != 0l) {   // the batched conv reads float4 rows (validate-at-load, kv_validate_q8 precedent)
                 panic("dasLLAMA: deltanet conv_dim {dn_conv_dim(t.config)} must be a multiple of 4")
             }
-            // MTP/NextN consistency: the metadata and the tensor directory must agree, and an
-            // MTP-only sidecar (trunk stripped, llama.cpp mtp_only) is not loadable standalone
-            if (t.config.n_layer_nextn > 0l) {
-                if (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") < 0) {
-                    panic("dasLLAMA: nextn_predict_layers = {t.config.n_layer_nextn} but blk.{layers}.nextn.eh_proj.weight is missing")
-                }
-                if (gguf_find_tensor(m, "blk.0.attn_norm.weight") < 0) {
-                    panic("dasLLAMA: MTP-only sidecar GGUF (no trunk tensors) is not supported — use the full -MTP file")
-                }
-            } elif (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") >= 0
-                    || gguf_find_tensor(m, "blk.{layers - 1l}.nextn.eh_proj.weight") >= 0) {
-                // the second probe catches a malformed file whose block_count already counts the
-                // draft block — its nextn tensors sit one below the first probe's index
-                panic("dasLLAMA: file ships NextN tensors but no nextn_predict_layers key — refusing to guess")
+        }
+        // MTP/NextN consistency (arch-agnostic — qwen35 hybrids AND glm4moe carry draft blocks):
+        // the metadata and the tensor directory must agree, and an MTP-only sidecar (trunk
+        // stripped, llama.cpp mtp_only) is not loadable standalone
+        if (t.config.n_layer_nextn > 0l) {
+            if (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") < 0) {
+                panic("dasLLAMA: nextn_predict_layers = {t.config.n_layer_nextn} but blk.{layers}.nextn.eh_proj.weight is missing")
             }
+            if (gguf_find_tensor(m, "blk.0.attn_norm.weight") < 0) {
+                panic("dasLLAMA: MTP-only sidecar GGUF (no trunk tensors) is not supported — use the full -MTP file")
+            }
+            // glm4moe ships the draft head with its OWN embed_tokens/shared_head_head; the das
+            // MTP head drafts through the TRUNK's embedding/classifier (the qwen35 tied shape),
+            // so drafting here would use the wrong weights. Draft-only concern (spec-decode
+            // verifies against the trunk), but skip the head honestly until acceptance with
+            // trunk-head drafting is measured. llama.cpp never runs the NextN layer either.
+            if (gguf_find_tensor(m, "blk.{layers}.nextn.embed_tokens.weight") >= 0
+                    || gguf_find_tensor(m, "blk.{layers}.nextn.shared_head_head.weight") >= 0) {
+                to_log(LOG_WARNING, "dasLLAMA: NextN block carries its own embed_tokens/shared_head_head — MTP draft head disabled\n")
+                t.config.n_layer_nextn = 0l
+            }
+        } elif (gguf_find_tensor(m, "blk.{layers}.nextn.eh_proj.weight") >= 0
+                || gguf_find_tensor(m, "blk.{layers - 1l}.nextn.eh_proj.weight") >= 0) {
+            // the second probe catches a malformed file whose block_count already counts the
+            // draft block — its nextn tensors sit one below the first probe's index
+            panic("dasLLAMA: file ships NextN tensors but no nextn_predict_layers key — refusing to guess")
         }
         // KV-head count: scalar (uniform), or gemma4's per-layer array — which must collapse to the
         // TWO layer classes (one value on sliding layers, one on global) the engine models
@@ -1885,6 +1914,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 if (t.config.rope_dim <= 0l || t.config.rope_dim % 2l != 0l || t.config.rope_dim > t.config.head_size) {
                     panic("dasLLAMA: bad partial rotary width {t.config.rope_dim} (head_size {t.config.head_size})")
                 }
+                if (!t.config.rope_neox) {   // only the NEOX _part leaves exist (qwen35/glm4moe are NEOX)
+                    panic("dasLLAMA: partial rotary is only supported with NEOX rope")
+                }
             } else {
                 panic("dasLLAMA: partial rotary (rope.dimension_count != head_size) is not supported")
             }
@@ -1931,14 +1963,27 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             if (t.config.n_ff_exp <= 0l) {   // pure-MoE files may omit feed_forward_length (hidden 0) — then the expert key is mandatory
                 panic("dasLLAMA: expert_feed_forward_length missing (and no dense feed_forward_length to derive it)")
             }
-            // shared expert: present iff its tensors are (qwen2moe always ships one)
-            if (gguf_find_tensor(m, "blk.0.ffn_up_shexp.weight") >= 0) {
+            // glm4moe: the first k layers are plain dense FFN — every MoE tensor probe below keys
+            // off the FIRST ROUTED layer, not blk.0 (blk.0 is dense there and would misdetect)
+            if (gguf_has(m, "{arch}.leading_dense_block_count")) {
+                t.config.n_layer_dense_lead = gguf_int(m, bytes, "{arch}.leading_dense_block_count")
+                if (t.config.n_layer_dense_lead < 0l || t.config.n_layer_dense_lead >= layers) {
+                    panic("dasLLAMA: leading_dense_block_count = {t.config.n_layer_dense_lead} leaves no routed layers ({layers} trunk layers)")
+                }
+            }
+            let lead = t.config.n_layer_dense_lead
+            // shared expert: present iff its tensors are (qwen2moe always ships one; glm4moe's is
+            // UNGATED — no ffn_gate_inp_shexp — and its width is n_ff_exp x expert_shared_count)
+            if (gguf_find_tensor(m, "blk.{lead}.ffn_up_shexp.weight") >= 0) {
                 t.config.n_ff_shexp = (gguf_has(m, "{arch}.expert_shared_feed_forward_length")
                     ? gguf_int(m, bytes, "{arch}.expert_shared_feed_forward_length")
-                    : hidden)
+                    : (gguf_has(m, "{arch}.expert_shared_count")
+                        ? t.config.n_ff_exp * gguf_int(m, bytes, "{arch}.expert_shared_count")
+                        : hidden))
                 if (t.config.n_ff_shexp <= 0l) {
                     panic("dasLLAMA: expert_shared_feed_forward_length missing (and no dense feed_forward_length to derive it)")
                 }
+                t.config.moe_shexp_gated = gguf_find_tensor(m, "blk.{lead}.ffn_gate_inp_shexp.weight") >= 0
             }
             if (gguf_has(m, "{arch}.expert_weights_norm")) {
                 t.config.norm_topk_prob = gguf_int(m, bytes, "{arch}.expert_weights_norm") != 0l
@@ -1963,23 +2008,28 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             if (gguf_has(m, "{arch}.expert_group_count") && gguf_int(m, bytes, "{arch}.expert_group_count") > 1l) {
                 panic("dasLLAMA: grouped expert routing (expert_group_count > 1) is not yet supported")
             }
-            // expert-selection bias the core doesn't apply — refuse instead of silently dropping it
-            if (gguf_find_tensor(m, "blk.0.exp_probs_b.bias") >= 0) {
-                panic("dasLLAMA: expert selection bias (exp_probs_b, DeepSeek-V3) is not yet supported")
-            }
+            // DeepSeek-V3/glm4moe expert-selection bias: added to the (sigmoid) probs for the top-k
+            // PICK only; the mixing weights stay unbiased (llama.cpp build_moe_ffn)
+            t.config.moe_exp_probs = gguf_find_tensor(m, "blk.{lead}.exp_probs_b.bias") >= 0
             // router / per-expert biases (gpt-oss) — detected from the tensor table; the gate/up
             // pair always ships together, so probing ffn_up_exps.bias covers all three stacks
-            t.config.moe_router_bias = gguf_find_tensor(m, "blk.0.ffn_gate_inp.bias") >= 0
-            t.config.moe_exps_bias = gguf_find_tensor(m, "blk.0.ffn_up_exps.bias") >= 0
+            t.config.moe_router_bias = gguf_find_tensor(m, "blk.{lead}.ffn_gate_inp.bias") >= 0
+            t.config.moe_exps_bias = gguf_find_tensor(m, "blk.{lead}.ffn_up_exps.bias") >= 0
             // gemma4 family: a DENSE parallel shared expert (plain ffn_gate/up/down alongside the routed
             // experts) plus the fused gate_up stacks + sandwich norms + custom router that ride with it
-            t.config.moe_dense_shexp = gguf_find_tensor(m, "blk.0.ffn_gate.weight") >= 0
+            // (probed at the first ROUTED layer — a glm4moe dense-lead blk.0.ffn_gate must not trip it)
+            t.config.moe_dense_shexp = gguf_find_tensor(m, "blk.{lead}.ffn_gate.weight") >= 0
         } elif (gguf_has(m, "{arch}.expert_count") && gguf_int(m, bytes, "{arch}.expert_count") > 0l) {
             panic("dasLLAMA: MoE expert blocks are not supported for arch '{arch}'")
         }
         // attention output-projection bias + per-head sink logits (gpt-oss) — tensor-detected
         t.config.attn_out_bias = gguf_find_tensor(m, "blk.0.attn_output.bias") >= 0
         t.config.attn_sinks = gguf_find_tensor(m, "blk.0.attn_sinks.weight") >= 0
+        // QK-norm ships per-FILE within some families (GLM-4.5 355B carries attn_q_norm, Air
+        // doesn't) — an arch that didn't opt in would silently skip the norms, so refuse instead
+        if (!t.config.qk_norm && gguf_find_tensor(m, "blk.0.attn_q_norm.weight") >= 0) {
+            panic("dasLLAMA: file ships attn_q_norm but arch '{arch}' does not configure qk_norm — refusing to mis-run")
+        }
         // llama4-style per-position attention temperature tuning (mistral3 carries the key, shipped
         // as 0 = disabled) — no Q-scaling path here, fail closed rather than silently mis-attend
         let tskey = "{arch}.attention.temperature_scale"
@@ -2015,6 +2065,11 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             let nff = t.config.head_size / 2l
             t.rope_freqs |> resize(nff)
             gguf_read_tensor_f32(m, bytes, rf_name, t.rope_freqs, 0l, nff)
+            // the _part leaves take a factor pointer, but no partial-rope model ships factors —
+            // the untested combination stays fail-closed (std paths pass has_ff=false when partial)
+            if (t.config.rope_dim > 0l && t.config.rope_dim != t.config.head_size) {
+                panic("dasLLAMA: partial rotary combined with per-pair rope factors is not supported")
+            }
         }
         // Phi3 LongRoPE magnitude factor (attn_factor) scales the rope output; absent (=1.0) elsewhere
         let mskey = "{arch}.rope.scaling.attn_factor"
@@ -2027,6 +2082,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
         if (gguf_has(m, "{arch}.rope.scaling.type") && gguf_str(m, bytes, "{arch}.rope.scaling.type") == "yarn") {
             if (!empty(t.rope_freqs)) {
                 panic("dasLLAMA: YaRN combined with per-pair rope factors is not supported")
+            }
+            if (t.config.rope_dim > 0l && t.config.rope_dim != t.config.head_size) {
+                panic("dasLLAMA: partial rotary combined with YaRN is not supported")
             }
             // yarn_log_multiplier replaces the 0.1 in the mscale correction (DeepSeek-2 lineage);
             // mistral3 files carry it as 0, where llama.cpp's cancel-and-reapply dance nets out to
@@ -2300,7 +2358,7 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
             if (t.wo_offs[l] >= 0l) {   // absent on deltanet layers (ssm_out is their out projection)
                 load_big(m, bytes, "blk.{l}.attn_output.weight", t, t.wo_offs[l], qd_l * dim, scratch, 0l, fmt_at(t.wo_fmt, l))
             }
-            if (t.config.n_expert > 0l) {
+            if (t.config.n_expert > 0l && l >= t.config.n_layer_dense_lead) {
                 // MoE: fp32 router (+ shared-expert gate vector) -> fblob; the 3D expert stacks are
                 // expert-major on disk, so ONE contiguous load lands every expert's 2D matrix at its
                 // we*_off + (l*n_expert + e) * (dim*n_ff_exp) slot
@@ -2309,6 +2367,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 gguf_read_tensor_f32(m, bytes, "blk.{l}.ffn_gate_inp.weight", t.fblob, t.router_off + l * ne * dim, ne * dim)
                 if (t.config.moe_router_bias) {
                     gguf_read_tensor_f32(m, bytes, "blk.{l}.ffn_gate_inp.bias", t.fblob, t.router_b_off + l * ne, ne)
+                }
+                if (t.config.moe_exp_probs) {   // DeepSeek/glm4moe selection bias (f32, one per expert)
+                    gguf_read_tensor_f32(m, bytes, "blk.{l}.exp_probs_b.bias", t.fblob, t.exp_probs_off + l * ne, ne)
                 }
                 if (t.experts_mx4) {
                     // native MXFP4: raw nibble + scale bits straight into the planes (no dequant)
@@ -2344,7 +2405,9 @@ def private load_gguf_parsed(var t : Model; m : GGUFMeta; bytes : array<uint8> |
                 }
                 if (t.config.n_ff_shexp > 0l) {
                     let she = dim * t.config.n_ff_shexp
-                    gguf_read_tensor_f32(m, bytes, "blk.{l}.ffn_gate_inp_shexp.weight", t.fblob, t.shexp_gate_off + l * dim, dim)
+                    if (t.config.moe_shexp_gated) {   // glm4moe's shared expert is ungated — no gate vector on disk
+                        gguf_read_tensor_f32(m, bytes, "blk.{l}.ffn_gate_inp_shexp.weight", t.fblob, t.shexp_gate_off + l * dim, dim)
+                    }
                     load_big(m, bytes, "blk.{l}.ffn_gate_shexp.weight", t, t.wsh1_off + l * she, she, scratch)
                     load_big(m, bytes, "blk.{l}.ffn_down_shexp.weight", t, t.wsh2_off + l * she, she, scratch)
                     load_big(m, bytes, "blk.{l}.ffn_up_shexp.weight", t, t.wsh3_off + l * she, she, scratch)
@@ -3145,11 +3208,13 @@ def private rms_batch(var out : array<float>; src : array<float>; t : Model; wof
 //   param readonly and eliminate the leaf's reinterpret-back write — the rope silently no-ops. A
 //   call-site reinterpret launders it, but that can't be lint-suppressed inside maybe_parallel_for, so
 //   calling the leaf directly is the clean fix.
-def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model; theta, fscale : float; start_pos, npos, head_size, qd, kv_dim : int64; use_ff : bool = true) {
+def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model; theta, fscale : float; start_pos, npos, head_size, qd, kv_dim : int64; use_ff : bool = true; rot : int64 = 0l) {
     let c = t.config
     let neox = c.rope_neox
     let mscale = c.rope_mscale
     let has_ff = use_ff && !empty(t.rope_freqs)
+    // partial rotary (glm4moe: 64 of 128) — the loader guarantees partial => NEOX, no rope_freqs
+    let part = rot > 0l && rot != head_size
     unsafe {
         var qp = addr(q_b[0])
         var kp = addr(k_b[0])
@@ -3160,7 +3225,10 @@ def private rope_batch(var q_b : array<float>; var k_b : array<float>; t : Model
                 for (p in range(rb, re)) {
                     let pp = int64(p)
                     let ap = start_pos + pp
-                    if (neox) {
+                    if (part) {
+                        rope_scaled_neox_part(qp + pp * qd, ap, head_size, rot, qd, theta, fscale, has_ff, ffp, mscale)
+                        rope_scaled_neox_part(kp + pp * kv_dim, ap, head_size, rot, kv_dim, theta, fscale, has_ff, ffp, mscale)
+                    } elif (neox) {
                         rope_scaled_neox(qp + pp * qd, ap, head_size, qd, theta, fscale, has_ff, ffp, mscale)
                         rope_scaled_neox(kp + pp * kv_dim, ap, head_size, kv_dim, theta, fscale, has_ff, ffp, mscale)
                     } else {
@@ -3240,8 +3308,11 @@ def private build_rope_table_rows(var cos_tab : array<float>; var sin_tab : arra
 // and like it calls the LEAF rope_scaled_*_tab DIRECTLY (not a dispatch wrapper) to avoid the JIT
 // pass-through-const-write-elision bug. crow/srow point at position p's table row (half entries).
 def private rope_batch_tab(var q_b : array<float>; var k_b : array<float>; cos_tab : array<float>; sin_tab : array<float>;
-                           neox : bool; npos, head_size, qd, kv_dim : int64) {
-    let half = head_size / 2l
+                           neox : bool; npos, head_size, qd, kv_dim : int64; rot : int64 = 0l) {
+    // partial rotary (glm4moe: 64 of 128): the table spans rot/2 pairs — a full-head walk would
+    // read past each row AND rotate dims that must stay put. Loader guarantees partial => NEOX.
+    let part = rot > 0l && rot != head_size
+    let half = part ? rot / 2l : head_size / 2l
     unsafe {
         var qp = addr(q_b[0])
         var kp = addr(k_b[0])
@@ -3254,7 +3325,10 @@ def private rope_batch_tab(var q_b : array<float>; var k_b : array<float>; cos_t
                     let pp = int64(p)
                     let crow = cp + pp * half
                     let srow = sp + pp * half
-                    if (neox) {
+                    if (part) {
+                        rope_scaled_neox_tab_part(qp + pp * qd, head_size, rot, qd, crow, srow)
+                        rope_scaled_neox_tab_part(kp + pp * kv_dim, head_size, rot, kv_dim, crow, srow)
+                    } elif (neox) {
                         rope_scaled_neox_tab(qp + pp * qd, head_size, qd, crow, srow)
                         rope_scaled_neox_tab(kp + pp * kv_dim, head_size, kv_dim, crow, srow)
                     } else {
@@ -4620,6 +4694,9 @@ def private fused_attn_ok(t : Model; l : int64) : bool {
     // needs whole 32-quant groups per head (real targets are 64/128/256; stories15M's 48 falls back)
     return (g_fused_decode && t.quant == QuantMode.q8 && g_use_rope_table
         && t.wv_offs[l] >= 0l && head_size % 32l == 0l
+        // partial rotary (glm4moe): the chain's per-head-slot rope walks the full head — fall
+        // back to attention_std_decode, which has the rot-aware leaves
+        && (c.rope_dim == 0l || c.rope_dim == head_size)
         && kq_servable(t, fq) && kq_servable(t, fk) && kq_servable(t, fv) && kq_servable(t, fo)
         // kq v2 regrain: Q8_K quantizes whole 256-superblocks — the layer-input quantize needs
         // dim % 256, and a kq wo requants the attention output per HEAD GROUP of 256/head_size
@@ -5387,12 +5464,17 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
     // this position's cos/sin row was built ONCE in forward() (bit-identical values) — the leaves
     // are called DIRECTLY, same as rope_batch_tab, to dodge the pass-through-const-write-elision.
     let ts_rope = ref_time_ticks()
+    // partial rotary (glm4moe: 64 of 128) — table rows span rot/2 pairs; loader guarantees NEOX
+    let rot = c.rope_dim > 0l ? c.rope_dim : head_size
     if (g_use_rope_table) {
         let swa_row = is_sliding && has_dual_rope(c)
         unsafe {
             let crow = swa_row ? addr<float const?>(s.rope_cos_swa[0]) : addr<float const?>(s.rope_cos[0])
             let srow = swa_row ? addr<float const?>(s.rope_sin_swa[0]) : addr<float const?>(s.rope_sin[0])
-            if (c.rope_neox) {
+            if (rot != head_size) {
+                rope_scaled_neox_tab_part(addr(s.q[0]), head_size, rot, qd, crow, srow)
+                if (!kv_shared) { rope_scaled_neox_tab_part(addr(s.k[0]), head_size, rot, kv_dim, crow, srow) }
+            } elif (c.rope_neox) {
                 rope_scaled_neox_tab(addr(s.q[0]), head_size, qd, crow, srow)
                 if (!kv_shared) { rope_scaled_neox_tab(addr(s.k[0]), head_size, kv_dim, crow, srow) }
             } else {
@@ -5404,9 +5486,18 @@ def private attention_std_decode(t : Model; var s : Session; l : int64; pos : in
         let theta = is_sliding ? c.rope_freq_base_swa : c.rope_freq_base
         let fscale = is_sliding ? c.rope_freq_scale_swa : c.rope_freq_scale
         let use_ff = !(c.rope_ff_global_only && is_sliding)
-        rope_apply(s.q, pos, head_size, qd, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
-        if (!kv_shared) {
-            rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+        if (rot != head_size) {
+            unsafe {
+                rope_scaled_neox_part(addr(s.q[0]), pos, head_size, rot, qd, theta, fscale, false, null, c.rope_mscale)
+                if (!kv_shared) {
+                    rope_scaled_neox_part(addr(s.k[0]), pos, head_size, rot, kv_dim, theta, fscale, false, null, c.rope_mscale)
+                }
+            }
+        } else {
+            rope_apply(s.q, pos, head_size, qd, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+            if (!kv_shared) {
+                rope_apply(s.k, pos, head_size, kv_dim, theta, fscale, t.rope_freqs, c.rope_neox, c.rope_mscale, use_ff)
+            }
         }
     }
     prof_add("rope", ts_rope)
@@ -5960,17 +6051,19 @@ def private ffn_dense_decode(t : Model; var s : Session; l : int64) {
 // Gate transform + top-k selection + weight post-processing on one router-logit row, IN PLACE (the
 // top-k knockout consumes the row). The selected ids/weights land at idx[off..]/w[off..] — off is 0
 // for decode, p*k for the grouped prefill router. One body for both, so routing is bit-identical.
-def private moe_select(c : Config; var lg : float?; var idx : array<int64>; var w : array<float>; off : int64) {
+def private moe_select(c : Config; var lg : float?; var idx : array<int64>; var w : array<float>; off : int64; bias : float const? = null) {
     unsafe {
         moe_select_core(c.moe_gate, c.n_expert, c.n_expert_used, c.norm_topk_prob, c.expert_weights_scale,
-            lg, addr(idx[0]), addr(w[0]), off)
+            lg, addr(idx[0]), addr(w[0]), off, bias)
     }
 }
 
 // pointer core — the threaded prefill router runs this in fork workers (scalars + raw pointers
-// only; Config/Session stay on the caller)
+// only; Config/Session stay on the caller). `bias` (exp_probs_b, DeepSeek-V3/glm4moe) skews the
+// top-k PICK only — the stored weights stay the unbiased probs (llama.cpp build_moe_ffn order).
 def private moe_select_core(gate : MoeGate; ne, k : int64; norm_topk : bool; wscale : float;
-                            var lg : float?; var idx : int64?; var w : float?; off : int64) {
+                            var lg : float?; var idx : int64?; var w : float?; off : int64;
+                            bias : float const? = null) {
     unsafe {   // the whole body indexes the logit-row pointer (in-place gate + top-k knockout)
     // probs — softmax_weight routes on the RAW biased logits and softmaxes only the selected
     // top-k afterwards (gpt-oss)
@@ -6018,17 +6111,39 @@ def private moe_select_core(gate : MoeGate; ne, k : int64; norm_topk : bool; wsc
     }
     // top-k by selection score — the winner is knocked out with -FLT_MAX (softmax_weight selects on
     // raw logits, which can be arbitrarily negative); first-index-wins on ties matches argsort's
-    // stable descending order
-    for (j in range64(k)) {
-        var best = 0l
-        for (i in range64(ne)) {
-            if (lg[i] > lg[best]) {
-                best = i
+    // stable descending order. With a selection bias the pick compares lg[i]+bias[i] but stores the
+    // UNBIASED lg[best]; knocked-out entries are skipped explicitly, so winners stay dead even
+    // against a corrupt/inf file bias (a real exp_probs_b is O(1) and -FLT_MAX absorbs it anyway).
+    if (bias == null) {
+        for (j in range64(k)) {
+            var best = 0l
+            for (i in range64(ne)) {
+                if (lg[i] > lg[best]) {
+                    best = i
+                }
             }
+            idx[off + j] = best
+            w[off + j] = lg[best]
+            lg[best] = -FLT_MAX
         }
-        idx[off + j] = best
-        w[off + j] = lg[best]
-        lg[best] = -FLT_MAX
+    } else {
+        for (j in range64(k)) {
+            var best = 0l
+            var bs = -FLT_MAX
+            for (i in range64(ne)) {
+                if (lg[i] == -FLT_MAX) {   // knocked out — a huge/inf file bias must not resurrect it
+                    continue
+                }
+                let sc = lg[i] + bias[i]
+                if (sc > bs) {
+                    best = i
+                    bs = sc
+                }
+            }
+            idx[off + j] = best
+            w[off + j] = lg[best]
+            lg[best] = -FLT_MAX
+        }
     }
     if (gate == MoeGate.softmax_weight) {  // gpt-oss: softmax over just the selected k logits
         softmax(w + off, k)
@@ -6223,15 +6338,19 @@ def private moe_ffn_core(t : Model; var s : Session; l : int64) {
     if (c.moe_router_bias) {
         add_bias(s.moe_logits, 0l, t.fblob, t.router_b_off + l * ne, ne)
     }
-    moe_select(c, unsafe(addr(s.moe_logits[0])), s.moe_idx, s.moe_w, 0l)
+    var ebp : float const?
+    if (c.moe_exp_probs) {
+        ebp = unsafe(addr<float const?>(t.fblob[t.exp_probs_off + l * ne]))
+    }
+    moe_select(c, unsafe(addr(s.moe_logits[0])), s.moe_idx, s.moe_w, 0l, ebp)
     prof_add("moe_route", ts_route)
     moe_experts_apply(t, s, l)
-    // shared expert, gated by a sigmoid scalar from its per-layer gate vector
+    // shared expert, gated by a sigmoid scalar from its per-layer gate vector (glm4moe: ungated, g = 1)
     if (c.n_ff_shexp > 0l) {
         let pre_q8 = t.quant == QuantMode.q8
         let ts_sh = ref_time_ticks()
         trace_tag(TRACE_TAG_SHEXP)
-        let g = moe_shexp_gate(t, l, unsafe(addr(s.xb[0])))
+        let g = c.moe_shexp_gated ? moe_shexp_gate(t, l, unsafe(addr(s.xb[0]))) : 1.0
         let nsh = c.n_ff_shexp
         let she = dim * nsh
         if (pre_q8) {
@@ -6490,6 +6609,10 @@ def private ffn_gemma4_prefill(t : Model; var s : Session; l : int64; npos : int
 // optional post-norm / layer-output-scale steps so future MoE arches compose with them.
 def private ffn_moe_decode(t : Model; var s : Session; l : int64) {
     let c = t.config
+    if (l < c.n_layer_dense_lead) {   // glm4moe: the leading layer(s) are plain dense FFN
+        ffn_dense_decode(t, s, l)
+        return
+    }
     let dim = c.dim
     let ts_norm = ref_time_ticks()
     rms_at(s.xb, t, t.rms_ffn_off + l * dim, s.x, dim)
@@ -7896,15 +8019,15 @@ def private attn_qkv_rope_prefix(t : Model; var s : Session; l : int64; npos : i
     let rope_kv = kv_shared ? 0l : kv_dim
     if (use_rope_tab) {
         if (swa_rope) {
-            rope_batch_tab(s.q_b, s.k_b, s.rope_cos_swa, s.rope_sin_swa, c.rope_neox, npos, head_size, qd, rope_kv)
+            rope_batch_tab(s.q_b, s.k_b, s.rope_cos_swa, s.rope_sin_swa, c.rope_neox, npos, head_size, qd, rope_kv, c.rope_dim)
         } else {
-            rope_batch_tab(s.q_b, s.k_b, s.rope_cos, s.rope_sin, c.rope_neox, npos, head_size, qd, rope_kv)
+            rope_batch_tab(s.q_b, s.k_b, s.rope_cos, s.rope_sin, c.rope_neox, npos, head_size, qd, rope_kv, c.rope_dim)
         }
     } else {
         let theta = swa_rope ? c.rope_freq_base_swa : c.rope_freq_base
         let fscale = swa_rope ? c.rope_freq_scale_swa : c.rope_freq_scale
         let use_ff = !(c.rope_ff_global_only && is_sliding)
-        rope_batch(s.q_b, s.k_b, t, theta, fscale, start_pos, npos, head_size, qd, rope_kv, use_ff)
+        rope_batch(s.q_b, s.k_b, t, theta, fscale, start_pos, npos, head_size, qd, rope_kv, use_ff, c.rope_dim)
     }
     prof_add("rope", ts_rope)
 }
@@ -8720,7 +8843,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
     s.moe_hs |> resize(grows * nfx / 32l)
     s.moe_gout |> resize(grows * dim)
     s.moe_eout |> resize(nk * dim)
-    if (nsh > 0l) {
+    if (nsh > 0l && c.moe_shexp_gated) {
         s.moe_gl_b |> resize(npos)
     }
     if (kq_layer) {
@@ -8740,10 +8863,11 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         var rlp = addr(s.moe_rlog[0])
         var idxp = addr(s.moe_idx_b[0])
         var wp = addr(s.moe_w_b[0])
-        var glp = nsh > 0l ? addr(s.moe_gl_b[0]) : null
+        var glp = nsh > 0l && c.moe_shexp_gated ? addr(s.moe_gl_b[0]) : null
         let xbp = addr<float const?>(s.xb_b[0])
         let rbp = c.moe_router_bias ? addr<float const?>(t.fblob[t.router_b_off + l * ne]) : null
-        let gvp = nsh > 0l ? addr<float const?>(t.fblob[t.shexp_gate_off + l * dim]) : null
+        let ebp = c.moe_exp_probs ? addr<float const?>(t.fblob[t.exp_probs_off + l * ne]) : null
+        let gvp = nsh > 0l && c.moe_shexp_gated ? addr<float const?>(t.fblob[t.shexp_gate_off + l * dim]) : null
         let gate = c.moe_gate
         let norm_topk = c.norm_topk_prob
         let wscale = c.expert_weights_scale
@@ -8757,7 +8881,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
                             lgp[i] += rbp[i]
                         }
                     }
-                    moe_select_core(gate, ne, k, norm_topk, wscale, lgp, idxp, wp, p * k)
+                    moe_select_core(gate, ne, k, norm_topk, wscale, lgp, idxp, wp, p * k, ebp)
                     if (glp != null) {
                         glp[p] = 1.0 / (1.0 + exp(-dot(gvp, xbp + p * dim, dim)))
                     }
@@ -9024,7 +9148,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
         let ep = addr<float const?>(s.moe_eout[0])
         let wp = addr<float const?>(s.moe_w_b[0])
         let sp = nsh > 0l ? addr<float const?>(s.moe_gout[0]) : null
-        let gp = nsh > 0l ? addr<float const?>(s.moe_gl_b[0]) : null
+        let gp = nsh > 0l && c.moe_shexp_gated ? addr<float const?>(s.moe_gl_b[0]) : null
         maybe_parallel_for(nk * dim >= g_act_par_threshold, 0, int(npos), get_dispatch_lanes()) $(rb, re) {
             unsafe {
                 for (p in range(rb, re)) {
@@ -9041,7 +9165,7 @@ def private ffn_moe_prefill_grouped(t : Model; var s : Session; l : int64; npos 
                         }
                     }
                     if (sp != null) {
-                        let g = gp[pp]
+                        let g = gp != null ? gp[pp] : 1.0   // ungated shexp (glm4moe) adds at weight 1
                         let sr = sp + pp * dim
                         for (i in range64(dim)) {
                             arow[i] += g * sr[i]
@@ -9274,6 +9398,10 @@ def private gemma4_moe_prefill_grouped(t : Model; var s : Session; l : int64; np
 // the bit-identical A/B switch).
 def private ffn_moe_prefill(t : Model; var s : Session; l : int64; npos : int64) {
     let c = t.config
+    if (l < c.n_layer_dense_lead) {   // glm4moe: the leading layer(s) are plain dense FFN
+        ffn_dense_prefill(t, s, l, npos)
+        return
+    }
     let dim = c.dim
     let ts_norm = ref_time_ticks()
     rms_batch(s.xb_b, s.x_b, t, t.rms_ffn_off + l * dim, dim, npos)
@@ -9922,7 +10050,7 @@ def eval_batch_(t : Model; var ws : BatchWorkspace; var sessions : array<Session
     // per-row RoPE cos/sin table(s) — row i at sessions[i]'s own position
     let ts_rope_build = ref_time_ticks()
     build_rope_table_rows(ws.scr.rope_cos, ws.scr.rope_sin, t, c.rope_freq_base, c.rope_freq_scale,
-        ws.positions, nrows, c.head_size, true)
+        ws.positions, nrows, c.rope_dim > 0l ? c.rope_dim : c.head_size, true)
     if (has_dual_rope(c)) {
         let swa_hs = c.head_size_swa > 0l ? c.head_size_swa : c.head_size
         build_rope_table_rows(ws.scr.rope_cos_swa, ws.scr.rope_sin_swa, t, c.rope_freq_base_swa,
