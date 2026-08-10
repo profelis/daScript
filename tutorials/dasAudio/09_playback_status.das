@@ -1,14 +1,14 @@
 // Tutorial AUDIO-09: Playback Status
 //
 // This tutorial covers:
-//   - Registering a status LockBox with set_status_update
-//   - Reading the AudioChannelStatus snapshot (state, position, queue depth)
+//   - Reading a sound's status snapshot with get_sound_status
 //   - Watching a sound advance through its AudioChannelState lifecycle
-//   - Releasing the status box cleanly (unset_status_update + lock_box_remove)
+//   - Detecting that a one-shot sound has finished
+//   - Reading mixer utilization with get_audio_stats
 //
-// The audio thread publishes a snapshot into a LockBox once per mix; the main
-// thread reads it on demand with `box |> get()`. This is how you detect when a
-// one-shot sound has finished, or how full a streaming queue is.
+// The audio thread publishes a snapshot per sound on every mix; you read the
+// latest one whenever you want. Reading owns nothing — there is no handle to
+// create, register or release, and your read never makes the mixer wait.
 //
 // Run: daslang.exe tutorials/dasAudio/09_playback_status.das
 
@@ -17,7 +17,6 @@ options persistent_heap
 options indenting = 4
 
 require audio/audio_boost
-require daslib/jobque_boost
 require daslib/fio
 require math
 
@@ -40,46 +39,42 @@ def main() {
         print("Playing a 0.3s tone, SID = {sid}\n")
 
         // ──────────────────────────────────────────────────────────────────
-        // Register a status box. set_status_update seeds it with state
-        // `starting`; the audio thread then updates it as the sound plays.
+        // Poll the status until the sound reports `stopped` (or we give up
+        // after ~2s), printing each state transition we observe. The SID is
+        // the only thing you need — no setup call precedes this loop.
         // ──────────────────────────────────────────────────────────────────
-        var status_box <- lock_box_create()
-        set_status_update(sid, status_box)
-
-        // Poll until the sound reports `stopped` (or we time out after ~2s),
-        // printing each state transition we observe.
         var last_state = AudioChannelState.starting
-        var saw_read = false
         var reached_stopped = false
         for (_i in range(100)) {
-            status_box |> get() $(s : AudioChannelStatus#) {
-                saw_read = true
-                if (s.state != last_state) {
-                    print("  state: {s.state}  (position={int(s.playback_position)} frames, queue={s.stream_que_length})\n")
-                    last_state = s.state
-                }
-                if (s.state == AudioChannelState.stopped) {
-                    reached_stopped = true
-                }
+            let s = get_sound_status(sid)
+            if (s.state != last_state) {
+                print("  state: {s.state}  (position={int(s.playback_position)} frames, queue={s.stream_que_length})\n")
+                last_state = s.state
             }
-            break if (reached_stopped)
+            if (s.state == AudioChannelState.stopped) {
+                reached_stopped = true
+                break
+            }
             sleep(20u)
         }
 
-        assert(saw_read, "status box never produced a reading")
         print("  final observed state: {last_state}\n")
-        // The whole point of the status box is detecting completion — so confirm
-        // the one-shot tone actually ran through to `stopped` (0.3s tone, ~2s window).
+        // Detecting completion is the point of the status snapshot, so confirm
+        // the one-shot tone really ran through to `stopped` (0.3s tone, ~2s window).
         assert(reached_stopped, "sound never reached the stopped state within the poll window")
 
+        // A sound the mixer has finished with reads back as `stopped`, so the
+        // same call answers "is this still playing?" for any SID you hold —
+        // including one that ended long ago.
+        let still_playing = is_sound_playing(sid)
+        assert(!still_playing, "finished sound still reports as playing")
+
         // ──────────────────────────────────────────────────────────────────
-        // Release the status box. Order matters: stop the updates, clear the
-        // stored value, join, then remove — otherwise the LockBox leaks.
+        // The mixer publishes its own snapshot the same way. It refreshes
+        // about once a second, so early in a short run it reads back zero.
         // ──────────────────────────────────────────────────────────────────
-        unset_status_update(sid)
-        clear_status(status_box)
-        status_box |> join()
-        unsafe(lock_box_remove(status_box))
+        let stats = get_audio_stats()
+        print("\nmixer utilization: {stats.utilization_pct}%  (hrtf {stats.hrtf_count}/{stats.total_3d})\n")
 
         print("\nDone!\n")
     }

@@ -309,6 +309,188 @@ void on_error_log ( void * , ma_uint32 level, const char * message ) {
     }
 }
 
+// ---- per-sound status publication ----
+// The mix callback publishes one snapshot per channel; game threads read it by SID. This is a
+// seqlock rather than a mutex because the callback must never wait on a non-realtime thread — and
+// a mutex here does exactly that, since the reader holds it for the whole read. The writer bumps
+// seq odd, stores the payload, bumps it even; a reader that sees an odd or changed seq retries.
+// Neither side ever blocks, and there is no per-sound object to own, register or free.
+//
+// Slots are an open-addressed table keyed by sid, so a read is a hash probe rather than a scan of
+// the table. That is what lets the capacity be generous: a game polling a hundred sounds per frame
+// pays the same handful of loads per sound whether the table holds 64 sounds or 4096.
+//
+// The payload is the caller's das struct copied word-wise. That is sound because the mixer context
+// is a CLONE of the game context (get_clone_context in dasAudio_init below), so both sides share
+// one Program and therefore one layout for it. Words are atomic so the deliberate read/write race
+// the seqlock resolves is not also a TSAN data race.
+static constexpr int32_t  AUDIO_STATUS_SLOTS = 4096;                    // power of two; 256KB of table
+static constexpr int32_t  AUDIO_STATUS_MASK  = AUDIO_STATUS_SLOTS - 1;
+static constexpr int32_t  AUDIO_STATUS_PROBE = 48;                      // probe window per lookup
+static constexpr uint32_t AUDIO_STATUS_WORDS = 6;                       // 48 payload bytes, slot = 64
+static constexpr uint32_t AUDIO_STATUS_BYTES = AUDIO_STATUS_WORDS * 8;
+// A freed slot, distinct from never-used: a lookup must keep probing past it, or it would cut the
+// chain of a sound that landed later in the same run of slots.
+static constexpr uint64_t AUDIO_STATUS_FREED = ~0ull;
+
+struct AudioStatusSlot {
+    std::atomic<uint32_t> seq  { 0 };    // even = stable, odd = write in progress
+    std::atomic<uint64_t> sid  { 0 };    // 0 = never used, AUDIO_STATUS_FREED = released
+    std::atomic<uint32_t> size { 0 };    // 0 = claimed but nothing published yet
+    std::atomic<uint64_t> payload[AUDIO_STATUS_WORDS];
+};
+static AudioStatusSlot g_statusSlots[AUDIO_STATUS_SLOTS];
+
+// Sound ids come off a counter, so their low bits already spread; mix anyway so a caller passing
+// its own strided ids does not pile every sound into one probe chain. das::hash_uint64 is the
+// engine's own wyhash mixer — no reason to hand-roll one here.
+static inline uint64_t audio_status_hash ( uint64_t sid ) {
+    uint64_t h = hash_uint64(sid);
+    return h ^ (h >> 32);
+}
+static inline int32_t audio_status_home ( uint64_t h ) {
+    return int32_t(h & uint64_t(AUDIO_STATUS_MASK));
+}
+// The step comes from a SECOND hash, not from the high bits of the first: reusing one mixer's
+// upper half correlates step with home for strided ids, which collapses distinct sounds onto one
+// probe sequence (measured: capacity fell to 230 of 4096).
+static inline uint64_t audio_status_hash2 ( uint64_t h ) {
+    return hash_uint64(h ^ 0xd1b54a32d192ed03ull);
+}
+// Double hashing, not linear probing. Linear runs merge into clusters, and a cluster longer than
+// the probe window refuses a claim while the table is still half empty — measured at ~2000 of 4096
+// slots. An odd stride visits every slot of a power-of-two table, so the window bounds the search
+// without the capacity being eaten by clustering.
+static inline int32_t audio_status_step ( uint64_t h ) {
+    return int32_t((audio_status_hash2(h) & uint64_t(AUDIO_STATUS_MASK)) | 1ull);
+}
+
+// Exhaustion is a silent wrong answer otherwise (a live sound reading back `stopped`), so say it
+// once. Once, because the mixer would repeat it every add.
+static std::atomic<int32_t> g_statusLive { 0 };
+static std::atomic<bool> g_statusFullReported { false };
+static void audio_status_report_full () {
+    if ( !g_statusFullReported.exchange(true, std::memory_order_relaxed) ) {
+        LOG(LogLevel::error) << "dasAudio: no free status slot at "
+                             << g_statusLive.load(std::memory_order_relaxed) << " live sounds of "
+                             << AUDIO_STATUS_SLOTS << "; further sounds report no status\n";
+    }
+}
+
+// Claim runs on the DISPATCHING thread (begin_sound_status, before the add command is queued), so
+// the audio thread only ever needs the non-allocating find below. Idempotent per sid.
+int32_t dasAudio_statusClaim ( uint64_t sid ) {
+    if ( !sid || sid == AUDIO_STATUS_FREED ) return -1;
+    const uint64_t h = audio_status_hash(sid);
+    const int32_t home = audio_status_home(h), step = audio_status_step(h);
+    // Pass 1: an entry for this sid may already exist further along the chain, and reusing a freed
+    // slot before it would register the same sound twice.
+    for ( int32_t p=0, i=home; p!=AUDIO_STATUS_PROBE; ++p, i=(i+step) & AUDIO_STATUS_MASK ) {
+        uint64_t cur = g_statusSlots[i].sid.load(std::memory_order_acquire);
+        if ( cur == sid ) return i;
+        if ( cur == 0 ) break;      // never used ⇒ the chain ends here, sid is not in the table
+    }
+    for ( int32_t p=0, i=home; p!=AUDIO_STATUS_PROBE; ++p, i=(i+step) & AUDIO_STATUS_MASK ) {
+        auto & s = g_statusSlots[i];
+        uint64_t cur = s.sid.load(std::memory_order_acquire);
+        if ( cur == sid ) return i;
+        if ( cur != 0 && cur != AUDIO_STATUS_FREED ) continue;
+        if ( s.sid.compare_exchange_strong(cur, sid, std::memory_order_acq_rel) ) {
+            g_statusLive.fetch_add(1, std::memory_order_relaxed);
+            return i;
+        }
+        if ( s.sid.load(std::memory_order_acquire) == sid ) return i;   // lost the race to the same sid
+    }
+    audio_status_report_full();
+    return -1;
+}
+
+// Audio-thread lookup: never allocates, so a channel whose dispatch did not seed a slot simply
+// publishes nothing rather than competing for the table with the game thread.
+int32_t dasAudio_statusFind ( uint64_t sid ) {
+    if ( !sid || sid == AUDIO_STATUS_FREED ) return -1;
+    const uint64_t h = audio_status_hash(sid);
+    const int32_t step = audio_status_step(h);
+    for ( int32_t p=0, i=audio_status_home(h); p!=AUDIO_STATUS_PROBE; ++p, i=(i+step) & AUDIO_STATUS_MASK ) {
+        uint64_t cur = g_statusSlots[i].sid.load(std::memory_order_acquire);
+        if ( cur == sid ) return i;
+        if ( cur == 0 ) return -1;
+    }
+    return -1;
+}
+
+void dasAudio_statusRelease ( int32_t slot ) {
+    if ( slot < 0 || slot >= AUDIO_STATUS_SLOTS ) return;
+    auto & s = g_statusSlots[slot];
+    // Zero size BEFORE freeing sid: that is what stops the next tenant of this slot from being
+    // read with this one's stale payload, since a claim publishes the sid and nothing else.
+    s.seq.fetch_add(1, std::memory_order_acq_rel);
+    s.size.store(0, std::memory_order_relaxed);
+    s.seq.fetch_add(1, std::memory_order_release);
+    if ( s.sid.exchange(AUDIO_STATUS_FREED, std::memory_order_acq_rel) != AUDIO_STATUS_FREED ) {
+        g_statusLive.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
+void dasAudio_statusPublish ( int32_t slot, void * data, int32_t size ) {
+    if ( slot < 0 || slot >= AUDIO_STATUS_SLOTS ) return;
+    if ( size <= 0 || uint32_t(size) > AUDIO_STATUS_BYTES ) {
+        // A snapshot struct that outgrew the payload would otherwise vanish silently.
+        static std::atomic<bool> reported { false };
+        if ( !reported.exchange(true, std::memory_order_relaxed) ) {
+            LOG(LogLevel::error) << "dasAudio: status payload of " << size << " bytes exceeds "
+                                 << AUDIO_STATUS_BYTES << "; widen AUDIO_STATUS_WORDS\n";
+        }
+        return;
+    }
+    uint64_t words[AUDIO_STATUS_WORDS] = {};
+    memcpy(words, data, size_t(size));
+    auto & s = g_statusSlots[slot];
+    s.seq.fetch_add(1, std::memory_order_acq_rel);                          // odd: writing
+    for ( uint32_t w=0; w!=AUDIO_STATUS_WORDS; ++w ) s.payload[w].store(words[w], std::memory_order_relaxed);
+    s.size.store(uint32_t(size), std::memory_order_relaxed);
+    s.seq.fetch_add(1, std::memory_order_release);                          // even: stable
+}
+
+// Drop every slot. Called when the mixer context goes away: each channel's finalize releases its
+// own slot, but that path only runs if the shutdown command is processed, and a fresh
+// audio_system_create restarts the sid counter from 1 — so a surviving slot would hand a NEW sound
+// the status of a dead one. Clearing here makes "the sounds are gone" and "the statuses are gone"
+// the same event instead of two that usually agree.
+void dasAudio_statusResetAll () {
+    for ( int32_t i=0; i!=AUDIO_STATUS_SLOTS; ++i ) {
+        auto & s = g_statusSlots[i];
+        s.seq.fetch_add(1, std::memory_order_acq_rel);
+        s.size.store(0, std::memory_order_relaxed);
+        s.seq.fetch_add(1, std::memory_order_release);
+        s.sid.store(0, std::memory_order_release);
+    }
+    g_statusLive.store(0, std::memory_order_relaxed);
+    g_statusFullReported.store(false, std::memory_order_relaxed);
+}
+
+bool dasAudio_statusRead ( uint64_t sid, void * out, int32_t size ) {
+    if ( size <= 0 || uint32_t(size) > AUDIO_STATUS_BYTES ) return false;
+    const int32_t slot = dasAudio_statusFind(sid);
+    if ( slot < 0 ) return false;
+    auto & s = g_statusSlots[slot];
+    // The writer's critical section is a handful of stores, so a couple of retries is already
+    // pathological; give up rather than spin unboundedly on a caller's thread.
+    for ( int attempt=0; attempt!=16; ++attempt ) {
+        uint32_t s0 = s.seq.load(std::memory_order_acquire);
+        if ( s0 & 1u ) continue;
+        if ( s.size.load(std::memory_order_relaxed) != uint32_t(size) ) return false;    // nothing published yet
+        uint64_t words[AUDIO_STATUS_WORDS];
+        for ( uint32_t w=0; w!=AUDIO_STATUS_WORDS; ++w ) words[w] = s.payload[w].load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if ( s.seq.load(std::memory_order_relaxed) != s0 ) continue;
+        if ( s.sid.load(std::memory_order_relaxed) != sid ) return false;                // slot changed hands
+        memcpy(out, words, size_t(size));
+        return true;
+    }
+    return false;
+}
+
 void data_callback(ma_device*, void* pOutput, const void*, ma_uint32 frameCount) {
     float fdt = 1.0f / float(g_rate);
     Array buffer;
@@ -414,7 +596,8 @@ static bool ensure_capture_context () {
 
 void dasAudio_finalize ( void ) {
     if ( g_mixer_initialized ) {
-        ma_device_uninit(&g_device);
+        ma_device_uninit(&g_device);        // no further mix callbacks, so the table has no writer
+        dasAudio_statusResetAll();
         g_mixer_context.reset();
         g_mixer_initialized = false;
     }
@@ -1230,6 +1413,17 @@ public:
             SideEffects::modifyExternal, "dasAudio_set_null_device")->args({"enabled"});
         addExtern<DAS_BIND_FUN(dasAudio_is_single_threaded)>(*this, lib, "audio_is_single_threaded",
             SideEffects::accessExternal, "dasAudio_is_single_threaded");
+        // ---- per-sound status (seqlock slots, see dasAudio.h) ----
+        addExtern<DAS_BIND_FUN(dasAudio_statusClaim)>(*this, lib, "_builtin_audio_status_claim",
+            SideEffects::modifyExternal, "dasAudio_statusClaim")->args({"sid"});
+        addExtern<DAS_BIND_FUN(dasAudio_statusFind)>(*this, lib, "_builtin_audio_status_find",
+            SideEffects::accessExternal, "dasAudio_statusFind")->args({"sid"});
+        addExtern<DAS_BIND_FUN(dasAudio_statusRelease)>(*this, lib, "_builtin_audio_status_release",
+            SideEffects::modifyExternal, "dasAudio_statusRelease")->args({"slot"});
+        addExtern<DAS_BIND_FUN(dasAudio_statusPublish)>(*this, lib, "_builtin_audio_status_publish",
+            SideEffects::modifyExternal, "dasAudio_statusPublish")->args({"slot", "data", "size"});
+        addExtern<DAS_BIND_FUN(dasAudio_statusRead)>(*this, lib, "_builtin_audio_status_read",
+            SideEffects::modifyArgumentAndExternal, "dasAudio_statusRead")->args({"sid", "out", "size"});
         // ---- capture (microphone) ----
         addExtern<DAS_BIND_FUN(dasAudio_record_start)>(*this, lib, "sound_record_start",
             SideEffects::modifyExternal, "dasAudio_record_start")->args({"rate", "channels", "rb_frames", "device_index", "context", "at"});

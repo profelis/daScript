@@ -49,6 +49,17 @@ namespace das {
     void dasAudio_set_null_device ( bool enabled );
     bool dasAudio_is_single_threaded ();
 
+    // ---- per-sound status publication ----
+    // Seqlock slots shared by the mix callback (writer) and game threads (readers). Wait-free on
+    // both sides, so the callback never waits on a non-realtime thread and there is no per-sound
+    // object to own. Claim/release/publish run on the audio thread; read runs anywhere.
+    int32_t dasAudio_statusClaim ( uint64_t sid );      // dispatching thread only (allocates a slot)
+    int32_t dasAudio_statusFind ( uint64_t sid );       // audio thread lookup, never allocates
+    void dasAudio_statusRelease ( int32_t slot );
+    void dasAudio_statusPublish ( int32_t slot, void * data, int32_t size );
+    bool dasAudio_statusRead ( uint64_t sid, void * out, int32_t size );
+    void dasAudio_statusResetAll ();                    // mixer teardown: sounds and statuses die together
+
     // ---- capture (microphone) ----
     // Separate capture device + a lock-free ring (ma_pcm_rb): the RT callback only writes C++-owned
     // memory (no daScript context on the audio thread); scripts drain on the main thread via sound_record_read.

@@ -1591,7 +1591,7 @@ def document_module_audio_boost(_root : string) {
         group_by_regex("Reverb", mod, %regex~(set_reverb|set_reverb_preset)$%%),
         group_by_regex("Chorus", mod, %regex~(set_chorus|set_chorus_default)$%%),
         group_by_regex("Attenuation", mod, %regex~(compute_attenuation|default_attenuation|inverse_distance_attenuation|linear_attenuation|quadratic_attenuation|inverse_square_attenuation)$%%),
-        group_by_regex("Status monitoring", mod, %regex~(set_status_update|clear_status|unset_status_update|set_audio_stats_box)$%%),
+        group_by_regex("Status monitoring", mod, %regex~(get_sound_status|is_sound_playing|get_audio_stats)$%%),
         group_by_regex("Command batching", mod, %regex~(begin_batch|end_batch|batch)$%%),
         group_by_regex("PCM stream", mod, %regex~(append_to_pcm|append_box_to_pcm)$%%),
         group_by_regex("Decoding", mod, %regex~(decode_audio)$%%),

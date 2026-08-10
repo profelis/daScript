@@ -188,7 +188,6 @@ var window : GLFWwindow?
 var solid_program : uint
 var line_program : uint
 var sphere : OpenGLGeometryFragment
-var stats_box : LockBox?
 var asch : AudioSystemChannels
 var last_time = 0.0lf
 var n_was_pressed = false
@@ -263,19 +262,11 @@ def init {
     // Load sound
     load_sound_data()
 
-    // Stats LockBox for per-second utilization + HRTF/simulated split readout.
-    // Lifecycle wraps the audio system: the audio thread releases its share-ref during
-    // audio_system_finalize, THEN shutdown calls lock_box_remove to do the final delete.
-    // `release` alone never deletes.
-    stats_box = lock_box_create()
-
     // Audio system — all audio API calls happen between here and audio_system_finalize in shutdown
     asch = audio_system_create()
 
     // Start with one source in front
     add_sound_source(float3(0.0, 0.0, -3.0))
-
-    set_audio_stats_box(stats_box)
 
     print("HRTF 3D Audio Demo\n")
     print("  Click to capture mouse, click again to release\n")
@@ -344,13 +335,11 @@ def update { // nolint:STYLE038 — linear per-frame UI flow
     }
     b_was_pressed = b_pressed
 
-    // Per-second audio-system stats line. `get` is read-only — keeps the box alive across reads.
-    // `grab` would consume the notification and break the periodic publish/poll loop.
+    // Per-second audio-system stats line — a plain read, nothing to keep alive.
     since_stats_print += dt
     if (since_stats_print >= 1.0) {
-        stats_box |> get() $(s : AudioSystemStats#) {
-            print("audio: util={s.utilization_pct}%, hrtf={s.hrtf_count}/{s.total_3d} (budget={HRTF_BUDGETS[hrtf_budget_idx]})\n")
-        }
+        let s = get_audio_stats()
+        print("audio: util={s.utilization_pct}%, hrtf={s.hrtf_count}/{s.total_3d} (budget={HRTF_BUDGETS[hrtf_budget_idx]})\n")
         since_stats_print = 0.0
     }
 
@@ -401,10 +390,6 @@ def update { // nolint:STYLE038 — linear per-frame UI flow
 [export]
 def shutdown {
     audio_system_finalize(asch.command, asch.next_sid)
-    if (stats_box != null) {
-        unsafe(lock_box_remove(stats_box))
-        stats_box = null
-    }
     if (window != null) {
         glfwDestroyWindow(window)
         window = null

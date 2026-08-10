@@ -66,7 +66,8 @@ enum public AudioChannelState {
     //! Channel has been created but has not started playing yet.
 }
 
-//! Concurrent status snapshot for a playing sound, readable via LockBox.
+//! Concurrent status snapshot for a playing sound. Read it with ``get_sound_status(sid)`` — the
+//! audio thread publishes one of these per mix into a lock-free slot, so reading owns nothing.
 struct public AudioChannelStatus {
     state : AudioChannelState
     //! Current playback state.
@@ -78,7 +79,15 @@ struct public AudioChannelStatus {
     //! Number of pending PCM chunks in the stream queue.
 }
 
-//! Snapshot of the audio system's recent CPU utilization and HRTF/simulated routing split, published to a caller-provided LockBox.
+// Payload widths of a status slot. Both sides pass the size so the C++ seqlock can reject a
+// mismatch instead of copying the wrong number of bytes.
+let private AUDIO_STATUS_SIZE = typeinfo sizeof(type<AudioChannelStatus>)
+let private AUDIO_STATS_SIZE = typeinfo sizeof(type<AudioSystemStats>)
+// System stats ride the same slot table under an id no generate_sound_sid() can hand out.
+// Not all-ones: that value is the table's freed-slot sentinel.
+let private AUDIO_STATS_SID = 0xfffffffffffffffeul
+
+//! Snapshot of the audio system's recent CPU utilization and HRTF/simulated routing split. Read it with ``get_audio_stats()``.
 struct public AudioSystemStats {
     utilization_pct : float
     //! Mixer CPU utilization over the last ~1 second, in percent (0..100+).
@@ -149,7 +158,7 @@ class AudioSource {
     def set_position(pos : uint64) : uint64 {
         return 0ul
     }
-    def update_status(var status : AudioChannelStatus#) {
+    def update_status(var status : AudioChannelStatus) {
         status.stream_que_length = 0
     }
 }
@@ -177,7 +186,7 @@ class AudioChannel {
     is3D : bool = false
     is_hrtf : bool = true      // runtime per-channel mode; rewritten each frame by update_hrtf's budget
     setup3D : bool = true
-    @do_not_delete status : LockBox? = null
+    status_slot : int = -1     // seqlock slot published to game threads; -1 = none (see get_sound_status)
     @do_not_delete reverb : I3DL2Reverb?
     @do_not_delete chorus : ma_chorus?
     hrtf : ma_hrtf
@@ -243,9 +252,9 @@ class AudioChannel {
             ma_channel_converter_uninit(unsafe(addr(channel_converter_sim)))
         }
         ma_resampler_uninit(unsafe(addr(resampler)))
-        if (status != null) {
-            status |> notify_and_release
-            status = null
+        if (status_slot >= 0) {
+            _builtin_audio_status_release(status_slot)
+            status_slot = -1
         }
         if (reverb != null) {
             unsafe {
@@ -261,23 +270,21 @@ class AudioChannel {
             ma_hrtf_uninit(unsafe(addr(hrtf)))
         }
     }
+    def publish_status(state : AudioChannelState) {
+        // Wait-free snapshot for whoever polls get_sound_status: build it on the audio stack, hand
+        // the bytes to the seqlock slot. Nothing here can block, allocate or run foreign code.
+        return if (status_slot < 0)
+        var snapshot = AudioChannelStatus(state = state, playback_position = playback_position)
+        source->update_status(snapshot)
+        _builtin_audio_status_publish(status_slot, unsafe(addr<void?>(snapshot)), AUDIO_STATUS_SIZE)
+    }
     def report_eos {
-        if (status != null) {
-            status |> update() $(var data : AudioChannelStatus#) {
-                data = AudioChannelStatus(state = AudioChannelState.stopped)
-            }
-        }
+        publish_status(AudioChannelState.stopped)
     }
     def mix(var data : array<float>#; channels, rate : int; dt : float) : bool {  // nolint:STYLE037 - one DSP stage per branch, linear pipeline
         if (!source->ready() || g_pitch == 0.) return true
         if (paused) {
-            if (status != null) {
-                status |> update() $(var status_channel : AudioChannelStatus#) {
-                    status_channel.state = AudioChannelState.paused
-                    status_channel.playback_position = playback_position
-                    source->update_status(status_channel)
-                }
-            }
+            publish_status(AudioChannelState.paused)
             return true
         }
         if (stop && volume_mixer.volume == 0.) return false
@@ -387,13 +394,7 @@ class AudioChannel {
         // update position
         playback_position += inputFrames
         // update status
-        if (status != null) {
-            status |> update() $(var status_channel : AudioChannelStatus#) {
-                status_channel.state = paused ? AudioChannelState.paused : (stop ? AudioChannelState.stopping : AudioChannelState.playing)
-                status_channel.playback_position = playback_position
-                source->update_status(status_channel)
-            }
-        }
+        publish_status(paused ? AudioChannelState.paused : (stop ? AudioChannelState.stopping : AudioChannelState.playing))
         return true
     }
 }
@@ -495,7 +496,7 @@ class AudioSourcePCMStream : AudioSource {
         consumed += uint64(ofs / channels)
         return <- data
     }
-    def override update_status(var status : AudioChannelStatus#) {
+    def override update_status(var status : AudioChannelStatus) {
         status.stream_que_length = length(chunks)
         status.consumed_position = consumed
     }
@@ -794,11 +795,6 @@ struct AudioCommandAddPCMStream3D : AudioCommandAddPCMStream {
     attenuation : Attenuation
 }
 
-struct AudioCommandStatus {
-    sid : SID
-    status : uint64       //! opaque LockBox? (archive-safe)
-}
-
 struct AudioCommandSoundPosition3D {
     sid : SID
     position : float3
@@ -838,7 +834,6 @@ variant AudioCommand {
     stop                    : tuple<sid : SID; time : float>
     head_transform          : AudioCommandHeadPosition3D
     sound_position          : AudioCommandSoundPosition3D
-    status                  : AudioCommandStatus
     reverb                  : tuple<sid : SID; properties : I3DL2ReverbProperties>
     chorus_cmd              : tuple<sid : SID; config : ma_chorus_config>
     set_playback_position   : tuple<sid : SID; position : uint64>
@@ -846,7 +841,6 @@ variant AudioCommand {
     global_volume           : float
     ignore_global_volume    : tuple<sid : SID; value : bool>
     hrtf_budget             : int
-    system_stats_box        : uint64       //! opaque LockBox? (archive-safe)
 }
 
 var g_command_stream : Stream?
@@ -862,6 +856,10 @@ def add_channel(sid : SID; var channel : AudioChannel?) {
     if (sid != INVALID_SID) {
         channel.sid = sid
         g_sid_2_channel |> insert(sid, channel)
+        // Every identified sound publishes status — it costs one seqlock slot and a 32-byte store
+        // per mix, so there is nothing for the caller to opt into, register or clean up. The slot
+        // was claimed by the dispatching thread in begin_sound_status; find it, never allocate here.
+        channel.status_slot = _builtin_audio_status_find(sid)
     }
     let g = channel.ignoreGlobalVolume ? 1.0 : g_volume
     ma_volume_mixer_set_volume(unsafe(addr(channel.volume_mixer)), channel.volume * g)
@@ -890,11 +888,9 @@ def command_processor {  // nolint:STYLE038 - one arm per AudioCommand variant
                 delete g_channels
             }
             g_sid_2_channel |> clear()
-            if (g_stats_box != null) {
-                // stats box is a read-only long-lived publication target, not a one-shot;
-                // never `notify_and_release` (the caller's `get()` doesn't consume notifications).
-                g_stats_box |> release
-                g_stats_box = null
+            if (g_stats_slot >= 0) {
+                _builtin_audio_status_release(g_stats_slot)
+                g_stats_slot = -1
             }
             g_command_stream |> release
         } elif (cmd is add_decoder) {
@@ -1013,17 +1009,6 @@ def command_processor {  // nolint:STYLE038 - one arm per AudioCommand variant
             }
         } elif (cmd is hrtf_budget) {
             g_hrtf_budget = max(0, cmd as hrtf_budget)
-        } elif (cmd is system_stats_box) {
-            let sbox = cmd as system_stats_box
-            if (g_stats_box != null) {
-                g_stats_box |> release
-                g_stats_box = null
-            }
-            // Reset the rolling window so a re-registered box starts with a clean accumulator
-            // instead of inheriting partial data from the previous registration.
-            g_stats_window_time_ms = 0.0lf
-            g_stats_window_samples = 0ul
-            g_stats_box = unsafe(reinterpret<LockBox?>(sbox))
         } elif (cmd is stop) {
             let scmd = cmd as stop
             g_sid_2_channel |> get(scmd.sid) $(var ch : AudioChannel?&) {
@@ -1046,26 +1031,6 @@ def command_processor {  // nolint:STYLE038 - one arm per AudioCommand variant
             g_sid_2_channel |> get(scmd.sid) $(var ch : AudioChannel?&) {
                 ch.position3d = scmd.position
                 ch.velocity3d = scmd.velocity
-            }
-        } elif (cmd is status) {
-            assume scmd = cmd as status
-            var scmd_status = unsafe(reinterpret<LockBox?>(scmd.status))
-            let found = g_sid_2_channel |> get(scmd.sid) $(var ch : AudioChannel?&) {
-                if (ch.status != null) {
-                    if (scmd_status != null) {
-                        panic("audio: status already set for {scmd.sid}")
-                    }
-                    ch.status |> notify_and_release
-                }
-                ch.status = scmd_status
-            }
-            if (!found) {
-                if (scmd_status != null) {
-                    scmd_status |> update() $(var data : AudioChannelStatus#) {
-                        data = AudioChannelStatus(state = AudioChannelState.stopped)
-                    }
-                    scmd_status |> notify_and_release
-                }
             }
         } elif (cmd is reverb) {
             assume rcmd = cmd as reverb
@@ -1101,8 +1066,8 @@ var g_mix_buffer : array<float>
 var g_pause : bool = false
 var g_volume : float = 1.  //! global master volume multiplier (1.0 = full, 0.0 = mute)
 
-// AudioSystemStats publication state (audio-context-side; main side holds the LockBox handle and read-grabs it).
-var g_stats_box : LockBox? = null
+// AudioSystemStats publication state (audio-context-side; the main side just reads the slot).
+var g_stats_slot : int = -1
 var g_stats_window_time_ms = 0.0lf      // accumulated mixer wall time over the current window
 var g_stats_window_samples = 0ul        // accumulated audio frames over the current window (flush gate: realTimeMs >= 1000)
 var g_stats_recent_util_pct : float = 0.0
@@ -1150,9 +1115,9 @@ def mixer(var data : array<float>#; channels, rate : int; dt : float) {
 }
 
 // Accumulate per-callback time + samples into a 1-second rolling window. On window flush, compute
-// utilization (= mixer time / real time) and update the caller's stats LockBox so main thread can read it.
+// utilization (= mixer time / real time) and publish it for get_audio_stats to read.
 def private publish_audio_stats(dt_ms : double; frames : uint64) {
-    return if (g_stats_box == null)
+    return if (g_stats_slot < 0)
     g_stats_window_time_ms += dt_ms
     g_stats_window_samples += frames
     let realTimeMs = double(g_stats_window_samples) * 1000.lf / double(MA_SAMPLE_RATE)
@@ -1164,17 +1129,15 @@ def private publish_audio_stats(dt_ms : double; frames : uint64) {
     let snap = g_stats_recent_util_pct
     let hrtfCount = g_stats_hrtf_count
     let total3D = g_stats_3d_count
-    g_stats_box |> update() $(var s : AudioSystemStats#) {
-        s.utilization_pct = snap
-        s.hrtf_count = hrtfCount
-        s.total_3d = total3D
-    }
+    var snapshot = AudioSystemStats(utilization_pct = snap, hrtf_count = hrtfCount, total_3d = total3D)
+    _builtin_audio_status_publish(g_stats_slot, unsafe(addr<void?>(snapshot)), AUDIO_STATS_SIZE)
 }
 
 [init]
 def initialize_mixer {
     if (this_context().category.audio) {
         this_context().name := "audio_mixer"
+        g_stats_slot = _builtin_audio_status_claim(AUDIO_STATS_SID)
         ma_limiter_init(unsafe(addr(g_limiter)),
             MA_LIMITER_THRESHOLD,
             MA_LIMITER_ATTACK_TIME,
@@ -1368,12 +1331,25 @@ def push_cmd(var cmd : AudioCommand) {
     }
 }
 
+def private begin_sound_status(sid : SID) : SID {
+    // Claim the sound's status slot here, on the caller's thread, and seed it `starting`. The
+    // audio thread claims the same slot by sid when it processes the add command (the claim is
+    // idempotent), so a read landing in between reports `starting` rather than `stopped`.
+    let slot = _builtin_audio_status_claim(sid)
+    if (slot >= 0) {
+        var snapshot = AudioChannelStatus(state = AudioChannelState.starting)
+        _builtin_audio_status_publish(slot, unsafe(addr<void?>(snapshot)), AUDIO_STATUS_SIZE)
+    }
+    return sid
+}
+
 def public play_sound_from_file(filename : string; rate, channels : int; sid : SID = INVALID_SID; loop : bool = false) {
     //! plays sound from file. If sid is INVALID_SID, a new SID is generated.
     //! note - this function is blocking for the duration of the decoder creation
     var decoder = make_decoder(filename, rate, channels)
     if (decoder == null) return INVALID_SID
     let useSid = sid != INVALID_SID ? sid : generate_sound_sid()
+    begin_sound_status(useSid)
     push_cmd(AudioCommand(add_decoder = AudioCommandAddDecoder(sid = useSid, decoder = intptr(decoder), rate = rate, channels = channels, loop = loop)))
     return useSid
 }
@@ -1384,6 +1360,7 @@ def public play_3d_sound_from_file(filename : string; position : float3; attenua
     var decoder = make_decoder(filename, rate, channels)
     if (decoder == null) return INVALID_SID
     let useSid = sid != INVALID_SID ? sid : generate_sound_sid()
+    begin_sound_status(useSid)
     push_cmd(AudioCommand(add_decoder_3d =
         AudioCommandAddDecoder3D(sid = useSid, decoder = intptr(decoder), rate = rate, channels = channels, position = position, attenuation = attenuation, loop = loop)))
     return useSid
@@ -1392,6 +1369,7 @@ def public play_3d_sound_from_file(filename : string; position : float3; attenua
 def public play_sound_from_pcm_stream(rate, channels : int; sid : SID = INVALID_SID) {
     //! Create a PCM streaming channel. Feed it samples with append_to_pcm. If sid is INVALID_SID, a new SID is generated.
     let useSid = sid != INVALID_SID ? sid : generate_sound_sid()
+    begin_sound_status(useSid)
     push_cmd(AudioCommand(add_pcm_stream <- AudioCommandAddPCMStream(sid = useSid, rate = rate, channels = channels)))
     return useSid
 }
@@ -1399,6 +1377,7 @@ def public play_sound_from_pcm_stream(rate, channels : int; sid : SID = INVALID_
 def public play_3d_sound_from_pcm_stream(position : float3; attenuation : Attenuation; rate, channels : int; sid : SID = INVALID_SID) {
     //! Create a 3D PCM streaming channel. Feed it samples with append_to_pcm. If sid is INVALID_SID, a new SID is generated.
     let useSid = sid != INVALID_SID ? sid : generate_sound_sid()
+    begin_sound_status(useSid)
     push_cmd(AudioCommand(add_pcm_stream_3d <-
         AudioCommandAddPCMStream3D(sid = useSid, rate = rate, channels = channels, position = position, attenuation = attenuation)))
     return useSid
@@ -1407,6 +1386,7 @@ def public play_3d_sound_from_pcm_stream(position : float3; attenuation : Attenu
 def public play_sound_from_pcm(rate, channels : int; var samples : array<float>; sid : SID = INVALID_SID) {
     //! plays sound from PCM data. If sid is INVALID_SID, a new SID is generated.
     let useSid = sid != INVALID_SID ? sid : generate_sound_sid()
+    begin_sound_status(useSid)
     push_cmd(AudioCommand(add_pcm <- AudioCommandAddPCM(sid = useSid, rate = rate, channels = channels, samples <- samples, loop = false)))
     return useSid
 }
@@ -1414,6 +1394,7 @@ def public play_sound_from_pcm(rate, channels : int; var samples : array<float>;
 def public play_sound_loop_from_pcm(rate, channels : int; var samples : array<float>; sid : SID = INVALID_SID) {
     //! plays looping sound from PCM data. If sid is INVALID_SID, a new SID is generated.
     let useSid = sid != INVALID_SID ? sid : generate_sound_sid()
+    begin_sound_status(useSid)
     push_cmd(AudioCommand(add_pcm <- AudioCommandAddPCM(sid = useSid, rate = rate, channels = channels, samples <- samples, loop = true)))
     return useSid
 }
@@ -1421,6 +1402,7 @@ def public play_sound_loop_from_pcm(rate, channels : int; var samples : array<fl
 def public play_3d_sound_from_pcm(position : float3; attenuation : Attenuation; rate, channels : int; var samples : array<float>; sid : SID = INVALID_SID) {
     //! plays 3D sound from PCM data. If sid is INVALID_SID, a new SID is generated.
     let useSid = sid != INVALID_SID ? sid : generate_sound_sid()
+    begin_sound_status(useSid)
     push_cmd(AudioCommand(add_pcm_3d <-
         AudioCommandAddPCM3D(sid = useSid, rate = rate, channels = channels, samples <- samples, loop = false, position = position, attenuation = attenuation)))
     return useSid
@@ -1429,6 +1411,7 @@ def public play_3d_sound_from_pcm(position : float3; attenuation : Attenuation; 
 def public play_3d_sound_loop_from_pcm(position : float3; attenuation : Attenuation; rate, channels : int; var samples : array<float>; sid : SID = INVALID_SID) {
     //! plays 3D looping sound from PCM data. If sid is INVALID_SID, a new SID is generated.
     let useSid = sid != INVALID_SID ? sid : generate_sound_sid()
+    begin_sound_status(useSid)
     push_cmd(AudioCommand(add_pcm_3d <-
         AudioCommandAddPCM3D(sid = useSid, rate = rate, channels = channels, samples <- samples, loop = true, position = position, attenuation = attenuation)))
     return useSid
@@ -1500,18 +1483,13 @@ def public set_hrtf_budget(n : int) {
     push_cmd(AudioCommand(hrtf_budget = n))
 }
 
-def public set_audio_stats_box(var box : LockBox?) {
-    //! Register a LockBox to receive periodic AudioSystemStats updates from the audio thread.
-    //! The audio thread writes one snapshot per ~1-second window; the caller reads it on demand
-    //! via ``box |> get() $(var s : AudioSystemStats) { ... }`` (read-only — keeps the box alive
-    //! across multiple reads). Pass null to clear. Do NOT use ``grab()``: that's a one-shot consume.
-    if (box == null) {
-        push_cmd(AudioCommand(system_stats_box = 0ul))
-        return
-    }
-    box |> add_ref
-    box |> set() <| new AudioSystemStats(utilization_pct = 0.0, hrtf_count = 0, total_3d = 0)
-    push_cmd(AudioCommand(system_stats_box = intptr(box)))
+def public get_audio_stats() : AudioSystemStats {
+    //! Mixer CPU utilization and the HRTF/simulated 3D split, refreshed by the audio thread about
+    //! once a second. Owns nothing and never blocks the mixer — read it whenever you like. Reads
+    //! back all-zero until the first window closes.
+    var snapshot = AudioSystemStats(utilization_pct = 0.0, hrtf_count = 0, total_3d = 0)
+    _builtin_audio_status_read(AUDIO_STATS_SID, unsafe(addr<void?>(snapshot)), AUDIO_STATS_SIZE)
+    return snapshot
 }
 
 def public stop(sid : SID; time : float = 0.0f) {
@@ -1531,24 +1509,19 @@ def public set_position(sid : SID; pos : float3; dir : float3 = float3(0.)) {
     return sid
 }
 
-def public set_status_update(sid : SID; var status : LockBox?) {
-    //! set status for sound
-    status |> add_ref
-    status |> append(1)
-    status |> set() <| new AudioChannelStatus(state = AudioChannelState.starting)
-    push_cmd(AudioCommand(status = AudioCommandStatus(sid = sid, status = intptr(status))))
-    return sid
+def public get_sound_status(sid : SID) : AudioChannelStatus {
+    //! Latest status snapshot for ``sid``. The audio thread publishes one per mix into a lock-free
+    //! slot, so reading owns nothing — no box to create, register, join or remove, and the read
+    //! never blocks the mixer. A sound that finished, was stopped, or never existed reads back as
+    //! ``stopped``, which is the same answer a caller wants for "is it done".
+    var snapshot = AudioChannelStatus(state = AudioChannelState.stopped)
+    _builtin_audio_status_read(sid, unsafe(addr<void?>(snapshot)), AUDIO_STATUS_SIZE)
+    return snapshot
 }
 
-def public clear_status(var status : LockBox?) {
-    //! clear status for sound
-    status |> clear(type <AudioChannelStatus>)
-}
-
-def public unset_status_update(sid : SID) {
-    //! unset status for sound
-    push_cmd(AudioCommand(status = AudioCommandStatus(sid = sid, status = 0ul)))
-    return sid
+def public is_sound_playing(sid : SID) : bool {
+    //! True while the mixer still holds this sound — playing, paused, or fading out.
+    return get_sound_status(sid).state != AudioChannelState.stopped
 }
 
 def public set_reverb(sid : SID; reverb : I3DL2ReverbProperties) {
